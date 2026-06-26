@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# uv
+# uv.lock IS committed (pinned deps) — do not ignore it.
+
+# Captured corpus payloads may contain tool output; keep the dir, ignore contents.
+corpus/*
+!corpus/.gitkeep
+
+# Spike reports
+reports/
