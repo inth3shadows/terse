@@ -2,6 +2,8 @@
 
 Tier 0   — minify (whitespace) + tabularize (fold repeated KEYS of record arrays)
 Tier 0.5 — dictionary coding (fold repeated VALUES via an inline legend)
+Tier 0.7 — cross-call diffing (encode a result as a lossless delta vs the prior
+           same-tool result; stateful, applied by the proxy, opt-in)
 
 Each transform is paired with an exact inverse; `roundtrip_ok` asserts
 decompress(compress(x)) == x over any JSON-native value. A failing round-trip is a
@@ -17,12 +19,13 @@ exact lookup. The dict tier is also size-guarded: it is committed only when it a
 reduces tokens, so it can never regress a payload (losslessness is separate, and
 absolute — the round-trip gate).
 
-Not yet built (deferred, per the plan): cross-call diffing; Tier 1 lossy modes
-(truncate / drop-to-retrieve).
+Not yet built (deferred, per the plan): Tier 1 lossy modes (truncate / drop-to-retrieve).
 """
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 from collections import Counter
 from typing import Any
@@ -32,6 +35,7 @@ from .tokenize import count_cl100k
 # Structural markers. Chosen to be vanishingly unlikely in real tool output.
 TABLE_MARKER = "__terse_table__"
 DICT_MARKER = "__terse_dict__"
+DIFF_MARKER = "__terse_diff__"
 ALIAS_SIGIL = "~"
 
 
@@ -302,6 +306,168 @@ def dict_decode(node: Any, legend: dict) -> Any:
     if isinstance(node, dict):
         return {k: dict_decode(v, legend) for k, v in node.items()}
     return node
+
+
+# --------------------------------------------------------------------------- #
+# Cross-call diffing (lossless) — encode curr as a delta against the prior same-tool
+# result. The 91% same-tool token overlap the ceiling probe measured is the headroom.
+#
+# Self-describing, like every other tier: the diff names the prior result it bases on
+# and carries the changes inline, so the model reads it against the previous turn's
+# result already in its context — never an out-of-band retrieve. A diff is accepted
+# ONLY if it reconstructs curr EXACTLY (verified at encode time), so it is lossless by
+# construction. When no representable diff applies, `diff_encode` returns None and the
+# caller falls back to the full compressed form (the dangling-reference fallback).
+# --------------------------------------------------------------------------- #
+def _locate_records(obj: Any) -> tuple[Any, list[dict]] | None:
+    """(at, records) for the list-of-uniform-dicts in obj — `at` is None for a top-level
+    list or the dict key that holds it. None if obj has no record list (mirrors what
+    tabularize folds, so the diff reasons about the same rows)."""
+    if isinstance(obj, list) and len(obj) >= 2 and all(isinstance(x, dict) for x in obj):
+        return (None, obj)
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, list) and len(v) >= 2 and all(isinstance(x, dict) for x in v):
+                return (k, v)
+    return None
+
+
+def _diff_id_col(prev_recs: list[dict], curr_recs: list[dict]) -> str | None:
+    """A column present in every record of both lists whose values are scalar (str/int)
+    and unique within each list — usable to align rows across the two calls."""
+    for c in prev_recs[0].keys():
+        if not (all(c in r for r in prev_recs) and all(c in r for r in curr_recs)):
+            continue
+        pv = [r[c] for r in prev_recs]
+        cv = [r[c] for r in curr_recs]
+        vals = pv + cv
+        if (all(isinstance(v, (str, int)) and not isinstance(v, bool) for v in vals)
+                and len(set(pv)) == len(pv) and len(set(cv)) == len(cv)):
+            return c
+    return None
+
+
+def _encode_rows(prev: Any, curr: Any) -> dict | None:
+    """Keyed row diff: changed/new records keyed by a stable id column, plus removals.
+
+    Only represents the agent-loop pattern — surviving rows keep their relative order
+    and new rows are appended. A reorder/interleave can't be reconstructed from
+    (prev + this diff), so it returns None and a coarser strategy (or full) is used.
+    """
+    p, c = _locate_records(prev), _locate_records(curr)
+    if not p or not c:
+        return None
+    (at_p, prev_recs), (at_c, curr_recs) = p, c
+    if at_p != at_c:
+        return None
+    by = _diff_id_col(prev_recs, curr_recs)
+    if by is None:
+        return None
+    prev_by = {r[by]: r for r in prev_recs}
+    prev_order = [r[by] for r in prev_recs]
+    curr_by = {r[by]: r for r in curr_recs}
+    curr_order = [r[by] for r in curr_recs]
+    del_ids = [i for i in prev_order if i not in curr_by]
+    new_ids = [i for i in curr_order if i not in prev_by]
+    survivors = [i for i in prev_order if i in curr_by]
+    if survivors + new_ids != curr_order:
+        return None  # reordered/interleaved — not representable as prev+delta
+    changed = [curr_by[i] for i in survivors if curr_by[i] != prev_by[i]]
+    new_recs = [curr_by[i] for i in new_ids]
+    set_recs = changed + new_recs
+    return {DIFF_MARKER: 1, "shape": "rows", "at": at_c, "by": by,
+            "n": len(curr_recs), "set": set_recs, "new": new_ids,
+            "del": del_ids, "same": len(curr_recs) - len(set_recs)}
+
+
+def _decode_rows(prev: Any, diff: dict) -> Any:
+    at, by = diff["at"], diff["by"]
+    prev_recs = prev if at is None else prev[at]
+    set_by = {r[by]: r for r in diff["set"]}
+    del_set = set(diff["del"])
+    result = [set_by.get(r[by], r) for r in prev_recs if r[by] not in del_set]
+    result += [set_by[i] for i in diff["new"]]
+    if at is None:
+        return result
+    out = copy.deepcopy(prev)
+    out[at] = result
+    return out
+
+
+def _encode_keys(prev: Any, curr: Any) -> dict | None:
+    """Shallow object key diff — the coarse fallback for two dicts (or a dict whose
+    record list moved/reordered, where the row diff bows out)."""
+    if not (isinstance(prev, dict) and isinstance(curr, dict)):
+        return None
+    set_k = {k: v for k, v in curr.items() if k not in prev or prev[k] != v}
+    del_k = [k for k in prev if k not in curr]
+    return {DIFF_MARKER: 1, "shape": "keys", "set": set_k, "del": del_k}
+
+
+def _decode_keys(prev: Any, diff: dict) -> Any:
+    del_set = set(diff["del"])
+    out = {k: v for k, v in prev.items() if k not in del_set}
+    out.update(diff["set"])
+    return out
+
+
+def diff_decode(prev: Any, diff: dict) -> Any:
+    """Reconstruct curr from the prior value + a diff. Exact inverse of the matching
+    encoder. Raises ValueError on an unknown shape."""
+    shape = diff.get("shape")
+    if shape == "rows":
+        return _decode_rows(prev, diff)
+    if shape == "keys":
+        return _decode_keys(prev, diff)
+    raise ValueError(f"unknown diff shape: {shape!r}")
+
+
+def diff_encode(prev: Any, curr: Any) -> dict | None:
+    """A self-describing lossless diff of curr against prev, or None if none applies.
+
+    Strategies are tried finest-first (row diff, then coarse key diff); each is accepted
+    ONLY if it reconstructs curr exactly, so a returned diff is lossless by construction.
+    The caller still decides whether the diff is worth emitting (it must also be smaller).
+    """
+    for strat in (_encode_rows, _encode_keys):
+        diff = strat(prev, curr)
+        if diff is None:
+            continue
+        try:
+            if diff_decode(prev, diff) == curr:
+                return diff
+        except (KeyError, TypeError, ValueError):
+            pass
+    return None
+
+
+def diff_roundtrip_ok(prev: Any, curr: Any) -> bool:
+    """The lossless GATE for diffing: True iff a diff exists and rebuilds curr exactly."""
+    diff = diff_encode(prev, curr)
+    return diff is not None and diff_decode(prev, diff) == curr
+
+
+def diff_wire(prev: Any, curr: Any, tool: str = "") -> str | None:
+    """The model-facing diff envelope text, or None if no lossless diff applies.
+
+    The diff plus a self-describing note and a base anchor (a short hash of the prior
+    value). Shared by the proxy (what ships) and the fluency-for-diff eval (what's
+    measured), so the eval tests exactly the bytes the model would read.
+    """
+    diff = diff_encode(prev, curr)
+    if diff is None:
+        return None
+    base = hashlib.sha1(minify(prev).encode("utf-8")).hexdigest()[:8]
+    label = f" {tool}" if tool else ""
+    if diff.get("shape") == "rows":
+        note = (f"Same as the previous{label} result (shown earlier), with only the "
+                "changes below: take its records, drop the ids in `del`, then "
+                "overwrite/append the records in `set` (matched by the `by` column; ids "
+                "in `new` are appended in order). `n` is the resulting record count.")
+    else:
+        note = (f"Same as the previous{label} result (shown earlier): take that object, "
+                "remove the keys in `del`, then apply the key/value pairs in `set`.")
+    return minify({**diff, "of": tool, "base": base, "note": note})
 
 
 # --------------------------------------------------------------------------- #
