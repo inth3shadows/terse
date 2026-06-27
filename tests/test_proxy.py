@@ -142,6 +142,52 @@ def _cost_lt(a, b):
     return _cost(a) < _cost(b)
 
 
+# --- one-time format primer via initialize.instructions (#13) ---
+
+def _init_req(mid=1):
+    return json.dumps({"jsonrpc": "2.0", "id": mid, "method": "initialize", "params": {}})
+
+
+def _init_resp(mid=1, instructions=None):
+    result = {"protocolVersion": "1", "capabilities": {}, "serverInfo": {"name": "s"}}
+    if instructions is not None:
+        result["instructions"] = instructions
+    return json.dumps({"jsonrpc": "2.0", "id": mid, "result": result})
+
+
+def test_initialize_reply_gets_format_primer():
+    inter = Interceptor(FULL)
+    inter.note_request(_init_req(1))
+    out = json.loads(inter.transform_response(_init_resp(1)))
+    instr = out["result"]["instructions"]
+    assert "__terse_table__" in instr and "__terse_diff__" in instr   # covers all forms
+    assert out["result"]["serverInfo"]["name"] == "s"                 # rest untouched
+
+
+def test_initialize_preserves_existing_instructions():
+    inter = Interceptor(FULL)
+    inter.note_request(_init_req(1))
+    out = json.loads(inter.transform_response(_init_resp(1, "USE TOOL X FIRST.")))
+    instr = out["result"]["instructions"]
+    assert "USE TOOL X FIRST." in instr and "__terse_table__" in instr
+
+
+def test_untracked_initialize_passes_through_unchanged():
+    # never saw the request -> don't touch the reply
+    inter = Interceptor(FULL)
+    resp = _init_resp(1)
+    assert inter.transform_response(resp) == resp
+
+
+def test_primer_injected_once_not_per_message():
+    inter = Interceptor(FULL)
+    inter.note_request(_init_req(1))
+    inter.transform_response(_init_resp(1))
+    # a second initialize-shaped reply with the same id is no longer tracked -> untouched
+    resp2 = _init_resp(1)
+    assert inter.transform_response(resp2) == resp2
+
+
 # --- end-to-end through a real subprocess ---
 
 def test_run_proxy_end_to_end_compresses_losslessly():
@@ -155,8 +201,9 @@ def test_run_proxy_end_to_end_compresses_losslessly():
     assert rc == 0
     by_id = {json.loads(l)["id"]: json.loads(l) for l in cout.getvalue().splitlines() if l.strip()}
 
-    # initialize forwarded untouched
+    # initialize: serverInfo intact, and the format primer was injected end-to-end
     assert by_id[1]["result"]["serverInfo"]["name"] == "fake"
+    assert "__terse_table__" in by_id[1]["result"]["instructions"]
     # tools/call result compressed, smaller, and round-trips to the exact original
     text = by_id[2]["result"]["content"][0]["text"]
     expected = {"result": [{"id": i, "status": "active", "url": "https://x.example/api/items"}

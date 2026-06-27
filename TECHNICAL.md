@@ -182,10 +182,16 @@ gitignored because captured tool output may contain real data.
 - **Proxy: the model must understand terse's format.** The proxy compresses tool
   results in place, so the model receives the table/legend form. It is self-describing
   (a `cols` header, an inline legend) and needs no decode step, but a model that has
-  never seen the format might read it less fluently than raw JSON. The recommended
-  pairing is a one-time system note describing the format; a per-call preamble is
-  deliberately not added (it would cost tokens on every call). This was the main open
-  question for proxy *usefulness* (correctness is covered by the round-trip tests).
+  never seen the format might read it less fluently than raw JSON. The proxy delivers a
+  one-time format primer by augmenting the MCP `initialize` result's `instructions`
+  field (which compliant clients add to the model's system context) — paid once per
+  session, not per call. This is load-bearing: `terse fluency --diff` with NO system
+  primer (the inline-note-only condition) showed `gemini-2.5-flash` regressing ~20% on
+  diff reconstruction, while the same model with a system primer held 100% — i.e. the
+  *inline* note can't substitute for the system-level primer for weaker models. Caveat:
+  not all clients surface `instructions`; the inline self-describing forms remain the
+  fallback. This was the main open question for proxy *usefulness* (correctness is
+  covered by the round-trip tests).
   **Measured (`terse fluency`):** over a synthetic stress corpus that maximizes the
   riskiest transforms, Claude Haiku 4.5 and Gemini 2.5 Flash answered terse-form
   questions within tolerance of raw JSON (96–100% paired) at a ~38% token saving;
