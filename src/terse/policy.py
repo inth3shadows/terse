@@ -45,6 +45,10 @@ class Rule:
 class Policy:
     rules: list[Rule]
     default_tiers: tuple[str, ...] = ("minify", "tabularize", "dictionary")
+    # Cross-call diffing is stateful and its model-fluency is unproven, so it is OFF by
+    # default: enable per-policy (`"diff": true`) or with `proxy --diff`. The proxy still
+    # falls back to the full compressed form whenever a diff doesn't apply or win.
+    diff: bool = False
 
     def select(self, tool: str) -> Rule:
         """First rule whose glob matches the tool name, else the lossless default."""
@@ -82,7 +86,7 @@ def load_policy(path: str | Path) -> Policy:
         glob = match.get("tool", "*")
         rules.append(Rule(tool_glob=glob, tiers=_coerce_tiers(r.get("tiers", []), f"policies[{i}]"),
                           fields=r.get("fields", {})))
-    return Policy(rules=rules, default_tiers=default_tiers)
+    return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", False)))
 
 
 @dataclass
