@@ -89,6 +89,51 @@ def build_probe_report(
     return "\n".join(out)
 
 
+def build_tokenizer_report(rows: list[dict[str, Any]]) -> str:
+    """Render cross-tokenizer invariance — cl100k vs o200k savings % per tool.
+
+    True Anthropic ground truth needs the count_tokens API (a key we don't have, and
+    Claude has no public local tokenizer). Invariance across two different vocabs is
+    the keyless substitute: if the savings % barely moves, it's robust to Claude's.
+    """
+    from .tokenize import CL100K, O200K
+
+    out: list[str] = [
+        "# terse cross-tokenizer invariance",
+        "",
+        "No Anthropic key available (Claude Code uses OAuth; no public Claude tokenizer).",
+        "Substitute: savings % under two different BPE vocabularies. Stability => robust",
+        "to Claude's tokenizer, because structural folding removes tokens in any vocab.",
+        "",
+        "| Tool | cl100k % | o200k % | Δ (pts) |",
+        "|---|---|---|---|",
+    ]
+    deltas = []
+    for r in sorted(rows, key=lambda r: -(r[CL100K]["pct"] or 0)):
+        a = r[CL100K]["pct"]
+        b = r[O200K]["pct"]
+        if a is None or b is None:
+            out.append(f"| `{r['tool']}` | n/a | n/a | n/a |")
+            continue
+        d = abs(a - b)
+        deltas.append(d)
+        out.append(f"| `{r['tool']}` | {a:+.1f}% | {b:+.1f}% | {d:.1f} |")
+    out.append("")
+    if deltas:
+        worst = max(deltas)
+        mean = sum(deltas) / len(deltas)
+        verdict = "savings are tokenizer-invariant" if worst <= 3.0 else "savings vary by tokenizer — investigate"
+        out += [
+            f"Max divergence: **{worst:.1f} pts**, mean **{mean:.1f} pts** → {verdict}.",
+            "",
+            "_To get a real Anthropic point-check: provide a key and run "
+            "`terse measure --anthropic` (recommend gh-only — public data — to avoid "
+            "sending private payloads externally)._",
+            "",
+        ]
+    return "\n".join(out)
+
+
 def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
     out: list[str] = ["# terse spike report", ""]
 

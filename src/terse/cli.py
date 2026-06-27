@@ -18,9 +18,9 @@ import json as _json
 
 from . import transforms
 from .capture import capture_payload, classify_shape, coverage, extract_records, load_corpus
-from .measure import measure_corpus
+from .measure import cross_tokenizer_savings, measure_corpus
 from .probes import cross_call_overlap, value_redundancy
-from .report import build_probe_report, build_report
+from .report import build_probe_report, build_report, build_tokenizer_report
 from .tokenize import count_cl100k
 
 DEFAULT_CORPUS = "corpus"
@@ -61,6 +61,20 @@ def _cmd_measure(args: argparse.Namespace) -> int:
         return 1
     rows = measure_corpus(envelopes, use_anthropic=args.anthropic)
     report = build_report(rows, coverage(envelopes))
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(report, encoding="utf-8")
+    print(report)
+    print(f"\n[report written to {out}]")
+    return 0
+
+
+def _cmd_validate(args: argparse.Namespace) -> int:
+    envelopes = load_corpus(args.corpus)
+    if not envelopes:
+        print(f"no payloads in {args.corpus}/ — capture some first (`terse capture`).")
+        return 1
+    report = build_tokenizer_report(cross_tokenizer_savings(envelopes))
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report, encoding="utf-8")
@@ -130,6 +144,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--corpus", default=DEFAULT_CORPUS)
     p.add_argument("--out", default=DEFAULT_PROBE_REPORT)
     p.set_defaults(func=_cmd_probe)
+
+    v = sub.add_parser("validate", help="cross-tokenizer invariance (cl100k vs o200k)")
+    v.add_argument("--corpus", default=DEFAULT_CORPUS)
+    v.add_argument("--out", default="reports/tokenizer-report.md")
+    v.set_defaults(func=_cmd_validate)
 
     args = parser.parse_args(argv)
     return args.func(args)

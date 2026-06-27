@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 
 from terse import capture
-from terse.measure import measure_corpus, measure_payload
+from terse.measure import cross_tokenizer_savings, measure_corpus, measure_payload
+from terse.tokenize import CL100K, O200K
 
 
 def test_decomposition_sums_to_total():
@@ -64,6 +65,17 @@ def test_capture_is_idempotent_by_sha(tmp_path):
     p2 = capture.capture_payload("t", raw, tmp_path)
     assert p1 == p2
     assert len(capture.load_corpus(tmp_path)) == 1
+
+
+def test_cross_tokenizer_savings_are_close():
+    raw = json.dumps({"result": [{"id": i, "status": "active", "u": "https://x.example/api/v1/items"}
+                                  for i in range(25)]})
+    rows = cross_tokenizer_savings([{"tool": "t", "raw": raw}])
+    cl = rows[0][CL100K]["pct"]
+    o2 = rows[0][O200K]["pct"]
+    assert cl is not None and cl > 0
+    if o2 is not None:  # o200k may be unavailable offline
+        assert abs(cl - o2) < 8.0  # structural savings track across vocabularies
 
 
 def test_measure_corpus_attaches_provenance(tmp_path):

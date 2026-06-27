@@ -23,7 +23,7 @@ from typing import Any, Optional
 
 from . import transforms
 from .capture import classify_shape
-from .tokenize import count_anthropic, count_cl100k
+from .tokenize import CL100K, O200K, count, count_anthropic, count_cl100k
 
 
 def measure_payload(raw: str, use_anthropic: bool = False) -> dict[str, Any]:
@@ -78,6 +78,29 @@ def measure_payload(raw: str, use_anthropic: bool = False) -> dict[str, Any]:
         a_cmp = count_anthropic(compressed)
         row["anthropic"] = {"raw": a_raw, "compressed": a_cmp, "saved": _saved(a_raw, a_cmp)}
     return row
+
+
+def cross_tokenizer_savings(envelopes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-tool Tier-0 savings under two different BPE vocabularies (cl100k, o200k).
+
+    Stability of the savings % across two very different tokenizers is the keyless
+    evidence that the structural savings hold for Claude's (unpublished) tokenizer:
+    folding whitespace/keys/values removes tokens regardless of vocabulary.
+    """
+    out = []
+    for env in envelopes:
+        raw = env["raw"]
+        try:
+            comp = transforms.compress(json.loads(raw))
+        except (json.JSONDecodeError, TypeError):
+            comp = raw
+        row: dict[str, Any] = {"tool": env.get("tool", "?")}
+        for enc in (CL100K, O200K):
+            r, c = count(raw, enc), count(comp, enc)
+            pct = ((r - c) / r * 100) if (r and c is not None) else None
+            row[enc] = {"raw": r, "compressed": c, "pct": pct}
+        out.append(row)
+    return out
 
 
 def measure_corpus(
