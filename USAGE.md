@@ -154,9 +154,14 @@ specific rules first. An empty tier list means "leave this tool's output alone."
   or had little repetition (single objects and already-tidy tools do this). The
   per-tool report will show which tools are worth compressing and which aren't.
 
-- **A `[warn] field ... requests a lossy mode` message** — Expected for now. The policy
-  mentions an optional "drop some detail" mode that isn't built yet, so terse safely
-  ignored it and kept everything. Nothing was lost.
+- **A `[warn] field ... not implemented yet` message** — The policy asked for `summarize`
+  or `drop-to-retrieve` on a field; those modes aren't built yet, so terse safely ignored
+  them and kept everything. Nothing was lost.
+- **A `[warn] lossy: truncated marked field(s) — output is NOT lossless` message** — Expected
+  when a field is marked `{"lossy":"truncate"}`. terse capped that field on purpose and
+  annotated the cut (`…⟨+N chars⟩`). Only fields you marked (never `{"critical":true}` ones)
+  are affected; if the gate can't prove that, terse falls back to the lossless output and
+  says so (`lossy step skipped`).
 
 - **"no payloads in corpus/"** — You ran a report before capturing any samples. Capture
   some tool outputs first (see "Building a sample set").

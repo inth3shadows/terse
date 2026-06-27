@@ -19,7 +19,8 @@ exact lookup. The dict tier is also size-guarded: it is committed only when it a
 reduces tokens, so it can never regress a payload (losslessness is separate, and
 absolute — the round-trip gate).
 
-Not yet built (deferred, per the plan): Tier 1 lossy modes (truncate / drop-to-retrieve).
+Tier 1 lossy lives in `lossy.py` (truncate built; summarize / drop-to-retrieve deferred)
+— it operates on the parsed object BEFORE these lossless tiers serialize it.
 """
 
 from __future__ import annotations

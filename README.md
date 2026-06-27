@@ -32,9 +32,11 @@ then (optionally) serves it through a per-tool policy that decides which tiers r
   the full payload (the 91%-overlap headroom). Self-describing, verified to reconstruct
   exactly, and emitted only when smaller — falls back to the full form otherwise. OFF by
   default (`proxy --diff`); its model-fluency is checked by `terse fluency --diff`.
-- **Tier 1 — lossy (opt-in, NOT YET BUILT)**: per marked field — truncate /
-  summarize / drop-to-retrieve. The policy schema accepts these today but the
-  engine warns and leaves them lossless until the tier exists.
+- **Tier 1 — lossy (opt-in, per field)**: `truncate` is built — a field marked
+  `{"lossy":"truncate","max":N}` is capped and annotated, gated by an acceptable-loss
+  check (only marked, non-`critical` fields may differ, each only as a valid
+  truncation). `summarize` (needs a model) and `drop-to-retrieve` (needs a retrieve
+  tool) are parsed but deferred — warned and left lossless. Off everywhere by default.
 
 Every transform has an exact inverse, and a round-trip gate asserts
 `decompress(compress(x)) == x` over the whole corpus. The transformed bytes *are*

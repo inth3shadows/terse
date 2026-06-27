@@ -16,6 +16,10 @@ corpus/*
 # `python scripts/gen_stress_corpus.py`.
 corpus-stress/
 
+# Ad-hoc eval corpora for cross-call diffing (synthetic pair + real gh captures) — derived.
+corpus-diff/
+corpus-real/
+
 # Spike reports
 reports/
 

@@ -171,9 +171,14 @@ gitignored because captured tool output may contain real data.
 
 ## Known Limitations
 
-- **Tier 1 (lossy) is not built.** `truncate` / `summarize` / `drop-to-retrieve` are
-  in the policy schema but warned-and-skipped. Today terse is 100% lossless regardless
-  of policy.
+- **Tier 1 (lossy) is partially built — `truncate` only.** A field marked
+  `{"lossy":"truncate","max":N}` (and not `{"critical":true}`) is capped + annotated,
+  gated by `lossy.acceptable_loss`: only marked, non-critical fields may differ, each
+  only as a valid truncation, else it fails closed to the lossless output. `summarize`
+  (needs a model in the proxy) and `drop-to-retrieve` (needs a stateful store + a
+  retrieve tool) are parsed but deferred — warned and left lossless. Lossy is off
+  everywhere by default; the round-trip gate is replaced by the acceptable-loss gate
+  only where a field is explicitly marked.
 - **Proxy: the model must understand terse's format.** The proxy compresses tool
   results in place, so the model receives the table/legend form. It is self-describing
   (a `cols` header, an inline legend) and needs no decode step, but a model that has
