@@ -53,6 +53,9 @@ echo '[{"id":1,"name":"a"},{"id":2,"name":"b"},{"id":3,"name":"c"}]' | uv run te
 # Compress a tool output through a per-tool policy
 some-tool-emitting-json | uv run terse compress --tool gh.api.repos --policy policy.example.json -
 
+# Run an MCP server behind terse: it compresses that server's tool results live
+uv run terse proxy --policy policy.example.json -- uvx some-mcp-server --flags
+
 # Run the test suite (it IS the lossless gate)
 uv run pytest
 ```
@@ -63,12 +66,13 @@ uv run pytest
 src/terse/
   transforms.py  lossless tiers (minify, tabularize, dict coding) + round-trip gate
   policy.py      selective per-tool policy: load, match, apply
+  proxy.py       MCP stdio middleware: compress a downstream server's tool results
   capture.py     corpus capture (shape-tagged envelopes) + shape classifier
   measure.py     per-payload + cross-tokenizer token measurement
   probes.py      value-redundancy + cross-call-overlap ceiling probes
   tokenize.py    cl100k / o200k token counting (+ optional Anthropic)
   report.py      markdown reports (savings, per-tool, probes, tokenizer)
-  cli.py         entrypoint: gate / capture / measure / probe / validate / compress
+  cli.py         entrypoint: gate / capture / measure / probe / validate / compress / proxy
 tests/           round-trip, measurement, probe, and policy tests
 policy.example.json   selective policy encoding the measured per-tool insight
 corpus/          captured tool outputs (gitignored; may contain real data)
@@ -81,6 +85,7 @@ corpus/          captured tool outputs (gitignored; may contain real data)
 
 ## Status
 
-Phase-0 spike: a working, measured, selective **lossless** library + CLI. The MCP
-proxy wrapper and the Tier 1 lossy modes are designed but not yet built — see
-TECHNICAL.md "Known Limitations".
+Phase-0 spike: a working, measured, selective **lossless** library, CLI, and MCP
+stdio proxy. The Tier 1 lossy modes (truncate / drop-to-retrieve) and the higher-
+ceiling lossless levers (whole-subtree aliasing, cross-call diffing) are designed
+but not yet built — see TECHNICAL.md "Known Limitations".

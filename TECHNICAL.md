@@ -57,6 +57,12 @@ raw tool output (JSON text)
   `default_policy`, `Policy.select` (first tool-glob match wins), and `apply()` which
   returns an `Applied` record (text, tiers run, skipped, warnings). The only module
   that knows about lossy field modes (which it parses and warns about, never executes).
+- **`proxy.py`** — MCP stdio middleware. `Interceptor` is the pure message logic
+  (records request `id → tool name`, compresses the matching `tools/call` result via
+  `policy.apply`); it is transparent (non-result messages forwarded unchanged),
+  fail-open (any error forwards the original), and frame-safe. `run_proxy` launches
+  the downstream server as a subprocess and wires `Interceptor` to stdio with two
+  pump threads.
 - **`capture.py`** — `classify_shape` (pretty/compact JSON, array-of-records,
   long-text), `capture_payload` (writes a sha-idempotent envelope to `corpus/`),
   `load_corpus`, `coverage`, `extract_records`.
@@ -136,9 +142,19 @@ uv run terse <subcommand>     # run the CLI
 ```
 
 To use it as a library, import `terse.policy.apply` / `terse.transforms.compress`.
-A future MCP proxy would call `policy.apply(raw, tool, policy)` on each tool result
-(not yet built). There is no remote infrastructure and nothing to roll back; reverting
-is `git checkout` of a prior commit.
+
+To run a downstream MCP server behind terse, wrap its launch command with the proxy:
+
+```bash
+terse proxy --policy policy.example.json -- <downstream server command and args>
+```
+
+In an MCP client config (e.g. Claude Code's `mcpServers`), set the server's command
+to `terse` and prefix the original command/args after `proxy --policy <file> --`. The
+proxy speaks plain MCP stdio, so the client needs no changes. Note: the policy's tool
+globs match the **downstream tool names** as that server defines them (not any client-
+side `mcp__<server>__` prefix). There is no remote infrastructure and nothing to roll
+back; reverting is `git checkout` of a prior commit.
 
 ## Maintenance Commands
 
@@ -158,8 +174,15 @@ gitignored because captured tool output may contain real data.
 - **Tier 1 (lossy) is not built.** `truncate` / `summarize` / `drop-to-retrieve` are
   in the policy schema but warned-and-skipped. Today terse is 100% lossless regardless
   of policy.
-- **No MCP proxy yet.** The selective library + CLI exists; the thin proxy that would
-  intercept live tool results and call `policy.apply()` is designed but unbuilt.
+- **Proxy: the model must understand terse's format.** The proxy compresses tool
+  results in place, so the model receives the table/legend form. It is self-describing
+  (a `cols` header, an inline legend) and needs no decode step, but a model that has
+  never seen the format may read it less fluently than raw JSON. The recommended
+  pairing is a one-time system note describing the format; a per-call preamble is
+  deliberately not added (it would cost tokens on every call). This is the main open
+  question for proxy *usefulness* (as opposed to correctness, which the tests cover).
+- **Proxy is single-downstream and stdio-only.** One server per proxy instance; no
+  HTTP/SSE transport, no fan-out to multiple servers. Run one proxy per server.
 - **Whole-subtree aliasing and cross-call diffing are unbuilt.** Probes show headroom
   (repeated whole objects; 91% overlap between successive same-tool calls) but the
   coders for them do not exist yet.

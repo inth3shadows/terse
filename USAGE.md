@@ -46,6 +46,20 @@ the percent saved). `--tool` is the name terse matches against your policy to de
 how to treat that tool. If you leave off `--policy`, terse uses a safe lossless
 default for everything.
 
+### Run a tool server "behind" terse (automatic compression)
+
+Instead of compressing outputs by hand, you can put terse in front of a whole tool
+server so it compresses that server's results automatically, as they come back:
+
+```
+uv run terse proxy --policy policy.example.json -- <the command that starts the server>
+```
+
+Everything still works exactly as before from the outside — terse just quietly shrinks
+the results the policy says to shrink, and passes everything else through untouched. If
+anything ever goes wrong with a compression, terse sends the original result instead, so
+a tool call is never lost. Add `--debug` to see what it compressed.
+
 ### See how well it does across many tools
 
 If you've collected sample outputs (see "Building a sample set" below), these produce
