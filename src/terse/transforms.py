@@ -460,14 +460,19 @@ def diff_wire(prev: Any, curr: Any, tool: str = "") -> str | None:
         return None
     base = hashlib.sha1(minify(prev).encode("utf-8")).hexdigest()[:8]
     label = f" {tool}" if tool else ""
+    # Note kept tight on purpose (#9): it is fixed per-diff overhead and the only format
+    # guidance the proxy can give (it can't set a system prompt). Verified self-sufficient
+    # by `terse fluency --diff` with NO system primer — the production condition.
+    # Kept lean on purpose (#9): the inline note can't be made comprehension-sufficient
+    # for weaker models by *length* — measurement showed wording doesn't recover them
+    # (the system primer did, which the stdio proxy can't deliver). So minimize overhead
+    # and address comprehension via a one-time format primer instead.
     if diff.get("shape") == "rows":
-        note = (f"Same as the previous{label} result (shown earlier), with only the "
-                "changes below: take its records, drop the ids in `del`, then "
-                "overwrite/append the records in `set` (matched by the `by` column; ids "
-                "in `new` are appended in order). `n` is the resulting record count.")
+        note = (f"Diff of the previous{label} result above: from its records drop `del` "
+                "ids, upsert `set` by the `by` field, append `new` ids; n=final count.")
     else:
-        note = (f"Same as the previous{label} result (shown earlier): take that object, "
-                "remove the keys in `del`, then apply the key/value pairs in `set`.")
+        note = (f"Diff of the previous{label} result above: on that object remove `del` "
+                "keys, then apply `set` key/values.")
     return minify({**diff, "of": tool, "base": base, "note": note})
 
 

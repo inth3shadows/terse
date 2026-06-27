@@ -353,26 +353,19 @@ def run_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
 # --------------------------------------------------------------------------- #
 # Cross-call diff fluency — does the model read a diff as well as the full result?
 # (Issue #1 risk item: the round-trip gate proves the diff reconstructs, NOT that the
-# model reads it. This measures the second thing, so flipping `proxy --diff` on is a
-# measured decision.)
+# model reads it. This measures the second thing, with NO system primer — only the diff's
+# inline note, as the proxy delivers it — so flipping `proxy --diff` on is a measured
+# decision under production conditions.)
 # --------------------------------------------------------------------------- #
-DIFF_PRIMER = (
-    "Some results are sent as a 'terse' diff against the PREVIOUS result of the same "
-    "tool, so unchanged data isn't resent. A diff "
-    '{"__terse_diff__":1,"shape":"rows","by":COL,"set":[...],"new":[...],"del":[...],"n":N} '
-    'means: start from the previous result\'s records, drop every id in "del", then for '
-    'each record in "set" overwrite the record whose "by"-column value matches it (ids '
-    'listed in "new" are appended, in order). "n" is the exact resulting record count. A '
-    '{"shape":"keys","set":{...},"del":[...]} diff instead means: take the previous '
-    'object, remove the keys in "del", then apply the key/value pairs in "set". Answer '
-    "about the RECONSTRUCTED current result."
-)
-
-
 def run_diff_payload(prev_obj: Any, curr_obj: Any, answerer: Answerer,
-                     tool: str = "", primer: str = DIFF_PRIMER, trials: int = 1) -> list[dict]:
+                     tool: str = "", trials: int = 1) -> list[dict]:
     """Does the model answer questions about the CURRENT result as well from
     (previous full result + diff) as from the full current result?
+
+    Both forms are asked with NO system primer — the proxy can't set one, so the diff's
+    inline note is the only format guidance, exactly as in production. This is the
+    honest test of #9's shortened note (an earlier version fed a full DIFF_PRIMER the
+    proxy can't deliver, overstating comprehension).
 
     Returns rows carrying full-terse (`terse_ok`) and diff-form (`diff_ok`) success
     counts over the SAME questions. [] if curr is not record-shaped or no lossless diff
@@ -392,7 +385,7 @@ def run_diff_payload(prev_obj: Any, curr_obj: Any, answerer: Answerer,
         out.append({
             "qid": q.qid, "qtype": q.qtype, "transform": q.transform, "trials": trials,
             "terse_ok": _ask_n(answerer, "", full_u, q.qtype, q.expected, trials),
-            "diff_ok": _ask_n(answerer, primer, diff_u, q.qtype, q.expected, trials),
+            "diff_ok": _ask_n(answerer, "", diff_u, q.qtype, q.expected, trials),
         })
     return out
 
