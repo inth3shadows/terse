@@ -35,6 +35,20 @@ CASES = [
     pytest.param([{"id": 1}], id="single-record-no-fold"),
     pytest.param("just a string", id="bare-string"),
     pytest.param([1, 2, 3, "mixed", {"a": 1}], id="mixed-list"),
+    # Tier 0.5 dictionary-coding exercise: repeated long string values across rows.
+    pytest.param(
+        [
+            {"id": i, "url": "https://api.github.com/repos/inth3shadows/terse",
+             "owner": {"login": "inth3shadows", "type": "User"}}
+            for i in range(15)
+        ],
+        id="repeated-values-and-subobjects",
+    ),
+    # Adversarial: literal values that look like alias references must still round-trip.
+    pytest.param(
+        [{"v": "~0"}, {"v": "~0"}, {"v": "~1"}, {"v": "real"}, {"v": "real"}, {"v": "real"}],
+        id="values-collide-with-alias-namespace",
+    ),
 ]
 
 
@@ -55,3 +69,28 @@ def test_tabularize_declines_heterogeneous():
     records = [{"id": 1, "name": "a"}, {"id": 2}]
     compressed = transforms.compress_structure(records)
     assert isinstance(compressed, list)  # left untouched, not wrapped
+
+
+def test_dictionary_coding_folds_repeated_values():
+    url = "https://api.github.com/repos/inth3shadows/terse/contents/very/deep/path"
+    structure = transforms.compress_structure([{"id": i, "url": url} for i in range(20)])
+    data, legend = transforms.dict_encode(structure)
+    assert legend, "expected a repeated long URL to be aliased"
+    # The long URL appears once (in the legend), not 20 times in the data.
+    assert transforms.minify(data).count(url) == 0
+    assert url in legend.values()
+
+
+def test_dictionary_coding_declines_when_no_repeats():
+    structure = transforms.compress_structure([{"id": i, "u": f"unique-{i}"} for i in range(5)])
+    _data, legend = transforms.dict_encode(structure)
+    assert legend == {}  # nothing repeats enough to pay
+
+
+def test_aliases_never_collide_with_literals():
+    # 'real' repeats (would be aliased); '~0'/'~1' are literal values. Whatever
+    # aliases get assigned must avoid the literal '~0'/'~1', else decode corrupts.
+    obj = [{"v": "real", "w": "~0"}, {"v": "real", "w": "~1"}, {"v": "real", "w": "~0"}]
+    assert transforms.roundtrip_ok(obj)
+    _data, legend = transforms.dict_encode(transforms.compress_structure(obj))
+    assert "~0" not in legend and "~1" not in legend

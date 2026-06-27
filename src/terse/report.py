@@ -146,17 +146,19 @@ def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
     out += [
         "## Tier attribution by shape (cl100k tokens saved)",
         "",
-        "minify = whitespace + \\uXXXX unescaping · tabularize = repeated keys folded.",
+        "minify = whitespace + \\uXXXX unescaping · tabularize = repeated keys folded ·",
+        "dictionary = repeated values folded into an inline legend (Tier 0.5).",
         "A ~0 minify column means the payload arrived already-compact (the headroom no-op).",
         "",
-        "| Shape | minify saved | tabularize saved | tier0 total |",
-        "|---|---|---|---|",
+        "| Shape | minify | tabularize | dictionary | total |",
+        "|---|---|---|---|---|",
     ]
     for shape in shapes:
         sub = [r for r in rows if r["shape"] == shape]
         m = _sum(sub, "saved_cl100k", "minify")
         t = _sum(sub, "saved_cl100k", "tabularize")
-        out.append(f"| {shape} | {m:+d} | {t:+d} | {m + t:+d} |")
+        d = _sum(sub, "saved_cl100k", "dictionary")
+        out.append(f"| {shape} | {m:+d} | {t:+d} | {d:+d} | {m + t + d:+d} |")
     out.append("")
 
     # --- Anthropic ground truth (if measured) ---

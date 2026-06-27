@@ -12,7 +12,7 @@ def test_decomposition_sums_to_total():
     raw = json.dumps({"result": [{"id": i, "name": f"n{i}", "ok": True} for i in range(20)]})
     row = measure_payload(raw)
     s = row["saved_cl100k"]
-    assert s["minify"] + s["tabularize"] == s["tier0_total"]
+    assert s["minify"] + s["tabularize"] + s["dictionary"] == s["tier_total"]
     assert row["roundtrip_ok"] is True
 
 
@@ -37,7 +37,7 @@ def test_non_json_is_passthrough_and_lossless():
     row = measure_payload(raw)
     assert row["applicable"] is False
     assert row["roundtrip_ok"] is True
-    assert row["saved_cl100k"]["tier0_total"] == 0
+    assert row["saved_cl100k"]["tier_total"] == 0
 
 
 def test_capture_load_coverage_roundtrip(tmp_path):

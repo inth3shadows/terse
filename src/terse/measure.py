@@ -40,8 +40,8 @@ def measure_payload(raw: str, use_anthropic: bool = False) -> dict[str, Any]:
             "shape": shape,
             "applicable": False,
             "roundtrip_ok": True,
-            "cl100k": {"raw": raw_tok, "minified": raw_tok, "compressed": raw_tok},
-            "saved_cl100k": {"minify": 0, "tabularize": 0, "tier0_total": 0},
+            "cl100k": {"raw": raw_tok, "minified": raw_tok, "tabular": raw_tok, "compressed": raw_tok},
+            "saved_cl100k": {"minify": 0, "tabularize": 0, "dictionary": 0, "tier_total": 0},
         }
         if use_anthropic:
             a = count_anthropic(raw)
@@ -49,11 +49,13 @@ def measure_payload(raw: str, use_anthropic: bool = False) -> dict[str, Any]:
         return row
 
     minified = transforms.minify(obj)
-    compressed = transforms.compress(obj)
+    tabular = transforms.compress_tabular(obj)  # Tier-0 only (minify + tabularize)
+    compressed = transforms.compress(obj)       # + Tier-0.5 dictionary coding
     gate = transforms.roundtrip_ok(obj)
 
     raw_tok = count_cl100k(raw)
     min_tok = count_cl100k(minified)
+    tab_tok = count_cl100k(tabular)
     cmp_tok = count_cl100k(compressed)
 
     def _saved(a: Optional[int], b: Optional[int]) -> Optional[int]:
@@ -63,11 +65,12 @@ def measure_payload(raw: str, use_anthropic: bool = False) -> dict[str, Any]:
         "shape": shape,
         "applicable": True,
         "roundtrip_ok": gate,
-        "cl100k": {"raw": raw_tok, "minified": min_tok, "compressed": cmp_tok},
+        "cl100k": {"raw": raw_tok, "minified": min_tok, "tabular": tab_tok, "compressed": cmp_tok},
         "saved_cl100k": {
             "minify": _saved(raw_tok, min_tok),
-            "tabularize": _saved(min_tok, cmp_tok),
-            "tier0_total": _saved(raw_tok, cmp_tok),
+            "tabularize": _saved(min_tok, tab_tok),
+            "dictionary": _saved(tab_tok, cmp_tok),
+            "tier_total": _saved(raw_tok, cmp_tok),
         },
     }
     if use_anthropic:

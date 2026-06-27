@@ -1,42 +1,49 @@
-"""Tier-0 lossless transforms: minify + tabularize, with a round-trip gate.
+"""Lossless transforms with a round-trip gate.
 
-These are the differentiated, fully-lossless core. Each transform is paired with
-an exact inverse, and `roundtrip_ok` asserts decompress(compress(x)) == x over
-any JSON-native value. A failing round-trip is a bug, not a tuning knob.
+Tier 0   — minify (whitespace) + tabularize (fold repeated KEYS of record arrays)
+Tier 0.5 — dictionary coding (fold repeated VALUES via an inline legend)
 
-Not yet implemented (deferred until the spike justifies them, per the plan):
-  - Tier 0.5 dictionary coding (repeated VALUES + tokenizer-aware delimiters)
-  - Tier 1 lossy modes (truncate / drop-to-retrieve)
+Each transform is paired with an exact inverse; `roundtrip_ok` asserts
+decompress(compress(x)) == x over any JSON-native value. A failing round-trip is a
+bug, not a tuning knob — token availability changes WHICH values get aliased, never
+losslessness.
+
+Dictionary coding stays model-legible: the legend ships inline with the data, so a
+`~0` reference is resolved by reading the same payload — never an out-of-band
+retrieve (the headroom failure mode). Aliases come from a sigil namespace proven
+disjoint from every literal string in the payload, so decode is an exact lookup.
+
+Not yet built (deferred, per the plan): nested-object key folding; Tier 1 lossy
+modes (truncate / drop-to-retrieve).
 """
 
 from __future__ import annotations
 
 import json
+from collections import Counter
 from typing import Any
 
-# Marker for a tabularized list. Chosen to be vanishingly unlikely in real tool
-# output; detable keys off it. (A production version would also guard against a
-# genuine payload that happens to contain this key.)
+from .tokenize import count_cl100k
+
+# Structural markers. Chosen to be vanishingly unlikely in real tool output.
 TABLE_MARKER = "__terse_table__"
+DICT_MARKER = "__terse_dict__"
+ALIAS_SIGIL = "~"
 
 
+# --------------------------------------------------------------------------- #
+# minify
+# --------------------------------------------------------------------------- #
 def minify(obj: Any) -> str:
-    """Serialize with no insignificant whitespace. Lossless for JSON-native data.
-
-    Inverse: json.loads. Round-trips because JSON scalar/containers survive a
-    dumps->loads cycle by value (key *order* is preserved by json; dict equality
-    ignores order regardless).
-    """
+    """Serialize with no insignificant whitespace. Lossless for JSON-native data."""
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
 
+# --------------------------------------------------------------------------- #
+# Tier 0 — tabularize (fold repeated keys)
+# --------------------------------------------------------------------------- #
 def _is_tabularizable(value: Any) -> bool:
-    """True iff `value` is a list of >=2 dicts that all share an identical key set.
-
-    The shared-keyset requirement is what makes tabularization unambiguous: one
-    column header reconstructs every row. Heterogeneous lists are left untouched
-    (still lossless, just no saving) rather than padded with sentinels in v1.
-    """
+    """True iff `value` is a list of >=2 dicts that all share an identical key set."""
     if not isinstance(value, list) or len(value) < 2:
         return False
     if not all(isinstance(item, dict) for item in value):
@@ -46,11 +53,7 @@ def _is_tabularizable(value: Any) -> bool:
 
 
 def compress_structure(obj: Any) -> Any:
-    """Recursively fold every qualifying list-of-uniform-dicts into a table.
-
-    Bottom-up: children are transformed first, then the (transformed) list is
-    wrapped if it qualifies. Mirrored exactly by `decompress_structure`.
-    """
+    """Recursively fold every qualifying list-of-uniform-dicts into a table."""
     if isinstance(obj, dict):
         return {k: compress_structure(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -76,16 +79,147 @@ def decompress_structure(obj: Any) -> Any:
     return obj
 
 
-def compress(obj: Any) -> str:
-    """Full Tier-0 pipeline: structural fold, then minified serialization."""
+# --------------------------------------------------------------------------- #
+# Tier 0.5 — dictionary coding (fold repeated values)
+# --------------------------------------------------------------------------- #
+def _tok(s: str) -> int:
+    """Token cost of a string's minified JSON form; len-based fallback if no tiktoken."""
+    text = json.dumps(s, ensure_ascii=False)
+    c = count_cl100k(text)
+    return c if c is not None else max(1, len(text) // 4)
+
+
+def _count_value_strings(node: Any, counter: Counter) -> None:
+    """Count strings that occur in VALUE positions (not dict keys), recursively."""
+    if isinstance(node, str):
+        counter[node] += 1
+    elif isinstance(node, list):
+        for x in node:
+            _count_value_strings(x, counter)
+    elif isinstance(node, dict):
+        for v in node.values():
+            _count_value_strings(v, counter)
+
+
+def _collect_all_strings(node: Any, out: set) -> None:
+    """All strings anywhere (keys + values) — the avoid-set aliases must stay clear of."""
+    if isinstance(node, str):
+        out.add(node)
+    elif isinstance(node, list):
+        for x in node:
+            _collect_all_strings(x, out)
+    elif isinstance(node, dict):
+        for k, v in node.items():
+            out.add(k)
+            _collect_all_strings(v, out)
+
+
+def _b36(n: int) -> str:
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    if n == 0:
+        return "0"
+    out = ""
+    while n:
+        n, r = divmod(n, 36)
+        out = digits[r] + out
+    return out
+
+
+def _alias_gen(avoid: set):
+    """Yield ~-sigil aliases guaranteed not to collide with any literal string."""
+    i = 0
+    while True:
+        a = ALIAS_SIGIL + _b36(i)
+        i += 1
+        if a not in avoid:
+            yield a
+
+
+def _replace_values(node: Any, alias_for: dict) -> Any:
+    """Replace value-position strings with their alias; keys left untouched."""
+    if isinstance(node, str):
+        return alias_for.get(node, node)
+    if isinstance(node, list):
+        return [_replace_values(x, alias_for) for x in node]
+    if isinstance(node, dict):
+        return {k: _replace_values(v, alias_for) for k, v in node.items()}
+    return node
+
+
+def dict_encode(structure: Any) -> tuple[Any, dict]:
+    """Fold repeated value-strings into an inline legend. Returns (data, legend).
+
+    Tokenizer-aware: a value is aliased only when (n-1)*tok(value) exceeds the
+    (n+1)*tok(alias) cost of the legend entry plus references. legend maps
+    alias -> original string; an empty legend means dictionary coding didn't pay.
+    """
+    counts: Counter = Counter()
+    _count_value_strings(structure, counts)
+    candidates = [(s, n) for s, n in counts.items() if n >= 2 and (n - 1) * _tok(s) > 0]
+    if not candidates:
+        return structure, {}
+
+    # Biggest potential first, so the cheapest aliases land on the biggest wins.
+    candidates.sort(key=lambda sn: (sn[1] - 1) * _tok(sn[0]), reverse=True)
+
+    avoid: set = set()
+    _collect_all_strings(structure, avoid)
+    gen = _alias_gen(avoid)
+
+    alias_for: dict = {}
+    legend: dict = {}
+    for s, n in candidates:
+        alias = next(gen)
+        # Exact saving with this alias's real token cost: occurrences collapse to
+        # the alias (n * ac), plus one legend entry (alias + value ~= ac + t).
+        saving = (n * _tok(s)) - (n * _tok(alias) + _tok(alias) + _tok(s))
+        if saving <= 0:
+            continue
+        alias_for[s] = alias
+        legend[alias] = s
+
+    if not alias_for:
+        return structure, {}
+    return _replace_values(structure, alias_for), legend
+
+
+def dict_decode(node: Any, legend: dict) -> Any:
+    """Exact inverse of dict_encode's replacement: expand value-position aliases."""
+    if isinstance(node, str):
+        return legend.get(node, node)
+    if isinstance(node, list):
+        return [dict_decode(x, legend) for x in node]
+    if isinstance(node, dict):
+        return {k: dict_decode(v, legend) for k, v in node.items()}
+    return node
+
+
+# --------------------------------------------------------------------------- #
+# Full pipeline
+# --------------------------------------------------------------------------- #
+def compress_tabular(obj: Any) -> str:
+    """Tier-0 only (minify + tabularize), no dictionary coding. For measurement."""
     return minify(compress_structure(obj))
 
 
+def compress(obj: Any) -> str:
+    """Full pipeline: tabularize, then dictionary-code, then minify."""
+    structure = compress_structure(obj)
+    data, legend = dict_encode(structure)
+    if legend:
+        return minify({DICT_MARKER: 1, "legend": legend, "data": data})
+    return minify(structure)
+
+
 def decompress(text: str) -> Any:
-    """Inverse of `compress`: parse, then structural unfold."""
-    return decompress_structure(json.loads(text))
+    """Inverse of `compress`: parse, expand legend (if any), structural unfold."""
+    parsed = json.loads(text)
+    if isinstance(parsed, dict) and parsed.get(DICT_MARKER) == 1:
+        data = dict_decode(parsed["data"], parsed["legend"])
+        return decompress_structure(data)
+    return decompress_structure(parsed)
 
 
 def roundtrip_ok(obj: Any) -> bool:
-    """The lossless GATE. True iff the Tier-0 pipeline is byte-faithful by value."""
+    """The lossless GATE. True iff the full pipeline is byte-faithful by value."""
     return decompress(compress(obj)) == obj
