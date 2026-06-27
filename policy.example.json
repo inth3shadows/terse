@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "_comment": "Selective per-tool policy, informed by the spike's measured per-tool savings (gh records +16-30%, runecho +25-29%, kb +2.6%, single objects +0%). First matching rule wins; unmatched tools use defaults. tiers subset of [minify, tabularize, dictionary]; [] = passthrough. v1 is 100% lossless: lossy field modes are parsed but not executed (warned).",
+  "_comment": "Selective per-tool policy, informed by the spike's measured per-tool savings (gh records +16-30%, runecho +25-29%, kb +2.6%, single objects +0%). First matching rule wins; unmatched tools use defaults. tiers subset of [minify, tabularize, dictionary]; [] = passthrough. Lossless by default. Per-field lossy is opt-in: 'truncate' executes (gated by an acceptable-loss check); 'summarize'/'drop-to-retrieve' are parsed but deferred (warned). A field marked {critical:true} is never made lossy.",
   "defaults": {
     "tiers": ["minify", "tabularize", "dictionary"]
   },
@@ -10,8 +10,8 @@
       "match": { "tool": "gh.*" },
       "tiers": ["minify", "tabularize", "dictionary"],
       "fields": {
-        "result[].id": { "critical": true },
-        "result[].body": { "lossy": "drop-to-retrieve", "_note": "v1: warned, left lossless" }
+        "result[].id": { "critical": true, "_note": "identifier — never made lossy" },
+        "result[].body": { "lossy": "truncate", "max": 500, "_note": "keep first 500 chars + a loss marker" }
       }
     },
     {

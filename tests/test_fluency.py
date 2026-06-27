@@ -130,6 +130,42 @@ def test_run_payload_structure_with_constant_answerer():
     assert not lookup_row["terse_ok"]
 
 
+def test_run_payload_trials_count_partial_successes():
+    # a flaky answerer: right, wrong, right -> count question scores 2/3, and every row
+    # carries trials=3. Proves multi-trial records counts, not a single boolean.
+    replies = iter(["6", "nope", "6"] * 10)  # enough for all questions x 3 forms
+    rows = fluency.run_payload(PAYLOAD, fluency.compress(PAYLOAD), lambda s, u: next(replies), trials=3)
+    assert all(r["trials"] == 3 for r in rows)
+    count_row = next(r for r in rows if r["qid"] == "count")
+    assert count_row["raw_ok"] == 2  # right, wrong, right
+    assert 0 <= count_row["terse_ok"] <= 3
+
+
+def test_score_pack_accepts_multi_trial_lists():
+    pack = fluency.build_pack([{"tool": "demo", "sha": "abc123", "raw": fluency_raw()}], trials=2)
+    assert pack["trials"] == 2
+    sha = pack["payloads"][0]["sha"]
+    # two replies per form: first correct, second wrong -> 1/2 each form
+    resp = {q["qid"]: {"raw": [_gt(q), "wrong"], "terse": [_gt(q), "wrong"],
+                       "primer": [_gt(q), "wrong"]}
+            for q in pack["payloads"][0]["questions"]}
+    rows = fluency.score_pack(pack, {"m": {sha: resp}})["m"]
+    assert rows and all(r["trials"] == 2 for r in rows)
+    assert all(r["raw_ok"] == 1 for r in rows)  # exactly one of two correct
+
+
+def test_multi_trial_report_shows_bound():
+    from terse.report import build_fluency_report
+    # 10 questions, 4 trials each; terse a touch noisier than raw
+    rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
+             "trials": 4, "raw_ok": 4, "terse_ok": 3, "primer_ok": 4} for i in range(10)]
+    report = build_fluency_report({"m": rows}, [])
+    assert "Trials per question: **4**" in report
+    assert "±" in report
+    verdict = report.split("## Verdict", 1)[1]
+    assert "pts)" in verdict  # the gap carries a confidence interval
+
+
 def test_build_pack_then_score_pack_roundtrips_through_ground_truth():
     pack = fluency.build_pack([{"tool": "demo", "sha": "abc123", "raw": fluency_raw()}])
     assert len(pack["payloads"]) == 1
@@ -166,6 +202,49 @@ def test_verdict_excludes_models_that_fail_the_raw_control():
     verdict = report.split("## Verdict", 1)[1]
     assert "Excluded" in verdict and "`broken`" in verdict
     assert "PASS" in verdict
+
+
+DIFF_PREV = [{"id": i, "status": "active-long-status-string-value", "score": i} for i in range(8)]
+DIFF_CURR = ([{"id": i, "status": "active-long-status-string-value", "score": i} for i in range(8)]
+             + [{"id": 8, "status": "active-long-status-string-value", "score": 99}])
+
+
+def test_run_diff_payload_structure_and_forms():
+    # a perfect answerer scores both forms right; rows carry terse_ok AND diff_ok counts
+    def oracle(system, user):
+        import json as _j
+        # answer count questions with the current count (9); others may be wrong — we only
+        # assert structure here, not full correctness
+        return "9"
+    rows = fluency.run_diff_payload(DIFF_PREV, DIFF_CURR, oracle, tool="demo", trials=2)
+    assert rows, "a record-shaped curr with a representable diff yields rows"
+    assert all("terse_ok" in r and "diff_ok" in r and r["trials"] == 2 for r in rows)
+    count_row = next(r for r in rows if r["qid"] == "count")
+    assert count_row["terse_ok"] == 2 and count_row["diff_ok"] == 2  # 9 is the new count
+
+
+def test_run_diff_payload_empty_when_no_diff_applies():
+    # identical-shape but non-record curr -> no questions -> no rows
+    assert fluency.run_diff_payload({"a": 1}, {"a": 2}, lambda s, u: "x") == []
+
+
+def test_run_diff_fluency_pairs_same_tool_payloads():
+    import json
+    envs = [{"tool": "demo", "sha": "aaa", "raw": json.dumps(DIFF_PREV)},
+            {"tool": "demo", "sha": "bbb", "raw": json.dumps(DIFF_CURR)}]
+    results = fluency.run_diff_fluency(envs, {"m": lambda s, u: "9"}, trials=1)
+    assert results["m"], "the one same-tool pair produces rows"
+    assert all(r["tool"] == "demo" for r in results["m"])
+
+
+def test_build_diff_report_verdict_and_empty():
+    from terse.report import build_diff_report
+    assert "No model answers" in build_diff_report({})
+    rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
+             "trials": 1, "terse_ok": 1, "diff_ok": 1} for i in range(10)]
+    report = build_diff_report({"m": rows})
+    verdict = report.split("## Verdict", 1)[1]
+    assert "PASS" in verdict and "FAIL" not in verdict
 
 
 def _gt(q: dict) -> str:

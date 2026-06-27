@@ -76,6 +76,72 @@ def test_skip_policy_leaves_result_unchanged():
     assert inter.transform_response(line) == line
 
 
+# --- cross-call diffing (opt-in) ---
+
+DIFF = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))], diff=True)
+
+
+def _req(mid, name):
+    return json.dumps({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+                       "params": {"name": name}})
+
+
+def _records(n, change=None):
+    rows = [{"id": i, "status": "active", "url": "https://x.example/api/items"} for i in range(n)]
+    if change is not None:
+        rows[change]["status"] = "closed"
+    return {"result": rows}
+
+
+def _emit(inter, mid, tool, payload):
+    inter.note_request(_req(mid, tool))
+    out = inter.transform_response(_result_msg(mid, json.dumps(payload)))
+    return json.loads(out)["result"]["content"][0]["text"]
+
+
+def test_first_call_has_no_prior_so_sends_full_compressed():
+    inter = Interceptor(DIFF)
+    text = _emit(inter, 1, "gh.api.items", _records(40))
+    assert transforms.DIFF_MARKER not in text
+    assert transforms.decompress(text) == _records(40)
+
+
+def test_second_same_tool_result_emits_smaller_lossless_diff():
+    inter = Interceptor(DIFF)
+    prev, curr = _records(40), _records(40, change=5)
+    full = _emit(inter, 1, "gh.api.items", prev)
+    diff_text = _emit(inter, 2, "gh.api.items", curr)
+    env = json.loads(diff_text)
+    assert env.get(transforms.DIFF_MARKER) == 1          # a diff was emitted
+    assert transforms.diff_decode(prev, env) == curr     # and reconstructs curr exactly
+    assert _cost_lt(diff_text, full)                     # and it is smaller
+
+
+def test_diff_off_by_default_sends_full_both_times():
+    inter = Interceptor(FULL)  # diff flag defaults off
+    prev, curr = _records(40), _records(40, change=5)
+    t1 = _emit(inter, 1, "gh.api.items", prev)
+    t2 = _emit(inter, 2, "gh.api.items", curr)
+    assert transforms.DIFF_MARKER not in t1 and transforms.DIFF_MARKER not in t2
+    assert transforms.decompress(t2) == curr
+
+
+def test_diff_not_emitted_when_it_would_not_be_smaller():
+    # an unrelated second payload makes any diff at least as large as the full form,
+    # so the proxy keeps the full compressed result (fallback), still lossless.
+    inter = Interceptor(DIFF)
+    _emit(inter, 1, "gh.api.items", _records(40))
+    other = {"result": [{"k": i, "v": "x" * 50} for i in range(40)]}
+    text = _emit(inter, 2, "gh.api.items", other)
+    assert transforms.DIFF_MARKER not in text
+    assert transforms.decompress(text) == other
+
+
+def _cost_lt(a, b):
+    from terse.proxy import _cost
+    return _cost(a) < _cost(b)
+
+
 # --- end-to-end through a real subprocess ---
 
 def test_run_proxy_end_to_end_compresses_losslessly():

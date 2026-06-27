@@ -11,7 +11,37 @@ Honesty requirements (plan Section 7, principle #24):
 
 from __future__ import annotations
 
+import math
 from typing import Any
+
+
+def _form_stats(rows: list[dict[str, Any]], form: str) -> tuple[float, float]:
+    """(accuracy, standard_error) for one form over rows carrying success COUNTS.
+
+    accuracy = Σsuccesses / Σtrials. SE is the pooled binomial SE of that estimator:
+    each row is t trials of a Bernoulli with p̂=k/t, so Var(total successes)=Σ t·p̂(1-p̂)
+    and SE(acc)=√Var / Σt. This is stable at the realistic small trial count (N=2–3),
+    where an empirical std across N whole-eval runs would be pure noise. At trials=1
+    every p̂∈{0,1} → SE=0, so single-trial runs report exactly as before.
+    """
+    tot_t = tot_k = 0
+    var = 0.0
+    for r in rows:
+        t = r.get("trials", 1)
+        k = int(r[form])
+        tot_t += t
+        tot_k += k
+        if t > 0:
+            p = k / t
+            var += t * p * (1 - p)
+    if tot_t == 0:
+        return 0.0, 0.0
+    return tot_k / tot_t, math.sqrt(var) / tot_t
+
+
+def _ci(se: float) -> float:
+    """95% half-width in accuracy units."""
+    return 1.96 * se
 
 
 def _pct(saved: int, base: int) -> str:
@@ -243,6 +273,79 @@ def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def build_diff_report(results: dict) -> str:
+    """Render the cross-call diff fluency eval: does a model read a diff against the
+    prior result as accurately as the full current result?
+
+    `results` is {model: [row,...]} from fluency.run_diff_fluency; each row carries
+    full-terse (`terse_ok`) and diff-form (`diff_ok`) success counts over the same
+    questions. The verdict gates on the worst model (principle #24): the proxy emits a
+    diff only when smaller, so this bounds the comprehension cost of enabling it.
+    """
+    out: list[str] = ["# terse cross-call diff fluency", ""]
+    out += [
+        "Does a model read a diff against the prior same-tool result as accurately as the",
+        "full current result? Same questions, paired per question; ground truth is",
+        "deterministic. Risk-item check for `proxy --diff` before turning it on.",
+        "",
+    ]
+    if not results or not any(results.values()):
+        out += [
+            "No model answers, or no same-tool payload PAIRS in the corpus. Capture a tool",
+            "2+ times (an agent loop) and configure a backend, then re-run "
+            "`terse fluency --diff`.",
+            "",
+        ]
+        return "\n".join(out)
+
+    trials = max((r.get("trials", 1) for rows in results.values() for r in rows), default=1)
+    out += [
+        "## Accuracy by model",
+        "",
+        f"Trials per question: **{trials}**. `±` is the 95% half-width of a pooled "
+        "binomial bound.",
+        "",
+        "| Model | q | full-terse | diff | regressions |",
+        "|---|---|---|---|---|",
+    ]
+    summary: dict[str, dict[str, float]] = {}
+    for model, rows in results.items():
+        n = len(rows)
+        if not n:
+            continue
+        facc, fse = _form_stats(rows, "terse_ok")
+        dacc, dse = _form_stats(rows, "diff_ok")
+        regr = sum(1 for r in rows if int(r["terse_ok"]) == r.get("trials", 1)
+                   and int(r["diff_ok"]) < r.get("trials", 1))
+        summary[model] = {"full": facc, "full_se": fse, "diff": dacc, "diff_se": dse}
+        out.append(f"| `{model}` | {n} | {facc:.0%} ±{_ci(fse) * 100:.0f} "
+                   f"| {dacc:.0%} ±{_ci(dse) * 100:.0f} | {regr} |")
+    out.append("")
+
+    out += ["## Verdict", ""]
+    tol = 0.05
+    worst = None  # (model, gap, diff_acc, full_acc, gap_ci)
+    for model, s in summary.items():
+        gap = s["diff"] - s["full"]
+        gap_ci = _ci(math.sqrt(s["full_se"] ** 2 + s["diff_se"] ** 2))
+        if worst is None or gap < worst[1]:
+            worst = (model, gap, s["diff"], s["full"], gap_ci)
+    if worst:
+        model, gap, dacc, facc, gap_ci = worst
+        passed = gap >= -tol - 1e-9
+        out.append(f"- Worst-case model `{model}`: diff-form {dacc:.0%} vs full-terse {facc:.0%} "
+                   f"(gap {gap:+.0%} ±{gap_ci * 100:.0f} pts). "
+                   f"**{'PASS' if passed else 'FAIL'}** at {tol:.0%} tolerance.")
+        if passed:
+            out.append("- Reading the diff costs no comprehension beyond tolerance — safe to "
+                       "enable `proxy --diff` for the tested models.")
+        else:
+            out.append("- The diff form regresses comprehension beyond tolerance — keep "
+                       "`proxy --diff` off, or restrict it to tools whose diffs stay legible.")
+    out.append("")
+    return "\n".join(out)
+
+
 def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str:
     """Render the format-fluency eval: does the model read terse as well as raw JSON?
 
@@ -280,10 +383,17 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
             ]
 
     # --- per-model accuracy by form ---
+    # Trial count is read from the rows (multi-trial via `--trials`); a `±` column shows
+    # the 95% half-width so the verdict is a bound, not a single noisy point. A question
+    # "regresses" when raw is fully right across its trials but terse is not.
+    trials = max((r.get("trials", 1) for rows in results.values() for r in rows), default=1)
     out += [
         "## Accuracy by model and form",
         "",
-        "| Model | n | raw | terse | terse+primer | regressions | primer recovers |",
+        f"Trials per question: **{trials}**. `±` is the 95% half-width of a pooled "
+        "binomial bound on the accuracy.",
+        "",
+        "| Model | q | raw | terse | terse+primer | regressions | primer recovers |",
         "|---|---|---|---|---|---|---|",
     ]
     summary: dict[str, dict[str, float]] = {}
@@ -291,13 +401,19 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         n = len(rows)
         if not n:
             continue
-        racc = sum(r["raw_ok"] for r in rows) / n
-        tacc = sum(r["terse_ok"] for r in rows) / n
-        pacc = sum(r["primer_ok"] for r in rows) / n
-        regr = sum(1 for r in rows if r["raw_ok"] and not r["terse_ok"])
-        rec = sum(1 for r in rows if not r["terse_ok"] and r["primer_ok"])
-        summary[model] = {"n": n, "raw": racc, "terse": tacc, "primer": pacc}
-        out.append(f"| `{model}` | {n} | {racc:.0%} | {tacc:.0%} | {pacc:.0%} | {regr} | {rec} |")
+        racc, rse = _form_stats(rows, "raw_ok")
+        tacc, tse = _form_stats(rows, "terse_ok")
+        pacc, pse = _form_stats(rows, "primer_ok")
+        regr = sum(1 for r in rows if int(r["raw_ok"]) == r.get("trials", 1)
+                   and int(r["terse_ok"]) < r.get("trials", 1))
+        rec = sum(1 for r in rows if int(r["terse_ok"]) < r.get("trials", 1)
+                  and int(r["primer_ok"]) == r.get("trials", 1))
+        summary[model] = {"n": n, "raw": racc, "raw_se": rse,
+                          "terse": tacc, "terse_se": tse, "primer": pacc, "primer_se": pse}
+        out.append(
+            f"| `{model}` | {n} | {racc:.0%} ±{_ci(rse) * 100:.0f} | {tacc:.0%} ±{_ci(tse) * 100:.0f} "
+            f"| {pacc:.0%} ±{_ci(pse) * 100:.0f} | {regr} | {rec} |"
+        )
     out.append("")
 
     # --- per-transform breakdown (terse form, pooled across models) ---
@@ -316,9 +432,9 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
             "|---|---|---|---|",
         ]
         for tf, rs in sorted(by_tf.items()):
-            n = len(rs)
-            out.append(f"| {tf} | {n} | {sum(x['terse_ok'] for x in rs) / n:.0%} "
-                       f"| {sum(x['primer_ok'] for x in rs) / n:.0%} |")
+            tacc, _ = _form_stats(rs, "terse_ok")
+            pacc, _ = _form_stats(rs, "primer_ok")
+            out.append(f"| {tf} | {len(rs)} | {tacc:.0%} | {pacc:.0%} |")
         out.append("")
 
     # --- verdict: gate on the worst model ---
@@ -332,18 +448,28 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     if broken:
         out.append(f"- Excluded (raw control failed — backend/config error, not comprehension): "
                    f"{', '.join(f'`{m}`' for m in broken)}.")
-    worst = None  # (model, gap, best_form_acc, raw_acc)
+    worst = None  # (model, gap, best_form_acc, raw_acc, gap_ci)
     for model, s in gated.items():
-        best = max(s["terse"], s["primer"])
+        # best terse-side form, carrying its own SE for the gap's confidence interval.
+        best, best_se = (s["terse"], s["terse_se"]) if s["terse"] >= s["primer"] \
+            else (s["primer"], s["primer_se"])
         gap = best - s["raw"]
+        # gap CI: raw and the best form are over the same questions (not independent),
+        # so √(se_raw²+se_best²) is a conservative over-estimate of the gap's SE — the
+        # honest direction for a bound that gates a ship decision.
+        gap_ci = _ci(math.sqrt(s["raw_se"] ** 2 + best_se ** 2))
         if worst is None or gap < worst[1]:
-            worst = (model, gap, best, s["raw"])
+            worst = (model, gap, best, s["raw"], gap_ci)
     if worst:
-        model, gap, best, raw = worst
+        model, gap, best, raw, gap_ci = worst
         passed = gap >= -tol - 1e-9  # inclusive: exactly -tol is within tolerance
         helps = sum(1 for s in gated.values() if s["primer"] > s["terse"] + 1e-9)
         out.append(f"- Worst-case model `{model}`: best terse-form {best:.0%} vs raw {raw:.0%} "
-                   f"(gap {gap:+.0%}). **{'PASS' if passed else 'FAIL'}** at {tol:.0%} tolerance.")
+                   f"(gap {gap:+.0%} ±{gap_ci * 100:.0f} pts). "
+                   f"**{'PASS' if passed else 'FAIL'}** at {tol:.0%} tolerance.")
+        if gap_ci > 1e-9 and abs(gap) < gap_ci:
+            out.append("- The gap is within its own confidence interval — terse and raw are "
+                       "indistinguishable at this trial count (raise `--trials` to tighten).")
         out.append(f"- The primer improves terse-form accuracy for {helps}/{len(gated)} model(s).")
         if passed:
             out.append("- terse's compressed form preserves comprehension within tolerance — "

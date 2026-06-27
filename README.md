@@ -27,9 +27,16 @@ then (optionally) serves it through a per-tool policy that decides which tiers r
 - **Tier 0.5 — dictionary code**: repeated string values *and repeated whole subtrees*
   are folded into an inline legend (`~0`, `~1`, …) proven disjoint from every literal in
   the payload. Committed only when it actually saves tokens, so it never regresses.
-- **Tier 1 — lossy (opt-in, NOT YET BUILT)**: per marked field — truncate /
-  summarize / drop-to-retrieve. The policy schema accepts these today but the
-  engine warns and leaves them lossless until the tier exists.
+- **Tier 0.7 — cross-call diff (opt-in, stateful)**: when the same tool is called
+  repeatedly, the proxy can emit a lossless delta against the prior result instead of
+  the full payload (the 91%-overlap headroom). Self-describing, verified to reconstruct
+  exactly, and emitted only when smaller — falls back to the full form otherwise. OFF by
+  default (`proxy --diff`); its model-fluency is checked by `terse fluency --diff`.
+- **Tier 1 — lossy (opt-in, per field)**: `truncate` is built — a field marked
+  `{"lossy":"truncate","max":N}` is capped and annotated, gated by an acceptable-loss
+  check (only marked, non-`critical` fields may differ, each only as a valid
+  truncation). `summarize` (needs a model) and `drop-to-retrieve` (needs a retrieve
+  tool) are parsed but deferred — warned and left lossless. Off everywhere by default.
 
 Every transform has an exact inverse, and a round-trip gate asserts
 `decompress(compress(x)) == x` over the whole corpus. The transformed bytes *are*
@@ -94,6 +101,7 @@ stdio proxy. The proxy's open question — *does a model read the compressed for
 well as raw JSON?* — now has a measured answer: on a stress corpus, Claude Haiku 4.5
 and Gemini 2.5 Flash match raw-JSON accuracy on the compressed form (100% paired) at a
 37% token saving (`terse fluency`; see TECHNICAL.md). Whole-subtree aliasing (folding
-repeated objects, not just strings) is built. The Tier 1 lossy modes (truncate /
-drop-to-retrieve) and cross-call diffing are designed but not yet built — see
-TECHNICAL.md "Known Limitations".
+repeated objects, not just strings) is built. Cross-call diffing is now built as an
+**opt-in** lossless tier (`proxy --diff`), with its own fluency check (`fluency --diff`)
+gating whether it's safe to enable. The Tier 1 lossy modes (truncate / drop-to-retrieve)
+remain designed but not yet built — see TECHNICAL.md "Known Limitations".

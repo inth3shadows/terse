@@ -26,15 +26,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import lossy as lossy_mod
 from . import transforms
 
 VALID_TIERS = ("minify", "tabularize", "dictionary")
+LOSSY_MODES = ("truncate",)  # implemented; summarize / drop-to-retrieve are deferred
 
 
 @dataclass
 class Rule:
     tool_glob: str
     tiers: tuple[str, ...]
+    # Per-field map: {path: {"lossy": mode, "max": N} | {"critical": true}}. `critical`
+    # is a field flag (never made lossy); see lossy.critical_paths.
     fields: dict[str, dict] = field(default_factory=dict)
 
     def lossy_fields(self) -> list[str]:
@@ -45,6 +49,10 @@ class Rule:
 class Policy:
     rules: list[Rule]
     default_tiers: tuple[str, ...] = ("minify", "tabularize", "dictionary")
+    # Cross-call diffing is stateful and its model-fluency is unproven, so it is OFF by
+    # default: enable per-policy (`"diff": true`) or with `proxy --diff`. The proxy still
+    # falls back to the full compressed form whenever a diff doesn't apply or win.
+    diff: bool = False
 
     def select(self, tool: str) -> Rule:
         """First rule whose glob matches the tool name, else the lossless default."""
@@ -82,7 +90,7 @@ def load_policy(path: str | Path) -> Policy:
         glob = match.get("tool", "*")
         rules.append(Rule(tool_glob=glob, tiers=_coerce_tiers(r.get("tiers", []), f"policies[{i}]"),
                           fields=r.get("fields", {})))
-    return Policy(rules=rules, default_tiers=default_tiers)
+    return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", False)))
 
 
 @dataclass
@@ -94,15 +102,34 @@ class Applied:
     warnings: list[str]
 
 
+def _lossy_warnings(rule: Rule) -> list[str]:
+    """Warn about field lossy requests that won't be executed as asked: deferred modes,
+    unknown modes, and the truncate-vs-critical contradiction."""
+    critical = lossy_mod.critical_paths(rule)
+    out: list[str] = []
+    for path, spec in rule.fields.items():
+        mode = spec.get("lossy") if isinstance(spec, dict) else None
+        if not mode:
+            continue
+        if mode in ("summarize", "drop-to-retrieve"):
+            out.append(f"field '{path}': lossy mode '{mode}' not implemented yet (left lossless)")
+        elif mode not in LOSSY_MODES:
+            out.append(f"field '{path}': unknown lossy mode '{mode}' (ignored)")
+        elif path in critical:
+            out.append(f"field '{path}': marked '{mode}' AND critical — kept lossless")
+    return out
+
+
 def apply(raw: str, tool: str, policy: Policy) -> Applied:
-    """Compress one raw payload per policy. Always lossless; non-JSON passes through.
+    """Compress one raw payload per policy. Lossless by default; a field marked
+    `truncate` (and not `critical`) is reduced, gated by the acceptable-loss invariant.
+    Non-JSON passes through.
 
     Returns the (possibly unchanged) text plus what was applied — so a caller/proxy
-    can log why a payload was or wasn't compressed.
+    can log why a payload was or wasn't compressed, and whether anything was dropped.
     """
     rule = policy.select(tool)
-    warnings = [f"field '{f}' requests a lossy mode, not implemented in v1 (left lossless)"
-                for f in rule.lossy_fields()]
+    warnings = _lossy_warnings(rule)
 
     if not rule.tiers:
         return Applied(text=raw, tool=tool, tiers=(), skipped=True, warnings=warnings)
@@ -115,8 +142,22 @@ def apply(raw: str, tool: str, policy: Policy) -> Applied:
         return Applied(text=raw, tool=tool, tiers=(), skipped=True,
                        warnings=warnings + ["payload is not JSON; passed through"])
 
+    # Tier-1 lossy (truncate) runs BEFORE the lossless tiers and is fail-closed: any
+    # path that doesn't resolve, or a gate failure, keeps the fully-lossless object.
+    data = obj
+    if lossy_mod._truncate_specs(rule):
+        try:
+            cand = lossy_mod.apply_lossy(obj, rule)
+            if cand is not obj and cand != obj and lossy_mod.acceptable_loss(obj, cand, rule):
+                data = cand
+                warnings.append("lossy: truncated marked field(s) — output is NOT lossless")
+            elif cand != obj:
+                warnings.append("lossy step skipped: acceptable-loss gate failed (kept lossless)")
+        except lossy_mod.PathError as exc:
+            warnings.append(f"lossy step skipped: {exc} (kept lossless)")
+
     text = transforms.compress_with(
-        obj,
+        data,
         tabularize="tabularize" in rule.tiers,
         dictionary="dictionary" in rule.tiers,
     )

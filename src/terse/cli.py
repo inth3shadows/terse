@@ -87,6 +87,8 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
               "  terse proxy --policy p.json -- uvx some-mcp-server", file=sys.stderr)
         return 2
     pol = load_policy(args.policy) if args.policy else default_policy()
+    if args.diff:
+        pol.diff = True  # CLI opt-in overrides the policy default (off)
     return run_proxy(cmd, pol, debug=args.debug)
 
 
@@ -185,12 +187,24 @@ def _build_answerers(args: argparse.Namespace) -> dict:
 
 def _cmd_fluency(args: argparse.Namespace) -> int:
     from . import fluency
-    from .report import build_fluency_report
+    from .report import build_diff_report, build_fluency_report
 
     envelopes = load_corpus(args.corpus)
     if not envelopes:
         print(f"no payloads in {args.corpus}/ — capture some first (`terse capture`).")
         return 1
+
+    # Diff mode: does a model read a cross-call DIFF as well as the full result? Needs a
+    # live model (it measures comprehension of a form, not ground-truth math).
+    if args.diff:
+        answerers = _build_answerers(args)
+        if not answerers:
+            print("`fluency --diff` needs a configured model: set TERSE_FLUENCY_BASE_URL/"
+                  "_API_KEY/_MODELS or pass --anthropic.")
+            return 1
+        results = fluency.run_diff_fluency(envelopes, answerers, trials=args.trials)
+        _write_report(build_diff_report(results), args.out)
+        return 0
 
     # Score mode: an externally-collected responses file against a previously-written pack.
     if args.responses:
@@ -204,7 +218,7 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
     answerers = _build_answerers(args)
     if not answerers:
         # Keyless default: write the eval pack and explain how to drive it.
-        pack = fluency.build_pack(envelopes)
+        pack = fluency.build_pack(envelopes, trials=args.trials)
         out = Path(args.pack)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(_json.dumps(pack, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -217,7 +231,7 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
               f"--pack {out}`.")
         return 0
 
-    results = fluency.run_fluency(envelopes, answerers)
+    results = fluency.run_fluency(envelopes, answerers, trials=args.trials)
     report = build_fluency_report(results, fluency.token_summary(envelopes))
     _write_report(report, args.out)
     return 0
@@ -270,6 +284,9 @@ def main(argv: list[str] | None = None) -> int:
     px = sub.add_parser("proxy", help="MCP stdio proxy: compress a downstream server's "
                                       "tool results per policy")
     px.add_argument("--policy", help="path to a JSON policy file (default: lossless-everywhere)")
+    px.add_argument("--diff", action="store_true",
+                    help="enable cross-call diffing (stateful; emits a lossless delta vs the "
+                         "prior same-tool result when smaller). Opt-in: fluency unverified")
     px.add_argument("--debug", action="store_true", help="log compressions to stderr")
     px.add_argument("cmd", nargs=argparse.REMAINDER,
                     help="-- <downstream MCP server command and args>")
@@ -282,6 +299,11 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--pack", default=DEFAULT_FLUENCY_PACK,
                    help="path for the offline eval pack (written when no model is configured)")
     f.add_argument("--responses", help="score a collected responses JSON against --pack")
+    f.add_argument("--trials", type=int, default=1,
+                   help="repeat each question N times; report mean ± a binomial bound (default 1)")
+    f.add_argument("--diff", action="store_true",
+                   help="eval whether a model reads a cross-call DIFF as well as the full "
+                        "result (needs same-tool corpus pairs + a configured model)")
     f.add_argument("--base-url", help="OpenAI-compatible base URL (else $TERSE_FLUENCY_BASE_URL)")
     f.add_argument("--models", help="comma-separated model ids (else $TERSE_FLUENCY_MODELS)")
     f.add_argument("--api-key-env", default="TERSE_FLUENCY_API_KEY",

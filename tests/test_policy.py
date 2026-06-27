@@ -51,12 +51,20 @@ def test_non_json_passes_through():
     assert result.text == "not json at all"
 
 
-def test_lossy_field_is_warned_not_executed():
+def test_deferred_lossy_mode_is_warned_not_executed():
+    # summarize / drop-to-retrieve are deferred — warned and left lossless
+    p = Policy(rules=[Rule(tool_glob="gh.*", tiers=("minify", "tabularize"),
+                           fields={"result[].body": {"lossy": "summarize"}})])
+    result = apply(RECORDS, "gh.api.x", p)
+    assert any("not implemented" in w for w in result.warnings)
+    assert transforms.decompress(result.text) == json.loads(RECORDS)
+
+
+def test_truncate_on_absent_field_is_lossless_noop():
+    # RECORDS has no 'body' field, so truncate finds nothing to cut -> stays lossless
     p = Policy(rules=[Rule(tool_glob="gh.*", tiers=("minify", "tabularize"),
                            fields={"result[].body": {"lossy": "truncate"}})])
     result = apply(RECORDS, "gh.api.x", p)
-    assert any("lossy" in w for w in result.warnings)
-    # still lossless despite the lossy request
     assert transforms.decompress(result.text) == json.loads(RECORDS)
 
 

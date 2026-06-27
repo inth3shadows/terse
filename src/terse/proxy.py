@@ -25,17 +25,32 @@ from threading import Thread
 from typing import Any, Callable, Optional, TextIO
 
 from . import policy as policy_mod
+from . import transforms
+from .tokenize import count_cl100k
+
+
+def _cost(text: str) -> int:
+    """Token cost, falling back to byte length where tiktoken is unavailable."""
+    c = count_cl100k(text)
+    return c if c is not None else len(text)
 
 
 class Interceptor:
     """Pure JSON-RPC message logic. Tracks request id -> tool name and compresses
     matching results. No I/O; both methods take and return a single line of text
-    (without the trailing newline)."""
+    (without the trailing newline).
+
+    When `policy.diff` is on, it also keeps the previous per-tool result and emits a
+    lossless delta when that is smaller than the full compressed form — the stateful
+    cross-call lever. It is fail-open and self-verifying: a diff is sent only when it
+    provably reconstructs the result, and the full form is always the fallback."""
 
     def __init__(self, pol: policy_mod.Policy, debug: bool = False):
         self.policy = pol
         self.pending: dict[Any, str] = {}
         self.debug = debug
+        self.diff = pol.diff
+        self.last: dict[str, Any] = {}  # tool -> previous result object (the diff base)
 
     def note_request(self, line: str) -> None:
         """Record id -> tool name for any tools/call request. Side-effect only."""
@@ -67,10 +82,18 @@ class Interceptor:
         if not isinstance(content, list):
             return line
 
+        text_blocks = [b for b in content
+                       if isinstance(b, dict) and b.get("type") == "text"
+                       and isinstance(b.get("text"), str)]
+
         changed = False
-        for block in content:
-            if (isinstance(block, dict) and block.get("type") == "text"
-                    and isinstance(block.get("text"), str)):
+        # Diffing reasons about ONE logical payload, so it only engages for a single
+        # text block (the overwhelmingly common tool-result shape); multi-block results
+        # take the plain per-block compression path.
+        if self.diff and len(text_blocks) == 1:
+            changed = self._compress_or_diff(text_blocks[0], tool)
+        else:
+            for block in text_blocks:
                 new_text = self._compress(block["text"], tool)
                 if new_text != block["text"]:
                     block["text"] = new_text
@@ -79,6 +102,54 @@ class Interceptor:
             return line
         # Re-serialize compactly. JSON-RPC is semantics, not formatting; no newlines.
         return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+
+    def _compress_or_diff(self, block: dict, tool: str) -> bool:
+        """Compress one block, preferring a lossless delta vs the prior same-tool result
+        when it is smaller. Updates the per-tool diff base. Returns whether the block
+        text changed. Fail-open: any error leaves the block untouched and state intact."""
+        text = block["text"]
+        try:
+            applied = policy_mod.apply(text, tool, self.policy)
+        except Exception as exc:  # noqa: BLE001 — fail-open is the whole point
+            if self.debug:
+                sys.stderr.write(f"[terse-proxy] {tool}: passthrough on error: {exc}\n")
+            return False
+        if applied.skipped:
+            return False  # passthrough tool: leave fully alone, keep no diff state
+
+        chosen = applied.text
+        try:
+            curr = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            curr = None
+        if curr is not None:
+            prev = self.last.get(tool)
+            if prev is not None:
+                wire = self._diff_wire(prev, curr, tool)
+                if wire is not None and _cost(wire) < _cost(applied.text):
+                    chosen = wire
+                    if self.debug:
+                        sys.stderr.write(
+                            f"[terse-proxy] {tool}: diff {_cost(applied.text)}->{_cost(wire)} "
+                            f"tok vs full compressed\n")
+            # Base the NEXT diff on the true current value, whichever form we emit:
+            # the model's reconstructable state after this turn is `curr` either way.
+            self.last[tool] = curr
+
+        if chosen != text:
+            block["text"] = chosen
+            return True
+        return False
+
+    def _diff_wire(self, prev: Any, curr: Any, tool: str) -> Optional[str]:
+        """The on-the-wire diff envelope, or None if no lossless diff applies. Self-
+        describing: it names the prior result (already in the model's context) and
+        carries the changes inline, so the model reconstructs without an out-of-band
+        retrieve. Shared with the fluency-for-diff eval via `transforms.diff_wire`."""
+        try:
+            return transforms.diff_wire(prev, curr, tool)
+        except Exception:  # noqa: BLE001 — fail-open
+            return None
 
     def _compress(self, text: str, tool: str) -> str:
         """policy.apply with a hard fail-open: any error returns the original text."""

@@ -171,9 +171,14 @@ gitignored because captured tool output may contain real data.
 
 ## Known Limitations
 
-- **Tier 1 (lossy) is not built.** `truncate` / `summarize` / `drop-to-retrieve` are
-  in the policy schema but warned-and-skipped. Today terse is 100% lossless regardless
-  of policy.
+- **Tier 1 (lossy) is partially built — `truncate` only.** A field marked
+  `{"lossy":"truncate","max":N}` (and not `{"critical":true}`) is capped + annotated,
+  gated by `lossy.acceptable_loss`: only marked, non-critical fields may differ, each
+  only as a valid truncation, else it fails closed to the lossless output. `summarize`
+  (needs a model in the proxy) and `drop-to-retrieve` (needs a stateful store + a
+  retrieve tool) are parsed but deferred — warned and left lossless. Lossy is off
+  everywhere by default; the round-trip gate is replaced by the acceptable-loss gate
+  only where a field is explicitly marked.
 - **Proxy: the model must understand terse's format.** The proxy compresses tool
   results in place, so the model receives the table/legend form. It is self-describing
   (a `cols` header, an inline legend) and needs no decode step, but a model that has
@@ -190,16 +195,24 @@ gitignored because captured tool output may contain real data.
   bare but **100% with the one-time primer**, and the primer recovered every DeepSeek
   regression. Takeaway: alias-heavy payloads (including subtree aliasing) are safe in
   the proxy *with the primer system note*; without it a weaker model can regress past
-  tolerance. Verdict gates on the worst model, not the mean. Caveat: single-trial
-  accuracy carries run-to-run noise at temperature 0; treat it as directional. Re-run
-  with `terse fluency` (see USAGE.md).
+  tolerance. Verdict gates on the worst model, not the mean. Run-to-run noise at
+  temperature 0 is no longer eyeballed: `terse fluency --trials N` repeats each question
+  N times and reports accuracy with a pooled binomial confidence interval, so the
+  verdict is a bound, not a direction. (Parametric SE over N×Q×P Bernoulli draws is
+  used rather than the std of N whole-eval runs, which is itself noise at small N.)
 - **Proxy is single-downstream and stdio-only.** One server per proxy instance; no
   HTTP/SSE transport, no fan-out to multiple servers. Run one proxy per server.
-- **Cross-call diffing is unbuilt.** The probe shows 91% overlap between successive
-  same-tool calls, but a diff coder (which would make the proxy stateful) does not
-  exist yet. (Whole-subtree aliasing — the other probe headroom, repeated whole
-  objects — is now built: the dictionary tier folds repeated subtrees, not just
-  strings, guarded so it never regresses tokens.)
+- **Cross-call diffing is built, opt-in (`proxy --diff`).** The probe shows 91% overlap
+  between successive same-tool calls; the proxy can now emit a lossless delta against the
+  prior result (keyed row diff for record arrays, shallow key diff for objects) instead
+  of the full payload. It is stateful (per-tool last result), self-verifying (a diff is
+  sent only when it provably reconstructs the result), and fail-open (full form whenever
+  a diff doesn't apply or isn't smaller — the dangling-reference fallback). It ships OFF
+  by default because two risks are model-side, not codec-side: (1) the round-trip gate
+  proves the diff reconstructs but **not** that a model *reads* it as well as the full
+  form — checked by `terse fluency --diff`; (2) the diff references the prior result in
+  the model's context, which a context compaction could evict. Enable only after the diff
+  fluency check passes for your consumer.
 - **Marker collision.** A payload that genuinely contains a top-level
   `__terse_table__` / `__terse_dict__` key, or whose strings exhaust the entire
   `~`-alias namespace, is a theoretical edge not specially handled. Real tool output
