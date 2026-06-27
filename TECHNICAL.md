@@ -191,9 +191,11 @@ gitignored because captured tool output may contain real data.
   as directional, not a tight bound. Re-run with `terse fluency` (see USAGE.md).
 - **Proxy is single-downstream and stdio-only.** One server per proxy instance; no
   HTTP/SSE transport, no fan-out to multiple servers. Run one proxy per server.
-- **Whole-subtree aliasing and cross-call diffing are unbuilt.** Probes show headroom
-  (repeated whole objects; 91% overlap between successive same-tool calls) but the
-  coders for them do not exist yet.
+- **Cross-call diffing is unbuilt.** The probe shows 91% overlap between successive
+  same-tool calls, but a diff coder (which would make the proxy stateful) does not
+  exist yet. (Whole-subtree aliasing — the other probe headroom, repeated whole
+  objects — is now built: the dictionary tier folds repeated subtrees, not just
+  strings, guarded so it never regresses tokens.)
 - **Marker collision.** A payload that genuinely contains a top-level
   `__terse_table__` / `__terse_dict__` key, or whose strings exhaust the entire
   `~`-alias namespace, is a theoretical edge not specially handled. Real tool output

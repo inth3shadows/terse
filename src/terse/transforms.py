@@ -8,13 +8,17 @@ decompress(compress(x)) == x over any JSON-native value. A failing round-trip is
 bug, not a tuning knob — token availability changes WHICH values get aliased, never
 losslessness.
 
-Dictionary coding stays model-legible: the legend ships inline with the data, so a
-`~0` reference is resolved by reading the same payload — never an out-of-band
-retrieve (the headroom failure mode). Aliases come from a sigil namespace proven
-disjoint from every literal string in the payload, so decode is an exact lookup.
+Dictionary coding folds repeated value-strings AND repeated whole subtrees (dicts /
+lists) into the legend, keyed by canonical form. It stays model-legible: the legend
+ships inline with the data, so a `~0` reference is resolved by reading the same payload
+— never an out-of-band retrieve (the headroom failure mode). Aliases come from a sigil
+namespace proven disjoint from every literal string in the payload, so decode is an
+exact lookup. The dict tier is also size-guarded: it is committed only when it actually
+reduces tokens, so it can never regress a payload (losslessness is separate, and
+absolute — the round-trip gate).
 
-Not yet built (deferred, per the plan): nested-object key folding; Tier 1 lossy
-modes (truncate / drop-to-retrieve).
+Not yet built (deferred, per the plan): cross-call diffing; Tier 1 lossy modes
+(truncate / drop-to-retrieve).
 """
 
 from __future__ import annotations
@@ -129,23 +133,44 @@ def decompress_structure(obj: Any) -> Any:
 # --------------------------------------------------------------------------- #
 # Tier 0.5 — dictionary coding (fold repeated values)
 # --------------------------------------------------------------------------- #
-def _tok(s: str) -> int:
-    """Token cost of a string's minified JSON form; len-based fallback if no tiktoken."""
-    text = json.dumps(s, ensure_ascii=False)
+def _tok_text(text: str) -> int:
+    """Token cost of a literal text; len-based fallback if no tiktoken."""
     c = count_cl100k(text)
     return c if c is not None else max(1, len(text) // 4)
 
 
-def _count_value_strings(node: Any, counter: Counter) -> None:
-    """Count strings that occur in VALUE positions (not dict keys), recursively."""
+def _tok(s: str) -> int:
+    """Token cost of a string VALUE (i.e. JSON-quoted), incl. the alias sigils."""
+    return _tok_text(json.dumps(s, ensure_ascii=False))
+
+
+# A candidate is keyed by ("s", literal_string) or ("j", canonical_minified_json) so
+# strings and whole subtrees share one dedup/aliasing path. The canonical form is the
+# subtree's minified JSON — equal-by-value subtrees with the same key order collapse;
+# a different key order is just a missed fold, never a correctness risk (the legend
+# stores the real node, so decode is exact).
+def _node_tok(key: tuple) -> int:
+    """Token cost of a candidate in its VALUE position: a quoted string, or the raw
+    (already-minified) JSON of a subtree."""
+    kind, payload = key
+    return _tok(payload) if kind == "s" else _tok_text(payload)
+
+
+def _count_value_nodes(node: Any, counter: Counter) -> None:
+    """Count VALUE-position nodes (not dict keys) by canonical form, recursively.
+    Strings count as ("s", str); dicts/lists count as ("j", minified) AND recurse,
+    so a repeated whole subtree and a repeated string inside it are both seen."""
     if isinstance(node, str):
-        counter[node] += 1
+        counter[("s", node)] += 1
     elif isinstance(node, list):
+        counter[("j", minify(node))] += 1
         for x in node:
-            _count_value_strings(x, counter)
+            _count_value_nodes(x, counter)
     elif isinstance(node, dict):
+        counter[("j", minify(node))] += 1
         for v in node.values():
-            _count_value_strings(v, counter)
+            _count_value_nodes(v, counter)
+    # scalars (int/float/bool/None) are too cheap to alias
 
 
 def _collect_all_strings(node: Any, out: set) -> None:
@@ -182,58 +207,96 @@ def _alias_gen(avoid: set):
             yield a
 
 
-def _replace_values(node: Any, alias_for: dict) -> Any:
-    """Replace value-position strings with their alias; keys left untouched."""
+def _replace_nodes(node: Any, alias_for_str: dict, alias_for_json: dict) -> Any:
+    """Replace value-position strings AND whole subtrees with their alias; keys left
+    untouched. Top-down: a matched container is replaced before descending, so an
+    aliased subtree is folded as a unit (nested candidates inside it are captured by
+    the parent's legend entry, never double-aliased)."""
     if isinstance(node, str):
-        return alias_for.get(node, node)
-    if isinstance(node, list):
-        return [_replace_values(x, alias_for) for x in node]
-    if isinstance(node, dict):
-        return {k: _replace_values(v, alias_for) for k, v in node.items()}
+        return alias_for_str.get(node, node)
+    if isinstance(node, (list, dict)):
+        alias = alias_for_json.get(minify(node))
+        if alias is not None:
+            return alias
+        if isinstance(node, list):
+            return [_replace_nodes(x, alias_for_str, alias_for_json) for x in node]
+        return {k: _replace_nodes(v, alias_for_str, alias_for_json) for k, v in node.items()}
     return node
 
 
-def dict_encode(structure: Any) -> tuple[Any, dict]:
-    """Fold repeated value-strings into an inline legend. Returns (data, legend).
+def _collect_used_aliases(node: Any, legend: dict, out: set) -> None:
+    """Aliases actually referenced in the (replaced) data. Legend values are stored
+    literal — they hold no aliases — so references live only here."""
+    if isinstance(node, str):
+        if node in legend:
+            out.add(node)
+    elif isinstance(node, list):
+        for x in node:
+            _collect_used_aliases(x, legend, out)
+    elif isinstance(node, dict):
+        for v in node.values():
+            _collect_used_aliases(v, legend, out)
 
-    Tokenizer-aware: a value is aliased only when (n-1)*tok(value) exceeds the
-    (n+1)*tok(alias) cost of the legend entry plus references. legend maps
-    alias -> original string; an empty legend means dictionary coding didn't pay.
+
+def dict_encode(structure: Any) -> tuple[Any, dict]:
+    """Fold repeated value-strings AND repeated whole subtrees into an inline legend.
+    Returns (data, legend).
+
+    Tokenizer-aware: a node is aliased only when (n-1)*tok(node) exceeds the legend +
+    reference cost. legend maps alias -> original string-or-subtree; an empty legend
+    means dictionary coding didn't pay. Unused aliases (a string whose every occurrence
+    was swallowed by an aliased parent subtree) are pruned so they never cost tokens.
     """
     counts: Counter = Counter()
-    _count_value_strings(structure, counts)
-    candidates = [(s, n) for s, n in counts.items() if n >= 2 and (n - 1) * _tok(s) > 0]
+    _count_value_nodes(structure, counts)
+    candidates = [(key, n) for key, n in counts.items()
+                  if n >= 2 and (n - 1) * _node_tok(key) > 0]
     if not candidates:
         return structure, {}
 
     # Biggest potential first, so the cheapest aliases land on the biggest wins.
-    candidates.sort(key=lambda sn: (sn[1] - 1) * _tok(sn[0]), reverse=True)
+    candidates.sort(key=lambda kn: (kn[1] - 1) * _node_tok(kn[0]), reverse=True)
 
     avoid: set = set()
     _collect_all_strings(structure, avoid)
     gen = _alias_gen(avoid)
 
-    alias_for: dict = {}
+    alias_for_str: dict = {}
+    alias_for_json: dict = {}
     legend: dict = {}
-    for s, n in candidates:
+    for key, n in candidates:
         alias = next(gen)
-        # Exact saving with this alias's real token cost: occurrences collapse to
-        # the alias (n * ac), plus one legend entry (alias + value ~= ac + t).
-        saving = (n * _tok(s)) - (n * _tok(alias) + _tok(alias) + _tok(s))
+        t = _node_tok(key)
+        # Exact saving with this alias's real token cost: occurrences collapse to the
+        # alias (n * ac), plus one legend entry (alias + value ~= ac + t).
+        saving = (n * t) - (n * _tok(alias) + _tok(alias) + t)
         if saving <= 0:
             continue
-        alias_for[s] = alias
-        legend[alias] = s
+        kind, payload = key
+        if kind == "s":
+            alias_for_str[payload] = alias
+            legend[alias] = payload
+        else:
+            alias_for_json[payload] = alias
+            legend[alias] = json.loads(payload)  # the real subtree, restored exactly
 
-    if not alias_for:
+    if not (alias_for_str or alias_for_json):
         return structure, {}
-    return _replace_values(structure, alias_for), legend
+    data = _replace_nodes(structure, alias_for_str, alias_for_json)
+    used: set = set()
+    _collect_used_aliases(data, legend, used)
+    legend = {a: v for a, v in legend.items() if a in used}
+    if not legend:
+        return structure, {}
+    return data, legend
 
 
 def dict_decode(node: Any, legend: dict) -> Any:
-    """Exact inverse of dict_encode's replacement: expand value-position aliases."""
+    """Exact inverse of dict_encode's replacement: expand value-position aliases,
+    including aliases that expand to whole subtrees. Legend values are alias-free, so
+    the recursion into an expanded value terminates immediately."""
     if isinstance(node, str):
-        return legend.get(node, node)
+        return dict_decode(legend[node], legend) if node in legend else node
     if isinstance(node, list):
         return [dict_decode(x, legend) for x in node]
     if isinstance(node, dict):
@@ -256,11 +319,18 @@ def compress_with(obj: Any, tabularize: bool = True, dictionary: bool = True) ->
     always applied (it is the serialization). Pass both False for minify-only.
     """
     structure = compress_structure(obj) if tabularize else obj
+    base = minify(structure)
     if dictionary:
         data, legend = dict_encode(structure)
         if legend:
-            return minify({DICT_MARKER: 1, "legend": legend, "data": data})
-    return minify(structure)
+            coded = minify({DICT_MARKER: 1, "legend": legend, "data": data})
+            # Net-token guard: with whole-subtree aliasing the per-candidate estimate
+            # can mis-rank under nesting overlap, so commit the dict block only when it
+            # is actually smaller. Losslessness is independent (the round-trip gate);
+            # this guards SIZE — the dict tier can never regress the payload.
+            if _tok_text(coded) < _tok_text(base):
+                return coded
+    return base
 
 
 def compress(obj: Any) -> str:

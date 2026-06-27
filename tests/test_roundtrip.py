@@ -60,6 +60,18 @@ CASES = [
         [{"id": 1, "meta": {"a": 1}}, {"id": 2, "meta": {"b": 2}}, {"id": 3, "meta": {"a": 9}}],
         id="nested-dicts-heterogeneous",
     ),
+    # Whole-subtree aliasing: the same config object in many value positions (NOT a
+    # record list, so tabularize can't fold it — only subtree aliasing can).
+    pytest.param(
+        {f"svc{i}": {"region": "us-east-1", "retries": 5, "endpoints": ["a", "b", "c"]}
+         for i in range(6)},
+        id="repeated-whole-subobject",
+    ),
+    # Whole-subtree aliasing of a repeated list value inside records.
+    pytest.param(
+        [{"id": i, "tags": ["alpha", "beta", "gamma", "delta"]} for i in range(10)],
+        id="repeated-whole-list",
+    ),
 ]
 
 
@@ -114,6 +126,27 @@ def test_dictionary_coding_folds_repeated_values():
     # The long URL appears once (in the legend), not 20 times in the data.
     assert transforms.minify(data).count(url) == 0
     assert url in legend.values()
+
+
+def test_subtree_aliasing_folds_a_repeated_subobject():
+    cfg = {"region": "us-east-1", "retries": 5, "endpoints": ["alpha", "beta", "gamma"]}
+    obj = {f"svc{i}": cfg for i in range(6)}
+    structure = transforms.compress_structure(obj)  # a dict, not a record list -> no table
+    data, legend = transforms.dict_encode(structure)
+    assert legend, "expected the repeated config subtree to be aliased"
+    # the whole subtree is the legend value (a dict), referenced once per occurrence
+    assert any(isinstance(v, dict) and v == cfg for v in legend.values())
+    # the inner region string was swallowed by the subtree alias, not aliased separately
+    assert transforms.minify(data).count("us-east-1") == 0
+    assert transforms.roundtrip_ok(obj)
+
+
+@pytest.mark.parametrize("obj", CASES)
+def test_dictionary_tier_never_regresses_tokens(obj):
+    """The net-token guard: the dict tier (incl. subtree aliasing) must never produce a
+    larger payload than tabularize-only."""
+    assert transforms._tok_text(transforms.compress(obj)) <= \
+        transforms._tok_text(transforms.compress_tabular(obj))
 
 
 def test_dictionary_coding_declines_when_no_repeats():

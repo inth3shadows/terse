@@ -24,8 +24,9 @@ then (optionally) serves it through a per-tool policy that decides which tiers r
 - **Tier 0 — tabularize**: a list of uniform records becomes one header + value
   rows (keys written once, not once per record), recursively hoisting nested
   uniform-dict columns into a shared header.
-- **Tier 0.5 — dictionary code**: repeated string values are folded into an inline
-  legend (`~0`, `~1`, …) proven disjoint from every literal in the payload.
+- **Tier 0.5 — dictionary code**: repeated string values *and repeated whole subtrees*
+  are folded into an inline legend (`~0`, `~1`, …) proven disjoint from every literal in
+  the payload. Committed only when it actually saves tokens, so it never regresses.
 - **Tier 1 — lossy (opt-in, NOT YET BUILT)**: per marked field — truncate /
   summarize / drop-to-retrieve. The policy schema accepts these today but the
   engine warns and leaves them lossless until the tier exists.
@@ -92,6 +93,7 @@ Phase-0 spike: a working, measured, selective **lossless** library, CLI, and MCP
 stdio proxy. The proxy's open question — *does a model read the compressed form as
 well as raw JSON?* — now has a measured answer: on a stress corpus, Claude Haiku 4.5
 and Gemini 2.5 Flash match raw-JSON accuracy on the compressed form (100% paired) at a
-37% token saving (`terse fluency`; see TECHNICAL.md). The Tier 1 lossy modes (truncate
-/ drop-to-retrieve) and the higher-ceiling lossless levers (whole-subtree aliasing,
-cross-call diffing) are designed but not yet built — see TECHNICAL.md "Known Limitations".
+37% token saving (`terse fluency`; see TECHNICAL.md). Whole-subtree aliasing (folding
+repeated objects, not just strings) is built. The Tier 1 lossy modes (truncate /
+drop-to-retrieve) and cross-call diffing are designed but not yet built — see
+TECHNICAL.md "Known Limitations".
