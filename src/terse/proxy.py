@@ -35,6 +35,29 @@ def _cost(text: str) -> int:
     return c if c is not None else len(text)
 
 
+# A one-time, system-level explanation of terse's wire forms, injected into the MCP
+# `initialize` result's `instructions` field (#13). Measurement showed a *system-level*
+# primer recovers comprehension that an inline per-result note cannot (the stdio proxy
+# can't set a system prompt); `instructions` is the channel clients add to that context.
+# Covers the always-on table/dict forms AND the opt-in diff form, so it helps base
+# comprehension too — paid once per session, not per result.
+TERSE_PRIMER = (
+    "Some tool results are 'terse'-compressed (a lossless, denser JSON encoding); some "
+    "are sent as diffs against the previous result of the same tool. Read each as the "
+    "equivalent full JSON:\n"
+    '- Table {"__terse_table__":1,"n":N,"cols":[...],"rows":[[...]]}: N records, each row '
+    'POSITIONAL — its i-th value belongs to the i-th name in "cols". "n" is the exact count.\n'
+    '- Dict {"__terse_dict__":1,"legend":{"~0":value,...},"data":...}: every "~K" token '
+    'inside "data" stands for legend["~K"] — substitute it back.\n'
+    '- Diff {"__terse_diff__":1,"shape":"rows","by":COL,"set":[...],"new":[...],"del":[...],'
+    '"n":N}: update the PREVIOUS same-tool result — from its records drop ids in "del", '
+    'overwrite/insert each record in "set" matched by its "by" field, append ids in "new"; '
+    '"n" is the final record count. A {"shape":"keys","set":{...},"del":[...]} diff instead '
+    'removes "del" keys and applies "set" key/values to the previous object. '
+    "Always reason about the fully reconstructed result."
+)
+
+
 class Interceptor:
     """Pure JSON-RPC message logic. Tracks request id -> tool name and compresses
     matching results. No I/O; both methods take and return a single line of text
@@ -51,31 +74,44 @@ class Interceptor:
         self.debug = debug
         self.diff = pol.diff
         self.last: dict[str, Any] = {}  # tool -> previous result object (the diff base)
+        self.init_id: Any = None        # id of the initialize request, to prime its reply
 
     def note_request(self, line: str) -> None:
-        """Record id -> tool name for any tools/call request. Side-effect only."""
+        """Record id -> tool name for tools/call requests, and the initialize request id
+        (so its reply can carry the format primer). Side-effect only."""
         try:
             msg = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             return
-        if not isinstance(msg, dict) or msg.get("method") != "tools/call":
+        if not isinstance(msg, dict):
             return
         mid = msg.get("id")
+        method = msg.get("method")
+        if method == "initialize" and mid is not None:
+            self.init_id = mid
+            return
+        if method != "tools/call":
+            return
         name = (msg.get("params") or {}).get("name")
         if mid is not None and isinstance(name, str):
             self.pending[mid] = name
 
     def transform_response(self, line: str) -> str:
-        """Compress the text of a tracked tools/call result; else return unchanged."""
+        """Compress the text of a tracked tools/call result; prime the initialize reply;
+        else return unchanged."""
         try:
             msg = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             return line
         if not isinstance(msg, dict) or "result" not in msg or msg.get("id") is None:
             return line
+        if msg["id"] == self.init_id:
+            self.init_id = None  # one-time
+            primed = self._augment_initialize(msg)
+            return primed if primed is not None else line
         tool = self.pending.pop(msg["id"], None)
         if tool is None:
-            return line  # not a tracked tools/call response (initialize, tools/list, ...)
+            return line  # not a tracked tools/call response (tools/list, ...)
 
         result = msg.get("result")
         content = result.get("content") if isinstance(result, dict) else None
@@ -140,6 +176,23 @@ class Interceptor:
             block["text"] = chosen
             return True
         return False
+
+    def _augment_initialize(self, msg: dict) -> Optional[str]:
+        """Prepend the terse format primer to the initialize result's `instructions` (#13),
+        preserving any the downstream server set. Idempotent. Returns the reserialized
+        line, or None to forward unchanged."""
+        result = msg.get("result")
+        if not isinstance(result, dict):
+            return None
+        existing = result.get("instructions")
+        existing = existing if isinstance(existing, str) else ""
+        if TERSE_PRIMER in existing:
+            return None
+        result["instructions"] = TERSE_PRIMER + (f"\n\n{existing}" if existing else "")
+        if self.debug:
+            sys.stderr.write("[terse-proxy] injected terse format primer into "
+                             "initialize.instructions\n")
+        return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
 
     def _diff_wire(self, prev: Any, curr: Any, tool: str) -> Optional[str]:
         """The on-the-wire diff envelope, or None if no lossless diff applies. Self-
