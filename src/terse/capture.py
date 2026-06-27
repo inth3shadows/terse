@@ -43,6 +43,20 @@ def _has_record_list(obj: Any) -> bool:
     return False
 
 
+def extract_records(obj: Any) -> list[dict] | None:
+    """Return the list-of-uniform-dicts inside obj (top-level or one wrap deep), else None.
+
+    Mirrors what the tabularizer folds, so the probes reason about the same cells.
+    """
+    if isinstance(obj, list) and len(obj) >= 2 and all(isinstance(x, dict) for x in obj):
+        return obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            if isinstance(v, list) and len(v) >= 2 and all(isinstance(x, dict) for x in v):
+                return v
+    return None
+
+
 def classify_shape(raw: str) -> str:
     """Bucket a raw tool-output string by structural shape.
 

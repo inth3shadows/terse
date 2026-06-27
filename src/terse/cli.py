@@ -14,14 +14,18 @@ import json
 import sys
 from pathlib import Path
 
+import json as _json
+
 from . import transforms
-from .capture import capture_payload, classify_shape, coverage, load_corpus
+from .capture import capture_payload, classify_shape, coverage, extract_records, load_corpus
 from .measure import measure_corpus
-from .report import build_report
+from .probes import cross_call_overlap, value_redundancy
+from .report import build_probe_report, build_report
 from .tokenize import count_cl100k
 
 DEFAULT_CORPUS = "corpus"
 DEFAULT_REPORT = "reports/spike-report.md"
+DEFAULT_PROBE_REPORT = "reports/probe-report.md"
 
 
 def _read(file: str) -> str:
@@ -65,11 +69,41 @@ def _cmd_measure(args: argparse.Namespace) -> int:
     return 0
 
 
-def _todo(name: str):
-    def run(_args: argparse.Namespace) -> int:
-        print(f"`terse {name}` not implemented yet — see the plan / module TODOs.")
-        return 2
-    return run
+def _cmd_probe(args: argparse.Namespace) -> int:
+    envelopes = load_corpus(args.corpus)
+    if not envelopes:
+        print(f"no payloads in {args.corpus}/ — capture some first (`terse capture`).")
+        return 1
+
+    vr_rows = []
+    for env in envelopes:
+        try:
+            records = extract_records(_json.loads(env["raw"]))
+        except (ValueError, TypeError):
+            records = None
+        if records:
+            vr_rows.append({"tool": env["tool"], "sha": env.get("sha", "?"), **value_redundancy(records)})
+
+    # Cross-call overlap: successive payloads sharing a tool (sorted by sha for determinism).
+    overlap_rows = []
+    by_tool: dict[str, list[dict]] = {}
+    for env in envelopes:
+        by_tool.setdefault(env["tool"], []).append(env)
+    for tool, envs in by_tool.items():
+        envs = sorted(envs, key=lambda e: e.get("sha", ""))
+        for prev, curr in zip(envs, envs[1:]):
+            res = cross_call_overlap(prev["raw"], curr["raw"])
+            if res.get("available"):
+                overlap_rows.append({"tool": tool, "prev_sha": prev.get("sha", "?"),
+                                     "curr_sha": curr.get("sha", "?"), **res})
+
+    report = build_probe_report(vr_rows, overlap_rows)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(report, encoding="utf-8")
+    print(report)
+    print(f"\n[report written to {out}]")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -92,8 +126,10 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--anthropic", action="store_true", help="also count with Anthropic (network)")
     m.set_defaults(func=_cmd_measure)
 
-    p = sub.add_parser("probe", help="value-redundancy + cross-call-overlap (TODO)")
-    p.set_defaults(func=_todo("probe"))
+    p = sub.add_parser("probe", help="value-redundancy + cross-call-overlap ceiling probes")
+    p.add_argument("--corpus", default=DEFAULT_CORPUS)
+    p.add_argument("--out", default=DEFAULT_PROBE_REPORT)
+    p.set_defaults(func=_cmd_probe)
 
     args = parser.parse_args(argv)
     return args.func(args)

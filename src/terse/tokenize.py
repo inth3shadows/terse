@@ -31,6 +31,13 @@ def count_cl100k(text: str) -> Optional[int]:
     return len(enc.encode(text)) if enc is not None else None
 
 
+def encode_cl100k(text: str) -> Optional[list[int]]:
+    """cl100k_base token ids, or None if unavailable. Used by the probes to reason
+    about token-level overlap/redundancy, not just counts."""
+    enc = _cl100k()
+    return enc.encode(text) if enc is not None else None
+
+
 def count_anthropic(text: str, model: str = "claude-opus-4-8") -> Optional[int]:
     """Ground-truth token count for the real consumer, or None if unavailable.
 

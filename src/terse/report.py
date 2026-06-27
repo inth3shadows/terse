@@ -29,6 +29,66 @@ def _sum(rows: list[dict[str, Any]], *path: str) -> int:
     return total
 
 
+def build_probe_report(
+    vr_rows: list[dict[str, Any]], overlap_rows: list[dict[str, Any]]
+) -> str:
+    """Render the Tier-0.5 ceiling probes — value redundancy + cross-call overlap.
+
+    These are UPPER BOUNDS on what a dictionary coder / diff encoder could save,
+    measured ON TOP of what tabularize already achieves. They inform the go/no-go
+    on building Tier 0.5; they do not compress anything.
+    """
+    out: list[str] = ["# terse ceiling probes (Tier 0.5)", ""]
+
+    out += [
+        "## Value redundancy — dictionary-coding headroom",
+        "",
+        "Repeated VALUE tokens across cells, beyond the repeated KEYS tabularize folds.",
+        "`est dict saving` is a conservative upper bound (first occurrence kept as legend).",
+        "",
+        "| Tool | sha | cells | redundancy | redundant tok | est dict saving |",
+        "|---|---|---|---|---|---|",
+    ]
+    for r in vr_rows:
+        out.append(
+            f"| `{r['tool']}` | `{r['sha']}` | {r['cells']} | {r['redundancy_ratio']:.1%} "
+            f"| {r['redundant_value_tokens']} | {r['est_dict_saving_tokens']} |"
+        )
+    if vr_rows:
+        ratios = sorted(r["redundancy_ratio"] for r in vr_rows)
+        median = ratios[len(ratios) // 2]
+        verdict = "worth a Tier 0.5 build" if median >= 0.15 else "thin — likely skip Tier 0.5"
+        out += ["", f"Median value-redundancy: **{median:.1%}** → {verdict}.", ""]
+    else:
+        out += ["", "_No record-shaped payloads in corpus to probe._", ""]
+
+    out += [
+        "## Cross-call overlap — diffing headroom",
+        "",
+        "Token overlap between successive same-tool payloads. `est delta saving` is the",
+        "fraction of the current payload already present in the prior one (upper bound).",
+        "",
+    ]
+    if overlap_rows:
+        out += [
+            "| Tool | prev | curr | curr tok | shared | overlap |",
+            "|---|---|---|---|---|---|",
+        ]
+        for r in overlap_rows:
+            out.append(
+                f"| `{r['tool']}` | `{r['prev_sha']}` | `{r['curr_sha']}` | {r['curr_tokens']} "
+                f"| {r['shared_tokens']} | {r['overlap_ratio']:.1%} |"
+            )
+        out.append("")
+    else:
+        out += [
+            "_No same-tool payload pairs in corpus — capture a tool 2+ times in an agent",
+            "loop to measure diffing headroom._",
+            "",
+        ]
+    return "\n".join(out)
+
+
 def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
     out: list[str] = ["# terse spike report", ""]
 
