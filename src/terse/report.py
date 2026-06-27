@@ -241,3 +241,116 @@ def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
         ]
 
     return "\n".join(out)
+
+
+def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str:
+    """Render the format-fluency eval: does the model read terse as well as raw JSON?
+
+    `results` is {model: [scored_row,...]} from fluency.run_fluency / score_pack. Each
+    row has raw_ok / terse_ok / primer_ok plus qtype/transform. Scoring is PAIRED, so a
+    regression (raw right, terse wrong) is a first-class column. The verdict gates on
+    the worst model, not the mean (principle #24): a format that helps one model but
+    breaks the consumer is a regression, not a wash.
+    """
+    out: list[str] = ["# terse format-fluency eval", ""]
+    out += [
+        "Can a model read terse's compressed form as accurately as raw JSON?",
+        "Ground truth is deterministic (no LLM judge); scoring is paired per question.",
+        "",
+    ]
+    if not results or not any(results.values()):
+        out += [
+            "No model answers provided. Configure a backend and re-run:",
+            "  - broker pool: set TERSE_FLUENCY_BASE_URL / TERSE_FLUENCY_API_KEY / TERSE_FLUENCY_MODELS",
+            "  - real consumer: pass --anthropic (needs the anthropic extra + key)",
+            "  - offline: `terse fluency` writes an eval pack you can drive by hand and score later.",
+            "",
+        ]
+        return "\n".join(out)
+
+    if token_rows:
+        rt = sum(r["raw_tok"] for r in token_rows if r.get("raw_tok"))
+        tt = sum(r["terse_tok"] for r in token_rows if r.get("terse_tok"))
+        if rt:
+            out += [
+                f"Token cost over {len(token_rows)} record-shaped payloads: "
+                f"raw {rt} -> terse {tt} ({_pct(tt - rt, rt)}). "
+                "Comprehension is the price of that saving — measured below.",
+                "",
+            ]
+
+    # --- per-model accuracy by form ---
+    out += [
+        "## Accuracy by model and form",
+        "",
+        "| Model | n | raw | terse | terse+primer | regressions | primer recovers |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    summary: dict[str, dict[str, float]] = {}
+    for model, rows in results.items():
+        n = len(rows)
+        if not n:
+            continue
+        racc = sum(r["raw_ok"] for r in rows) / n
+        tacc = sum(r["terse_ok"] for r in rows) / n
+        pacc = sum(r["primer_ok"] for r in rows) / n
+        regr = sum(1 for r in rows if r["raw_ok"] and not r["terse_ok"])
+        rec = sum(1 for r in rows if not r["terse_ok"] and r["primer_ok"])
+        summary[model] = {"n": n, "raw": racc, "terse": tacc, "primer": pacc}
+        out.append(f"| `{model}` | {n} | {racc:.0%} | {tacc:.0%} | {pacc:.0%} | {regr} | {rec} |")
+    out.append("")
+
+    # --- per-transform breakdown (terse form, pooled across models) ---
+    by_tf: dict[str, list[dict]] = {}
+    for rows in results.values():
+        for r in rows:
+            by_tf.setdefault(r["transform"], []).append(r)
+    if by_tf:
+        out += [
+            "## terse-form accuracy by stressed transform",
+            "",
+            "Which transform, if any, costs comprehension. `table+dict` rows resolve a "
+            "`~N` alias; `table` rows map a column position to a value.",
+            "",
+            "| Transform | n | terse | terse+primer |",
+            "|---|---|---|---|",
+        ]
+        for tf, rs in sorted(by_tf.items()):
+            n = len(rs)
+            out.append(f"| {tf} | {n} | {sum(x['terse_ok'] for x in rs) / n:.0%} "
+                       f"| {sum(x['primer_ok'] for x in rs) / n:.0%} |")
+        out.append("")
+
+    # --- verdict: gate on the worst model ---
+    out += ["## Verdict", ""]
+    tol = 0.05
+    # Raw JSON is the control: a model that can't read RAW (0%) is a backend/config
+    # failure (bad model id, refusals), not a terse-comprehension result — exclude it
+    # from the gate, but say so, so a broken run can't masquerade as a verdict.
+    broken = [m for m, s in summary.items() if s["raw"] == 0]
+    gated = {m: s for m, s in summary.items() if s["raw"] > 0}
+    if broken:
+        out.append(f"- Excluded (raw control failed — backend/config error, not comprehension): "
+                   f"{', '.join(f'`{m}`' for m in broken)}.")
+    worst = None  # (model, gap, best_form_acc, raw_acc)
+    for model, s in gated.items():
+        best = max(s["terse"], s["primer"])
+        gap = best - s["raw"]
+        if worst is None or gap < worst[1]:
+            worst = (model, gap, best, s["raw"])
+    if worst:
+        model, gap, best, raw = worst
+        passed = gap >= -tol - 1e-9  # inclusive: exactly -tol is within tolerance
+        helps = sum(1 for s in gated.values() if s["primer"] > s["terse"] + 1e-9)
+        out.append(f"- Worst-case model `{model}`: best terse-form {best:.0%} vs raw {raw:.0%} "
+                   f"(gap {gap:+.0%}). **{'PASS' if passed else 'FAIL'}** at {tol:.0%} tolerance.")
+        out.append(f"- The primer improves terse-form accuracy for {helps}/{len(gated)} model(s).")
+        if passed:
+            out.append("- terse's compressed form preserves comprehension within tolerance — "
+                       "the proxy's in-place rewrite holds for the tested models.")
+        else:
+            out.append("- Comprehension regresses beyond tolerance — the proxy's in-place rewrite "
+                       "is not safe to ship as-is for the worst model; prefer the primer or restrict "
+                       "the policy to the transforms that held.")
+    out.append("")
+    return "\n".join(out)

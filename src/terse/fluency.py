@@ -1,0 +1,405 @@
+"""Format-fluency eval: does a model read terse's compressed form as accurately
+as raw JSON?
+
+This answers the proxy's one open question (TECHNICAL.md "Known Limitations"):
+*correctness* is test-covered — `decompress(compress(x)) == x` — but *usefulness*
+rests on an untested assumption, that a model reading the table/legend form in place
+of raw JSON loses no comprehension. We measure it the way this project measures
+everything: deterministically, cross-model, and never as a single black-box number.
+
+Method (the honesty bar, principle #24):
+  - Ground truth is computed from the parsed records (count / lookup / enumerate /
+    aggregate) and checked programmatically — no LLM-as-judge, which would re-import
+    the nondeterminism we are trying to measure away.
+  - Questions deliberately target the two transforms most likely to cost
+    comprehension: `~N` dictionary-alias resolution and column->value mapping over
+    wide/long positional tables (the under-enumeration gap the row-count hint exists
+    for). Each question is tagged with the transform it stresses, so the report says
+    *which* transform costs comprehension, not just an aggregate.
+  - Scoring is PAIRED: the same questions, same order, over raw vs terse (+/- a
+    one-time format primer). A regression is a question the model got right on raw
+    and wrong on terse — a stronger signal than two independent accuracy rates.
+  - The verdict gates on the WORST model, not the mean: a format that helps one model
+    but breaks the real consumer is a regression (mirrors how `validate` reports
+    cross-tokenizer divergence rather than averaging it away).
+
+The answerer is a pluggable `(system, user) -> reply` callable, so the pure core
+(question generation + scoring) runs offline with no network or key. Live backends
+(`openai_answerer` over stdlib urllib for the broker pool; `anthropic_answerer` via
+the existing optional extra for the real consumer) add zero new dependencies.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import urllib.request
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from .capture import extract_records
+from .tokenize import count_cl100k
+from .transforms import compress, compress_structure, dict_encode
+
+# An answerer takes (system_prompt, user_prompt) and returns the model's reply text.
+# Empty system_prompt means "no system message".
+Answerer = Callable[[str, str], str]
+
+# One-time format primer. Deliberately short — in deployment it would be a single
+# system note, not a per-call preamble (which would cost tokens on every call).
+PRIMER = (
+    "Some data below is in 'terse' compressed JSON — a lossless, denser encoding. "
+    "Read it as the equivalent expanded JSON:\n"
+    '- A table object {"__terse_table__":1,"n":N,"cols":[...],"rows":[[...],...]} '
+    "is N records. Each row is POSITIONAL: the i-th value in a row belongs to the "
+    'i-th column name in "cols". "n" is the exact row count — use it to check you '
+    "read every row.\n"
+    '- A dict object {"__terse_dict__":1,"legend":{"~0":"value",...},"data":...} '
+    'means every "~K" token appearing inside "data" is shorthand for legend["~K"]; '
+    "substitute the legend value back wherever you see its alias."
+)
+
+_NUM = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _is_number(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+# --------------------------------------------------------------------------- #
+# Question generation — deterministic, targeting terse's risky transforms
+# --------------------------------------------------------------------------- #
+@dataclass
+class Question:
+    qid: str          # unique within a payload
+    qtype: str        # count | lookup | enumerate | aggregate
+    transform: str    # transform stressed: table | table+dict
+    prompt: str
+    instruction: str  # how the model must format its answer (keeps scoring exact)
+    expected: Any
+
+
+def _aliased_values(obj: Any) -> set:
+    """The set of value-strings terse would fold into the `~`-legend for this payload.
+
+    Used to steer the lookup question onto a dict-coded field, so it actually
+    stresses `~N` resolution rather than a plain literal.
+    """
+    _, legend = dict_encode(compress_structure(obj))
+    return set(legend.values())
+
+
+def _pick_id_col(records: list[dict], cols: list[str]) -> str | None:
+    """A column whose values are scalar and unique — usable to address one record."""
+    n = len(records)
+    for c in cols:
+        vals = [r[c] for r in records]
+        if all(isinstance(v, (str, int)) and not isinstance(v, bool) for v in vals) and len(set(vals)) == n:
+            return c
+    return None
+
+
+def _pick_target_col(records: list[dict], cols: list[str], idcol: str, aliased: set) -> str | None:
+    """Prefer a column whose values are dict-coded (stresses alias resolution);
+    fall back to any other scalar column."""
+    fallback = None
+    for c in cols:
+        if c == idcol:
+            continue
+        vals = [r[c] for r in records]
+        if any(isinstance(v, str) and v in aliased for v in vals):
+            return c
+        if fallback is None and all(
+            isinstance(v, (str, int, float)) and not isinstance(v, bool) for v in vals
+        ):
+            fallback = c
+    return fallback
+
+
+def _pick_numeric_col(records: list[dict], cols: list[str], exclude: str | None = None) -> str | None:
+    """An all-numeric column, preferring one other than the identifier (a max over
+    unique ids is a trivial check); falls back to the id column only if it is the
+    only numeric one."""
+    fallback = None
+    for c in cols:
+        if not all(_is_number(r[c]) for r in records):
+            continue
+        if c == exclude:
+            fallback = fallback or c
+        else:
+            return c
+    return fallback
+
+
+def gen_questions(obj: Any) -> list[Question]:
+    """Generate deterministic, programmatically-checkable questions for a payload.
+
+    Only record-shaped payloads (what terse transforms) yield questions; everything
+    else returns []. Selection is fully deterministic so a re-run is reproducible.
+    """
+    records = extract_records(obj)
+    if not records:
+        return []
+    cols = list(records[0].keys())
+    n = len(records)
+    aliased = _aliased_values(obj)
+    qs: list[Question] = []
+
+    # count — enumeration fidelity; the motivation for the row-count hint.
+    qs.append(Question(
+        "count", "count", "table",
+        "How many records does the dataset contain?",
+        "Reply with only the integer count.",
+        n,
+    ))
+
+    idcol = _pick_id_col(records, cols)
+    if idcol is not None:
+        tgt = _pick_target_col(records, cols, idcol, aliased)
+        if tgt is not None:
+            # Prefer a record whose target value is dict-coded (so the lookup truly
+            # stresses `~N` resolution); else the middle record. Deterministic.
+            ri = next((i for i in range(n)
+                       if isinstance(records[i][tgt], str) and records[i][tgt] in aliased), n // 2)
+            expected = records[ri][tgt]
+            transform = "table+dict" if isinstance(expected, str) and expected in aliased else "table"
+            qs.append(Question(
+                "lookup", "lookup", transform,
+                f"For the record whose {idcol!r} is {json.dumps(records[ri][idcol], ensure_ascii=False)}, "
+                f"what is the value of {tgt!r}?",
+                "Reply with only the value, with no quotes and no extra words.",
+                expected,
+            ))
+        # enumerate — under-enumeration of wide tables was terse's measured recall gap.
+        qs.append(Question(
+            "enumerate", "enumerate", "table",
+            f"List the {idcol!r} of every record, in order.",
+            "Reply with a JSON array of the values and nothing else.",
+            [r[idcol] for r in records],
+        ))
+
+    numcol = _pick_numeric_col(records, cols, exclude=idcol)
+    if numcol is not None:
+        qs.append(Question(
+            "aggregate", "aggregate", "table",
+            f"What is the maximum value of {numcol!r} across all records?",
+            "Reply with only the number.",
+            max(r[numcol] for r in records),
+        ))
+    return qs
+
+
+# --------------------------------------------------------------------------- #
+# Scoring — deterministic, lenient on formatting, strict on the value
+# --------------------------------------------------------------------------- #
+def _norm_scalar(s: str) -> str:
+    return s.strip().strip("\"'").strip().lower()
+
+
+def _parse_list(reply: str) -> list | None:
+    """Best-effort: a JSON array if present, else a comma/newline split. We instructed
+    a JSON array, so the split is only a courtesy against formatting quirks."""
+    start, end = reply.find("["), reply.rfind("]")
+    if start != -1 and end > start:
+        try:
+            v = json.loads(reply[start:end + 1])
+            if isinstance(v, list):
+                return v
+        except json.JSONDecodeError:
+            pass
+    parts = [p.strip().strip("\"'") for p in re.split(r"[,\n]", reply) if p.strip()]
+    return parts or None
+
+
+def score(qtype: str, expected: Any, reply: str) -> bool:
+    """True iff the reply conveys the expected answer. Tolerates surrounding prose/
+    quotes; compares the value exactly (numbers within float epsilon)."""
+    reply = reply.strip()
+    if not reply:
+        return False
+    if qtype == "count" or (qtype == "aggregate" and _is_number(expected)):
+        m = _NUM.search(reply)
+        return m is not None and abs(float(m.group()) - float(expected)) < 1e-9
+    if qtype == "enumerate":
+        got = _parse_list(reply)
+        if got is None:
+            return False
+        return [_norm_scalar(str(x)) for x in got] == [_norm_scalar(str(x)) for x in expected]
+    # lookup / generic scalar
+    if _is_number(expected):
+        m = _NUM.search(reply)
+        return m is not None and abs(float(m.group()) - float(expected)) < 1e-9
+    return _norm_scalar(reply) == _norm_scalar(str(expected))
+
+
+# --------------------------------------------------------------------------- #
+# Running an eval — live (pluggable answerer) and offline (pack + responses)
+# --------------------------------------------------------------------------- #
+def _user_prompt(prompt: str, instruction: str, data: str) -> str:
+    return f"{prompt}\n{instruction}\n\nDATA:\n{data}"
+
+
+def _safe_ask(answerer: Answerer, system: str, user: str) -> str:
+    """Call the model, but never let one failed call abort a long multi-model run —
+    a transport error / rate limit / refusal scores as a wrong answer, not a crash."""
+    try:
+        return answerer(system, user)
+    except Exception:
+        return ""
+
+
+def run_payload(obj: Any, raw_text: str, answerer: Answerer, primer: str = PRIMER) -> list[dict]:
+    """Ask one payload's questions over raw / terse / terse+primer; return scored rows."""
+    terse_text = compress(obj)
+    out: list[dict] = []
+    for q in gen_questions(obj):
+        raw_reply = _safe_ask(answerer, "", _user_prompt(q.prompt, q.instruction, raw_text))
+        terse_reply = _safe_ask(answerer, "", _user_prompt(q.prompt, q.instruction, terse_text))
+        primer_reply = _safe_ask(answerer, primer, _user_prompt(q.prompt, q.instruction, terse_text))
+        out.append({
+            "qid": q.qid, "qtype": q.qtype, "transform": q.transform,
+            "raw_ok": score(q.qtype, q.expected, raw_reply),
+            "terse_ok": score(q.qtype, q.expected, terse_reply),
+            "primer_ok": score(q.qtype, q.expected, primer_reply),
+        })
+    return out
+
+
+def run_fluency(envelopes: list[dict], answerers: dict[str, Answerer], primer: str = PRIMER) -> dict:
+    """Run the eval for each named answerer over every record-shaped payload.
+
+    Returns {model_name: [scored_row, ...]} where each row carries tool/sha plus the
+    per-form correctness flags. Non-record payloads are skipped (they generate no
+    questions — terse does not transform them).
+    """
+    results: dict[str, list[dict]] = {}
+    for name, fn in answerers.items():
+        rows: list[dict] = []
+        for env in envelopes:
+            try:
+                obj = json.loads(env["raw"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for row in run_payload(obj, env["raw"], fn, primer):
+                rows.append({"tool": env["tool"], "sha": env.get("sha", "?"), **row})
+        results[name] = rows
+    return results
+
+
+def build_pack(envelopes: list[dict], primer: str = PRIMER) -> dict:
+    """Emit a self-contained eval pack (prompts + raw/terse forms + ground truth) so a
+    run can be driven by any model client (e.g. via the secret-broker) and scored later
+    with `score_pack`. Keyless: no model is called here."""
+    payloads = []
+    for env in envelopes:
+        try:
+            obj = json.loads(env["raw"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        qs = gen_questions(obj)
+        if not qs:
+            continue
+        payloads.append({
+            "tool": env["tool"], "sha": env.get("sha", "?"),
+            "raw": env["raw"], "terse": compress(obj),
+            "questions": [{
+                "qid": q.qid, "qtype": q.qtype, "transform": q.transform,
+                "prompt": q.prompt, "instruction": q.instruction, "expected": q.expected,
+            } for q in qs],
+        })
+    return {"primer": primer, "payloads": payloads}
+
+
+def score_pack(pack: dict, responses: dict) -> dict:
+    """Score externally-collected responses against a pack's ground truth.
+
+    responses: {model: {sha: {qid: {"raw": str, "terse": str, "primer": str}}}}.
+    Returns the same {model: [scored_row,...]} shape as `run_fluency`.
+    """
+    index: dict[tuple, dict] = {}
+    for p in pack["payloads"]:
+        for q in p["questions"]:
+            index[(p["sha"], q["qid"])] = {"tool": p["tool"], **q}
+    results: dict[str, list[dict]] = {}
+    for model, by_sha in responses.items():
+        rows: list[dict] = []
+        for sha, by_qid in by_sha.items():
+            for qid, forms in by_qid.items():
+                meta = index.get((sha, qid))
+                if meta is None:
+                    continue
+                qtype, expected = meta["qtype"], meta["expected"]
+                rows.append({
+                    "tool": meta["tool"], "sha": sha, "qid": qid,
+                    "qtype": qtype, "transform": meta["transform"],
+                    "raw_ok": score(qtype, expected, forms.get("raw", "")),
+                    "terse_ok": score(qtype, expected, forms.get("terse", "")),
+                    "primer_ok": score(qtype, expected, forms.get("primer", "")),
+                })
+        results[model] = rows
+    return results
+
+
+def token_summary(envelopes: list[dict]) -> list[dict]:
+    """Per-payload raw vs terse cl100k token counts, so the report shows comprehension
+    AND the saving it buys in the same place (record-shaped payloads only)."""
+    rows: list[dict] = []
+    for env in envelopes:
+        try:
+            obj = json.loads(env["raw"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not extract_records(obj):
+            continue
+        rows.append({
+            "tool": env["tool"], "sha": env.get("sha", "?"),
+            "raw_tok": count_cl100k(env["raw"]), "terse_tok": count_cl100k(compress(obj)),
+        })
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# Live backends — zero new dependencies
+# --------------------------------------------------------------------------- #
+def openai_answerer(base_url: str, api_key: str, model: str,
+                    temperature: float = 0.0, timeout: int = 60) -> Answerer:
+    """OpenAI-compatible /chat/completions answerer over stdlib urllib. Covers the
+    broker pool (OpenRouter et al.) without an SDK dependency. temperature 0 for
+    reproducibility."""
+    url = base_url.rstrip("/") + "/chat/completions"
+
+    def ask(system: str, user: str) -> str:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": user})
+        body = json.dumps({"model": model, "messages": messages,
+                           "temperature": temperature}).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers={
+            "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"] or ""
+
+    return ask
+
+
+def anthropic_answerer(model: str = "claude-opus-4-8", max_tokens: int = 1024) -> Answerer:
+    """The real-consumer answerer via the optional `anthropic` extra. Raises at
+    construction if the extra/key is absent, so the CLI can fall back cleanly."""
+    import anthropic
+
+    client = anthropic.Anthropic()
+
+    def ask(system: str, user: str) -> str:
+        kwargs: dict[str, Any] = {
+            "model": model, "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": user}],
+        }
+        if system:
+            kwargs["system"] = system
+        resp = client.messages.create(**kwargs)
+        return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+
+    return ask

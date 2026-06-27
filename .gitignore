@@ -12,6 +12,10 @@ __pycache__/
 corpus/*
 !corpus/.gitkeep
 
+# Synthetic stress corpus for the fluency eval — derived; regenerate with
+# `python scripts/gen_stress_corpus.py`.
+corpus-stress/
+
 # Spike reports
 reports/
 

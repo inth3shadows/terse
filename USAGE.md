@@ -68,6 +68,35 @@ markdown reports:
 - `uv run terse measure` — how many tokens are saved, per tool and per data shape.
 - `uv run terse probe` — whether there's more to gain from future features.
 - `uv run terse validate` — confirms the savings hold across different token counters.
+- `uv run terse fluency` — the one that matters for the proxy: does a model *read* the
+  compressed form as accurately as raw JSON? (see below.)
+
+### Check that the model still understands the compressed output
+
+Saving tokens is pointless if the model reads the compressed form worse than raw JSON.
+`fluency` measures that directly: it asks a model deterministic questions (count a
+field, look one up, list them all, take a max) over both forms and scores the answers
+against known-correct values — no second model judging.
+
+```
+# 1. (optional) build a synthetic corpus that stresses the hardest cases
+python scripts/gen_stress_corpus.py corpus-stress
+
+# 2a. keyless: writes an eval pack you can drive by hand, then score
+uv run terse fluency --corpus corpus-stress
+
+# 2b. with models (one OpenAI-compatible endpoint, e.g. OpenRouter):
+TERSE_FLUENCY_BASE_URL=https://openrouter.ai/api/v1 \
+TERSE_FLUENCY_API_KEY=sk-... \
+TERSE_FLUENCY_MODELS=google/gemini-2.5-flash,anthropic/claude-haiku-4.5 \
+  uv run terse fluency --corpus corpus-stress
+```
+
+The report shows accuracy per model for raw vs compressed vs compressed-with-a-one-time
+format note ("primer"), flags which transform (if any) costs comprehension, and gives a
+PASS/FAIL gated on the *worst* model. A model that scores 0% on raw JSON is a setup
+error (wrong model id, no key) and is excluded from the verdict, not counted as a
+comprehension failure. Single runs carry some noise — re-run for a tighter read.
 
 ### Building a sample set
 

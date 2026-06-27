@@ -4,7 +4,11 @@ Subcommands:
   gate <file|->            run the lossless round-trip gate on a JSON payload
   capture --tool N <file|-> persist a tool output to corpus/ + bucket by shape
   measure [--anthropic]    token delta per tier per shape bucket over the corpus
-  probe                    value-redundancy + cross-call-overlap          (TODO)
+  probe                    value-redundancy + cross-call-overlap ceiling probes
+  validate                 cross-tokenizer invariance (cl100k vs o200k)
+  compress --tool N        compress one tool output through a policy (the shell)
+  proxy -- <cmd>           MCP stdio proxy: compress a downstream server's results
+  fluency                  does a model read the compressed form as well as raw JSON?
 """
 
 from __future__ import annotations
@@ -26,6 +30,8 @@ from .tokenize import count_cl100k
 DEFAULT_CORPUS = "corpus"
 DEFAULT_REPORT = "reports/spike-report.md"
 DEFAULT_PROBE_REPORT = "reports/probe-report.md"
+DEFAULT_FLUENCY_REPORT = "reports/fluency-report.md"
+DEFAULT_FLUENCY_PACK = "reports/fluency-pack.json"
 
 
 def _read(file: str) -> str:
@@ -152,6 +158,79 @@ def _cmd_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_answerers(args: argparse.Namespace) -> dict:
+    """Assemble named answerers from env + flags. Empty means keyless (pack) mode."""
+    import os
+
+    from . import fluency
+
+    answerers: dict = {}
+    # Flags win over env so a credential-injecting launcher (e.g. secret_inject_env,
+    # which sets the key under its own env var) can drive the CLI without a shell.
+    base = args.base_url or os.environ.get("TERSE_FLUENCY_BASE_URL")
+    key = os.environ.get(args.api_key_env or "TERSE_FLUENCY_API_KEY")
+    models = args.models or os.environ.get("TERSE_FLUENCY_MODELS", "")
+    if base and key and models:
+        for m in (x.strip() for x in models.split(",") if x.strip()):
+            answerers[m] = fluency.openai_answerer(base, key, m)
+    if args.anthropic:
+        try:
+            answerers[f"anthropic:{args.anthropic_model}"] = fluency.anthropic_answerer(
+                args.anthropic_model
+            )
+        except Exception as e:  # missing extra/key — fall back, don't crash the run
+            print(f"[warn] anthropic answerer unavailable: {e}", file=sys.stderr)
+    return answerers
+
+
+def _cmd_fluency(args: argparse.Namespace) -> int:
+    from . import fluency
+    from .report import build_fluency_report
+
+    envelopes = load_corpus(args.corpus)
+    if not envelopes:
+        print(f"no payloads in {args.corpus}/ — capture some first (`terse capture`).")
+        return 1
+
+    # Score mode: an externally-collected responses file against a previously-written pack.
+    if args.responses:
+        pack = _json.loads(Path(args.pack).read_text(encoding="utf-8"))
+        responses = _json.loads(Path(args.responses).read_text(encoding="utf-8"))
+        results = fluency.score_pack(pack, responses)
+        report = build_fluency_report(results, fluency.token_summary(envelopes))
+        _write_report(report, args.out)
+        return 0
+
+    answerers = _build_answerers(args)
+    if not answerers:
+        # Keyless default: write the eval pack and explain how to drive it.
+        pack = fluency.build_pack(envelopes)
+        out = Path(args.pack)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(_json.dumps(pack, ensure_ascii=False, indent=2), encoding="utf-8")
+        nq = sum(len(p["questions"]) for p in pack["payloads"])
+        print(f"no model configured — wrote {nq} questions over {len(pack['payloads'])} "
+              f"record-shaped payloads to {out}.")
+        print("To run a model: set TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS (broker pool) "
+              "or pass --anthropic, then re-run.")
+        print(f"Or drive the pack by hand and score it: `terse fluency --responses <file> "
+              f"--pack {out}`.")
+        return 0
+
+    results = fluency.run_fluency(envelopes, answerers)
+    report = build_fluency_report(results, fluency.token_summary(envelopes))
+    _write_report(report, args.out)
+    return 0
+
+
+def _write_report(report: str, out_path: str) -> None:
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(report, encoding="utf-8")
+    print(report)
+    print(f"\n[report written to {out}]")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="terse", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -195,6 +274,22 @@ def main(argv: list[str] | None = None) -> int:
     px.add_argument("cmd", nargs=argparse.REMAINDER,
                     help="-- <downstream MCP server command and args>")
     px.set_defaults(func=_cmd_proxy)
+
+    f = sub.add_parser("fluency", help="does a model read the compressed form as "
+                                       "accurately as raw JSON? (proxy's open question)")
+    f.add_argument("--corpus", default=DEFAULT_CORPUS)
+    f.add_argument("--out", default=DEFAULT_FLUENCY_REPORT)
+    f.add_argument("--pack", default=DEFAULT_FLUENCY_PACK,
+                   help="path for the offline eval pack (written when no model is configured)")
+    f.add_argument("--responses", help="score a collected responses JSON against --pack")
+    f.add_argument("--base-url", help="OpenAI-compatible base URL (else $TERSE_FLUENCY_BASE_URL)")
+    f.add_argument("--models", help="comma-separated model ids (else $TERSE_FLUENCY_MODELS)")
+    f.add_argument("--api-key-env", default="TERSE_FLUENCY_API_KEY",
+                   help="env var holding the API key (default TERSE_FLUENCY_API_KEY)")
+    f.add_argument("--anthropic", action="store_true",
+                   help="also test the real consumer (needs the anthropic extra + key)")
+    f.add_argument("--anthropic-model", default="claude-opus-4-8")
+    f.set_defaults(func=_cmd_fluency)
 
     args = parser.parse_args(argv)
     return args.func(args)

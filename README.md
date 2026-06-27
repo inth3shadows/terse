@@ -70,10 +70,13 @@ src/terse/
   capture.py     corpus capture (shape-tagged envelopes) + shape classifier
   measure.py     per-payload + cross-tokenizer token measurement
   probes.py      value-redundancy + cross-call-overlap ceiling probes
+  fluency.py     does a model read the compressed form as accurately as raw JSON?
   tokenize.py    cl100k / o200k token counting (+ optional Anthropic)
-  report.py      markdown reports (savings, per-tool, probes, tokenizer)
-  cli.py         entrypoint: gate / capture / measure / probe / validate / compress / proxy
-tests/           round-trip, measurement, probe, and policy tests
+  report.py      markdown reports (savings, per-tool, probes, tokenizer, fluency)
+  cli.py         entrypoint: gate / capture / measure / probe / validate / compress / proxy / fluency
+scripts/
+  gen_stress_corpus.py  synthetic stress corpus for the fluency eval
+tests/           round-trip, measurement, probe, policy, and fluency tests
 policy.example.json   selective policy encoding the measured per-tool insight
 corpus/          captured tool outputs (gitignored; may contain real data)
 ```
@@ -86,6 +89,9 @@ corpus/          captured tool outputs (gitignored; may contain real data)
 ## Status
 
 Phase-0 spike: a working, measured, selective **lossless** library, CLI, and MCP
-stdio proxy. The Tier 1 lossy modes (truncate / drop-to-retrieve) and the higher-
-ceiling lossless levers (whole-subtree aliasing, cross-call diffing) are designed
-but not yet built — see TECHNICAL.md "Known Limitations".
+stdio proxy. The proxy's open question — *does a model read the compressed form as
+well as raw JSON?* — now has a measured answer: on a stress corpus, Claude Haiku 4.5
+and Gemini 2.5 Flash match raw-JSON accuracy on the compressed form (100% paired) at a
+37% token saving (`terse fluency`; see TECHNICAL.md). The Tier 1 lossy modes (truncate
+/ drop-to-retrieve) and the higher-ceiling lossless levers (whole-subtree aliasing,
+cross-call diffing) are designed but not yet built — see TECHNICAL.md "Known Limitations".

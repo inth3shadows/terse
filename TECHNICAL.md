@@ -177,10 +177,18 @@ gitignored because captured tool output may contain real data.
 - **Proxy: the model must understand terse's format.** The proxy compresses tool
   results in place, so the model receives the table/legend form. It is self-describing
   (a `cols` header, an inline legend) and needs no decode step, but a model that has
-  never seen the format may read it less fluently than raw JSON. The recommended
+  never seen the format might read it less fluently than raw JSON. The recommended
   pairing is a one-time system note describing the format; a per-call preamble is
-  deliberately not added (it would cost tokens on every call). This is the main open
-  question for proxy *usefulness* (as opposed to correctness, which the tests cover).
+  deliberately not added (it would cost tokens on every call). This was the main open
+  question for proxy *usefulness* (correctness is covered by the round-trip tests).
+  **Measured (`terse fluency`):** over a synthetic stress corpus that maximizes the
+  riskiest transforms, Claude Haiku 4.5 and Gemini 2.5 Flash answered terse-form
+  questions with the SAME accuracy as raw JSON (100% paired), at a 37% token saving;
+  a weaker model (DeepSeek) matched raw within the 5% tolerance. The `~N`
+  dictionary-alias transform is the one most likely to cost a weaker model, and the
+  one-time primer recovers it. Verdict gates on the worst model, not the mean. Caveat:
+  single-trial accuracy carries run-to-run noise at temperature 0; treat the verdict
+  as directional, not a tight bound. Re-run with `terse fluency` (see USAGE.md).
 - **Proxy is single-downstream and stdio-only.** One server per proxy instance; no
   HTTP/SSE transport, no fan-out to multiple servers. Run one proxy per server.
 - **Whole-subtree aliasing and cross-call diffing are unbuilt.** Probes show headroom
