@@ -90,13 +90,39 @@ TERSE_FLUENCY_BASE_URL=https://openrouter.ai/api/v1 \
 TERSE_FLUENCY_API_KEY=sk-... \
 TERSE_FLUENCY_MODELS=google/gemini-2.5-flash,anthropic/claude-haiku-4.5 \
   uv run terse fluency --corpus corpus-stress
+
+# 2c. tighten the verdict: repeat each question N times for a confidence interval
+TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \
+  uv run terse fluency --corpus corpus-stress --trials 5
 ```
 
 The report shows accuracy per model for raw vs compressed vs compressed-with-a-one-time
 format note ("primer"), flags which transform (if any) costs comprehension, and gives a
 PASS/FAIL gated on the *worst* model. A model that scores 0% on raw JSON is a setup
 error (wrong model id, no key) and is excluded from the verdict, not counted as a
-comprehension failure. Single runs carry some noise — re-run for a tighter read.
+comprehension failure. `--trials N` repeats each question N times and reports each
+accuracy with a `±` 95% bound, so the verdict is a tight bound rather than directional.
+
+### Cross-call diffing and its fluency check
+
+The proxy can emit a lossless **delta** against the prior same-tool result instead of
+the full payload — big in agent loops that call the same tool repeatedly (~91% overlap).
+It is **opt-in** and stateful:
+
+```
+# enable it on the proxy (off by default):
+uv run terse proxy --diff -- uvx some-mcp-server
+
+# before trusting it, check a model still reads the diff as well as the full result.
+# needs same-tool PAIRS in the corpus (capture a tool 2+ times) + a configured model:
+TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \
+  uv run terse fluency --diff --corpus corpus
+```
+
+`fluency --diff` reports diff-form accuracy vs full-result accuracy on the same
+questions and PASS/FAILs on the worst model — run it before enabling `proxy --diff` for
+your consumer. The diff is always lossless and only sent when smaller; it falls back to
+the full compressed form whenever no diff applies or the prior result isn't available.
 
 ### Building a sample set
 

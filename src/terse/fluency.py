@@ -39,7 +39,7 @@ from typing import Any, Callable
 
 from .capture import extract_records
 from .tokenize import count_cl100k
-from .transforms import compress, compress_structure, dict_encode, minify
+from .transforms import compress, compress_structure, dict_encode, diff_wire, minify
 
 # An answerer takes (system_prompt, user_prompt) and returns the model's reply text.
 # Empty system_prompt means "no system message".
@@ -297,29 +297,44 @@ def _safe_ask(answerer: Answerer, system: str, user: str) -> str:
         return ""
 
 
-def run_payload(obj: Any, raw_text: str, answerer: Answerer, primer: str = PRIMER) -> list[dict]:
-    """Ask one payload's questions over raw / terse / terse+primer; return scored rows."""
+def _ask_n(answerer: Answerer, system: str, user: str,
+           qtype: str, expected: Any, trials: int) -> int:
+    """Ask the same question `trials` times; return how many replies scored correct
+    (0..trials). Repeating at temperature 0 is not redundant — it surfaces the
+    provider-side nondeterminism (batching / MoE routing) behind the ~5pt run-to-run
+    accuracy wobble the report's binomial bound quantifies."""
+    return sum(score(qtype, expected, _safe_ask(answerer, system, user)) for _ in range(trials))
+
+
+def run_payload(obj: Any, raw_text: str, answerer: Answerer,
+                primer: str = PRIMER, trials: int = 1) -> list[dict]:
+    """Ask one payload's questions over raw / terse / terse+primer, `trials` times each.
+
+    Each returned row carries per-form success COUNTS (0..trials) plus `trials`, not
+    booleans. At trials=1 a count is 0 or 1 — truthy/falsy exactly like the old bool —
+    so every existing aggregation keeps working unchanged.
+    """
     terse_text = compress(obj)
     out: list[dict] = []
     for q in gen_questions(obj):
-        raw_reply = _safe_ask(answerer, "", _user_prompt(q.prompt, q.instruction, raw_text))
-        terse_reply = _safe_ask(answerer, "", _user_prompt(q.prompt, q.instruction, terse_text))
-        primer_reply = _safe_ask(answerer, primer, _user_prompt(q.prompt, q.instruction, terse_text))
+        raw_u = _user_prompt(q.prompt, q.instruction, raw_text)
+        terse_u = _user_prompt(q.prompt, q.instruction, terse_text)
         out.append({
-            "qid": q.qid, "qtype": q.qtype, "transform": q.transform,
-            "raw_ok": score(q.qtype, q.expected, raw_reply),
-            "terse_ok": score(q.qtype, q.expected, terse_reply),
-            "primer_ok": score(q.qtype, q.expected, primer_reply),
+            "qid": q.qid, "qtype": q.qtype, "transform": q.transform, "trials": trials,
+            "raw_ok": _ask_n(answerer, "", raw_u, q.qtype, q.expected, trials),
+            "terse_ok": _ask_n(answerer, "", terse_u, q.qtype, q.expected, trials),
+            "primer_ok": _ask_n(answerer, primer, terse_u, q.qtype, q.expected, trials),
         })
     return out
 
 
-def run_fluency(envelopes: list[dict], answerers: dict[str, Answerer], primer: str = PRIMER) -> dict:
+def run_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
+                primer: str = PRIMER, trials: int = 1) -> dict:
     """Run the eval for each named answerer over every record-shaped payload.
 
     Returns {model_name: [scored_row, ...]} where each row carries tool/sha plus the
-    per-form correctness flags. Non-record payloads are skipped (they generate no
-    questions — terse does not transform them).
+    per-form success counts and trial count. Non-record payloads are skipped (they
+    generate no questions — terse does not transform them).
     """
     results: dict[str, list[dict]] = {}
     for name, fn in answerers.items():
@@ -329,16 +344,92 @@ def run_fluency(envelopes: list[dict], answerers: dict[str, Answerer], primer: s
                 obj = json.loads(env["raw"])
             except (json.JSONDecodeError, TypeError):
                 continue
-            for row in run_payload(obj, env["raw"], fn, primer):
+            for row in run_payload(obj, env["raw"], fn, primer, trials):
                 rows.append({"tool": env["tool"], "sha": env.get("sha", "?"), **row})
         results[name] = rows
     return results
 
 
-def build_pack(envelopes: list[dict], primer: str = PRIMER) -> dict:
+# --------------------------------------------------------------------------- #
+# Cross-call diff fluency — does the model read a diff as well as the full result?
+# (Issue #1 risk item: the round-trip gate proves the diff reconstructs, NOT that the
+# model reads it. This measures the second thing, so flipping `proxy --diff` on is a
+# measured decision.)
+# --------------------------------------------------------------------------- #
+DIFF_PRIMER = (
+    "Some results are sent as a 'terse' diff against the PREVIOUS result of the same "
+    "tool, so unchanged data isn't resent. A diff "
+    '{"__terse_diff__":1,"shape":"rows","by":COL,"set":[...],"new":[...],"del":[...],"n":N} '
+    'means: start from the previous result\'s records, drop every id in "del", then for '
+    'each record in "set" overwrite the record whose "by"-column value matches it (ids '
+    'listed in "new" are appended, in order). "n" is the exact resulting record count. A '
+    '{"shape":"keys","set":{...},"del":[...]} diff instead means: take the previous '
+    'object, remove the keys in "del", then apply the key/value pairs in "set". Answer '
+    "about the RECONSTRUCTED current result."
+)
+
+
+def run_diff_payload(prev_obj: Any, curr_obj: Any, answerer: Answerer,
+                     tool: str = "", primer: str = DIFF_PRIMER, trials: int = 1) -> list[dict]:
+    """Does the model answer questions about the CURRENT result as well from
+    (previous full result + diff) as from the full current result?
+
+    Returns rows carrying full-terse (`terse_ok`) and diff-form (`diff_ok`) success
+    counts over the SAME questions. [] if curr is not record-shaped or no lossless diff
+    applies (nothing to compare)."""
+    questions = gen_questions(curr_obj)
+    if not questions:
+        return []
+    wire = diff_wire(prev_obj, curr_obj, tool)
+    if wire is None:
+        return []
+    curr_terse = compress(curr_obj)
+    diff_data = f"PREVIOUS RESULT:\n{compress(prev_obj)}\n\nUPDATE (diff against it):\n{wire}"
+    out: list[dict] = []
+    for q in questions:
+        full_u = _user_prompt(q.prompt, q.instruction, curr_terse)
+        diff_u = _user_prompt(q.prompt, q.instruction, diff_data)
+        out.append({
+            "qid": q.qid, "qtype": q.qtype, "transform": q.transform, "trials": trials,
+            "terse_ok": _ask_n(answerer, "", full_u, q.qtype, q.expected, trials),
+            "diff_ok": _ask_n(answerer, primer, diff_u, q.qtype, q.expected, trials),
+        })
+    return out
+
+
+def run_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
+                     trials: int = 1) -> dict:
+    """Run the diff-fluency eval over consecutive same-tool payload PAIRS (sorted by sha
+    for determinism — the order the proxy would see them). Returns {model: [rows]}."""
+    by_tool: dict[str, list[dict]] = {}
+    for env in envelopes:
+        by_tool.setdefault(env["tool"], []).append(env)
+    pairs: list[tuple] = []
+    for tool, envs in by_tool.items():
+        envs = sorted(envs, key=lambda e: e.get("sha", ""))
+        for prev_env, curr_env in zip(envs, envs[1:]):
+            try:
+                prev_obj = json.loads(prev_env["raw"])
+                curr_obj = json.loads(curr_env["raw"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            pairs.append((tool, curr_env.get("sha", "?"), prev_obj, curr_obj))
+
+    results: dict[str, list[dict]] = {}
+    for name, fn in answerers.items():
+        rows: list[dict] = []
+        for tool, csha, prev_obj, curr_obj in pairs:
+            for row in run_diff_payload(prev_obj, curr_obj, fn, tool, trials=trials):
+                rows.append({"tool": tool, "sha": csha, **row})
+        results[name] = rows
+    return results
+
+
+def build_pack(envelopes: list[dict], primer: str = PRIMER, trials: int = 1) -> dict:
     """Emit a self-contained eval pack (prompts + raw/terse forms + ground truth) so a
     run can be driven by any model client (e.g. via the secret-broker) and scored later
-    with `score_pack`. Keyless: no model is called here."""
+    with `score_pack`. Keyless: no model is called here. `trials` is a hint to the
+    external driver: collect that many replies per form (as a list) for a bounded verdict."""
     payloads = []
     for env in envelopes:
         try:
@@ -356,14 +447,26 @@ def build_pack(envelopes: list[dict], primer: str = PRIMER) -> dict:
                 "prompt": q.prompt, "instruction": q.instruction, "expected": q.expected,
             } for q in qs],
         })
-    return {"primer": primer, "payloads": payloads}
+    return {"primer": primer, "trials": trials, "payloads": payloads}
+
+
+def _score_form(qtype: str, expected: Any, form_val: Any) -> tuple[int, int]:
+    """(successes, trials) for one form's collected reply(s). A single string is one
+    trial; a list of strings is N trials (the multi-trial pack form). Returns (0, 1)
+    for a missing/empty single reply, matching the prior single-trial behaviour."""
+    replies = form_val if isinstance(form_val, list) else [form_val]
+    if not replies:
+        return 0, 0
+    successes = sum(score(qtype, expected, r) for r in replies if isinstance(r, str))
+    return successes, len(replies)
 
 
 def score_pack(pack: dict, responses: dict) -> dict:
     """Score externally-collected responses against a pack's ground truth.
 
-    responses: {model: {sha: {qid: {"raw": str, "terse": str, "primer": str}}}}.
-    Returns the same {model: [scored_row,...]} shape as `run_fluency`.
+    responses: {model: {sha: {qid: {"raw": str|[str], "terse": ..., "primer": ...}}}}.
+    A list value is multi-trial (N replies for that form). Returns the same
+    {model: [scored_row,...]} shape as `run_fluency`, with per-form success counts.
     """
     index: dict[tuple, dict] = {}
     for p in pack["payloads"]:
@@ -378,12 +481,16 @@ def score_pack(pack: dict, responses: dict) -> dict:
                 if meta is None:
                     continue
                 qtype, expected = meta["qtype"], meta["expected"]
+                raw_k, raw_t = _score_form(qtype, expected, forms.get("raw", ""))
+                terse_k, terse_t = _score_form(qtype, expected, forms.get("terse", ""))
+                primer_k, primer_t = _score_form(qtype, expected, forms.get("primer", ""))
                 rows.append({
                     "tool": meta["tool"], "sha": sha, "qid": qid,
                     "qtype": qtype, "transform": meta["transform"],
-                    "raw_ok": score(qtype, expected, forms.get("raw", "")),
-                    "terse_ok": score(qtype, expected, forms.get("terse", "")),
-                    "primer_ok": score(qtype, expected, forms.get("primer", "")),
+                    # forms are collected with the same trial count (build_pack's hint);
+                    # store the max so an uneven hand-built file still reports sanely.
+                    "trials": max(raw_t, terse_t, primer_t, 1),
+                    "raw_ok": raw_k, "terse_ok": terse_k, "primer_ok": primer_k,
                 })
         results[model] = rows
     return results
