@@ -183,12 +183,16 @@ gitignored because captured tool output may contain real data.
   question for proxy *usefulness* (correctness is covered by the round-trip tests).
   **Measured (`terse fluency`):** over a synthetic stress corpus that maximizes the
   riskiest transforms, Claude Haiku 4.5 and Gemini 2.5 Flash answered terse-form
-  questions with the SAME accuracy as raw JSON (100% paired), at a 37% token saving;
-  a weaker model (DeepSeek) matched raw within the 5% tolerance. The `~N`
-  dictionary-alias transform is the one most likely to cost a weaker model, and the
-  one-time primer recovers it. Verdict gates on the worst model, not the mean. Caveat:
-  single-trial accuracy carries run-to-run noise at temperature 0; treat the verdict
-  as directional, not a tight bound. Re-run with `terse fluency` (see USAGE.md).
+  questions within tolerance of raw JSON (96–100% paired) at a ~38% token saving;
+  DeepSeek matched raw within the 5% tolerance. The decisive lever is the `~N`
+  dictionary alias — especially the whole-subtree variant where `~N` expands to an
+  entire OBJECT (the `deref` question probes this). Alias-resolution accuracy is 83%
+  bare but **100% with the one-time primer**, and the primer recovered every DeepSeek
+  regression. Takeaway: alias-heavy payloads (including subtree aliasing) are safe in
+  the proxy *with the primer system note*; without it a weaker model can regress past
+  tolerance. Verdict gates on the worst model, not the mean. Caveat: single-trial
+  accuracy carries run-to-run noise at temperature 0; treat it as directional. Re-run
+  with `terse fluency` (see USAGE.md).
 - **Proxy is single-downstream and stdio-only.** One server per proxy instance; no
   HTTP/SSE transport, no fan-out to multiple servers. Run one proxy per server.
 - **Cross-call diffing is unbuilt.** The probe shows 91% overlap between successive

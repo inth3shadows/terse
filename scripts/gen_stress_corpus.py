@@ -82,12 +82,26 @@ def mixed_realistic(n_rows: int = 12) -> list[dict]:
     } for i in range(n_rows)]
 
 
+def object_alias(n: int = 12) -> list[dict]:
+    """A column of repeated WHOLE objects with non-uniform key sets, so tabularize
+    declines to hoist them to subcols and whole-subtree aliasing folds each into a
+    `~N` that expands to an OBJECT — the comprehension case the deref question probes."""
+    configs = [
+        {"region": "us-east-1", "tier": "gold", "flags": ["a", "b"]},
+        {"region": "eu-west-1", "tier": "silver", "extra": 1},          # different keys
+        {"zone": "ap-south-1", "tier": "bronze", "flags": ["c", "d", "e"]},  # different keys
+    ]
+    return [{"id": i + 1, "name": f"node-{i + 1:02d}", "config": configs[i % len(configs)]}
+            for i in range(n)]
+
+
 PAYLOADS = {
     "stress.wide_table": wide_table(),
     "stress.long_table": long_table(),
     "stress.heavy_alias": heavy_alias(),
     "stress.nested_records": nested_records(),
     "stress.mixed_realistic": mixed_realistic(),
+    "stress.object_alias": object_alias(),
 }
 
 

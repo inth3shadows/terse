@@ -39,7 +39,7 @@ from typing import Any, Callable
 
 from .capture import extract_records
 from .tokenize import count_cl100k
-from .transforms import compress, compress_structure, dict_encode
+from .transforms import compress, compress_structure, dict_encode, minify
 
 # An answerer takes (system_prompt, user_prompt) and returns the model's reply text.
 # Empty system_prompt means "no system message".
@@ -79,14 +79,21 @@ class Question:
     expected: Any
 
 
-def _aliased_values(obj: Any) -> set:
-    """The set of value-strings terse would fold into the `~`-legend for this payload.
-
-    Used to steer the lookup question onto a dict-coded field, so it actually
-    stresses `~N` resolution rather than a plain literal.
-    """
+def _aliased_strings(obj: Any) -> set:
+    """The value-STRINGS terse would fold into the `~`-legend for this payload. Used to
+    steer the lookup question onto a dict-coded field, so it stresses `~N` resolution
+    rather than a plain literal. (Legend values can now be whole subtrees, which are
+    unhashable — filter to strings here; use `_aliased_canon` for subtree membership.)"""
     _, legend = dict_encode(compress_structure(obj))
-    return set(legend.values())
+    return {v for v in legend.values() if isinstance(v, str)}
+
+
+def _aliased_canon(obj: Any) -> set:
+    """Canonical (minified) forms of EVERY aliased value — string or whole subtree — so
+    a question can be tagged as stressing alias resolution even when the alias expands
+    to an object/list (the whole-subtree-aliasing case)."""
+    _, legend = dict_encode(compress_structure(obj))
+    return {minify(v) for v in legend.values()}
 
 
 def _pick_id_col(records: list[dict], cols: list[str]) -> str | None:
@@ -142,7 +149,8 @@ def gen_questions(obj: Any) -> list[Question]:
         return []
     cols = list(records[0].keys())
     n = len(records)
-    aliased = _aliased_values(obj)
+    aliased = _aliased_strings(obj)
+    canon = _aliased_canon(obj)
     qs: list[Question] = []
 
     # count — enumeration fidelity; the motivation for the row-count hint.
@@ -186,6 +194,24 @@ def gen_questions(obj: Any) -> list[Question]:
             "Reply with only the number.",
             max(r[numcol] for r in records),
         ))
+
+    # deref — a column whose cells are whole objects/lists. With whole-subtree aliasing
+    # these become `~N` that expand to a STRUCTURE, so this question stresses the new,
+    # harder comprehension case: resolve an alias to an entire object, not a string.
+    if idcol is not None:
+        blobcol = next((c for c in cols if c != idcol
+                        and all(isinstance(r[c], (dict, list)) for r in records)), None)
+        if blobcol is not None:
+            ri = next((i for i in range(n) if minify(records[i][blobcol]) in canon), n // 2)
+            expected = records[ri][blobcol]
+            transform = "table+dict" if minify(expected) in canon else "table"
+            qs.append(Question(
+                "deref", "deref", transform,
+                f"For the record whose {idcol!r} is {json.dumps(records[ri][idcol], ensure_ascii=False)}, "
+                f"what is the full value of {blobcol!r}?",
+                "Reply with only that value as compact JSON, and nothing else.",
+                expected,
+            ))
     return qs
 
 
@@ -218,6 +244,19 @@ def _matches_number(reply: str, expected: Any) -> bool:
     return any(abs(float(tok) - float(expected)) < 1e-9 for tok in _NUM.findall(reply))
 
 
+def _extract_json(reply: str) -> Any:
+    """Pull the first JSON object/array out of a reply (tolerating surrounding prose).
+    Returns a sentinel-free value or raises ValueError if none parses."""
+    for open_c, close_c in (("{", "}"), ("[", "]")):
+        i, j = reply.find(open_c), reply.rfind(close_c)
+        if i != -1 and j > i:
+            try:
+                return json.loads(reply[i:j + 1])
+            except json.JSONDecodeError:
+                pass
+    return json.loads(reply)  # last resort; raises if not JSON
+
+
 def score(qtype: str, expected: Any, reply: str) -> bool:
     """True iff the reply conveys the expected answer. Tolerates surrounding prose/
     quotes; compares the value exactly (numbers within float epsilon). No blanket
@@ -231,6 +270,11 @@ def score(qtype: str, expected: Any, reply: str) -> bool:
         if got is None:
             return False
         return [_norm_scalar(str(x)) for x in got] == [_norm_scalar(str(x)) for x in expected]
+    if qtype == "deref":
+        try:
+            return _extract_json(reply) == expected  # JSON value-equality (dict order-insensitive)
+        except (json.JSONDecodeError, ValueError):
+            return False
     # lookup / generic scalar
     if _is_number(expected):
         return _matches_number(reply, expected)

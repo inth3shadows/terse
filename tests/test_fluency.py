@@ -43,6 +43,37 @@ def test_lookup_targets_a_dict_coded_field():
     assert qs["lookup"].transform == "table+dict"
 
 
+BLOB_PAYLOAD = [
+    {"id": i + 1, "config": [{"region": "us-east-1", "tier": "gold", "flags": ["a", "b"]},
+                             {"zone": "eu-west-1", "tier": "silver", "extra": 1}][i % 2]}
+    for i in range(8)
+]
+
+
+def test_deref_question_targets_an_object_valued_alias():
+    # whole-subtree aliasing folds the repeated config objects; the deref question must
+    # exist, target that column, and be tagged as stressing alias resolution
+    qs = {q.qtype: q for q in fluency.gen_questions(BLOB_PAYLOAD)}
+    assert "deref" in qs
+    assert isinstance(qs["deref"].expected, dict)
+    assert qs["deref"].transform == "table+dict"  # the object is dict-coded
+
+
+def test_aliased_helpers_survive_unhashable_subtree_legend():
+    # regression: _aliased_strings/_aliased_canon must not choke on object legend values
+    # (set(legend.values()) would raise TypeError once subtrees can be aliased)
+    assert isinstance(fluency._aliased_strings(BLOB_PAYLOAD), set)
+    assert isinstance(fluency._aliased_canon(BLOB_PAYLOAD), set)
+
+
+def test_score_deref_json_value_equality():
+    assert fluency.score("deref", {"a": 1, "b": 2}, '{"b": 2, "a": 1}')  # order-insensitive
+    assert fluency.score("deref", {"a": 1}, 'The value is {"a": 1}.')    # prose-tolerant
+    assert fluency.score("deref", [1, 2, 3], "[1, 2, 3]")
+    assert not fluency.score("deref", {"a": 1}, '{"a": 2}')
+    assert not fluency.score("deref", {"a": 1}, "not json")
+
+
 def test_no_questions_for_non_record_payloads():
     assert fluency.gen_questions({"just": "an object"}) == []
     assert fluency.gen_questions([1, 2, 3]) == []
