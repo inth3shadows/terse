@@ -76,6 +76,15 @@ def test_tabularize_actually_folds_records():
     assert len(compressed["rows"]) == 5
 
 
+def test_table_header_carries_row_count():
+    """The `n` hint must equal the row count and survive the round-trip exactly."""
+    records = [{"id": i, "name": "x"} for i in range(5)]
+    compressed = transforms.compress_structure(records)
+    assert compressed["n"] == 5 == len(compressed["rows"])
+    # `n` is redundant: the inverse ignores it, so losslessness is unaffected.
+    assert transforms.roundtrip_ok(records)
+
+
 def test_tabularize_declines_heterogeneous():
     records = [{"id": 1, "name": "a"}, {"id": 2}]
     compressed = transforms.compress_structure(records)

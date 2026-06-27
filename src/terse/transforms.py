@@ -88,7 +88,11 @@ def compress_structure(obj: Any) -> Any:
     if isinstance(obj, list):
         if _uniform_dict_list(obj):
             spec, posrows = _fold_records(obj)
-            table = {TABLE_MARKER: 1, "cols": spec["cols"], "rows": posrows}
+            # `n` is a redundant row-count hint: it lets a reader self-check that it
+            # enumerated every row (fidelity probe found terse's only recall gap was
+            # under-enumeration of wide positional tables). decompress ignores it, so
+            # the round-trip stays exact.
+            table = {TABLE_MARKER: 1, "n": len(posrows), "cols": spec["cols"], "rows": posrows}
             if "subcols" in spec:
                 table["subcols"] = spec["subcols"]
             return table

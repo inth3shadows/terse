@@ -17,3 +17,6 @@ reports/
 
 # runecho stray index dirs (created if `runecho-ir` is run with cwd here)
 .ai/
+
+# Ad-hoc experiment harnesses (e.g. the fidelity probe) — not part of the lib
+scratch_fidelity/
