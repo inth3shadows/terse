@@ -40,9 +40,9 @@ def minify(obj: Any) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Tier 0 — tabularize (fold repeated keys)
+# Tier 0 — tabularize (fold repeated keys, including nested dict-columns)
 # --------------------------------------------------------------------------- #
-def _is_tabularizable(value: Any) -> bool:
+def _uniform_dict_list(value: Any) -> bool:
     """True iff `value` is a list of >=2 dicts that all share an identical key set."""
     if not isinstance(value, list) or len(value) < 2:
         return False
@@ -52,18 +52,61 @@ def _is_tabularizable(value: Any) -> bool:
     return all(set(item.keys()) == first_keys for item in value[1:])
 
 
+def _fold_records(records: list[dict]) -> tuple[dict, list]:
+    """Fold a uniform-dict list into (spec, positional rows), recursing on dict-columns.
+
+    A column whose values are themselves all uniform dicts is hoisted: its key-set
+    moves to spec['subcols'][col] once, and each cell becomes a positional tuple.
+    Non-dict columns are recursed through compress_structure (so a list-of-dicts cell
+    becomes its own sub-table). spec = {'cols': [...], 'subcols': {col: spec, ...}}.
+    """
+    keys = list(records[0].keys())
+    posrows = [[rec[k] for k in keys] for rec in records]
+    subcols: dict = {}
+    n = len(records)
+    for ci, k in enumerate(keys):
+        col = [posrows[ri][ci] for ri in range(n)]
+        if _uniform_dict_list(col):
+            sub_spec, sub_pos = _fold_records(col)
+            subcols[k] = sub_spec
+            for ri in range(n):
+                posrows[ri][ci] = sub_pos[ri]
+        else:
+            for ri in range(n):
+                posrows[ri][ci] = compress_structure(posrows[ri][ci])
+    spec: dict = {"cols": keys}
+    if subcols:
+        spec["subcols"] = subcols
+    return spec, posrows
+
+
 def compress_structure(obj: Any) -> Any:
-    """Recursively fold every qualifying list-of-uniform-dicts into a table."""
+    """Recursively fold every qualifying list-of-uniform-dicts into a table,
+    hoisting nested uniform-dict columns into a shared subcols header."""
     if isinstance(obj, dict):
         return {k: compress_structure(v) for k, v in obj.items()}
     if isinstance(obj, list):
-        children = [compress_structure(item) for item in obj]
-        if _is_tabularizable(children):
-            cols = list(children[0].keys())
-            rows = [[row[c] for c in cols] for row in children]
-            return {TABLE_MARKER: 1, "cols": cols, "rows": rows}
-        return children
+        if _uniform_dict_list(obj):
+            spec, posrows = _fold_records(obj)
+            table = {TABLE_MARKER: 1, "cols": spec["cols"], "rows": posrows}
+            if "subcols" in spec:
+                table["subcols"] = spec["subcols"]
+            return table
+        return [compress_structure(item) for item in obj]
     return obj
+
+
+def _unfold_row(row: list, cols: list, subcols: dict) -> dict:
+    """Rebuild one record from a positional row + its (possibly nested) header."""
+    rec = {}
+    for ci, k in enumerate(cols):
+        cell = row[ci]
+        sub = subcols.get(k)
+        if sub is not None:
+            rec[k] = _unfold_row(cell, sub["cols"], sub.get("subcols", {}))
+        else:
+            rec[k] = decompress_structure(cell)
+    return rec
 
 
 def decompress_structure(obj: Any) -> Any:
@@ -71,8 +114,8 @@ def decompress_structure(obj: Any) -> Any:
     if isinstance(obj, dict):
         if obj.get(TABLE_MARKER) == 1 and "cols" in obj and "rows" in obj:
             cols = obj["cols"]
-            records = [dict(zip(cols, row)) for row in obj["rows"]]
-            return [decompress_structure(rec) for rec in records]
+            subcols = obj.get("subcols", {})
+            return [_unfold_row(row, cols, subcols) for row in obj["rows"]]
         return {k: decompress_structure(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [decompress_structure(item) for item in obj]

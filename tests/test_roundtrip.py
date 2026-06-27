@@ -49,6 +49,17 @@ CASES = [
         [{"v": "~0"}, {"v": "~0"}, {"v": "~1"}, {"v": "real"}, {"v": "real"}, {"v": "real"}],
         id="values-collide-with-alias-namespace",
     ),
+    # Nested key folding: a uniform-dict column (owner) hoisted to subcols.
+    pytest.param(
+        [{"id": i, "owner": {"login": "eric", "perms": {"push": True, "admin": False}}}
+         for i in range(8)],
+        id="nested-dict-columns-deep",
+    ),
+    # Heterogeneous nested dicts must NOT fold (different inner keys) — still lossless.
+    pytest.param(
+        [{"id": 1, "meta": {"a": 1}}, {"id": 2, "meta": {"b": 2}}, {"id": 3, "meta": {"a": 9}}],
+        id="nested-dicts-heterogeneous",
+    ),
 ]
 
 
@@ -69,6 +80,21 @@ def test_tabularize_declines_heterogeneous():
     records = [{"id": 1, "name": "a"}, {"id": 2}]
     compressed = transforms.compress_structure(records)
     assert isinstance(compressed, list)  # left untouched, not wrapped
+
+
+def test_nested_key_folding_hoists_subcols():
+    records = [{"id": i, "owner": {"login": "eric", "type": "User"}} for i in range(6)]
+    table = transforms.compress_structure(records)
+    assert table["cols"] == ["id", "owner"]
+    assert "subcols" in table and table["subcols"]["owner"]["cols"] == ["login", "type"]
+    # The nested keys 'login'/'type' appear once in subcols, not once per row.
+    assert transforms.minify(table).count('"login"') == 1
+
+
+def test_nested_heterogeneous_columns_not_folded():
+    records = [{"id": 1, "meta": {"a": 1}}, {"id": 2, "meta": {"b": 2}}]
+    table = transforms.compress_structure(records)
+    assert "subcols" not in table  # differing inner keys -> left as dicts in cells
 
 
 def test_dictionary_coding_folds_repeated_values():
