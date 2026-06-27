@@ -69,7 +69,8 @@ def classify_shape(raw: str) -> str:
     except (json.JSONDecodeError, TypeError):
         return LONG_TEXT if len(raw) >= _LONG_TEXT_CHARS else OTHER
 
-    is_pretty = "\n" in raw  # json.dumps(indent=...) inserts newlines; compact never does
+    is_pretty = "\n" in raw.strip()  # indented JSON has interior newlines; a lone
+    #                                   trailing newline (e.g. from `jq -c`) is not pretty
 
     if _has_record_list(obj):
         return ARRAY_OF_RECORDS

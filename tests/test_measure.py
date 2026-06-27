@@ -40,6 +40,14 @@ def test_non_json_is_passthrough_and_lossless():
     assert row["saved_cl100k"]["tier_total"] == 0
 
 
+def test_minified_json_with_trailing_newline_is_not_pretty():
+    # `jq -c` emits one line + a trailing newline; that must not read as pretty-printed.
+    compact = json.dumps({"a": 1, "b": [1, 2, 3]}) + "\n"
+    assert capture.classify_shape(compact) == capture.COMPACT_JSON
+    indented = json.dumps({"a": 1, "b": [1, 2, 3]}, indent=2)
+    assert capture.classify_shape(indented) == capture.PRETTY_JSON
+
+
 def test_capture_load_coverage_roundtrip(tmp_path):
     capture.capture_payload("gh.issues", json.dumps([{"n": 1}, {"n": 2}]), tmp_path)
     capture.capture_payload("gh.user", json.dumps({"login": "x"}), tmp_path)

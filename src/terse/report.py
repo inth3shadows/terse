@@ -142,6 +142,29 @@ def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
     )
     out.append("")
 
+    # --- Per-tool savings (the proxy decision is per-tool, not per-shape) ---
+    # Shape buckets can hide a deep-nested win next to a true no-op (e.g. runecho's
+    # nested symbol lists vs a single compact object both land in 'compact-json').
+    tools = sorted({r.get("tool", "?") for r in rows})
+    out += [
+        "## Tier-0 savings by tool (cl100k)",
+        "",
+        "Per-tool, because terse's value is shape-dependent and a blanket average hides it.",
+        "",
+        "| Tool | shape | raw tok | terse tok | saved | % |",
+        "|---|---|---|---|---|---|",
+    ]
+    tool_rows = []
+    for tool in tools:
+        sub = [r for r in rows if r.get("tool") == tool]
+        raw = _sum(sub, "cl100k", "raw")
+        cmp_ = _sum(sub, "cl100k", "compressed")
+        shape = sub[0]["shape"] if sub else "?"
+        tool_rows.append((raw - cmp_, raw, cmp_, tool, shape))
+    for saved, raw, cmp_, tool, shape in sorted(tool_rows, reverse=True):
+        out.append(f"| `{tool}` | {shape} | {raw} | {cmp_} | {saved:+d} | {_pct(saved, raw)} |")
+    out.append("")
+
     # --- Tier attribution (where the saving came from) ---
     out += [
         "## Tier attribution by shape (cl100k tokens saved)",
