@@ -75,6 +75,19 @@ def test_score_enumerate_json_array_exact_and_lenient():
     assert fluency.score("enumerate", ["a", "b"], "a, b")
 
 
+def test_score_empty_expected_scalar_matches_empty_reply():
+    # a legitimately-empty field value must score correct when the model returns nothing
+    assert fluency.score("lookup", "", "")
+    assert not fluency.score("lookup", "x", "")  # empty reply, non-empty expected -> wrong
+
+
+def test_score_number_matches_anywhere_not_just_first():
+    # prose with a leading incidental number must not fool numeric scoring
+    assert fluency.score("count", 6, "I see 2 columns and 6 records")
+    assert fluency.score("aggregate", 30, "the values range up to 30")
+    assert not fluency.score("count", 6, "I see 2 columns and 5 records")
+
+
 def test_run_payload_structure_with_constant_answerer():
     # a model that always says "6" gets count right, the rest wrong — proves the
     # harness scores each form independently and returns one row per question

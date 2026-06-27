@@ -211,15 +211,21 @@ def _parse_list(reply: str) -> list | None:
     return parts or None
 
 
+def _matches_number(reply: str, expected: Any) -> bool:
+    """True iff the expected number appears anywhere in the reply. Matching ANY number
+    (not just the first) tolerates prose like "there are 6 records" without being fooled
+    by a leading incidental number."""
+    return any(abs(float(tok) - float(expected)) < 1e-9 for tok in _NUM.findall(reply))
+
+
 def score(qtype: str, expected: Any, reply: str) -> bool:
     """True iff the reply conveys the expected answer. Tolerates surrounding prose/
-    quotes; compares the value exactly (numbers within float epsilon)."""
+    quotes; compares the value exactly (numbers within float epsilon). No blanket
+    empty-reply reject — an empty reply only matches an empty expected scalar, which
+    each branch already decides correctly."""
     reply = reply.strip()
-    if not reply:
-        return False
     if qtype == "count" or (qtype == "aggregate" and _is_number(expected)):
-        m = _NUM.search(reply)
-        return m is not None and abs(float(m.group()) - float(expected)) < 1e-9
+        return _matches_number(reply, expected)
     if qtype == "enumerate":
         got = _parse_list(reply)
         if got is None:
@@ -227,8 +233,7 @@ def score(qtype: str, expected: Any, reply: str) -> bool:
         return [_norm_scalar(str(x)) for x in got] == [_norm_scalar(str(x)) for x in expected]
     # lookup / generic scalar
     if _is_number(expected):
-        m = _NUM.search(reply)
-        return m is not None and abs(float(m.group()) - float(expected)) < 1e-9
+        return _matches_number(reply, expected)
     return _norm_scalar(reply) == _norm_scalar(str(expected))
 
 
@@ -380,6 +385,10 @@ def openai_answerer(base_url: str, api_key: str, model: str,
         })
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
+        # Some OpenAI-compatible gateways return 200 with an error body (no choices);
+        # surface a clear message instead of a bare KeyError.
+        if "choices" not in data:
+            raise RuntimeError(f"{model}: no choices in response: {data.get('error', data)}")
         return data["choices"][0]["message"]["content"] or ""
 
     return ask
