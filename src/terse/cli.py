@@ -69,6 +69,21 @@ def _cmd_measure(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_proxy(args: argparse.Namespace) -> int:
+    from .policy import default_policy, load_policy
+    from .proxy import run_proxy
+
+    cmd = args.cmd
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        print("proxy: provide the downstream server command after `--`, e.g.\n"
+              "  terse proxy --policy p.json -- uvx some-mcp-server", file=sys.stderr)
+        return 2
+    pol = load_policy(args.policy) if args.policy else default_policy()
+    return run_proxy(cmd, pol, debug=args.debug)
+
+
 def _cmd_compress(args: argparse.Namespace) -> int:
     from .policy import apply, default_policy, load_policy
 
@@ -172,6 +187,14 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--corpus", default=DEFAULT_CORPUS)
     v.add_argument("--out", default="reports/tokenizer-report.md")
     v.set_defaults(func=_cmd_validate)
+
+    px = sub.add_parser("proxy", help="MCP stdio proxy: compress a downstream server's "
+                                      "tool results per policy")
+    px.add_argument("--policy", help="path to a JSON policy file (default: lossless-everywhere)")
+    px.add_argument("--debug", action="store_true", help="log compressions to stderr")
+    px.add_argument("cmd", nargs=argparse.REMAINDER,
+                    help="-- <downstream MCP server command and args>")
+    px.set_defaults(func=_cmd_proxy)
 
     args = parser.parse_args(argv)
     return args.func(args)
