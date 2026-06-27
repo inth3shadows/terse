@@ -69,6 +69,23 @@ def _cmd_measure(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_compress(args: argparse.Namespace) -> int:
+    from .policy import apply, default_policy, load_policy
+
+    policy = load_policy(args.policy) if args.policy else default_policy()
+    raw = _read(args.file)
+    result = apply(raw, args.tool, policy)
+    sys.stdout.write(result.text)
+    summary = "skipped (passthrough)" if result.skipped else f"tiers={list(result.tiers)}"
+    before, after = count_cl100k(raw), count_cl100k(result.text)
+    if before and after is not None:
+        summary += f"  cl100k {before}->{after} ({(before - after) / before * 100:+.1f}%)"
+    print(f"[{args.tool}] {summary}", file=sys.stderr)
+    for w in result.warnings:
+        print(f"[warn] {w}", file=sys.stderr)
+    return 0
+
+
 def _cmd_validate(args: argparse.Namespace) -> int:
     envelopes = load_corpus(args.corpus)
     if not envelopes:
@@ -127,6 +144,12 @@ def main(argv: list[str] | None = None) -> int:
     g = sub.add_parser("gate", help="run the lossless round-trip gate on a JSON file")
     g.add_argument("file", help="path to a JSON payload, or - for stdin")
     g.set_defaults(func=_cmd_gate)
+
+    c2 = sub.add_parser("compress", help="compress a tool output per policy (the shell)")
+    c2.add_argument("file", help="path to the raw tool output, or - for stdin")
+    c2.add_argument("--tool", required=True, help="tool name to match against the policy")
+    c2.add_argument("--policy", help="path to a JSON policy file (default: lossless-everywhere)")
+    c2.set_defaults(func=_cmd_compress)
 
     c = sub.add_parser("capture", help="persist a tool output to the corpus")
     c.add_argument("file", help="path to the raw tool output, or - for stdin")

@@ -245,13 +245,23 @@ def compress_tabular(obj: Any) -> str:
     return minify(compress_structure(obj))
 
 
+def compress_with(obj: Any, tabularize: bool = True, dictionary: bool = True) -> str:
+    """Apply a selectable subset of lossless tiers, then minify.
+
+    `decompress` auto-detects the markers, so any combination round-trips. minify is
+    always applied (it is the serialization). Pass both False for minify-only.
+    """
+    structure = compress_structure(obj) if tabularize else obj
+    if dictionary:
+        data, legend = dict_encode(structure)
+        if legend:
+            return minify({DICT_MARKER: 1, "legend": legend, "data": data})
+    return minify(structure)
+
+
 def compress(obj: Any) -> str:
     """Full pipeline: tabularize, then dictionary-code, then minify."""
-    structure = compress_structure(obj)
-    data, legend = dict_encode(structure)
-    if legend:
-        return minify({DICT_MARKER: 1, "legend": legend, "data": data})
-    return minify(structure)
+    return compress_with(obj, tabularize=True, dictionary=True)
 
 
 def decompress(text: str) -> Any:

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "_comment": "Selective per-tool policy, informed by the spike's measured per-tool savings (gh records +16-30%, runecho +25-29%, kb +2.6%, single objects +0%). First matching rule wins; unmatched tools use defaults. tiers subset of [minify, tabularize, dictionary]; [] = passthrough. v1 is 100% lossless: lossy field modes are parsed but not executed (warned).",
+  "defaults": {
+    "tiers": ["minify", "tabularize", "dictionary"]
+  },
+  "policies": [
+    {
+      "_comment": "Verbose record/symbol APIs — full Tier-0/0.5 pays (16-30%).",
+      "match": { "tool": "gh.*" },
+      "tiers": ["minify", "tabularize", "dictionary"],
+      "fields": {
+        "result[].id": { "critical": true },
+        "result[].body": { "lossy": "drop-to-retrieve", "_note": "v1: warned, left lossless" }
+      }
+    },
+    {
+      "match": { "tool": "runecho.*" },
+      "tiers": ["minify", "tabularize", "dictionary"]
+    },
+    {
+      "_comment": "Already field-projected + high-cardinality content; dictionary added ~nothing (+2.6% total). Keep cheap structural tiers, drop dictionary.",
+      "match": { "tool": "kb.*" },
+      "tiers": ["minify", "tabularize"]
+    },
+    {
+      "_comment": "Status/single-object endpoints measured +0% — skip entirely to avoid transform cost.",
+      "match": { "tool": "*.rate_limit" },
+      "tiers": []
+    }
+  ]
+}
