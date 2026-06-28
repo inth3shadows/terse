@@ -19,6 +19,11 @@
       "tiers": ["minify", "tabularize", "dictionary"]
     },
     {
+      "_comment": "codegraph: search/query JSON measured +33%. explore/node return markdown+source (non-JSON) — terse can't parse those and passes them through untouched, so this rule only ever fires on the JSON-shaped tools.",
+      "match": { "tool": "codegraph.*" },
+      "tiers": ["minify", "tabularize", "dictionary"]
+    },
+    {
       "_comment": "Already field-projected + high-cardinality content; dictionary added ~nothing (+2.6% total). Keep cheap structural tiers, drop dictionary.",
       "match": { "tool": "kb.*" },
       "tiers": ["minify", "tabularize"]

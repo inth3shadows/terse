@@ -239,6 +239,53 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
     return 0
 
 
+def _short_cmd(entry) -> str:
+    if not entry:
+        return "(absent)"
+    return " ".join([entry.get("command", "?"), *entry.get("args", [])])[:100]
+
+
+def _cmd_install_mcp(args: argparse.Namespace) -> int:
+    from .install_mcp import do_install
+
+    try:
+        res = do_install(args.servers, args.policy, dry_run=args.print)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"install-mcp: {e}", file=sys.stderr)
+        return 2
+    tag = "[dry-run] would wrap" if res["dry_run"] else "wrapped"
+    for c in res["changes"]:
+        print(f"{tag} {c['server']}:")
+        print(f"    before: {_short_cmd(c['before'])}")
+        print(f"    after:  {_short_cmd(c['after'])}")
+    print(f"config: {res['config']}  policy: {res['policy']}")
+    if res["backup"]:
+        print(f"backup: {res['backup']}")
+    if not res["dry_run"] and res["changes"]:
+        print("→ restart Claude Code for the change to take effect.")
+    return 0
+
+
+def _cmd_uninstall_mcp(args: argparse.Namespace) -> int:
+    from .install_mcp import do_uninstall
+
+    res = do_uninstall(args.servers, all_=args.all, dry_run=args.print)
+    tag = "[dry-run] would restore" if res["dry_run"] else "restored"
+    if not res["changes"]:
+        print("nothing to do (no terse-managed servers).")
+        return 0
+    for c in res["changes"]:
+        if c.get("restored"):
+            print(f"{tag} {c['server']}")
+        else:
+            print(f"skip {c['server']}: {c.get('reason')}")
+    if res["backup"]:
+        print(f"backup: {res['backup']}")
+    if not res["dry_run"] and any(c.get("restored") for c in res["changes"]):
+        print("→ restart Claude Code for the change to take effect.")
+    return 0
+
+
 def _write_report(report: str, out_path: str) -> None:
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -317,6 +364,22 @@ def main(argv: list[str] | None = None) -> int:
                    help="also test the real consumer (needs the anthropic extra + key)")
     f.add_argument("--anthropic-model", default="claude-opus-4-8")
     f.set_defaults(func=_cmd_fluency)
+
+    im = sub.add_parser("install-mcp", help="wrap Claude Code MCP server(s) with the "
+                                            "terse proxy in ~/.claude.json")
+    im.add_argument("servers", nargs="+", help="mcpServers name(s) to wrap (e.g. runecho)")
+    im.add_argument("--policy", required=True, help="path to the JSON policy file")
+    im.add_argument("--print", action="store_true",
+                    help="dry-run: show the before/after without writing")
+    im.set_defaults(func=_cmd_install_mcp)
+
+    um = sub.add_parser("uninstall-mcp", help="restore terse-wrapped MCP server(s) to "
+                                              "their original command")
+    um.add_argument("servers", nargs="*", help="server name(s) to restore (or use --all)")
+    um.add_argument("--all", action="store_true", help="restore every terse-managed server")
+    um.add_argument("--print", action="store_true",
+                    help="dry-run: show what would be restored without writing")
+    um.set_defaults(func=_cmd_uninstall_mcp)
 
     args = parser.parse_args(argv)
     return args.func(args)

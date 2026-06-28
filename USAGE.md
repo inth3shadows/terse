@@ -60,6 +60,31 @@ the results the policy says to shrink, and passes everything else through untouc
 anything ever goes wrong with a compression, terse sends the original result instead, so
 a tool call is never lost. Add `--debug` to see what it compressed.
 
+### Wire terse into Claude Code automatically (`install-mcp`)
+
+Rather than editing `~/.claude.json` by hand, let terse wrap your MCP servers for you:
+
+```
+# preview the change (writes nothing):
+uv run terse install-mcp runecho --policy policy.example.json --print
+
+# apply it (backs up ~/.claude.json first), then restart Claude Code:
+uv run terse install-mcp runecho codegraph --policy policy.example.json
+
+# undo — restore the original command(s) exactly:
+uv run terse uninstall-mcp runecho        # one server
+uv run terse uninstall-mcp --all          # every terse-managed server
+```
+
+`install-mcp` rewrites each named `mcpServers` entry so its command becomes
+`<python> -m terse proxy --policy <policy> -- <the original command>`, preserving
+the entry's `env`/`cwd`/etc. The original is saved verbatim in a sidecar stash
+(`.terse-mcp-stash.json` next to the config), so `uninstall-mcp` restores it
+byte-for-byte. It's **idempotent** (re-running re-wraps from the stashed original
+instead of nesting proxies) and never enables `--diff`. It honors `$CLAUDE_CONFIG`
+if your config isn't at `~/.claude.json`. Start with one high-win, read-only
+server (e.g. `runecho`) and confirm it works before wrapping more.
+
 ### See how well it does across many tools
 
 If you've collected sample outputs (see "Building a sample set" below), these produce
