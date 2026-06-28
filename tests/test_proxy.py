@@ -137,6 +137,31 @@ def test_diff_not_emitted_when_it_would_not_be_smaller():
     assert transforms.decompress(text) == other
 
 
+def test_keyframe_forces_full_after_k_consecutive_diffs():
+    # With interval K, the (K+1)th same-tool result is a full keyframe, not a diff, so a
+    # chained diff never drifts more than K turns from a self-contained anchor (#8).
+    pol = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))],
+                 diff=True, diff_keyframe_interval=3)
+    inter = Interceptor(pol)
+    texts = [_emit(inter, 1, "gh.api.items", _records(40))]            # full (no prior)
+    for i in range(2, 8):                                              # small change each call
+        texts.append(_emit(inter, i, "gh.api.items", _records(40, change=i % 40)))
+    is_diff = [transforms.DIFF_MARKER in t for t in texts]
+    assert is_diff == [False, True, True, True, False, True, True]    # F D D D | F(keyframe) D D
+    # the keyframe (index 4, i.e. call i=5) reconstructs WITHOUT any prior — self-contained
+    assert transforms.decompress(texts[4]) == _records(40, change=5)
+
+
+def test_keyframe_interval_zero_never_forces_full():
+    pol = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))],
+                 diff=True, diff_keyframe_interval=0)
+    inter = Interceptor(pol)
+    texts = [_emit(inter, 1, "gh.api.items", _records(40))]
+    for i in range(2, 8):
+        texts.append(_emit(inter, i, "gh.api.items", _records(40, change=i % 40)))
+    assert all(transforms.DIFF_MARKER in t for t in texts[1:])        # every follow-up is a diff
+
+
 def _cost_lt(a, b):
     from terse.proxy import _cost
     return _cost(a) < _cost(b)

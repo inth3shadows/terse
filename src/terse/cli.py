@@ -89,6 +89,8 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
     pol = load_policy(args.policy) if args.policy else default_policy()
     if args.diff:
         pol.diff = True  # CLI opt-in overrides the policy default (off)
+    if args.diff_keyframe_interval is not None:
+        pol.diff_keyframe_interval = args.diff_keyframe_interval
     return run_proxy(cmd, pol, debug=args.debug)
 
 
@@ -284,6 +286,9 @@ def main(argv: list[str] | None = None) -> int:
     px = sub.add_parser("proxy", help="MCP stdio proxy: compress a downstream server's "
                                       "tool results per policy")
     px.add_argument("--policy", help="path to a JSON policy file (default: lossless-everywhere)")
+    px.add_argument("--diff-keyframe-interval", type=int, default=None, metavar="K",
+                    help="with --diff, force a full result every K consecutive diffs per tool "
+                         "to bound dangling-reference drift (default 5; 0 disables)")
     px.add_argument("--diff", action="store_true",
                     help="enable cross-call diffing (stateful; emits a lossless delta vs the "
                          "prior same-tool result when smaller). Opt-in: fluency unverified")

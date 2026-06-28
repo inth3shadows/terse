@@ -32,14 +32,18 @@ _SANITIZE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _has_record_list(obj: Any) -> bool:
-    """True if obj is, or directly wraps, a list of >=2 dicts (the tabularize shape)."""
+    """True if obj contains, at ANY depth, a list of >=2 dicts (the tabularize shape).
+
+    Recurses to match what `transforms.compress_structure` actually folds: a record
+    list nested several levels deep (e.g. {"data": {"results": [...]}}) still
+    tabularizes, so it must bucket as ARRAY_OF_RECORDS rather than mis-classify as
+    compact-json and understate coverage (issue #4)."""
     if isinstance(obj, list):
-        return len(obj) >= 2 and all(isinstance(x, dict) for x in obj)
+        if len(obj) >= 2 and all(isinstance(x, dict) for x in obj):
+            return True
+        return any(_has_record_list(x) for x in obj)
     if isinstance(obj, dict):
-        return any(
-            isinstance(v, list) and len(v) >= 2 and all(isinstance(x, dict) for x in v)
-            for v in obj.values()
-        )
+        return any(_has_record_list(v) for v in obj.values())
     return False
 
 

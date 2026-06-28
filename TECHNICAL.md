@@ -218,7 +218,11 @@ gitignored because captured tool output may contain real data.
   proves the diff reconstructs but **not** that a model *reads* it as well as the full
   form — checked by `terse fluency --diff`; (2) the diff references the prior result in
   the model's context, which a context compaction could evict. Enable only after the diff
-  fluency check passes for your consumer.
+  fluency check passes for your consumer. Risk (2) is bounded by **keyframes**: the proxy
+  forces a self-contained full result after every K consecutive diffs per tool, so a
+  chained diff can never drift more than K turns from an anchor a model can reconstruct
+  from scratch (`diff_keyframe_interval` policy field / `proxy --diff-keyframe-interval K`,
+  default 5; 0 disables).
 - **Marker collision.** A payload that genuinely contains a top-level
   `__terse_table__` / `__terse_dict__` key, or whose strings exhaust the entire
   `~`-alias namespace, is a theoretical edge not specially handled. Real tool output

@@ -53,6 +53,11 @@ class Policy:
     # default: enable per-policy (`"diff": true`) or with `proxy --diff`. The proxy still
     # falls back to the full compressed form whenever a diff doesn't apply or win.
     diff: bool = False
+    # Bound dangling-reference drift (#8): force a self-contained full result (a
+    # keyframe, like video I-frames) after this many consecutive diffs per tool, so a
+    # chained diff can never drift more than K turns from an anchor the model can
+    # reconstruct from scratch. 0 disables keyframing (diff whenever it wins).
+    diff_keyframe_interval: int = 5
 
     def select(self, tool: str) -> Rule:
         """First rule whose glob matches the tool name, else the lossless default."""
@@ -90,7 +95,8 @@ def load_policy(path: str | Path) -> Policy:
         glob = match.get("tool", "*")
         rules.append(Rule(tool_glob=glob, tiers=_coerce_tiers(r.get("tiers", []), f"policies[{i}]"),
                           fields=r.get("fields", {})))
-    return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", False)))
+    return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", False)),
+                  diff_keyframe_interval=int(doc.get("diff_keyframe_interval", 5)))
 
 
 @dataclass
