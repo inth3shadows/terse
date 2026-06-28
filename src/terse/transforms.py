@@ -39,6 +39,26 @@ DICT_MARKER = "__terse_dict__"
 DIFF_MARKER = "__terse_diff__"
 ALIAS_SIGIL = "~"
 
+# Keys reserved for terse's own envelopes. A real payload that already contains one
+# can't be safely compressed: the consumer reads these markers per the format primer,
+# so it would mis-reconstruct the user's literal dict as a terse envelope. The codec
+# has no escape convention, so the only lossless move is to leave such a payload alone.
+_RESERVED_MARKERS = frozenset({TABLE_MARKER, DICT_MARKER, DIFF_MARKER})
+
+
+def has_terse_marker(obj: Any) -> bool:
+    """True if obj contains, at ANY depth, a dict key reserved for a terse envelope.
+
+    decompress / the model's primer interpret these markers wherever they appear, so a
+    collision anywhere — not just top-level — makes a payload unsafe to compress."""
+    if isinstance(obj, dict):
+        if not _RESERVED_MARKERS.isdisjoint(obj.keys()):
+            return True
+        return any(has_terse_marker(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(has_terse_marker(x) for x in obj)
+    return False
+
 
 # --------------------------------------------------------------------------- #
 # minify
