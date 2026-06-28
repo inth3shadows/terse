@@ -1,0 +1,26 @@
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read          # least privilege — the workflow only reads the repo
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Floor (the requires-python promise) through current stable. Test both ends so
+        # a ">=3.11" claim is actually verified, not just the dev default. 3.14 is left
+        # off until tiktoken ships wheels for it (else CI compiles the Rust ext + fails).
+        python-version: ["3.11", "3.12", "3.13"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --dev          # no anthropic extra: keeps CI keyless, matches design
+      - run: uv run pytest -q
