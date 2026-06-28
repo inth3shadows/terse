@@ -162,6 +162,23 @@ def test_keyframe_interval_zero_never_forces_full():
     assert all(transforms.DIFF_MARKER in t for t in texts[1:])        # every follow-up is a diff
 
 
+def test_non_json_result_evicts_diff_base_so_next_re_anchors():
+    # JSON A -> non-JSON error -> JSON C for the same tool. The non-JSON result is the
+    # model's visible "previous result", so C must NOT diff against the now-invisible A;
+    # the base is evicted and C re-anchors as a full, else reconstruction applies the
+    # delta to the wrong base (#8).
+    pol = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))], diff=True)
+    inter = Interceptor(pol)
+    _emit(inter, 1, "gh.api.items", _records(40))                    # full (no prior); sets base
+    inter.note_request(_req(2, "gh.api.items"))                      # same tool, non-JSON result
+    err = inter.transform_response(_result_msg(2, "upstream error: rate limited"))
+    assert json.loads(err)["result"]["content"][0]["text"] == "upstream error: rate limited"
+    # base evicted -> the next JSON result is a full keyframe, not a diff against A
+    c = _emit(inter, 3, "gh.api.items", _records(40, change=5))
+    assert transforms.DIFF_MARKER not in c
+    assert transforms.decompress(c) == _records(40, change=5)
+
+
 def _cost_lt(a, b):
     from terse.proxy import _cost
     return _cost(a) < _cost(b)

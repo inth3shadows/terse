@@ -53,3 +53,19 @@ def test_extract_records_top_level_and_wrapped():
     assert extract_records({"result": [{"a": 1}, {"a": 2}]}) is not None
     assert extract_records({"a": 1}) is None
     assert extract_records([{"a": 1}]) is None  # single record, not a list to fold
+
+
+def test_extract_records_recurses_to_match_the_tabularizer():
+    # The tabularizer folds a uniform record list at ANY depth, so extract_records must
+    # find it there too — else the probes/fluency silently skip nested record payloads
+    # the coverage report counts as record-shaped (#4).
+    nested = {"data": {"results": [{"id": 1, "s": "a"}, {"id": 2, "s": "b"}]}}
+    assert extract_records(nested) == [{"id": 1, "s": "a"}, {"id": 2, "s": "b"}]
+
+
+def test_extract_records_requires_uniform_keys():
+    # A non-uniform dict list is NOT what the tabularizer folds (it needs one shared key
+    # set), so it must not be returned — callers index every record by the first record's
+    # columns and would KeyError otherwise.
+    assert extract_records([{"a": 1}, {"b": 2}]) is None
+    assert extract_records({"result": [{"id": 1, "x": 0}, {"id": 2}]}) is None

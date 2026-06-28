@@ -155,7 +155,15 @@ class Interceptor:
                 sys.stderr.write(f"[terse-proxy] {tool}: passthrough on error: {exc}\n")
             return False
         if applied.skipped:
-            return False  # passthrough tool: leave fully alone, keep no diff state
+            # Skipped = a passthrough tool OR a non-JSON result (e.g. an upstream error
+            # string) for a normally-compressed one. Either way it carries no JSON the
+            # next diff could build on, and it becomes the model's visible "previous
+            # same-tool result" — so drop any stale diff base and reset the keyframe
+            # counter, forcing the next result to re-anchor as a full (#8). A passthrough
+            # tool never accumulates state, so this is a no-op for it.
+            self.last.pop(tool, None)
+            self.since_keyframe.pop(tool, None)
+            return False  # leave the payload itself fully alone
 
         chosen = applied.text
         try:

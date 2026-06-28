@@ -62,6 +62,21 @@ def test_deeply_nested_record_list_is_array_of_records():
     assert capture.classify_shape(plain) == capture.COMPACT_JSON
 
 
+def test_non_uniform_dict_list_is_not_array_of_records():
+    # The tabularizer only folds dict lists that share one key set; a non-uniform list
+    # is a measured no-op for tabularize, so it must NOT bucket as array-of-records and
+    # overstate coverage (matches transforms._uniform_dict_list, the canonical rule).
+    nonuniform = json.dumps([{"a": 1}, {"b": 2}])
+    assert capture.classify_shape(nonuniform) == capture.COMPACT_JSON
+
+
+def test_classify_shape_survives_pathological_nesting():
+    # An absurdly deep (record-free) payload json.loads accepts must not blow the stack
+    # in the classifier; it bails to a non-record bucket rather than raising (#4).
+    deep = "[" * 1000 + "1" + "]" * 1000
+    assert capture.classify_shape(deep) == capture.COMPACT_JSON
+
+
 def test_capture_load_coverage_roundtrip(tmp_path):
     capture.capture_payload("gh.issues", json.dumps([{"n": 1}, {"n": 2}]), tmp_path)
     capture.capture_payload("gh.user", json.dumps({"login": "x"}), tmp_path)
