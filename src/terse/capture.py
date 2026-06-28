@@ -91,6 +91,11 @@ def classify_shape(raw: str) -> str:
         obj = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return LONG_TEXT if len(raw) >= _LONG_TEXT_CHARS else OTHER
+    except RecursionError:
+        # On the 3.11 floor, json.loads itself recurses and overflows on a deeply nested
+        # payload (3.12+ parse it iteratively). Too deep to parse == can't be classified
+        # or compressed, so bucket it as unparseable rather than crash the measurement.
+        return LONG_TEXT if len(raw) >= _LONG_TEXT_CHARS else OTHER
 
     is_pretty = "\n" in raw.strip()  # indented JSON has interior newlines; a lone
     #                                   trailing newline (e.g. from `jq -c`) is not pretty
