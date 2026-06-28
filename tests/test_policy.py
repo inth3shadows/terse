@@ -68,6 +68,35 @@ def test_truncate_on_absent_field_is_lossless_noop():
     assert transforms.decompress(result.text) == json.loads(RECORDS)
 
 
+def test_has_terse_marker_detects_reserved_keys_at_any_depth():
+    assert transforms.has_terse_marker({"__terse_table__": 1, "cols": [], "rows": []})
+    assert transforms.has_terse_marker({"a": [{"__terse_dict__": 1}]})        # nested in a list
+    assert transforms.has_terse_marker({"x": {"y": {"__terse_diff__": 1}}})   # deeply nested
+    assert not transforms.has_terse_marker({"result": [{"id": 1}, {"id": 2}]})
+    assert not transforms.has_terse_marker({"terse_table": 1, "~0": "not a marker"})
+
+
+def test_marker_collision_payload_passes_through_uncompressed():
+    # A payload that already carries a reserved marker can't be compressed: the consumer
+    # reads the marker per the primer and would mis-reconstruct the user's own dict. The
+    # guard leaves it verbatim and warns, rather than silently corrupting it (#6).
+    collide = json.dumps({"__terse_table__": 1, "cols": ["a"], "rows": [[1]]})
+    p = _policy()
+    result = apply(collide, "gh.api.x", p)
+    assert result.skipped is True
+    assert result.text == collide                                  # emitted verbatim
+    assert any("reserved terse marker" in w for w in result.warnings)
+    # the danger the guard averts: compressing then decompressing this payload mangles it
+    assert transforms.decompress(transforms.compress(json.loads(collide))) != json.loads(collide)
+
+
+def test_marker_collision_guard_does_not_touch_normal_payloads():
+    p = _policy()
+    result = apply(RECORDS, "gh.api.x", p)
+    assert result.skipped is False
+    assert transforms.decompress(result.text) == json.loads(RECORDS)
+
+
 def test_tabularize_only_smaller_than_passthrough_but_lossless():
     p = Policy(rules=[Rule(tool_glob="*", tiers=("minify", "tabularize"))])
     result = apply(RECORDS, "any", p)

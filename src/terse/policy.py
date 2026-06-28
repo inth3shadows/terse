@@ -148,6 +148,14 @@ def apply(raw: str, tool: str, policy: Policy) -> Applied:
         return Applied(text=raw, tool=tool, tiers=(), skipped=True,
                        warnings=warnings + ["payload is not JSON; passed through"])
 
+    # Marker-collision guard: a payload that already carries a reserved terse marker key
+    # can't be compressed without the consumer mis-reading its own data as a terse
+    # envelope (the codec has no escape convention). Pass it through untouched (#6).
+    if transforms.has_terse_marker(obj):
+        return Applied(text=raw, tool=tool, tiers=(), skipped=True,
+                       warnings=warnings + ["payload contains a reserved terse marker key; "
+                                            "passed through uncompressed to stay lossless"])
+
     # Tier-1 lossy (truncate) runs BEFORE the lossless tiers and is fail-closed: any
     # path that doesn't resolve, or a gate failure, keeps the fully-lossless object.
     data = obj

@@ -223,10 +223,14 @@ gitignored because captured tool output may contain real data.
   chained diff can never drift more than K turns from an anchor a model can reconstruct
   from scratch (`diff_keyframe_interval` policy field / `proxy --diff-keyframe-interval K`,
   default 5; 0 disables).
-- **Marker collision.** A payload that genuinely contains a top-level
-  `__terse_table__` / `__terse_dict__` key, or whose strings exhaust the entire
-  `~`-alias namespace, is a theoretical edge not specially handled. Real tool output
-  does not contain these.
+- **Marker collision.** A payload that genuinely contains a reserved
+  `__terse_table__` / `__terse_dict__` / `__terse_diff__` key (at any depth) can't be
+  compressed without the consumer mis-reading the user's own dict as a terse envelope —
+  the codec has no escape convention. `policy.apply` detects this
+  (`transforms.has_terse_marker`) and passes the payload through uncompressed with a
+  warning, so the proxy stays lossless. The `~`-alias namespace can't be exhausted: the
+  base-36 generator is unbounded against a finite avoid-set. Real tool output contains
+  none of these.
 - **Dictionary coding trades some direct legibility for tokens.** A `~0` reference is
   resolved by reading the inline legend in the same payload (no retrieve step), but it
   is less immediately readable than the literal value. It is gated on real token
