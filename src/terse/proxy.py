@@ -74,6 +74,10 @@ class Interceptor:
         self.debug = debug
         self.diff = pol.diff
         self.last: dict[str, Any] = {}  # tool -> previous result object (the diff base)
+        # tool -> consecutive diffs emitted since the last full (keyframe) result. Bounds
+        # how far a chained diff can drift from a self-contained anchor (#8).
+        self.keyframe_interval = pol.diff_keyframe_interval
+        self.since_keyframe: dict[str, int] = {}
         self.init_id: Any = None        # id of the initialize request, to prime its reply
 
     def note_request(self, line: str) -> None:
@@ -151,7 +155,15 @@ class Interceptor:
                 sys.stderr.write(f"[terse-proxy] {tool}: passthrough on error: {exc}\n")
             return False
         if applied.skipped:
-            return False  # passthrough tool: leave fully alone, keep no diff state
+            # Skipped = a passthrough tool OR a non-JSON result (e.g. an upstream error
+            # string) for a normally-compressed one. Either way it carries no JSON the
+            # next diff could build on, and it becomes the model's visible "previous
+            # same-tool result" — so drop any stale diff base and reset the keyframe
+            # counter, forcing the next result to re-anchor as a full (#8). A passthrough
+            # tool never accumulates state, so this is a no-op for it.
+            self.last.pop(tool, None)
+            self.since_keyframe.pop(tool, None)
+            return False  # leave the payload itself fully alone
 
         chosen = applied.text
         try:
@@ -160,14 +172,26 @@ class Interceptor:
             curr = None
         if curr is not None:
             prev = self.last.get(tool)
-            if prev is not None:
+            emitted_diff = False
+            # A keyframe is due once K diffs have chained off the last full result; force
+            # the full compressed form so the chain re-anchors (#8). interval 0 = never.
+            keyframe_due = (self.keyframe_interval > 0
+                            and self.since_keyframe.get(tool, 0) >= self.keyframe_interval)
+            if prev is not None and not keyframe_due:
                 wire = self._diff_wire(prev, curr, tool)
                 if wire is not None and _cost(wire) < _cost(applied.text):
                     chosen = wire
+                    emitted_diff = True
                     if self.debug:
                         sys.stderr.write(
                             f"[terse-proxy] {tool}: diff {_cost(applied.text)}->{_cost(wire)} "
                             f"tok vs full compressed\n")
+            if self.debug and keyframe_due:
+                sys.stderr.write(f"[terse-proxy] {tool}: keyframe (full) after "
+                                 f"{self.since_keyframe.get(tool, 0)} diffs\n")
+            # A diff extends the chain; any full result (no prior, diff lost, or keyframe)
+            # is a fresh anchor and resets the counter.
+            self.since_keyframe[tool] = self.since_keyframe.get(tool, 0) + 1 if emitted_diff else 0
             # Base the NEXT diff on the true current value, whichever form we emit:
             # the model's reconstructable state after this turn is `curr` either way.
             self.last[tool] = curr

@@ -19,6 +19,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .transforms import _uniform_dict_list  # the one canonical "what tabularize folds" rule
+
 # Shape buckets. classify_shape returns one of these.
 PRETTY_JSON = "pretty-json"
 COMPACT_JSON = "compact-json"
@@ -31,30 +33,51 @@ _LONG_TEXT_CHARS = 2000
 _SANITIZE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
-def _has_record_list(obj: Any) -> bool:
-    """True if obj is, or directly wraps, a list of >=2 dicts (the tabularize shape)."""
+# Cap recursion so an adversarially/pathologically nested payload (which json.loads
+# will happily parse) can't blow the stack inside the classifier; real tool output is
+# shallow, and at absurd depth the tabularizer itself would also bail, so returning
+# "no record list" is the safe, mirror-preserving direction (#4).
+_MAX_SHAPE_DEPTH = 200
+
+
+def _find_record_list(obj: Any, _depth: int = 0) -> list[dict] | None:
+    """The first list-of-uniform-dicts at ANY depth in obj (depth-first), else None.
+
+    This is exactly what `transforms.compress_structure` folds into a table — a list
+    of >=2 dicts that share one key set, nested arbitrarily deep — and it reuses the
+    canonical `_uniform_dict_list` rule so the shape classifier, the probe/fluency
+    record extractor, and the tabularizer can never drift on what counts as
+    record-shaped (the bug behind #4: three hand-rolled "mirror" checks disagreed)."""
+    if _depth > _MAX_SHAPE_DEPTH:
+        return None
     if isinstance(obj, list):
-        return len(obj) >= 2 and all(isinstance(x, dict) for x in obj)
-    if isinstance(obj, dict):
-        return any(
-            isinstance(v, list) and len(v) >= 2 and all(isinstance(x, dict) for x in v)
-            for v in obj.values()
-        )
-    return False
+        if _uniform_dict_list(obj):
+            return obj
+        for x in obj:
+            found = _find_record_list(x, _depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            found = _find_record_list(v, _depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _has_record_list(obj: Any) -> bool:
+    """True if obj contains, at ANY depth, a list-of-uniform-dicts (the tabularize shape)."""
+    return _find_record_list(obj) is not None
 
 
 def extract_records(obj: Any) -> list[dict] | None:
-    """Return the list-of-uniform-dicts inside obj (top-level or one wrap deep), else None.
+    """Return the list-of-uniform-dicts inside obj (at any depth), else None.
 
     Mirrors what the tabularizer folds, so the probes reason about the same cells.
+    Uniform keys are guaranteed, so callers may index every record by the first
+    record's columns without a KeyError.
     """
-    if isinstance(obj, list) and len(obj) >= 2 and all(isinstance(x, dict) for x in obj):
-        return obj
-    if isinstance(obj, dict):
-        for v in obj.values():
-            if isinstance(v, list) and len(v) >= 2 and all(isinstance(x, dict) for x in v):
-                return v
-    return None
+    return _find_record_list(obj)
 
 
 def classify_shape(raw: str) -> str:
