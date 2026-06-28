@@ -71,9 +71,20 @@ def test_non_uniform_dict_list_is_not_array_of_records():
 
 
 def test_classify_shape_survives_pathological_nesting():
-    # An absurdly deep (record-free) payload json.loads accepts must not blow the stack
-    # in the classifier; it bails to a non-record bucket rather than raising (#4).
+    # Depth that exceeds json.loads's own recursion tolerance on the 3.11 floor: the
+    # classifier must catch it and still return a bucket, not crash (#4). The exact
+    # bucket is version-dependent (3.11 can't parse this; 3.12+ can), so assert only
+    # that it survives with a valid bucket.
     deep = "[" * 1000 + "1" + "]" * 1000
+    assert capture.classify_shape(deep) in {
+        capture.COMPACT_JSON, capture.LONG_TEXT, capture.OTHER}
+
+
+def test_classify_shape_caps_deep_recursion_without_crashing():
+    # Parseable on every supported Python (well under json.loads's floor-version limit),
+    # but deeper than the classifier's own record-search cap: it must return a record-free
+    # bucket rather than RecursionError inside the walk (#4).
+    deep = "[" * 300 + "1" + "]" * 300
     assert capture.classify_shape(deep) == capture.COMPACT_JSON
 
 
