@@ -164,6 +164,49 @@ def build_tokenizer_report(rows: list[dict[str, Any]]) -> str:
     return "\n".join(out)
 
 
+def build_verify_header(corpus_label: str, n_payloads: int) -> str:
+    """Attestation header for `terse verify` — states what the report proves and what an
+    adopter must still verify themselves (tests, no-egress, fail-open). Self-contained so
+    the markdown stands alone as a shareable proof. No timestamp, so the artifact stays
+    reproducible (principle #31)."""
+    import platform
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        v = version("terse")
+    except PackageNotFoundError:
+        v = "(editable/dev)"
+    return "\n".join([
+        "# terse — verification report",
+        "",
+        f"- terse `{v}`  ·  python `{platform.python_version()}`  ·  os `{platform.system()}`",
+        f"- corpus: {corpus_label} — {n_payloads} payloads",
+        "",
+        "## What the tables below prove",
+        "",
+        "- **Lossless** — every payload round-trips byte-faithfully through terse. The "
+        "lossless gate INVALIDATES the whole report if any payload fails, because token "
+        "savings on top of corrupted data are meaningless.",
+        "- **Savings** — measured cl100k-token reduction per shape bucket and per tool on "
+        "this corpus. terse's win is shape-dependent, so it is never averaged into one "
+        "headline number.",
+        "",
+        "## What this does NOT replace — verify these yourself",
+        "",
+        "- **Correctness suite:** `pytest` — the full lossless / diff / proxy test set "
+        "(runs in CI on Python 3.11–3.13).",
+        '- **No egress:** `grep -rE "requests|urllib|socket" src/terse` resolves only to '
+        "`fluency.py` (an explicit, opt-in model eval the proxy never calls). The proxy is "
+        "stdio-only and persists nothing.",
+        "- **Fail-open:** read `src/terse/proxy.py` — any parse/compress error forwards the "
+        "ORIGINAL tool result unchanged; terse never drops or blocks a tool call.",
+        "",
+        "---",
+        "",
+        "",
+    ])
+
+
 def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
     out: list[str] = ["# terse spike report", ""]
 
