@@ -76,6 +76,30 @@ def test_do_install_writes_config_stash_and_backup(tmp_path, monkeypatch):
     assert back["mcpServers"]["runecho"] == {"command": "uvx", "args": ["runecho-mcp"]}
 
 
+def test_roundtrip_byte_identical_with_non_ascii(tmp_path, monkeypatch):
+    # The real ~/.claude.json holds non-ASCII (em-dashes, emoji, arrows) and is written
+    # by Claude Code with indent=2, ensure_ascii=False, and NO trailing newline. #27's
+    # acceptance is that install -> uninstall restores the file byte-for-byte. A naive
+    # json.dumps (ensure_ascii=True, +"\n") silently fails this on any non-ASCII config.
+    cfg = tmp_path / ".claude.json"
+    original_obj = {
+        "note": "onboarding — em-dash, emoji 🚨, and an arrow →",
+        "mcpServers": {"runecho": {"command": "uvx", "args": ["runecho-mcp"]}},
+        "otherTopLevel": {"keep": True},
+    }
+    original_text = json.dumps(original_obj, indent=2, ensure_ascii=False)  # no trailing nl
+    cfg.write_text(original_text, encoding="utf-8")
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+
+    im.do_install(["runecho"], str(policy), cfg=cfg)
+    assert "🚨" in cfg.read_text(encoding="utf-8")  # literal, not \uXXXX-escaped
+
+    im.do_uninstall(["runecho"], cfg=cfg)
+    assert cfg.read_text(encoding="utf-8") == original_text  # byte-identical to backup
+
+
 def test_do_install_unknown_server_raises_with_available(tmp_path, monkeypatch):
     cfg = tmp_path / ".claude.json"
     cfg.write_text(json.dumps(_cfg(runecho={"command": "uvx"})))

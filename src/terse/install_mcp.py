@@ -91,8 +91,13 @@ def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
 
-def _write_json(path: Path, obj: dict) -> None:
-    path.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
+def _write_json(path: Path, obj: dict, *, trailing_newline: bool = True) -> None:
+    # ensure_ascii=False keeps non-ASCII (em-dashes, emoji, …) literal, matching how
+    # Claude Code itself serializes ~/.claude.json. With the default (True), the first
+    # wrap rewrites the WHOLE file as \uXXXX escapes — huge spurious diff, and the
+    # install→uninstall round-trip is no longer byte-identical to the backup (#27).
+    text = json.dumps(obj, indent=2, ensure_ascii=False)
+    path.write_text(text + ("\n" if trailing_newline else ""), encoding="utf-8")
 
 
 def _backup(cfg: Path) -> Path:
@@ -106,7 +111,9 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
     cfg = cfg or config_path()
     if not cfg.exists():
         raise FileNotFoundError(f"Claude config not found: {cfg}")
-    config = _load_json(cfg)
+    raw = cfg.read_text(encoding="utf-8")
+    config = json.loads(raw)
+    had_nl = raw.endswith("\n")  # preserve trailing-newline state for byte-fidelity
     stash = _load_json(stash_path(cfg))
     policy_abs = str(Path(policy).resolve())
     if not Path(policy_abs).exists():
@@ -131,7 +138,7 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
               "changes": changes, "dry_run": dry_run, "backup": None}
     if not dry_run and changes:
         result["backup"] = str(_backup(cfg))
-        _write_json(cfg, config)
+        _write_json(cfg, config, trailing_newline=had_nl)
         _write_json(stash_path(cfg), stash)
     return result
 
@@ -139,7 +146,9 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
 def do_uninstall(servers: list[str] | None, *, all_: bool = False,
                  dry_run: bool = False, cfg: Path | None = None) -> dict:
     cfg = cfg or config_path()
-    config = _load_json(cfg)
+    raw = cfg.read_text(encoding="utf-8") if cfg.exists() else ""
+    config = json.loads(raw) if raw else {}
+    had_nl = raw.endswith("\n") if raw else True  # preserve trailing-newline state
     stash = _load_json(stash_path(cfg))
     targets = sorted(stash.keys()) if all_ else (servers or [])
 
@@ -154,6 +163,6 @@ def do_uninstall(servers: list[str] | None, *, all_: bool = False,
     result = {"config": str(cfg), "changes": changes, "dry_run": dry_run, "backup": None}
     if not dry_run and any(c.get("restored") for c in changes):
         result["backup"] = str(_backup(cfg))
-        _write_json(cfg, config)
+        _write_json(cfg, config, trailing_newline=had_nl)
         _write_json(stash_path(cfg), stash)
     return result
