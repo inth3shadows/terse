@@ -50,6 +50,17 @@ uv run terse capture --tool runecho.structure path/to/output.json --corpus corpu
 uv run terse verify --corpus corpus --out reports/verify-report.md
 ```
 
+Or capture your *live* traffic automatically: run the proxy with `--capture-dir`, use
+your agent normally, then verify what it actually saw — no per-payload `capture` step.
+
+```bash
+uv run terse proxy --capture-dir corpus --policy policy.json -- some-mcp-server
+uv run terse verify --corpus corpus --out reports/verify-report.md
+```
+
+`--capture-dir` tees only the *raw* (pre-compression) payloads and is a pure side
+effect — a capture failure never changes what your agent receives.
+
 The bundled sample proves the *mechanism* (lossless + the transforms firing); your own
 captured corpus proves the *savings on your workload* — terse's win is shape-dependent
 (large on record/symbol-shaped output, ~0% on already-compact or single-object tools),
