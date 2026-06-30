@@ -95,6 +95,40 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
                      debug_log=args.debug_log)
 
 
+def _cmd_policy_generate(args: argparse.Namespace) -> int:
+    from .policy import load_policy
+    from .policy_gen import generate_policy
+
+    envelopes = load_corpus(args.corpus)
+    if not envelopes:
+        print(f"no payloads in {args.corpus}/ — capture some first "
+              f"(`terse capture` or `proxy --capture-dir`).", file=sys.stderr)
+        return 1
+
+    doc, rows = generate_policy(envelopes, threshold=args.threshold)
+    text = _json.dumps(doc, ensure_ascii=False, indent=2)
+
+    # Per-tool decision summary to stderr so stdout stays a clean policy when piped.
+    print(f"# terse policy generate — {len(rows)} tool(s), threshold {args.threshold:.1f}%",
+          file=sys.stderr)
+    for r in rows:
+        tiers = ",".join(r["tiers"]) or "(passthrough)"
+        print(f"  {r['tool']:<28} {tiers:<28} {r['reason']}", file=sys.stderr)
+
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text + "\n", encoding="utf-8")
+        # Fail loudly if we just wrote a policy our own loader rejects — a generated file
+        # that can't be loaded is worse than none.
+        load_policy(out)
+        print(f"[policy written to {out} — verify comprehension with "
+              f"`terse fluency --corpus {args.corpus}`]", file=sys.stderr)
+    else:
+        sys.stdout.write(text + "\n")
+    return 0
+
+
 def _cmd_compress(args: argparse.Namespace) -> int:
     from .policy import apply, default_policy, load_policy
 
@@ -353,6 +387,17 @@ def main(argv: list[str] | None = None) -> int:
     g = sub.add_parser("gate", help="run the lossless round-trip gate on a JSON file")
     g.add_argument("file", help="path to a JSON payload, or - for stdin")
     g.set_defaults(func=_cmd_gate)
+
+    pol = sub.add_parser("policy", help="author/inspect a per-tool policy")
+    pol_sub = pol.add_subparsers(dest="policy_cmd", required=True)
+    pg = pol_sub.add_parser("generate", help="auto-author a conservative lossless policy "
+                                             "from a measured corpus")
+    pg.add_argument("--corpus", default=DEFAULT_CORPUS)
+    pg.add_argument("--out", help="write the policy here (default: stdout)")
+    pg.add_argument("--threshold", type=float, default=5.0, metavar="PCT",
+                    help="min total savings %% to compress a tool, and min marginal %% to add "
+                         "the dictionary tier (default 5.0; conservative)")
+    pg.set_defaults(func=_cmd_policy_generate)
 
     c2 = sub.add_parser("compress", help="compress a tool output per policy (the shell)")
     c2.add_argument("file", help="path to the raw tool output, or - for stdin")
