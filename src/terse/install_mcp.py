@@ -47,11 +47,12 @@ def terse_invocation() -> list[str]:
 
 # ------------------------------------------------------------------- pure core
 def wrap(config: dict, stash: dict, server: str, policy: str,
-         terse_cmd: list[str]) -> tuple[dict, dict]:
+         terse_cmd: list[str], capture_dir: str | None = None) -> tuple[dict, dict]:
     """Wrap `server`'s entry with the terse proxy. Idempotent: if already managed
     (present in stash), re-wrap from the stashed original so policy/cmd updates
     apply cleanly without nesting proxies. Preserves all non-command/args keys
-    (env, cwd, type, …) of the original entry."""
+    (env, cwd, type, …) of the original entry. With `capture_dir`, the wrapped proxy
+    tees raw tool results into that corpus for later measurement (#32)."""
     servers = config.setdefault("mcpServers", {})
     if server in stash:
         original = stash[server]
@@ -66,10 +67,12 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
         raise ValueError(f"server '{server}' has no 'command' to wrap")
     orig_args = list(original.get("args", []))
 
+    proxy_opts = ["--policy", policy]
+    if capture_dir:
+        proxy_opts += ["--capture-dir", capture_dir]
     new_entry = {k: v for k, v in original.items() if k not in ("command", "args")}
     new_entry["command"] = terse_cmd[0]
-    new_entry["args"] = [*terse_cmd[1:], "proxy", "--policy", policy, "--",
-                         orig_cmd, *orig_args]
+    new_entry["args"] = [*terse_cmd[1:], "proxy", *proxy_opts, "--", orig_cmd, *orig_args]
     servers[server] = new_entry
     return config, stash
 
@@ -107,7 +110,7 @@ def _backup(cfg: Path) -> Path:
 
 
 def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
-               cfg: Path | None = None) -> dict:
+               cfg: Path | None = None, capture_dir: str | None = None) -> dict:
     cfg = cfg or config_path()
     if not cfg.exists():
         raise FileNotFoundError(f"Claude config not found: {cfg}")
@@ -118,6 +121,9 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
     policy_abs = str(Path(policy).resolve())
     if not Path(policy_abs).exists():
         raise FileNotFoundError(f"policy not found: {policy_abs}")
+    # Resolve to an absolute path so capture works regardless of the proxy's cwd; the
+    # proxy/capture_payload creates the dir on first write, so no need to pre-create it.
+    capture_abs = str(Path(capture_dir).resolve()) if capture_dir else None
     terse_cmd = terse_invocation()
 
     available = sorted((config.get("mcpServers") or {}).keys())
@@ -130,12 +136,13 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
     changes = []
     for s in servers:
         before = (config.get("mcpServers") or {}).get(s)
-        wrap(config, stash, s, policy_abs, terse_cmd)
+        wrap(config, stash, s, policy_abs, terse_cmd, capture_dir=capture_abs)
         changes.append({"server": s, "before": before,
                         "after": config["mcpServers"][s]})
 
     result = {"config": str(cfg), "policy": policy_abs, "available": available,
-              "changes": changes, "dry_run": dry_run, "backup": None}
+              "changes": changes, "dry_run": dry_run, "backup": None,
+              "capture_dir": capture_abs}
     if not dry_run and changes:
         result["backup"] = str(_backup(cfg))
         _write_json(cfg, config, trailing_newline=had_nl)
