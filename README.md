@@ -89,8 +89,20 @@ policy.example.json   selective policy encoding the measured per-tool insight
 corpus/          captured tool outputs (gitignored; may contain real data)
 ```
 
+## Verify it yourself
+
+terse sits in your agent's critical path, so it earns trust by inspection. See
+[VERIFY.md](VERIFY.md) for the full walkthrough — or generate a self-contained
+report (lossless gate + per-tool token savings) in one command:
+
+```bash
+terse verify --out reports/verify-report.md          # bundled sample, zero setup
+terse verify --corpus corpus --out report.md         # your own captured traffic
+```
+
 ## Related Documentation
 
+- [Verify it yourself](VERIFY.md) — prove losslessness, savings, and no-egress locally
 - [Technical Reference](TECHNICAL.md) — architecture, pipeline, policy schema, limitations
 - [Usage Guide](USAGE.md) — running the CLI day-to-day and reading its output
 

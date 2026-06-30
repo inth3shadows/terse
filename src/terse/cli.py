@@ -286,6 +286,54 @@ def _cmd_uninstall_mcp(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_verify(args: argparse.Namespace) -> int:
+    """Self-contained verification report: lossless gate + token savings + an attestation
+    header pointing at the checks terse can't self-certify (tests, no-egress, fail-open).
+    Runs on captured traffic (--corpus) or, with none, a bundled deterministic sample so
+    it works with zero setup from a checkout."""
+    import subprocess
+    import tempfile
+
+    from .capture import coverage, load_corpus
+    from .measure import measure_corpus
+    from .report import build_report, build_verify_header
+
+    if args.corpus:
+        envelopes = load_corpus(args.corpus)
+        if not envelopes:
+            print(f"verify: no payloads in {args.corpus}/ — capture some first "
+                  "(`terse capture --tool <name> <payload>`).", file=sys.stderr)
+            return 1
+        label = f"your captured traffic (`{args.corpus}`)"
+    else:
+        # scripts/ ships with the repo, not the installed wheel — so the zero-setup sample
+        # path works from a checkout (where an adopter also runs pytest), not pip-only.
+        script = Path(__file__).resolve().parents[2] / "scripts" / "gen_stress_corpus.py"
+        if not script.exists():
+            print("verify: no --corpus given and the bundled sample generator isn't "
+                  "available here. Run from a repo checkout, or pass --corpus <dir> with "
+                  "captured output (`terse capture`).", file=sys.stderr)
+            return 2
+        # TemporaryDirectory so the synthetic corpus doesn't accumulate in /tmp; envelopes
+        # are read fully into memory by load_corpus, so the dir can go right after.
+        with tempfile.TemporaryDirectory(prefix="terse-verify-") as sample_dir:
+            try:
+                subprocess.run([sys.executable, str(script), sample_dir], check=True,
+                               stdout=subprocess.DEVNULL)
+            except subprocess.CalledProcessError as exc:
+                print(f"verify: the bundled sample generator failed (exit {exc.returncode}). "
+                      "Pass --corpus <dir> with captured output instead.", file=sys.stderr)
+                return 2
+            envelopes = load_corpus(sample_dir)
+        label = ("bundled deterministic sample — synthetic; capture real traffic with "
+                 "`terse capture` for your own numbers")
+
+    rows = measure_corpus(envelopes, use_anthropic=False)
+    report = build_verify_header(label, len(envelopes)) + build_report(rows, coverage(envelopes))
+    _write_report(report, args.out)
+    return 0
+
+
 def _write_report(report: str, out_path: str) -> None:
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -380,6 +428,13 @@ def main(argv: list[str] | None = None) -> int:
     um.add_argument("--print", action="store_true",
                     help="dry-run: show what would be restored without writing")
     um.set_defaults(func=_cmd_uninstall_mcp)
+
+    vf = sub.add_parser("verify", help="self-contained verification report: lossless gate "
+                                       "+ token savings, and how to verify the rest")
+    vf.add_argument("--corpus", help="captured-traffic corpus dir (default: a bundled "
+                                     "deterministic sample, so it runs with zero setup)")
+    vf.add_argument("--out", default="reports/verify-report.md")
+    vf.set_defaults(func=_cmd_verify)
 
     args = parser.parse_args(argv)
     return args.func(args)
