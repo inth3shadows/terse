@@ -75,11 +75,16 @@ class Interceptor:
     # evicted id whose result arrives late just forwards uncompressed — safe, fail-open.
     PENDING_MAX = 1024
 
-    def __init__(self, pol: policy_mod.Policy, debug: bool = False):
+    def __init__(self, pol: policy_mod.Policy, debug: bool = False,
+                 capture: Optional[Callable[[str, str], None]] = None):
         self.policy = pol
         self.pending: dict[Any, str] = {}
         self.debug = debug
         self.diff = pol.diff
+        # Optional tee of each RAW (pre-compression) tool-result text, keyed by tool name
+        # (#32). Keeps the Interceptor I/O-free: the callback owns the disk write. Never
+        # affects forwarding — its failures are swallowed at the call site.
+        self.capture = capture
         self.last: dict[str, Any] = {}  # tool -> previous result object (the diff base)
         # tool -> consecutive diffs emitted since the last full (keyframe) result. Bounds
         # how far a chained diff can drift from a self-contained anchor (#8).
@@ -159,6 +164,17 @@ class Interceptor:
             text_blocks = [b for b in content
                            if isinstance(b, dict) and b.get("type") == "text"
                            and isinstance(b.get("text"), str)]
+
+            # Tee the RAW payload before any compression touches it (#32). Strictly a side
+            # effect: a capture failure must NEVER affect what the client receives, so it
+            # is swallowed here regardless of what the callback does.
+            if self.capture is not None:
+                for b in text_blocks:
+                    try:
+                        self.capture(tool, b["text"])
+                    except Exception as exc:  # noqa: BLE001 — capture is never load-bearing
+                        if self.debug:
+                            sys.stderr.write(f"[terse-proxy] {tool}: capture skipped: {exc}\n")
 
             changed = False
             # Diffing reasons about ONE logical payload, so it only engages for a single
@@ -314,14 +330,33 @@ def run_proxy(
     debug: bool = False,
     stdin: Optional[TextIO] = None,
     stdout: Optional[TextIO] = None,
+    capture_dir: Optional[str] = None,
 ) -> int:
     """Launch the downstream MCP server `cmd` and proxy stdio through `Interceptor`.
     The child shares this process's lifecycle: it is reaped on normal exit, on a crash
     (via `finally`), and on SIGTERM (the signal a parent MCP client uses to stop us),
-    so it is never left orphaned (#21)."""
+    so it is never left orphaned (#21).
+
+    With `capture_dir`, each raw tool-result payload is also teed into that corpus dir
+    (#32) for later `terse verify --corpus`/`measure` — opt-in, and strictly a side
+    effect that can never change what the client receives."""
     cin = stdin or sys.stdin
     cout = stdout or sys.stdout
-    inter = Interceptor(pol, debug=debug)
+
+    capture: Optional[Callable[[str, str], None]] = None
+    if capture_dir is not None:
+        from .capture import capture_payload
+
+        def capture(tool: str, raw: str) -> None:
+            # Swallow here too (defense in depth alongside the Interceptor's guard): a
+            # read-only or full corpus dir must not break the proxy.
+            try:
+                capture_payload(tool, raw, capture_dir)
+            except Exception as exc:  # noqa: BLE001 — capture is never load-bearing
+                if debug:
+                    sys.stderr.write(f"[terse-proxy] capture_payload failed: {exc}\n")
+
+    inter = Interceptor(pol, debug=debug, capture=capture)
 
     proc = subprocess.Popen(  # noqa: S603 — cmd is operator-supplied, by design
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,

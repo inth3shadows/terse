@@ -295,6 +295,70 @@ def test_primer_injected_once_not_per_message():
     assert inter.transform_response(resp2) == resp2
 
 
+# --- raw-payload capture tee (#32) ---
+
+def test_capture_tees_raw_text_before_compression():
+    captured: list[tuple[str, str]] = []
+    inter = Interceptor(FULL, capture=lambda tool, raw: captured.append((tool, raw)))
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                                   "params": {"name": "gh.api.items"}}))
+    raw = _records_text()
+    out = inter.transform_response(_result_msg(7, raw))
+    # captured payload is the RAW pre-compression text, tagged by tool...
+    assert captured == [("gh.api.items", raw)]
+    # ...while the client still received the compressed (transformed) form
+    assert json.loads(out)["result"]["content"][0]["text"] != raw
+
+
+def test_capture_failure_never_affects_forwarding():
+    def boom(tool: str, raw: str) -> None:
+        raise OSError("read-only corpus")
+    inter = Interceptor(FULL, capture=boom)
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "gh.api.items"}}))
+    out = inter.transform_response(_result_msg(1, _records_text()))
+    # despite the capture raising, the result is still compressed losslessly and delivered
+    text = json.loads(out)["result"]["content"][0]["text"]
+    assert transforms.decompress(text) == json.loads(_records_text())
+
+
+def test_run_proxy_capture_dir_writes_loadable_corpus(tmp_path):
+    from terse.capture import load_corpus
+
+    requests = "\n".join([
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "gh.api.items"}}),
+    ]) + "\n"
+    cin, cout = io.StringIO(requests), io.StringIO()
+    corpus = tmp_path / "corpus"
+    rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout,
+                   capture_dir=str(corpus))
+    assert rc == 0
+    envs = load_corpus(corpus)
+    # exactly the one tools/call result was teed (the initialize reply is not a tool call)
+    assert len(envs) == 1 and envs[0]["tool"] == "gh.api.items"
+    # and it captured the RAW payload, consumable by verify/measure
+    assert json.loads(envs[0]["raw"])["result"][0]["status"] == "active"
+
+
+def test_run_proxy_capture_dir_failure_does_not_break_traffic(tmp_path):
+    # point --capture-dir at an existing FILE: capture_payload's mkdir fails on every
+    # call, but the proxy must still forward and compress (capture is never load-bearing).
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    requests = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "gh.api.items"}}) + "\n"
+    cin, cout = io.StringIO(requests), io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout,
+                   capture_dir=str(blocker))
+    assert rc == 0
+    line = [l for l in cout.getvalue().splitlines() if l.strip()][0]
+    text = json.loads(line)["result"]["content"][0]["text"]
+    assert transforms.decompress(text) == {"result": [
+        {"id": i, "status": "active", "url": "https://x.example/api/items"} for i in range(20)]}
+
+
 # --- downstream lifecycle: no orphaned child (#21) ---
 
 def test_terminate_child_reaps_running_downstream():
