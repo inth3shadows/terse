@@ -98,8 +98,17 @@ class Interceptor:
             return
         mid = msg.get("id")
         method = msg.get("method")
-        if method == "initialize" and mid is not None:
-            self.init_id = mid
+        if method == "initialize":
+            # A re-handshake means the client rebuilt its MCP connection — and almost
+            # certainly its context window — so the model no longer holds any prior result
+            # a diff could reference. Drop every diff base so each tool re-anchors as a
+            # full, guarding against a silently-unresolvable delta after a client-side
+            # context reset (#20). Context COMPACTION without a reconnect is unobservable
+            # over stdio; that residual risk is why --diff stays opt-in.
+            self.last.clear()
+            self.since_keyframe.clear()
+            if mid is not None:
+                self.init_id = mid
             return
         if method != "tools/call":
             return

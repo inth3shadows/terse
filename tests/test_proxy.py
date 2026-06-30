@@ -193,6 +193,20 @@ def test_non_json_result_evicts_diff_base_so_next_re_anchors():
     assert transforms.decompress(c) == _records(40, change=5)
 
 
+def test_reinitialize_resets_diff_bases_to_prevent_desync():
+    # A client re-handshake (new `initialize`) means the model's context — and the prior
+    # result a diff would reference — is gone. Every diff base must drop so the next
+    # result re-anchors as a full, never a delta against a lost base (#20).
+    inter = Interceptor(DIFF)
+    _emit(inter, 1, "gh.api.items", _records(40))            # sets the diff base
+    assert "gh.api.items" in inter.last
+    inter.note_request(_init_req(2))                         # client reconnects
+    assert inter.last == {} and inter.since_keyframe == {}   # bases dropped
+    text = _emit(inter, 3, "gh.api.items", _records(40, change=5))
+    assert transforms.DIFF_MARKER not in text               # full keyframe, not a diff
+    assert transforms.decompress(text) == _records(40, change=5)
+
+
 def _cost_lt(a, b):
     from terse.proxy import _cost
     return _cost(a) < _cost(b)
