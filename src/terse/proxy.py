@@ -19,6 +19,7 @@ The pure message logic lives in `Interceptor` (unit-tested without any I/O). The
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 import sys
 from threading import Thread
@@ -68,6 +69,12 @@ class Interceptor:
     cross-call lever. It is fail-open and self-verifying: a diff is sent only when it
     provably reconstructs the result, and the full form is always the fallback."""
 
+    # Cap on in-flight request ids tracked at once. A tools/call that times out with no
+    # result body never gets popped from `pending` (#22), so bound the map and evict
+    # oldest-first: a long session against a flaky server can't leak unboundedly. An
+    # evicted id whose result arrives late just forwards uncompressed — safe, fail-open.
+    PENDING_MAX = 1024
+
     def __init__(self, pol: policy_mod.Policy, debug: bool = False):
         self.policy = pol
         self.pending: dict[Any, str] = {}
@@ -99,6 +106,10 @@ class Interceptor:
         name = (msg.get("params") or {}).get("name")
         if mid is not None and isinstance(name, str):
             self.pending[mid] = name
+            # dict preserves insertion order; drop the oldest tracked id(s) once over cap
+            # so abandoned (timed-out) entries can't accumulate (#22).
+            while len(self.pending) > self.PENDING_MAX:
+                self.pending.pop(next(iter(self.pending)))
 
     def transform_response(self, line: str) -> str:
         """Compress the text of a tracked tools/call result; prime the initialize reply;
@@ -258,6 +269,22 @@ def pump(src: TextIO, dst: TextIO, transform: Callable[[str], Optional[str]]) ->
         dst.flush()
 
 
+def _terminate_child(proc: "subprocess.Popen[Any]", timeout: float = 2.0) -> None:
+    """Reap the downstream server if it is still running, so it shares the proxy's
+    lifecycle and is never orphaned (#21). SIGTERM first, then SIGKILL on timeout."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def run_proxy(
     cmd: list[str],
     pol: policy_mod.Policy,
@@ -265,7 +292,10 @@ def run_proxy(
     stdin: Optional[TextIO] = None,
     stdout: Optional[TextIO] = None,
 ) -> int:
-    """Launch the downstream MCP server `cmd` and proxy stdio through `Interceptor`."""
+    """Launch the downstream MCP server `cmd` and proxy stdio through `Interceptor`.
+    The child shares this process's lifecycle: it is reaped on normal exit, on a crash
+    (via `finally`), and on SIGTERM (the signal a parent MCP client uses to stop us),
+    so it is never left orphaned (#21)."""
     cin = stdin or sys.stdin
     cout = stdout or sys.stdout
     inter = Interceptor(pol, debug=debug)
@@ -276,25 +306,46 @@ def run_proxy(
     )
     assert proc.stdin is not None and proc.stdout is not None
 
-    def client_to_server() -> None:
-        def fwd(line: str) -> str:
-            inter.note_request(line)
-            return line  # forward request unchanged; only observe
-        try:
-            pump(cin, proc.stdin, fwd)
-        finally:
+    # SIGTERM otherwise bypasses `finally` (default action exits immediately), orphaning
+    # the child. Convert it to a clean SystemExit so cleanup runs. Only the main thread
+    # may install handlers; in a worker (e.g. tests calling run_proxy directly) the
+    # try/finally still covers the crash and normal-exit paths.
+    prev_sigterm = None
+    installed_sigterm = False
+    try:
+        prev_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+        installed_sigterm = True
+    except (ValueError, OSError):
+        pass
+
+    try:
+        def client_to_server() -> None:
+            def fwd(line: str) -> str:
+                inter.note_request(line)
+                return line  # forward request unchanged; only observe
             try:
-                proc.stdin.close()
-            except Exception:  # noqa: BLE001
+                pump(cin, proc.stdin, fwd)
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        def server_to_client() -> None:
+            pump(proc.stdout, cout, inter.transform_response)
+
+        t_up = Thread(target=client_to_server, daemon=True)
+        t_down = Thread(target=server_to_client, daemon=True)
+        t_up.start()
+        t_down.start()
+        rc = proc.wait()
+        t_down.join(timeout=2.0)
+        return rc
+    finally:
+        _terminate_child(proc)
+        if installed_sigterm and prev_sigterm is not None:
+            try:
+                signal.signal(signal.SIGTERM, prev_sigterm)
+            except (ValueError, OSError, TypeError):
                 pass
-
-    def server_to_client() -> None:
-        pump(proc.stdout, cout, inter.transform_response)
-
-    t_up = Thread(target=client_to_server, daemon=True)
-    t_down = Thread(target=server_to_client, daemon=True)
-    t_up.start()
-    t_down.start()
-    rc = proc.wait()
-    t_down.join(timeout=2.0)
-    return rc

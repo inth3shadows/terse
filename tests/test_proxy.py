@@ -39,6 +39,20 @@ def test_tracks_request_and_compresses_matching_result():
     assert inter.pending == {}                            # id consumed
 
 
+def test_pending_map_is_bounded_under_unanswered_calls():
+    # tools/call ids that never get a result (timed-out / abandoned) must not leak the
+    # pending map without bound (#22). Evicts oldest-first; recent ids survive.
+    inter = Interceptor(FULL)
+    for i in range(Interceptor.PENDING_MAX + 50):
+        inter.note_request(_req(i, "gh.api.items"))
+    assert len(inter.pending) <= Interceptor.PENDING_MAX
+    assert (Interceptor.PENDING_MAX + 49) in inter.pending   # newest kept
+    assert 0 not in inter.pending                            # oldest evicted
+    # an evicted id's late result just forwards uncompressed (fail-open), not a crash
+    assert inter.transform_response(_result_msg(0, _records_text())) == \
+        _result_msg(0, _records_text())
+
+
 def test_untracked_result_passes_through_unchanged():
     inter = Interceptor(FULL)
     line = _result_msg(99, _records_text())              # no matching request noted
@@ -228,6 +242,30 @@ def test_primer_injected_once_not_per_message():
     # a second initialize-shaped reply with the same id is no longer tracked -> untouched
     resp2 = _init_resp(1)
     assert inter.transform_response(resp2) == resp2
+
+
+# --- downstream lifecycle: no orphaned child (#21) ---
+
+def test_terminate_child_reaps_running_downstream():
+    import subprocess as sp
+
+    from terse.proxy import _terminate_child
+
+    proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    assert proc.poll() is None                      # running
+    _terminate_child(proc)
+    assert proc.poll() is not None                  # reaped, not orphaned
+
+
+def test_terminate_child_is_noop_on_already_exited():
+    import subprocess as sp
+
+    from terse.proxy import _terminate_child
+
+    proc = sp.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    _terminate_child(proc)                           # must not raise on a dead child
+    assert proc.poll() is not None
 
 
 # --- end-to-end through a real subprocess ---
