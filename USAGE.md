@@ -101,6 +101,39 @@ instead of nesting proxies) and never enables `--diff`. It honors `$CLAUDE_CONFI
 if your config isn't at `~/.claude.json`. Start with one high-win, read-only
 server (e.g. `runecho`) and confirm it works before wrapping more.
 
+### Let terse write the policy for you (`policy generate`)
+
+Authoring `policy.json` by hand is the main chore: add a server, see no compression, then
+capture → measure → read the report → edit JSON. `policy generate` does that loop for you
+from a corpus of captured outputs (collect one with `proxy --capture-dir` or `install-mcp
+--capture-dir`):
+
+```bash
+# print a policy to stdout (per-tool decisions go to stderr):
+uv run terse policy generate --corpus ~/.config/terse/session-corpus
+
+# or write it straight to a file:
+uv run terse policy generate --corpus <dir> --out policy.json
+```
+
+It is **conservative and lossless**: for each tool it measures the real per-tier token
+savings and enables a tier only where the saving clears `--threshold` (default 5%) *and*
+every payload round-trips exactly — otherwise that tool is left as passthrough. The
+dictionary tier is added only where its *marginal* saving clears the bar too (so a tool
+that tabularizes well but has no repeated values won't carry the dictionary cost). Each
+rule is commented with the measured savings, and the summary prints highest-win tools
+first:
+
+```
+# terse policy generate — 6 tool(s), threshold 5.0%
+  gh.api.items        minify,tabularize,dictionary  40.4% saved (dictionary +30.2%)
+  kb.read.search      minify,tabularize             31.5% saved (dictionary +0.0% below threshold — dropped)
+  status.rate_limit   (passthrough)                 1.2% < 5.0% threshold
+```
+
+terse measures *tokens*, not comprehension — before relying on a generated policy, confirm
+the model still reads the compressed form with `terse fluency --corpus <dir>` (see below).
+
 ### When a result looks wrong: the replay log
 
 If a compressed result ever looks misshapen, add `--debug-log FILE` to the proxy and it
