@@ -131,6 +131,20 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path) -> Path:
     return path
 
 
+def append_audit(record: dict[str, Any], log_path: str | Path) -> None:
+    """Append one audit record as a JSON line to log_path (#23).
+
+    A chronological replay trace — unlike capture_payload's idempotent-by-sha corpus,
+    order matters here (diff chains are sequence-dependent) so we append, never dedup.
+    One open-append-close per call keeps it crash-safe and lock-free across the proxy's
+    threads; tool results are low-frequency enough that the syscall cost is irrelevant.
+    """
+    p = Path(log_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
     """Load every captured envelope from corpus/, skipping the .gitkeep placeholder."""
     corpus = Path(corpus_dir)

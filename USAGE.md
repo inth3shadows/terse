@@ -85,6 +85,21 @@ instead of nesting proxies) and never enables `--diff`. It honors `$CLAUDE_CONFI
 if your config isn't at `~/.claude.json`. Start with one high-win, read-only
 server (e.g. `runecho`) and confirm it works before wrapping more.
 
+### When a result looks wrong: the replay log
+
+If a compressed result ever looks misshapen, add `--debug-log FILE` to the proxy and it
+appends one JSON line per intercepted result — the raw payload, the tier decision, and
+exactly what terse emitted:
+
+```bash
+uv run terse proxy --debug-log /tmp/terse-audit.jsonl -- uvx some-mcp-server
+```
+
+Each line has `{tool, id, diff_mode, tiers, changed, blocks:[{raw, emitted}]}`. Even a
+no-op (`changed:false`) is logged, so you can confirm terse left a suspect payload alone.
+Replay any line through `terse compress --tool <tool>` on its `raw` to reproduce. Opt-in
+and side-effect-only: a log-write failure never affects what the client receives.
+
 ### See how well it does across many tools
 
 If you've collected sample outputs (see "Building a sample set" below), these produce

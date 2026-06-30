@@ -359,6 +359,27 @@ def test_run_proxy_capture_dir_failure_does_not_break_traffic(tmp_path):
         {"id": i, "status": "active", "url": "https://x.example/api/items"} for i in range(20)]}
 
 
+def test_run_proxy_debug_log_writes_replay_trace(tmp_path):
+    requests = "\n".join([
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "gh.api.items"}}),
+    ]) + "\n"
+    cin, cout = io.StringIO(requests), io.StringIO()
+    log = tmp_path / "audit.jsonl"
+    rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout,
+                   debug_log=str(log))
+    assert rc == 0
+    lines = [l for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
+    # exactly the one tools/call result was logged (initialize is not a tool call)
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["tool"] == "gh.api.items" and rec["id"] == 2 and rec["changed"] is True
+    blk = rec["blocks"][0]
+    assert json.loads(blk["raw"])["result"][0]["status"] == "active"   # raw payload
+    assert transforms.decompress(blk["emitted"]) == json.loads(blk["raw"])  # lossless
+
+
 # --- downstream lifecycle: no orphaned child (#21) ---
 
 def test_terminate_child_reaps_running_downstream():
@@ -405,3 +426,70 @@ def test_run_proxy_end_to_end_compresses_losslessly():
                            for i in range(20)]}
     assert transforms.decompress(text) == expected
     assert len(text) < len(_records_text())
+
+
+# --- #23: audit/replay log ---
+
+def _note_call(inter, mid, name):
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+                                   "params": {"name": name}}))
+
+
+def test_audit_emits_one_record_per_result_in_order():
+    records = []
+    inter = Interceptor(FULL, audit=records.append)
+    for mid in (1, 2):
+        _note_call(inter, mid, "gh.api.items")
+        inter.transform_response(_result_msg(mid, _records_text()))
+    assert [r["id"] for r in records] == [1, 2]            # one record/result, in order
+    rec = records[0]
+    assert rec["tool"] == "gh.api.items"
+    assert rec["changed"] is True
+    assert rec["tiers"] == ["minify", "tabularize", "dictionary"]
+    blk = rec["blocks"][0]
+    assert blk["raw"] == _records_text()                   # raw snapshot, pre-transform
+    assert blk["emitted"] != _records_text()               # emitted, post-transform
+    assert transforms.decompress(blk["emitted"]) == json.loads(_records_text())  # lossless
+
+
+def test_audit_logs_unchanged_passthrough_result():
+    # A passthrough tool (no tiers) is left alone — still audited, since "terse touched
+    # nothing" is exactly what you want recorded when a result looks wrong.
+    records = []
+    inter = Interceptor(Policy(rules=[Rule("gh.*", ())]), audit=records.append)
+    _note_call(inter, 5, "gh.api.items")
+    out = inter.transform_response(_result_msg(5, _records_text()))
+    assert out == _result_msg(5, _records_text())          # byte-identical forward
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["changed"] is False
+    assert rec["blocks"][0]["raw"] == rec["blocks"][0]["emitted"]  # raw == emitted
+
+
+def test_audit_failure_never_breaks_forwarding():
+    def boom(_record):
+        raise RuntimeError("disk full")
+    inter = Interceptor(FULL, audit=boom)
+    _note_call(inter, 9, "gh.api.items")
+    out = inter.transform_response(_result_msg(9, _records_text()))
+    # Forwarding is unaffected by the audit explosion: still the compressed, lossless result.
+    text = json.loads(out)["result"]["content"][0]["text"]
+    assert transforms.decompress(text) == json.loads(_records_text())
+
+
+def test_no_audit_callback_is_byte_identical():
+    plain = Interceptor(FULL)
+    audited = Interceptor(FULL, audit=lambda _r: None)
+    _note_call(plain, 3, "gh.api.items")
+    _note_call(audited, 3, "gh.api.items")
+    assert plain.transform_response(_result_msg(3, _records_text())) == \
+        audited.transform_response(_result_msg(3, _records_text()))
+
+
+def test_append_audit_writes_one_json_line_per_call(tmp_path):
+    from terse.capture import append_audit
+    log = tmp_path / "nested" / "audit.jsonl"           # parent created on demand
+    append_audit({"tool": "a", "id": 1}, log)
+    append_audit({"tool": "b", "id": 2}, log)
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["id"] for line in lines] == [1, 2]
