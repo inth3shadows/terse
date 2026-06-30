@@ -76,6 +76,28 @@ def test_do_install_writes_config_stash_and_backup(tmp_path, monkeypatch):
     assert back["mcpServers"]["runecho"] == {"command": "uvx", "args": ["runecho-mcp"]}
 
 
+def test_do_install_capture_dir_adds_proxy_flag(tmp_path, monkeypatch):
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+
+    cap = tmp_path / "session-corpus"
+    res = im.do_install(["runecho"], str(policy), cfg=cfg, capture_dir=str(cap))
+    args = json.loads(cfg.read_text())["mcpServers"]["runecho"]["args"]
+    # the proxy carries --capture-dir <abs> BEFORE the `--` downstream separator
+    assert "--capture-dir" in args
+    ci = args.index("--capture-dir")
+    assert args[ci + 1] == str(cap.resolve())          # absolute, cwd-independent
+    assert ci < args.index("--")                        # an opt, not a downstream arg
+    assert res["capture_dir"] == str(cap.resolve())
+    # uninstall still restores the true original (capture flag was terse's, not theirs)
+    im.do_uninstall(["runecho"], cfg=cfg)
+    assert json.loads(cfg.read_text())["mcpServers"]["runecho"] == {
+        "command": "uvx", "args": ["runecho-mcp"]}
+
+
 def test_roundtrip_byte_identical_with_non_ascii(tmp_path, monkeypatch):
     # The real ~/.claude.json holds non-ASCII (em-dashes, emoji, arrows) and is written
     # by Claude Code with indent=2, ensure_ascii=False, and NO trailing newline. #27's

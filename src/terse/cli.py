@@ -249,7 +249,8 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
     from .install_mcp import do_install
 
     try:
-        res = do_install(args.servers, args.policy, dry_run=args.print)
+        res = do_install(args.servers, args.policy, dry_run=args.print,
+                         capture_dir=args.capture_dir)
     except (FileNotFoundError, ValueError) as e:
         print(f"install-mcp: {e}", file=sys.stderr)
         return 2
@@ -420,6 +421,9 @@ def main(argv: list[str] | None = None) -> int:
                                             "terse proxy in ~/.claude.json")
     im.add_argument("servers", nargs="+", help="mcpServers name(s) to wrap (e.g. runecho)")
     im.add_argument("--policy", required=True, help="path to the JSON policy file")
+    im.add_argument("--capture-dir", metavar="DIR",
+                    help="also tee raw tool results into this corpus dir for later "
+                         "`terse measure`/`verify` (opt-in; never affects forwarding)")
     im.add_argument("--print", action="store_true",
                     help="dry-run: show the before/after without writing")
     im.set_defaults(func=_cmd_install_mcp)
