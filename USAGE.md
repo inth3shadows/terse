@@ -60,6 +60,22 @@ the results the policy says to shrink, and passes everything else through untouc
 anything ever goes wrong with a compression, terse sends the original result instead, so
 a tool call is never lost. Add `--debug` to see what it compressed.
 
+**One proxy per server (stdio only).** Each `terse proxy` wraps exactly one **stdio**
+MCP server — the kind launched by a command that talks newline-delimited JSON-RPC over
+stdin/stdout. To cover several servers, give each its own wrapper (one `terse proxy --
+<server cmd>` entry per server); `install-mcp` below does this for you. terse does **not**
+proxy HTTP/SSE servers (the kind configured by a `url`); pointed at one it fails fast with
+a clear message instead of hanging, e.g.:
+
+```
+$ uv run terse proxy -- https://example.com/mcp
+[terse-proxy] 'https://example.com/mcp' looks like a URL — terse proxies a stdio MCP
+server (a launchable command), not an HTTP/SSE endpoint. HTTP/SSE transport is not
+supported yet (issue #5).
+```
+
+Multi-downstream and HTTP/SSE support are tracked in issue #5.
+
 ### Wire terse into Claude Code automatically (`install-mcp`)
 
 Rather than editing `~/.claude.json` by hand, let terse wrap your MCP servers for you:
