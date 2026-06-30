@@ -260,6 +260,8 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
         print(f"    before: {_short_cmd(c['before'])}")
         print(f"    after:  {_short_cmd(c['after'])}")
     print(f"config: {res['config']}  policy: {res['policy']}")
+    if res.get("capture_dir"):
+        print(f"capture: raw tool results → {res['capture_dir']}")
     if res["backup"]:
         print(f"backup: {res['backup']}")
     if not res["dry_run"] and res["changes"]:
