@@ -53,6 +53,41 @@ def test_pending_map_is_bounded_under_unanswered_calls():
         _result_msg(0, _records_text())
 
 
+def test_concurrent_note_and_transform_do_not_crash_under_eviction():
+    # The two pump threads call note_request and transform_response concurrently on the
+    # same Interceptor. The #22 eviction iterates `pending` while the other thread pops
+    # it; without the lock, `next(iter(...))` raises "dictionary changed size during
+    # iteration" and kills the request pump. The lock must make this safe.
+    import threading
+
+    inter = Interceptor(FULL)
+    inter.PENDING_MAX = 16                                # force constant eviction churn
+    errors: list[Exception] = []
+    N = 4000
+
+    def noter():
+        try:
+            for i in range(N):
+                inter.note_request(_req(i, "gh.api.items"))
+        except Exception as e:  # noqa: BLE001 — capture, don't swallow into the thread
+            errors.append(e)
+
+    def transformer():
+        try:
+            for i in range(N):
+                inter.transform_response(_result_msg(i, _records_text()))
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=noter), threading.Thread(target=transformer)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []                                  # no RuntimeError from the race
+    assert len(inter.pending) <= inter.PENDING_MAX       # still bounded
+
+
 def test_untracked_result_passes_through_unchanged():
     inter = Interceptor(FULL)
     line = _result_msg(99, _records_text())              # no matching request noted
@@ -200,8 +235,10 @@ def test_reinitialize_resets_diff_bases_to_prevent_desync():
     inter = Interceptor(DIFF)
     _emit(inter, 1, "gh.api.items", _records(40))            # sets the diff base
     assert "gh.api.items" in inter.last
+    inter.note_request(_req(9, "gh.api.slow"))              # an in-flight, unanswered call
     inter.note_request(_init_req(2))                         # client reconnects
     assert inter.last == {} and inter.since_keyframe == {}   # bases dropped
+    assert inter.pending == {}                               # stale ids dropped too (#20/#22)
     text = _emit(inter, 3, "gh.api.items", _records(40, change=5))
     assert transforms.DIFF_MARKER not in text               # full keyframe, not a diff
     assert transforms.decompress(text) == _records(40, change=5)

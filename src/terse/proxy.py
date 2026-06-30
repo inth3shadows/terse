@@ -22,7 +22,7 @@ import json
 import signal
 import subprocess
 import sys
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Callable, Optional, TextIO
 
 from . import policy as policy_mod
@@ -86,6 +86,11 @@ class Interceptor:
         self.keyframe_interval = pol.diff_keyframe_interval
         self.since_keyframe: dict[str, int] = {}
         self.init_id: Any = None        # id of the initialize request, to prime its reply
+        # The two proxy pump threads call note_request (client->server) and
+        # transform_response (server->client) concurrently, both mutating the shared
+        # pending/last/since_keyframe state. One lock serializes each method so the
+        # compound eviction + the reconnect reset can't race a response in flight.
+        self._lock = Lock()
 
     def note_request(self, line: str) -> None:
         """Record id -> tool name for tools/call requests, and the initialize request id
@@ -98,27 +103,33 @@ class Interceptor:
             return
         mid = msg.get("id")
         method = msg.get("method")
-        if method == "initialize":
-            # A re-handshake means the client rebuilt its MCP connection — and almost
-            # certainly its context window — so the model no longer holds any prior result
-            # a diff could reference. Drop every diff base so each tool re-anchors as a
-            # full, guarding against a silently-unresolvable delta after a client-side
-            # context reset (#20). Context COMPACTION without a reconnect is unobservable
-            # over stdio; that residual risk is why --diff stays opt-in.
-            self.last.clear()
-            self.since_keyframe.clear()
-            if mid is not None:
-                self.init_id = mid
-            return
-        if method != "tools/call":
-            return
-        name = (msg.get("params") or {}).get("name")
-        if mid is not None and isinstance(name, str):
-            self.pending[mid] = name
-            # dict preserves insertion order; drop the oldest tracked id(s) once over cap
-            # so abandoned (timed-out) entries can't accumulate (#22).
-            while len(self.pending) > self.PENDING_MAX:
-                self.pending.pop(next(iter(self.pending)))
+        with self._lock:
+            if method == "initialize":
+                # A re-handshake means the client rebuilt its MCP connection — and almost
+                # certainly its context window — so the model no longer holds any prior
+                # result a diff could reference. Drop every diff base so each tool
+                # re-anchors as a full, guarding against a silently-unresolvable delta
+                # after a client-side context reset (#20). Also drop pending: a stale
+                # pre-reconnect id could otherwise collide with a reused id and mis-route
+                # a late response to the wrong tool's codec. Context COMPACTION without a
+                # reconnect is unobservable over stdio; that residual risk is why --diff
+                # stays opt-in.
+                self.last.clear()
+                self.since_keyframe.clear()
+                self.pending.clear()
+                if mid is not None:
+                    self.init_id = mid
+                return
+            if method != "tools/call":
+                return
+            name = (msg.get("params") or {}).get("name")
+            if mid is not None and isinstance(name, str):
+                self.pending[mid] = name
+                # dict preserves insertion order; drop the oldest tracked id(s) once over
+                # cap so abandoned (timed-out) entries can't accumulate (#22). Safe under
+                # the lock — no concurrent mutation during the iterate-then-pop.
+                while len(self.pending) > self.PENDING_MAX:
+                    self.pending.pop(next(iter(self.pending)))
 
     def transform_response(self, line: str) -> str:
         """Compress the text of a tracked tools/call result; prime the initialize reply;
@@ -129,39 +140,42 @@ class Interceptor:
             return line
         if not isinstance(msg, dict) or "result" not in msg or msg.get("id") is None:
             return line
-        if msg["id"] == self.init_id:
-            self.init_id = None  # one-time
-            primed = self._augment_initialize(msg)
-            return primed if primed is not None else line
-        tool = self.pending.pop(msg["id"], None)
-        if tool is None:
-            return line  # not a tracked tools/call response (tools/list, ...)
+        # Held across the whole body so the shared init_id/pending/last/since_keyframe
+        # state stays consistent against a concurrent note_request on the other thread.
+        with self._lock:
+            if msg["id"] == self.init_id:
+                self.init_id = None  # one-time
+                primed = self._augment_initialize(msg)
+                return primed if primed is not None else line
+            tool = self.pending.pop(msg["id"], None)
+            if tool is None:
+                return line  # not a tracked tools/call response (tools/list, ...)
 
-        result = msg.get("result")
-        content = result.get("content") if isinstance(result, dict) else None
-        if not isinstance(content, list):
-            return line
+            result = msg.get("result")
+            content = result.get("content") if isinstance(result, dict) else None
+            if not isinstance(content, list):
+                return line
 
-        text_blocks = [b for b in content
-                       if isinstance(b, dict) and b.get("type") == "text"
-                       and isinstance(b.get("text"), str)]
+            text_blocks = [b for b in content
+                           if isinstance(b, dict) and b.get("type") == "text"
+                           and isinstance(b.get("text"), str)]
 
-        changed = False
-        # Diffing reasons about ONE logical payload, so it only engages for a single
-        # text block (the overwhelmingly common tool-result shape); multi-block results
-        # take the plain per-block compression path.
-        if self.diff and len(text_blocks) == 1:
-            changed = self._compress_or_diff(text_blocks[0], tool)
-        else:
-            for block in text_blocks:
-                new_text = self._compress(block["text"], tool)
-                if new_text != block["text"]:
-                    block["text"] = new_text
-                    changed = True
-        if not changed:
-            return line
-        # Re-serialize compactly. JSON-RPC is semantics, not formatting; no newlines.
-        return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+            changed = False
+            # Diffing reasons about ONE logical payload, so it only engages for a single
+            # text block (the overwhelmingly common tool-result shape); multi-block results
+            # take the plain per-block compression path.
+            if self.diff and len(text_blocks) == 1:
+                changed = self._compress_or_diff(text_blocks[0], tool)
+            else:
+                for block in text_blocks:
+                    new_text = self._compress(block["text"], tool)
+                    if new_text != block["text"]:
+                        block["text"] = new_text
+                        changed = True
+            if not changed:
+                return line
+            # Re-serialize compactly. JSON-RPC is semantics, not formatting; no newlines.
+            return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
 
     def _compress_or_diff(self, block: dict, tool: str) -> bool:
         """Compress one block, preferring a lossless delta vs the prior same-tool result
@@ -352,9 +366,20 @@ def run_proxy(
         t_down.join(timeout=2.0)
         return rc
     finally:
-        _terminate_child(proc)
-        if installed_sigterm and prev_sigterm is not None:
+        if installed_sigterm:
+            # Ignore further SIGTERM while reaping: a second signal would otherwise
+            # re-enter the sys.exit(143) handler and unwind out of _terminate_child
+            # before the SIGKILL escalation and the restore below ever run.
             try:
-                signal.signal(signal.SIGTERM, prev_sigterm)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            except (ValueError, OSError):
+                pass
+        _terminate_child(proc)
+        if installed_sigterm:
+            # Restore the prior disposition; SIG_DFL when it wasn't a Python-set handler
+            # (getsignal returns None there), so we never leave our lambda installed.
+            try:
+                signal.signal(signal.SIGTERM,
+                              prev_sigterm if prev_sigterm is not None else signal.SIG_DFL)
             except (ValueError, OSError, TypeError):
                 pass
