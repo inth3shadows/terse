@@ -404,6 +404,33 @@ def test_terminate_child_is_noop_on_already_exited():
     assert proc.poll() is not None
 
 
+# --- #19: fail-fast on a non-stdio downstream ---
+
+def test_stdio_transport_error_flags_url_and_passes_command():
+    from terse.proxy import stdio_transport_error
+
+    assert stdio_transport_error([]) is not None                       # nothing given
+    assert "issue #5" in stdio_transport_error(["https://example.com/mcp"])
+    assert stdio_transport_error(["sse://host/path"]) is not None      # any scheme
+    assert stdio_transport_error(["uvx", "some-mcp-server"]) is None   # a real command
+    assert stdio_transport_error([sys.executable, str(FAKE)]) is None
+
+
+def test_run_proxy_rejects_url_downstream_without_launching():
+    cin, cout = io.StringIO('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'), io.StringIO()
+    rc = run_proxy(["https://example.com/mcp"], FULL, stdin=cin, stdout=cout)
+    assert rc == 2
+    assert cout.getvalue() == ""        # nothing launched, nothing forwarded
+
+
+def test_run_proxy_reports_unlaunchable_command_cleanly():
+    # a command that cannot be exec'd must surface as a clean exit code, not a traceback
+    cin, cout = io.StringIO(""), io.StringIO()
+    rc = run_proxy(["/no/such/terse-downstream-binary"], FULL, stdin=cin, stdout=cout)
+    assert rc == 127
+    assert cout.getvalue() == ""
+
+
 # --- end-to-end through a real subprocess ---
 
 def test_run_proxy_end_to_end_compresses_losslessly():

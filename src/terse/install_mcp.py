@@ -64,7 +64,13 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
 
     orig_cmd = original.get("command")
     if not orig_cmd:
-        raise ValueError(f"server '{server}' has no 'command' to wrap")
+        # No 'command' almost always means an HTTP/SSE server (configured by 'url').
+        # terse proxies stdio servers only — name that explicitly so the user isn't
+        # left guessing why a valid-looking server can't be wrapped (#19).
+        hint = " (it is configured by 'url')" if original.get("url") else ""
+        raise ValueError(
+            f"server '{server}' has no 'command' to wrap{hint} — terse proxies stdio "
+            f"MCP servers only; HTTP/SSE transport is not supported yet (issue #5)")
     orig_args = list(original.get("args", []))
 
     proxy_opts = ["--policy", policy]

@@ -50,6 +50,15 @@ def test_wrap_is_idempotent_no_double_nesting():
     assert once != twice  # policy actually changed between wraps
 
 
+def test_wrap_http_sse_server_fails_fast_with_clear_message():
+    # an HTTP/SSE server has a 'url', no 'command' — terse can't proxy it (#19/#5)
+    config = _cfg(remote={"type": "sse", "url": "https://example.com/mcp"})
+    with pytest.raises(ValueError) as exc:
+        im.wrap(config, {}, "remote", "/p/policy.json", TERSE_CMD)
+    msg = str(exc.value)
+    assert "url" in msg and "#5" in msg
+
+
 def test_unwrap_unmanaged_raises():
     with pytest.raises(KeyError):
         im.unwrap(_cfg(x={"command": "c"}), {}, "x")

@@ -343,6 +343,25 @@ def pump(src: TextIO, dst: TextIO, transform: Callable[[str], Optional[str]]) ->
         dst.flush()
 
 
+def stdio_transport_error(cmd: list[str]) -> Optional[str]:
+    """Return a clear error if `cmd` can't be a stdio MCP launch, else None (#19).
+
+    terse proxies exactly ONE stdio server: it speaks newline-delimited JSON-RPC over
+    the child's stdin/stdout. An HTTP/SSE endpoint is a URL, not a launchable command,
+    so it can never speak stdio — pointed at one, the proxy would otherwise look like a
+    hang or an empty result (the client's `initialize` goes in, nothing valid comes
+    back) rather than a config error. Catch the URL case up front. Full HTTP/SSE
+    transport support is tracked separately (#5)."""
+    if not cmd:
+        return "no downstream command given after `--`"
+    first = cmd[0]
+    if "://" in first:
+        return (f"{first!r} looks like a URL — terse proxies a stdio MCP server (a "
+                f"launchable command), not an HTTP/SSE endpoint. HTTP/SSE transport "
+                f"is not supported yet (issue #5).")
+    return None
+
+
 def _terminate_child(proc: "subprocess.Popen[Any]", timeout: float = 2.0) -> None:
     """Reap the downstream server if it is still running, so it shares the proxy's
     lifecycle and is never orphaned (#21). SIGTERM first, then SIGKILL on timeout."""
@@ -383,6 +402,13 @@ def run_proxy(
     cin = stdin or sys.stdin
     cout = stdout or sys.stdout
 
+    # Fail fast on a downstream that can never speak stdio (a URL / HTTP-SSE endpoint)
+    # before launching anything (#19): clearer than a hang or empty result later.
+    transport_err = stdio_transport_error(cmd)
+    if transport_err is not None:
+        sys.stderr.write(f"[terse-proxy] {transport_err}\n")
+        return 2
+
     capture: Optional[Callable[[str, str], None]] = None
     if capture_dir is not None:
         from .capture import capture_payload
@@ -411,10 +437,18 @@ def run_proxy(
 
     inter = Interceptor(pol, debug=debug, capture=capture, audit=audit)
 
-    proc = subprocess.Popen(  # noqa: S603 — cmd is operator-supplied, by design
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
-        encoding="utf-8",
-    )
+    try:
+        proc = subprocess.Popen(  # noqa: S603 — cmd is operator-supplied, by design
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        # Mistyped path, non-executable, or otherwise unlaunchable downstream — report
+        # it as a config error instead of an uncaught traceback (#19). 127 = the shell
+        # convention for "command not found".
+        sys.stderr.write(f"[terse-proxy] failed to launch downstream server {cmd[0]!r}: "
+                         f"{exc}\n")
+        return 127
     assert proc.stdin is not None and proc.stdout is not None
 
     # SIGTERM otherwise bypasses `finally` (default action exits immediately), orphaning
