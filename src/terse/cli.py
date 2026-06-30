@@ -314,10 +314,17 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                   "available here. Run from a repo checkout, or pass --corpus <dir> with "
                   "captured output (`terse capture`).", file=sys.stderr)
             return 2
-        sample_dir = tempfile.mkdtemp(prefix="terse-verify-")
-        subprocess.run([sys.executable, str(script), sample_dir], check=True,
-                       stdout=subprocess.DEVNULL)
-        envelopes = load_corpus(sample_dir)
+        # TemporaryDirectory so the synthetic corpus doesn't accumulate in /tmp; envelopes
+        # are read fully into memory by load_corpus, so the dir can go right after.
+        with tempfile.TemporaryDirectory(prefix="terse-verify-") as sample_dir:
+            try:
+                subprocess.run([sys.executable, str(script), sample_dir], check=True,
+                               stdout=subprocess.DEVNULL)
+            except subprocess.CalledProcessError as exc:
+                print(f"verify: the bundled sample generator failed (exit {exc.returncode}). "
+                      "Pass --corpus <dir> with captured output instead.", file=sys.stderr)
+                return 2
+            envelopes = load_corpus(sample_dir)
         label = ("bundled deterministic sample — synthetic; capture real traffic with "
                  "`terse capture` for your own numbers")
 
