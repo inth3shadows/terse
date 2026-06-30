@@ -39,6 +39,55 @@ def test_tracks_request_and_compresses_matching_result():
     assert inter.pending == {}                            # id consumed
 
 
+def test_pending_map_is_bounded_under_unanswered_calls():
+    # tools/call ids that never get a result (timed-out / abandoned) must not leak the
+    # pending map without bound (#22). Evicts oldest-first; recent ids survive.
+    inter = Interceptor(FULL)
+    for i in range(Interceptor.PENDING_MAX + 50):
+        inter.note_request(_req(i, "gh.api.items"))
+    assert len(inter.pending) <= Interceptor.PENDING_MAX
+    assert (Interceptor.PENDING_MAX + 49) in inter.pending   # newest kept
+    assert 0 not in inter.pending                            # oldest evicted
+    # an evicted id's late result just forwards uncompressed (fail-open), not a crash
+    assert inter.transform_response(_result_msg(0, _records_text())) == \
+        _result_msg(0, _records_text())
+
+
+def test_concurrent_note_and_transform_do_not_crash_under_eviction():
+    # The two pump threads call note_request and transform_response concurrently on the
+    # same Interceptor. The #22 eviction iterates `pending` while the other thread pops
+    # it; without the lock, `next(iter(...))` raises "dictionary changed size during
+    # iteration" and kills the request pump. The lock must make this safe.
+    import threading
+
+    inter = Interceptor(FULL)
+    inter.PENDING_MAX = 16                                # force constant eviction churn
+    errors: list[Exception] = []
+    N = 4000
+
+    def noter():
+        try:
+            for i in range(N):
+                inter.note_request(_req(i, "gh.api.items"))
+        except Exception as e:  # noqa: BLE001 — capture, don't swallow into the thread
+            errors.append(e)
+
+    def transformer():
+        try:
+            for i in range(N):
+                inter.transform_response(_result_msg(i, _records_text()))
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=noter), threading.Thread(target=transformer)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []                                  # no RuntimeError from the race
+    assert len(inter.pending) <= inter.PENDING_MAX       # still bounded
+
+
 def test_untracked_result_passes_through_unchanged():
     inter = Interceptor(FULL)
     line = _result_msg(99, _records_text())              # no matching request noted
@@ -179,6 +228,22 @@ def test_non_json_result_evicts_diff_base_so_next_re_anchors():
     assert transforms.decompress(c) == _records(40, change=5)
 
 
+def test_reinitialize_resets_diff_bases_to_prevent_desync():
+    # A client re-handshake (new `initialize`) means the model's context — and the prior
+    # result a diff would reference — is gone. Every diff base must drop so the next
+    # result re-anchors as a full, never a delta against a lost base (#20).
+    inter = Interceptor(DIFF)
+    _emit(inter, 1, "gh.api.items", _records(40))            # sets the diff base
+    assert "gh.api.items" in inter.last
+    inter.note_request(_req(9, "gh.api.slow"))              # an in-flight, unanswered call
+    inter.note_request(_init_req(2))                         # client reconnects
+    assert inter.last == {} and inter.since_keyframe == {}   # bases dropped
+    assert inter.pending == {}                               # stale ids dropped too (#20/#22)
+    text = _emit(inter, 3, "gh.api.items", _records(40, change=5))
+    assert transforms.DIFF_MARKER not in text               # full keyframe, not a diff
+    assert transforms.decompress(text) == _records(40, change=5)
+
+
 def _cost_lt(a, b):
     from terse.proxy import _cost
     return _cost(a) < _cost(b)
@@ -228,6 +293,30 @@ def test_primer_injected_once_not_per_message():
     # a second initialize-shaped reply with the same id is no longer tracked -> untouched
     resp2 = _init_resp(1)
     assert inter.transform_response(resp2) == resp2
+
+
+# --- downstream lifecycle: no orphaned child (#21) ---
+
+def test_terminate_child_reaps_running_downstream():
+    import subprocess as sp
+
+    from terse.proxy import _terminate_child
+
+    proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    assert proc.poll() is None                      # running
+    _terminate_child(proc)
+    assert proc.poll() is not None                  # reaped, not orphaned
+
+
+def test_terminate_child_is_noop_on_already_exited():
+    import subprocess as sp
+
+    from terse.proxy import _terminate_child
+
+    proc = sp.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    _terminate_child(proc)                           # must not raise on a dead child
+    assert proc.poll() is not None
 
 
 # --- end-to-end through a real subprocess ---

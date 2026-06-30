@@ -222,7 +222,11 @@ gitignored because captured tool output may contain real data.
   forces a self-contained full result after every K consecutive diffs per tool, so a
   chained diff can never drift more than K turns from an anchor a model can reconstruct
   from scratch (`diff_keyframe_interval` policy field / `proxy --diff-keyframe-interval K`,
-  default 5; 0 disables).
+  default 5; 0 disables). A client *reconnect* (a new MCP `initialize`) is a stronger
+  reset signal: the proxy drops every per-tool diff base on it, so the next result of
+  each tool re-anchors as a full rather than a delta against a base the rebuilt context
+  no longer holds (#20). The residual gap — a context *compaction* with no reconnect — is
+  unobservable over stdio, and is the standing reason `--diff` is opt-in.
 - **Marker collision.** A payload that genuinely contains a reserved
   `__terse_table__` / `__terse_dict__` / `__terse_diff__` key (at any depth) can't be
   compressed without the consumer mis-reading the user's own dict as a terse envelope —

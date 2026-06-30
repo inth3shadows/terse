@@ -19,9 +19,10 @@ The pure message logic lives in `Interceptor` (unit-tested without any I/O). The
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 import sys
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Callable, Optional, TextIO
 
 from . import policy as policy_mod
@@ -68,6 +69,12 @@ class Interceptor:
     cross-call lever. It is fail-open and self-verifying: a diff is sent only when it
     provably reconstructs the result, and the full form is always the fallback."""
 
+    # Cap on in-flight request ids tracked at once. A tools/call that times out with no
+    # result body never gets popped from `pending` (#22), so bound the map and evict
+    # oldest-first: a long session against a flaky server can't leak unboundedly. An
+    # evicted id whose result arrives late just forwards uncompressed — safe, fail-open.
+    PENDING_MAX = 1024
+
     def __init__(self, pol: policy_mod.Policy, debug: bool = False):
         self.policy = pol
         self.pending: dict[Any, str] = {}
@@ -79,6 +86,11 @@ class Interceptor:
         self.keyframe_interval = pol.diff_keyframe_interval
         self.since_keyframe: dict[str, int] = {}
         self.init_id: Any = None        # id of the initialize request, to prime its reply
+        # The two proxy pump threads call note_request (client->server) and
+        # transform_response (server->client) concurrently, both mutating the shared
+        # pending/last/since_keyframe state. One lock serializes each method so the
+        # compound eviction + the reconnect reset can't race a response in flight.
+        self._lock = Lock()
 
     def note_request(self, line: str) -> None:
         """Record id -> tool name for tools/call requests, and the initialize request id
@@ -91,14 +103,33 @@ class Interceptor:
             return
         mid = msg.get("id")
         method = msg.get("method")
-        if method == "initialize" and mid is not None:
-            self.init_id = mid
-            return
-        if method != "tools/call":
-            return
-        name = (msg.get("params") or {}).get("name")
-        if mid is not None and isinstance(name, str):
-            self.pending[mid] = name
+        with self._lock:
+            if method == "initialize":
+                # A re-handshake means the client rebuilt its MCP connection — and almost
+                # certainly its context window — so the model no longer holds any prior
+                # result a diff could reference. Drop every diff base so each tool
+                # re-anchors as a full, guarding against a silently-unresolvable delta
+                # after a client-side context reset (#20). Also drop pending: a stale
+                # pre-reconnect id could otherwise collide with a reused id and mis-route
+                # a late response to the wrong tool's codec. Context COMPACTION without a
+                # reconnect is unobservable over stdio; that residual risk is why --diff
+                # stays opt-in.
+                self.last.clear()
+                self.since_keyframe.clear()
+                self.pending.clear()
+                if mid is not None:
+                    self.init_id = mid
+                return
+            if method != "tools/call":
+                return
+            name = (msg.get("params") or {}).get("name")
+            if mid is not None and isinstance(name, str):
+                self.pending[mid] = name
+                # dict preserves insertion order; drop the oldest tracked id(s) once over
+                # cap so abandoned (timed-out) entries can't accumulate (#22). Safe under
+                # the lock — no concurrent mutation during the iterate-then-pop.
+                while len(self.pending) > self.PENDING_MAX:
+                    self.pending.pop(next(iter(self.pending)))
 
     def transform_response(self, line: str) -> str:
         """Compress the text of a tracked tools/call result; prime the initialize reply;
@@ -109,39 +140,42 @@ class Interceptor:
             return line
         if not isinstance(msg, dict) or "result" not in msg or msg.get("id") is None:
             return line
-        if msg["id"] == self.init_id:
-            self.init_id = None  # one-time
-            primed = self._augment_initialize(msg)
-            return primed if primed is not None else line
-        tool = self.pending.pop(msg["id"], None)
-        if tool is None:
-            return line  # not a tracked tools/call response (tools/list, ...)
+        # Held across the whole body so the shared init_id/pending/last/since_keyframe
+        # state stays consistent against a concurrent note_request on the other thread.
+        with self._lock:
+            if msg["id"] == self.init_id:
+                self.init_id = None  # one-time
+                primed = self._augment_initialize(msg)
+                return primed if primed is not None else line
+            tool = self.pending.pop(msg["id"], None)
+            if tool is None:
+                return line  # not a tracked tools/call response (tools/list, ...)
 
-        result = msg.get("result")
-        content = result.get("content") if isinstance(result, dict) else None
-        if not isinstance(content, list):
-            return line
+            result = msg.get("result")
+            content = result.get("content") if isinstance(result, dict) else None
+            if not isinstance(content, list):
+                return line
 
-        text_blocks = [b for b in content
-                       if isinstance(b, dict) and b.get("type") == "text"
-                       and isinstance(b.get("text"), str)]
+            text_blocks = [b for b in content
+                           if isinstance(b, dict) and b.get("type") == "text"
+                           and isinstance(b.get("text"), str)]
 
-        changed = False
-        # Diffing reasons about ONE logical payload, so it only engages for a single
-        # text block (the overwhelmingly common tool-result shape); multi-block results
-        # take the plain per-block compression path.
-        if self.diff and len(text_blocks) == 1:
-            changed = self._compress_or_diff(text_blocks[0], tool)
-        else:
-            for block in text_blocks:
-                new_text = self._compress(block["text"], tool)
-                if new_text != block["text"]:
-                    block["text"] = new_text
-                    changed = True
-        if not changed:
-            return line
-        # Re-serialize compactly. JSON-RPC is semantics, not formatting; no newlines.
-        return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+            changed = False
+            # Diffing reasons about ONE logical payload, so it only engages for a single
+            # text block (the overwhelmingly common tool-result shape); multi-block results
+            # take the plain per-block compression path.
+            if self.diff and len(text_blocks) == 1:
+                changed = self._compress_or_diff(text_blocks[0], tool)
+            else:
+                for block in text_blocks:
+                    new_text = self._compress(block["text"], tool)
+                    if new_text != block["text"]:
+                        block["text"] = new_text
+                        changed = True
+            if not changed:
+                return line
+            # Re-serialize compactly. JSON-RPC is semantics, not formatting; no newlines.
+            return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
 
     def _compress_or_diff(self, block: dict, tool: str) -> bool:
         """Compress one block, preferring a lossless delta vs the prior same-tool result
@@ -258,6 +292,22 @@ def pump(src: TextIO, dst: TextIO, transform: Callable[[str], Optional[str]]) ->
         dst.flush()
 
 
+def _terminate_child(proc: "subprocess.Popen[Any]", timeout: float = 2.0) -> None:
+    """Reap the downstream server if it is still running, so it shares the proxy's
+    lifecycle and is never orphaned (#21). SIGTERM first, then SIGKILL on timeout."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def run_proxy(
     cmd: list[str],
     pol: policy_mod.Policy,
@@ -265,7 +315,10 @@ def run_proxy(
     stdin: Optional[TextIO] = None,
     stdout: Optional[TextIO] = None,
 ) -> int:
-    """Launch the downstream MCP server `cmd` and proxy stdio through `Interceptor`."""
+    """Launch the downstream MCP server `cmd` and proxy stdio through `Interceptor`.
+    The child shares this process's lifecycle: it is reaped on normal exit, on a crash
+    (via `finally`), and on SIGTERM (the signal a parent MCP client uses to stop us),
+    so it is never left orphaned (#21)."""
     cin = stdin or sys.stdin
     cout = stdout or sys.stdout
     inter = Interceptor(pol, debug=debug)
@@ -276,25 +329,57 @@ def run_proxy(
     )
     assert proc.stdin is not None and proc.stdout is not None
 
-    def client_to_server() -> None:
-        def fwd(line: str) -> str:
-            inter.note_request(line)
-            return line  # forward request unchanged; only observe
-        try:
-            pump(cin, proc.stdin, fwd)
-        finally:
+    # SIGTERM otherwise bypasses `finally` (default action exits immediately), orphaning
+    # the child. Convert it to a clean SystemExit so cleanup runs. Only the main thread
+    # may install handlers; in a worker (e.g. tests calling run_proxy directly) the
+    # try/finally still covers the crash and normal-exit paths.
+    prev_sigterm = None
+    installed_sigterm = False
+    try:
+        prev_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+        installed_sigterm = True
+    except (ValueError, OSError):
+        pass
+
+    try:
+        def client_to_server() -> None:
+            def fwd(line: str) -> str:
+                inter.note_request(line)
+                return line  # forward request unchanged; only observe
             try:
-                proc.stdin.close()
-            except Exception:  # noqa: BLE001
+                pump(cin, proc.stdin, fwd)
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        def server_to_client() -> None:
+            pump(proc.stdout, cout, inter.transform_response)
+
+        t_up = Thread(target=client_to_server, daemon=True)
+        t_down = Thread(target=server_to_client, daemon=True)
+        t_up.start()
+        t_down.start()
+        rc = proc.wait()
+        t_down.join(timeout=2.0)
+        return rc
+    finally:
+        if installed_sigterm:
+            # Ignore further SIGTERM while reaping: a second signal would otherwise
+            # re-enter the sys.exit(143) handler and unwind out of _terminate_child
+            # before the SIGKILL escalation and the restore below ever run.
+            try:
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            except (ValueError, OSError):
                 pass
-
-    def server_to_client() -> None:
-        pump(proc.stdout, cout, inter.transform_response)
-
-    t_up = Thread(target=client_to_server, daemon=True)
-    t_down = Thread(target=server_to_client, daemon=True)
-    t_up.start()
-    t_down.start()
-    rc = proc.wait()
-    t_down.join(timeout=2.0)
-    return rc
+        _terminate_child(proc)
+        if installed_sigterm:
+            # Restore the prior disposition; SIG_DFL when it wasn't a Python-set handler
+            # (getsignal returns None there), so we never leave our lambda installed.
+            try:
+                signal.signal(signal.SIGTERM,
+                              prev_sigterm if prev_sigterm is not None else signal.SIG_DFL)
+            except (ValueError, OSError, TypeError):
+                pass
