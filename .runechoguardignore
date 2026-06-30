@@ -1,0 +1,5 @@
+# Symbols the guard mis-flags as unresolved. The guard parses `from X import Y`
+# only within a staged diff hunk, so a new line using a stdlib symbol whose import
+# line isn't also in the hunk gets a false positive. A genuinely missing import of
+# these is caught immediately by pytest/import, so suppressing them here is safe.
+Path
