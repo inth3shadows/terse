@@ -76,7 +76,8 @@ class Interceptor:
     PENDING_MAX = 1024
 
     def __init__(self, pol: policy_mod.Policy, debug: bool = False,
-                 capture: Optional[Callable[[str, str], None]] = None):
+                 capture: Optional[Callable[[str, str], None]] = None,
+                 audit: Optional[Callable[[dict], None]] = None):
         self.policy = pol
         self.pending: dict[Any, str] = {}
         self.debug = debug
@@ -85,6 +86,10 @@ class Interceptor:
         # (#32). Keeps the Interceptor I/O-free: the callback owns the disk write. Never
         # affects forwarding — its failures are swallowed at the call site.
         self.capture = capture
+        # Optional structured replay log of the raw->decision->emitted triple per result
+        # (#23). Like capture, the callback owns I/O and its failures are swallowed: an
+        # audit-log write must NEVER change what the client receives.
+        self.audit = audit
         self.last: dict[str, Any] = {}  # tool -> previous result object (the diff base)
         # tool -> consecutive diffs emitted since the last full (keyframe) result. Bounds
         # how far a chained diff can drift from a self-contained anchor (#8).
@@ -176,6 +181,10 @@ class Interceptor:
                         if self.debug:
                             sys.stderr.write(f"[terse-proxy] {tool}: capture skipped: {exc}\n")
 
+            # Snapshot the raw block texts before any transform mutates them in place, so
+            # the audit log can pair each raw payload with what terse actually emitted (#23).
+            raw_texts = [b["text"] for b in text_blocks] if self.audit is not None else None
+
             changed = False
             # Diffing reasons about ONE logical payload, so it only engages for a single
             # text block (the overwhelmingly common tool-result shape); multi-block results
@@ -188,6 +197,12 @@ class Interceptor:
                     if new_text != block["text"]:
                         block["text"] = new_text
                         changed = True
+
+            # Audit AFTER the transform, regardless of `changed`: a no-op is itself
+            # diagnostic — it confirms terse left a suspect payload untouched.
+            if self.audit is not None and raw_texts is not None:
+                self._emit_audit(tool, msg["id"], raw_texts, text_blocks, changed)
+
             if not changed:
                 return line
             # Re-serialize compactly. JSON-RPC is semantics, not formatting; no newlines.
@@ -293,6 +308,26 @@ class Interceptor:
                 sys.stderr.write(f"[terse-proxy] {tool}: passthrough on error: {exc}\n")
             return text
 
+    def _emit_audit(self, tool: str, mid: Any, raw_texts: list[str],
+                    text_blocks: list[dict], changed: bool) -> None:
+        """Hand the audit callback one replay record per result (#23). Strictly a side
+        effect: any error is swallowed so an audit-log write can never change what the
+        client receives — same fail-open contract as capture."""
+        record = {
+            "tool": tool,
+            "id": mid,
+            "diff_mode": self.diff,
+            "tiers": list(self.policy.select(tool).tiers),
+            "changed": changed,
+            "blocks": [{"raw": raw, "emitted": b["text"]}
+                       for raw, b in zip(raw_texts, text_blocks)],
+        }
+        try:
+            self.audit(record)  # type: ignore[misc]  — only called when set
+        except Exception as exc:  # noqa: BLE001 — audit is never load-bearing
+            if self.debug:
+                sys.stderr.write(f"[terse-proxy] {tool}: audit skipped: {exc}\n")
+
 
 def pump(src: TextIO, dst: TextIO, transform: Callable[[str], Optional[str]]) -> None:
     """Read lines from src, apply transform (None = drop nothing here, forward), write
@@ -331,6 +366,7 @@ def run_proxy(
     stdin: Optional[TextIO] = None,
     stdout: Optional[TextIO] = None,
     capture_dir: Optional[str] = None,
+    debug_log: Optional[str] = None,
 ) -> int:
     """Launch the downstream MCP server `cmd` and proxy stdio through `Interceptor`.
     The child shares this process's lifecycle: it is reaped on normal exit, on a crash
@@ -339,7 +375,11 @@ def run_proxy(
 
     With `capture_dir`, each raw tool-result payload is also teed into that corpus dir
     (#32) for later `terse verify --corpus`/`measure` — opt-in, and strictly a side
-    effect that can never change what the client receives."""
+    effect that can never change what the client receives.
+
+    With `debug_log`, a structured raw->decision->emitted record per result is appended
+    to that JSONL path (#23) for after-the-fact diagnosis/replay of a silent compression
+    bug — same opt-in, side-effect-only contract."""
     cin = stdin or sys.stdin
     cout = stdout or sys.stdout
 
@@ -356,7 +396,20 @@ def run_proxy(
                 if debug:
                     sys.stderr.write(f"[terse-proxy] capture_payload failed: {exc}\n")
 
-    inter = Interceptor(pol, debug=debug, capture=capture)
+    audit: Optional[Callable[[dict], None]] = None
+    if debug_log is not None:
+        from .capture import append_audit
+
+        def audit(record: dict) -> None:
+            # Defense in depth alongside the Interceptor's guard: a read-only or full
+            # disk must not break the proxy.
+            try:
+                append_audit(record, debug_log)
+            except Exception as exc:  # noqa: BLE001 — audit is never load-bearing
+                if debug:
+                    sys.stderr.write(f"[terse-proxy] append_audit failed: {exc}\n")
+
+    inter = Interceptor(pol, debug=debug, capture=capture, audit=audit)
 
     proc = subprocess.Popen(  # noqa: S603 — cmd is operator-supplied, by design
         cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,

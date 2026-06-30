@@ -91,7 +91,8 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         pol.diff = True  # CLI opt-in overrides the policy default (off)
     if args.diff_keyframe_interval is not None:
         pol.diff_keyframe_interval = args.diff_keyframe_interval
-    return run_proxy(cmd, pol, debug=args.debug, capture_dir=args.capture_dir)
+    return run_proxy(cmd, pol, debug=args.debug, capture_dir=args.capture_dir,
+                     debug_log=args.debug_log)
 
 
 def _cmd_compress(args: argparse.Namespace) -> int:
@@ -394,6 +395,10 @@ def main(argv: list[str] | None = None) -> int:
     px.add_argument("--capture-dir", metavar="DIR",
                     help="tee each raw tool-result payload into this corpus dir for later "
                          "`terse verify --corpus`/`measure` (opt-in; never affects forwarding)")
+    px.add_argument("--debug-log", metavar="FILE",
+                    help="append a structured raw->decision->emitted record per result to "
+                         "this JSONL file for after-the-fact diagnosis/replay (opt-in; never "
+                         "affects forwarding)")
     px.add_argument("cmd", nargs=argparse.REMAINDER,
                     help="-- <downstream MCP server command and args>")
     px.set_defaults(func=_cmd_proxy)
