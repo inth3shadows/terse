@@ -639,3 +639,149 @@ def test_append_audit_writes_one_json_line_per_call(tmp_path):
     append_audit({"tool": "b", "id": 2}, log)
     lines = log.read_text(encoding="utf-8").splitlines()
     assert [json.loads(line)["id"] for line in lines] == [1, 2]
+
+
+# --- drop-to-retrieve: store + tools/list injection (#10, Phase 2) ---
+
+DROP = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"),
+                          fields={"result[].body": {"lossy": "drop-to-retrieve"}})])
+
+
+def _tools_list(mid, names):
+    return json.dumps({"jsonrpc": "2.0", "id": mid,
+                       "result": {"tools": [{"name": n} for n in names]}})
+
+
+def test_injects_retrieve_tool_into_tools_list_when_drop_enabled():
+    inter = Interceptor(DROP)
+    out = json.loads(inter.transform_response(_tools_list(1, ["gh.api.items"])))
+    assert "terse.retrieve" in [t["name"] for t in out["result"]["tools"]]
+    # idempotent: re-listing an already-injected list doesn't duplicate it
+    again = json.loads(inter.transform_response(json.dumps(out)))
+    assert [t["name"] for t in again["result"]["tools"]].count("terse.retrieve") == 1
+
+
+def test_no_retrieve_tool_when_drop_disabled():
+    inter = Interceptor(FULL)                                  # no drop-marked fields
+    tl = _tools_list(1, ["gh.api.items"])
+    out = inter.transform_response(tl)
+    assert out == tl and "terse.retrieve" not in out           # forwarded unchanged
+
+
+def test_drop_result_populates_store_and_carries_the_marker():
+    inter = Interceptor(DROP)
+    out = _emit(inter, 9, "gh.api.items", {"result": [{"id": 1, "body": "B" * 400}]})
+    assert transforms.DROPPED_MARKER in out                    # emitted with a handle
+    assert len(inter.dropped) == 1
+    handle = next(iter(inter.dropped))
+    assert inter.dropped[handle] == "B" * 400                  # original stored, recoverable
+
+
+def test_reconnect_clears_the_drop_store():
+    inter = Interceptor(DROP)
+    _emit(inter, 9, "gh.api.items", {"result": [{"id": 1, "body": "B" * 400}]})
+    assert inter.dropped and inter._dropped_bytes > 0
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize"}))
+    assert len(inter.dropped) == 0 and inter._dropped_bytes == 0
+
+
+def test_drop_store_evicts_lru_over_count_cap():
+    inter = Interceptor(DROP)
+    inter.DROPPED_MAX = 3                                       # shadow the class cap
+    for i in range(5):
+        inter._drop_put(f"h{i}", "x" * 10)
+    assert list(inter.dropped) == ["h2", "h3", "h4"]           # two oldest evicted
+
+
+def test_drop_store_evicts_over_byte_cap():
+    inter = Interceptor(DROP)
+    inter.DROPPED_MAX_BYTES = 25
+    inter._drop_put("a", "x" * 10)
+    inter._drop_put("b", "y" * 10)
+    inter._drop_put("c", "z" * 10)                             # 30 > 25 -> evict oldest (a)
+    assert "a" not in inter.dropped and inter._dropped_bytes == 20
+
+
+def test_drop_store_refreshes_recency_on_reinsert():
+    inter = Interceptor(DROP)
+    inter.DROPPED_MAX = 2
+    inter._drop_put("a", "x" * 10)
+    inter._drop_put("b", "y" * 10)
+    inter._drop_put("a", "x" * 10)                             # touch a -> most-recent
+    inter._drop_put("c", "z" * 10)                             # evict LRU = b
+    assert list(inter.dropped) == ["a", "c"] and inter._dropped_bytes == 20
+
+
+# --- drop-to-retrieve: serving terse.retrieve (#10, Phase 3) ---
+
+def _retrieve_call(mid, handle):
+    return json.dumps({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+                       "params": {"name": "terse.retrieve", "arguments": {"handle": handle}}})
+
+
+def test_answer_retrieve_returns_the_stored_original():
+    inter = Interceptor(DROP)
+    inter._drop_put("abc123", "the original body value")
+    reply = json.loads(inter.answer_retrieve(_retrieve_call(5, "abc123")))
+    assert reply["id"] == 5
+    assert reply["result"]["content"][0]["text"] == "the original body value"
+    assert not reply["result"].get("isError")
+
+
+def test_answer_retrieve_serializes_a_structured_original():
+    inter = Interceptor(DROP)
+    inter._drop_put("h", {"a": [1, 2, 3]})
+    reply = json.loads(inter.answer_retrieve(_retrieve_call(9, "h")))
+    assert json.loads(reply["result"]["content"][0]["text"]) == {"a": [1, 2, 3]}
+
+
+def test_answer_retrieve_miss_is_a_legible_error_not_a_protocol_error():
+    inter = Interceptor(DROP)
+    reply = json.loads(inter.answer_retrieve(_retrieve_call(6, "gone")))
+    assert reply["id"] == 6 and reply["result"]["isError"] is True
+    assert "no longer available" in reply["result"]["content"][0]["text"]
+
+
+def test_answer_retrieve_ignores_non_retrieve_lines():
+    inter = Interceptor(DROP)
+    assert inter.answer_retrieve(_req(7, "gh.api.items")) is None          # a real tool call
+    assert inter.answer_retrieve("not json") is None
+    assert inter.answer_retrieve(
+        json.dumps({"jsonrpc": "2.0", "id": 8, "method": "initialize"})) is None
+
+
+def test_pump_swallow_writes_nothing_else_forwards():
+    from terse.proxy import SWALLOW, pump
+    src = io.StringIO("keep\ndrop\nkeep2\n")
+    dst = io.StringIO()
+    pump(src, dst, lambda line: SWALLOW if line == "drop" else None)
+    assert dst.getvalue().splitlines() == ["keep", "keep2"]
+
+
+def test_run_proxy_injects_retrieve_tool_into_a_live_tools_list():
+    requests = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                           "params": {}}) + "\n"
+    cin, cout = io.StringIO(requests), io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], DROP, stdin=cin, stdout=cout)
+    assert rc == 0
+    resp = json.loads([ln for ln in cout.getvalue().splitlines() if ln.strip()][0])
+    assert "terse.retrieve" in [t["name"] for t in resp["result"]["tools"]]
+
+
+def test_primer_documents_the_drop_marker_and_retrieve_tool():
+    # Load-bearing: without this the model sees an opaque marker and never fetches the value.
+    from terse.proxy import TERSE_PRIMER
+    assert transforms.DROPPED_MARKER in TERSE_PRIMER
+    assert "terse.retrieve" in TERSE_PRIMER
+
+
+def test_run_proxy_answers_retrieve_without_forwarding_downstream():
+    # A miss handle is enough to prove the swallow: the reply is OUR synthesized error, and
+    # the downstream fake never saw the call (it would have returned records if forwarded).
+    requests = _retrieve_call(1, "nope") + "\n"
+    cin, cout = io.StringIO(requests), io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], DROP, stdin=cin, stdout=cout)
+    assert rc == 0
+    resp = json.loads([ln for ln in cout.getvalue().splitlines() if ln.strip()][0])
+    assert resp["id"] == 1 and resp["result"]["isError"] is True
+    assert '"status"' not in resp["result"]["content"][0]["text"]           # not the fake's records

@@ -244,13 +244,19 @@ specific rules first. An empty tier list means "leave this tool's output alone."
   per-tool report will show which tools are worth compressing and which aren't.
 
 - **A `[warn] field ... not implemented yet` message** — The policy asked for `summarize`
-  or `drop-to-retrieve` on a field; those modes aren't built yet, so terse safely ignored
-  them and kept everything. Nothing was lost.
+  on a field; that mode isn't built yet, so terse safely ignored it and kept everything.
+  Nothing was lost.
 - **A `[warn] lossy: truncated marked field(s) — output is NOT lossless` message** — Expected
   when a field is marked `{"lossy":"truncate"}`. terse capped that field on purpose and
   annotated the cut (`…⟨+N chars⟩`). Only fields you marked (never `{"critical":true}` ones)
   are affected; if the gate can't prove that, terse falls back to the lossless output and
   says so (`lossy step skipped`).
+- **A `[warn] lossy: dropped marked field(s) to retrieve handle(s)` message** — Expected
+  when a field is marked `{"lossy":"drop-to-retrieve"}` and terse is running as the proxy.
+  terse replaced that field with a `__terse_dropped__` handle and stored the original; the
+  model gets it back by calling the injected `terse.retrieve` tool. Outside the proxy (e.g.
+  the one-shot CLI) there is no store, so the field is left lossless with a
+  `needs the proxy store` warning instead.
 
 - **"no payloads in corpus/"** — You ran a report before capturing any samples. Capture
   some tool outputs first (see "Building a sample set").

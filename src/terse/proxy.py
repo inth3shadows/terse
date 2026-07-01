@@ -22,13 +22,33 @@ import json
 import signal
 import subprocess
 import sys
+from collections import OrderedDict
 from threading import Lock, Thread
 from typing import Any, Callable, Optional, TextIO
 
+from . import lossy as lossy_mod
 from . import policy as policy_mod
 from . import text_diff
 from . import transforms
 from .tokenize import count_cl100k
+
+# The synthetic tool terse advertises in tools/list when a policy enables drop-to-retrieve
+# (#10). The proxy answers its calls itself from the drop store — the downstream server
+# never sees it.
+RETRIEVE_TOOL_DEF = {
+    "name": lossy_mod.RETRIEVE_TOOL,
+    "description": ("Fetch the full original value of a field terse dropped from an earlier "
+                    "tool result to save context. Pass the handle string shown in the field's "
+                    f"{lossy_mod.DROP_KEY!r} marker; returns the exact original value."),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "handle": {"type": "string",
+                       "description": f"The handle from a {lossy_mod.DROP_KEY!r} marker."},
+        },
+        "required": ["handle"],
+    },
+}
 
 
 def _cost(text: str) -> int:
@@ -59,7 +79,11 @@ TERSE_PRIMER = (
     'A text diff {"__terse_textdiff__":1,"ops":[["=",a,b],["+","..."],...]} updates the '
     "PREVIOUS same-tool plain-text result: process ops in order, copying chunks a..b of "
     "that prior text for a `=` op or inserting its literal string for a `+` op, then "
-    "concatenating everything. Always reason about the fully reconstructed result."
+    "concatenating everything.\n"
+    '- Dropped field {"__terse_dropped__":"H","bytes":N,"retrieve":"terse.retrieve"}: a '
+    "large field value was omitted to save context. It is NOT lost — when you actually need "
+    'it, call the terse.retrieve tool with {"handle":"H"} to get the exact original back.\n'
+    "Always reason about the fully reconstructed result."
 )
 
 
@@ -80,6 +104,12 @@ class Interceptor:
     # oldest-first: a long session against a flaky server can't leak unboundedly. An
     # evicted id whose result arrives late just forwards uncompressed — safe, fail-open.
     PENDING_MAX = 1024
+    # drop-to-retrieve store bounds (#10): retain at most this many distinct handles AND at
+    # most this many bytes of stored originals, evicting least-recently-used first. A dropped
+    # field the model never retrieves before eviction just fails its retrieve legibly (Phase
+    # 3) — fail-open, never a crash. Both caps guard a long session from unbounded growth.
+    DROPPED_MAX = 512
+    DROPPED_MAX_BYTES = 8 << 20  # 8 MiB
 
     def __init__(self, pol: policy_mod.Policy, debug: bool = False,
                  capture: Optional[Callable[[str, str], None]] = None,
@@ -106,6 +136,13 @@ class Interceptor:
         # non-JSON result never populates `last` (there is no JSON object to diff).
         self.last_text: dict[str, str] = {}
         self.since_text_keyframe: dict[str, int] = {}
+        # drop-to-retrieve store (#10): handle -> original field value, filled when a field
+        # marked drop-to-retrieve is replaced inline by a handle, and read back by the
+        # synthetic terse.retrieve tool. LRU-ordered; bounded by DROPPED_MAX / _MAX_BYTES;
+        # cleared on reconnect (like the diff bases) since the model's context — and thus
+        # every emitted handle — resets then too.
+        self.dropped: "OrderedDict[str, Any]" = OrderedDict()
+        self._dropped_bytes = 0
         self.init_id: Any = None        # id of the initialize request, to prime its reply
         # The two proxy pump threads call note_request (client->server) and
         # transform_response (server->client) concurrently, both mutating the shared
@@ -140,6 +177,8 @@ class Interceptor:
                 self.last_text.clear()
                 self.since_text_keyframe.clear()
                 self.pending.clear()
+                self.dropped.clear()
+                self._dropped_bytes = 0
                 if mid is not None:
                     self.init_id = mid
                 return
@@ -172,6 +211,14 @@ class Interceptor:
                 return primed if primed is not None else line
             tool = self.pending.pop(msg["id"], None)
             if tool is None:
+                # Not a tracked tools/call response. When a policy enables drop-to-retrieve,
+                # a tools/list reply is where we advertise the synthetic terse.retrieve tool
+                # so the model knows how to fetch a dropped field back (#10). Anything else
+                # (and any non-tools/list message) forwards unchanged.
+                if self.policy.has_drop():
+                    injected = self._inject_retrieve_tool(msg)
+                    if injected is not None:
+                        return injected
                 return line  # not a tracked tools/call response (tools/list, ...)
 
             result = msg.get("result")
@@ -227,7 +274,7 @@ class Interceptor:
         text changed. Fail-open: any error leaves the block untouched and state intact."""
         text = block["text"]
         try:
-            applied = policy_mod.apply(text, tool, self.policy)
+            applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put)
         except Exception as exc:  # noqa: BLE001 — fail-open is the whole point
             if self.debug:
                 sys.stderr.write(f"[terse-proxy] {tool}: passthrough on error: {exc}\n")
@@ -342,7 +389,7 @@ class Interceptor:
     def _compress(self, text: str, tool: str) -> str:
         """policy.apply with a hard fail-open: any error returns the original text."""
         try:
-            applied = policy_mod.apply(text, tool, self.policy)
+            applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put)
             if self.debug and not applied.skipped and applied.text != text:
                 sys.stderr.write(
                     f"[terse-proxy] {tool}: {len(text)}->{len(applied.text)} bytes "
@@ -353,6 +400,78 @@ class Interceptor:
             if self.debug:
                 sys.stderr.write(f"[terse-proxy] {tool}: passthrough on error: {exc}\n")
             return text
+
+    def _drop_put(self, handle: str, value: Any) -> None:
+        """Store a dropped field's original under `handle` for a later terse.retrieve (#10).
+        LRU: re-inserting an existing handle refreshes its recency; once over the count or
+        byte cap, evict oldest-first. Called from apply() inside transform_response, which
+        already holds self._lock — no separate lock needed."""
+        size = len(lossy_mod._serialize(value))
+        if handle in self.dropped:
+            self._dropped_bytes -= len(lossy_mod._serialize(self.dropped[handle]))
+            self.dropped.move_to_end(handle)
+        self.dropped[handle] = value
+        self._dropped_bytes += size
+        while self.dropped and (len(self.dropped) > self.DROPPED_MAX
+                                or self._dropped_bytes > self.DROPPED_MAX_BYTES):
+            _, evicted = self.dropped.popitem(last=False)
+            self._dropped_bytes -= len(lossy_mod._serialize(evicted))
+
+    def _inject_retrieve_tool(self, msg: dict) -> Optional[str]:
+        """If `msg` is a tools/list result, append the synthetic terse.retrieve tool so the
+        model can fetch a drop-to-retrieve field back by handle (#10). Idempotent. Returns
+        the reserialized line, or None to forward unchanged (not a tools/list, or already
+        advertised)."""
+        result = msg.get("result")
+        if not isinstance(result, dict):
+            return None
+        tools = result.get("tools")
+        if not isinstance(tools, list):
+            return None
+        if any(isinstance(t, dict) and t.get("name") == lossy_mod.RETRIEVE_TOOL for t in tools):
+            return None  # already present — idempotent across re-lists
+        tools.append(RETRIEVE_TOOL_DEF)
+        if self.debug:
+            sys.stderr.write(f"[terse-proxy] injected {lossy_mod.RETRIEVE_TOOL} into tools/list\n")
+        return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+
+    def answer_retrieve(self, line: str) -> Optional[str]:
+        """If `line` is a client tools/call for the synthetic terse.retrieve tool, produce the
+        JSON-RPC reply here — from the drop store — instead of forwarding it downstream, which
+        has no such tool (#10). Returns the reply line to write back to the client, or None if
+        this isn't a retrieve call. A miss (evicted, or a handle from before a reconnect) is a
+        legible error result, never a protocol error — the model can just re-run the tool."""
+        try:
+            msg = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(msg, dict) or msg.get("method") != "tools/call":
+            return None
+        params = msg.get("params") or {}
+        if params.get("name") != lossy_mod.RETRIEVE_TOOL:
+            return None
+        mid = msg.get("id")
+        handle = (params.get("arguments") or {}).get("handle")
+        value = None
+        with self._lock:
+            hit = handle in self.dropped
+            if hit:
+                self.dropped.move_to_end(handle)  # a read refreshes recency
+                value = self.dropped[handle]
+        if hit:
+            result: dict = {"content": [{"type": "text", "text": lossy_mod._serialize(value)}]}
+        else:
+            result = {"content": [{"type": "text",
+                                   "text": (f"terse: dropped-field handle {handle!r} is no "
+                                            "longer available (evicted, or the session "
+                                            "reconnected). Re-run the original tool to get "
+                                            "the value again.")}],
+                      "isError": True}
+        if self.debug:
+            sys.stderr.write(f"[terse-proxy] answered {lossy_mod.RETRIEVE_TOOL} "
+                             f"handle={handle!r} hit={hit}\n")
+        return json.dumps({"jsonrpc": "2.0", "id": mid, "result": result},
+                          separators=(",", ":"), ensure_ascii=False)
 
     def _emit_audit(self, tool: str, mid: Any, raw_texts: list[str],
                     text_blocks: list[dict], changed: bool) -> None:
@@ -375,18 +494,35 @@ class Interceptor:
                 sys.stderr.write(f"[terse-proxy] {tool}: audit skipped: {exc}\n")
 
 
-def pump(src: TextIO, dst: TextIO, transform: Callable[[str], Optional[str]]) -> None:
-    """Read lines from src, apply transform (None = drop nothing here, forward), write
-    to dst with a single trailing newline. Stops at EOF. Used for both directions."""
+# Sentinel a transform returns to SWALLOW a line — write nothing to dst — as distinct from
+# None, which forwards the line unchanged. Used when the client->server side answers a
+# synthetic terse.retrieve call itself and must not forward it downstream (#10).
+SWALLOW: Any = object()
+
+
+def pump(src: TextIO, dst: TextIO, transform: Callable[[str], Any],
+         lock: "Optional[Lock]" = None) -> None:
+    """Read lines from src, apply transform, write to dst with a single trailing newline.
+    transform returns: a string to write, None to forward the line unchanged, or SWALLOW to
+    write nothing (the transform handled it out-of-band). Stops at EOF. With `lock`, each
+    write+flush is serialized — needed on the shared client-facing stream, which both this
+    pump and the retrieve answerer write to (#10)."""
     for raw in src:
         line = raw.rstrip("\n")
         if not line:
             continue
         out = transform(line)
+        if out is SWALLOW:
+            continue
         if out is None:
             out = line
-        dst.write(out + "\n")
-        dst.flush()
+        if lock is not None:
+            with lock:
+                dst.write(out + "\n")
+                dst.flush()
+        else:
+            dst.write(out + "\n")
+            dst.flush()
 
 
 def stdio_transport_error(cmd: list[str]) -> Optional[str]:
@@ -510,9 +646,25 @@ def run_proxy(
     except (ValueError, OSError):
         pass
 
+    # The client-facing stream (cout) now has TWO writers: the server->client pump and the
+    # client->server side answering a swallowed terse.retrieve call (#10). Serialize every
+    # write+flush to it so a synthesized reply can't interleave mid-line with a result.
+    out_lock = Lock()
+
     try:
         def client_to_server() -> None:
-            def fwd(line: str) -> str:
+            def fwd(line: str) -> Any:
+                # A terse.retrieve call is ours to answer from the drop store — the downstream
+                # server has no such tool. Write the reply straight back to the client and
+                # SWALLOW the request so it never reaches downstream (and never enters
+                # `pending`, since we don't call note_request for it).
+                if inter.policy.has_drop():
+                    reply = inter.answer_retrieve(line)
+                    if reply is not None:
+                        with out_lock:
+                            cout.write(reply + "\n")
+                            cout.flush()
+                        return SWALLOW
                 inter.note_request(line)
                 return line  # forward request unchanged; only observe
             try:
@@ -524,7 +676,7 @@ def run_proxy(
                     pass
 
         def server_to_client() -> None:
-            pump(proc.stdout, cout, inter.transform_response)
+            pump(proc.stdout, cout, inter.transform_response, lock=out_lock)
 
         t_up = Thread(target=client_to_server, daemon=True)
         t_down = Thread(target=server_to_client, daemon=True)
