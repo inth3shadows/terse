@@ -710,3 +710,71 @@ def test_drop_store_refreshes_recency_on_reinsert():
     inter._drop_put("a", "x" * 10)                             # touch a -> most-recent
     inter._drop_put("c", "z" * 10)                             # evict LRU = b
     assert list(inter.dropped) == ["a", "c"] and inter._dropped_bytes == 20
+
+
+# --- drop-to-retrieve: serving terse.retrieve (#10, Phase 3) ---
+
+def _retrieve_call(mid, handle):
+    return json.dumps({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+                       "params": {"name": "terse.retrieve", "arguments": {"handle": handle}}})
+
+
+def test_answer_retrieve_returns_the_stored_original():
+    inter = Interceptor(DROP)
+    inter._drop_put("abc123", "the original body value")
+    reply = json.loads(inter.answer_retrieve(_retrieve_call(5, "abc123")))
+    assert reply["id"] == 5
+    assert reply["result"]["content"][0]["text"] == "the original body value"
+    assert not reply["result"].get("isError")
+
+
+def test_answer_retrieve_serializes_a_structured_original():
+    inter = Interceptor(DROP)
+    inter._drop_put("h", {"a": [1, 2, 3]})
+    reply = json.loads(inter.answer_retrieve(_retrieve_call(9, "h")))
+    assert json.loads(reply["result"]["content"][0]["text"]) == {"a": [1, 2, 3]}
+
+
+def test_answer_retrieve_miss_is_a_legible_error_not_a_protocol_error():
+    inter = Interceptor(DROP)
+    reply = json.loads(inter.answer_retrieve(_retrieve_call(6, "gone")))
+    assert reply["id"] == 6 and reply["result"]["isError"] is True
+    assert "no longer available" in reply["result"]["content"][0]["text"]
+
+
+def test_answer_retrieve_ignores_non_retrieve_lines():
+    inter = Interceptor(DROP)
+    assert inter.answer_retrieve(_req(7, "gh.api.items")) is None          # a real tool call
+    assert inter.answer_retrieve("not json") is None
+    assert inter.answer_retrieve(
+        json.dumps({"jsonrpc": "2.0", "id": 8, "method": "initialize"})) is None
+
+
+def test_pump_swallow_writes_nothing_else_forwards():
+    from terse.proxy import SWALLOW, pump
+    src = io.StringIO("keep\ndrop\nkeep2\n")
+    dst = io.StringIO()
+    pump(src, dst, lambda line: SWALLOW if line == "drop" else None)
+    assert dst.getvalue().splitlines() == ["keep", "keep2"]
+
+
+def test_run_proxy_injects_retrieve_tool_into_a_live_tools_list():
+    requests = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                           "params": {}}) + "\n"
+    cin, cout = io.StringIO(requests), io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], DROP, stdin=cin, stdout=cout)
+    assert rc == 0
+    resp = json.loads([ln for ln in cout.getvalue().splitlines() if ln.strip()][0])
+    assert "terse.retrieve" in [t["name"] for t in resp["result"]["tools"]]
+
+
+def test_run_proxy_answers_retrieve_without_forwarding_downstream():
+    # A miss handle is enough to prove the swallow: the reply is OUR synthesized error, and
+    # the downstream fake never saw the call (it would have returned records if forwarded).
+    requests = _retrieve_call(1, "nope") + "\n"
+    cin, cout = io.StringIO(requests), io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], DROP, stdin=cin, stdout=cout)
+    assert rc == 0
+    resp = json.loads([ln for ln in cout.getvalue().splitlines() if ln.strip()][0])
+    assert resp["id"] == 1 and resp["result"]["isError"] is True
+    assert '"status"' not in resp["result"]["content"][0]["text"]           # not the fake's records

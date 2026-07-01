@@ -431,6 +431,44 @@ class Interceptor:
             sys.stderr.write(f"[terse-proxy] injected {lossy_mod.RETRIEVE_TOOL} into tools/list\n")
         return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
 
+    def answer_retrieve(self, line: str) -> Optional[str]:
+        """If `line` is a client tools/call for the synthetic terse.retrieve tool, produce the
+        JSON-RPC reply here — from the drop store — instead of forwarding it downstream, which
+        has no such tool (#10). Returns the reply line to write back to the client, or None if
+        this isn't a retrieve call. A miss (evicted, or a handle from before a reconnect) is a
+        legible error result, never a protocol error — the model can just re-run the tool."""
+        try:
+            msg = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(msg, dict) or msg.get("method") != "tools/call":
+            return None
+        params = msg.get("params") or {}
+        if params.get("name") != lossy_mod.RETRIEVE_TOOL:
+            return None
+        mid = msg.get("id")
+        handle = (params.get("arguments") or {}).get("handle")
+        value = None
+        with self._lock:
+            hit = handle in self.dropped
+            if hit:
+                self.dropped.move_to_end(handle)  # a read refreshes recency
+                value = self.dropped[handle]
+        if hit:
+            result: dict = {"content": [{"type": "text", "text": lossy_mod._serialize(value)}]}
+        else:
+            result = {"content": [{"type": "text",
+                                   "text": (f"terse: dropped-field handle {handle!r} is no "
+                                            "longer available (evicted, or the session "
+                                            "reconnected). Re-run the original tool to get "
+                                            "the value again.")}],
+                      "isError": True}
+        if self.debug:
+            sys.stderr.write(f"[terse-proxy] answered {lossy_mod.RETRIEVE_TOOL} "
+                             f"handle={handle!r} hit={hit}\n")
+        return json.dumps({"jsonrpc": "2.0", "id": mid, "result": result},
+                          separators=(",", ":"), ensure_ascii=False)
+
     def _emit_audit(self, tool: str, mid: Any, raw_texts: list[str],
                     text_blocks: list[dict], changed: bool) -> None:
         """Hand the audit callback one replay record per result (#23). Strictly a side
@@ -452,18 +490,35 @@ class Interceptor:
                 sys.stderr.write(f"[terse-proxy] {tool}: audit skipped: {exc}\n")
 
 
-def pump(src: TextIO, dst: TextIO, transform: Callable[[str], Optional[str]]) -> None:
-    """Read lines from src, apply transform (None = drop nothing here, forward), write
-    to dst with a single trailing newline. Stops at EOF. Used for both directions."""
+# Sentinel a transform returns to SWALLOW a line — write nothing to dst — as distinct from
+# None, which forwards the line unchanged. Used when the client->server side answers a
+# synthetic terse.retrieve call itself and must not forward it downstream (#10).
+SWALLOW: Any = object()
+
+
+def pump(src: TextIO, dst: TextIO, transform: Callable[[str], Any],
+         lock: "Optional[Lock]" = None) -> None:
+    """Read lines from src, apply transform, write to dst with a single trailing newline.
+    transform returns: a string to write, None to forward the line unchanged, or SWALLOW to
+    write nothing (the transform handled it out-of-band). Stops at EOF. With `lock`, each
+    write+flush is serialized — needed on the shared client-facing stream, which both this
+    pump and the retrieve answerer write to (#10)."""
     for raw in src:
         line = raw.rstrip("\n")
         if not line:
             continue
         out = transform(line)
+        if out is SWALLOW:
+            continue
         if out is None:
             out = line
-        dst.write(out + "\n")
-        dst.flush()
+        if lock is not None:
+            with lock:
+                dst.write(out + "\n")
+                dst.flush()
+        else:
+            dst.write(out + "\n")
+            dst.flush()
 
 
 def stdio_transport_error(cmd: list[str]) -> Optional[str]:
@@ -587,9 +642,25 @@ def run_proxy(
     except (ValueError, OSError):
         pass
 
+    # The client-facing stream (cout) now has TWO writers: the server->client pump and the
+    # client->server side answering a swallowed terse.retrieve call (#10). Serialize every
+    # write+flush to it so a synthesized reply can't interleave mid-line with a result.
+    out_lock = Lock()
+
     try:
         def client_to_server() -> None:
-            def fwd(line: str) -> str:
+            def fwd(line: str) -> Any:
+                # A terse.retrieve call is ours to answer from the drop store — the downstream
+                # server has no such tool. Write the reply straight back to the client and
+                # SWALLOW the request so it never reaches downstream (and never enters
+                # `pending`, since we don't call note_request for it).
+                if inter.policy.has_drop():
+                    reply = inter.answer_retrieve(line)
+                    if reply is not None:
+                        with out_lock:
+                            cout.write(reply + "\n")
+                            cout.flush()
+                        return SWALLOW
                 inter.note_request(line)
                 return line  # forward request unchanged; only observe
             try:
@@ -601,7 +672,7 @@ def run_proxy(
                     pass
 
         def server_to_client() -> None:
-            pump(proc.stdout, cout, inter.transform_response)
+            pump(proc.stdout, cout, inter.transform_response, lock=out_lock)
 
         t_up = Thread(target=client_to_server, daemon=True)
         t_down = Thread(target=server_to_client, daemon=True)

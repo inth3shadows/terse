@@ -50,6 +50,9 @@ def main() -> None:
                 text = json.dumps({"result": RECORDS}, indent=2)
             resp = {"jsonrpc": "2.0", "id": mid,
                     "result": {"content": [{"type": "text", "text": text}], "isError": False}}
+        elif method == "tools/list":
+            resp = {"jsonrpc": "2.0", "id": mid,
+                    "result": {"tools": [{"name": "gh.api.items"}, {"name": "fs.read"}]}}
         elif method and method.startswith("notifications/"):
             continue  # notifications get no response
         elif mid is not None:
