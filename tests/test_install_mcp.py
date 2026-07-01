@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import stat
+from pathlib import Path
 
 import pytest
 
@@ -78,6 +80,11 @@ def test_do_install_writes_config_stash_and_backup(tmp_path, monkeypatch):
     assert written["otherTopLevel"] == {"keep": True}  # untouched
     stash = json.loads(im.stash_path(cfg).read_text())
     assert stash["runecho"] == {"command": "uvx", "args": ["runecho-mcp"]}
+
+    # config, stash, and backup can all carry secrets (MCP server `env` blocks) — every
+    # file this operation writes must be owner-only, never world/group-readable.
+    for written_path in (cfg, im.stash_path(cfg), Path(res["backup"])):
+        assert stat.S_IMODE(written_path.stat().st_mode) == 0o600
 
     # full round-trip: uninstall restores the original mcpServers entry
     im.do_uninstall(["runecho"], cfg=cfg)

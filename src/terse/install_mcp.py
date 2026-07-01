@@ -21,6 +21,8 @@ import sys
 import time
 from pathlib import Path
 
+from ._secure_io import write_restricted
+
 STASH_NAME = ".terse-mcp-stash.json"
 
 
@@ -106,15 +108,14 @@ def _write_json(path: Path, obj: dict, *, trailing_newline: bool = True) -> None
     # wrap rewrites the WHOLE file as \uXXXX escapes — huge spurious diff, and the
     # install→uninstall round-trip is no longer byte-identical to the backup (#27).
     text = json.dumps(obj, indent=2, ensure_ascii=False)
-    path.write_text(text + ("\n" if trailing_newline else ""), encoding="utf-8")
-    # MCP server entries can carry secrets in `env` blocks — this file mirrors that.
-    os.chmod(path, 0o600)
+    # MCP server entries can carry secrets in `env` blocks — write_restricted keeps this
+    # file at 0600 from before any content lands on disk (see _secure_io).
+    write_restricted(path, text + ("\n" if trailing_newline else ""))
 
 
 def _backup(cfg: Path) -> Path:
     bak = cfg.with_name(f"{cfg.name}.bak-{int(time.time())}")
-    bak.write_text(cfg.read_text(encoding="utf-8"), encoding="utf-8")
-    os.chmod(bak, 0o600)  # backup mirrors cfg, which can hold secrets in `env` blocks
+    write_restricted(bak, cfg.read_text(encoding="utf-8"))  # backup mirrors cfg's secrets
     return bak
 
 
