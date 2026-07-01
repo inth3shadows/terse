@@ -30,7 +30,7 @@ from . import lossy as lossy_mod
 from . import transforms
 
 VALID_TIERS = ("minify", "tabularize", "dictionary")
-LOSSY_MODES = ("truncate",)  # implemented; summarize / drop-to-retrieve are deferred
+LOSSY_MODES = ("truncate", "drop-to-retrieve")  # implemented; summarize is still deferred
 
 
 @dataclass
@@ -65,6 +65,12 @@ class Policy:
             if fnmatch.fnmatch(tool, rule.tool_glob):
                 return rule
         return Rule(tool_glob="*", tiers=self.default_tiers)
+
+    def has_drop(self) -> bool:
+        """True if any rule marks a field drop-to-retrieve. Gates whether the proxy injects
+        the synthetic terse.retrieve tool into tools/list (#10)."""
+        return any(isinstance(s, dict) and s.get("lossy") == "drop-to-retrieve"
+                   for r in self.rules for s in r.fields.values())
 
 
 def default_policy() -> Policy:
@@ -117,7 +123,7 @@ def _lossy_warnings(rule: Rule) -> list[str]:
         mode = spec.get("lossy") if isinstance(spec, dict) else None
         if not mode:
             continue
-        if mode in ("summarize", "drop-to-retrieve"):
+        if mode == "summarize":
             out.append(f"field '{path}': lossy mode '{mode}' not implemented yet (left lossless)")
         elif mode not in LOSSY_MODES:
             out.append(f"field '{path}': unknown lossy mode '{mode}' (ignored)")
@@ -126,10 +132,15 @@ def _lossy_warnings(rule: Rule) -> list[str]:
     return out
 
 
-def apply(raw: str, tool: str, policy: Policy) -> Applied:
+def apply(raw: str, tool: str, policy: Policy,
+          drop_sink: Any = None) -> Applied:
     """Compress one raw payload per policy. Lossless by default; a field marked
     `truncate` (and not `critical`) is reduced, gated by the acceptable-loss invariant.
     Non-JSON passes through.
+
+    `drop_sink` — the per-session drop-to-retrieve store, `handle -> value` — exists only
+    in the running proxy, per issue #10. When it is None a drop-marked field can't be made
+    recoverable, so it is left lossless with a warning instead of silently vanishing.
 
     Returns the (possibly unchanged) text plus what was applied — so a caller/proxy
     can log why a payload was or wasn't compressed, and whether anything was dropped.
@@ -169,6 +180,28 @@ def apply(raw: str, tool: str, policy: Policy) -> Applied:
                 warnings.append("lossy step skipped: acceptable-loss gate failed (kept lossless)")
         except lossy_mod.PathError as exc:
             warnings.append(f"lossy step skipped: {exc} (kept lossless)")
+
+    # Tier-1 lossy (drop-to-retrieve, #10): replace a marked field with a handle marker and
+    # persist the original to the session store, so the model can fetch it back on demand.
+    # Same fail-closed contract as truncate, plus: writes are STAGED and committed to the
+    # real store only after the gate passes, so a gate failure leaves no orphan handles.
+    if lossy_mod._drop_specs(rule):
+        if drop_sink is None:
+            warnings.append("lossy: drop-to-retrieve needs the proxy store; left lossless")
+        else:
+            staging: dict[str, Any] = {}
+            try:
+                cand = lossy_mod.apply_drops(data, rule, tool, staging.__setitem__)
+                if cand != data and lossy_mod.droppable_loss(data, cand, rule, staging.__getitem__):
+                    for handle, value in staging.items():
+                        drop_sink(handle, value)  # commit only once recoverability is proven
+                    data = cand
+                    warnings.append("lossy: dropped marked field(s) to retrieve handle(s) — "
+                                    "output is NOT lossless")
+                elif cand != data:
+                    warnings.append("lossy step skipped: droppable-loss gate failed (kept lossless)")
+            except lossy_mod.PathError as exc:
+                warnings.append(f"lossy step skipped: {exc} (kept lossless)")
 
     text = transforms.compress_with(
         data,

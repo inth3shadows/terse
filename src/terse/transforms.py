@@ -37,13 +37,17 @@ from .tokenize import count_cl100k
 TABLE_MARKER = "__terse_table__"
 DICT_MARKER = "__terse_dict__"
 DIFF_MARKER = "__terse_diff__"
+# The drop-to-retrieve inline handle marker (#10). Not a transforms envelope — it is
+# produced by the lossy layer and consumed by the proxy's retrieve handler — but it lives
+# in this registry so all `__terse_*` wire keys have one home and are reserved together.
+DROPPED_MARKER = "__terse_dropped__"
 ALIAS_SIGIL = "~"
 
 # Keys reserved for terse's own envelopes. A real payload that already contains one
 # can't be safely compressed: the consumer reads these markers per the format primer,
 # so it would mis-reconstruct the user's literal dict as a terse envelope. The codec
 # has no escape convention, so the only lossless move is to leave such a payload alone.
-_RESERVED_MARKERS = frozenset({TABLE_MARKER, DICT_MARKER, DIFF_MARKER})
+_RESERVED_MARKERS = frozenset({TABLE_MARKER, DICT_MARKER, DIFF_MARKER, DROPPED_MARKER})
 
 
 def has_terse_marker(obj: Any) -> bool:

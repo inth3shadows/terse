@@ -5,8 +5,10 @@ proxy; here the store is a fake dict injected via sink/resolve."""
 
 from __future__ import annotations
 
-from terse import lossy
-from terse.policy import Rule
+import json
+
+from terse import lossy, transforms
+from terse.policy import Policy, Rule, _lossy_warnings, apply
 
 
 def _rule(fields):
@@ -127,3 +129,37 @@ def test_gate_fails_closed_on_shape_mismatch():
     obj = {"result": {"body": "B" * 300}}
     rule = _rule({"result[].body": {"lossy": "drop-to-retrieve"}})
     assert not lossy.droppable_loss(obj, obj, rule, {}.__getitem__)
+
+
+# --- end to end through policy.apply ---
+def test_apply_executes_drop_with_a_sink_and_warns_not_lossless():
+    obj = {"result": [{"id": i, "body": "LONGBODY" * 40} for i in range(4)]}
+    raw = json.dumps(obj)
+    store: dict = {}
+    p = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"),
+                           fields={"result[].body": {"lossy": "drop-to-retrieve"}})])
+    res = apply(raw, "gh.api.x", p, drop_sink=store.__setitem__)
+    assert any("NOT lossless" in w for w in res.warnings)
+    decoded = transforms.decompress(res.text)
+    for r in decoded["result"]:
+        assert lossy._is_drop_marker(r["body"])
+        assert store[r["body"][lossy.DROP_KEY]] == "LONGBODY" * 40   # exactly recoverable
+    assert [r["id"] for r in decoded["result"]] == [0, 1, 2, 3]      # ids preserved
+    assert len(res.text) < len(raw)
+
+
+def test_apply_without_a_sink_keeps_drop_lossless_and_warns():
+    obj = {"result": [{"id": 1, "body": "B" * 300}]}
+    raw = json.dumps(obj)
+    p = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"),
+                           fields={"result[].body": {"lossy": "drop-to-retrieve"}})])
+    res = apply(raw, "gh.api.x", p)                                  # no drop_sink
+    assert any("needs the proxy store" in w for w in res.warnings)
+    assert transforms.decompress(res.text) == obj                   # lossless fallback
+
+
+def test_drop_is_no_longer_warned_as_unimplemented_but_summarize_still_is():
+    assert not any("not implemented" in w
+                   for w in _lossy_warnings(_rule({"x": {"lossy": "drop-to-retrieve"}})))
+    assert any("not implemented" in w
+               for w in _lossy_warnings(_rule({"x": {"lossy": "summarize"}})))

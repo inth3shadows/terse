@@ -639,3 +639,74 @@ def test_append_audit_writes_one_json_line_per_call(tmp_path):
     append_audit({"tool": "b", "id": 2}, log)
     lines = log.read_text(encoding="utf-8").splitlines()
     assert [json.loads(line)["id"] for line in lines] == [1, 2]
+
+
+# --- drop-to-retrieve: store + tools/list injection (#10, Phase 2) ---
+
+DROP = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"),
+                          fields={"result[].body": {"lossy": "drop-to-retrieve"}})])
+
+
+def _tools_list(mid, names):
+    return json.dumps({"jsonrpc": "2.0", "id": mid,
+                       "result": {"tools": [{"name": n} for n in names]}})
+
+
+def test_injects_retrieve_tool_into_tools_list_when_drop_enabled():
+    inter = Interceptor(DROP)
+    out = json.loads(inter.transform_response(_tools_list(1, ["gh.api.items"])))
+    assert "terse.retrieve" in [t["name"] for t in out["result"]["tools"]]
+    # idempotent: re-listing an already-injected list doesn't duplicate it
+    again = json.loads(inter.transform_response(json.dumps(out)))
+    assert [t["name"] for t in again["result"]["tools"]].count("terse.retrieve") == 1
+
+
+def test_no_retrieve_tool_when_drop_disabled():
+    inter = Interceptor(FULL)                                  # no drop-marked fields
+    tl = _tools_list(1, ["gh.api.items"])
+    out = inter.transform_response(tl)
+    assert out == tl and "terse.retrieve" not in out           # forwarded unchanged
+
+
+def test_drop_result_populates_store_and_carries_the_marker():
+    inter = Interceptor(DROP)
+    out = _emit(inter, 9, "gh.api.items", {"result": [{"id": 1, "body": "B" * 400}]})
+    assert transforms.DROPPED_MARKER in out                    # emitted with a handle
+    assert len(inter.dropped) == 1
+    handle = next(iter(inter.dropped))
+    assert inter.dropped[handle] == "B" * 400                  # original stored, recoverable
+
+
+def test_reconnect_clears_the_drop_store():
+    inter = Interceptor(DROP)
+    _emit(inter, 9, "gh.api.items", {"result": [{"id": 1, "body": "B" * 400}]})
+    assert inter.dropped and inter._dropped_bytes > 0
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize"}))
+    assert len(inter.dropped) == 0 and inter._dropped_bytes == 0
+
+
+def test_drop_store_evicts_lru_over_count_cap():
+    inter = Interceptor(DROP)
+    inter.DROPPED_MAX = 3                                       # shadow the class cap
+    for i in range(5):
+        inter._drop_put(f"h{i}", "x" * 10)
+    assert list(inter.dropped) == ["h2", "h3", "h4"]           # two oldest evicted
+
+
+def test_drop_store_evicts_over_byte_cap():
+    inter = Interceptor(DROP)
+    inter.DROPPED_MAX_BYTES = 25
+    inter._drop_put("a", "x" * 10)
+    inter._drop_put("b", "y" * 10)
+    inter._drop_put("c", "z" * 10)                             # 30 > 25 -> evict oldest (a)
+    assert "a" not in inter.dropped and inter._dropped_bytes == 20
+
+
+def test_drop_store_refreshes_recency_on_reinsert():
+    inter = Interceptor(DROP)
+    inter.DROPPED_MAX = 2
+    inter._drop_put("a", "x" * 10)
+    inter._drop_put("b", "y" * 10)
+    inter._drop_put("a", "x" * 10)                             # touch a -> most-recent
+    inter._drop_put("c", "z" * 10)                             # evict LRU = b
+    assert list(inter.dropped) == ["a", "c"] and inter._dropped_bytes == 20

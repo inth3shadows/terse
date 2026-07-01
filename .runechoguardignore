@@ -3,3 +3,8 @@
 # line isn't also in the hunk gets a false positive. A genuinely missing import of
 # these is caught immediately by pytest/import, so suppressing them here is safe.
 Path
+OrderedDict
+# Also mis-flagged: a callback PARAMETER invoked as a bare call (`drop_sink(h, v)` in
+# policy.apply). The guard resolves module symbols/imports, not function parameters, so a
+# param called by name reads as unresolved. A genuinely wrong name is caught by pytest.
+drop_sink

@@ -27,14 +27,16 @@ import hashlib
 import json
 from typing import Any, Callable, Iterator
 
+from .transforms import DROPPED_MARKER as DROP_KEY
+
 DEFAULT_MAX = 120  # default truncate length when a field spec omits "max"
 
 # drop-to-retrieve (#10): a field marked {"lossy":"drop-to-retrieve"} is replaced inline
-# by this marker, and the original is persisted to an injected sink to be served back when
-# the model calls the retrieve tool. The handle is content-addressed => deterministic,
-# dedups equal values, no RNG. A value whose serialized form is under DROP_MIN is left in
-# place: a retrieve round-trip isn't worth saving a handful of tokens.
-DROP_KEY = "__terse_dropped__"
+# by the DROP_KEY marker (defined in transforms' wire-marker registry), and the original is
+# persisted to an injected sink to be served back when the model calls the retrieve tool.
+# The handle is content-addressed => deterministic, dedups equal values, no RNG. A value
+# whose serialized form is under DROP_MIN is left in place: a retrieve round-trip isn't
+# worth saving a handful of tokens.
 RETRIEVE_TOOL = "terse.retrieve"
 DEFAULT_DROP_MIN = 200  # min serialized length (chars) of a value worth dropping
 HANDLE_LEN = 12         # sha1 hex prefix; 48 bits, ample for a per-session store
