@@ -31,9 +31,12 @@ raw tool output (JSON text)
   `decompress(compress(obj)) == obj`. Token availability changes *which* values get
   aliased (a performance choice) but never correctness. The test suite is a
   parametrized battery of this gate.
-- **Representation transform, not offload.** The compressed form is valid input the
-  model reads directly (a table, an inline legend). There is no `retrieve` step.
-  This is the core difference from lossy-offload approaches.
+- **Representation transform by default, not offload.** The lossless tiers produce valid
+  input the model reads directly (a table, an inline legend) with no `retrieve` step — the
+  core difference from lossy-offload approaches. The one deliberate exception is the opt-in
+  `drop-to-retrieve` lossy mode (#10): where you explicitly mark a field, terse evicts it to
+  a handle and serves it back through a synthetic `terse.retrieve` tool. Off by default —
+  lossless-first is the rule, retrieve is the marked exception.
 - **Row-major tables.** Tabularization keeps rows as rows (positional cells mapped to
   a `cols` header), including nested `subcols`, so the table stays as legible as
   CSV/markdown — the model already does position→header mapping for the outer table.
@@ -106,8 +109,8 @@ raw tool output (JSON text)
       "match": { "tool": "gh.*" },    // fnmatch glob on the tool name
       "tiers": ["minify", "tabularize", "dictionary"],   // [] = passthrough (skip)
       "fields": {                     // optional, per-field
-        "result[].id":   { "critical": true },           // honored trivially in v1 (lossless)
-        "result[].body": { "lossy": "drop-to-retrieve" } // parsed, WARNED, not executed in v1
+        "result[].id":   { "critical": true },           // denylist: never made lossy
+        "result[].body": { "lossy": "drop-to-retrieve" } // evicted to a handle; served by terse.retrieve
       }
     }
   ]
@@ -118,10 +121,11 @@ raw tool output (JSON text)
   matches wins. No match → `defaults.tiers`.
 - **Tiers:** any subset of `minify` / `tabularize` / `dictionary`. `minify` is implied
   by serialization (a warning is emitted if omitted). `[]` = passthrough.
-- **`critical`:** a denylist against lossy ops. In v1 (lossless only) it is honored
-  automatically since nothing is dropped.
-- **`lossy`:** `truncate` / `summarize` / `drop-to-retrieve`. Accepted by the schema
-  for forward-compatibility; v1 emits a warning and leaves the field lossless.
+- **`critical`:** a denylist against lossy ops — a `critical` field is never truncated
+  or dropped, even if also marked `lossy`.
+- **`lossy`:** `truncate` and `drop-to-retrieve` are implemented (opt-in, off by default);
+  `summarize` is accepted by the schema but deferred — it emits a warning and leaves the
+  field lossless.
 - Validation: unknown tiers and unsupported versions raise `ValueError` at load time.
 
 `policy.example.json` ships a policy that encodes the measured insight (gh/runecho
@@ -171,14 +175,20 @@ gitignored because captured tool output may contain real data.
 
 ## Known Limitations
 
-- **Tier 1 (lossy) is partially built — `truncate` only.** A field marked
-  `{"lossy":"truncate","max":N}` (and not `{"critical":true}`) is capped + annotated,
-  gated by `lossy.acceptable_loss`: only marked, non-critical fields may differ, each
-  only as a valid truncation, else it fails closed to the lossless output. `summarize`
-  (needs a model in the proxy) and `drop-to-retrieve` (needs a stateful store + a
-  retrieve tool) are parsed but deferred — warned and left lossless. Lossy is off
-  everywhere by default; the round-trip gate is replaced by the acceptable-loss gate
-  only where a field is explicitly marked.
+- **Tier 1 (lossy) — `truncate` and `drop-to-retrieve` built; `summarize` deferred.**
+  A field marked `{"lossy":"truncate","max":N}` (and not `{"critical":true}`) is capped +
+  annotated, gated by `lossy.acceptable_loss`: only marked, non-critical fields may differ,
+  each only as a valid truncation. A field marked `{"lossy":"drop-to-retrieve"}` (with an
+  optional `min` size floor) is replaced by a `__terse_dropped__` handle; the original is
+  stored per session (proxy-only, LRU-bounded by count and bytes, cleared on reconnect) and
+  served back by a synthetic `terse.retrieve` tool the proxy injects into `tools/list` and
+  answers itself. Its gate `lossy.droppable_loss` accepts a drop only if the handle resolves
+  to the exact original (recoverable == acceptable); store writes are staged and committed
+  only on gate pass, so a failure leaves no orphan handles. A retrieve miss (evicted, or a
+  pre-reconnect handle) returns a legible `isError`, never a protocol error. `summarize`
+  (needs a model in the proxy) is parsed but deferred — warned and left lossless. All lossy
+  is off by default; each mode replaces the round-trip gate with its own acceptable-loss
+  gate only where a field is explicitly marked.
 - **Proxy: the model must understand terse's format.** The proxy compresses tool
   results in place, so the model receives the table/legend form. It is self-describing
   (a `cols` header, an inline legend) and needs no decode step, but a model that has
