@@ -114,6 +114,11 @@ def _cmd_policy_generate(args: argparse.Namespace) -> int:
     for r in rows:
         tiers = ",".join(r["tiers"]) or "(passthrough)"
         print(f"  {r['tool']:<28} {tiers:<28} {r['reason']}", file=sys.stderr)
+        for dr in r.get("drop_rows", []):
+            print(f"      ↳ drop-candidate {dr['path']} "
+                  f"(~{dr['tok_share']*100:.0f}% of tokens, {dr['uniq_ratio']*100:.0f}% unique, "
+                  f"~{dr['mean_tok']:.0f} tok/value) — suggested, off by default",
+                  file=sys.stderr)
 
     if args.out:
         out = Path(args.out)

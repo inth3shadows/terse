@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from terse.capture import extract_records
-from terse.probes import cross_call_overlap, value_redundancy
+from terse.probes import cross_call_overlap, field_profiles, value_redundancy
 
 
 def test_value_redundancy_flags_repeated_values():
@@ -69,3 +69,16 @@ def test_extract_records_requires_uniform_keys():
     # columns and would KeyError otherwise.
     assert extract_records([{"a": 1}, {"b": 2}]) is None
     assert extract_records({"result": [{"id": 1, "x": 0}, {"id": 2}]}) is None
+
+
+def test_field_profiles_size_and_cardinality():
+    # 'blob' is identical across rows (low cardinality, large); 'uniq' differs every row;
+    # 'id' is small. This is the size x cardinality split drop-candidate detection keys on.
+    recs = [{"id": i, "blob": "z" * 400, "uniq": f"u{i}"} for i in range(10)]
+    p = field_profiles(recs)
+    assert p["uniq"]["uniq_ratio"] == 1.0
+    assert p["blob"]["uniq_ratio"] == 0.1                 # 1 distinct / 10 present
+    assert p["blob"]["mean_tok"] > p["id"]["mean_tok"]    # the blob dominates size
+    assert p["blob"]["n"] == 10
+    # tok_share is a fraction of the record list's total tokens
+    assert abs(sum(f["tok_share"] for f in p.values()) - 1.0) < 1e-6

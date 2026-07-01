@@ -131,6 +131,21 @@ first:
   status.rate_limit   (passthrough)                 1.2% < 5.0% threshold
 ```
 
+It also **suggests** (never enables) `drop-to-retrieve` candidates: fields that are large
+*and* near-unique, where the lossless tiers are powerless (nothing repeats to fold) but the
+field dominates the payload — the classic case being an `embedding`/vector field. These ride
+along as an **inactive** `_suggested_fields` block and print under the tool:
+
+```
+  kb.read.list_nodes  (passthrough)                 2.6% < 5.0% threshold
+      ↳ drop-candidate result[].embedding (~84% of tokens, 100% unique, ~2293 tok/value) — suggested, off by default
+```
+
+Because drop is lossy, you opt in by renaming `_suggested_fields` → `fields` in the output —
+then confirm the model still answers with `terse fluency`. Until you do, it is a no-op (the
+loader ignores `_suggested_fields`). On the measured corpus, enabling the `embedding` drop
+turns a +2.6% tool into a +77% one.
+
 terse measures *tokens*, not comprehension — before relying on a generated policy, confirm
 the model still reads the compressed form with `terse fluency --corpus <dir>` (see below).
 

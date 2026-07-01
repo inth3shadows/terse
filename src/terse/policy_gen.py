@@ -5,7 +5,7 @@ a server, see no compression, then manually capture → measure → read the rep
 JSON. `capture.py`/`measure.py` already produce per-tool, per-tier token savings — this
 turns that measurement into a policy directly.
 
-The decision is deliberately CONSERVATIVE and 100% lossless (it only ever enables the
+The tier decision is deliberately CONSERVATIVE and 100% lossless (it only ever enables the
 round-trip-gated Tier-0/0.5 tiers, never a lossy mode):
 
   For each tool, aggregate its payloads' per-tier cl100k savings, then:
@@ -15,6 +15,14 @@ round-trip-gated Tier-0/0.5 tiers, never a lossy mode):
        not worth a marginal gain)
     3. otherwise  ["minify","tabularize"] (+ "dictionary" iff its MARGINAL saving clears
        the threshold — mirrors the hand-authored example dropping dictionary on `kb.*`).
+
+Separately, it SUGGESTS drop-to-retrieve candidates (#47) — fields that are large AND
+near-unique, where the lossless tiers are structurally powerless — nothing repeats to fold —
+but a huge, rarely-needed value dominates the record. The measured example: a kb
+`embedding` field, 77% of tokens, all unique — lossless gets +4%, dropping it gets +77%.
+These are emitted as an INACTIVE `_suggested_fields` block the operator opts into by
+renaming to `fields`: drop is lossy, so the generator never enables it automatically — it
+only surfaces the opportunity the operator would otherwise miss.
 
 The output is a policy DOC (the same shape `policy.load_policy` parses) plus a row per
 tool explaining the decision. Pure: no I/O, so the generator is unit-testable and the
@@ -28,13 +36,78 @@ transform. The CLI surfaces that pointer; it is not a hard gate here.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
+from . import probes
+from .capture import find_record_list_with_path
 from .measure import measure_payload
 
 # Tiers are cumulative in the codec (minify ⊂ tabularize ⊂ dictionary). minify is implied
 # by re-serialization, so it never ships alone — tabularize always carries it.
 _BASE_TIERS = ["minify", "tabularize"]
+
+# drop-to-retrieve candidate thresholds (#47). A field is suggested only when all three hold:
+_DROP_MIN_MEAN_TOK = 50.0    # large: ~200 serialized chars, matching lossy.DEFAULT_DROP_MIN
+_DROP_MIN_UNIQ_RATIO = 0.9   # near-unique: the dictionary tier can't fold it, so lossless is out
+_DROP_MIN_SHARE = 0.10       # worth a retrieve round-trip: >=10% of the record list's tokens
+
+
+def _drop_candidates(
+    raws: list[str],
+    min_mean_tok: float = _DROP_MIN_MEAN_TOK,
+    min_uniq_ratio: float = _DROP_MIN_UNIQ_RATIO,
+    min_share: float = _DROP_MIN_SHARE,
+) -> tuple[dict[str, dict], list[dict[str, Any]]]:
+    """Suggest drop-to-retrieve field paths for one tool from its payloads. Pools records
+    across payloads that share the first payload's record path (per-tool shape is assumed
+    consistent) and flags fields that are large + near-unique + a meaningful token share.
+    Returns `(suggestion, rows)`: `suggestion` is an INACTIVE `{path: {"lossy": ...}}` block
+    the operator opts into; `rows` are per-field stats for the report. Empty when a tool has
+    no record list or no field clears every threshold.
+
+    Each payload is profiled INDEPENDENTLY and the metrics are averaged: cardinality is a
+    within-payload property (the drop runs per result at runtime), so pooling records across
+    payloads would wrongly halve `uniq_ratio` when the same result is captured twice."""
+    path: str | None = None
+    per_payload: list[dict[str, dict[str, Any]]] = []
+    for raw in raws:
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        records, p = find_record_list_with_path(obj)
+        if records is None or p is None:
+            continue
+        if path is None:
+            path = p
+        if p == path:
+            per_payload.append(probes.field_profiles(records))
+    if path is None or not per_payload:
+        return {}, []
+
+    def _avg(field: str, key: str) -> float:
+        vals = [pp[field][key] for pp in per_payload if field in pp]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    fields = {f for pp in per_payload for f in pp}
+    agg = {f: {"n": sum(pp[f]["n"] for pp in per_payload if f in pp),
+               "distinct": sum(pp[f]["distinct"] for pp in per_payload if f in pp),
+               "uniq_ratio": round(_avg(f, "uniq_ratio"), 4),
+               "mean_tok": round(_avg(f, "mean_tok"), 1),
+               "max_tok": max(pp[f]["max_tok"] for pp in per_payload if f in pp),
+               "tok_share": round(_avg(f, "tok_share"), 4)} for f in fields}
+
+    suggestion: dict[str, dict] = {}
+    rows: list[dict[str, Any]] = []
+    # Highest token-share first: the report and the suggestion read by impact.
+    for field, pr in sorted(agg.items(), key=lambda kv: -kv[1]["tok_share"]):
+        if (pr["mean_tok"] >= min_mean_tok and pr["uniq_ratio"] >= min_uniq_ratio
+                and pr["tok_share"] >= min_share):
+            fpath = f"{path}.{field}"
+            suggestion[fpath] = {"lossy": "drop-to-retrieve"}
+            rows.append({"path": fpath, **pr})
+    return suggestion, rows
 
 
 def _pct(saved: int, raw: int) -> float:
@@ -61,10 +134,17 @@ def _tool_decision(tool: str, raws: list[str], threshold: float) -> dict[str, An
     total_pct = _pct(total, raw_tok)
     dict_pct = _pct(dictionary, raw_tok)
 
+    # Drop-to-retrieve candidates are detected INDEPENDENTLY of the lossless-tier decision:
+    # the highest-value case (kb `embedding`) is a tool whose lossless savings fall BELOW the
+    # threshold — passthrough for tiers — yet is dominated by a huge unique field only drop
+    # can shrink. So compute it here and carry it through every return path.
+    drop_suggestion, drop_rows = _drop_candidates(raws)
+
     base = {
         "tool": tool, "n": n, "raw_tok": raw_tok,
         "saved_pct": round(total_pct, 1), "dict_pct": round(dict_pct, 1),
         "minify": minify, "tabularize": tabularize, "dictionary": dictionary,
+        "drop_suggestion": drop_suggestion, "drop_rows": drop_rows,
     }
 
     if non_json or gate_fail:
@@ -110,15 +190,30 @@ def generate_policy(
     policies = []
     for r in rows:
         comment = f"{r['n']} payload(s), {r['reason']}"
-        policies.append({"_comment": comment, "match": {"tool": r["tool"]}, "tiers": r["tiers"]})
+        entry: dict[str, Any] = {"_comment": comment, "match": {"tool": r["tool"]},
+                                 "tiers": r["tiers"]}
+        # Drop-to-retrieve suggestions ride along INACTIVE: the loader reads `fields`, not
+        # `_suggested_fields`, so this is a no-op until the operator renames it. Drop is
+        # lossy — the human confirms; the generator never enables it.
+        if r.get("drop_suggestion"):
+            shares = ", ".join(f"{dr['path']} ~{dr['tok_share']*100:.0f}%" for dr in r["drop_rows"])
+            entry["_suggested_fields"] = r["drop_suggestion"]
+            entry["_suggested_fields_note"] = (
+                f"LOSSY drop-to-retrieve candidates (large + near-unique: {shares}). "
+                f"Rename '_suggested_fields' -> 'fields' to enable, then confirm the model "
+                f"still answers with `terse fluency`. Off until you do.")
+        policies.append(entry)
 
+    any_drops = any(r.get("drop_suggestion") for r in rows)
     doc = {
         "version": 1,
         "_comment": (f"Auto-generated by `terse policy generate` (threshold {threshold:.1f}%). "
                      f"Conservative + lossless: a tier is enabled only where measured savings "
                      f"clear the threshold and every payload round-trips. Verify the model still "
                      f"reads the compressed form with `terse fluency --corpus <dir>` before relying "
-                     f"on it."),
+                     f"on it."
+                     + (" Some tools carry INACTIVE `_suggested_fields` (lossy drop-to-retrieve "
+                        "candidates) — opt in by renaming to `fields`." if any_drops else "")),
         "defaults": {"tiers": ["minify", "tabularize", "dictionary"]},
         "policies": policies,
     }
