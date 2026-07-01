@@ -32,6 +32,11 @@ then (optionally) serves it through a per-tool policy that decides which tiers r
   the full payload (the 91%-overlap headroom). Self-describing, verified to reconstruct
   exactly, and emitted only when smaller — falls back to the full form otherwise. OFF by
   default (`proxy --diff`); its model-fluency is checked by `terse fluency --diff`.
+  Record-shaped JSON gets a row/key diff; non-JSON results (file reads, source excerpts,
+  log tails) get a separate content-defined-chunking (CDC) diff — a rolling hash cuts
+  chunk boundaries by content, not position, so an edit anywhere only perturbs the
+  chunk(s) it overlaps and the rest is sent as references to the prior result. Each
+  shape keeps its own diff base per tool.
 - **Tier 1 — lossy (opt-in, per field)**: `truncate` is built — a field marked
   `{"lossy":"truncate","max":N}` is capped and annotated, gated by an acceptable-loss
   check (only marked, non-`critical` fields may differ, each only as a valid

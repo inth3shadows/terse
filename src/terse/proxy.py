@@ -26,6 +26,7 @@ from threading import Lock, Thread
 from typing import Any, Callable, Optional, TextIO
 
 from . import policy as policy_mod
+from . import text_diff
 from . import transforms
 from .tokenize import count_cl100k
 
@@ -55,7 +56,10 @@ TERSE_PRIMER = (
     'overwrite/insert each record in "set" matched by its "by" field, append ids in "new"; '
     '"n" is the final record count. A {"shape":"keys","set":{...},"del":[...]} diff instead '
     'removes "del" keys and applies "set" key/values to the previous object. '
-    "Always reason about the fully reconstructed result."
+    'A text diff {"__terse_textdiff__":1,"ops":[["=",a,b],["+","..."],...]} updates the '
+    "PREVIOUS same-tool plain-text result: process ops in order, copying chunks a..b of "
+    "that prior text for a `=` op or inserting its literal string for a `+` op, then "
+    "concatenating everything. Always reason about the fully reconstructed result."
 )
 
 
@@ -67,7 +71,9 @@ class Interceptor:
     When `policy.diff` is on, it also keeps the previous per-tool result and emits a
     lossless delta when that is smaller than the full compressed form — the stateful
     cross-call lever. It is fail-open and self-verifying: a diff is sent only when it
-    provably reconstructs the result, and the full form is always the fallback."""
+    provably reconstructs the result, and the full form is always the fallback. JSON and
+    non-JSON (text/log/file) results each get their own diff base and codec (#25) so a
+    tool that alternates between the two never mixes bases across shapes."""
 
     # Cap on in-flight request ids tracked at once. A tools/call that times out with no
     # result body never gets popped from `pending` (#22), so bound the map and evict
@@ -95,6 +101,11 @@ class Interceptor:
         # how far a chained diff can drift from a self-contained anchor (#8).
         self.keyframe_interval = pol.diff_keyframe_interval
         self.since_keyframe: dict[str, int] = {}
+        # Same two roles as `last`/`since_keyframe` but for non-JSON payloads (#25):
+        # the CDC text diff (Tier 0.7 text) needs its own prior-text base, since a
+        # non-JSON result never populates `last` (there is no JSON object to diff).
+        self.last_text: dict[str, str] = {}
+        self.since_text_keyframe: dict[str, int] = {}
         self.init_id: Any = None        # id of the initialize request, to prime its reply
         # The two proxy pump threads call note_request (client->server) and
         # transform_response (server->client) concurrently, both mutating the shared
@@ -126,6 +137,8 @@ class Interceptor:
                 # stays opt-in.
                 self.last.clear()
                 self.since_keyframe.clear()
+                self.last_text.clear()
+                self.since_text_keyframe.clear()
                 self.pending.clear()
                 if mid is not None:
                     self.init_id = mid
@@ -220,15 +233,17 @@ class Interceptor:
                 sys.stderr.write(f"[terse-proxy] {tool}: passthrough on error: {exc}\n")
             return False
         if applied.skipped:
-            # Skipped = a passthrough tool OR a non-JSON result (e.g. an upstream error
-            # string) for a normally-compressed one. Either way it carries no JSON the
-            # next diff could build on, and it becomes the model's visible "previous
-            # same-tool result" — so drop any stale diff base and reset the keyframe
-            # counter, forcing the next result to re-anchor as a full (#8). A passthrough
-            # tool never accumulates state, so this is a no-op for it.
+            # Skipped = a passthrough tool (empty tiers) OR a non-JSON result (e.g. an
+            # upstream error string, a file read, a log tail) for a normally-compressed
+            # one. Either way it carries no JSON the next JSON diff could build on, and
+            # it becomes the model's visible "previous same-tool result" — so drop any
+            # stale JSON diff base and reset its keyframe counter, forcing the next JSON
+            # result to re-anchor as a full (#8).
             self.last.pop(tool, None)
             self.since_keyframe.pop(tool, None)
-            return False  # leave the payload itself fully alone
+            if not self.policy.select(tool).tiers:
+                return False  # true passthrough policy: hands off entirely, no state kept
+            return self._text_diff_or_store(block, tool, text)
 
         chosen = applied.text
         try:
@@ -290,6 +305,37 @@ class Interceptor:
         retrieve. Shared with the fluency-for-diff eval via `transforms.diff_wire`."""
         try:
             return transforms.diff_wire(prev, curr, tool)
+        except Exception:  # noqa: BLE001 — fail-open
+            return None
+
+    def _text_diff_or_store(self, block: dict, tool: str, text: str) -> bool:
+        """Tier 0.7 text (#25): CDC-diff a non-JSON result against this tool's own prior
+        non-JSON result, when diffing is on. Same fail-open/self-verifying/keyframe
+        contract as the JSON diff path — a diff is sent only when it provably
+        reconstructs the text AND is smaller than the raw payload; the raw text is
+        always the fallback, and every Kth result re-anchors as a full (#8)."""
+        if not self.diff:
+            return False
+        prev_text = self.last_text.get(tool)
+        keyframe_due = (self.keyframe_interval > 0
+                        and self.since_text_keyframe.get(tool, 0) >= self.keyframe_interval)
+        changed = False
+        if prev_text is not None and not keyframe_due:
+            wire = self._text_diff_wire(prev_text, text, tool)
+            if wire is not None and _cost(wire) < _cost(text):
+                block["text"] = wire
+                changed = True
+                if self.debug:
+                    sys.stderr.write(f"[terse-proxy] {tool}: text diff {_cost(text)}->"
+                                     f"{_cost(wire)} tok vs raw\n")
+        self.since_text_keyframe[tool] = self.since_text_keyframe.get(tool, 0) + 1 if changed else 0
+        self.last_text[tool] = text
+        return changed
+
+    def _text_diff_wire(self, prev: str, curr: str, tool: str) -> Optional[str]:
+        """Fail-open wrapper mirroring `_diff_wire`, for the CDC text-diff codec."""
+        try:
+            return text_diff.text_diff_wire(prev, curr, tool)
         except Exception:  # noqa: BLE001 — fail-open
             return None
 

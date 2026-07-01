@@ -7,7 +7,7 @@ import json
 import pathlib
 import sys
 
-from terse import transforms
+from terse import text_diff, transforms
 from terse.policy import Policy, Rule
 from terse.proxy import Interceptor, run_proxy
 
@@ -249,6 +249,99 @@ def _cost_lt(a, b):
     return _cost(a) < _cost(b)
 
 
+# --- cross-call text diffing for non-JSON results (Tier 0.7 text, #25) ---
+
+def _log_text(n, changed_line=None):
+    lines = [f"[{i:04d}] worker heartbeat ok, queue_depth={i % 7}" for i in range(n)]
+    if changed_line is not None:
+        lines[changed_line] = "[ERROR] worker crashed: connection reset"
+    return "\n".join(lines)
+
+
+def _emit_text(inter, mid, tool, text):
+    inter.note_request(_req(mid, tool))
+    out = inter.transform_response(_result_msg(mid, text))
+    return json.loads(out)["result"]["content"][0]["text"]
+
+
+def test_first_non_json_result_has_no_prior_so_passes_through_raw():
+    inter = Interceptor(DIFF)
+    text = _log_text(80)
+    assert _emit_text(inter, 1, "fs.read", text) == text
+
+
+def test_second_non_json_result_emits_smaller_lossless_text_diff():
+    inter = Interceptor(DIFF)
+    prev, curr = _log_text(200), _log_text(200, changed_line=100)
+    raw_first = _emit_text(inter, 1, "fs.read", prev)
+    diff_text = _emit_text(inter, 2, "fs.read", curr)
+    env = json.loads(diff_text)
+    assert env.get(text_diff.DIFF_MARKER) == 1
+    assert text_diff.text_diff_decode(prev, env) == curr
+    assert _cost_lt(diff_text, curr)
+    assert raw_first == prev  # sanity: first call was untouched
+
+
+def test_text_diff_off_by_default_sends_raw_both_times():
+    inter = Interceptor(FULL)  # diff flag defaults off
+    prev, curr = _log_text(80), _log_text(80, changed_line=40)
+    t1 = _emit_text(inter, 1, "fs.read", prev)
+    t2 = _emit_text(inter, 2, "fs.read", curr)
+    assert t1 == prev and t2 == curr
+
+
+def test_text_diff_not_emitted_when_it_would_not_be_smaller():
+    inter = Interceptor(DIFF)
+    _emit_text(inter, 1, "fs.read", _log_text(20))
+    other = "totally unrelated content " * 5
+    text = _emit_text(inter, 2, "fs.read", other)
+    assert text_diff.DIFF_MARKER not in text
+    assert text == other
+
+
+def test_passthrough_policy_never_text_diffs_even_with_diff_on():
+    # empty tiers = a policy that says "hands off this tool entirely" (mirrors the JSON
+    # diff path, which also never engages for a passthrough-tiered tool).
+    pol = Policy(rules=[Rule("fs.*", ())], diff=True)
+    inter = Interceptor(pol)
+    prev, curr = _log_text(50), _log_text(50, changed_line=10)
+    _emit_text(inter, 1, "fs.read", prev)
+    text = _emit_text(inter, 2, "fs.read", curr)
+    assert text == curr
+    assert inter.last_text == {}
+
+
+def test_text_diff_keyframe_forces_raw_after_k_consecutive_diffs():
+    pol = Policy(rules=[Rule("fs.*", ("minify", "tabularize", "dictionary"))],
+                 diff=True, diff_keyframe_interval=2)
+    inter = Interceptor(pol)
+    texts = [_emit_text(inter, 1, "fs.read", _log_text(100))]           # raw (no prior)
+    for i in range(2, 7):
+        texts.append(_emit_text(inter, i, "fs.read", _log_text(100, changed_line=i)))
+    is_diff = [text_diff.DIFF_MARKER in t for t in texts]
+    assert is_diff == [False, True, True, False, True, True]           # F D D | F(keyframe) D D
+
+
+def test_json_and_text_diff_bases_are_independent_for_the_same_tool():
+    # A tool that sometimes returns JSON and sometimes plain text must not let one
+    # shape's diff base leak into the other's codec.
+    inter = Interceptor(DIFF)
+    _emit(inter, 1, "mixed.tool", _records(20))               # JSON base set
+    _emit_text(inter, 2, "mixed.tool", _log_text(50))         # non-JSON: evicts JSON base
+    assert inter.last.get("mixed.tool") is None
+    diff_text = _emit_text(inter, 3, "mixed.tool", _log_text(50, changed_line=5))
+    assert text_diff.DIFF_MARKER in diff_text
+    assert text_diff.text_diff_decode(_log_text(50), json.loads(diff_text)) == _log_text(50, changed_line=5)
+
+
+def test_text_diff_reinitialize_resets_bases_to_prevent_desync():
+    inter = Interceptor(DIFF)
+    _emit_text(inter, 1, "fs.read", _log_text(50))
+    assert "fs.read" in inter.last_text
+    inter.note_request(_init_req(2))
+    assert inter.last_text == {} and inter.since_text_keyframe == {}
+
+
 # --- one-time format primer via initialize.instructions (#13) ---
 
 def _init_req(mid=1):
@@ -268,6 +361,7 @@ def test_initialize_reply_gets_format_primer():
     out = json.loads(inter.transform_response(_init_resp(1)))
     instr = out["result"]["instructions"]
     assert "__terse_table__" in instr and "__terse_diff__" in instr   # covers all forms
+    assert "__terse_textdiff__" in instr
     assert out["result"]["serverInfo"]["name"] == "s"                 # rest untouched
 
 
@@ -453,6 +547,31 @@ def test_run_proxy_end_to_end_compresses_losslessly():
                            for i in range(20)]}
     assert transforms.decompress(text) == expected
     assert len(text) < len(_records_text())
+
+
+def test_run_proxy_end_to_end_text_diffs_repeated_non_json_reads():
+    # A real subprocess run (not the pure Interceptor) reading the "same file" twice via
+    # fs.read, whose 2nd result has one line changed -- proves Tier 0.7 text (#25) fires
+    # over the actual stdio pump, not just in isolated unit tests.
+    pol = Policy(rules=[Rule("fs.*", ("minify", "tabularize", "dictionary"))], diff=True)
+    requests = "\n".join([
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "fs.read"}}),
+        json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "fs.read"}}),
+    ]) + "\n"
+    cin, cout = io.StringIO(requests), io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], pol, stdin=cin, stdout=cout)
+    assert rc == 0
+    by_id = {json.loads(ln)["id"]: json.loads(ln) for ln in cout.getvalue().splitlines() if ln.strip()}
+
+    first = by_id[2]["result"]["content"][0]["text"]
+    second = by_id[3]["result"]["content"][0]["text"]
+    assert first == _log_text(200)                            # 1st read: untouched, no prior
+    assert text_diff.DIFF_MARKER in second                     # 2nd read: a text diff was sent
+    assert text_diff.text_diff_decode(first, json.loads(second)) == _log_text(200, changed_line=100)
+    assert len(second) < len(_log_text(200, changed_line=100))  # actually smaller over the wire
 
 
 # --- #23: audit/replay log ---
