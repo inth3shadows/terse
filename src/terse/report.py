@@ -12,7 +12,9 @@ Honesty requirements (plan Section 7, principle #24):
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, NamedTuple
+
+_GAP_TOLERANCE = 0.05  # shared pass/fail tolerance for both worst-case verdict gates below
 
 
 def _form_stats(rows: list[dict[str, Any]], form: str) -> tuple[float, float]:
@@ -44,17 +46,28 @@ def _ci(se: float) -> float:
     return 1.96 * se
 
 
+class GapVerdict(NamedTuple):
+    model: str
+    gap: float
+    form_acc: float
+    control_acc: float
+    gap_ci: float
+    passed: bool
+
+
 def _worst_case_gap(
-    rows: dict[str, tuple[float, float, float, float]], tol: float
-) -> tuple[str, float, float, float, float, bool] | None:
-    """Shared verdict-gating math for both fluency-style reports (principle #24: gate on the
-    worst model, never the mean). `rows` is {model: (form_acc, form_se, control_acc, control_se)}.
-    Returns the worst-case (lowest-gap) model's (model, gap, form_acc, control_acc, gap_ci,
-    passed), or None if `rows` is empty. gap = form_acc - control_acc; gap_ci is the 95%
-    half-width of √(form_se²+control_se²); passed iff gap is within `tol` of zero (inclusive)."""
-    worst = None
-    for model, (facc, fse, cacc, cse) in rows.items():
-        gap = facc - cacc
+    rows: dict[str, tuple[float, float, float, float]], tol: float = _GAP_TOLERANCE
+) -> GapVerdict | None:
+    """Shared verdict-gating math for both fluency-style reports — principle #24, gate on
+    the worst model, never the mean. `rows` maps model to a 4-tuple of form_acc, form_se,
+    control_acc, control_se. Returns the model with the lowest gap as a GapVerdict, or
+    None if `rows` is empty. gap = form_acc minus control_acc; gap_ci is the 95%
+    half-width of the pooled standard error; passed iff gap is at least -tol, inclusive
+    of the boundary. Callers access fields by name, e.g. verdict.form_acc, never by
+    position, so a future field reorder can't silently swap values."""
+    worst = None  # (model, gap, facc, cacc, gap_ci) — cheapest to track positionally here;
+    for model, (facc, fse, cacc, cse) in rows.items():  # this is a private local, not the
+        gap = facc - cacc                               # public interface callers rely on.
         gap_ci = _ci(math.sqrt(fse ** 2 + cse ** 2))
         if worst is None or gap < worst[1]:
             worst = (model, gap, facc, cacc, gap_ci)
@@ -62,7 +75,14 @@ def _worst_case_gap(
         return None
     model, gap, facc, cacc, gap_ci = worst
     passed = gap >= -tol - 1e-9
-    return model, gap, facc, cacc, gap_ci, passed
+    return GapVerdict(model, gap, facc, cacc, gap_ci, passed)
+
+
+def _format_worst_case_line(verdict: GapVerdict, tol: float, form_label: str, control_label: str) -> str:
+    return (f"- Worst-case model `{verdict.model}`: {form_label} {verdict.form_acc:.0%} vs "
+            f"{control_label} {verdict.control_acc:.0%} (gap {verdict.gap:+.0%} "
+            f"±{verdict.gap_ci * 100:.0f} pts). **{'PASS' if verdict.passed else 'FAIL'}** "
+            f"at {tol:.0%} tolerance.")
 
 
 def _pct(saved: int, base: int) -> str:
@@ -372,7 +392,7 @@ def build_diff_report(results: dict) -> str:
         "| Model | q | full-terse | diff | regressions |",
         "|---|---|---|---|---|",
     ]
-    summary: dict[str, dict[str, float]] = {}
+    gap_rows: dict[str, tuple[float, float, float, float]] = {}
     for model, rows in results.items():
         n = len(rows)
         if not n:
@@ -381,22 +401,16 @@ def build_diff_report(results: dict) -> str:
         dacc, dse = _form_stats(rows, "diff_ok")
         regr = sum(1 for r in rows if int(r["terse_ok"]) == r.get("trials", 1)
                    and int(r["diff_ok"]) < r.get("trials", 1))
-        summary[model] = {"full": facc, "full_se": fse, "diff": dacc, "diff_se": dse}
+        gap_rows[model] = (dacc, dse, facc, fse)  # form=diff, control=full-terse
         out.append(f"| `{model}` | {n} | {facc:.0%} ±{_ci(fse) * 100:.0f} "
                    f"| {dacc:.0%} ±{_ci(dse) * 100:.0f} | {regr} |")
     out.append("")
 
     out += ["## Verdict", ""]
-    tol = 0.05
-    gap_rows = {model: (s["diff"], s["diff_se"], s["full"], s["full_se"])
-                for model, s in summary.items()}
-    worst = _worst_case_gap(gap_rows, tol)
+    worst = _worst_case_gap(gap_rows)
     if worst:
-        model, gap, dacc, facc, gap_ci, passed = worst
-        out.append(f"- Worst-case model `{model}`: diff-form {dacc:.0%} vs full-terse {facc:.0%} "
-                   f"(gap {gap:+.0%} ±{gap_ci * 100:.0f} pts). "
-                   f"**{'PASS' if passed else 'FAIL'}** at {tol:.0%} tolerance.")
-        if passed:
+        out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "diff-form", "full-terse"))
+        if worst.passed:
             out.append("- Reading the diff costs no comprehension beyond tolerance — safe to "
                        "enable `proxy --diff` for the tested models.")
         else:
@@ -499,7 +513,6 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
 
     # --- verdict: gate on the worst model ---
     out += ["## Verdict", ""]
-    tol = 0.05
     # Raw JSON is the control: a model that can't read RAW (0%) is a backend/config
     # failure (bad model id, refusals), not a terse-comprehension result — exclude it
     # from the gate, but say so, so a broken run can't masquerade as a verdict.
@@ -517,18 +530,15 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         best, best_se = (s["terse"], s["terse_se"]) if s["terse"] >= s["primer"] \
             else (s["primer"], s["primer_se"])
         gap_rows[model] = (best, best_se, s["raw"], s["raw_se"])
-    worst = _worst_case_gap(gap_rows, tol)
+    worst = _worst_case_gap(gap_rows)
     if worst:
-        model, gap, best, raw, gap_ci, passed = worst
         helps = sum(1 for s in gated.values() if s["primer"] > s["terse"] + 1e-9)
-        out.append(f"- Worst-case model `{model}`: best terse-form {best:.0%} vs raw {raw:.0%} "
-                   f"(gap {gap:+.0%} ±{gap_ci * 100:.0f} pts). "
-                   f"**{'PASS' if passed else 'FAIL'}** at {tol:.0%} tolerance.")
-        if gap_ci > 1e-9 and abs(gap) < gap_ci:
+        out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "best terse-form", "raw"))
+        if worst.gap_ci > 1e-9 and abs(worst.gap) < worst.gap_ci:
             out.append("- The gap is within its own confidence interval — terse and raw are "
                        "indistinguishable at this trial count (raise `--trials` to tighten).")
         out.append(f"- The primer improves terse-form accuracy for {helps}/{len(gated)} model(s).")
-        if passed:
+        if worst.passed:
             out.append("- terse's compressed form preserves comprehension within tolerance — "
                        "the proxy's in-place rewrite holds for the tested models.")
         else:

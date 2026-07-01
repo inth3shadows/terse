@@ -19,6 +19,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ._secure_io import append_restricted, write_restricted
+
 from .transforms import _uniform_dict_list  # the one canonical "what tabularize folds" rule
 
 # Shape buckets. classify_shape returns one of these.
@@ -127,7 +129,9 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path) -> Path:
     }
     safe_tool = _SANITIZE.sub("_", tool).strip("_") or "unknown"
     path = corpus / f"{safe_tool}__{envelope['sha']}.json"
-    path.write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Captured payloads are real MCP tool traffic (README/TECHNICAL: "may contain real
+    # data") — restrict permissions the same as terse-managed config/secrets (#42).
+    write_restricted(path, json.dumps(envelope, ensure_ascii=False, indent=2))
     return path
 
 
@@ -141,8 +145,8 @@ def append_audit(record: dict[str, Any], log_path: str | Path) -> None:
     """
     p = Path(log_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    # Replay records embed raw tool traffic too — same secrets exposure as capture_payload.
+    append_restricted(p, json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
