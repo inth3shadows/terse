@@ -768,6 +768,13 @@ def test_run_proxy_injects_retrieve_tool_into_a_live_tools_list():
     assert "terse.retrieve" in [t["name"] for t in resp["result"]["tools"]]
 
 
+def test_primer_documents_the_drop_marker_and_retrieve_tool():
+    # Load-bearing: without this the model sees an opaque marker and never fetches the value.
+    from terse.proxy import TERSE_PRIMER
+    assert transforms.DROPPED_MARKER in TERSE_PRIMER
+    assert "terse.retrieve" in TERSE_PRIMER
+
+
 def test_run_proxy_answers_retrieve_without_forwarding_downstream():
     # A miss handle is enough to prove the swallow: the reply is OUR synthesized error, and
     # the downstream fake never saw the call (it would have returned records if forwarded).

@@ -3,12 +3,14 @@
 Lossless-first compression layer for AI-agent tool outputs — byte-faithful on
 fields you mark critical, configurable lossy reduction only where you opt in.
 
-terse is the inverse of blanket lossy offload (e.g. headroom's "drop to a
-retrieve-cache"). Instead of evicting data and making the model call `retrieve`,
-terse keeps everything **resident and legible** in context and removes only
-*structural* overhead: pretty-print whitespace, keys repeated once per record,
+terse is lossless-first. Unlike blanket lossy offload (e.g. headroom's "drop to a
+retrieve-cache"), it keeps everything **resident and legible** by default and removes
+only *structural* overhead: pretty-print whitespace, keys repeated once per record,
 repeated values, repeated nested schema. Tokens go down; nothing the model needs
-leaves the window; there is no decode step.
+leaves the window; there is no decode step. Lossy reduction is strictly opt-in, per
+field — including `drop-to-retrieve`, a deliberate escape hatch that evicts a marked
+field to a handle the model can fetch back with a `terse.retrieve` tool. It is off by
+default and never the rule.
 
 It is **selective by design**. Measurement on real tool output showed the win is
 strongly per-tool (0–30%): large on record/symbol-shaped verbose output, near-zero
@@ -37,11 +39,13 @@ then (optionally) serves it through a per-tool policy that decides which tiers r
   chunk boundaries by content, not position, so an edit anywhere only perturbs the
   chunk(s) it overlaps and the rest is sent as references to the prior result. Each
   shape keeps its own diff base per tool.
-- **Tier 1 — lossy (opt-in, per field)**: `truncate` is built — a field marked
-  `{"lossy":"truncate","max":N}` is capped and annotated, gated by an acceptable-loss
-  check (only marked, non-`critical` fields may differ, each only as a valid
-  truncation). `summarize` (needs a model) and `drop-to-retrieve` (needs a retrieve
-  tool) are parsed but deferred — warned and left lossless. Off everywhere by default.
+- **Tier 1 — lossy (opt-in, per field)**: `truncate` caps and annotates a field marked
+  `{"lossy":"truncate","max":N}`, gated by an acceptable-loss check (only marked,
+  non-`critical` fields may differ, each only as a valid truncation). `drop-to-retrieve`
+  replaces a marked field with a handle, stores the original per session, and serves it
+  back via a synthetic `terse.retrieve` tool the proxy injects — gated so a drop is
+  accepted only if the handle resolves to the exact original. `summarize` (needs a model)
+  is still parsed but deferred — warned and left lossless. Off everywhere by default.
 
 Every transform has an exact inverse, and a round-trip gate asserts
 `decompress(compress(x)) == x` over the whole corpus. The transformed bytes *are*
@@ -120,5 +124,6 @@ and Gemini 2.5 Flash match raw-JSON accuracy on the compressed form (100% paired
 37% token saving (`terse fluency`; see TECHNICAL.md). Whole-subtree aliasing (folding
 repeated objects, not just strings) is built. Cross-call diffing is now built as an
 **opt-in** lossless tier (`proxy --diff`), with its own fluency check (`fluency --diff`)
-gating whether it's safe to enable. The Tier 1 lossy modes (truncate / drop-to-retrieve)
-remain designed but not yet built — see TECHNICAL.md "Known Limitations".
+gating whether it's safe to enable. The Tier 1 lossy modes `truncate` and
+`drop-to-retrieve` are built (opt-in, off by default); `summarize` remains designed but
+not yet built — see TECHNICAL.md "Known Limitations".

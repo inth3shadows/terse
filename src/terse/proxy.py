@@ -79,7 +79,11 @@ TERSE_PRIMER = (
     'A text diff {"__terse_textdiff__":1,"ops":[["=",a,b],["+","..."],...]} updates the '
     "PREVIOUS same-tool plain-text result: process ops in order, copying chunks a..b of "
     "that prior text for a `=` op or inserting its literal string for a `+` op, then "
-    "concatenating everything. Always reason about the fully reconstructed result."
+    "concatenating everything.\n"
+    '- Dropped field {"__terse_dropped__":"H","bytes":N,"retrieve":"terse.retrieve"}: a '
+    "large field value was omitted to save context. It is NOT lost — when you actually need "
+    'it, call the terse.retrieve tool with {"handle":"H"} to get the exact original back.\n'
+    "Always reason about the fully reconstructed result."
 )
 
 

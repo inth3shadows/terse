@@ -52,7 +52,8 @@ def test_non_json_passes_through():
 
 
 def test_deferred_lossy_mode_is_warned_not_executed():
-    # summarize / drop-to-retrieve are deferred — warned and left lossless
+    # summarize is still deferred — warned and left lossless (truncate + drop-to-retrieve
+    # are now implemented; see test_lossy.py / test_drop.py)
     p = Policy(rules=[Rule(tool_glob="gh.*", tiers=("minify", "tabularize"),
                            fields={"result[].body": {"lossy": "summarize"}})])
     result = apply(RECORDS, "gh.api.x", p)
