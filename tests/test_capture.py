@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import stat
 
-from terse.capture import append_audit, capture_payload
+from terse.capture import append_audit, capture_payload, find_record_list_with_path
 
 
 def test_capture_payload_writes_owner_only_file(tmp_path):
@@ -31,3 +31,17 @@ def test_append_audit_writes_owner_only_and_appends(tmp_path):
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
     lines = log.read_text(encoding="utf-8").splitlines()
     assert [json.loads(ln)["id"] for ln in lines] == [1, 2]
+
+
+def test_find_record_list_with_path_returns_expressible_drop_path():
+    recs = [{"a": 1}, {"a": 2}]
+    assert find_record_list_with_path({"result": recs}) == (recs, "result[]")
+    assert find_record_list_with_path(recs) == (recs, "[]")                 # top-level list
+    assert find_record_list_with_path({"data": {"items": recs}}) == (recs, "data.items[]")
+
+
+def test_find_record_list_with_path_none_when_no_simple_path():
+    assert find_record_list_with_path({"x": 1}) == (None, None)             # no record list
+    assert find_record_list_with_path([1, 2, 3]) == (None, None)           # list of scalars
+    # a record list nested inside another list has no simple field path -> not returned
+    assert find_record_list_with_path([[{"a": 1}, {"a": 2}]]) == (None, None)

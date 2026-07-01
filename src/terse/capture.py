@@ -82,6 +82,30 @@ def extract_records(obj: Any) -> list[dict] | None:
     return _find_record_list(obj)
 
 
+def find_record_list_with_path(obj: Any, _prefix: tuple[str, ...] = ()) -> tuple[list[dict] | None, str | None]:
+    """Like `extract_records`, but also return the field-path prefix to the record list in
+    `lossy._parse_path` form (e.g. `result[]`, `data.items[]`, or `[]` for a top-level
+    list) — so a caller can build a per-field drop path like `result[].embedding` (#47).
+
+    Walks DICT KEYS only, not into intermediate lists: a record list nested inside another
+    list has no simple expressible path, so it returns (records, None-path) is avoided —
+    such a list yields (None, None). Returns the first record list reached through keys,
+    depth-first, matching `_find_record_list`'s canonical `_uniform_dict_list` rule."""
+    if len(_prefix) > _MAX_SHAPE_DEPTH:
+        return None, None
+    if isinstance(obj, list):
+        if _uniform_dict_list(obj):
+            prefix = ".".join(_prefix)
+            return obj, (f"{prefix}[]" if prefix else "[]")
+        return None, None  # list-of-non-records / list-of-lists: no simple field path
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            records, path = find_record_list_with_path(v, (*_prefix, str(k)))
+            if records is not None:
+                return records, path
+    return None, None
+
+
 def classify_shape(raw: str) -> str:
     """Bucket a raw tool-output string by structural shape.
 

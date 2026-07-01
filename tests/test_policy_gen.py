@@ -41,6 +41,63 @@ def test_compact_object_tool_is_passthrough():
     assert "threshold" in next(r for r in rows if r["tool"] == "status.ping")["reason"]
 
 
+# A record list dominated by a huge, unique field (an embedding-like vector) — the drop-to-
+# retrieve signature: lossless folding is powerless (nothing repeats) but the field is most
+# of the payload.
+def _blob_records(n=20):
+    return {"result": [{"id": i, "status": "active",
+                        "embedding": json.dumps([round((i * 100 + j) * 0.001, 3)
+                                                 for j in range(200)])}
+                       for i in range(n)]}
+
+
+def test_drop_candidate_suggested_for_large_unique_field():
+    doc, rows = generate_policy([_env("kb.nodes", _blob_records()) for _ in range(2)])
+    rule = next(p for p in doc["policies"] if p["match"]["tool"] == "kb.nodes")
+    assert rule["_suggested_fields"] == {"result[].embedding": {"lossy": "drop-to-retrieve"}}
+    # small / low-cardinality fields are NOT suggested
+    assert "result[].status" not in rule["_suggested_fields"]   # repeated -> low cardinality
+    assert "result[].id" not in rule["_suggested_fields"]       # tiny
+    # the note flags it as lossy + opt-in
+    assert "LOSSY" in rule["_suggested_fields_note"]
+
+
+def test_suggestion_is_inactive_when_loaded():
+    # `_suggested_fields` is NOT `fields`, so the loader enables no lossy op — stays lossless.
+    doc, _ = generate_policy([_env("kb.nodes", _blob_records()) for _ in range(2)])
+    import pathlib
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        p = pathlib.Path(d) / "pol.json"
+        p.write_text(json.dumps(doc), encoding="utf-8")
+        pol = load_policy(p)
+    assert pol.select("kb.nodes").fields == {}      # suggestion did not become active
+    assert not pol.has_drop()                        # nothing enables drop-to-retrieve
+
+
+def test_drop_candidate_appears_even_when_tier_decision_is_passthrough():
+    # A tool whose lossless savings fall below threshold still gets the suggestion: the
+    # highest-value drop case (kb embedding) is exactly a low-lossless-savings tool.
+    doc, rows = generate_policy([_env("kb.nodes", _blob_records())], threshold=99.0)
+    rule = next(p for p in doc["policies"] if p["match"]["tool"] == "kb.nodes")
+    assert rule["tiers"] == []                                   # forced passthrough
+    assert "result[].embedding" in rule["_suggested_fields"]     # suggestion survives
+
+
+def test_top_level_record_list_yields_bracket_path():
+    recs = [{"id": i, "embedding": json.dumps([float(i * 100 + j) for j in range(200)])}
+            for i in range(20)]
+    doc, _ = generate_policy([_env("x.list", recs)])
+    rule = next(p for p in doc["policies"] if p["match"]["tool"] == "x.list")
+    assert "[].embedding" in rule.get("_suggested_fields", {})
+
+
+def test_no_suggestion_when_no_field_qualifies():
+    doc, _ = generate_policy([_env("gh.items", _records()) for _ in range(2)])
+    rule = next(p for p in doc["policies"] if p["match"]["tool"] == "gh.items")
+    assert "_suggested_fields" not in rule                        # small, foldable fields only
+
+
 def test_non_json_payload_disqualifies_the_tool():
     # even one non-JSON result among a tool's payloads forces passthrough — the policy
     # matches by tool name, so we can't compress only "most" of its results.

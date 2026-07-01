@@ -57,6 +57,39 @@ def value_redundancy(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def field_profiles(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per-field size + cardinality across a record list, for drop-to-retrieve candidate
+    detection (#47). For each field: how often it's present, its distinct-value ratio, the
+    mean/max cl100k tokens of its serialized value, and its share of the record list's total
+    tokens. A large mean size + near-unique cardinality is the drop-to-retrieve signature:
+    lossless value-folding can't help a near-unique field (nothing repeats), so evicting it
+    to a retrievable handle is the only lever left. Pure measurement — no thresholds here."""
+    present: Counter = Counter()
+    toks: dict[str, list[int]] = {}
+    uniq: dict[str, set] = {}
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        for k, v in rec.items():
+            s = _cell_str(v)
+            present[k] += 1
+            toks.setdefault(k, []).append(count_cl100k(s) or 0)
+            uniq.setdefault(k, set()).add(s)
+    total = sum(sum(t) for t in toks.values()) or 1
+    out: dict[str, dict[str, Any]] = {}
+    for k, n in present.items():
+        tk = toks[k]
+        out[k] = {
+            "n": n,
+            "distinct": len(uniq[k]),
+            "uniq_ratio": round(len(uniq[k]) / n, 4) if n else 0.0,
+            "mean_tok": round(sum(tk) / len(tk), 1) if tk else 0.0,
+            "max_tok": max(tk) if tk else 0,
+            "tok_share": round(sum(tk) / total, 4),
+        }
+    return out
+
+
 def cross_call_overlap(prev_raw: str, curr_raw: str) -> dict[str, Any]:
     """Token overlap of a payload with the previous same-tool payload (multiset).
 
