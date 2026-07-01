@@ -31,7 +31,6 @@ def measure_payload(raw: str, use_anthropic: bool = False) -> dict[str, Any]:
     shape = classify_shape(raw)
     try:
         obj = json.loads(raw)
-        applicable = True
     except (json.JSONDecodeError, TypeError):
         # Non-JSON (long-text / other): Tier-0 is a pass-through. Lossless trivially;
         # any real saving here would come from the (unbuilt, opt-in) lossy tier.

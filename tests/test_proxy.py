@@ -353,7 +353,7 @@ def test_run_proxy_capture_dir_failure_does_not_break_traffic(tmp_path):
     rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout,
                    capture_dir=str(blocker))
     assert rc == 0
-    line = [l for l in cout.getvalue().splitlines() if l.strip()][0]
+    line = [ln for ln in cout.getvalue().splitlines() if ln.strip()][0]
     text = json.loads(line)["result"]["content"][0]["text"]
     assert transforms.decompress(text) == {"result": [
         {"id": i, "status": "active", "url": "https://x.example/api/items"} for i in range(20)]}
@@ -370,7 +370,7 @@ def test_run_proxy_debug_log_writes_replay_trace(tmp_path):
     rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout,
                    debug_log=str(log))
     assert rc == 0
-    lines = [l for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
+    lines = [ln for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()]
     # exactly the one tools/call result was logged (initialize is not a tool call)
     assert len(lines) == 1
     rec = json.loads(lines[0])
@@ -442,7 +442,7 @@ def test_run_proxy_end_to_end_compresses_losslessly():
     cin, cout = io.StringIO(requests), io.StringIO()
     rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout)
     assert rc == 0
-    by_id = {json.loads(l)["id"]: json.loads(l) for l in cout.getvalue().splitlines() if l.strip()}
+    by_id = {json.loads(ln)["id"]: json.loads(ln) for ln in cout.getvalue().splitlines() if ln.strip()}
 
     # initialize: serverInfo intact, and the format primer was injected end-to-end
     assert by_id[1]["result"]["serverInfo"]["name"] == "fake"
