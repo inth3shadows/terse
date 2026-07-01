@@ -6,6 +6,17 @@ on:
 permissions:
   contents: read          # least privilege — the workflow only reads the repo
 jobs:
+  lint:
+    # Deterministic and version-independent — its own job so a lint failure reports as
+    # one named check, not 3 identical red X's under the pytest matrix.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --dev          # no anthropic extra: keeps CI keyless, matches design
+      - run: uv run ruff check .
   pytest:
     runs-on: ubuntu-latest
     strategy:
@@ -23,5 +34,4 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --dev          # no anthropic extra: keeps CI keyless, matches design
-      - run: uv run ruff check .
       - run: uv run pytest -q
