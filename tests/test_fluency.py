@@ -212,7 +212,6 @@ DIFF_CURR = ([{"id": i, "status": "active-long-status-string-value", "score": i}
 def test_run_diff_payload_structure_and_forms():
     # a perfect answerer scores both forms right; rows carry terse_ok AND diff_ok counts
     def oracle(system, user):
-        import json as _j
         # answer count questions with the current count (9); others may be wrong — we only
         # assert structure here, not full correctness
         return "9"

@@ -17,7 +17,7 @@ anthropic = ["anthropic"]
 terse = "terse.cli:main"
 
 [dependency-groups]
-dev = ["pytest"]
+dev = ["pytest", "ruff"]
 
 [build-system]
 requires = ["hatchling"]

@@ -107,11 +107,14 @@ def _write_json(path: Path, obj: dict, *, trailing_newline: bool = True) -> None
     # install→uninstall round-trip is no longer byte-identical to the backup (#27).
     text = json.dumps(obj, indent=2, ensure_ascii=False)
     path.write_text(text + ("\n" if trailing_newline else ""), encoding="utf-8")
+    # MCP server entries can carry secrets in `env` blocks — this file mirrors that.
+    os.chmod(path, 0o600)
 
 
 def _backup(cfg: Path) -> Path:
     bak = cfg.with_name(f"{cfg.name}.bak-{int(time.time())}")
     bak.write_text(cfg.read_text(encoding="utf-8"), encoding="utf-8")
+    os.chmod(bak, 0o600)  # backup mirrors cfg, which can hold secrets in `env` blocks
     return bak
 
 

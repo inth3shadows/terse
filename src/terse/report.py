@@ -44,6 +44,27 @@ def _ci(se: float) -> float:
     return 1.96 * se
 
 
+def _worst_case_gap(
+    rows: dict[str, tuple[float, float, float, float]], tol: float
+) -> tuple[str, float, float, float, float, bool] | None:
+    """Shared verdict-gating math for both fluency-style reports (principle #24: gate on the
+    worst model, never the mean). `rows` is {model: (form_acc, form_se, control_acc, control_se)}.
+    Returns the worst-case (lowest-gap) model's (model, gap, form_acc, control_acc, gap_ci,
+    passed), or None if `rows` is empty. gap = form_acc - control_acc; gap_ci is the 95%
+    half-width of √(form_se²+control_se²); passed iff gap is within `tol` of zero (inclusive)."""
+    worst = None
+    for model, (facc, fse, cacc, cse) in rows.items():
+        gap = facc - cacc
+        gap_ci = _ci(math.sqrt(fse ** 2 + cse ** 2))
+        if worst is None or gap < worst[1]:
+            worst = (model, gap, facc, cacc, gap_ci)
+    if worst is None:
+        return None
+    model, gap, facc, cacc, gap_ci = worst
+    passed = gap >= -tol - 1e-9
+    return model, gap, facc, cacc, gap_ci, passed
+
+
 def _pct(saved: int, base: int) -> str:
     return f"{(saved / base * 100):+.1f}%" if base else "n/a"
 
@@ -367,15 +388,11 @@ def build_diff_report(results: dict) -> str:
 
     out += ["## Verdict", ""]
     tol = 0.05
-    worst = None  # (model, gap, diff_acc, full_acc, gap_ci)
-    for model, s in summary.items():
-        gap = s["diff"] - s["full"]
-        gap_ci = _ci(math.sqrt(s["full_se"] ** 2 + s["diff_se"] ** 2))
-        if worst is None or gap < worst[1]:
-            worst = (model, gap, s["diff"], s["full"], gap_ci)
+    gap_rows = {model: (s["diff"], s["diff_se"], s["full"], s["full_se"])
+                for model, s in summary.items()}
+    worst = _worst_case_gap(gap_rows, tol)
     if worst:
-        model, gap, dacc, facc, gap_ci = worst
-        passed = gap >= -tol - 1e-9
+        model, gap, dacc, facc, gap_ci, passed = worst
         out.append(f"- Worst-case model `{model}`: diff-form {dacc:.0%} vs full-terse {facc:.0%} "
                    f"(gap {gap:+.0%} ±{gap_ci * 100:.0f} pts). "
                    f"**{'PASS' if passed else 'FAIL'}** at {tol:.0%} tolerance.")
@@ -491,21 +508,18 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     if broken:
         out.append(f"- Excluded (raw control failed — backend/config error, not comprehension): "
                    f"{', '.join(f'`{m}`' for m in broken)}.")
-    worst = None  # (model, gap, best_form_acc, raw_acc, gap_ci)
+    # best terse-side form per model, carrying its own SE for the gap's confidence interval.
+    # gap CI: raw and the best form are over the same questions (not independent), so
+    # √(se_raw²+se_best²) is a conservative over-estimate of the gap's SE — the honest
+    # direction for a bound that gates a ship decision.
+    gap_rows = {}
     for model, s in gated.items():
-        # best terse-side form, carrying its own SE for the gap's confidence interval.
         best, best_se = (s["terse"], s["terse_se"]) if s["terse"] >= s["primer"] \
             else (s["primer"], s["primer_se"])
-        gap = best - s["raw"]
-        # gap CI: raw and the best form are over the same questions (not independent),
-        # so √(se_raw²+se_best²) is a conservative over-estimate of the gap's SE — the
-        # honest direction for a bound that gates a ship decision.
-        gap_ci = _ci(math.sqrt(s["raw_se"] ** 2 + best_se ** 2))
-        if worst is None or gap < worst[1]:
-            worst = (model, gap, best, s["raw"], gap_ci)
+        gap_rows[model] = (best, best_se, s["raw"], s["raw_se"])
+    worst = _worst_case_gap(gap_rows, tol)
     if worst:
-        model, gap, best, raw, gap_ci = worst
-        passed = gap >= -tol - 1e-9  # inclusive: exactly -tol is within tolerance
+        model, gap, best, raw, gap_ci, passed = worst
         helps = sum(1 for s in gated.values() if s["primer"] > s["terse"] + 1e-9)
         out.append(f"- Worst-case model `{model}`: best terse-form {best:.0%} vs raw {raw:.0%} "
                    f"(gap {gap:+.0%} ±{gap_ci * 100:.0f} pts). "
