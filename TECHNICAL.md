@@ -227,6 +227,23 @@ gitignored because captured tool output may contain real data.
   each tool re-anchors as a full rather than a delta against a base the rebuilt context
   no longer holds (#20). The residual gap — a context *compaction* with no reconnect — is
   unobservable over stdio, and is the standing reason `--diff` is opt-in.
+- **Text diff (Tier 0.7 text, #25) covers non-JSON results, but only the codec side is
+  measured so far.** File reads, source excerpts, and log tails get `applicable: False`
+  in `measure_payload` — zero Tier-0 compression — and used to get zero cross-call
+  diffing too, since the row/key diff above only reasons about JSON. `text_diff` adds a
+  second, independent diff codec for exactly that case: a rolling-hash content-defined
+  chunker (`text_diff._chunk`) splits the prior and current text into position-independent
+  chunks, and the diff references unchanged chunks instead of resending them — same
+  self-describing/fail-open/keyframe contract as the JSON diff, with its own per-tool
+  base (`Interceptor.last_text`) so a tool that alternates JSON and text results never
+  mixes bases. Round-trip correctness is test-covered (`tests/test_text_diff.py`) and a
+  live proxy run confirms ~90-93% token savings on a mostly-unchanged 200-line log
+  re-read or append. **Not yet done:** the model-fluency question `terse fluency --diff`
+  answers for the JSON row/key diff — does a model reconstruct the text-diff form as
+  accurately as the raw text — has no text-diff equivalent yet; `fluency.gen_questions`
+  is built around record/column-shaped payloads and doesn't generalize to unstructured
+  text without its own question-generation design. Track as a follow-on before enabling
+  `--diff` for text-heavy tools against a real model consumer.
 - **Marker collision.** A payload that genuinely contains a reserved
   `__terse_table__` / `__terse_dict__` / `__terse_diff__` key (at any depth) can't be
   compressed without the consumer mis-reading the user's own dict as a terse envelope —
