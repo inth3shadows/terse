@@ -682,9 +682,9 @@ def test_drop_result_populates_store_and_carries_the_marker():
 def test_reconnect_clears_the_drop_store():
     inter = Interceptor(DROP)
     _emit(inter, 9, "gh.api.items", {"result": [{"id": 1, "body": "B" * 400}]})
-    assert inter.dropped and inter._dropped_bytes > 0
+    assert inter.dropped and inter._dropped_bytes_box[0] > 0
     inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize"}))
-    assert len(inter.dropped) == 0 and inter._dropped_bytes == 0
+    assert len(inter.dropped) == 0 and inter._dropped_bytes_box[0] == 0
 
 
 def test_drop_store_evicts_lru_over_count_cap():
@@ -701,7 +701,7 @@ def test_drop_store_evicts_over_byte_cap():
     inter._drop_put("a", "x" * 10)
     inter._drop_put("b", "y" * 10)
     inter._drop_put("c", "z" * 10)                             # 30 > 25 -> evict oldest (a)
-    assert "a" not in inter.dropped and inter._dropped_bytes == 20
+    assert "a" not in inter.dropped and inter._dropped_bytes_box[0] == 20
 
 
 def test_drop_store_refreshes_recency_on_reinsert():
@@ -711,7 +711,7 @@ def test_drop_store_refreshes_recency_on_reinsert():
     inter._drop_put("b", "y" * 10)
     inter._drop_put("a", "x" * 10)                             # touch a -> most-recent
     inter._drop_put("c", "z" * 10)                             # evict LRU = b
-    assert list(inter.dropped) == ["a", "c"] and inter._dropped_bytes == 20
+    assert list(inter.dropped) == ["a", "c"] and inter._dropped_bytes_box[0] == 20
 
 
 # --- drop-to-retrieve: serving terse.retrieve (#10, Phase 3) ---

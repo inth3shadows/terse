@@ -174,6 +174,31 @@ def test_proxy_cmd_rejects_malformed_header_without_launching(monkeypatch, capsy
     assert "NAME=VALUE" in capsys.readouterr().err
 
 
+def test_proxy_cmd_missing_command_with_bad_policy_still_shows_clean_error(tmp_path, capsys):
+    # Regression: --policy used to be loaded BEFORE the missing-downstream-command
+    # check, so a bad/missing --policy path crashed with an uncaught traceback (exit 1)
+    # instead of the clean "provide the downstream server command" message (exit 2) —
+    # regardless of whether --policy was even the thing the user got wrong.
+    rc = main(["proxy", "--policy", str(tmp_path / "does-not-exist.json")])
+    assert rc == 2
+    assert "provide the downstream server command" in capsys.readouterr().err
+
+
+def test_proxy_cmd_rejects_header_with_config(tmp_path, monkeypatch, capsys):
+    # Regression: --header was silently discarded when combined with --config (only the
+    # single-downstream branch ever read args.header) — no warning, no error.
+    def fake_run_multi_proxy(*_a, **_kw):
+        raise AssertionError("run_multi_proxy must not be called when --header is "
+                             "combined with --config")
+
+    monkeypatch.setattr("terse.multiproxy.run_multi_proxy", fake_run_multi_proxy)
+    cfg = tmp_path / "peers.json"
+    cfg.write_text("{}", encoding="utf-8")
+    rc = main(["proxy", "--header", "Authorization=Bearer xyz", "--config", str(cfg)])
+    assert rc == 2
+    assert "--header" in capsys.readouterr().err
+
+
 def test_redact_args_masks_two_arg_and_equals_form_secrets():
     # --flag VALUE form: value is the NEXT arg.
     assert _redact_args(["--api-key", "sk-live-abc123", "run"]) == \

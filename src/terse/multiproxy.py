@@ -7,14 +7,19 @@ This is explicitly an ergonomics feature (single policy/primer/process) — MCP 
 already multiplex servers natively — so the v1 scope below is deliberately
 proportionate. Documented limitations are fine; silent gaps are not:
   - A server-initiated request FROM a downstream that expects a client reply
-    (sampling/createMessage, roots) is forwarded to the client, but the client's reply
-    is not routed back to the originating peer — there is no reverse-routing table in
-    v1. Rare for a compression proxy.
+    (sampling/createMessage, roots) is forwarded to the client with its id rewritten
+    to a router-namespaced one (`_rewrite_server_request`); the client's reply is
+    routed back to the originating peer with the original id restored
+    (`route_client_line`'s method-is-None branch) — an id whose peer isn't known
+    (unrecognized, already answered, or evicted past `_SERVER_REQ_MAX`) is dropped
+    rather than guessed at.
   - Any client method other than `initialize`/`tools/list` (broadcast+merge) or
     `tools/call` (routed by prefix) — e.g. `resources/list`, `prompts/list`, `ping` —
-    is forwarded to peer 0 ONLY, not broadcast/merged. Building full N-way
-    broadcast/merge logic for every possible MCP method is disproportionate for a
-    feature the issue itself calls "ergonomics, modest value".
+    is forwarded to peer 0 ONLY, not broadcast/merged, and this is logged to stderr
+    unconditionally (not gated behind --debug — silently dropping N-1 peers' data
+    from the reply is exactly the kind of gap this file promises not to hide).
+    Building full N-way broadcast/merge logic for every possible MCP method is
+    disproportionate for a feature the issue itself calls "ergonomics, modest value".
   - A broadcast (`initialize`/`tools/list`) blocks on every peer up to
     `BROADCAST_TIMEOUT` seconds; a peer that never answers can't wedge it — the reply
     goes out with whatever DID arrive, and the missing peer(s) are logged to stderr.
@@ -31,6 +36,7 @@ broadcast id-remapping/merge.
 from __future__ import annotations
 
 import json
+import queue
 import signal
 import sys
 import threading
@@ -60,6 +66,20 @@ BROADCAST_TIMEOUT = 30.0
 # else that still carries an id (not tools/call, not one of these) falls through to
 # the documented v1 "forward to peer 0 only" path.
 _BROADCAST_METHODS = ("initialize", "tools/list")
+
+# Bound on `Router._local_id_map` (broadcast-local id -> broadcast seq). Entries are
+# deliberately NOT popped as soon as a broadcast finishes (a late, post-finish reply
+# must still resolve to "already done" and be swallowed rather than leak to the client
+# — see `_maybe_collect`/`_finish_broadcast`), so growth is bounded by eviction instead,
+# the same LRU-cap shape `Interceptor.PENDING_MAX`/`DROPPED_MAX` already use elsewhere
+# in this codebase. Sized generously (a broadcast is a rare event, not a hot path).
+_LOCAL_ID_MAP_MAX = 4096
+
+# Bound on `Router._server_requests` (router-local id -> (peer_idx, original id)),
+# mirroring `_LOCAL_ID_MAP_MAX`'s reasoning: a peer that keeps issuing server-initiated
+# requests (sampling/createMessage, roots) the client never answers can't grow this
+# unboundedly — an evicted entry just means that particular late reply is dropped.
+_SERVER_REQ_MAX = 1024
 
 
 @dataclass
@@ -113,6 +133,13 @@ def load_multi_config(path: str) -> list[DownstreamSpec]:
         if name in seen:
             raise ValueError(f"{path}: duplicate downstream name {name!r} — 'name' must "
                              "be unique (it becomes the tool-prefix/routing key)")
+        if PREFIX_SEP in name:
+            # `_route_call` splits a routed tool name on the FIRST "__", so a name that
+            # itself contains "__" is ambiguous against another peer whose name is its
+            # prefix (e.g. "gh" and "gh__api" would both match a "gh__api__foo" call —
+            # silently to the wrong one). Reject at config-load time instead.
+            raise ValueError(f"{path}: downstream name {name!r} must not contain "
+                             f"{PREFIX_SEP!r} — that's the tool-prefix separator")
         seen.add(name)
 
         url, command = d.get("url"), d.get("command")
@@ -151,19 +178,71 @@ def load_multi_config(path: str) -> list[DownstreamSpec]:
 @dataclass
 class _PendingBroadcast:
     """Bookkeeping for one in-flight broadcast (`initialize` or `tools/list`), keyed by
-    the ORIGINAL client request id. `parts` collects each peer's parsed reply as it
-    arrives (peer index -> the full JSON-RPC message, so a peer error is distinguishable
-    from a peer that hasn't answered yet); `remaining` shrinks to empty as replies land,
-    or the broadcast is force-completed by `Router._timeout_broadcast` once
-    `BROADCAST_TIMEOUT` elapses. `local_ids` is every peer's rewritten id for THIS
-    broadcast, kept so a late (post-timeout) reply and a leftover `_local_id_map` entry
-    can both be cleaned up once the broadcast finishes."""
+    a router-local, globally-unique SEQUENCE NUMBER — not the client's request id.
+    A client id is only unique among an individual client's in-flight requests; keying
+    by seq instead means two broadcasts can never collide even if a client illegally
+    reuses an id while the first is still in flight (JSON-RPC forbids that, but a
+    misbehaving client is exactly the case worth being safe against — see `_broadcast`).
+    `client_id` is kept so the eventual merged reply can be written with the id the
+    client actually used. `parts` collects each peer's parsed reply as it arrives (peer
+    index -> the full JSON-RPC message, so a peer error is distinguishable from a peer
+    that hasn't answered yet); `remaining` shrinks to empty as replies land, or the
+    broadcast is force-completed by `Router._timeout_broadcast` once `BROADCAST_TIMEOUT`
+    elapses. Peer-local ids aren't stored here — they're deterministic from
+    `(seq, peer_idx)` (`f"terse-b{seq}-{i}"`), recomputed wherever needed instead of
+    tracked in a second structure that could drift out of sync with `_local_id_map`."""
     kind: str
+    client_id: Any
     remaining: set[int]
     parts: dict[int, dict] = field(default_factory=dict)
-    local_ids: dict[int, Any] = field(default_factory=dict)
     timer: Optional[threading.Timer] = None
     done: bool = False
+
+
+class _PeerSender:
+    """Per-peer background writer (#5): `send()` enqueues a line and returns
+    immediately; a single worker thread per peer drains its queue and does the actual
+    write+flush (which, for an `HttpTransport` peer, is a BLOCKING network round-trip —
+    see `transport.HttpTransport._post`). One worker per peer preserves that peer's own
+    line ORDER (FIFO queue, single consumer) while letting different peers' sends
+    proceed independently.
+
+    Without this, the client->server fan-out ran on ONE thread (`Router.route_client_line`,
+    by design — see the module docstring), so writing to a slow HTTP peer blocked that
+    same thread from even STARTING to write to any other peer — serializing all peer
+    traffic behind whichever peer was currently slowest, and for a broadcast, consuming
+    the shared `BROADCAST_TIMEOUT` budget before a healthy peer further down the peer
+    list was ever contacted."""
+
+    _STOP: Any = object()
+
+    def __init__(self, transport: Transport, debug: bool = False):
+        self._transport = transport
+        self._debug = debug
+        self._q: "queue.Queue[Any]" = queue.Queue()
+        self._thread = Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def send(self, line: str) -> None:
+        self._q.put(line)
+
+    def _run(self) -> None:
+        while True:
+            line = self._q.get()
+            if line is self._STOP:
+                return
+            try:
+                w = self._transport.outbound()
+                w.write(line + "\n")
+                w.flush()
+            except Exception as exc:  # noqa: BLE001 — one peer's send failure must
+                                       # never crash its worker thread or any other peer
+                if self._debug:
+                    sys.stderr.write(f"[terse-multiproxy] send failed: {exc}\n")
+
+    def close(self) -> None:
+        self._q.put(self._STOP)
+        self._thread.join(timeout=2.0)
 
 
 class Router:
@@ -188,13 +267,36 @@ class Router:
         # tools/list advertises the single synthetic terse.retrieve tool at all, mirroring
         # single-peer Interceptor.policy.has_drop() (#10).
         self.has_drop = any(p.inter.policy.has_drop() for p in peers)
+        # One background sender per peer (index-aligned with `peers`) so a slow HTTP
+        # peer's blocking send can't stall routing to any other peer — see _PeerSender.
+        self._senders = [_PeerSender(p.transport, debug=debug) for p in peers]
 
         self._pending_lock = Lock()
-        self._pending: dict[Any, _PendingBroadcast] = {}
-        # peer-local broadcast id -> the ORIGINAL client id it was issued for. Doubles as
-        # the "is this id one of ours" check: from_peer() pops from here, so an unknown id
-        # (a normal routed tools/call response) is a clean miss, not a string-parse guess.
-        self._local_id_map: dict[Any, Any] = {}
+        # keyed by broadcast SEQUENCE NUMBER, not client id — see _PendingBroadcast.
+        self._pending: dict[int, _PendingBroadcast] = {}
+        self._broadcast_seq = 0
+        # client id -> the seq of that client id's currently-active broadcast, if any.
+        # Lets a reused client id (a protocol violation, but one worth failing safe
+        # against) cancel/abandon the PRIOR broadcast's seq without touching its still-
+        # live _local_id_map entries — those remain valid pointers to the old (now
+        # abandoned) seq, so a late reply for them still resolves through _pending.get()
+        # to "not found" and is swallowed, never misattributed to the new broadcast.
+        self._active_seq: dict[Any, int] = {}
+        # peer-local broadcast id -> the seq it belongs to. Doubles as the "is this id
+        # one of ours" check: from_peer() looks here first, so an unknown id (a normal
+        # routed tools/call response) is a clean miss, not a string-parse guess. NOT
+        # popped when a broadcast finishes — a reply arriving after the merge already
+        # went out must still resolve here and be swallowed (see _maybe_collect), not
+        # fall through to a peer's Interceptor as an unsolicited message. Bounded by
+        # _LOCAL_ID_MAP_MAX eviction instead of eager per-broadcast cleanup.
+        self._local_id_map: "OrderedDict[Any, int]" = OrderedDict()
+        # router-local id -> (peer_idx, original id), for a server-initiated request
+        # forwarded to the client (see _rewrite_server_request) so the client's eventual
+        # reply can be routed back to the peer that actually asked, with its original id
+        # restored — instead of the prior v1 gap (misdelivered to peer 0). Bounded by
+        # _SERVER_REQ_MAX eviction.
+        self._server_requests: "OrderedDict[str, tuple[int, Any]]" = OrderedDict()
+        self._server_req_seq = 0
 
     # ---------- client -> server ----------
 
@@ -225,16 +327,38 @@ class Router:
                 self._broadcast_notification(line)
             return
 
+        if method is None:
+            # A JSON-RPC response (never carries "method") with an id: the client's
+            # reply to some peer's earlier server-initiated request, whose id
+            # `_rewrite_server_request` rewrote specifically so it could be routed back
+            # here — a peer-chosen id isn't namespaced across peers, so two peers could
+            # otherwise pick colliding ids for unrelated requests. An id we don't
+            # recognize (unknown, already answered, or evicted past _SERVER_REQ_MAX) is
+            # dropped rather than forwarded to an arbitrary peer that never asked for it.
+            with self._pending_lock:
+                entry = self._server_requests.pop(mid, None)
+            if entry is not None:
+                peer_idx, orig_id = entry
+                restored = dict(msg)
+                restored["id"] = orig_id
+                self._write_peer(peer_idx, json.dumps(restored, separators=(",", ":"),
+                                                       ensure_ascii=False))
+            elif self.debug:
+                sys.stderr.write(f"[terse-multiproxy] reply for unknown id {mid!r} — "
+                                 "no peer is waiting on it; dropped\n")
+            return
+
         # v1 scope decision (see module docstring): anything else that still carries an
         # id — resources/list, prompts/list, ping, ... — is NOT worth full broadcast/
-        # merge machinery. Forward to peer 0 only, and say so on stderr rather than
-        # silently guessing; a caller who needs more can front that server alone.
+        # merge machinery. Forward to peer 0 only, and say so on stderr (unconditionally
+        # — silently dropping N-1 peers' data from the reply is exactly the kind of gap
+        # this file promises not to hide); a caller who needs more can front that server
+        # alone.
         if self.peers:
-            if self.debug:
-                sys.stderr.write(
-                    f"[terse-multiproxy] {method!r} isn't tools/call or a broadcast "
-                    f"method; forwarding to peer 0 ({self.peers[0].name!r}) only "
-                    "(v1 scope — see multiproxy.py's module docstring)\n")
+            sys.stderr.write(
+                f"[terse-multiproxy] {method!r} isn't tools/call or a broadcast "
+                f"method; forwarding to peer 0 ({self.peers[0].name!r}) only "
+                "(v1 scope — see multiproxy.py's module docstring)\n")
             self._write_peer(0, line)
 
     def _route_call(self, msg: dict) -> None:
@@ -282,28 +406,41 @@ class Router:
         if not self.peers:
             return
         client_id = msg.get("id")
-        pb = _PendingBroadcast(kind=kind, remaining=set(range(len(self.peers))))
         with self._pending_lock:
-            # JSON-RPC forbids reusing an id while the matching request is in flight, so
-            # a client doing that is already violating the protocol; fail safe rather
-            # than silently corrupting bookkeeping by dropping the stale entry first.
-            prior = self._pending.pop(client_id, None)
-            if prior is not None and prior.timer is not None:
-                prior.timer.cancel()
+            seq = self._broadcast_seq
+            self._broadcast_seq += 1
+            # A client reusing an id while its prior broadcast is still in flight is
+            # already a JSON-RPC protocol violation (ids must be unique among in-flight
+            # requests) — fail safe against it anyway rather than trust it never
+            # happens: abandon the PRIOR broadcast under ITS OWN seq (cancel its timer,
+            # drop it from `_pending`) instead of overwriting shared state it still
+            # references. Every broadcast gets a globally unique seq, so there is never
+            # a live local-id collision between two broadcasts even under this
+            # misbehavior — a late reply for the abandoned one resolves via
+            # `_local_id_map` to a seq no longer in `_pending` and is safely swallowed
+            # (see `_maybe_collect`), never misattributed to the new broadcast.
+            prior_seq = self._active_seq.get(client_id)
+            if prior_seq is not None:
+                prior = self._pending.pop(prior_seq, None)
+                if prior is not None and prior.timer is not None:
+                    prior.timer.cancel()
+            pb = _PendingBroadcast(kind=kind, client_id=client_id,
+                                   remaining=set(range(len(self.peers))))
+            self._pending[seq] = pb
+            self._active_seq[client_id] = seq
             for i in range(len(self.peers)):
-                local_id = f"terse-b{client_id}-{i}"
-                pb.local_ids[i] = local_id
-                self._local_id_map[local_id] = client_id
-            self._pending[client_id] = pb
+                self._local_id_map[f"terse-b{seq}-{i}"] = seq
+            while len(self._local_id_map) > _LOCAL_ID_MAP_MAX:
+                self._local_id_map.popitem(last=False)
             timer = threading.Timer(self.broadcast_timeout, self._timeout_broadcast,
-                                    args=(client_id,))
+                                    args=(seq,))
             timer.daemon = True
             pb.timer = timer
         timer.start()
 
         for i, peer in enumerate(self.peers):
             rewritten = dict(msg)
-            rewritten["id"] = pb.local_ids[i]
+            rewritten["id"] = f"terse-b{seq}-{i}"
             line = json.dumps(rewritten, separators=(",", ":"), ensure_ascii=False)
             # For "initialize" this also resets this peer's OWN diff/pending/dropped
             # state (note_request's reconnect handling) — correct on a real client
@@ -315,27 +452,27 @@ class Router:
             self._write_peer(i, line)
 
     def _broadcast_notification(self, line: str) -> None:
-        for peer in self.peers:
-            try:
-                self._write_peer_line(peer, line)
-            except Exception as exc:  # noqa: BLE001 — one broken peer must not crash fan-out
-                if self.debug:
-                    sys.stderr.write(f"[terse-multiproxy] notification to {peer.name!r} "
-                                     f"failed: {exc}\n")
+        for sender in self._senders:
+            sender.send(line)
 
     def _write_peer(self, idx: int, line: str) -> None:
-        self._write_peer_line(self.peers[idx], line)
-
-    @staticmethod
-    def _write_peer_line(peer: Peer, line: str) -> None:
-        w = peer.transport.outbound()
-        w.write(line + "\n")
-        w.flush()
+        # Enqueued to the peer's own background sender (#5): never blocks this thread
+        # on a peer's network round-trip, so one slow HTTP peer can't stall routing to
+        # any OTHER peer — see _PeerSender's docstring.
+        self._senders[idx].send(line)
 
     def _write_client(self, line: str) -> None:
         with self.out_lock:
             self.out.write(line + "\n")
             self.out.flush()
+
+    def close_senders(self) -> None:
+        """Stop every peer's background sender thread (#5). Called once, after the
+        client->server fan-out loop and `drain_pending_broadcasts` finish, before
+        `run_multi_proxy` tears the peers' transports down — so no sender is still
+        mid-write when its transport closes underneath it."""
+        for sender in self._senders:
+            sender.close()
 
     # ---------- server -> client ----------
 
@@ -349,6 +486,15 @@ class Router:
             if isinstance(msg, dict) and msg.get("id") is not None:
                 if self._maybe_collect(peer_idx, msg):
                     return SWALLOW  # a broadcast-local-id reply: never forwarded as-is
+                if (msg.get("method") is not None
+                        and "result" not in msg and "error" not in msg):
+                    # A server-initiated request FROM this peer (sampling/createMessage,
+                    # roots, ...) expecting a client reply: rewrite its id so the reply
+                    # can be routed back to THIS peer specifically (see
+                    # _rewrite_server_request / route_client_line's method-is-None
+                    # branch), instead of the prior v1 gap where it was forwarded
+                    # verbatim and any reply defaulted to peer 0.
+                    return self._rewrite_server_request(peer_idx, msg)
             # A normal routed response (or the v1 forward-to-peer-0 passthrough): run it
             # through THIS peer's own Interceptor so its per-peer diff/drop/compress
             # state applies correctly. `note_request` was told the REWRITTEN/bare tool
@@ -359,6 +505,24 @@ class Router:
             return self.peers[peer_idx].inter.transform_response(line)
         return _transform
 
+    def _rewrite_server_request(self, peer_idx: int, msg: dict) -> str:
+        """Rewrite a server-initiated request's id to a router-local one and remember
+        (peer_idx, original id) so `route_client_line` can restore it and deliver the
+        client's eventual reply back to THIS peer. A peer-chosen id isn't namespaced —
+        two peers could independently pick the same id for unrelated requests — so
+        without this rewrite the client's reply would be ambiguous by construction, not
+        just misrouted by policy. Bounded by `_SERVER_REQ_MAX` eviction (see module
+        docstring): an evicted entry just means that particular late reply is dropped."""
+        with self._pending_lock:
+            local_id = f"terse-s{self._server_req_seq}"
+            self._server_req_seq += 1
+            self._server_requests[local_id] = (peer_idx, msg.get("id"))
+            while len(self._server_requests) > _SERVER_REQ_MAX:
+                self._server_requests.popitem(last=False)
+        rewritten = dict(msg)
+        rewritten["id"] = local_id
+        return json.dumps(rewritten, separators=(",", ":"), ensure_ascii=False)
+
     def _maybe_collect(self, peer_idx: int, msg: dict) -> bool:
         """If `msg.id` is a router-issued broadcast-local id, record it into the
         matching pending broadcast and return True (the caller must SWALLOW — the
@@ -366,17 +530,22 @@ class Router:
         one of ours — a normal routed response, handle it the usual way."""
         mid = msg["id"]
         with self._pending_lock:
-            client_id = self._local_id_map.pop(mid, None)
-            if client_id is None:
+            # `.get`, not `.pop`: a reply that arrives AFTER its broadcast already
+            # finished (timed out or fully merged) must still resolve here and be
+            # swallowed below (pb is None/done -> True) rather than fall through to
+            # transform_response as an unsolicited message. _local_id_map entries are
+            # bounded by eviction (_LOCAL_ID_MAP_MAX in _broadcast), not by popping here.
+            seq = self._local_id_map.get(mid)
+            if seq is None:
                 return False
-            pb = self._pending.get(client_id)
+            pb = self._pending.get(seq)
             if pb is None or pb.done:
                 return True  # already merged/timed out — a late arrival; swallow, drop
             pb.parts[peer_idx] = msg
             pb.remaining.discard(peer_idx)
             remaining_empty = not pb.remaining
         if remaining_empty:
-            self._finish_broadcast(client_id)
+            self._finish_broadcast(seq)
         return True
 
     def drain_pending_broadcasts(self) -> None:
@@ -393,37 +562,40 @@ class Router:
         for timer in timers:
             timer.join(timeout=self.broadcast_timeout + 1.0)
 
-    def _timeout_broadcast(self, client_id: Any) -> None:
+    def _timeout_broadcast(self, seq: int) -> None:
         with self._pending_lock:
-            pb = self._pending.get(client_id)
+            pb = self._pending.get(seq)
             if pb is None or pb.done:
                 return
             missing = sorted(pb.remaining)
+            client_id = pb.client_id
         names = [self.peers[i].name for i in missing]
         sys.stderr.write(f"[terse-multiproxy] broadcast (client id {client_id!r}) timed "
                          f"out after {self.broadcast_timeout}s waiting on peer(s) {names}; "
                          "merging with whatever arrived — a dead/slow peer never wedges "
                          "the proxy\n")
-        self._finish_broadcast(client_id)
+        self._finish_broadcast(seq)
 
-    def _finish_broadcast(self, client_id: Any) -> None:
+    def _finish_broadcast(self, seq: int) -> None:
         with self._pending_lock:
-            pb = self._pending.pop(client_id, None)
+            pb = self._pending.pop(seq, None)
             if pb is None or pb.done:
                 return
             pb.done = True
             if pb.timer is not None:
                 pb.timer.cancel()
-            # Clean up any local ids that never got a reply (a timed-out peer) so
-            # _local_id_map can't grow unboundedly over a long session with a
-            # persistently dead peer.
-            for i in pb.remaining:
-                self._local_id_map.pop(pb.local_ids.get(i), None)
+            if self._active_seq.get(pb.client_id) == seq:
+                self._active_seq.pop(pb.client_id, None)
+            # `_local_id_map` entries for this seq are deliberately left in place (see
+            # __init__/_maybe_collect) — they're bounded by eviction, not popped here,
+            # so a reply that arrives after this point still resolves to "seq not in
+            # _pending" and is safely swallowed instead of leaking to the client.
 
         merged = (self._merge_initialize(pb) if pb.kind == "initialize"
                  else self._merge_tools_list(pb))
-        self._write_client(json.dumps({"jsonrpc": "2.0", "id": client_id, "result": merged},
-                                      separators=(",", ":"), ensure_ascii=False))
+        self._write_client(json.dumps(
+            {"jsonrpc": "2.0", "id": pb.client_id, "result": merged},
+            separators=(",", ":"), ensure_ascii=False))
 
     # ---------- broadcast merges ----------
 
@@ -487,20 +659,28 @@ class Router:
 def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy, *,
                  debug: bool, capture: Optional[Callable[[str, str], None]],
                  audit: Optional[Callable[[dict], None]],
-                 store: "OrderedDict[str, Any]", store_lock: Lock) -> list[Peer]:
+                 store: "OrderedDict[str, Any]", store_lock: Lock,
+                 dropped_bytes: list[int]) -> list[Peer]:
     """Build every `Peer`: its own `Transport` (stdio or HTTP, via `build_transport`)
-    and its own `Interceptor` (per-peer diff/compress state, but the drop store is
-    injected shared). Raises OSError if a stdio peer can't be launched — the caller
-    closes whatever peers WERE built before re-raising/reporting, so a bad 2nd peer
-    doesn't orphan the 1st peer's already-launched child."""
+    and its own `Interceptor` (per-peer diff/compress state, but the drop store —
+    including its byte-eviction counter — is injected shared). Raises OSError if a
+    stdio peer can't be launched — closes whatever peers WERE already built (their
+    live children/connections) before re-raising, so a bad Nth peer doesn't orphan an
+    earlier peer's already-launched child."""
     peers: list[Peer] = []
-    for spec in specs:
-        pol = (policy_mod.load_policy(spec.policy_path) if spec.policy_path
-              else default_policy)
-        inter = Interceptor(pol, debug=debug, capture=capture, audit=audit,
-                            store=store, store_lock=store_lock)
-        transport = build_transport(spec.target, headers=spec.headers or None)
-        peers.append(Peer(name=spec.name, transport=transport, inter=inter))
+    try:
+        for spec in specs:
+            pol = (policy_mod.load_policy(spec.policy_path) if spec.policy_path
+                  else default_policy)
+            inter = Interceptor(pol, debug=debug, capture=capture, audit=audit,
+                                store=store, store_lock=store_lock,
+                                dropped_bytes=dropped_bytes)
+            transport = build_transport(spec.target, headers=spec.headers or None)
+            peers.append(Peer(name=spec.name, transport=transport, inter=inter))
+    except OSError:
+        for peer in peers:
+            peer.transport.close()
+        raise
     return peers
 
 
@@ -560,10 +740,12 @@ def run_multi_proxy(
 
     store: "OrderedDict[str, Any]" = OrderedDict()
     store_lock = Lock()
+    dropped_bytes: list[int] = [0]
 
     try:
         peers = _build_peers(specs, default_policy, debug=debug, capture=capture,
-                             audit=audit, store=store, store_lock=store_lock)
+                             audit=audit, store=store, store_lock=store_lock,
+                             dropped_bytes=dropped_bytes)
     except OSError as exc:
         sys.stderr.write(f"[terse-multiproxy] failed to launch a downstream peer: {exc}\n")
         return 127
@@ -605,6 +787,11 @@ def run_multi_proxy(
         # in flight (bounded by its own timeout) before tearing peers down.
         router.drain_pending_broadcasts()
 
+        # Stop every peer's background sender BEFORE closing any transport below —
+        # otherwise a sender thread could still be mid-write to a transport that's
+        # about to be torn down.
+        router.close_senders()
+
         # Client EOF: let each peer wind down like run_proxy's client_to_server finally
         # does for a single stdio downstream — half-close a stdio peer's stdin so a
         # well-behaved child sees EOF and exits on its own; an HTTP peer has no
@@ -628,6 +815,12 @@ def run_multi_proxy(
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)
             except (ValueError, OSError):
                 pass
+        # Idempotent defense-in-depth: if the try block raised before reaching the
+        # normal close_senders()/transport-teardown sequence above, stop every sender
+        # here too before closing transports. A repeat call is a harmless no-op: the
+        # sender thread already exited on the first STOP, so this just re-queues one
+        # nobody will read and joins an already-finished thread.
+        router.close_senders()
         # Idempotent last-resort reaper for every peer (SIGTERM/SIGKILL escalation for a
         # stdio child that didn't exit on its own; a harmless repeat close for HTTP).
         for peer in peers:

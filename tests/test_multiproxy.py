@@ -16,19 +16,22 @@ import json
 import pathlib
 import sys
 import threading
+import time
 from collections import OrderedDict
 from threading import Lock
 
 from terse import __version__, transforms
 from terse.lossy import _handle, _serialize
 from terse.multiproxy import (
+    DownstreamSpec,
     Peer,
     Router,
+    _build_peers,
     load_multi_config,
     run_multi_proxy,
 )
 from terse.policy import Policy, Rule
-from terse.proxy import Interceptor
+from terse.proxy import SWALLOW, Interceptor
 from terse.transport import build_transport
 
 FAKE = pathlib.Path(__file__).parent / "fake_mcp_server.py"
@@ -116,6 +119,25 @@ def _write_config(tmp_path, downstreams: list[dict]) -> pathlib.Path:
 
 def _lines(cout: io.StringIO) -> list[dict]:
     return [json.loads(ln) for ln in cout.getvalue().splitlines() if ln.strip()]
+
+
+class _FakePeerTransport:
+    """A minimal `Transport` for unit-testing `Router` without a real subprocess/HTTP
+    peer: `outbound()` always returns the SAME `io.StringIO` (so a `_PeerSender`'s
+    writes accumulate and stay inspectable after the fact), `inbound()` yields nothing
+    (these tests drive `from_peer(i)`'s transform directly instead)."""
+
+    def __init__(self):
+        self.out = io.StringIO()
+
+    def inbound(self):
+        return iter([])
+
+    def outbound(self):
+        return self.out
+
+    def close(self):
+        pass
 
 
 DROP_POLICY = Policy(rules=[
@@ -366,3 +388,227 @@ def test_interceptor_injected_store_is_actually_shared():
         {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
          "params": {"name": "terse.retrieve", "arguments": {"handle": "h"}}})))
     assert reply["result"]["content"][0]["text"] == "value"
+
+
+def test_shared_dropped_bytes_evicts_over_combined_cap_across_peers():
+    # Regression: each Interceptor's own byte counter used to be private even when the
+    # DICT was shared (multiproxy._build_peers), so the DROPPED_MAX_BYTES cap never saw
+    # the true combined size — two peers each individually under-cap could jointly blow
+    # way past it. A shared `dropped_bytes` box fixes that.
+    store: "OrderedDict[str, object]" = OrderedDict()
+    lock = Lock()
+    dropped_bytes: list[int] = [0]
+    a = Interceptor(DROP_POLICY, store=store, store_lock=lock, dropped_bytes=dropped_bytes)
+    b = Interceptor(DROP_POLICY, store=store, store_lock=lock, dropped_bytes=dropped_bytes)
+    a.DROPPED_MAX_BYTES = b.DROPPED_MAX_BYTES = 25
+
+    a._drop_put("a", "x" * 10)                        # peer a: 10 bytes, under its own cap
+    b._drop_put("b", "y" * 10)                         # peer b: 10 bytes, under its own cap
+    a._drop_put("c", "z" * 10)                         # combined 30 > 25 -> evict oldest ("a")
+
+    assert "a" not in store                            # evicted despite peer `a` alone never
+                                                        # exceeding 25 bytes on its own
+    assert set(store) == {"b", "c"}
+    assert dropped_bytes[0] == 20
+
+
+def test_build_peers_closes_already_launched_peer_on_partial_failure(monkeypatch):
+    # Regression: _build_peers used to let an OSError from a later spec propagate with
+    # no cleanup, orphaning an earlier spec's already-launched child/connection.
+    from terse import multiproxy as mp
+
+    closed = []
+
+    class _FakeTransport:
+        def inbound(self):
+            return iter([])
+
+        def outbound(self):
+            return io.StringIO()
+
+        def close(self):
+            closed.append(True)
+
+    calls = {"n": 0}
+
+    def fake_build_transport(target, headers=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _FakeTransport()
+        raise OSError("boom: can't launch second peer")
+
+    monkeypatch.setattr(mp, "build_transport", fake_build_transport)
+    specs = [
+        DownstreamSpec(name="a", target=["a"], headers={}, policy_path=None),
+        DownstreamSpec(name="b", target=["b"], headers={}, policy_path=None),
+    ]
+    try:
+        _build_peers(specs, PLAIN_POLICY, debug=False, capture=None, audit=None,
+                     store=OrderedDict(), store_lock=Lock(), dropped_bytes=[0])
+        raise AssertionError("expected OSError for the unlaunchable 2nd peer")
+    except OSError:
+        pass
+    assert closed == [True]  # the first (already-launched) peer's transport was closed
+
+
+def test_load_multi_config_rejects_name_containing_prefix_sep(tmp_path):
+    # Regression: a name like "gh__api" wasn't rejected, so it could shadow a shorter
+    # peer name ("gh") under _route_call's first-occurrence "__" split.
+    cfg = _write_config(tmp_path, [{"name": "gh__api", "command": ["a"]}])
+    try:
+        load_multi_config(str(cfg))
+        raise AssertionError("expected ValueError for a name containing '__'")
+    except ValueError as e:
+        assert "__" in str(e)
+
+
+def test_server_initiated_request_reply_routes_back_to_originating_peer():
+    # Regression: the client's reply to a server-initiated request (sampling/
+    # createMessage, roots, ...) from a peer OTHER than peer 0 used to be misdelivered
+    # to peer 0 unconditionally.
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    router = Router(peers, io.StringIO(), Lock())
+    try:
+        forwarded = router.from_peer(1)(json.dumps(
+            {"jsonrpc": "2.0", "id": 42, "method": "sampling/createMessage", "params": {}}))
+        fwd_msg = json.loads(forwarded)
+        assert fwd_msg["id"] != 42  # rewritten to a router-local id, not forwarded verbatim
+
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": fwd_msg["id"], "result": {"ok": True}}))
+    finally:
+        router.close_senders()
+
+    assert t0.out.getvalue() == ""                     # never reached peer 0
+    delivered = json.loads(t1.out.getvalue().strip())  # reached peer 1, its true origin
+    assert delivered["id"] == 42                        # with the ORIGINAL id restored
+
+
+def test_reply_for_unknown_id_is_dropped_not_misrouted():
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    router = Router(peers, io.StringIO(), Lock())
+    try:
+        router.route_client_line(json.dumps({"jsonrpc": "2.0", "id": 999, "result": {}}))
+    finally:
+        router.close_senders()
+    assert t0.out.getvalue() == "" and t1.out.getvalue() == ""
+
+
+def test_late_broadcast_reply_after_timeout_is_swallowed_not_leaked():
+    # Regression: a peer's broadcast reply arriving AFTER _timeout_broadcast already
+    # merged and replied used to fall through to that peer's own transform_response and
+    # get written straight to the client, unmerged and carrying an internal id.
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)  # never fires on its own
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+        # peer 0 answers promptly
+        router.from_peer(0)(json.dumps(
+            {"jsonrpc": "2.0", "id": "terse-b0-0",
+             "result": {"protocolVersion": "2024-11-05", "capabilities": {}}}))
+        # force the broadcast to finish (as if its timer had fired) before peer 1 answers
+        router._timeout_broadcast(0)
+        assert len(_lines(out)) == 1  # the merged reply already went out
+
+        # peer 1's reply arrives LATE
+        result = router.from_peer(1)(json.dumps(
+            {"jsonrpc": "2.0", "id": "terse-b0-1",
+             "result": {"protocolVersion": "2024-11-05", "capabilities": {}}}))
+    finally:
+        router.close_senders()
+
+    assert result is SWALLOW           # swallowed, not forwarded as an unsolicited message
+    assert len(_lines(out)) == 1        # still exactly one reply on the client stream
+
+
+def test_reused_client_id_during_broadcast_resolves_to_correct_broadcast():
+    # Regression: a client reusing an id while its broadcast was still in flight used to
+    # produce IDENTICAL peer-local id strings for both broadcasts (format depended only
+    # on client_id + peer index), so a stale reply for the first could get recorded into
+    # the second (wrong) broadcast's merge.
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+        # client illegally reuses id=1 for a second broadcast before the first resolves
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+
+        # a stale reply for the FIRST (now-abandoned) broadcast arrives
+        late = router.from_peer(0)(json.dumps(
+            {"jsonrpc": "2.0", "id": "terse-b0-0",
+             "result": {"protocolVersion": "2024-11-05", "capabilities": {"first": True}}}))
+
+        # both peers answer the SECOND (active) broadcast
+        router.from_peer(0)(json.dumps(
+            {"jsonrpc": "2.0", "id": "terse-b1-0",
+             "result": {"protocolVersion": "2024-11-05", "capabilities": {"second": True}}}))
+        router.from_peer(1)(json.dumps(
+            {"jsonrpc": "2.0", "id": "terse-b1-1",
+             "result": {"protocolVersion": "2024-11-05", "capabilities": {"second": True}}}))
+    finally:
+        router.close_senders()
+
+    assert late is SWALLOW              # the stale first-broadcast reply must never leak
+    msgs = _lines(out)
+    assert len(msgs) == 1               # exactly one merged reply for client id=1
+    assert msgs[0]["result"]["capabilities"] == {"second": True}  # from the CORRECT broadcast
+
+
+def test_slow_peer_write_does_not_block_routing_to_other_peers():
+    # Regression: the client->server fan-out ran on one thread and wrote to each peer
+    # inline/synchronously, so a slow peer's send blocked routing to every OTHER peer
+    # until it finished.
+    release = threading.Event()
+
+    class _SlowTransport(_FakePeerTransport):
+        def outbound(self):
+            release.wait(timeout=5)
+            return self.out
+
+    slow, fast = _SlowTransport(), _FakePeerTransport()
+    peers = [Peer("slow", slow, Interceptor(PLAIN_POLICY)),
+             Peer("fast", fast, Interceptor(PLAIN_POLICY))]
+    router = Router(peers, io.StringIO(), Lock())
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "slow__x"}}))
+        # routed while `slow`'s send is still blocked in outbound() above — proves the
+        # two peers' sends aren't serialized on one thread
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "fast__y"}}))
+        deadline = time.monotonic() + 2.0
+        while fast.out.getvalue() == "" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert fast.out.getvalue() != ""  # got through despite `slow` still blocked
+    finally:
+        release.set()
+        router.close_senders()
+
+
+def test_unknown_method_forwards_to_peer_0_and_logs_without_debug(capsys):
+    # Regression: this v1-scope fallback's explanatory stderr note was gated behind
+    # --debug, so by default an operator saw N-1 peers' data silently vanish from the
+    # reply with no indication anything was dropped.
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    router = Router(peers, io.StringIO(), Lock(), debug=False)
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "resources/list", "params": {}}))
+        deadline = time.monotonic() + 2.0
+        while t0.out.getvalue() == "" and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        router.close_senders()
+    assert t0.out.getvalue() != "" and t1.out.getvalue() == ""  # forwarded to peer 0 only
+    err = capsys.readouterr().err
+    assert "resources/list" in err and "peer 0" in err  # logged even without --debug

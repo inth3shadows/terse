@@ -97,12 +97,11 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
 
-    pol = load_policy(args.policy) if args.policy else default_policy()
-    if args.diff:
-        pol.diff = True  # CLI opt-in overrides the policy default (off)
-    if args.diff_keyframe_interval is not None:
-        pol.diff_keyframe_interval = args.diff_keyframe_interval
-
+    # Validate the cmd/--config/--header combination BEFORE touching the policy file
+    # (or anything else with a side effect): a missing downstream command must always
+    # produce this clean, actionable message regardless of whether --policy also
+    # happens to be bad — checking cmd only after loading the policy let an unrelated
+    # bad --policy path crash with a raw traceback instead.
     if args.config:
         # --config (#5 Half B, multi-downstream fan-out) and a positional downstream
         # command are mutually exclusive: each names ITS downstream(s) a different way,
@@ -111,6 +110,30 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
             print("proxy: --config and a downstream command (after `--`) are mutually "
                   "exclusive — use one or the other", file=sys.stderr)
             return 2
+        if args.header:
+            # --header has no --config equivalent: run_multi_proxy fronts N peers, each
+            # with its own optional "headers" in the config file, so a single flag value
+            # can't apply to all of them unambiguously. Reject loudly rather than
+            # silently dropping a header the user thinks is taking effect.
+            print("proxy: --header has no effect with --config — set a per-downstream "
+                  '"headers" object in the config file instead', file=sys.stderr)
+            return 2
+    elif not cmd:
+        print("proxy: provide the downstream server command after `--`, e.g.\n"
+              "  terse proxy --policy p.json -- uvx some-mcp-server", file=sys.stderr)
+        return 2
+
+    try:
+        pol = load_policy(args.policy) if args.policy else default_policy()
+    except (OSError, ValueError) as e:
+        print(f"proxy: {e}", file=sys.stderr)
+        return 2
+    if args.diff:
+        pol.diff = True  # CLI opt-in overrides the policy default (off)
+    if args.diff_keyframe_interval is not None:
+        pol.diff_keyframe_interval = args.diff_keyframe_interval
+
+    if args.config:
         from .multiproxy import run_multi_proxy
         try:
             return run_multi_proxy(args.config, pol, debug=args.debug,
@@ -121,10 +144,6 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
 
     from .proxy import run_proxy
 
-    if not cmd:
-        print("proxy: provide the downstream server command after `--`, e.g.\n"
-              "  terse proxy --policy p.json -- uvx some-mcp-server", file=sys.stderr)
-        return 2
     try:
         headers = _parse_headers(args.header)
     except ValueError as e:
@@ -602,7 +621,8 @@ def main(argv: list[str] | None = None) -> int:
                          "affects forwarding)")
     px.add_argument("--header", action="append", metavar="NAME=VALUE",
                     help="HTTP header to send to an HTTP/SSE downstream (repeatable), e.g. "
-                         "--header 'Authorization=Bearer xyz'. Ignored for a stdio downstream.")
+                         "--header 'Authorization=Bearer xyz'. Ignored for a stdio downstream. "
+                         "Not valid with --config — set headers per-downstream in that file.")
     px.add_argument("--config", metavar="FILE",
                     help="JSON file listing multiple downstream peers to front behind "
                          "one process (#5 Half B, fan-out): "

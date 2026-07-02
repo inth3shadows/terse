@@ -120,7 +120,8 @@ class Interceptor:
                  capture: Optional[Callable[[str, str], None]] = None,
                  audit: Optional[Callable[[dict], None]] = None,
                  store: Optional["OrderedDict[str, Any]"] = None,
-                 store_lock: Optional[Lock] = None):
+                 store_lock: Optional[Lock] = None,
+                 dropped_bytes: Optional[list[int]] = None):
         self.policy = pol
         self.pending: dict[Any, str] = {}
         self.debug = debug
@@ -159,7 +160,15 @@ class Interceptor:
         # existing single-peer caller: a fresh private OrderedDict + Lock, exactly as
         # before this parameter existed.
         self.dropped: "OrderedDict[str, Any]" = store if store is not None else OrderedDict()
-        self._dropped_bytes = 0
+        # `dropped_bytes` (#5 Half B): a 1-element box, not a plain int, specifically so
+        # it can be SHARED the same way `store` is. `self.dropped` can be one dict shared
+        # across N Interceptors, but a plain `self._dropped_bytes = 0` would still be
+        # per-instance — each peer would only ever see bytes IT personally inserted, so
+        # the DROPPED_MAX_BYTES eviction check would never fire against the shared dict's
+        # TRUE combined size. A shared box keeps the byte tally as cross-peer-accurate as
+        # the dict it's tracking. Default (None) is behavior-preserving: a fresh private
+        # box, exactly equivalent to a private int.
+        self._dropped_bytes_box: list[int] = dropped_bytes if dropped_bytes is not None else [0]
         self.init_id: Any = None        # id of the initialize request, to prime its reply
         # The two proxy pump threads call note_request (client->server) and
         # transform_response (server->client) concurrently, both mutating the shared
@@ -202,7 +211,7 @@ class Interceptor:
                 self.since_text_keyframe.clear()
                 self.pending.clear()
                 self.dropped.clear()
-                self._dropped_bytes = 0
+                self._dropped_bytes_box[0] = 0
                 if mid is not None:
                     self.init_id = mid
                 return
@@ -432,14 +441,14 @@ class Interceptor:
         already holds self._lock — no separate lock needed."""
         size = len(lossy_mod._serialize(value))
         if handle in self.dropped:
-            self._dropped_bytes -= len(lossy_mod._serialize(self.dropped[handle]))
+            self._dropped_bytes_box[0] -= len(lossy_mod._serialize(self.dropped[handle]))
             self.dropped.move_to_end(handle)
         self.dropped[handle] = value
-        self._dropped_bytes += size
+        self._dropped_bytes_box[0] += size
         while self.dropped and (len(self.dropped) > self.DROPPED_MAX
-                                or self._dropped_bytes > self.DROPPED_MAX_BYTES):
+                                or self._dropped_bytes_box[0] > self.DROPPED_MAX_BYTES):
             _, evicted = self.dropped.popitem(last=False)
-            self._dropped_bytes -= len(lossy_mod._serialize(evicted))
+            self._dropped_bytes_box[0] -= len(lossy_mod._serialize(evicted))
 
     def _inject_retrieve_tool(self, msg: dict) -> Optional[str]:
         """If `msg` is a tools/list result, append the synthetic terse.retrieve tool so the
