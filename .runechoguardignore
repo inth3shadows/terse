@@ -6,7 +6,21 @@ Path
 OrderedDict
 Lock
 Counter
+Thread
+field
 # Also mis-flagged: a callback PARAMETER invoked as a bare call (`drop_sink(h, v)` in
 # policy.apply). The guard resolves module symbols/imports, not function parameters, so a
 # param called by name reads as unresolved. A genuinely wrong name is caught by pytest.
 drop_sink
+answerer
+rule_for
+# Also mis-flagged: plain English words inside a docstring that happen to look like
+# `word(...)` bare calls to the guard's pattern match (e.g. "the client's stdin",
+# "server->client", "closes the transport in turn"). Not code at all.
+client
+wire
+cleanly
+server
+args
+keys
+measurement

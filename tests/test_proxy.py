@@ -498,21 +498,23 @@ def test_terminate_child_is_noop_on_already_exited():
     assert proc.poll() is not None
 
 
-# --- #19: fail-fast on a non-stdio downstream ---
+# --- #19: fail-fast on a downstream with nothing to proxy at all ---
 
-def test_stdio_transport_error_flags_url_and_passes_command():
+def test_stdio_transport_error_only_flags_a_missing_command():
+    # #5: a URL is now a valid, dispatchable downstream (HttpTransport) — no longer
+    # rejected here. Only "nothing after --" remains an error.
     from terse.proxy import stdio_transport_error
 
     assert stdio_transport_error([]) is not None                       # nothing given
-    assert "issue #5" in stdio_transport_error(["https://example.com/mcp"])
-    assert stdio_transport_error(["sse://host/path"]) is not None      # any scheme
+    assert stdio_transport_error(["https://example.com/mcp"]) is None  # URL: now OK
+    assert stdio_transport_error(["sse://host/path"]) is None          # any scheme: OK
     assert stdio_transport_error(["uvx", "some-mcp-server"]) is None   # a real command
     assert stdio_transport_error([sys.executable, str(FAKE)]) is None
 
 
-def test_run_proxy_rejects_url_downstream_without_launching():
+def test_run_proxy_rejects_empty_downstream_without_launching():
     cin, cout = io.StringIO('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'), io.StringIO()
-    rc = run_proxy(["https://example.com/mcp"], FULL, stdin=cin, stdout=cout)
+    rc = run_proxy([], FULL, stdin=cin, stdout=cout)
     assert rc == 2
     assert cout.getvalue() == ""        # nothing launched, nothing forwarded
 

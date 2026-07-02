@@ -52,13 +52,46 @@ def test_wrap_is_idempotent_no_double_nesting():
     assert once != twice  # policy actually changed between wraps
 
 
-def test_wrap_http_sse_server_fails_fast_with_clear_message():
-    # an HTTP/SSE server has a 'url', no 'command' — terse can't proxy it (#19/#5)
-    config = _cfg(remote={"type": "sse", "url": "https://example.com/mcp"})
+def test_wrap_url_server_proxies_the_url_with_headers():
+    # An HTTP/SSE server has a 'url' (+ optional 'headers'), no 'command' — #5: terse
+    # now wraps it by pointing the proxy's downstream at that url.
+    original = {"type": "sse", "url": "https://example.com/mcp",
+                "headers": {"Authorization": "Bearer secret-token"}}
+    config = _cfg(remote=dict(original))
+    stash: dict = {}
+
+    im.wrap(config, stash, "remote", "/p/policy.json", TERSE_CMD)
+    entry = config["mcpServers"]["remote"]
+    assert entry["command"] == "/abs/python"
+    assert entry["args"] == [
+        "-m", "terse", "proxy", "--policy", "/p/policy.json",
+        "--header", "Authorization=Bearer secret-token",
+        "--", "https://example.com/mcp",
+    ]
+    assert "url" not in entry and "headers" not in entry     # folded into args
+    assert entry["type"] == "sse"                             # other keys preserved
+    assert stash["remote"] == original
+
+    im.unwrap(config, stash, "remote")
+    assert config["mcpServers"]["remote"] == original
+    assert "remote" not in stash
+
+
+def test_wrap_url_server_without_headers_omits_header_flags():
+    config = _cfg(remote={"url": "https://example.com/mcp"})
+    im.wrap(config, {}, "remote", "/p/policy.json", TERSE_CMD)
+    args = config["mcpServers"]["remote"]["args"]
+    assert "--header" not in args
+    assert args[-1] == "https://example.com/mcp"
+
+
+def test_wrap_malformed_entry_without_command_or_url_raises():
+    # Neither 'command' nor 'url' — not a valid MCP server entry at all (#19).
+    config = _cfg(broken={"type": "mystery"})
     with pytest.raises(ValueError) as exc:
-        im.wrap(config, {}, "remote", "/p/policy.json", TERSE_CMD)
+        im.wrap(config, {}, "broken", "/p/policy.json", TERSE_CMD)
     msg = str(exc.value)
-    assert "url" in msg and "#5" in msg
+    assert "command" in msg and "url" in msg
 
 
 def test_unwrap_unmanaged_raises():

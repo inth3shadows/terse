@@ -1,7 +1,8 @@
-"""MCP stdio proxy: compress downstream tool-call results per policy, transparently.
+"""MCP proxy: compress downstream tool-call results per policy, transparently.
 
-Sits between an MCP client (e.g. Claude Code) and one downstream MCP server. It
-launches the server as a subprocess and forwards JSON-RPC both ways. The ONLY
+Sits between an MCP client (e.g. Claude Code) and one downstream MCP server, which it
+reaches over a pluggable `Transport` (`transport.py`, #5): a local stdio subprocess, or
+an MCP Streamable-HTTP endpoint. Either way it forwards JSON-RPC both ways. The ONLY
 thing it changes is the text of a `tools/call` *result*, which it runs through
 `policy.apply()` using the tool name recorded from the matching request.
 
@@ -9,11 +10,14 @@ Design guarantees:
   - Transparent: every non-(tools/call-result) message is forwarded byte-for-byte.
   - Fail-open: any parse/compress error forwards the ORIGINAL message. A compression
     layer must never lose or corrupt a tool result.
-  - Frame-safe: MCP stdio is newline-delimited JSON; terse minified output has no
-    embedded newlines, so a compressed result stays one line.
+  - Frame-safe: MCP messages are newline-delimited JSON on the wire (stdio lines, or one
+    JSON-RPC message per SSE event over HTTP); terse minified output has no embedded
+    newlines, so a compressed result stays one line/event.
+  - Transport-independent: `Interceptor` and `pump()` operate on line-in/line-out only —
+    neither knows or cares whether the downstream is a subprocess or an HTTP peer.
 
 The pure message logic lives in `Interceptor` (unit-tested without any I/O). The
-`run_proxy` shell wires it to a subprocess with two pump threads.
+`run_proxy` shell wires it to a `Transport` with two pump threads.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from . import policy as policy_mod
 from . import text_diff
 from . import transforms
 from .tokenize import count_cl100k
+from .transport import HttpTransport, build_transport
 
 # The synthetic tool terse advertises in tools/list when a policy enables drop-to-retrieve
 # (#10). The proxy answers its calls itself from the drop store — the downstream server
@@ -113,7 +118,9 @@ class Interceptor:
 
     def __init__(self, pol: policy_mod.Policy, debug: bool = False,
                  capture: Optional[Callable[[str, str], None]] = None,
-                 audit: Optional[Callable[[dict], None]] = None):
+                 audit: Optional[Callable[[dict], None]] = None,
+                 store: Optional["OrderedDict[str, Any]"] = None,
+                 store_lock: Optional[Lock] = None):
         self.policy = pol
         self.pending: dict[Any, str] = {}
         self.debug = debug
@@ -141,14 +148,31 @@ class Interceptor:
         # synthetic terse.retrieve tool. LRU-ordered; bounded by DROPPED_MAX / _MAX_BYTES;
         # cleared on reconnect (like the diff bases) since the model's context — and thus
         # every emitted handle — resets then too.
-        self.dropped: "OrderedDict[str, Any]" = OrderedDict()
+        #
+        # `store`/`store_lock` (#5 Half B): when the caller passes them (multiproxy.py
+        # fronting N peers), this Interceptor shares its drop store + lock with every
+        # OTHER peer's Interceptor instead of keeping a private one. That is safe because
+        # handles are content-addressed and include the bare tool name (lossy._handle) —
+        # two peers dropping different values never collide, and equal values dedupe into
+        # one slot — so one shared store serves terse.retrieve correctly regardless of
+        # which peer answers it. Default (None) is 100% behavior-preserving for every
+        # existing single-peer caller: a fresh private OrderedDict + Lock, exactly as
+        # before this parameter existed.
+        self.dropped: "OrderedDict[str, Any]" = store if store is not None else OrderedDict()
         self._dropped_bytes = 0
         self.init_id: Any = None        # id of the initialize request, to prime its reply
         # The two proxy pump threads call note_request (client->server) and
         # transform_response (server->client) concurrently, both mutating the shared
         # pending/last/since_keyframe state. One lock serializes each method so the
         # compound eviction + the reconnect reset can't race a response in flight.
-        self._lock = Lock()
+        # When `store_lock` is injected, this Interceptor's ENTIRE critical section
+        # (not just the drop store) serializes against every other peer sharing that
+        # lock too — a peer's own pending/last/since_keyframe state doesn't strictly
+        # need cross-peer exclusion, but `self.dropped` does (it's the same physical
+        # dict), and `_drop_put` already assumes it's called under `self._lock` (see its
+        # docstring) — so reusing one lock for the whole critical section is the minimal,
+        # provably-safe change rather than carving out a second, finer-grained lock.
+        self._lock = store_lock if store_lock is not None else Lock()
 
     def note_request(self, line: str) -> None:
         """Record id -> tool name for tools/call requests, and the initialize request id
@@ -526,21 +550,13 @@ def pump(src: TextIO, dst: TextIO, transform: Callable[[str], Any],
 
 
 def stdio_transport_error(cmd: list[str]) -> Optional[str]:
-    """Return a clear error if `cmd` can't be a stdio MCP launch, else None (#19).
-
-    terse proxies exactly ONE stdio server: it speaks newline-delimited JSON-RPC over
-    the child's stdin/stdout. An HTTP/SSE endpoint is a URL, not a launchable command,
-    so it can never speak stdio — pointed at one, the proxy would otherwise look like a
-    hang or an empty result (the client's `initialize` goes in, nothing valid comes
-    back) rather than a config error. Catch the URL case up front. Full HTTP/SSE
-    transport support is tracked separately (#5)."""
+    """Return a clear error if `cmd` can't be a proxy downstream target at all, else
+    None (#19). Currently the only such case is nothing given after `--`. A URL is no
+    longer rejected here — `transport.build_transport` dispatches a single `"://"`
+    target to `HttpTransport` (#5), so a URL is a valid, launchable-in-spirit target
+    same as a stdio command."""
     if not cmd:
         return "no downstream command given after `--`"
-    first = cmd[0]
-    if "://" in first:
-        return (f"{first!r} looks like a URL — terse proxies a stdio MCP server (a "
-                f"launchable command), not an HTTP/SSE endpoint. HTTP/SSE transport "
-                f"is not supported yet (issue #5).")
     return None
 
 
@@ -568,11 +584,18 @@ def run_proxy(
     stdout: Optional[TextIO] = None,
     capture_dir: Optional[str] = None,
     debug_log: Optional[str] = None,
+    headers: Optional[dict[str, str]] = None,
 ) -> int:
-    """Launch the downstream MCP server `cmd` and proxy stdio through `Interceptor`.
-    The child shares this process's lifecycle: it is reaped on normal exit, on a crash
-    (via `finally`), and on SIGTERM (the signal a parent MCP client uses to stop us),
-    so it is never left orphaned (#21).
+    """Launch the downstream MCP peer `cmd` and proxy JSON-RPC through `Interceptor`.
+    `cmd` is either a stdio launch command, or a single-element list holding a URL — in
+    which case `transport.build_transport` dispatches to `HttpTransport` instead of
+    launching a subprocess (#5). `headers` is forwarded to an HTTP downstream only (e.g.
+    bearer auth); it is a harmless no-op for a stdio one.
+
+    A stdio child shares this process's lifecycle: it is reaped on normal exit, on a
+    crash (via `finally`), and on SIGTERM (the signal a parent MCP client uses to stop
+    us), so it is never left orphaned (#21). An HTTP downstream has no child process to
+    reap — see the transport-specific control flow below.
 
     With `capture_dir`, each raw tool-result payload is also teed into that corpus dir
     (#32) for later `terse verify --corpus`/`measure` — opt-in, and strictly a side
@@ -580,12 +603,19 @@ def run_proxy(
 
     With `debug_log`, a structured raw->decision->emitted record per result is appended
     to that JSONL path (#23) for after-the-fact diagnosis/replay of a silent compression
-    bug — same opt-in, side-effect-only contract."""
+    bug — same opt-in, side-effect-only contract.
+
+    Return code: for a stdio downstream, the child's real exit code (or 127 if it could
+    never be launched — #19), exactly as before this function grew a second transport.
+    For an HTTP downstream there is no child process to exit; 0 means the client
+    disconnected cleanly (its stdin hit EOF, which — via `client_to_server`'s `finally`
+    below — closes the transport in turn)."""
     cin = stdin or sys.stdin
     cout = stdout or sys.stdout
 
-    # Fail fast on a downstream that can never speak stdio (a URL / HTTP-SSE endpoint)
-    # before launching anything (#19): clearer than a hang or empty result later.
+    # Fail fast when there is nothing to proxy at all (#19): clearer than a hang or
+    # empty result later. A URL is now a valid downstream (build_transport dispatches
+    # it to HttpTransport below) — only "nothing after --" is still an error here.
     transport_err = stdio_transport_error(cmd)
     if transport_err is not None:
         sys.stderr.write(f"[terse-proxy] {transport_err}\n")
@@ -620,18 +650,24 @@ def run_proxy(
     inter = Interceptor(pol, debug=debug, capture=capture, audit=audit)
 
     try:
-        proc = subprocess.Popen(  # noqa: S603 — cmd is operator-supplied, by design
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
-            encoding="utf-8",
-        )
+        transport = build_transport(cmd, headers=headers)
     except OSError as exc:
-        # Mistyped path, non-executable, or otherwise unlaunchable downstream — report
-        # it as a config error instead of an uncaught traceback (#19). 127 = the shell
-        # convention for "command not found".
+        # Mistyped path, non-executable, or otherwise unlaunchable STDIO downstream —
+        # report it as a config error instead of an uncaught traceback (#19). 127 = the
+        # shell convention for "command not found". (An HTTP target never raises here:
+        # HttpTransport.__init__ does no I/O — a bad URL/host only ever surfaces later,
+        # fail-open, as a synthesized per-request error — see transport.py.)
         sys.stderr.write(f"[terse-proxy] failed to launch downstream server {cmd[0]!r}: "
                          f"{exc}\n")
         return 127
-    assert proc.stdin is not None and proc.stdout is not None
+
+    # The rest of this function is deliberately NOT fully transport-polymorphic: the
+    # stdio path keeps its exact pre-#5 control flow (half-close stdin, `proc.wait()`
+    # for the real exit code, `_terminate_child` as the last-resort reaper) so every
+    # existing behavior/test is byte-for-byte unchanged, while HTTP — which has no
+    # child process to wait() on — generalizes to "block until the inbound pump
+    # finishes", which for HTTP only happens once `transport.close()` runs.
+    is_http = isinstance(transport, HttpTransport)
 
     # SIGTERM otherwise bypasses `finally` (default action exits immediately), orphaning
     # the child. Convert it to a clean SystemExit so cleanup runs. Only the main thread
@@ -657,7 +693,9 @@ def run_proxy(
                 # A terse.retrieve call is ours to answer from the drop store — the downstream
                 # server has no such tool. Write the reply straight back to the client and
                 # SWALLOW the request so it never reaches downstream (and never enters
-                # `pending`, since we don't call note_request for it).
+                # `pending`, since we don't call note_request for it). This never touches
+                # `transport` at all — retrieve is a pure client<->proxy exchange, which is
+                # exactly why it needed zero HTTP-specific reimplementation for #5.
                 if inter.policy.has_drop():
                     reply = inter.answer_retrieve(line)
                     if reply is not None:
@@ -668,33 +706,55 @@ def run_proxy(
                 inter.note_request(line)
                 return line  # forward request unchanged; only observe
             try:
-                pump(cin, proc.stdin, fwd)
+                pump(cin, transport.outbound(), fwd)
             finally:
-                try:
-                    proc.stdin.close()
-                except Exception:  # noqa: BLE001
-                    pass
+                if is_http:
+                    # HTTP has no persistent connection to half-close: client stdin EOF
+                    # IS the transport's end-of-life signal. Closing here (not only in
+                    # the outer `finally`) is what lets `server_to_client`'s
+                    # `pump(transport.inbound(), ...)` below ever terminate —
+                    # HttpTransport.inbound() is a queue.Queue iterator with no other
+                    # EOF condition (#5).
+                    transport.close()
+                else:
+                    # stdio: half-close only, exactly as before this refactor. Closing
+                    # the child's stdin signals EOF so it can flush any remaining reply
+                    # and exit on its own; `proc.wait()` below blocks for that real
+                    # exit, and the outer `finally`'s transport.close() (SIGTERM/SIGKILL
+                    # escalation via `_terminate_child`) stays the last-resort reaper.
+                    try:
+                        transport.outbound().close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
         def server_to_client() -> None:
-            pump(proc.stdout, cout, inter.transform_response, lock=out_lock)
+            pump(transport.inbound(), cout, inter.transform_response, lock=out_lock)
 
         t_up = Thread(target=client_to_server, daemon=True)
         t_down = Thread(target=server_to_client, daemon=True)
         t_up.start()
         t_down.start()
-        rc = proc.wait()
-        t_down.join(timeout=2.0)
+        if is_http:
+            # No child process to wait() on: block until the inbound pump thread itself
+            # finishes, which only happens once `transport.close()` runs (above, from
+            # client EOF) and drains the sentinel through HttpTransport.inbound()'s
+            # queue iterator. No fixed timeout — inbound EOF IS the completion signal.
+            t_down.join()
+            rc = 0
+        else:
+            rc = transport.proc.wait()
+            t_down.join(timeout=2.0)
         return rc
     finally:
         if installed_sigterm:
             # Ignore further SIGTERM while reaping: a second signal would otherwise
-            # re-enter the sys.exit(143) handler and unwind out of _terminate_child
+            # re-enter the sys.exit(143) handler and unwind out of transport.close()
             # before the SIGKILL escalation and the restore below ever run.
             try:
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)
             except (ValueError, OSError):
                 pass
-        _terminate_child(proc)
+        transport.close()
         if installed_sigterm:
             # Restore the prior disposition; SIG_DFL when it wasn't a Python-set handler
             # (getsignal returns None there), so we never leave our lambda installed.

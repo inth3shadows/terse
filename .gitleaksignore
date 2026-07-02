@@ -1,0 +1,2 @@
+# False positives only — verify before adding (fake test fixture data, not a real secret).
+tests/test_cli.py:generic-api-key:193
