@@ -79,6 +79,29 @@ def test_measure_cmd_without_html_flag_writes_no_html(tmp_path):
     assert not out.with_suffix(".html").exists()
 
 
+def test_measure_cmd_bars_flag_prints_terminal_bars(tmp_path, capsys):
+    f = _write(tmp_path, "payload.json", PAYLOAD)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "demo", "--corpus", str(corpus)]) == 0
+    out = tmp_path / "report.md"
+    rc = main(["measure", "--corpus", str(corpus), "--out", str(out), "--bars"])
+    assert rc == 0
+    text = capsys.readouterr().out
+    # the markdown report itself already prints a "Tier-0 savings by shape bucket"
+    # heading, so assert on content ONLY the bar renderer emits (block glyph + legend).
+    assert "█" in text
+    assert "minify" in text and "tabularize" in text and "dictionary" in text
+
+
+def test_measure_cmd_without_bars_flag_prints_no_terminal_bars(tmp_path, capsys):
+    f = _write(tmp_path, "payload.json", PAYLOAD)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "demo", "--corpus", str(corpus)]) == 0
+    out = tmp_path / "report.md"
+    assert main(["measure", "--corpus", str(corpus), "--out", str(out)]) == 0
+    assert "█" not in capsys.readouterr().out
+
+
 def test_measure_cmd_empty_corpus_errors(tmp_path):
     corpus = tmp_path / "corpus"
     corpus.mkdir()

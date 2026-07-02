@@ -180,6 +180,10 @@ markdown (e.g. `reports/verify-report.html`) — inline SVG bar/stacked-bar char
 zero JS, zero CDN, so it stays offline like everything else in terse. Every chart
 has a `<details>` table-view fallback underneath it.
 
+Add `--bars` to `measure` or `verify` for the same savings charts as unicode bars
+printed straight to the terminal — no new file, color only when stdout is a tty
+(honors `NO_COLOR`).
+
 ### Check that the model still understands the compressed output
 
 Saving tokens is pointless if the model reads the compressed form worse than raw JSON.
