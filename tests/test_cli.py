@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import io
 import json
+import stat
+import sys
 
-from terse.cli import main
+from terse.cli import _redact_args, main
 
 PAYLOAD = json.dumps([{"id": 1, "name": "alpha"}, {"id": 2, "name": "beta"}])
 
@@ -141,3 +143,44 @@ def test_install_then_uninstall_mcp_roundtrips_via_cli(tmp_path, monkeypatch):
     assert main(["uninstall-mcp", "demo"]) == 0
     restored = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]["demo"]
     assert restored == original_entry
+
+
+def test_redact_args_masks_two_arg_and_equals_form_secrets():
+    # --flag VALUE form: value is the NEXT arg.
+    assert _redact_args(["--api-key", "sk-live-abc123", "run"]) == \
+        ["--api-key", "***", "run"]
+    # --flag=VALUE form: value is embedded in the same arg.
+    assert _redact_args(["--token=sk-live-abc123", "run"]) == ["--token=***", "run"]
+    # Non-secret flags/values pass through untouched.
+    assert _redact_args(["demo-mcp", "--verbose"]) == ["demo-mcp", "--verbose"]
+
+
+def test_install_mcp_print_redacts_secret_in_args(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({
+        "mcpServers": {"demo": {"command": "uvx",
+                                "args": ["demo-mcp", "--api-key", "sk-live-SECRETVALUE"]}}
+    }), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    policy = _write(tmp_path, "policy.json", json.dumps({"rules": []}))
+
+    rc = main(["install-mcp", "demo", "--policy", str(policy), "--print"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "sk-live-SECRETVALUE" not in out
+    assert "--api-key ***" in out
+
+
+def test_fluency_cmd_keyless_pack_is_written_with_restricted_permissions(tmp_path):
+    f = _write(tmp_path, "payload.json", PAYLOAD)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "demo", "--corpus", str(corpus)]) == 0
+    pack = tmp_path / "fluency-pack.json"
+
+    rc = main(["fluency", "--corpus", str(corpus), "--pack", str(pack),
+              "--out", str(tmp_path / "fluency-report.md")])
+    assert rc == 0
+    assert pack.exists()
+    if sys.platform != "win32":
+        mode = stat.S_IMODE(pack.stat().st_mode)
+        assert mode == 0o600, f"pack file mode {oct(mode)} is not restricted to 0600"

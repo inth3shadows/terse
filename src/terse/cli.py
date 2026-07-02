@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
 import json as _json
 
 from . import transforms
+from ._secure_io import write_restricted
 from .capture import capture_payload, classify_shape, coverage, extract_records, load_corpus
 from .measure import cross_tokenizer_savings, measure_corpus
 from .probes import cross_call_overlap, value_redundancy
@@ -259,11 +261,14 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
 
     answerers = _build_answerers(args)
     if not answerers:
-        # Keyless default: write the eval pack and explain how to drive it.
+        # Keyless default: write the eval pack and explain how to drive it. The pack
+        # embeds each payload's RAW captured text (fluency.build_pack) — the same
+        # "may contain real data" class capture_payload protects at 0600 — so write it
+        # the same way, not via plain write_text.
         pack = fluency.build_pack(envelopes, trials=args.trials)
         out = Path(args.pack)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(_json.dumps(pack, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_restricted(out, _json.dumps(pack, ensure_ascii=False, indent=2))
         nq = sum(len(p["questions"]) for p in pack["payloads"])
         print(f"no model configured — wrote {nq} questions over {len(pack['payloads'])} "
               f"record-shaped payloads to {out}.")
@@ -279,10 +284,36 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
     return 0
 
 
+# MCP servers commonly carry credentials directly in `args` (not just `env`); before/
+# after command lines get printed unconditionally by install/uninstall-mcp, including
+# to shared/logged terminals, so a secret-shaped flag's value is masked either way it
+# appears: `--api-key VALUE` (two args) or `--api-key=VALUE` (one arg).
+_SECRET_FLAG = re.compile(r"^--?(api[-_]?key|token|secret|password|passwd|auth|credential)s?$",
+                          re.IGNORECASE)
+
+
+def _redact_args(args: list) -> list:
+    out = []
+    redact_next = False
+    for a in args:
+        if redact_next:
+            out.append("***")
+            redact_next = False
+            continue
+        flag = a.split("=", 1)[0]
+        if _SECRET_FLAG.match(flag):
+            out.append(f"{flag}=***" if "=" in a else a)
+            redact_next = "=" not in a
+            continue
+        out.append(a)
+    return out
+
+
 def _short_cmd(entry) -> str:
     if not entry:
         return "(absent)"
-    return " ".join([entry.get("command", "?"), *entry.get("args", [])])[:100]
+    args = _redact_args(entry.get("args", []))
+    return " ".join([entry.get("command", "?"), *args])[:100]
 
 
 def _cmd_install_mcp(args: argparse.Namespace) -> int:
