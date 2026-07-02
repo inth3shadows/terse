@@ -66,12 +66,17 @@ captured corpus proves the *savings on your workload* — terse's win is shape-d
 (large on record/symbol-shaped output, ~0% on already-compact or single-object tools),
 so the per-tool table is the number that matters for you.
 
-## 4. Confirm no egress, and read the fail-open path
+## 4. Confirm no UNEXPECTED egress, and read the fail-open path
 
 ```bash
-# the only network code is fluency.py (an explicit, opt-in model eval the proxy
-# never calls); the proxy is stdio-only and persists nothing
-grep -rnE "requests|urllib|socket" src/terse        # → only src/terse/fluency.py
+# real network code lives in three places: fluency.py and dropeval.py (each an
+# explicit, opt-in model eval) and transport.py (the proxy's own downstream
+# connection — silent for a stdio-only setup; for an HTTP/SSE downstream it
+# talks only to the target you configured, never a third party). The grep
+# below also flags a few incidental, non-networking hits elsewhere in the tree
+# (the word "requests" in a comment/docstring, not the library) — read the
+# actual matches yourself rather than trusting a file count.
+grep -rnE "requests|urllib|socket" src/terse
 ```
 
 Then read `src/terse/proxy.py` (~300 lines): every `tools/call` result is run through

@@ -5,6 +5,7 @@ import re
 
 from terse.terminal_report import (
     build_terminal_diff_report,
+    build_terminal_dropeval_report,
     build_terminal_fluency_report,
     build_terminal_report,
     diverging_bar_lines,
@@ -154,3 +155,18 @@ def test_build_terminal_fluency_report_excludes_broken_model():
     text = build_terminal_fluency_report({"good": rows_good, "broken": rows_broken}, color=False)
     assert "good" in text and "PASS" in text
     assert "excluded" in text and "broken" in text
+
+
+def test_build_terminal_dropeval_report_renders_three_metrics():
+    rows = [{"kind": "recall", "trials": 1, "retrieve_ok": 1, "answer_ok": 1, "handle_ok": 1}
+            for _ in range(10)] + [{"kind": "precision", "trials": 1, "retrieve_ok": 1,
+                                    "answer_ok": 1, "handle_ok": 1} for _ in range(10)]
+    text = build_terminal_dropeval_report({"m": rows}, color=False)
+    assert "retrieve-recall" in text
+    assert "no-overfetch" in text
+    assert "final-accuracy" in text
+    assert "PASS" in text and "FAIL" not in text
+
+
+def test_build_terminal_dropeval_report_empty():
+    assert "no data" in build_terminal_dropeval_report({}, color=False)

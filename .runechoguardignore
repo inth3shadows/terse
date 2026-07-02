@@ -14,6 +14,18 @@ field
 drop_sink
 answerer
 rule_for
+# cli.py's _build_answerers(args, make_openai, make_anthropic, ...) — the two answerer-
+# factory PARAMETERS, called bare (make_openai(base, key, m) / make_anthropic(model)).
+# Same false-positive class as drop_sink/answerer/rule_for above.
+make_openai
+make_anthropic
+# Also mis-flagged: a local variable holding a function REFERENCE, called bare in a
+# monkeypatch wrapper (`real = mod.fn; def wrapper(*a): return real(*a)`), same
+# root cause as the callback-parameter case above — the guard resolves module
+# symbols/imports, not locals. Confirmed correct: pytest passes with these wrappers.
+real_apply
+real
+orig_send
 # Also mis-flagged: plain English words inside a docstring that happen to look like
 # `word(...)` bare calls to the guard's pattern match (e.g. "the client's stdin",
 # "server->client", "closes the transport in turn"). Not code at all.
@@ -27,6 +39,13 @@ measurement
 one
 unconditionally
 flight
+rows
+inner
+built
+wide
+name
+callers
+detail
 # Also mis-flagged: importlib.metadata.version, imported locally inside
 # _attestation_card (html_report.py) the same way report.py's build_verify_header
 # already does — same hunk-splitting false positive as the stdlib symbols above.

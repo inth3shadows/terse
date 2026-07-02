@@ -32,6 +32,15 @@ from . import transforms
 VALID_TIERS = ("minify", "tabularize", "dictionary")
 LOSSY_MODES = ("truncate", "drop-to-retrieve")  # implemented; summarize is still deferred
 
+# multiproxy's peer-qualifier separator (e.g. "gh__search" for peer "gh"'s "search"
+# tool). Defined here, not in multiproxy.py, so Policy.select can recognize and strip
+# it: a corpus captured through multiproxy stores each payload under its peer-qualified
+# name (to keep same-named tools on different peers from colliding in the corpus), but
+# a policy rule is authored against the downstream tool's own bare name — without this,
+# every rule silently misses for a multiproxy-captured corpus (fnmatch("gh__search",
+# "search") is False), and drop-eval/measure would score it as having nothing to test.
+PREFIX_SEP = "__"
+
 
 @dataclass
 class Rule:
@@ -60,11 +69,23 @@ class Policy:
     diff_keyframe_interval: int = 5
 
     def select(self, tool: str) -> Rule:
-        """First rule whose glob matches the tool name, else the lossless default."""
-        for rule in self.rules:
-            if fnmatch.fnmatch(tool, rule.tool_glob):
-                return rule
+        """First rule whose glob matches the tool name, else the lossless default.
+
+        Tries `tool` as given first, then — if it's a multiproxy peer-qualified name
+        (contains PREFIX_SEP) — the bare part after the separator, so a rule authored
+        for a downstream tool's own name still matches a multiproxy-captured corpus
+        entry for it. A single-proxy `tool` (no PREFIX_SEP) is unaffected."""
+        for candidate in self._match_candidates(tool):
+            for rule in self.rules:
+                if fnmatch.fnmatch(candidate, rule.tool_glob):
+                    return rule
         return Rule(tool_glob="*", tiers=self.default_tiers)
+
+    @staticmethod
+    def _match_candidates(tool: str) -> list[str]:
+        if PREFIX_SEP in tool:
+            return [tool, tool.partition(PREFIX_SEP)[2]]
+        return [tool]
 
     def has_drop(self) -> bool:
         """True if any rule marks a field drop-to-retrieve. Gates whether the proxy injects

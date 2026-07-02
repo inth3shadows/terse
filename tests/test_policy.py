@@ -30,6 +30,23 @@ def test_select_first_match_wins_else_default():
     assert p.select("unknown.tool").tiers == ("minify", "tabularize", "dictionary")
 
 
+def test_select_falls_back_to_bare_name_for_multiproxy_peer_qualified_tool():
+    # Regression: a corpus captured through multiproxy stores each payload under a
+    # peer-qualified name (e.g. "gh__gh.api.repos") to avoid same-named-tool
+    # collisions across peers, but a policy rule is authored against the downstream
+    # tool's own bare name — select() must still find it, not silently fall through
+    # to the lossless default (which made fluency --drop-eval report zero signal for
+    # any multiproxy-captured corpus).
+    p = _policy()
+    assert p.select("gh__gh.api.repos").tiers == ("minify", "tabularize", "dictionary")
+    assert p.select("gh__kb.read.search").tiers == ("minify", "tabularize")
+    # a rule authored for the QUALIFIED name still wins outright when one exists
+    qualified = Policy(rules=[Rule(tool_glob="gh__special.*", tiers=())])
+    assert qualified.select("gh__special.tool").tiers == ()
+    # single-proxy corpora (no "__") are completely unaffected
+    assert p.select("unknown.tool").tiers == ("minify", "tabularize", "dictionary")
+
+
 def test_apply_is_lossless_for_every_tier_combo():
     p = _policy()
     for tool in ("gh.api.repos", "kb.read.search", "totally.unknown"):
