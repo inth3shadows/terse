@@ -217,6 +217,36 @@ def test_install_mcp_print_redacts_secret_in_args(tmp_path, monkeypatch, capsys)
     assert "--api-key ***" in out
 
 
+def test_fluency_cmd_bars_flag_prints_forest_plot(tmp_path, capsys):
+    f = _write(tmp_path, "payload.json", PAYLOAD)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "demo", "--corpus", str(corpus)]) == 0
+    pack_path = tmp_path / "fluency-pack.json"
+    assert main(["fluency", "--corpus", str(corpus), "--pack", str(pack_path),
+                "--out", str(tmp_path / "fluency-report.md")]) == 0
+    capsys.readouterr()  # discard the pack-writing message
+
+    pack = json.loads(pack_path.read_text(encoding="utf-8"))
+
+    def gt(q):
+        return json.dumps(q["expected"]) if q["qtype"] == "enumerate" else str(q["expected"])
+
+    responses = {"perfect-model": {
+        p["sha"]: {q["qid"]: {"raw": gt(q), "terse": gt(q), "primer": gt(q)}
+                   for q in p["questions"]}
+        for p in pack["payloads"]
+    }}
+    responses_path = _write(tmp_path, "responses.json", json.dumps(responses))
+
+    rc = main(["fluency", "--corpus", str(corpus), "--pack", str(pack_path),
+              "--responses", str(responses_path), "--out", str(tmp_path / "fluency-report.md"),
+              "--bars"])
+    assert rc == 0
+    text = capsys.readouterr().out
+    assert "PASS" in text
+    assert "perfect-model" in text
+
+
 def test_fluency_cmd_keyless_pack_is_written_with_restricted_permissions(tmp_path):
     f = _write(tmp_path, "payload.json", PAYLOAD)
     corpus = tmp_path / "corpus"

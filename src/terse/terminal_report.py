@@ -15,11 +15,12 @@ import os
 import sys
 from typing import Any
 
-from .report import _sum
+from .report import _GAP_TOLERANCE, _ci, _sum, diff_gap_rows, fluency_gap_rows
 
 _BAR_WIDTH = 24
 _BLOCK = "█"
 _NEG_BLOCK = "▒"  # distinct glyph so a negative segment reads as an anomaly even without color
+_TRACK_WIDTH = 32
 
 
 def _color_enabled(stream: Any = None) -> bool:
@@ -124,3 +125,74 @@ def build_terminal_report(rows: list[dict[str, Any]], color: bool | None = None)
         stacked_bar_lines(tier_items, ("minify", "tabularize", "dictionary"), color=color),
     ]
     return "\n".join(out)
+
+
+def _track(acc: float, ci: float, marker: str) -> str:
+    """Fixed-width `_TRACK_WIDTH`+1 char track: '·' background, '─' whisker span over
+    the 95% CI, `marker` at the point estimate. Built and clamped BEFORE any coloring
+    is applied — see diverging_bar_lines for why that order matters."""
+    lo = max(acc - ci, 0.0)
+    hi = min(acc + ci, 1.0)
+    lo_col = round(lo * _TRACK_WIDTH)
+    hi_col = max(round(hi * _TRACK_WIDTH), lo_col)
+    m_col = min(max(round(acc * _TRACK_WIDTH), 0), _TRACK_WIDTH)
+    chars = ["·"] * (_TRACK_WIDTH + 1)
+    for i in range(lo_col, hi_col + 1):
+        if 0 <= i <= _TRACK_WIDTH:
+            chars[i] = "─"
+    chars[m_col] = marker
+    return "".join(chars)
+
+
+def forest_bar_lines(rows: list[dict[str, Any]], form_label: str, control_label: str,
+                      color: bool | None = None) -> str:
+    """Two-line-per-model forest plot: a 0%-100% track per series (point + 95% CI
+    whisker), plus a pass/fail badge on the form-series line. `rows`: dicts with
+    model/form_acc/form_ci/control_acc/control_ci/passed — same shape as
+    html_report.forest_plot's input, so the two stay easy to keep in sync."""
+    if not rows:
+        return "  (no data)"
+    enabled = _color_enabled() if color is None else color
+    label_w = min(max((len(r["model"]) for r in rows), default=0), 24)
+    scale = "0%" + "·" * (_TRACK_WIDTH + 1 - len("0%") - len("100%")) + "100%"
+    lines = [f"  {'':<{label_w}}  ○ {control_label}   ● {form_label}   {scale}"]
+    for r in rows:
+        badge = "PASS" if r["passed"] else "FAIL"
+        badge_sgr = "32" if r["passed"] else "31"
+        c_track = _c("36", _track(r["control_acc"], r["control_ci"], "○"), enabled)
+        f_track = _c("35", _track(r["form_acc"], r["form_ci"], "●"), enabled)
+        lines.append(f"  {r['model'][:label_w]:<{label_w}}  {c_track}")
+        lines.append(f"  {'':<{label_w}}  {f_track}  {_c(badge_sgr, badge, enabled)}")
+    return "\n".join(lines)
+
+
+def build_terminal_diff_report(results: dict, form_label: str = "diff-form",
+                                control_label: str = "full-terse",
+                                color: bool | None = None) -> str:
+    """Terminal counterpart to report.build_diff_report's verdict section — a forest
+    plot of per-model accuracy with 95% CI, gated on the worst model."""
+    gap_rows = diff_gap_rows(results)
+    plot_rows = []
+    for model, (facc, fse, cacc, cse) in gap_rows.items():
+        gap = facc - cacc
+        passed = gap >= -_GAP_TOLERANCE - 1e-9
+        plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
+                           "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
+    return forest_bar_lines(plot_rows, form_label, control_label, color=color)
+
+
+def build_terminal_fluency_report(results: dict, color: bool | None = None) -> str:
+    """Terminal counterpart to report.build_fluency_report's verdict section — a forest
+    plot of best-terse-form vs raw accuracy per model, gated on the worst model. Models
+    whose raw control failed (backend/config error) are excluded, same as the markdown."""
+    gap_rows, broken = fluency_gap_rows(results)
+    plot_rows = []
+    for model, (facc, fse, cacc, cse) in gap_rows.items():
+        gap = facc - cacc
+        passed = gap >= -_GAP_TOLERANCE - 1e-9
+        plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
+                           "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
+    text = forest_bar_lines(plot_rows, "best terse-form", "raw", color=color)
+    if broken:
+        text += f"\n  (excluded — raw control failed: {', '.join(broken)})"
+    return text
