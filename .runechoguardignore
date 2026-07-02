@@ -25,6 +25,7 @@ make_anthropic
 # symbols/imports, not locals. Confirmed correct: pytest passes with these wrappers.
 real_apply
 real
+orig_send
 # Also mis-flagged: plain English words inside a docstring that happen to look like
 # `word(...)` bare calls to the guard's pattern match (e.g. "the client's stdin",
 # "server->client", "closes the transport in turn"). Not code at all.

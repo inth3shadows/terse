@@ -39,6 +39,7 @@ import json
 import queue
 import sys
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,11 +61,10 @@ from .proxy import (
 )
 from .transport import Transport, build_transport
 
-# Tool-name prefix separator. Double underscore, not a dot: MCP/OpenAI function names
-# are commonly constrained to `^[a-zA-Z0-9_-]+$`, and a real downstream tool name can
-# already contain a dot (e.g. `gh.api.items`) — `.` as a separator would be ambiguous
-# to split back apart, `__` isn't.
-PREFIX_SEP = "__"
+# Tool-name prefix separator — defined in policy.py (not here) so Policy.select can
+# recognize and strip it when matching a captured, peer-qualified corpus tool name
+# against a rule authored for the downstream tool's own bare name.
+PREFIX_SEP = policy_mod.PREFIX_SEP
 
 # How long a broadcast (initialize/tools/list) waits for every peer before merging
 # whatever arrived and moving on. Module-level so a test can shrink it (a dead-peer
@@ -90,12 +90,20 @@ _LOCAL_ID_MAP_MAX = 4096
 # unboundedly — an evicted entry just means that particular late reply is dropped.
 _SERVER_REQ_MAX = 1024
 
-# Bound on `Router._routed_timed_out`, same eviction reasoning as _LOCAL_ID_MAP_MAX:
-# once a routed tools/call has timed out and been answered, its id is remembered only
-# long enough to swallow the peer's late real reply instead of double-answering the
-# client — an evicted entry just means an extremely late reply falls through to the
-# normal path instead (harmless: the client already has its timeout error).
-_ROUTED_TIMED_OUT_MAX = 4096
+# Bound on `Router._routed_timed_out`. UNLIKE `_local_id_map`'s eviction (harmless: a
+# broadcast-local id is namespaced, so an evicted-then-late reply just fails to match
+# anything and is dropped), a routed call's id is the CLIENT'S OWN live id — an
+# evicted-then-late reply looks exactly like a real second answer and WOULD be
+# delivered to the client, double-answering it. `_timeout_routed_call` now ages entries
+# out primarily by TIME (`Router._routed_timed_out_ttl`, a multiple of
+# `broadcast_timeout`), not population count: an id is dropped once it's old enough
+# that its peer's reply is essentially never coming. A plain OrderedDict is still
+# FIFO-ordered by insertion time, so a population cap alone would evict in the SAME
+# oldest-first order age-based eviction does — the fix here is sizing `_MAX` large
+# enough (not 4096) that a realistic burst of concurrent timeouts during a peer stall
+# never forces population-based eviction to remove something still younger than the
+# TTL; `_MAX` remains only as a backstop against truly pathological/unbounded growth.
+_ROUTED_TIMED_OUT_MAX = 65536
 
 
 @dataclass
@@ -320,9 +328,12 @@ class Router:
         # the race to pop an entry (the real reply in from_peer, or _timeout_routed_call
         # firing) is the one that answers the client; the loser does nothing.
         self._routed_timers: dict[Any, threading.Timer] = {}
-        # ids whose routed call already got a synthesized timeout reply — the peer's
-        # eventual real (late) reply must be swallowed here, not double-delivered.
-        self._routed_timed_out: "OrderedDict[Any, None]" = OrderedDict()
+        # ids whose routed call already got a synthesized timeout reply, mapped to the
+        # monotonic time that happened — the peer's eventual real (late) reply must be
+        # swallowed here, not double-delivered. Aged out by `_routed_timed_out_ttl`, not
+        # by population count (see `_ROUTED_TIMED_OUT_MAX`'s comment above).
+        self._routed_timed_out: "OrderedDict[Any, float]" = OrderedDict()
+        self._routed_timed_out_ttl = broadcast_timeout * 4
 
     # ---------- client -> server ----------
 
@@ -418,16 +429,27 @@ class Router:
                 # tools into one corpus bucket, even though the wire line sent to the
                 # downstream uses the bare name it actually expects.
                 self.peers[idx].inter.note_request(rewritten_line, tool_name=name)
-                self._write_peer(idx, rewritten_line)
                 if mid is not None:
                     # Bound the wait — a hung/dead peer must not wedge this call
                     # forever, matching _broadcast's BROADCAST_TIMEOUT guarantee.
+                    # Registered BEFORE the peer write below (mirroring _broadcast's own
+                    # bookkeeping-then-send order): a peer fast enough to reply before
+                    # this line ran would otherwise race from_peer's pop against this
+                    # registration, leaving an orphaned timer that later fires a
+                    # spurious timeout at a client who already got the real answer.
+                    # Cancel-and-replace any prior timer for this id the same way
+                    # _broadcast's _active_seq handling does, in case a client reuses an
+                    # id (a protocol violation, but one worth failing safe against).
                     timer = threading.Timer(self.broadcast_timeout,
                                             self._timeout_routed_call, args=(mid, idx))
                     timer.daemon = True
                     with self._pending_lock:
+                        prior = self._routed_timers.pop(mid, None)
+                        if prior is not None:
+                            prior.cancel()
                         self._routed_timers[mid] = timer
                     timer.start()
+                self._write_peer(idx, rewritten_line)
                 return
 
         # Unknown peer prefix (or no prefix at all) — a legible JSON-RPC error, not a
@@ -532,6 +554,19 @@ class Router:
             if isinstance(msg, dict) and msg.get("id") is not None:
                 if self._maybe_collect(peer_idx, msg):
                     return SWALLOW  # a broadcast-local-id reply: never forwarded as-is
+                if (msg.get("method") is not None
+                        and "result" not in msg and "error" not in msg):
+                    # A server-initiated request FROM this peer (sampling/createMessage,
+                    # roots, ...) expecting a client reply: rewrite its id so the reply
+                    # can be routed back to THIS peer specifically (see
+                    # _rewrite_server_request / route_client_line's method-is-None
+                    # branch), instead of the prior v1 gap where it was forwarded
+                    # verbatim and any reply defaulted to peer 0. Checked BEFORE
+                    # `_routed_timers` below: a peer's own request id is unnamespaced and
+                    # drawn from the same space a client's routed-call id lives in, so
+                    # treating it as a possible routed-call reply first could pop/cancel
+                    # an unrelated in-flight call's timeout purely on id coincidence.
+                    return self._rewrite_server_request(peer_idx, msg)
                 mid = msg["id"]
                 with self._pending_lock:
                     timer = self._routed_timers.pop(mid, None)
@@ -545,15 +580,6 @@ class Router:
                     # the peer's late real reply arriving after the fact; swallow it
                     # rather than double-answering.
                     return SWALLOW
-                if (msg.get("method") is not None
-                        and "result" not in msg and "error" not in msg):
-                    # A server-initiated request FROM this peer (sampling/createMessage,
-                    # roots, ...) expecting a client reply: rewrite its id so the reply
-                    # can be routed back to THIS peer specifically (see
-                    # _rewrite_server_request / route_client_line's method-is-None
-                    # branch), instead of the prior v1 gap where it was forwarded
-                    # verbatim and any reply defaulted to peer 0.
-                    return self._rewrite_server_request(peer_idx, msg)
             # A normal routed response (or the v1 forward-to-peer-0 passthrough): run it
             # through THIS peer's own Interceptor so its per-peer diff/drop/compress
             # state applies correctly. `note_request` was told the REWRITTEN/bare tool
@@ -621,6 +647,18 @@ class Router:
         for timer in timers:
             timer.join(timeout=self.broadcast_timeout + 1.0)
 
+    def drain_routed_calls(self) -> None:
+        """The routed-call counterpart to `drain_pending_broadcasts`: block until every
+        in-flight routed `tools/call` has either replied or hit its own timeout, instead
+        of having its still-pending `Timer` torn down mid-wait by shutdown. Without this,
+        a client that disconnects right after issuing a routed call to a slow/dead peer
+        would get an abruptly severed connection instead of the timeout error
+        `_timeout_routed_call` is meant to guarantee."""
+        with self._pending_lock:
+            timers = list(self._routed_timers.values())
+        for timer in timers:
+            timer.join(timeout=self.broadcast_timeout + 1.0)
+
     def _timeout_broadcast(self, seq: int) -> None:
         with self._pending_lock:
             pb = self._pending.get(seq)
@@ -646,7 +684,17 @@ class Router:
             timer = self._routed_timers.pop(mid, None)
             if timer is None:
                 return  # the real reply already arrived and cancelled this timer
-            self._routed_timed_out[mid] = None
+            now = time.monotonic()
+            self._routed_timed_out[mid] = now
+            # Age out first (see _ROUTED_TIMED_OUT_MAX's comment): a burst of unrelated
+            # timeouts must not evict an id that's still plausibly awaiting its own
+            # peer's very late reply just because it happens to be the oldest entry.
+            while self._routed_timed_out:
+                oldest_mid, inserted_at = next(iter(self._routed_timed_out.items()))
+                if now - inserted_at <= self._routed_timed_out_ttl:
+                    break
+                del self._routed_timed_out[oldest_mid]
+            # Population cap as a backstop against pathological unbounded growth.
             while len(self._routed_timed_out) > _ROUTED_TIMED_OUT_MAX:
                 self._routed_timed_out.popitem(last=False)
         peer_name = self.peers[peer_idx].name if 0 <= peer_idx < len(self.peers) else "?"
@@ -863,8 +911,10 @@ def run_multi_proxy(
 
         # A client that disconnects the instant after e.g. `initialize` — before any
         # peer answered — must still get its merged reply; wait out any broadcast still
-        # in flight (bounded by its own timeout) before tearing peers down.
+        # in flight (bounded by its own timeout) before tearing peers down. Same
+        # reasoning for a still-in-flight routed tools/call.
         router.drain_pending_broadcasts()
+        router.drain_routed_calls()
 
         # Stop every peer's background sender BEFORE closing any transport below —
         # otherwise a sender thread could still be mid-write to a transport that's

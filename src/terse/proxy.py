@@ -190,6 +190,17 @@ class Interceptor:
         # PRIVATE `_local_lock`) no longer serializes every other peer's response
         # processing behind it — only the brief drop-store dict mutation does, and that
         # happens on the order of microseconds, not a full compress/capture/audit pass.
+        #
+        # INVARIANT (read this before adding a new lock-acquiring method to this class):
+        # whenever a method needs BOTH locks, it must acquire `_local_lock` OUTER and
+        # `_store_lock` INNER, never the reverse — a method that acquires `_store_lock`
+        # first and then something needing `_local_lock` (directly, or by calling back
+        # into another method of this class) creates a lock-order cycle with any method
+        # that already does local-then-store, which can deadlock under concurrent
+        # multi-peer load. This is enforced only by this comment, not by the type system
+        # or a runtime check — `answer_retrieve` already acquires `_store_lock` alone
+        # with no nesting, so a future method extending that pattern must not also reach
+        # for `_local_lock` while still holding `_store_lock`.
         self._store_lock = store_lock if store_lock is not None else Lock()
 
     def note_request(self, line: str, *, tool_name: Optional[str] = None) -> None:

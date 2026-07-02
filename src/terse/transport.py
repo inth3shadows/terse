@@ -157,6 +157,22 @@ def _iter_sse(body: str) -> Iterator[str]:
         yield "\n".join(data_lines)
 
 
+def _parse_request_id(line: str) -> tuple[bool, Any]:
+    """Parse `line` (an outgoing JSON-RPC request) once: whether it carries an `"id"`
+    key at all (a notification has none and per JSON-RPC must never get a reply) and
+    that id's value. Shared by every HttpTransport error/reply path so each parses the
+    outgoing line only once. If `line` isn't valid JSON (shouldn't happen — it came
+    from the client through `note_request`/`pump` unchanged), fails toward "has an id"
+    so the caller reports the error rather than silently dropping it."""
+    try:
+        parsed = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return True, None
+    if not isinstance(parsed, dict):
+        return True, None
+    return "id" in parsed, parsed.get("id")
+
+
 class HttpTransport:
     """A downstream MCP server reached over MCP's Streamable HTTP transport
     (#5): the client POSTs one JSON-RPC line per call; the server replies with
@@ -253,7 +269,13 @@ class HttpTransport:
                 except (json.JSONDecodeError, ValueError):
                     parsed = None
                 if isinstance(parsed, dict) and "jsonrpc" in parsed:
-                    self._q.put(raw_body)
+                    # Forward it verbatim ONLY if the outgoing line actually expected a
+                    # reply — a notification (no "id") must never get one, the same
+                    # invariant _maybe_enqueue_error enforces for a non-JSON-RPC-shaped
+                    # error body just below.
+                    has_id, _ = _parse_request_id(line)
+                    if has_id:
+                        self._q.put(raw_body)
                     return
             detail = raw_body.strip() or str(exc)
             self._maybe_enqueue_error(
@@ -281,32 +303,17 @@ class HttpTransport:
         unless `line` is a notification (has no `"id"` key at all), which per
         JSON-RPC never gets a reply. Enqueuing one anyway would hand the client an
         unsolicited `id: null` message matching no request it sent, which a strict
-        client could reject or misinterpret as an unmatched response. If `line`
-        isn't valid JSON (shouldn't happen — it came from the client through
-        `note_request`/`pump` unchanged), fail toward reporting the error rather
-        than silently dropping it, since we can't tell whether a reply was expected."""
-        try:
-            parsed = json.loads(line)
-            has_id = isinstance(parsed, dict) and "id" in parsed
-        except (json.JSONDecodeError, ValueError):
-            has_id = True
+        client could reject or misinterpret as an unmatched response."""
+        has_id, mid = _parse_request_id(line)
         if not has_id:
             return
-        self._q.put(self._error_reply(line, message))
+        self._q.put(self._error_reply(mid, message))
 
-    def _error_reply(self, line: str, message: str) -> str:
-        """A JSON-RPC 2.0 error object for the request id parsed out of the
-        outgoing `line`, so the client's matching in-flight call gets a legible
-        failure instead of silence. Only called via `_maybe_enqueue_error`, which
-        already confirmed `line` carries an id (or couldn't tell) — best-effort
-        re-parse here just extracts that same id."""
-        mid = None
-        try:
-            parsed = json.loads(line)
-            if isinstance(parsed, dict):
-                mid = parsed.get("id")
-        except (json.JSONDecodeError, ValueError):
-            pass
+    @staticmethod
+    def _error_reply(mid: Any, message: str) -> str:
+        """A JSON-RPC 2.0 error object for `mid` (the outgoing line's own request id),
+        so the client's matching in-flight call gets a legible failure instead of
+        silence. Callers already resolved `mid` via `_parse_request_id`."""
         return json.dumps(
             {"jsonrpc": "2.0", "id": mid, "error": {"code": -32000, "message": message}},
             separators=(",", ":"), ensure_ascii=False,

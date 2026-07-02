@@ -290,6 +290,22 @@ def test_http_failure_on_notification_produces_no_reply():
     assert lines == []  # nothing forwarded — a notification never gets a reply
 
 
+def test_http_failure_on_notification_with_jsonrpc_error_body_produces_no_reply():
+    # Regression: the "forward the downstream's real JSON-RPC error verbatim" branch
+    # (added alongside test_http_failure_forwards_real_jsonrpc_error_verbatim above)
+    # had no has-id check at all, unlike the fail500/_maybe_enqueue_error path just
+    # above — a downstream returning a well-formed JSON-RPC error object in response to
+    # a NOTIFICATION would still get forwarded verbatim, violating the exact
+    # no-reply-to-a-notification invariant the other two tests already pin.
+    notification = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
+    cin, cout = io.StringIO(notification), io.StringIO()
+    with _fake_server(mode="fail_jsonrpc") as srv:
+        rc = run_proxy([_url(srv)], FULL, stdin=cin, stdout=cout)
+    assert rc == 0
+    lines = [ln for ln in cout.getvalue().splitlines() if ln.strip()]
+    assert lines == []  # nothing forwarded — a notification never gets a reply
+
+
 # --- 5: stdio_transport_error no longer rejects a URL (see also test_proxy.py) ---
 
 def test_stdio_transport_error_accepts_a_url():
