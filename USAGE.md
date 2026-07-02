@@ -207,6 +207,15 @@ markdown reports:
 - `uv run terse fluency` — the one that matters for the proxy: does a model *read* the
   compressed form as accurately as raw JSON? (see below.)
 
+Add `--html` to `measure` or `verify` for a charted companion report next to the
+markdown (e.g. `reports/verify-report.html`) — inline SVG bar/stacked-bar charts,
+zero JS, zero CDN, so it stays offline like everything else in terse. Every chart
+has a `<details>` table-view fallback underneath it.
+
+Add `--bars` to `measure` or `verify` for the same savings charts as unicode bars
+printed straight to the terminal — no new file, color only when stdout is a tty
+(honors `NO_COLOR`). `fluency` also has a `--bars` flag — see below.
+
 ### Check that the model still understands the compressed output
 
 Saving tokens is pointless if the model reads the compressed form worse than raw JSON.
@@ -238,6 +247,10 @@ PASS/FAIL gated on the *worst* model. A model that scores 0% on raw JSON is a se
 error (wrong model id, no key) and is excluded from the verdict, not counted as a
 comprehension failure. `--trials N` repeats each question N times and reports each
 accuracy with a `±` 95% bound, so the verdict is a tight bound rather than directional.
+
+Add `--bars` for the same verdict as a terminal forest plot — a point + 95% CI track
+per model (best terse-form vs raw, or diff-form vs full-terse under `--diff`) with a
+pass/fail badge, printed straight to the terminal.
 
 ### Does the model actually use `terse.retrieve`? (`fluency --drop-eval`)
 

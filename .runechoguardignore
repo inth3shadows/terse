@@ -27,3 +27,8 @@ measurement
 one
 unconditionally
 flight
+# Also mis-flagged: importlib.metadata.version, imported locally inside
+# _attestation_card (html_report.py) the same way report.py's build_verify_header
+# already does — same hunk-splitting false positive as the stdlib symbols above.
+# Confirmed resolving correctly: `terse verify --html` prints the real version.
+version

@@ -85,6 +85,41 @@ def _format_worst_case_line(verdict: GapVerdict, tol: float, form_label: str, co
             f"at {tol:.0%} tolerance.")
 
 
+def diff_gap_rows(results: dict) -> dict[str, tuple[float, float, float, float]]:
+    """(form=diff_ok, control=terse_ok) gap-row tuples per model — the same shape
+    `_worst_case_gap` and the bar-chart renderers (html/terminal) consume, computed
+    once here so a chart's gap can never read differently than build_diff_report's."""
+    out: dict[str, tuple[float, float, float, float]] = {}
+    for model, rows in results.items():
+        if not rows:
+            continue
+        facc, fse = _form_stats(rows, "diff_ok")
+        cacc, cse = _form_stats(rows, "terse_ok")
+        out[model] = (facc, fse, cacc, cse)
+    return out
+
+
+def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, float]], list[str]]:
+    """(form=best of terse/primer, control=raw) gap-row tuples per model, for the bar-
+    chart renderers. Excludes any model whose raw control failed (0% — a backend/config
+    error, not a comprehension result), matching build_fluency_report's gate. Returns
+    (gap_rows, excluded_model_names)."""
+    out: dict[str, tuple[float, float, float, float]] = {}
+    broken: list[str] = []
+    for model, rows in results.items():
+        if not rows:
+            continue
+        racc, rse = _form_stats(rows, "raw_ok")
+        if racc == 0:
+            broken.append(model)
+            continue
+        tacc, tse = _form_stats(rows, "terse_ok")
+        pacc, pse = _form_stats(rows, "primer_ok")
+        best, best_se = (tacc, tse) if tacc >= pacc else (pacc, pse)
+        out[model] = (best, best_se, racc, rse)
+    return out, broken
+
+
 def _pct(saved: int, base: int) -> str:
     return f"{(saved / base * 100):+.1f}%" if base else "n/a"
 

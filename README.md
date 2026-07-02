@@ -90,6 +90,7 @@ src/terse/
   fluency.py     does a model read the compressed form as accurately as raw JSON?
   tokenize.py    cl100k / o200k token counting (+ optional Anthropic)
   report.py      markdown reports (savings, per-tool, probes, tokenizer, fluency)
+  html_report.py charted HTML companion (inline SVG, no JS/CDN) for measure/verify
   cli.py         entrypoint: gate / capture / measure / probe / validate / compress / proxy / fluency
 scripts/
   gen_stress_corpus.py  synthetic stress corpus for the fluency eval
@@ -107,6 +108,7 @@ report (lossless gate + per-tool token savings) in one command:
 ```bash
 terse verify --out reports/verify-report.md          # bundled sample, zero setup
 terse verify --corpus corpus --out report.md         # your own captured traffic
+terse verify --html --out reports/verify-report.md   # + a charted HTML report alongside it
 ```
 
 ## Related Documentation

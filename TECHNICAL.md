@@ -81,6 +81,25 @@ raw tool output (JSON text)
 - **`report.py`** — markdown renderers: `build_report` (savings by shape + per-tool +
   tier attribution + coverage + gate banner), `build_probe_report`,
   `build_tokenizer_report`.
+- **`html_report.py`** — `build_html_report`'s charted HTML counterpart to
+  `build_report`: inline-SVG diverging bars (savings), stacked bars (tier
+  attribution), and a forest plot (`forest_plot`, per-model accuracy + 95% CI,
+  reserved for a future `fluency --diff --html`). Pure stdlib string templates —
+  no JS, no CDN, no new dependency — reuses `report.py`'s `_form_stats` /
+  `_worst_case_gap` so the verdict never diverges from the markdown. Wired via
+  `--html` on `measure`/`verify` (writes next to `--out`, same basename, `.html`
+  suffix).
+- **`terminal_report.py`** — zero-new-artifact bar-chart counterpart to `report.py`'s
+  markdown. `build_terminal_report` covers `build_report`'s savings-by-shape /
+  savings-by-tool / tier-attribution sections (gate/coverage stay markdown-only —
+  already glance-readable as text). `build_terminal_diff_report` /
+  `build_terminal_fluency_report` render a two-line-per-model forest plot (point + 95%
+  CI whisker track, pass/fail badge) for `build_diff_report`'s / `build_fluency_report`'s
+  verdict sections, fed by `report.py`'s `diff_gap_rows`/`fluency_gap_rows` so the gap a
+  chart shows can never diverge from the markdown's gate. Unicode glyphs always print;
+  ANSI color only when stdout is a tty and `NO_COLOR` is unset (piped/CI output keeps
+  the shape of the win, just uncolored). Wired via `--bars` on `measure`/`verify`/
+  `fluency`, printed straight to the terminal (nothing written to disk).
 - **`cli.py`** — argparse dispatch for the six subcommands.
 
 ## API Integrations

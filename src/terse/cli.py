@@ -26,7 +26,9 @@ from ._secure_io import write_restricted
 from .capture import capture_payload, classify_shape, coverage, extract_records, load_corpus
 from .measure import cross_tokenizer_savings, measure_corpus
 from .probes import cross_call_overlap, value_redundancy
+from .html_report import build_html_report
 from .report import build_probe_report, build_report, build_tokenizer_report
+from .terminal_report import build_terminal_report
 from .tokenize import count_cl100k
 
 DEFAULT_CORPUS = "corpus"
@@ -68,12 +70,17 @@ def _cmd_measure(args: argparse.Namespace) -> int:
         print(f"no payloads in {args.corpus}/ — capture some first (`terse capture`).")
         return 1
     rows = measure_corpus(envelopes, use_anthropic=args.anthropic)
-    report = build_report(rows, coverage(envelopes))
+    cov = coverage(envelopes)
+    report = build_report(rows, cov)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report, encoding="utf-8")
     print(report)
     print(f"\n[report written to {out}]")
+    if args.html:
+        _write_html_report(build_html_report(rows, cov), out)
+    if args.bars:
+        print("\n" + build_terminal_report(rows))
     return 0
 
 
@@ -317,6 +324,7 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
     from . import dropeval, fluency
     from .policy import default_policy, load_policy
     from .report import build_diff_report, build_dropeval_report, build_fluency_report
+    from .terminal_report import build_terminal_diff_report, build_terminal_fluency_report
 
     envelopes = load_corpus(args.corpus)
     if not envelopes:
@@ -352,6 +360,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             return 1
         results = fluency.run_diff_fluency(envelopes, answerers, trials=args.trials)
         _write_report(build_diff_report(results), args.out)
+        if args.bars:
+            print("\n" + build_terminal_diff_report(results))
         return 0
 
     # Score mode: an externally-collected responses file against a previously-written pack.
@@ -361,6 +371,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         results = fluency.score_pack(pack, responses)
         report = build_fluency_report(results, fluency.token_summary(envelopes))
         _write_report(report, args.out)
+        if args.bars:
+            print("\n" + build_terminal_fluency_report(results))
         return 0
 
     answerers = _build_answerers(args)
@@ -385,6 +397,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
     results = fluency.run_fluency(envelopes, answerers, trials=args.trials)
     report = build_fluency_report(results, fluency.token_summary(envelopes))
     _write_report(report, args.out)
+    if args.bars:
+        print("\n" + build_terminal_fluency_report(results))
     return 0
 
 
@@ -542,8 +556,14 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                  "`terse capture` for your own numbers")
 
     rows = measure_corpus(envelopes, use_anthropic=False)
-    report = build_verify_header(label, len(envelopes)) + build_report(rows, coverage(envelopes))
+    cov = coverage(envelopes)
+    report = build_verify_header(label, len(envelopes)) + build_report(rows, cov)
     _write_report(report, args.out)
+    if args.html:
+        html = build_html_report(rows, cov, attestation=(label, len(envelopes)))
+        _write_html_report(html, Path(args.out))
+    if args.bars:
+        print("\n" + build_terminal_report(rows))
     return 0
 
 
@@ -553,6 +573,15 @@ def _write_report(report: str, out_path: str) -> None:
     out.write_text(report, encoding="utf-8")
     print(report)
     print(f"\n[report written to {out}]")
+
+
+def _write_html_report(html: str, md_out_path: Path) -> None:
+    """Write the HTML chart companion alongside a markdown report's --out path,
+    swapping its suffix for .html (e.g. reports/verify-report.md -> ...html)."""
+    out = md_out_path.with_suffix(".html")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    print(f"[html report written to {out}]")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -590,6 +619,10 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--corpus", default=DEFAULT_CORPUS)
     m.add_argument("--out", default=DEFAULT_REPORT)
     m.add_argument("--anthropic", action="store_true", help="also count with Anthropic (network)")
+    m.add_argument("--html", action="store_true",
+                   help="also write a charted HTML report next to --out (inline SVG, no JS/CDN)")
+    m.add_argument("--bars", action="store_true",
+                   help="also print terminal bar charts for the savings sections (ANSI if a tty)")
     m.set_defaults(func=_cmd_measure)
 
     p = sub.add_parser("probe", help="value-redundancy + cross-call-overlap ceiling probes")
@@ -659,6 +692,9 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--anthropic", action="store_true",
                    help="also test the real consumer (needs the anthropic extra + key)")
     f.add_argument("--anthropic-model", default="claude-opus-4-8")
+    f.add_argument("--bars", action="store_true",
+                   help="also print a terminal forest plot (accuracy + 95%% CI per model, "
+                        "ANSI if a tty)")
     f.set_defaults(func=_cmd_fluency)
 
     im = sub.add_parser("install-mcp", help="wrap Claude Code MCP server(s) with the "
@@ -685,6 +721,10 @@ def main(argv: list[str] | None = None) -> int:
     vf.add_argument("--corpus", help="captured-traffic corpus dir (default: a bundled "
                                      "deterministic sample, so it runs with zero setup)")
     vf.add_argument("--out", default="reports/verify-report.md")
+    vf.add_argument("--html", action="store_true",
+                    help="also write a charted HTML report next to --out (inline SVG, no JS/CDN)")
+    vf.add_argument("--bars", action="store_true",
+                    help="also print terminal bar charts for the savings sections (ANSI if a tty)")
     vf.set_defaults(func=_cmd_verify)
 
     args = parser.parse_args(argv)

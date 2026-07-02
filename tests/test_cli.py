@@ -56,6 +56,52 @@ def test_measure_cmd_writes_report(tmp_path):
     assert "Lossless gate" in out.read_text(encoding="utf-8")
 
 
+def test_measure_cmd_html_flag_writes_svg_report(tmp_path):
+    f = _write(tmp_path, "payload.json", PAYLOAD)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "demo", "--corpus", str(corpus)]) == 0
+    out = tmp_path / "report.md"
+    rc = main(["measure", "--corpus", str(corpus), "--out", str(out), "--html"])
+    assert rc == 0
+    html_out = out.with_suffix(".html")
+    assert html_out.exists()
+    text = html_out.read_text(encoding="utf-8")
+    assert "<svg" in text
+    assert "<script" not in text
+
+
+def test_measure_cmd_without_html_flag_writes_no_html(tmp_path):
+    f = _write(tmp_path, "payload.json", PAYLOAD)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "demo", "--corpus", str(corpus)]) == 0
+    out = tmp_path / "report.md"
+    assert main(["measure", "--corpus", str(corpus), "--out", str(out)]) == 0
+    assert not out.with_suffix(".html").exists()
+
+
+def test_measure_cmd_bars_flag_prints_terminal_bars(tmp_path, capsys):
+    f = _write(tmp_path, "payload.json", PAYLOAD)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "demo", "--corpus", str(corpus)]) == 0
+    out = tmp_path / "report.md"
+    rc = main(["measure", "--corpus", str(corpus), "--out", str(out), "--bars"])
+    assert rc == 0
+    text = capsys.readouterr().out
+    # the markdown report itself already prints a "Tier-0 savings by shape bucket"
+    # heading, so assert on content ONLY the bar renderer emits (block glyph + legend).
+    assert "█" in text
+    assert "minify" in text and "tabularize" in text and "dictionary" in text
+
+
+def test_measure_cmd_without_bars_flag_prints_no_terminal_bars(tmp_path, capsys):
+    f = _write(tmp_path, "payload.json", PAYLOAD)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "demo", "--corpus", str(corpus)]) == 0
+    out = tmp_path / "report.md"
+    assert main(["measure", "--corpus", str(corpus), "--out", str(out)]) == 0
+    assert "█" not in capsys.readouterr().out
+
+
 def test_measure_cmd_empty_corpus_errors(tmp_path):
     corpus = tmp_path / "corpus"
     corpus.mkdir()
@@ -235,6 +281,36 @@ def test_install_mcp_print_redacts_secret_in_args(tmp_path, monkeypatch, capsys)
     out = capsys.readouterr().out
     assert "sk-live-SECRETVALUE" not in out
     assert "--api-key ***" in out
+
+
+def test_fluency_cmd_bars_flag_prints_forest_plot(tmp_path, capsys):
+    f = _write(tmp_path, "payload.json", PAYLOAD)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "demo", "--corpus", str(corpus)]) == 0
+    pack_path = tmp_path / "fluency-pack.json"
+    assert main(["fluency", "--corpus", str(corpus), "--pack", str(pack_path),
+                "--out", str(tmp_path / "fluency-report.md")]) == 0
+    capsys.readouterr()  # discard the pack-writing message
+
+    pack = json.loads(pack_path.read_text(encoding="utf-8"))
+
+    def gt(q):
+        return json.dumps(q["expected"]) if q["qtype"] == "enumerate" else str(q["expected"])
+
+    responses = {"perfect-model": {
+        p["sha"]: {q["qid"]: {"raw": gt(q), "terse": gt(q), "primer": gt(q)}
+                   for q in p["questions"]}
+        for p in pack["payloads"]
+    }}
+    responses_path = _write(tmp_path, "responses.json", json.dumps(responses))
+
+    rc = main(["fluency", "--corpus", str(corpus), "--pack", str(pack_path),
+              "--responses", str(responses_path), "--out", str(tmp_path / "fluency-report.md"),
+              "--bars"])
+    assert rc == 0
+    text = capsys.readouterr().out
+    assert "PASS" in text
+    assert "perfect-model" in text
 
 
 def test_fluency_cmd_keyless_pack_is_written_with_restricted_permissions(tmp_path):
