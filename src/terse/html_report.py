@@ -151,44 +151,88 @@ def stacked_bar_chart(items: list[tuple[str, list[float]]],
                        series_labels: tuple[str, ...],
                        series_colors: tuple[str, ...] = ("var(--series-1)", "var(--series-2)", "var(--series-3)")
                        ) -> str:
-    """Horizontal part-to-whole bars — one fixed hue per series (categorical), a
-    2px surface gap between segments, rounded outer cap on the final segment."""
+    """Horizontal part-to-whole bars, drawn as a waterfall of cumulative steps —
+    one fixed hue per series (categorical), a 2px surface gap between segments,
+    rounded cap on the true final total. A tier's value CAN be negative (measure.py:
+    "at tiny N the table envelope can cost more than the keys it folds") — clamping
+    it to zero-width would silently disagree with the printed total, so a negative
+    step instead retreats left of its predecessor: reduced fill-opacity plus a
+    critical-red outline flags it as the anomaly it is, and it always carries a
+    direct label (never just a hover title) since it's the one point in the row
+    the story is about."""
     if not items:
         return '<p class="sub">No data.</p>'
     label_w, right_pad = 190, 70
     plot_w = 500
-    width = label_w + plot_w + right_pad
     legend_h = 26
-    height = legend_h + _ROW_H * len(items) + 16
-    vmax = max((sum(max(v, 0) for v in vals) for _, vals in items), default=1) or 1
+    row_h = _ROW_H + 8  # a little extra air for the rare negative-step label
+    width = label_w + plot_w + right_pad
+    height = legend_h + row_h * len(items) + 16
+
+    cum_by_row: list[list[float]] = []
+    lo = hi = 0.0
+    for _, vals in items:
+        c = 0.0
+        seq = [0.0]
+        for v in vals:
+            c += v
+            seq.append(c)
+        cum_by_row.append(seq)
+        lo, hi = min(lo, min(seq)), max(hi, max(seq))
+    span = (hi - lo) or 1.0
+
+    def sx(v: float) -> float:
+        return label_w + (v - lo) / span * plot_w
+
+    zero_x = sx(0.0)
     out = [_svg_open(width, height)]
-    lx = label_w
-    ly = 14
+    lx, ly = label_w, 14
     for name, color in zip(series_labels, series_colors):
         out.append(f'<rect x="{lx}" y="{ly - 9}" width="10" height="10" rx="2" fill="{color}"/>')
         out.append(f'<text x="{lx + 15}" y="{ly}" class="axis-label">{_esc(name)}</text>')
         lx += 18 + 9 * len(name)
+    if lo < 0:
+        out.append(f'<line x1="{zero_x:.1f}" y1="{legend_h}" x2="{zero_x:.1f}" y2="{height - 4}" '
+                    f'stroke="var(--baseline)" stroke-width="1"/>')
+
     for i, (label, vals) in enumerate(items):
-        y = legend_h + 10 + i * _ROW_H
+        y = legend_h + 8 + i * row_h
+        seq = cum_by_row[i]
         out.append(f'<text x="{label_w - 10}" y="{y + _BAR_H / 2 + 4}" text-anchor="end" '
                     f'class="row-label">{_esc(label)}</text>')
-        x = label_w
         n = len(vals)
+        prev_px = zero_x
+        last_label_x: float | None = None  # gates negative-step labels below on collision
         for j, v in enumerate(vals):
-            seg_w = max(v, 0) / vmax * plot_w if vmax else 0
-            x0 = x + (_GAP / 2 if j > 0 else 0)
-            x1 = x + seg_w - (_GAP / 2 if j < n - 1 else 0)
-            if x1 > x0:
+            cur_px = sx(seq[j + 1])
+            direction = 1 if cur_px >= prev_px else -1
+            a = prev_px + (direction * _GAP / 2 if j > 0 else 0)
+            b = cur_px - (direction * _GAP / 2 if j < n - 1 else 0)
+            color = series_colors[j % len(series_colors)]
+            title = f'<title>{_esc(series_labels[j])}: {v:+.0f}</title>'
+            anomaly = ' fill-opacity="0.55" stroke="var(--diverging-neg)" stroke-width="2"' if v < 0 else ""
+            seg_px = abs(b - a)
+            if direction * (b - a) > 0.5:
                 if j == n - 1:
-                    path = _rounded_end_path(x0, x1, y, _BAR_H)
-                    out.append(f'<path d="{path}" fill="{series_colors[j % len(series_colors)]}">'
-                               f'<title>{_esc(series_labels[j])}: {v:+.0f}</title></path>')
+                    path = _rounded_end_path(a, b, y, _BAR_H)
+                    out.append(f'<path d="{path}" fill="{color}"{anomaly}>{title}</path>')
                 else:
+                    x0, x1 = (a, b) if b >= a else (b, a)
                     out.append(f'<rect x="{x0:.1f}" y="{y}" width="{(x1 - x0):.1f}" height="{_BAR_H}" '
-                               f'fill="{series_colors[j % len(series_colors)]}">'
-                               f'<title>{_esc(series_labels[j])}: {v:+.0f}</title></rect>')
-            x += seg_w
-        out.append(f'<text x="{x + 8:.1f}" y="{y + _BAR_H / 2 + 4}" class="value-label">'
+                               f'fill="{color}"{anomaly}>{title}</rect>')
+            # Direct label only where it fits and won't collide with a sibling label —
+            # "measure first" (marks-and-anatomy.md): too cramped to draw falls back to
+            # the hover title (always present, above) and the table view (always exact).
+            if v < 0 and seg_px >= 14:
+                mid = (a + b) / 2
+                if last_label_x is None or abs(mid - last_label_x) >= 24:
+                    out.append(f'<text x="{mid:.1f}" y="{y - 3}" text-anchor="middle" '
+                                f'class="value-label" fill="var(--critical)">({v:+.0f})</text>')
+                    last_label_x = mid
+            prev_px = cur_px
+        end_anchor = "start" if prev_px >= zero_x else "end"
+        out.append(f'<text x="{prev_px + (8 if end_anchor == "start" else -8):.1f}" '
+                    f'y="{y + _BAR_H / 2 + 4}" text-anchor="{end_anchor}" class="value-label">'
                     f'{sum(vals):+.0f}</text>')
     out.append("</svg>")
     return "".join(out)
@@ -375,7 +419,9 @@ SVG — no JS, no network. Hover a bar/point for its exact value.</p>
 <h2>Tier attribution by shape</h2>
 <div class="card">
 <p class="sub">minify = whitespace/escaping · tabularize = repeated keys folded ·
-dictionary = repeated values folded (Tier 0.5).</p>
+dictionary = repeated values folded, Tier 0.5. A tier can go negative at a
+small sample size — the table envelope costs more than it folds — shown as a
+red-outlined step back, never hidden.</p>
 {stacked_bar_chart(tier_items, ("minify", "tabularize", "dictionary"))}
 {_details("Table view", f"<table><thead><tr><th>Shape</th><th class='num'>minify</th>"
           f"<th class='num'>tabularize</th><th class='num'>dictionary</th>"

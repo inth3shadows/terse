@@ -65,6 +65,26 @@ def test_stacked_bar_chart_totals_and_legend():
     assert "+1008" in svg  # sum of the three tiers
 
 
+def test_stacked_bar_chart_negative_tier_not_clamped_to_zero():
+    # measure.py: "at tiny N the table envelope can cost more than the keys it
+    # folds" — a negative tier must still show up, not silently disappear.
+    svg = stacked_bar_chart([("tiny-payload", [-3, 40, 2])],
+                             ("minify", "tabularize", "dictionary"))
+    assert "(-3)" in svg  # direct label on the negative step, not just a hover title
+    assert "minify: -3" in svg  # hover title still carries the exact signed value
+    assert "var(--diverging-neg)" in svg  # anomaly outline present
+    assert "+39" in svg  # printed total matches sum(vals), not the clamped geometry
+
+
+def test_stacked_bar_chart_all_negative_tiers():
+    # Degenerate case: every tier regressed. Must not divide by zero or crash,
+    # and the total must still be the true (negative) sum.
+    svg = stacked_bar_chart([("worst-case", [-1, -2, -3])],
+                             ("minify", "tabularize", "dictionary"))
+    assert "-6" in svg
+    assert "(-1)" in svg and "(-2)" in svg and "(-3)" in svg
+
+
 def test_forest_plot_pass_fail_badges():
     rows = [
         {"model": "a", "form_acc": 0.9, "form_ci": 0.05, "control_acc": 0.92,
