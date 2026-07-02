@@ -28,6 +28,7 @@ from .measure import cross_tokenizer_savings, measure_corpus
 from .probes import cross_call_overlap, value_redundancy
 from .html_report import build_html_report
 from .report import build_probe_report, build_report, build_tokenizer_report
+from .terminal_report import build_terminal_report
 from .tokenize import count_cl100k
 
 DEFAULT_CORPUS = "corpus"
@@ -78,6 +79,8 @@ def _cmd_measure(args: argparse.Namespace) -> int:
     print(f"\n[report written to {out}]")
     if args.html:
         _write_html_report(build_html_report(rows, cov), out)
+    if args.bars:
+        print("\n" + build_terminal_report(rows))
     return 0
 
 
@@ -413,6 +416,8 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     if args.html:
         html = build_html_report(rows, cov, attestation=(label, len(envelopes)))
         _write_html_report(html, Path(args.out))
+    if args.bars:
+        print("\n" + build_terminal_report(rows))
     return 0
 
 
@@ -470,6 +475,8 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--anthropic", action="store_true", help="also count with Anthropic (network)")
     m.add_argument("--html", action="store_true",
                    help="also write a charted HTML report next to --out (inline SVG, no JS/CDN)")
+    m.add_argument("--bars", action="store_true",
+                   help="also print terminal bar charts for the savings sections (ANSI if a tty)")
     m.set_defaults(func=_cmd_measure)
 
     p = sub.add_parser("probe", help="value-redundancy + cross-call-overlap ceiling probes")
@@ -550,6 +557,8 @@ def main(argv: list[str] | None = None) -> int:
     vf.add_argument("--out", default="reports/verify-report.md")
     vf.add_argument("--html", action="store_true",
                     help="also write a charted HTML report next to --out (inline SVG, no JS/CDN)")
+    vf.add_argument("--bars", action="store_true",
+                    help="also print terminal bar charts for the savings sections (ANSI if a tty)")
     vf.set_defaults(func=_cmd_verify)
 
     args = parser.parse_args(argv)
