@@ -10,3 +10,8 @@ Counter
 # policy.apply). The guard resolves module symbols/imports, not function parameters, so a
 # param called by name reads as unresolved. A genuinely wrong name is caught by pytest.
 drop_sink
+# Also mis-flagged: importlib.metadata.version, imported locally inside
+# _attestation_card (html_report.py) the same way report.py's build_verify_header
+# already does — same hunk-splitting false positive as the stdlib symbols above.
+# Confirmed resolving correctly: `terse verify --html` prints the real version.
+version

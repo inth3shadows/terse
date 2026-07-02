@@ -175,6 +175,11 @@ markdown reports:
 - `uv run terse fluency` — the one that matters for the proxy: does a model *read* the
   compressed form as accurately as raw JSON? (see below.)
 
+Add `--html` to `measure` or `verify` for a charted companion report next to the
+markdown (e.g. `reports/verify-report.html`) — inline SVG bar/stacked-bar charts,
+zero JS, zero CDN, so it stays offline like everything else in terse. Every chart
+has a `<details>` table-view fallback underneath it.
+
 ### Check that the model still understands the compressed output
 
 Saving tokens is pointless if the model reads the compressed form worse than raw JSON.
