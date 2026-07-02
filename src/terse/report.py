@@ -120,6 +120,29 @@ def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float
     return out, broken
 
 
+def dropeval_gap_rows(results: dict) -> dict[str, dict[str, tuple[float, float, float, float]]]:
+    """Per-model (recall, precision, accuracy) gap-row tuples for build_dropeval_report
+    and its terminal-bar companion. Control is always a fixed 100% ideal (se=0) — there's
+    no raw/full-terse form to compare against here, only "did the model do the right
+    thing." Same per-model math build_dropeval_report's own table loop uses, kept in one
+    place so the two verdicts (markdown table, terminal chart) can never disagree."""
+    out: dict[str, dict[str, tuple[float, float, float, float]]] = {}
+    for model, rows in results.items():
+        if not rows:
+            continue
+        recall_rows = [r for r in rows if r["kind"] == "recall"]
+        precision_rows = [r for r in rows if r["kind"] == "precision"]
+        racc, rse = _form_stats(recall_rows, "retrieve_ok") if recall_rows else (0.0, 0.0)
+        pacc, pse = _form_stats(precision_rows, "retrieve_ok") if precision_rows else (0.0, 0.0)
+        aacc, ase = _form_stats(rows, "answer_ok")
+        out[model] = {
+            "recall": (racc, rse, 1.0, 0.0),
+            "precision": (pacc, pse, 1.0, 0.0),
+            "accuracy": (aacc, ase, 1.0, 0.0),
+        }
+    return out
+
+
 def _pct(saved: int, base: int) -> str:
     return f"{(saved / base * 100):+.1f}%" if base else "n/a"
 
@@ -271,9 +294,12 @@ def build_verify_header(corpus_label: str, n_payloads: int) -> str:
         "",
         "- **Correctness suite:** `pytest` — the full lossless / diff / proxy test set "
         "(runs in CI on Python 3.11–3.13).",
-        '- **No egress:** `grep -rE "requests|urllib|socket" src/terse` resolves only to '
-        "`fluency.py` (an explicit, opt-in model eval the proxy never calls). The proxy is "
-        "stdio-only and persists nothing.",
+        '- **No UNEXPECTED egress:** `grep -rE "requests|urllib|socket" src/terse` resolves '
+        "to `fluency.py` (an explicit, opt-in model eval) and `transport.py` (the proxy's "
+        "own downstream connection). A stdio-only downstream makes zero network calls; an "
+        "HTTP/SSE downstream (opt-in via `--config`/a `url`-configured server) talks only "
+        "to the target you configured — never a third party. The proxy persists nothing "
+        "beyond what `--capture-dir`/`--debug-log` explicitly ask for.",
         "- **Fail-open:** read `src/terse/proxy.py` — any parse/compress error forwards the "
         "ORIGINAL tool result unchanged; terse never drops or blocks a tool call.",
         "",

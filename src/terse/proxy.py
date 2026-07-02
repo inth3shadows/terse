@@ -123,7 +123,12 @@ class Interceptor:
                  store_lock: Optional[Lock] = None,
                  dropped_bytes: Optional[list[int]] = None):
         self.policy = pol
-        self.pending: dict[Any, str] = {}
+        # id -> (policy_tool, capture_tool): policy_tool drives compression/policy-tier
+        # lookup and MUST be the bare name the policy's rules match against; capture_tool
+        # is what capture()/audit() see and defaults to policy_tool, but multiproxy
+        # overrides it to a peer-qualified name (see note_request's tool_name) so two
+        # peers' same-named tools don't collide into one capture-corpus bucket.
+        self.pending: dict[Any, tuple[str, str]] = {}
         self.debug = debug
         self.diff = pol.diff
         # Optional tee of each RAW (pre-compression) tool-result text, keyed by tool name
@@ -171,21 +176,30 @@ class Interceptor:
         self._dropped_bytes_box: list[int] = dropped_bytes if dropped_bytes is not None else [0]
         self.init_id: Any = None        # id of the initialize request, to prime its reply
         # The two proxy pump threads call note_request (client->server) and
-        # transform_response (server->client) concurrently, both mutating the shared
-        # pending/last/since_keyframe state. One lock serializes each method so the
-        # compound eviction + the reconnect reset can't race a response in flight.
-        # When `store_lock` is injected, this Interceptor's ENTIRE critical section
-        # (not just the drop store) serializes against every other peer sharing that
-        # lock too — a peer's own pending/last/since_keyframe state doesn't strictly
-        # need cross-peer exclusion, but `self.dropped` does (it's the same physical
-        # dict), and `_drop_put` already assumes it's called under `self._lock` (see its
-        # docstring) — so reusing one lock for the whole critical section is the minimal,
-        # provably-safe change rather than carving out a second, finer-grained lock.
-        self._lock = store_lock if store_lock is not None else Lock()
+        # transform_response (server->client) concurrently, both mutating pending/last/
+        # since_keyframe/init_id state. `_local_lock` serializes each method against the
+        # other so the compound eviction + the reconnect reset can't race a response in
+        # flight — it is ALWAYS private to this Interceptor, never shared with another
+        # peer's, so it never blocks another peer's compression/capture/audit work.
+        self._local_lock = Lock()
+        # `_store_lock` guards ONLY `self.dropped`/`_dropped_bytes_box` (see `_drop_put`/
+        # `answer_retrieve`), which multiproxy.py DOES share across every peer's
+        # Interceptor via `store_lock` — that dict is the same physical object across
+        # peers, so mutating it needs cross-peer exclusion. Splitting this out from
+        # `_local_lock` means a slow peer's compression/disk-I/O (held under its own
+        # PRIVATE `_local_lock`) no longer serializes every other peer's response
+        # processing behind it — only the brief drop-store dict mutation does, and that
+        # happens on the order of microseconds, not a full compress/capture/audit pass.
+        self._store_lock = store_lock if store_lock is not None else Lock()
 
-    def note_request(self, line: str) -> None:
+    def note_request(self, line: str, *, tool_name: Optional[str] = None) -> None:
         """Record id -> tool name for tools/call requests, and the initialize request id
-        (so its reply can carry the format primer). Side-effect only."""
+        (so its reply can carry the format primer). Side-effect only.
+
+        `tool_name`, if given, overrides the name parsed from `line`'s own
+        `params.name` — used by multiproxy to track a peer-qualified name (e.g.
+        `"gh__search"`) for capture/audit bookkeeping, even though `line` itself
+        (sent to the downstream) carries the bare name the peer actually expects."""
         try:
             msg = json.loads(line)
         except (json.JSONDecodeError, ValueError):
@@ -194,7 +208,7 @@ class Interceptor:
             return
         mid = msg.get("id")
         method = msg.get("method")
-        with self._lock:
+        with self._local_lock:
             if method == "initialize":
                 # A re-handshake means the client rebuilt its MCP connection — and almost
                 # certainly its context window — so the model no longer holds any prior
@@ -210,8 +224,13 @@ class Interceptor:
                 self.last_text.clear()
                 self.since_text_keyframe.clear()
                 self.pending.clear()
-                self.dropped.clear()
-                self._dropped_bytes_box[0] = 0
+                # self.dropped is the (possibly cross-peer-shared) drop store — its own
+                # lock guards this reset, consistent with _drop_put/answer_retrieve.
+                # Lock order is always _local_lock then _store_lock, never reversed
+                # anywhere in this class, so nesting them here is deadlock-safe.
+                with self._store_lock:
+                    self.dropped.clear()
+                    self._dropped_bytes_box[0] = 0
                 if mid is not None:
                     self.init_id = mid
                 return
@@ -219,12 +238,23 @@ class Interceptor:
                 return
             name = (msg.get("params") or {}).get("name")
             if mid is not None and isinstance(name, str):
-                self.pending[mid] = name
+                self.pending[mid] = (name, tool_name if tool_name is not None else name)
                 # dict preserves insertion order; drop the oldest tracked id(s) once over
                 # cap so abandoned (timed-out) entries can't accumulate (#22). Safe under
                 # the lock — no concurrent mutation during the iterate-then-pop.
                 while len(self.pending) > self.PENDING_MAX:
                     self.pending.pop(next(iter(self.pending)))
+
+    def clear_init_id(self) -> None:
+        """Reset the one-time initialize-reply marker `note_request` just set, without
+        waiting for `transform_response` to see it. Used by multiproxy for a broadcast-
+        rewritten `initialize`: that peer's real reply is intercepted and merged by the
+        broadcast collector, never reaching `transform_response`, so its normal one-time
+        reset (`transform_response`'s `msg["id"] == self.init_id` branch) never fires and
+        `init_id` would otherwise stay stale, risking a later unrelated reply being
+        misidentified as the initialize reply if its id ever collides."""
+        with self._local_lock:
+            self.init_id = None
 
     def transform_response(self, line: str) -> str:
         """Compress the text of a tracked tools/call result; prime the initialize reply;
@@ -233,26 +263,37 @@ class Interceptor:
             msg = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             return line
-        if not isinstance(msg, dict) or "result" not in msg or msg.get("id") is None:
+        if not isinstance(msg, dict) or msg.get("id") is None:
             return line
-        # Held across the whole body so the shared init_id/pending/last/since_keyframe
-        # state stays consistent against a concurrent note_request on the other thread.
-        with self._lock:
+        # Held across the whole body so the init_id/pending/last/since_keyframe state
+        # stays consistent against a concurrent note_request on the other thread.
+        # ALWAYS this Interceptor's own private lock — never blocks another peer's
+        # transform_response, even under multiproxy's shared drop store (see
+        # _drop_put/_store_lock for the piece that DOES need cross-peer exclusion).
+        with self._local_lock:
             if msg["id"] == self.init_id:
                 self.init_id = None  # one-time
                 primed = self._augment_initialize(msg)
                 return primed if primed is not None else line
-            tool = self.pending.pop(msg["id"], None)
-            if tool is None:
-                # Not a tracked tools/call response. When a policy enables drop-to-retrieve,
-                # a tools/list reply is where we advertise the synthetic terse.retrieve tool
-                # so the model knows how to fetch a dropped field back (#10). Anything else
-                # (and any non-tools/list message) forwards unchanged.
-                if self.policy.has_drop():
+            # Pop BEFORE the "result" check (not after, as a top-level early-return
+            # guard would do): an error-shaped reply for a tracked id — including
+            # HttpTransport's own synthesized fail-open error — must still free its
+            # `pending` entry, or it lingers until PENDING_MAX eviction instead of
+            # being cleaned up immediately.
+            tracked = self.pending.pop(msg["id"], None)
+            if tracked is None or "result" not in msg:
+                # Either not a tracked tools/call response at all (tools/list, ...),
+                # or an error reply for one we WERE tracking (already popped above).
+                # When a policy enables drop-to-retrieve, a tools/list reply is where
+                # we advertise the synthetic terse.retrieve tool so the model knows
+                # how to fetch a dropped field back (#10) — only for the untracked
+                # case, never for a tracked call's error reply.
+                if tracked is None and self.policy.has_drop():
                     injected = self._inject_retrieve_tool(msg)
                     if injected is not None:
                         return injected
-                return line  # not a tracked tools/call response (tools/list, ...)
+                return line
+            tool, capture_tool = tracked
 
             result = msg.get("result")
             content = result.get("content") if isinstance(result, dict) else None
@@ -269,10 +310,11 @@ class Interceptor:
             if self.capture is not None:
                 for b in text_blocks:
                     try:
-                        self.capture(tool, b["text"])
+                        self.capture(capture_tool, b["text"])
                     except Exception as exc:  # noqa: BLE001 — capture is never load-bearing
                         if self.debug:
-                            sys.stderr.write(f"[terse-proxy] {tool}: capture skipped: {exc}\n")
+                            sys.stderr.write(
+                                f"[terse-proxy] {capture_tool}: capture skipped: {exc}\n")
 
             # Snapshot the raw block texts before any transform mutates them in place, so
             # the audit log can pair each raw payload with what terse actually emitted (#23).
@@ -294,7 +336,8 @@ class Interceptor:
             # Audit AFTER the transform, regardless of `changed`: a no-op is itself
             # diagnostic — it confirms terse left a suspect payload untouched.
             if self.audit is not None and raw_texts is not None:
-                self._emit_audit(tool, msg["id"], raw_texts, text_blocks, changed)
+                self._emit_audit(tool, msg["id"], raw_texts, text_blocks, changed,
+                                 display_tool=capture_tool)
 
             if not changed:
                 return line
@@ -437,18 +480,21 @@ class Interceptor:
     def _drop_put(self, handle: str, value: Any) -> None:
         """Store a dropped field's original under `handle` for a later terse.retrieve (#10).
         LRU: re-inserting an existing handle refreshes its recency; once over the count or
-        byte cap, evict oldest-first. Called from apply() inside transform_response, which
-        already holds self._lock — no separate lock needed."""
-        size = len(lossy_mod._serialize(value))
-        if handle in self.dropped:
-            self._dropped_bytes_box[0] -= len(lossy_mod._serialize(self.dropped[handle]))
-            self.dropped.move_to_end(handle)
-        self.dropped[handle] = value
-        self._dropped_bytes_box[0] += size
-        while self.dropped and (len(self.dropped) > self.DROPPED_MAX
-                                or self._dropped_bytes_box[0] > self.DROPPED_MAX_BYTES):
-            _, evicted = self.dropped.popitem(last=False)
-            self._dropped_bytes_box[0] -= len(lossy_mod._serialize(evicted))
+        byte cap, evict oldest-first. Called from apply() inside transform_response, while
+        that method's own `_local_lock` is held — acquires `_store_lock` itself here
+        rather than assuming a caller-held lock already covers it, since `_store_lock` is
+        the one that's actually shared across peers under multiproxy (`_local_lock` isn't)."""
+        with self._store_lock:
+            size = len(lossy_mod._serialize(value))
+            if handle in self.dropped:
+                self._dropped_bytes_box[0] -= len(lossy_mod._serialize(self.dropped[handle]))
+                self.dropped.move_to_end(handle)
+            self.dropped[handle] = value
+            self._dropped_bytes_box[0] += size
+            while self.dropped and (len(self.dropped) > self.DROPPED_MAX
+                                    or self._dropped_bytes_box[0] > self.DROPPED_MAX_BYTES):
+                _, evicted = self.dropped.popitem(last=False)
+                self._dropped_bytes_box[0] -= len(lossy_mod._serialize(evicted))
 
     def _inject_retrieve_tool(self, msg: dict) -> Optional[str]:
         """If `msg` is a tools/list result, append the synthetic terse.retrieve tool so the
@@ -486,7 +532,7 @@ class Interceptor:
         mid = msg.get("id")
         handle = (params.get("arguments") or {}).get("handle")
         value = None
-        with self._lock:
+        with self._store_lock:
             hit = handle in self.dropped
             if hit:
                 self.dropped.move_to_end(handle)  # a read refreshes recency
@@ -507,12 +553,19 @@ class Interceptor:
                           separators=(",", ":"), ensure_ascii=False)
 
     def _emit_audit(self, tool: str, mid: Any, raw_texts: list[str],
-                    text_blocks: list[dict], changed: bool) -> None:
+                    text_blocks: list[dict], changed: bool, *,
+                    display_tool: Optional[str] = None) -> None:
         """Hand the audit callback one replay record per result (#23). Strictly a side
         effect: any error is swallowed so an audit-log write can never change what the
-        client receives — same fail-open contract as capture."""
+        client receives — same fail-open contract as capture.
+
+        `tool` drives `self.policy.select(tool)` and MUST be the bare/policy-matching
+        name. `display_tool`, if given, overrides only the record's `"tool"` field
+        (e.g. multiproxy's peer-qualified name) without affecting which policy rule's
+        tiers get reported."""
+        shown_tool = display_tool if display_tool is not None else tool
         record = {
-            "tool": tool,
+            "tool": shown_tool,
             "id": mid,
             "diff_mode": self.diff,
             "tiers": list(self.policy.select(tool).tiers),
@@ -524,7 +577,7 @@ class Interceptor:
             self.audit(record)  # type: ignore[misc]  — only called when set
         except Exception as exc:  # noqa: BLE001 — audit is never load-bearing
             if self.debug:
-                sys.stderr.write(f"[terse-proxy] {tool}: audit skipped: {exc}\n")
+                sys.stderr.write(f"[terse-proxy] {shown_tool}: audit skipped: {exc}\n")
 
 
 # Sentinel a transform returns to SWALLOW a line — write nothing to dst — as distinct from
@@ -585,6 +638,90 @@ def _terminate_child(proc: "subprocess.Popen[Any]", timeout: float = 2.0) -> Non
             pass
 
 
+# Sentinel distinguishing "SIGTERM handler installation was attempted and failed" (a
+# non-main thread — signal.signal only works there; a caller-held finally must still
+# run cleanup regardless) from "installed, and the prior disposition was None" (no
+# Python-set handler; restore to SIG_DFL, not None). `_install_sigterm_to_exit`'s
+# return value is opaque to callers — pass it straight to `_ignore_sigterm`/
+# `_restore_sigterm`, which both already no-op correctly for this sentinel.
+_SIGTERM_NOT_INSTALLED: Any = object()
+
+
+def _install_sigterm_to_exit() -> Any:
+    """SIGTERM otherwise bypasses a caller's `finally` (default action exits
+    immediately), orphaning a child process/peer. Convert it to a clean
+    `sys.exit(143)` so cleanup runs. Shared by `run_proxy` and
+    `multiproxy.run_multi_proxy` (#21) — install/ignore/restore is identical in both,
+    differing only in what teardown work happens between `_ignore_sigterm` and
+    `_restore_sigterm`. Returns an opaque token for those two functions."""
+    try:
+        prev = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+        return prev
+    except (ValueError, OSError):
+        # Only the main thread may install signal handlers; in a worker (e.g. a test
+        # calling run_proxy directly) this silently no-ops — the caller's own
+        # try/finally still covers crash and normal-exit paths regardless.
+        return _SIGTERM_NOT_INSTALLED
+
+
+def _ignore_sigterm(token: Any) -> None:
+    """Ignore further SIGTERM while reaping: a second signal would otherwise
+    re-enter the `sys.exit(143)` handler and unwind out of teardown before the
+    SIGTERM/SIGKILL escalation and `_restore_sigterm` below ever run."""
+    if token is _SIGTERM_NOT_INSTALLED:
+        return
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass
+
+
+def _restore_sigterm(token: Any) -> None:
+    """Restore the prior disposition; SIG_DFL when it wasn't a Python-set handler
+    (`token is None`), so a caller never leaves the `sys.exit(143)` lambda installed."""
+    if token is _SIGTERM_NOT_INSTALLED:
+        return
+    try:
+        signal.signal(signal.SIGTERM, token if token is not None else signal.SIG_DFL)
+    except (ValueError, OSError, TypeError):
+        pass
+
+
+def _build_capture_and_audit(
+    capture_dir: Optional[str], debug_log: Optional[str], debug: bool, log_prefix: str
+) -> tuple[Optional[Callable[[str, str], None]], Optional[Callable[[dict], None]]]:
+    """Build the (capture, audit) callback pair from --capture-dir/--debug-log, shared
+    by `run_proxy` and `multiproxy.run_multi_proxy` (identical logic, differing only in
+    which process's downstream target they're wired to). Both callbacks are strictly
+    side effects — a read-only or full disk must never break the proxy — so a failure
+    is swallowed with only a --debug-gated stderr line, tagged with `log_prefix` (e.g.
+    `"[terse-proxy]"` vs `"[terse-multiproxy]"`) so the failure's origin stays legible."""
+    capture: Optional[Callable[[str, str], None]] = None
+    if capture_dir is not None:
+        from .capture import capture_payload
+
+        def capture(tool: str, raw: str) -> None:
+            try:
+                capture_payload(tool, raw, capture_dir)
+            except Exception as exc:  # noqa: BLE001 — capture is never load-bearing
+                if debug:
+                    sys.stderr.write(f"{log_prefix} capture_payload failed: {exc}\n")
+
+    audit: Optional[Callable[[dict], None]] = None
+    if debug_log is not None:
+        from .capture import append_audit
+
+        def audit(record: dict) -> None:
+            try:
+                append_audit(record, debug_log)
+            except Exception as exc:  # noqa: BLE001 — audit is never load-bearing
+                if debug:
+                    sys.stderr.write(f"{log_prefix} append_audit failed: {exc}\n")
+
+    return capture, audit
+
+
 def run_proxy(
     cmd: list[str],
     pol: policy_mod.Policy,
@@ -630,31 +767,7 @@ def run_proxy(
         sys.stderr.write(f"[terse-proxy] {transport_err}\n")
         return 2
 
-    capture: Optional[Callable[[str, str], None]] = None
-    if capture_dir is not None:
-        from .capture import capture_payload
-
-        def capture(tool: str, raw: str) -> None:
-            # Swallow here too (defense in depth alongside the Interceptor's guard): a
-            # read-only or full corpus dir must not break the proxy.
-            try:
-                capture_payload(tool, raw, capture_dir)
-            except Exception as exc:  # noqa: BLE001 — capture is never load-bearing
-                if debug:
-                    sys.stderr.write(f"[terse-proxy] capture_payload failed: {exc}\n")
-
-    audit: Optional[Callable[[dict], None]] = None
-    if debug_log is not None:
-        from .capture import append_audit
-
-        def audit(record: dict) -> None:
-            # Defense in depth alongside the Interceptor's guard: a read-only or full
-            # disk must not break the proxy.
-            try:
-                append_audit(record, debug_log)
-            except Exception as exc:  # noqa: BLE001 — audit is never load-bearing
-                if debug:
-                    sys.stderr.write(f"[terse-proxy] append_audit failed: {exc}\n")
+    capture, audit = _build_capture_and_audit(capture_dir, debug_log, debug, "[terse-proxy]")
 
     inter = Interceptor(pol, debug=debug, capture=capture, audit=audit)
 
@@ -670,26 +783,15 @@ def run_proxy(
                          f"{exc}\n")
         return 127
 
-    # The rest of this function is deliberately NOT fully transport-polymorphic: the
-    # stdio path keeps its exact pre-#5 control flow (half-close stdin, `proc.wait()`
-    # for the real exit code, `_terminate_child` as the last-resort reaper) so every
-    # existing behavior/test is byte-for-byte unchanged, while HTTP — which has no
-    # child process to wait() on — generalizes to "block until the inbound pump
-    # finishes", which for HTTP only happens once `transport.close()` runs.
+    # `half_close()`/`wait()` (Transport methods) hide every transport-specific
+    # teardown/exit-code detail behind polymorphism — no isinstance check needed for
+    # those. `is_http` is still needed for ONE genuinely irreducible difference: an
+    # HTTP downstream has no process exit code at all, so "how long do we block
+    # joining the inbound pump thread, and what's the resulting rc" differs in KIND,
+    # not just in which method to call (see the join/rc branch below).
     is_http = isinstance(transport, HttpTransport)
 
-    # SIGTERM otherwise bypasses `finally` (default action exits immediately), orphaning
-    # the child. Convert it to a clean SystemExit so cleanup runs. Only the main thread
-    # may install handlers; in a worker (e.g. tests calling run_proxy directly) the
-    # try/finally still covers the crash and normal-exit paths.
-    prev_sigterm = None
-    installed_sigterm = False
-    try:
-        prev_sigterm = signal.getsignal(signal.SIGTERM)
-        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-        installed_sigterm = True
-    except (ValueError, OSError):
-        pass
+    sigterm_token = _install_sigterm_to_exit()
 
     # The client-facing stream (cout) now has TWO writers: the server->client pump and the
     # client->server side answering a swallowed terse.retrieve call (#10). Serialize every
@@ -717,24 +819,15 @@ def run_proxy(
             try:
                 pump(cin, transport.outbound(), fwd)
             finally:
-                if is_http:
-                    # HTTP has no persistent connection to half-close: client stdin EOF
-                    # IS the transport's end-of-life signal. Closing here (not only in
-                    # the outer `finally`) is what lets `server_to_client`'s
-                    # `pump(transport.inbound(), ...)` below ever terminate —
-                    # HttpTransport.inbound() is a queue.Queue iterator with no other
-                    # EOF condition (#5).
-                    transport.close()
-                else:
-                    # stdio: half-close only, exactly as before this refactor. Closing
-                    # the child's stdin signals EOF so it can flush any remaining reply
-                    # and exit on its own; `proc.wait()` below blocks for that real
-                    # exit, and the outer `finally`'s transport.close() (SIGTERM/SIGKILL
-                    # escalation via `_terminate_child`) stays the last-resort reaper.
-                    try:
-                        transport.outbound().close()
-                    except Exception:  # noqa: BLE001
-                        pass
+                # transport.half_close() is what lets server_to_client's
+                # pump(transport.inbound(), ...) below ever terminate: for HTTP
+                # (a queue.Queue iterator with no other EOF condition) it closes
+                # outright; for stdio it closes the child's stdin so the child can
+                # flush any remaining reply and exit on its own (transport.wait()
+                # below blocks for that real exit; the outer finally's
+                # transport.close() — SIGTERM/SIGKILL escalation — stays the
+                # last-resort reaper either way).
+                transport.half_close()
 
         def server_to_client() -> None:
             pump(transport.inbound(), cout, inter.transform_response, lock=out_lock)
@@ -751,24 +844,10 @@ def run_proxy(
             t_down.join()
             rc = 0
         else:
-            rc = transport.proc.wait()
+            rc = transport.wait()
             t_down.join(timeout=2.0)
         return rc
     finally:
-        if installed_sigterm:
-            # Ignore further SIGTERM while reaping: a second signal would otherwise
-            # re-enter the sys.exit(143) handler and unwind out of transport.close()
-            # before the SIGKILL escalation and the restore below ever run.
-            try:
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            except (ValueError, OSError):
-                pass
+        _ignore_sigterm(sigterm_token)
         transport.close()
-        if installed_sigterm:
-            # Restore the prior disposition; SIG_DFL when it wasn't a Python-set handler
-            # (getsignal returns None there), so we never leave our lambda installed.
-            try:
-                signal.signal(signal.SIGTERM,
-                              prev_sigterm if prev_sigterm is not None else signal.SIG_DFL)
-            except (ValueError, OSError, TypeError):
-                pass
+        _restore_sigterm(sigterm_token)

@@ -18,7 +18,7 @@ def test_verify_on_corpus_emits_gate_savings_and_attestation(tmp_path):
     text = out.read_text(encoding="utf-8")
     assert "# terse — verification report" in text        # attestation header
     assert "round-trip losslessly" in text                # lossless gate ran
-    assert "Fail-open" in text and "No egress" in text     # self-cert caveats present
+    assert "Fail-open" in text and "No UNEXPECTED egress" in text  # self-cert caveats present
     assert "your captured traffic" in text                 # labelled as real corpus
 
 

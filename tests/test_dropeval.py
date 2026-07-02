@@ -120,6 +120,31 @@ def test_recall_question_scores_full_marks_when_retrieve_resolves_correctly():
     assert recall_row["handle_ok"] == 3
 
 
+def test_run_drop_payload_applies_policy_only_once(monkeypatch):
+    # Regression: run_drop_payload used to call gen_drop_questions (which internally
+    # calls _staged_apply) AND THEN call _staged_apply again itself with identical
+    # args — a flat 2x cost on policy.apply()'s parse/tabularize/dictionary-encode
+    # pass over every payload, before any per-question trial loop even started.
+    from terse import policy as policy_mod
+
+    calls = {"n": 0}
+    real_apply = policy_mod.apply
+
+    def counting_apply(*args, **kwargs):
+        calls["n"] += 1
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(policy_mod, "apply", counting_apply)
+
+    def never_retrieves(messages):
+        return dropeval.Turn(text="I don't know", tool_calls=[])
+
+    rows = dropeval.run_drop_payload(PAYLOAD, json.dumps(PAYLOAD), DROP_RULE, TOOL,
+                                     never_retrieves, trials=1)
+    assert rows  # sanity: the payload does have drop-marked questions
+    assert calls["n"] == 1
+
+
 # --------------------------------------------------------------------------- #
 # run_drop_payload — precision question penalizes over-fetch
 # --------------------------------------------------------------------------- #
@@ -211,3 +236,29 @@ def test_build_dropeval_report_passes_when_every_model_is_reliable():
 def test_build_dropeval_report_empty_results_shows_guidance_and_does_not_crash():
     assert "No tool-capable model" in build_dropeval_report({})
     assert "No tool-capable model" in build_dropeval_report({"m": []})
+
+
+def test_run_drop_fluency_computes_questions_once_per_envelope_not_per_model(monkeypatch):
+    # Regression: run_drop_fluency's outer loop was over MODELS, redoing the JSON
+    # parse + _questions_and_staging derivation (a policy.apply() pass) for every
+    # model even though that work is entirely model-independent — for M models and E
+    # envelopes this ran M times more often than necessary.
+    calls = {"n": 0}
+    real = dropeval._questions_and_staging
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(dropeval, "_questions_and_staging", counting)
+
+    def never_retrieves(messages):
+        return dropeval.Turn(text="I don't know", tool_calls=[])
+
+    envelopes = [{"tool": TOOL, "sha": "abc", "raw": json.dumps(PAYLOAD)}]
+    answerers = {"model-a": never_retrieves, "model-b": never_retrieves,
+                "model-c": never_retrieves}
+    results = dropeval.run_drop_fluency(envelopes, lambda t: DROP_RULE, answerers, trials=1)
+    assert set(results) == {"model-a", "model-b", "model-c"}
+    assert all(results[m] for m in results)  # each model still got real rows
+    assert calls["n"] == 1  # one envelope -> one derivation, reused across all 3 models

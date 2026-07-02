@@ -15,7 +15,7 @@ import os
 import sys
 from typing import Any
 
-from .report import _GAP_TOLERANCE, _ci, _sum, diff_gap_rows, fluency_gap_rows
+from .report import _GAP_TOLERANCE, _ci, _sum, diff_gap_rows, dropeval_gap_rows, fluency_gap_rows
 
 _BAR_WIDTH = 24
 _BLOCK = "█"
@@ -196,3 +196,29 @@ def build_terminal_fluency_report(results: dict, color: bool | None = None) -> s
     if broken:
         text += f"\n  (excluded — raw control failed: {', '.join(broken)})"
     return text
+
+
+_DROPEVAL_METRICS = (("recall", "retrieve-recall"), ("precision", "no-overfetch"),
+                     ("accuracy", "final-accuracy"))
+
+
+def build_terminal_dropeval_report(results: dict, color: bool | None = None) -> str:
+    """Terminal counterpart to report.build_dropeval_report's verdict section — three
+    forest plots (retrieve-recall, no-overfetch, final-accuracy), each vs a fixed
+    100%-ideal control, gated on the worst model per metric. Fed by report.py's
+    dropeval_gap_rows so the gap a chart shows can never diverge from the markdown."""
+    gaps = dropeval_gap_rows(results)
+    if not gaps:
+        return "  (no data)"
+    sections = []
+    for key, label in _DROPEVAL_METRICS:
+        plot_rows = []
+        for model, metrics in gaps.items():
+            facc, fse, cacc, cse = metrics[key]
+            gap = facc - cacc
+            passed = gap >= -_GAP_TOLERANCE - 1e-9
+            plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
+                               "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
+        sections.append(f"{label}:")
+        sections.append(forest_bar_lines(plot_rows, label, "ideal (100%)", color=color))
+    return "\n\n".join(sections)

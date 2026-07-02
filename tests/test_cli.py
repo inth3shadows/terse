@@ -283,6 +283,27 @@ def test_install_mcp_print_redacts_secret_in_args(tmp_path, monkeypatch, capsys)
     assert "--api-key ***" in out
 
 
+def test_install_mcp_print_shows_url_and_redacted_headers_for_url_server(tmp_path, monkeypatch, capsys):
+    # Regression: _short_cmd only read entry["command"]/entry["args"], so a
+    # url/headers-shaped entry (#5 HTTP downstream) printed just "before: ?" —
+    # silently losing the url/headers info from the dry-run display.
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({
+        "mcpServers": {"remote": {"url": "https://example.com/mcp",
+                                  "headers": {"Authorization": "Bearer sk-live-SECRETVALUE"}}}
+    }), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    policy = _write(tmp_path, "policy.json", json.dumps({"rules": []}))
+
+    rc = main(["install-mcp", "remote", "--policy", str(policy), "--print"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "before: ?" not in out
+    assert "https://example.com/mcp" in out
+    assert "sk-live-SECRETVALUE" not in out          # secret-shaped header value masked
+    assert "Authorization=***" in out
+
+
 def test_fluency_cmd_bars_flag_prints_forest_plot(tmp_path, capsys):
     f = _write(tmp_path, "payload.json", PAYLOAD)
     corpus = tmp_path / "corpus"
