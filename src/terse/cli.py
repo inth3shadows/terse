@@ -26,6 +26,7 @@ from ._secure_io import write_restricted
 from .capture import capture_payload, classify_shape, coverage, extract_records, load_corpus
 from .measure import cross_tokenizer_savings, measure_corpus
 from .probes import cross_call_overlap, value_redundancy
+from .html_report import build_html_report
 from .report import build_probe_report, build_report, build_tokenizer_report
 from .tokenize import count_cl100k
 
@@ -68,12 +69,15 @@ def _cmd_measure(args: argparse.Namespace) -> int:
         print(f"no payloads in {args.corpus}/ — capture some first (`terse capture`).")
         return 1
     rows = measure_corpus(envelopes, use_anthropic=args.anthropic)
-    report = build_report(rows, coverage(envelopes))
+    cov = coverage(envelopes)
+    report = build_report(rows, cov)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report, encoding="utf-8")
     print(report)
     print(f"\n[report written to {out}]")
+    if args.html:
+        _write_html_report(build_html_report(rows, cov), out)
     return 0
 
 
@@ -403,8 +407,12 @@ def _cmd_verify(args: argparse.Namespace) -> int:
                  "`terse capture` for your own numbers")
 
     rows = measure_corpus(envelopes, use_anthropic=False)
-    report = build_verify_header(label, len(envelopes)) + build_report(rows, coverage(envelopes))
+    cov = coverage(envelopes)
+    report = build_verify_header(label, len(envelopes)) + build_report(rows, cov)
     _write_report(report, args.out)
+    if args.html:
+        html = build_html_report(rows, cov, attestation=(label, len(envelopes)))
+        _write_html_report(html, Path(args.out))
     return 0
 
 
@@ -414,6 +422,15 @@ def _write_report(report: str, out_path: str) -> None:
     out.write_text(report, encoding="utf-8")
     print(report)
     print(f"\n[report written to {out}]")
+
+
+def _write_html_report(html: str, md_out_path: Path) -> None:
+    """Write the HTML chart companion alongside a markdown report's --out path,
+    swapping its suffix for .html (e.g. reports/verify-report.md -> ...html)."""
+    out = md_out_path.with_suffix(".html")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    print(f"[html report written to {out}]")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -451,6 +468,8 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--corpus", default=DEFAULT_CORPUS)
     m.add_argument("--out", default=DEFAULT_REPORT)
     m.add_argument("--anthropic", action="store_true", help="also count with Anthropic (network)")
+    m.add_argument("--html", action="store_true",
+                   help="also write a charted HTML report next to --out (inline SVG, no JS/CDN)")
     m.set_defaults(func=_cmd_measure)
 
     p = sub.add_parser("probe", help="value-redundancy + cross-call-overlap ceiling probes")
@@ -529,6 +548,8 @@ def main(argv: list[str] | None = None) -> int:
     vf.add_argument("--corpus", help="captured-traffic corpus dir (default: a bundled "
                                      "deterministic sample, so it runs with zero setup)")
     vf.add_argument("--out", default="reports/verify-report.md")
+    vf.add_argument("--html", action="store_true",
+                    help="also write a charted HTML report next to --out (inline SVG, no JS/CDN)")
     vf.set_defaults(func=_cmd_verify)
 
     args = parser.parse_args(argv)

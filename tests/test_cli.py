@@ -56,6 +56,29 @@ def test_measure_cmd_writes_report(tmp_path):
     assert "Lossless gate" in out.read_text(encoding="utf-8")
 
 
+def test_measure_cmd_html_flag_writes_svg_report(tmp_path):
+    f = _write(tmp_path, "payload.json", PAYLOAD)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "demo", "--corpus", str(corpus)]) == 0
+    out = tmp_path / "report.md"
+    rc = main(["measure", "--corpus", str(corpus), "--out", str(out), "--html"])
+    assert rc == 0
+    html_out = out.with_suffix(".html")
+    assert html_out.exists()
+    text = html_out.read_text(encoding="utf-8")
+    assert "<svg" in text
+    assert "<script" not in text
+
+
+def test_measure_cmd_without_html_flag_writes_no_html(tmp_path):
+    f = _write(tmp_path, "payload.json", PAYLOAD)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "demo", "--corpus", str(corpus)]) == 0
+    out = tmp_path / "report.md"
+    assert main(["measure", "--corpus", str(corpus), "--out", str(out)]) == 0
+    assert not out.with_suffix(".html").exists()
+
+
 def test_measure_cmd_empty_corpus_errors(tmp_path):
     corpus = tmp_path / "corpus"
     corpus.mkdir()
