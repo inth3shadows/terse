@@ -307,6 +307,8 @@ def test_dead_peer_does_not_wedge_broadcast_or_live_routed_calls(tmp_path, capsy
         json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
         json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                    "params": {"name": "gh__gh.api.items"}}),
+        json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                   "params": {"name": "dead__whatever"}}),
     ]) + "\n"
     cin, cout = io.StringIO(requests_text), io.StringIO()
     rc = run_multi_proxy(str(cfg), PLAIN_POLICY, stdin=cin, stdout=cout, broadcast_timeout=0.3)
@@ -321,6 +323,10 @@ def test_dead_peer_does_not_wedge_broadcast_or_live_routed_calls(tmp_path, capsy
     assert 2 in msgs                                     # the live peer still serves routed calls
     text = msgs[2]["result"]["content"][0]["text"]
     assert transforms.decompress(text) == {"result": RECORDS}
+    # a routed call TO the dead peer must not wedge the client forever either —
+    # it gets a timeout error instead of never answering.
+    assert 3 in msgs
+    assert "error" in msgs[3] and "timed out" in msgs[3]["error"]["message"]
 
 
 # --- config loading / validation ---
@@ -451,6 +457,62 @@ def test_build_peers_closes_already_launched_peer_on_partial_failure(monkeypatch
     assert closed == [True]  # the first (already-launched) peer's transport was closed
 
 
+def test_build_peers_closes_already_launched_peer_on_bad_peer_policy(monkeypatch, tmp_path):
+    # Regression: a later peer's malformed policy file raises ValueError from
+    # load_policy, not OSError — _build_peers used to only catch OSError, so this
+    # left an earlier peer's already-launched transport orphaned.
+    from terse import multiproxy as mp
+
+    closed = []
+
+    class _FakeTransport:
+        def inbound(self):
+            return iter([])
+
+        def outbound(self):
+            return io.StringIO()
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(mp, "build_transport", lambda target, headers=None: _FakeTransport())
+    bad_policy = tmp_path / "bad.json"
+    bad_policy.write_text("not valid json", encoding="utf-8")
+    specs = [
+        DownstreamSpec(name="a", target=["a"], headers={}, policy_path=None),
+        DownstreamSpec(name="b", target=["b"], headers={}, policy_path=str(bad_policy)),
+    ]
+    try:
+        _build_peers(specs, PLAIN_POLICY, debug=False, capture=None, audit=None,
+                     store=OrderedDict(), store_lock=Lock(), dropped_bytes=[0])
+        raise AssertionError("expected ValueError for the malformed 2nd peer policy")
+    except ValueError:
+        pass
+    assert closed == [True]  # the first (already-launched) peer's transport was closed
+
+
+def test_build_peers_diff_override_reaches_peer_with_own_policy_path(monkeypatch, tmp_path):
+    # Regression: --diff was applied to `default_policy` only, so a peer with its OWN
+    # policy_path (a freshly-loaded Policy object) silently never got cross-call
+    # diffing enabled, unlike a peer using the default policy.
+    from terse import multiproxy as mp
+
+    monkeypatch.setattr(mp, "build_transport",
+                        lambda target, headers=None: _FakePeerTransport())
+    own_policy = tmp_path / "own.json"
+    own_policy.write_text(json.dumps({"version": 1, "rules": []}), encoding="utf-8")
+    specs = [
+        DownstreamSpec(name="a", target=["a"], headers={}, policy_path=None),
+        DownstreamSpec(name="b", target=["b"], headers={}, policy_path=str(own_policy)),
+    ]
+    peers = _build_peers(specs, PLAIN_POLICY, debug=False, capture=None, audit=None,
+                         store=OrderedDict(), store_lock=Lock(), dropped_bytes=[0],
+                         diff_override=True, diff_keyframe_override=8)
+    assert peers[0].inter.policy.diff is True
+    assert peers[1].inter.policy.diff is True  # peer with its own policy file
+    assert peers[1].inter.policy.diff_keyframe_interval == 8
+
+
 def test_load_multi_config_rejects_name_containing_prefix_sep(tmp_path):
     # Regression: a name like "gh__api" wasn't rejected, so it could shadow a shorter
     # peer name ("gh") under _route_call's first-occurrence "__" split.
@@ -524,6 +586,232 @@ def test_late_broadcast_reply_after_timeout_is_swallowed_not_leaked():
 
     assert result is SWALLOW           # swallowed, not forwarded as an unsolicited message
     assert len(_lines(out)) == 1        # still exactly one reply on the client stream
+
+
+def test_late_routed_call_reply_after_timeout_is_swallowed_not_double_answered():
+    # Regression: a routed tools/call had no timeout at all — a hung/dead peer left it
+    # unanswered forever. Once bounded, a peer's real reply arriving AFTER
+    # _timeout_routed_call already answered the client must be swallowed, not
+    # double-delivered (which would confuse a client tracking one reply per id).
+    t0 = _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)  # never fires on its own
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+             "params": {"name": "a__gh.api.items"}}))
+        assert len(_lines(out)) == 0  # no reply yet — still waiting on the peer
+
+        # force the routed call to time out (as if its timer had fired) before the
+        # peer answers
+        router._timeout_routed_call(7, 0)
+        assert len(_lines(out)) == 1
+        assert "timed out" in _lines(out)[0]["error"]["message"]
+
+        # the peer's real reply arrives LATE
+        result = router.from_peer(0)(json.dumps(
+            {"jsonrpc": "2.0", "id": 7,
+             "result": {"content": [{"type": "text", "text": "late"}]}}))
+    finally:
+        router.close_senders()
+
+    assert result is SWALLOW           # swallowed, not forwarded as a second reply
+    assert len(_lines(out)) == 1        # still exactly one reply on the client stream
+
+
+def test_routed_call_registers_timeout_timer_before_writing_to_peer():
+    # Regression: _route_call used to write to the peer BEFORE registering the
+    # timeout timer in _routed_timers, with no lock spanning both steps. A peer fast
+    # enough to reply before registration ran would have its real reply processed by
+    # from_peer while the timer didn't exist yet (pop -> None, delivered normally),
+    # after which _route_call still inserted the now-orphaned timer — which would
+    # later fire and send the client a spurious timeout for an id already answered.
+    # Fixed by registering the timer before the peer write is even enqueued.
+    t0 = _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    seen_registered_before_send = []
+    orig_send = router._senders[0].send
+
+    def spy_send(line):
+        seen_registered_before_send.append(7 in router._routed_timers)
+        return orig_send(line)
+
+    router._senders[0].send = spy_send
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+             "params": {"name": "a__gh.api.items"}}))
+    finally:
+        router.close_senders()
+
+    assert seen_registered_before_send == [True]
+
+
+def test_peer_initiated_request_id_does_not_collide_with_routed_call_timeout():
+    # Regression: _routed_timers/_routed_timed_out were keyed only by the bare id,
+    # checked BEFORE a message was recognized as a peer-initiated server request
+    # (sampling/createMessage, roots). A peer's own request id is unnamespaced and
+    # can coincide with an unrelated in-flight routed call's id, which used to cancel
+    # that routed call's timeout (or swallow the peer's request) purely on the
+    # coincidence. Fixed by checking for a server-initiated request first.
+    t0 = _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)  # never fires on its own
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "a__gh.api.items"}}))
+        assert 1 in router._routed_timers  # the routed call's timeout is pending
+
+        # the SAME peer sends its own server-initiated request, reusing id=1 — its own
+        # id space, unrelated to the client's routed-call id
+        result = router.from_peer(0)(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "sampling/createMessage", "params": {}}))
+
+        # recognized as a request (rewritten + forwarded), not swallowed as a routed reply
+        assert result not in (None, SWALLOW)
+        rewritten = json.loads(result)
+        assert rewritten["method"] == "sampling/createMessage"
+        assert rewritten["id"] != 1  # namespaced, so the client's reply can route back
+
+        # the routed call's OWN timeout must be untouched by the id coincidence
+        assert 1 in router._routed_timers
+
+        # its real reply still arrives and resolves normally afterward
+        reply = router.from_peer(0)(json.dumps(
+            {"jsonrpc": "2.0", "id": 1,
+             "result": {"content": [{"type": "text", "text": "ok"}]}}))
+    finally:
+        router.close_senders()
+
+    assert reply not in (None, SWALLOW)
+    assert 1 not in router._routed_timers
+
+
+def test_routed_timeout_eviction_ages_out_stale_entries_independent_of_population(monkeypatch):
+    # Regression: _routed_timed_out was evicted purely by population count (FIFO) at a
+    # cap of 4096 — unlike a broadcast-local id (namespaced, so an evicted-then-late
+    # reply just fails to match anything and is dropped harmlessly), a routed call's id
+    # IS the client's own live id, so an evicted-then-late reply looks like a real
+    # second answer and gets delivered, double-answering the client. A realistic burst
+    # of thousands of concurrent timeouts during a peer stall could exceed 4096 well
+    # within a plausible "very late reply" window. Fixed two ways: (1) the population
+    # backstop is now sized generously (65536) so a realistic burst doesn't force
+    # eviction of anything still young, and (2) eviction is now proactively AGE-based
+    # (Router._routed_timed_out_ttl) so a genuinely stale entry is cleaned up even when
+    # population never approaches the backstop at all.
+    fake_now = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: fake_now[0])
+
+    t0 = _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    router._routed_timed_out_ttl = 10.0
+    try:
+        router._routed_timers[1] = threading.Timer(1000, lambda: None)
+        router._timeout_routed_call(1, 0)
+        assert 1 in router._routed_timed_out
+
+        # a second, unrelated timeout fires WELL WITHIN id 1's TTL — id 1 must still
+        # be there (a young entry is never evicted just because another, unrelated
+        # call also timed out)
+        fake_now[0] = 5.0
+        router._routed_timers[2] = threading.Timer(1000, lambda: None)
+        router._timeout_routed_call(2, 0)
+        assert 1 in router._routed_timed_out
+
+        # time passes past id 1's TTL (age 12 > 10) but NOT id 2's (age 12 - 5 = 7 <
+        # 10) — the next timeout's proactive age-based sweep must clean up only the
+        # genuinely stale one, with population nowhere near the (65536) backstop,
+        # proving eviction here is driven by age, not by population pressure
+        fake_now[0] = 12.0
+        router._routed_timers[3] = threading.Timer(1000, lambda: None)
+        router._timeout_routed_call(3, 0)
+        assert 1 not in router._routed_timed_out
+        assert 2 in router._routed_timed_out  # still within its own TTL window
+    finally:
+        router.close_senders()
+
+
+def test_drain_routed_calls_waits_out_in_flight_timeout_before_shutdown():
+    # Regression: run_multi_proxy drained in-flight broadcasts before shutdown but had
+    # no equivalent drain for routed calls — a client disconnecting right after issuing
+    # a routed call to a slow/dead peer would have its still-pending timer torn down
+    # mid-wait instead of given the same bounded-timeout guarantee as broadcasts.
+    t0 = _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=0.05)
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "a__gh.api.items"}}))
+        assert len(_lines(out)) == 0
+
+        router.drain_routed_calls()  # blocks until the 0.05s timer fires
+
+        assert len(_lines(out)) == 1
+        assert "timed out" in _lines(out)[0]["error"]["message"]
+    finally:
+        router.close_senders()
+
+
+def test_merge_initialize_protocol_version_uses_arrival_order_not_config_index():
+    # Regression: _merge_initialize iterated peers by fixed config index
+    # (range(len(self.peers))), so the merged protocolVersion always came from
+    # whichever peer had the LOWEST index that answered — not whichever genuinely
+    # replied FIRST, contradicting the method's own documented "first-arriving
+    # peer's" contract. Here peer 1 (higher config index) answers first; the merge
+    # must pick peer 1's protocolVersion, not peer 0's.
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+        # peer 1 (index 1, config-later) answers FIRST
+        router.from_peer(1)(json.dumps(
+            {"jsonrpc": "2.0", "id": "terse-b0-1",
+             "result": {"protocolVersion": "FIRST-ARRIVAL", "capabilities": {}}}))
+        # peer 0 (index 0, config-earlier) answers SECOND
+        router.from_peer(0)(json.dumps(
+            {"jsonrpc": "2.0", "id": "terse-b0-0",
+             "result": {"protocolVersion": "SECOND-ARRIVAL", "capabilities": {}}}))
+    finally:
+        router.close_senders()
+
+    merged = _lines(out)[0]
+    assert merged["result"]["protocolVersion"] == "FIRST-ARRIVAL"
+
+
+def test_broadcast_initialize_does_not_leave_stale_init_id_on_peer():
+    # Regression: note_request set each peer's Interceptor.init_id to the broadcast-
+    # local id (e.g. "terse-b0-1"), but that peer's real reply is swallowed by
+    # _maybe_collect before transform_response ever runs its one-time reset — so
+    # init_id stayed permanently stale (see test_clear_init_id_prevents_stale_reply_
+    # misidentification in test_proxy.py for what that staleness could corrupt).
+    t0 = _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+        assert peers[0].inter.init_id is None  # cleared immediately, not left stale
+
+        # peer answers the broadcast normally — still cleared, not repopulated
+        router.from_peer(0)(json.dumps(
+            {"jsonrpc": "2.0", "id": "terse-b0-0",
+             "result": {"protocolVersion": "2024-11-05", "capabilities": {}}}))
+        assert peers[0].inter.init_id is None
+    finally:
+        router.close_senders()
 
 
 def test_reused_client_id_during_broadcast_resolves_to_correct_broadcast():

@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from . import capture
 from . import fluency
@@ -92,28 +92,30 @@ def _staged_apply(obj: Any, rule: Any, tool: str) -> tuple[policy_mod.Applied, d
     return applied, staging
 
 
-def gen_drop_questions(obj: Any, rule: Any, tool: str) -> list[DropQuestion]:
-    """Generate one recall + one precision question for a record-shaped payload that
-    actually has a drop-marked field, else [] (nothing to test — fail closed rather than
-    fabricate an un-answerable question, mirroring the rest of this project's honesty
-    bar). Only a direct scalar field on the record list (e.g. `result[].body`) is
-    supported in v1 — matches the drop path shapes exercised in test_proxy.py/#10.
-    """
+def _questions_and_staging(
+    obj: Any, rule: Any, tool: str
+) -> tuple[list[DropQuestion], Optional[policy_mod.Applied], Optional[dict[str, Any]]]:
+    """Shared core of `gen_drop_questions`: generates the (recall, precision) question
+    pair AND returns the `(applied, staging)` that `_staged_apply` computed along the
+    way, so `run_drop_payload` can reuse them instead of a second `policy.apply()` pass
+    over the same payload. `applied`/`staging` are only meaningful when the question
+    list is non-empty — every early-exit path returns `None` for both instead of
+    fabricating a value the caller has no use for anyway."""
     if not lossy_mod._drop_specs(rule):
-        return []  # nothing marked drop-to-retrieve on this rule -> nothing to test
+        return [], None, None  # nothing marked drop-to-retrieve on this rule -> nothing to test
 
     records, list_path = capture.find_record_list_with_path(obj)
     if records is None or list_path is None:
-        return []  # not record-shaped (or no simple field path) -> terse wouldn't drop here
+        return [], None, None  # not record-shaped (or no simple field path) -> terse wouldn't drop here
 
     applied, staging = _staged_apply(obj, rule, tool)
     if applied.skipped or not staging:
-        return []  # every candidate field was under the size floor, or the gate failed
+        return [], None, None  # every candidate field was under the size floor, or the gate failed
 
     cols = list(records[0].keys())
     idcol = fluency._pick_id_col(records, cols)
     if idcol is None:
-        return []  # can't address a specific record without a unique scalar id column
+        return [], None, None  # can't address a specific record without a unique scalar id column
 
     # Find the (record, field) whose handle actually landed in `staging` — content-
     # addressed handles are deterministic (sha1 of tool+path+serialized value, no RNG),
@@ -141,7 +143,7 @@ def gen_drop_questions(obj: Any, rule: Any, tool: str) -> list[DropQuestion]:
         if hit is not None:
             break
     if hit is None:
-        return []
+        return [], None, None
     ri, field_name, value, handle = hit
 
     recall_q = DropQuestion(
@@ -161,7 +163,7 @@ def gen_drop_questions(obj: Any, rule: Any, tool: str) -> list[DropQuestion]:
     # the dropped value — a robust, deterministic no-overfetch probe.
     count_q = next((q for q in fluency.gen_questions(obj) if q.qtype == "count"), None)
     if count_q is None:
-        return []
+        return [], None, None
     precision_q = DropQuestion(
         qid="drop-precision",
         kind="precision",
@@ -171,7 +173,18 @@ def gen_drop_questions(obj: Any, rule: Any, tool: str) -> list[DropQuestion]:
         needs_retrieve=False,
         expected_handle=None,
     )
-    return [recall_q, precision_q]
+    return [recall_q, precision_q], applied, staging
+
+
+def gen_drop_questions(obj: Any, rule: Any, tool: str) -> list[DropQuestion]:
+    """Generate one recall + one precision question for a record-shaped payload that
+    actually has a drop-marked field, else [] (nothing to test — fail closed rather than
+    fabricate an un-answerable question, mirroring the rest of this project's honesty
+    bar). Only a direct scalar field on the record list (e.g. `result[].body`) is
+    supported in v1 — matches the drop path shapes exercised in test_proxy.py/#10.
+    """
+    questions, _applied, _staging = _questions_and_staging(obj, rule, tool)
+    return questions
 
 
 # --------------------------------------------------------------------------- #
@@ -250,24 +263,14 @@ def _run_question(question: DropQuestion, applied_text: str, staging: dict[str, 
     return retrieve_ok, answer_ok, handle_ok
 
 
-def run_drop_payload(obj: Any, raw: str, rule: Any, tool: str, answerer: ToolAnswerer,
-                     trials: int = 1) -> list[dict]:
-    """Ask each of a payload's drop questions `trials` times over the real 2-turn
-    protocol. Returns one row per question carrying per-metric success COUNTS (0..trials)
-    plus `trials` — the same convention fluency.py uses so report.py's `_form_stats`
-    works unchanged. [] if the payload has no drop-marked field (nothing to test).
-    """
-    questions = gen_drop_questions(obj, rule, tool)
-    if not questions:
-        return []
-
-    # `raw` is accepted for interface symmetry with fluency's run_payload/run_diff_payload
-    # (and so a future caller could pass the originally-captured text); the compressed-
-    # with-markers text and the drop store must come from the SAME apply() call the
-    # questions were derived from, so recompute from `obj` exactly as gen_drop_questions
-    # did rather than trust a possibly-stale `raw`.
-    applied, staging = _staged_apply(obj, rule, tool)
-
+def _run_questions_against(questions: list[DropQuestion], applied: policy_mod.Applied,
+                           staging: dict[str, Any], answerer: ToolAnswerer,
+                           trials: int = 1) -> list[dict]:
+    """Run `trials` trials of the real 2-turn retrieve protocol for each of `questions`
+    against one `answerer`, over an already-staged `(applied, staging)` pair. Split out
+    of `run_drop_payload` so `run_drop_fluency` can compute `_questions_and_staging`
+    ONCE per envelope and reuse it across every configured model, instead of
+    re-deriving it (a JSON parse + a `policy.apply()` pass) once per model."""
     rows: list[dict] = []
     for q in questions:
         retrieve_ok = answer_ok = handle_ok = 0
@@ -283,25 +286,52 @@ def run_drop_payload(obj: Any, raw: str, rule: Any, tool: str, answerer: ToolAns
     return rows
 
 
+def run_drop_payload(obj: Any, raw: str, rule: Any, tool: str, answerer: ToolAnswerer,
+                     trials: int = 1) -> list[dict]:
+    """Ask each of a payload's drop questions `trials` times over the real 2-turn
+    protocol. Returns one row per question carrying per-metric success COUNTS (0..trials)
+    plus `trials` — the same convention fluency.py uses so report.py's `_form_stats`
+    works unchanged. [] if the payload has no drop-marked field (nothing to test).
+    """
+    # `raw` is accepted for interface symmetry with fluency's run_payload/run_diff_payload
+    # (and so a future caller could pass the originally-captured text); the compressed-
+    # with-markers text and the drop store must come from the SAME apply() call the
+    # questions were derived from, so this reuses _questions_and_staging's own
+    # (applied, staging) rather than recomputing them with a second policy.apply() pass,
+    # and rather than trusting a possibly-stale `raw`.
+    questions, applied, staging = _questions_and_staging(obj, rule, tool)
+    if not questions:
+        return []
+    assert applied is not None and staging is not None  # guaranteed when questions is non-empty
+    return _run_questions_against(questions, applied, staging, answerer, trials=trials)
+
+
 def run_drop_fluency(envelopes: list[dict], rule_for: Callable[[str], Any],
                      answerers: dict[str, ToolAnswerer], trials: int = 1) -> dict:
     """Run the drop-eval for each named tool-capable answerer over every record-shaped,
     drop-marked payload in the corpus. Mirrors `fluency.run_diff_fluency`'s shape.
     Returns {model_name: [scored_row, ...]}; a payload/tool with no drop-marked field
-    contributes no rows (gen_drop_questions returns [] for it)."""
-    results: dict[str, list[dict]] = {}
-    for name, fn in answerers.items():
-        rows: list[dict] = []
-        for env in envelopes:
-            try:
-                obj = json.loads(env["raw"])
-            except (json.JSONDecodeError, TypeError):
-                continue
-            tool = env["tool"]
-            rule = rule_for(tool)
-            for row in run_drop_payload(obj, env["raw"], rule, tool, fn, trials=trials):
-                rows.append({"tool": tool, "sha": env.get("sha", "?"), **row})
-        results[name] = rows
+    contributes no rows (gen_drop_questions returns [] for it).
+
+    Loop nesting is envelope-outer, model-inner (not the reverse): the JSON parse and
+    `_questions_and_staging` derivation for a payload are the SAME regardless of which
+    model answers it, so doing that work per-envelope instead of per-(model, envelope)
+    avoids M times the redundant parsing/policy.apply() work for M configured models."""
+    results: dict[str, list[dict]] = {name: [] for name in answerers}
+    for env in envelopes:
+        try:
+            obj = json.loads(env["raw"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        tool = env["tool"]
+        rule = rule_for(tool)
+        questions, applied, staging = _questions_and_staging(obj, rule, tool)
+        if not questions:
+            continue
+        assert applied is not None and staging is not None
+        for name, fn in answerers.items():
+            for row in _run_questions_against(questions, applied, staging, fn, trials=trials):
+                results[name].append({"tool": tool, "sha": env.get("sha", "?"), **row})
     return results
 
 

@@ -39,6 +39,22 @@ def test_tracks_request_and_compresses_matching_result():
     assert inter.pending == {}                            # id consumed
 
 
+def test_error_reply_pops_pending_entry_too():
+    # Regression: transform_response's early-return guard checked "result" not in msg
+    # BEFORE popping pending, so an error-shaped reply (no "result" key — e.g. a
+    # genuine downstream JSON-RPC error, or HttpTransport's own synthesized fail-open
+    # error) left its pending entry lingering until PENDING_MAX eviction instead of
+    # being cleaned up immediately.
+    inter = Interceptor(FULL)
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                                   "params": {"name": "gh.api.items"}}))
+    error_reply = json.dumps({"jsonrpc": "2.0", "id": 7,
+                              "error": {"code": -32000, "message": "boom"}})
+    out = inter.transform_response(error_reply)
+    assert out == error_reply         # forwarded unchanged — not a tracked result
+    assert inter.pending == {}        # but the pending entry was still popped
+
+
 def test_pending_map_is_bounded_under_unanswered_calls():
     # tools/call ids that never get a result (timed-out / abandoned) must not leak the
     # pending map without bound (#22). Evicts oldest-first; recent ids survive.
@@ -380,6 +396,28 @@ def test_untracked_initialize_passes_through_unchanged():
     assert inter.transform_response(resp) == resp
 
 
+def test_clear_init_id_prevents_stale_reply_misidentification():
+    # Regression (multiproxy broadcast case): note_request sets init_id, but if the
+    # reply carrying that id never reaches transform_response (multiproxy swallows a
+    # broadcast peer's reply and merges it separately), the one-time reset never fires
+    # and init_id stays stale — a LATER unrelated reply reusing that same id would then
+    # be misidentified as the initialize reply and corrupted via _augment_initialize.
+    # clear_init_id() lets a caller reset it proactively when it knows the reply won't
+    # flow through transform_response.
+    inter = Interceptor(FULL)
+    inter.note_request(_init_req("terse-b0-1"))
+    assert inter.init_id == "terse-b0-1"
+    inter.clear_init_id()
+    assert inter.init_id is None
+
+    # a later, unrelated tools/call reply that happens to reuse that exact id string
+    # must be treated as a normal (untracked) message, not an initialize reply.
+    later = json.dumps({"jsonrpc": "2.0", "id": "terse-b0-1",
+                        "result": {"content": [{"type": "text", "text": "normal"}]}})
+    out = json.loads(inter.transform_response(later))
+    assert "instructions" not in out["result"]  # NOT run through _augment_initialize
+
+
 def test_primer_injected_once_not_per_message():
     inter = Interceptor(FULL)
     inter.note_request(_init_req(1))
@@ -401,6 +439,32 @@ def test_capture_tees_raw_text_before_compression():
     # captured payload is the RAW pre-compression text, tagged by tool...
     assert captured == [("gh.api.items", raw)]
     # ...while the client still received the compressed (transformed) form
+    assert json.loads(out)["result"]["content"][0]["text"] != raw
+
+
+def test_note_request_tool_name_qualifies_capture_but_not_policy_selection():
+    # Regression (multiproxy): capture/audit must see a peer-qualified tool name (so
+    # two peers' same-named tools don't collide into one capture-corpus bucket), but
+    # compression/policy-tier lookup must still use the BARE name the policy's own
+    # rules match against — conflating the two broke policy selection for a peer with
+    # a custom policy_path.
+    captured: list[tuple[str, str]] = []
+    audited = []
+    inter = Interceptor(FULL, capture=lambda tool, raw: captured.append((tool, raw)),
+                        audit=audited.append)
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                                   "params": {"name": "gh.api.items"}}),
+                       tool_name="gh__gh.api.items")
+    raw = _records_text()
+    out = inter.transform_response(_result_msg(7, raw))
+
+    # capture sees the peer-qualified name...
+    assert captured == [("gh__gh.api.items", raw)]
+    # ...and so does the audit record's display field...
+    assert audited[0]["tool"] == "gh__gh.api.items"
+    # ...but the policy still matched (and compressed) against the BARE name, exactly
+    # as it would have without the peer prefix.
+    assert audited[0]["tiers"] == ["minify", "tabularize", "dictionary"]
     assert json.loads(out)["result"]["content"][0]["text"] != raw
 
 
@@ -712,6 +776,52 @@ def test_drop_store_refreshes_recency_on_reinsert():
     inter._drop_put("a", "x" * 10)                             # touch a -> most-recent
     inter._drop_put("c", "z" * 10)                             # evict LRU = b
     assert list(inter.dropped) == ["a", "c"] and inter._dropped_bytes_box[0] == 20
+
+
+def test_shared_store_lock_does_not_serialize_unrelated_peers_transform_response():
+    # Regression: a single Lock() shared across every peer's Interceptor used to be
+    # held for transform_response's ENTIRE body (compression + capture/audit I/O), so
+    # one slow peer's response processing blocked every other peer sharing that lock —
+    # even though only the drop store (self.dropped/_dropped_bytes_box) actually needs
+    # cross-peer exclusion. _local_lock (always private) now covers the bulk of the
+    # method; _store_lock (the one multiproxy shares) covers only _drop_put/
+    # answer_retrieve. Prove it directly: a slow capture callback on peer A must not
+    # delay peer B's transform_response, even though they share a store_lock.
+    import threading
+    import time
+
+    shared_store: dict = {}
+    shared_store_lock = threading.Lock()
+
+    started_a = threading.Event()
+    release_a = threading.Event()
+
+    def slow_capture(tool, raw):
+        started_a.set()
+        release_a.wait(timeout=5)  # blocks peer A's transform_response indefinitely
+
+    inter_a = Interceptor(FULL, capture=slow_capture, store=shared_store,
+                          store_lock=shared_store_lock)
+    inter_b = Interceptor(FULL, store=shared_store, store_lock=shared_store_lock)
+    inter_a.note_request(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                     "params": {"name": "gh.api.items"}}))
+    inter_b.note_request(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                     "params": {"name": "gh.api.items"}}))
+
+    t_a = threading.Thread(target=lambda: inter_a.transform_response(
+        _result_msg(1, _records_text())))
+    t_a.start()
+    assert started_a.wait(timeout=5)  # peer A is now blocked mid-transform_response
+
+    # peer B's transform_response must complete promptly — NOT wait for peer A.
+    start = time.monotonic()
+    out_b = inter_b.transform_response(_result_msg(2, _records_text()))
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.0, f"peer B waited {elapsed:.2f}s — still serialized behind peer A"
+    assert json.loads(out_b)["result"]["content"][0]["text"] != _records_text()  # B compressed fine
+
+    release_a.set()
+    t_a.join(timeout=5)
 
 
 # --- drop-to-retrieve: serving terse.retrieve (#10, Phase 3) ---

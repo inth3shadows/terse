@@ -143,8 +143,13 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
     if args.config:
         from .multiproxy import run_multi_proxy
         try:
+            # diff_override/diff_keyframe_override (not just the mutated `pol` above)
+            # so --diff also applies to a peer with its OWN policy_path, not just
+            # peers using this default policy.
             return run_multi_proxy(args.config, pol, debug=args.debug,
-                                   capture_dir=args.capture_dir, debug_log=args.debug_log)
+                                   capture_dir=args.capture_dir, debug_log=args.debug_log,
+                                   diff_override=args.diff,
+                                   diff_keyframe_override=args.diff_keyframe_interval)
         except (OSError, ValueError) as e:
             print(f"proxy --config: {e}", file=sys.stderr)
             return 2
@@ -267,56 +272,30 @@ def _cmd_probe(args: argparse.Namespace) -> int:
     return 0
 
 
-def _build_answerers(args: argparse.Namespace) -> dict:
-    """Assemble named answerers from env + flags. Empty means keyless (pack) mode."""
+def _build_answerers(args: argparse.Namespace, make_openai, make_anthropic, *,
+                     warn_label: str = "anthropic") -> dict:
+    """Assemble named answerers from env + flags. Empty means keyless (pack) mode.
+
+    Shared by plain `fluency` (`make_openai=fluency.openai_answerer`) and
+    `fluency --drop-eval` (`make_openai` bound to `dropeval.openai_tool_answerer` +
+    the retrieve tool) so the two eval modes stay configured identically — only the
+    answerer FACTORY differs, never the env/flag precedence."""
     import os
 
-    from . import fluency
-
-    answerers: dict = {}
     # Flags win over env so a credential-injecting launcher (e.g. secret_inject_env,
     # which sets the key under its own env var) can drive the CLI without a shell.
-    base = args.base_url or os.environ.get("TERSE_FLUENCY_BASE_URL")
-    key = os.environ.get(args.api_key_env or "TERSE_FLUENCY_API_KEY")
-    models = args.models or os.environ.get("TERSE_FLUENCY_MODELS", "")
-    if base and key and models:
-        for m in (x.strip() for x in models.split(",") if x.strip()):
-            answerers[m] = fluency.openai_answerer(base, key, m)
-    if args.anthropic:
-        try:
-            answerers[f"anthropic:{args.anthropic_model}"] = fluency.anthropic_answerer(
-                args.anthropic_model
-            )
-        except Exception as e:  # missing extra/key — fall back, don't crash the run
-            print(f"[warn] anthropic answerer unavailable: {e}", file=sys.stderr)
-    return answerers
-
-
-def _build_tool_answerers(args: argparse.Namespace) -> dict:
-    """The tool-calling twin of `_build_answerers`, for `fluency --drop-eval`. Same env/
-    flag precedence (flags win over env; TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS or
-    --anthropic) so the two eval modes are configured identically — just returns
-    `dropeval.ToolAnswerer`s bound to the synthetic retrieve tool instead of plain
-    fluency.Answerer callables."""
-    import os
-
-    from . import dropeval
-    from .proxy import RETRIEVE_TOOL_DEF
-
     answerers: dict = {}
     base = args.base_url or os.environ.get("TERSE_FLUENCY_BASE_URL")
     key = os.environ.get(args.api_key_env or "TERSE_FLUENCY_API_KEY")
     models = args.models or os.environ.get("TERSE_FLUENCY_MODELS", "")
     if base and key and models:
         for m in (x.strip() for x in models.split(",") if x.strip()):
-            answerers[m] = dropeval.openai_tool_answerer(base, key, m, tools=[RETRIEVE_TOOL_DEF])
+            answerers[m] = make_openai(base, key, m)
     if args.anthropic:
         try:
-            answerers[f"anthropic:{args.anthropic_model}"] = dropeval.anthropic_tool_answerer(
-                args.anthropic_model, tools=[RETRIEVE_TOOL_DEF]
-            )
+            answerers[f"anthropic:{args.anthropic_model}"] = make_anthropic(args.anthropic_model)
         except Exception as e:  # missing extra/key — fall back, don't crash the run
-            print(f"[warn] anthropic tool answerer unavailable: {e}", file=sys.stderr)
+            print(f"[warn] {warn_label} answerer unavailable: {e}", file=sys.stderr)
     return answerers
 
 
@@ -324,7 +303,11 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
     from . import dropeval, fluency
     from .policy import default_policy, load_policy
     from .report import build_diff_report, build_dropeval_report, build_fluency_report
-    from .terminal_report import build_terminal_diff_report, build_terminal_fluency_report
+    from .terminal_report import (
+        build_terminal_diff_report,
+        build_terminal_dropeval_report,
+        build_terminal_fluency_report,
+    )
 
     envelopes = load_corpus(args.corpus)
     if not envelopes:
@@ -341,19 +324,29 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             print("`fluency --drop-eval` needs a policy with a drop-to-retrieve field "
                   "(pass --policy).")
             return 1
-        answerers = _build_tool_answerers(args)
+        from .proxy import RETRIEVE_TOOL_DEF
+
+        answerers = _build_answerers(
+            args,
+            lambda base, key, m: dropeval.openai_tool_answerer(base, key, m,
+                                                                tools=[RETRIEVE_TOOL_DEF]),
+            lambda model: dropeval.anthropic_tool_answerer(model, tools=[RETRIEVE_TOOL_DEF]),
+            warn_label="anthropic tool",
+        )
         if not answerers:
             print("`fluency --drop-eval` needs a configured model: set TERSE_FLUENCY_BASE_URL/"
                   "_API_KEY/_MODELS or pass --anthropic.")
             return 1
         results = dropeval.run_drop_fluency(envelopes, pol.select, answerers, trials=args.trials)
         _write_report(build_dropeval_report(results), args.out)
+        if args.bars:
+            print("\n" + build_terminal_dropeval_report(results))
         return 0
 
     # Diff mode: does a model read a cross-call DIFF as well as the full result? Needs a
     # live model (it measures comprehension of a form, not ground-truth math).
     if args.diff:
-        answerers = _build_answerers(args)
+        answerers = _build_answerers(args, fluency.openai_answerer, fluency.anthropic_answerer)
         if not answerers:
             print("`fluency --diff` needs a configured model: set TERSE_FLUENCY_BASE_URL/"
                   "_API_KEY/_MODELS or pass --anthropic.")
@@ -375,7 +368,7 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             print("\n" + build_terminal_fluency_report(results))
         return 0
 
-    answerers = _build_answerers(args)
+    answerers = _build_answerers(args, fluency.openai_answerer, fluency.anthropic_answerer)
     if not answerers:
         # Keyless default: write the eval pack and explain how to drive it. The pack
         # embeds each payload's RAW captured text (fluency.build_pack) — the same
@@ -465,6 +458,14 @@ def _redact_args(args: list) -> list:
 def _short_cmd(entry) -> str:
     if not entry:
         return "(absent)"
+    if "url" in entry:
+        # A url/headers-shaped entry (#5 HTTP downstream) has no "command"/"args" at
+        # all — falling through to entry.get("command", "?") used to print just "?",
+        # silently losing the url/headers info from the before/after display.
+        parts = [entry.get("url", "?")]
+        for k, v in (entry.get("headers") or {}).items():
+            parts += ["--header", _redact_header_value(f"{k}={v}")]
+        return " ".join(parts)[:100]
     args = _redact_args(entry.get("args", []))
     return " ".join([entry.get("command", "?"), *args])[:100]
 

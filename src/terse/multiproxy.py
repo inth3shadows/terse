@@ -37,9 +37,9 @@ from __future__ import annotations
 
 import json
 import queue
-import signal
 import sys
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,14 +48,23 @@ from typing import Any, Callable, Optional, TextIO
 
 from . import lossy as lossy_mod
 from . import policy as policy_mod
-from .proxy import RETRIEVE_TOOL_DEF, SWALLOW, TERSE_PRIMER, Interceptor, pump
-from .transport import HttpTransport, Transport, build_transport
+from .proxy import (
+    RETRIEVE_TOOL_DEF,
+    SWALLOW,
+    TERSE_PRIMER,
+    Interceptor,
+    _build_capture_and_audit,
+    _ignore_sigterm,
+    _install_sigterm_to_exit,
+    _restore_sigterm,
+    pump,
+)
+from .transport import Transport, build_transport
 
-# Tool-name prefix separator. Double underscore, not a dot: MCP/OpenAI function names
-# are commonly constrained to `^[a-zA-Z0-9_-]+$`, and a real downstream tool name can
-# already contain a dot (e.g. `gh.api.items`) — `.` as a separator would be ambiguous
-# to split back apart, `__` isn't.
-PREFIX_SEP = "__"
+# Tool-name prefix separator — defined in policy.py (not here) so Policy.select can
+# recognize and strip it when matching a captured, peer-qualified corpus tool name
+# against a rule authored for the downstream tool's own bare name.
+PREFIX_SEP = policy_mod.PREFIX_SEP
 
 # How long a broadcast (initialize/tools/list) waits for every peer before merging
 # whatever arrived and moving on. Module-level so a test can shrink it (a dead-peer
@@ -80,6 +89,21 @@ _LOCAL_ID_MAP_MAX = 4096
 # requests (sampling/createMessage, roots) the client never answers can't grow this
 # unboundedly — an evicted entry just means that particular late reply is dropped.
 _SERVER_REQ_MAX = 1024
+
+# Bound on `Router._routed_timed_out`. UNLIKE `_local_id_map`'s eviction (harmless: a
+# broadcast-local id is namespaced, so an evicted-then-late reply just fails to match
+# anything and is dropped), a routed call's id is the CLIENT'S OWN live id — an
+# evicted-then-late reply looks exactly like a real second answer and WOULD be
+# delivered to the client, double-answering it. `_timeout_routed_call` now ages entries
+# out primarily by TIME (`Router._routed_timed_out_ttl`, a multiple of
+# `broadcast_timeout`), not population count: an id is dropped once it's old enough
+# that its peer's reply is essentially never coming. A plain OrderedDict is still
+# FIFO-ordered by insertion time, so a population cap alone would evict in the SAME
+# oldest-first order age-based eviction does — the fix here is sizing `_MAX` large
+# enough (not 4096) that a realistic burst of concurrent timeouts during a peer stall
+# never forces population-based eviction to remove something still younger than the
+# TTL; `_MAX` remains only as a backstop against truly pathological/unbounded growth.
+_ROUTED_TIMED_OUT_MAX = 65536
 
 
 @dataclass
@@ -297,6 +321,19 @@ class Router:
         # _SERVER_REQ_MAX eviction.
         self._server_requests: "OrderedDict[str, tuple[int, Any]]" = OrderedDict()
         self._server_req_seq = 0
+        # client id -> Timer, for a routed (single-peer) tools/call awaiting reply —
+        # mirrors _broadcast's BROADCAST_TIMEOUT guarantee ("a dead peer can't wedge
+        # it") for the routed path, which previously had no bound at all: a hung/dead
+        # stdio peer left the client's request unanswered forever. Whichever side wins
+        # the race to pop an entry (the real reply in from_peer, or _timeout_routed_call
+        # firing) is the one that answers the client; the loser does nothing.
+        self._routed_timers: dict[Any, threading.Timer] = {}
+        # ids whose routed call already got a synthesized timeout reply, mapped to the
+        # monotonic time that happened — the peer's eventual real (late) reply must be
+        # swallowed here, not double-delivered. Aged out by `_routed_timed_out_ttl`, not
+        # by population count (see `_ROUTED_TIMED_OUT_MAX`'s comment above).
+        self._routed_timed_out: "OrderedDict[Any, float]" = OrderedDict()
+        self._routed_timed_out_ttl = broadcast_timeout * 4
 
     # ---------- client -> server ----------
 
@@ -387,7 +424,31 @@ class Router:
                 # The CLIENT's original id passes through unchanged: exactly one peer
                 # ever answers a routed call, so there's no id collision risk here (that
                 # risk only exists for the broadcast methods, which DO remap ids).
-                self.peers[idx].inter.note_request(rewritten_line)
+                # tool_name is the PEER-QUALIFIED name (e.g. "gh__search") — capture/
+                # audit bookkeeping must not collide two different peers' same-named
+                # tools into one corpus bucket, even though the wire line sent to the
+                # downstream uses the bare name it actually expects.
+                self.peers[idx].inter.note_request(rewritten_line, tool_name=name)
+                if mid is not None:
+                    # Bound the wait — a hung/dead peer must not wedge this call
+                    # forever, matching _broadcast's BROADCAST_TIMEOUT guarantee.
+                    # Registered BEFORE the peer write below (mirroring _broadcast's own
+                    # bookkeeping-then-send order): a peer fast enough to reply before
+                    # this line ran would otherwise race from_peer's pop against this
+                    # registration, leaving an orphaned timer that later fires a
+                    # spurious timeout at a client who already got the real answer.
+                    # Cancel-and-replace any prior timer for this id the same way
+                    # _broadcast's _active_seq handling does, in case a client reuses an
+                    # id (a protocol violation, but one worth failing safe against).
+                    timer = threading.Timer(self.broadcast_timeout,
+                                            self._timeout_routed_call, args=(mid, idx))
+                    timer.daemon = True
+                    with self._pending_lock:
+                        prior = self._routed_timers.pop(mid, None)
+                        if prior is not None:
+                            prior.cancel()
+                        self._routed_timers[mid] = timer
+                    timer.start()
                 self._write_peer(idx, rewritten_line)
                 return
 
@@ -449,6 +510,13 @@ class Router:
             # only acts on initialize/tools/call methods) — calling it unconditionally
             # here is simpler than branching on `kind`.
             peer.inter.note_request(line)
+            if kind == "initialize":
+                # note_request just set init_id to this broadcast-local id, but this
+                # peer's reply is intercepted by _maybe_collect/_merge_initialize below
+                # — it never reaches transform_response, so its one-time reset never
+                # fires. Clear it immediately: multiproxy builds its own merged
+                # initialize reply, so this peer's init_id has no other purpose.
+                peer.inter.clear_init_id()
             self._write_peer(i, line)
 
     def _broadcast_notification(self, line: str) -> None:
@@ -493,8 +561,25 @@ class Router:
                     # can be routed back to THIS peer specifically (see
                     # _rewrite_server_request / route_client_line's method-is-None
                     # branch), instead of the prior v1 gap where it was forwarded
-                    # verbatim and any reply defaulted to peer 0.
+                    # verbatim and any reply defaulted to peer 0. Checked BEFORE
+                    # `_routed_timers` below: a peer's own request id is unnamespaced and
+                    # drawn from the same space a client's routed-call id lives in, so
+                    # treating it as a possible routed-call reply first could pop/cancel
+                    # an unrelated in-flight call's timeout purely on id coincidence.
                     return self._rewrite_server_request(peer_idx, msg)
+                mid = msg["id"]
+                with self._pending_lock:
+                    timer = self._routed_timers.pop(mid, None)
+                    already_timed_out = timer is None and mid in self._routed_timed_out
+                    if already_timed_out:
+                        del self._routed_timed_out[mid]
+                if timer is not None:
+                    timer.cancel()
+                if already_timed_out:
+                    # The routed call's timeout already answered the client — this is
+                    # the peer's late real reply arriving after the fact; swallow it
+                    # rather than double-answering.
+                    return SWALLOW
             # A normal routed response (or the v1 forward-to-peer-0 passthrough): run it
             # through THIS peer's own Interceptor so its per-peer diff/drop/compress
             # state applies correctly. `note_request` was told the REWRITTEN/bare tool
@@ -562,6 +647,18 @@ class Router:
         for timer in timers:
             timer.join(timeout=self.broadcast_timeout + 1.0)
 
+    def drain_routed_calls(self) -> None:
+        """The routed-call counterpart to `drain_pending_broadcasts`: block until every
+        in-flight routed `tools/call` has either replied or hit its own timeout, instead
+        of having its still-pending `Timer` torn down mid-wait by shutdown. Without this,
+        a client that disconnects right after issuing a routed call to a slow/dead peer
+        would get an abruptly severed connection instead of the timeout error
+        `_timeout_routed_call` is meant to guarantee."""
+        with self._pending_lock:
+            timers = list(self._routed_timers.values())
+        for timer in timers:
+            timer.join(timeout=self.broadcast_timeout + 1.0)
+
     def _timeout_broadcast(self, seq: int) -> None:
         with self._pending_lock:
             pb = self._pending.get(seq)
@@ -575,6 +672,41 @@ class Router:
                          "merging with whatever arrived — a dead/slow peer never wedges "
                          "the proxy\n")
         self._finish_broadcast(seq)
+
+    def _timeout_routed_call(self, mid: Any, peer_idx: int) -> None:
+        """Fires if a routed (single-peer) `tools/call`'s target peer never replies
+        within `broadcast_timeout` — the routed-call counterpart to `_timeout_broadcast`.
+        Whichever side (this timer, or the real reply in `from_peer`) wins the race to
+        pop `_routed_timers[mid]` is the one that answers the client; if this timer
+        wins, the id is remembered in `_routed_timed_out` so the peer's eventual late
+        real reply is swallowed instead of double-answering the client."""
+        with self._pending_lock:
+            timer = self._routed_timers.pop(mid, None)
+            if timer is None:
+                return  # the real reply already arrived and cancelled this timer
+            now = time.monotonic()
+            self._routed_timed_out[mid] = now
+            # Age out first (see _ROUTED_TIMED_OUT_MAX's comment): a burst of unrelated
+            # timeouts must not evict an id that's still plausibly awaiting its own
+            # peer's very late reply just because it happens to be the oldest entry.
+            while self._routed_timed_out:
+                oldest_mid, inserted_at = next(iter(self._routed_timed_out.items()))
+                if now - inserted_at <= self._routed_timed_out_ttl:
+                    break
+                del self._routed_timed_out[oldest_mid]
+            # Population cap as a backstop against pathological unbounded growth.
+            while len(self._routed_timed_out) > _ROUTED_TIMED_OUT_MAX:
+                self._routed_timed_out.popitem(last=False)
+        peer_name = self.peers[peer_idx].name if 0 <= peer_idx < len(self.peers) else "?"
+        sys.stderr.write(f"[terse-multiproxy] peer {peer_name!r} did not answer "
+                         f"tools/call id={mid!r} within {self.broadcast_timeout}s — "
+                         "replying with a timeout error; a dead/slow peer never wedges "
+                         "a routed call\n")
+        self._write_client(json.dumps(
+            {"jsonrpc": "2.0", "id": mid, "error": {
+                "code": -32001,
+                "message": f"terse-multiproxy: peer {peer_name!r} timed out"}},
+            separators=(",", ":"), ensure_ascii=False))
 
     def _finish_broadcast(self, seq: int) -> None:
         with self._pending_lock:
@@ -630,8 +762,12 @@ class Router:
         protocol_version: Optional[str] = None
         capabilities: dict = {}
         instructions_parts: list[str] = []
-        for i in range(len(self.peers)):
-            result = pb.parts.get(i, {}).get("result")
+        # Iterate pb.parts in ITS OWN (insertion) order, not range(len(self.peers))
+        # (fixed config order) — pb.parts[peer_idx] = msg is only ever written under
+        # _pending_lock as each reply genuinely lands (see _maybe_collect), so its
+        # insertion order IS true arrival order, matching this method's own
+        # "first-arriving"/"arrival order" contract below.
+        for result in (part.get("result") for part in pb.parts.values()):
             if not isinstance(result, dict):
                 continue
             if protocol_version is None and isinstance(result.get("protocolVersion"), str):
@@ -660,24 +796,35 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                  debug: bool, capture: Optional[Callable[[str, str], None]],
                  audit: Optional[Callable[[dict], None]],
                  store: "OrderedDict[str, Any]", store_lock: Lock,
-                 dropped_bytes: list[int]) -> list[Peer]:
+                 dropped_bytes: list[int], diff_override: bool = False,
+                 diff_keyframe_override: Optional[int] = None) -> list[Peer]:
     """Build every `Peer`: its own `Transport` (stdio or HTTP, via `build_transport`)
     and its own `Interceptor` (per-peer diff/compress state, but the drop store —
-    including its byte-eviction counter — is injected shared). Raises OSError if a
-    stdio peer can't be launched — closes whatever peers WERE already built (their
-    live children/connections) before re-raising, so a bad Nth peer doesn't orphan an
-    earlier peer's already-launched child."""
+    including its byte-eviction counter — is injected shared). Raises on a bad spec —
+    OSError if a stdio peer can't be launched, ValueError if a peer's own policy file
+    is malformed — and closes whatever peers WERE already built (their live
+    children/connections) before re-raising, so a bad Nth peer doesn't orphan an
+    earlier peer's already-launched child. Catches Exception broadly (not just
+    OSError) since policy loading can fail for reasons unrelated to process launch.
+
+    `diff_override`/`diff_keyframe_override` are applied to EVERY peer's policy, not
+    just `default_policy`-derived ones — otherwise a peer with its own `policy_path`
+    silently never sees the CLI's `--diff` opt-in, unlike a peer using the default."""
     peers: list[Peer] = []
     try:
         for spec in specs:
             pol = (policy_mod.load_policy(spec.policy_path) if spec.policy_path
                   else default_policy)
+            if diff_override:
+                pol.diff = True
+            if diff_keyframe_override is not None:
+                pol.diff_keyframe_interval = diff_keyframe_override
             inter = Interceptor(pol, debug=debug, capture=capture, audit=audit,
                                 store=store, store_lock=store_lock,
                                 dropped_bytes=dropped_bytes)
             transport = build_transport(spec.target, headers=spec.headers or None)
             peers.append(Peer(name=spec.name, transport=transport, inter=inter))
-    except OSError:
+    except Exception:
         for peer in peers:
             peer.transport.close()
         raise
@@ -694,13 +841,18 @@ def run_multi_proxy(
     capture_dir: Optional[str] = None,
     debug_log: Optional[str] = None,
     broadcast_timeout: float = BROADCAST_TIMEOUT,
+    diff_override: bool = False,
+    diff_keyframe_override: Optional[int] = None,
 ) -> int:
     """Load `config_path`, build one `Peer` per downstream (own `Transport` + own
     `Interceptor`, all sharing one drop store), spawn one `pump()` reader thread per
     peer (server->client) plus run the client->server fan-out loop on this thread, and
     block until the client's stdin hits EOF. `broadcast_timeout` overrides
     `BROADCAST_TIMEOUT` — a test-only knob so a dead-peer test doesn't need to wait out
-    the real 30s default.
+    the real 30s default. `diff_override`/`diff_keyframe_override` mirror cli.py's
+    single-peer `--diff`/`--diff-keyframe-interval` CLI opt-in — applied to EVERY
+    peer's policy in `_build_peers`, including one loaded from its own `policy_path`,
+    so `--diff` is proxy-wide (not silently skipped for a peer with a custom policy).
 
     Return code: 2 for a bad/missing config (mirrors `run_proxy`'s `stdio_transport_error`
     path), 127 if a stdio peer can't be launched (mirrors `run_proxy`'s OSError path), 0
@@ -716,27 +868,7 @@ def run_multi_proxy(
         sys.stderr.write(f"[terse-multiproxy] {exc}\n")
         return 2
 
-    capture: Optional[Callable[[str, str], None]] = None
-    if capture_dir is not None:
-        from .capture import capture_payload
-
-        def capture(tool: str, raw: str) -> None:
-            try:
-                capture_payload(tool, raw, capture_dir)
-            except Exception as exc:  # noqa: BLE001 — capture is never load-bearing
-                if debug:
-                    sys.stderr.write(f"[terse-multiproxy] capture_payload failed: {exc}\n")
-
-    audit: Optional[Callable[[dict], None]] = None
-    if debug_log is not None:
-        from .capture import append_audit
-
-        def audit(record: dict) -> None:
-            try:
-                append_audit(record, debug_log)
-            except Exception as exc:  # noqa: BLE001 — audit is never load-bearing
-                if debug:
-                    sys.stderr.write(f"[terse-multiproxy] append_audit failed: {exc}\n")
+    capture, audit = _build_capture_and_audit(capture_dir, debug_log, debug, "[terse-multiproxy]")
 
     store: "OrderedDict[str, Any]" = OrderedDict()
     store_lock = Lock()
@@ -745,24 +877,19 @@ def run_multi_proxy(
     try:
         peers = _build_peers(specs, default_policy, debug=debug, capture=capture,
                              audit=audit, store=store, store_lock=store_lock,
-                             dropped_bytes=dropped_bytes)
+                             dropped_bytes=dropped_bytes, diff_override=diff_override,
+                             diff_keyframe_override=diff_keyframe_override)
     except OSError as exc:
         sys.stderr.write(f"[terse-multiproxy] failed to launch a downstream peer: {exc}\n")
         return 127
+    except ValueError as exc:
+        sys.stderr.write(f"[terse-multiproxy] bad downstream policy: {exc}\n")
+        return 2
 
     out_lock = Lock()
     router = Router(peers, cout, out_lock, debug=debug, broadcast_timeout=broadcast_timeout)
 
-    # SIGTERM handling mirrors run_proxy's (#21): convert to a clean SystemExit so every
-    # peer still gets reaped via `finally` instead of the default action bypassing it.
-    prev_sigterm = None
-    installed_sigterm = False
-    try:
-        prev_sigterm = signal.getsignal(signal.SIGTERM)
-        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-        installed_sigterm = True
-    except (ValueError, OSError):
-        pass
+    sigterm_token = _install_sigterm_to_exit()
 
     try:
         threads = [Thread(target=pump,
@@ -784,8 +911,10 @@ def run_multi_proxy(
 
         # A client that disconnects the instant after e.g. `initialize` — before any
         # peer answered — must still get its merged reply; wait out any broadcast still
-        # in flight (bounded by its own timeout) before tearing peers down.
+        # in flight (bounded by its own timeout) before tearing peers down. Same
+        # reasoning for a still-in-flight routed tools/call.
         router.drain_pending_broadcasts()
+        router.drain_routed_calls()
 
         # Stop every peer's background sender BEFORE closing any transport below —
         # otherwise a sender thread could still be mid-write to a transport that's
@@ -793,28 +922,18 @@ def run_multi_proxy(
         router.close_senders()
 
         # Client EOF: let each peer wind down like run_proxy's client_to_server finally
-        # does for a single stdio downstream — half-close a stdio peer's stdin so a
-        # well-behaved child sees EOF and exits on its own; an HTTP peer has no
-        # persistent connection to half-close, so close it outright (pushes the sentinel
-        # that ends its inbound() queue iterator). Then join every reader thread so no
-        # peer output is still in flight when this function returns.
+        # does for a single stdio downstream — transport.half_close() (Transport
+        # method, shared with proxy.py — see transport.py) handles the stdio-vs-HTTP
+        # distinction internally, so this loop needs no isinstance check on the
+        # concrete transport type. Then join every reader thread so no peer output is
+        # still in flight when this function returns.
         for peer in peers:
-            if isinstance(peer.transport, HttpTransport):
-                peer.transport.close()
-            else:
-                try:
-                    peer.transport.outbound().close()
-                except Exception:  # noqa: BLE001 — best-effort half-close
-                    pass
+            peer.transport.half_close()
         for t in threads:
             t.join(timeout=2.0)
         return 0
     finally:
-        if installed_sigterm:
-            try:
-                signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            except (ValueError, OSError):
-                pass
+        _ignore_sigterm(sigterm_token)
         # Idempotent defense-in-depth: if the try block raised before reaching the
         # normal close_senders()/transport-teardown sequence above, stop every sender
         # here too before closing transports. A repeat call is a harmless no-op: the
@@ -825,9 +944,4 @@ def run_multi_proxy(
         # stdio child that didn't exit on its own; a harmless repeat close for HTTP).
         for peer in peers:
             peer.transport.close()
-        if installed_sigterm:
-            try:
-                signal.signal(signal.SIGTERM,
-                              prev_sigterm if prev_sigterm is not None else signal.SIG_DFL)
-            except (ValueError, OSError, TypeError):
-                pass
+        _restore_sigterm(sigterm_token)
