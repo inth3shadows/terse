@@ -38,6 +38,19 @@ def test_verify_html_flag_writes_svg_report_alongside_markdown(tmp_path):
     assert "<script" not in text
 
 
+def test_verify_bars_flag_prints_terminal_bars(tmp_path, capsys):
+    payload = json.dumps([{"id": 1, "name": "alpha"}, {"id": 2, "name": "beta"}])
+    capture.capture_payload("demo.tool", payload, tmp_path / "corpus")
+    out = tmp_path / "verify.md"
+
+    rc = main(["verify", "--corpus", str(tmp_path / "corpus"), "--out", str(out), "--bars"])
+    assert rc == 0
+
+    text = capsys.readouterr().out
+    assert "█" in text
+    assert "minify" in text and "tabularize" in text and "dictionary" in text
+
+
 def test_verify_empty_corpus_errors(tmp_path):
     (tmp_path / "corpus").mkdir()
     out = tmp_path / "o.md"
