@@ -239,6 +239,7 @@ def _build_answerers(args: argparse.Namespace) -> dict:
 def _cmd_fluency(args: argparse.Namespace) -> int:
     from . import fluency
     from .report import build_diff_report, build_fluency_report
+    from .terminal_report import build_terminal_diff_report, build_terminal_fluency_report
 
     envelopes = load_corpus(args.corpus)
     if not envelopes:
@@ -255,6 +256,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             return 1
         results = fluency.run_diff_fluency(envelopes, answerers, trials=args.trials)
         _write_report(build_diff_report(results), args.out)
+        if args.bars:
+            print("\n" + build_terminal_diff_report(results))
         return 0
 
     # Score mode: an externally-collected responses file against a previously-written pack.
@@ -264,6 +267,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         results = fluency.score_pack(pack, responses)
         report = build_fluency_report(results, fluency.token_summary(envelopes))
         _write_report(report, args.out)
+        if args.bars:
+            print("\n" + build_terminal_fluency_report(results))
         return 0
 
     answerers = _build_answerers(args)
@@ -288,6 +293,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
     results = fluency.run_fluency(envelopes, answerers, trials=args.trials)
     report = build_fluency_report(results, fluency.token_summary(envelopes))
     _write_report(report, args.out)
+    if args.bars:
+        print("\n" + build_terminal_fluency_report(results))
     return 0
 
 
@@ -529,6 +536,9 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--anthropic", action="store_true",
                    help="also test the real consumer (needs the anthropic extra + key)")
     f.add_argument("--anthropic-model", default="claude-opus-4-8")
+    f.add_argument("--bars", action="store_true",
+                   help="also print a terminal forest plot (accuracy + 95%% CI per model, "
+                        "ANSI if a tty)")
     f.set_defaults(func=_cmd_fluency)
 
     im = sub.add_parser("install-mcp", help="wrap Claude Code MCP server(s) with the "

@@ -89,15 +89,17 @@ raw tool output (JSON text)
   `_worst_case_gap` so the verdict never diverges from the markdown. Wired via
   `--html` on `measure`/`verify` (writes next to `--out`, same basename, `.html`
   suffix).
-- **`terminal_report.py`** — `build_terminal_report`'s zero-new-artifact bar-chart
-  counterpart to `build_report`'s savings-by-shape / savings-by-tool / tier-attribution
-  sections (the gate/coverage sections stay markdown-only — already glance-readable as
-  text). Unicode block-char bars, ANSI color only when stdout is a tty and `NO_COLOR`
-  is unset (bar glyphs always print, so piped/CI output keeps the shape of the win
-  uncolored). Reuses `report.py`'s `_sum` so the numbers never diverge from the
-  markdown. Wired via `--bars` on `measure`/`verify`, printed straight to the
-  terminal (nothing written to disk). `fluency --bars` (accuracy/forest-style bars)
-  is a fast-follow — different data shape from the savings charts above.
+- **`terminal_report.py`** — zero-new-artifact bar-chart counterpart to `report.py`'s
+  markdown. `build_terminal_report` covers `build_report`'s savings-by-shape /
+  savings-by-tool / tier-attribution sections (gate/coverage stay markdown-only —
+  already glance-readable as text). `build_terminal_diff_report` /
+  `build_terminal_fluency_report` render a two-line-per-model forest plot (point + 95%
+  CI whisker track, pass/fail badge) for `build_diff_report`'s / `build_fluency_report`'s
+  verdict sections, fed by `report.py`'s `diff_gap_rows`/`fluency_gap_rows` so the gap a
+  chart shows can never diverge from the markdown's gate. Unicode glyphs always print;
+  ANSI color only when stdout is a tty and `NO_COLOR` is unset (piped/CI output keeps
+  the shape of the win, just uncolored). Wired via `--bars` on `measure`/`verify`/
+  `fluency`, printed straight to the terminal (nothing written to disk).
 - **`cli.py`** — argparse dispatch for the six subcommands.
 
 ## API Integrations

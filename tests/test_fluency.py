@@ -246,6 +246,39 @@ def test_build_diff_report_verdict_and_empty():
     assert "PASS" in verdict and "FAIL" not in verdict
 
 
+def test_diff_gap_rows_matches_build_diff_report_verdict():
+    # diff_gap_rows feeds the bar-chart renderers (html/terminal) — its per-model
+    # accuracy/gap must agree with what the markdown verdict already gates on.
+    from terse.report import diff_gap_rows
+
+    rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
+             "trials": 1, "terse_ok": 1, "diff_ok": 1 if i < 8 else 0} for i in range(10)]
+    gap_rows = diff_gap_rows({"m": rows})
+    facc, _, cacc, _ = gap_rows["m"]
+    assert facc == 0.8 and cacc == 1.0
+
+
+def test_diff_gap_rows_skips_empty_models():
+    from terse.report import diff_gap_rows
+    assert diff_gap_rows({"empty": []}) == {}
+
+
+def test_fluency_gap_rows_best_of_terse_or_primer_vs_raw():
+    from terse.report import fluency_gap_rows
+    # raw 100%, terse 95%, primer 100% -> best form is primer (100%), gap 0
+    gap_rows, broken = fluency_gap_rows({"m": _rows(20, 19, 20)})
+    facc, _, cacc, _ = gap_rows["m"]
+    assert facc == 1.0 and cacc == 1.0
+    assert broken == []
+
+
+def test_fluency_gap_rows_excludes_broken_raw_control():
+    from terse.report import fluency_gap_rows
+    gap_rows, broken = fluency_gap_rows({"broken": _rows(0, 0, 0), "good": _rows(20, 20, 20)})
+    assert "broken" not in gap_rows and broken == ["broken"]
+    assert "good" in gap_rows
+
+
 def _gt(q: dict) -> str:
     """Render a question's expected answer the way a perfect model would."""
     import json
