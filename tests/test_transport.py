@@ -41,9 +41,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             msg = {}
         self.server.requests.append(msg)  # type: ignore[attr-defined]
         mode = self.server.mode  # type: ignore[attr-defined]
+        mid = msg.get("id")
 
         if mode == "fail500":
-            payload = b"internal error"
+            payload = b"internal error: disk full"
             self.send_response(500)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(payload)))
@@ -51,7 +52,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
-        method, mid = msg.get("method"), msg.get("id")
+        if mode == "fail_jsonrpc":
+            # A server that follows MCP Streamable-HTTP's allowance to send a real
+            # JSON-RPC error object even on a non-2xx status.
+            payload = json.dumps({"jsonrpc": "2.0", "id": mid, "error": {
+                "code": -32001, "message": "missing Authorization header"}}).encode("utf-8")
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        method = msg.get("method")
         if method == "initialize":
             self._send_json({"jsonrpc": "2.0", "id": mid,
                              "result": {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -239,6 +252,42 @@ def test_http_failure_is_fail_open_not_a_hang():
     msg = json.loads(lines[0])
     assert msg["id"] == 1                                       # matched to the request
     assert "error" in msg and "terse" in msg["error"]["message"].lower()
+    # Regression: the downstream's real error body used to be discarded entirely —
+    # confirm it now surfaces in the synthesized error message.
+    assert "internal error: disk full" in msg["error"]["message"]
+
+
+def test_http_failure_forwards_real_jsonrpc_error_verbatim():
+    # Regression: a downstream that follows MCP Streamable-HTTP's allowance to send a
+    # real JSON-RPC error object on a non-2xx status used to have that discarded in
+    # favor of terse's own generic wrapper — the client lost the actionable detail
+    # (e.g. exactly which auth header is missing).
+    requests = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": "items.get"}}) + "\n"
+    cin, cout = io.StringIO(requests), io.StringIO()
+    with _fake_server(mode="fail_jsonrpc") as srv:
+        rc = run_proxy([_url(srv)], FULL, stdin=cin, stdout=cout)
+    assert rc == 0
+    lines = [ln for ln in cout.getvalue().splitlines() if ln.strip()]
+    assert len(lines) == 1
+    msg = json.loads(lines[0])
+    assert msg["id"] == 1
+    # the downstream's OWN error object, not terse's generic wrapper
+    assert msg["error"]["code"] == -32001
+    assert msg["error"]["message"] == "missing Authorization header"
+
+
+def test_http_failure_on_notification_produces_no_reply():
+    # Regression: a failed POST for a notification (no "id" — never expects a reply)
+    # used to synthesize an `id: null` error and forward it anyway — an unsolicited
+    # message matching no request the client sent, which a strict client could reject.
+    notification = json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n"
+    cin, cout = io.StringIO(notification), io.StringIO()
+    with _fake_server(mode="fail500") as srv:
+        rc = run_proxy([_url(srv)], FULL, stdin=cin, stdout=cout)
+    assert rc == 0
+    lines = [ln for ln in cout.getvalue().splitlines() if ln.strip()]
+    assert lines == []  # nothing forwarded — a notification never gets a reply
 
 
 # --- 5: stdio_transport_error no longer rejects a URL (see also test_proxy.py) ---
@@ -247,3 +296,31 @@ def test_stdio_transport_error_accepts_a_url():
     from terse.proxy import stdio_transport_error
 
     assert stdio_transport_error(["https://example.com/mcp"]) is None
+
+
+# --- 6: Transport.half_close()/wait() — no isinstance check needed by callers ---
+
+def test_stdio_transport_half_close_lets_child_exit_then_wait_returns_its_code():
+    import sys as _sys
+
+    from terse.transport import StdioTransport
+
+    # A child that reads stdin to EOF then exits 0 — proves half_close() (closing
+    # stdin) is enough to let it finish on its own, and wait() then returns its
+    # real exit code, exactly as run_proxy relied on transport.proc.wait() doing
+    # before it went through this polymorphic method.
+    t = StdioTransport([_sys.executable, "-c", "import sys\nfor _ in sys.stdin: pass\nsys.exit(0)"])
+    try:
+        t.half_close()
+        assert t.wait() == 0
+    finally:
+        t.close()
+
+
+def test_http_transport_half_close_ends_inbound_and_wait_is_zero():
+    from terse.transport import HttpTransport
+
+    t = HttpTransport("http://127.0.0.1:1/mcp")  # never actually connected to
+    t.half_close()  # no persistent connection — closes outright
+    assert list(t.inbound()) == []  # sentinel already drained; iterator ends immediately
+    assert t.wait() == 0  # no process — always 0

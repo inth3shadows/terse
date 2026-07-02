@@ -32,13 +32,24 @@ class Transport(Protocol):
     `.flush()` for client->server lines — usable directly as `pump()`'s `dst`.
     `close()` releases whatever resource backs the peer (a child process, an
     HTTP session) — idempotent, safe to call more than once (`run_proxy` calls
-    it from more than one place as a defense-in-depth cleanup)."""
+    it from more than one place as a defense-in-depth cleanup).
+
+    `half_close()` and `wait()` exist so callers (`run_proxy`/`multiproxy.py`)
+    never need an `isinstance` check against a concrete subtype to tear a peer
+    down correctly — every transport-specific teardown detail (does closing
+    stdin let a child flush and exit on its own? is there even a process to
+    wait for an exit code from?) lives behind these two methods instead of
+    leaking into every call site as a runtime type check."""
 
     def inbound(self) -> Iterator[str]: ...
 
     def outbound(self) -> Any: ...
 
     def close(self) -> None: ...
+
+    def half_close(self) -> None: ...
+
+    def wait(self) -> int: ...
 
 
 class StdioTransport:
@@ -73,6 +84,18 @@ class StdioTransport:
         from .proxy import _terminate_child
 
         _terminate_child(self.proc)
+
+    def half_close(self) -> None:
+        """Close stdin only, signaling EOF so the child can flush any remaining
+        reply and exit on its own — `wait()`/`close()` (SIGTERM/SIGKILL escalation
+        via `_terminate_child`) still run afterward as the real/last-resort reaper."""
+        try:
+            self.proc.stdin.close()  # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            pass
+
+    def wait(self) -> int:
+        return self.proc.wait()
 
 
 # Sentinel that ends `HttpTransport.inbound()`'s queue-backed iterator. A plain
@@ -179,6 +202,18 @@ class HttpTransport:
     def close(self) -> None:
         self._q.put(_SENTINEL)
 
+    def half_close(self) -> None:
+        """No persistent connection to half-close — client stdin EOF IS the
+        transport's whole end-of-life signal, so closing outright is correct."""
+        self.close()
+
+    def wait(self) -> int:
+        """No child process to wait for an exit code from — always 0. The real
+        completion signal for HTTP is the caller joining its inbound pump thread,
+        which only finishes once close() has drained the sentinel (see
+        run_proxy/run_multi_proxy)."""
+        return 0
+
     def _post(self, line: str) -> None:
         """POST one JSON-RPC line downstream and enqueue whatever comes back
         onto `self._q` for `inbound()` to yield. Never raises: every failure
@@ -202,13 +237,34 @@ class HttpTransport:
                     self.session = sid
                 ctype = resp.headers.get("Content-Type", "")
                 body = resp.read()
+        except urllib.error.HTTPError as exc:
+            # A 4xx/5xx status. Per MCP Streamable-HTTP the server MAY still have sent
+            # a legitimate JSON-RPC error object in the body (e.g. "missing
+            # Authorization header") — read it and forward it verbatim when it looks
+            # like one, instead of discarding the real detail behind a generic
+            # wrapper message the client can't act on.
+            try:
+                raw_body = exc.read().decode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001 — reading the error body is best-effort
+                raw_body = ""
+            if raw_body.strip():
+                try:
+                    parsed = json.loads(raw_body)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = None
+                if isinstance(parsed, dict) and "jsonrpc" in parsed:
+                    self._q.put(raw_body)
+                    return
+            detail = raw_body.strip() or str(exc)
+            self._maybe_enqueue_error(
+                line, f"terse: downstream HTTP {exc.code} {exc.reason}: {detail}")
+            return
         except (urllib.error.URLError, OSError) as exc:
-            # URLError covers HTTPError (a 4xx/5xx status) too, since it's a
-            # subclass; OSError covers a bare connection-refused/timeout that
-            # never got far enough to become a URLError. Either way: the
-            # in-flight request gets a legible error instead of the client
-            # hanging forever on a reply that's never coming.
-            self._q.put(self._error_reply(line, f"terse: downstream HTTP request failed: {exc}"))
+            # OSError covers a bare connection-refused/timeout that never got far
+            # enough to become a URLError. Either way: the in-flight request gets a
+            # legible error instead of the client hanging forever on a reply that's
+            # never coming.
+            self._maybe_enqueue_error(line, f"terse: downstream HTTP request failed: {exc}")
             return
         if "text/event-stream" in ctype:
             for msg in _iter_sse(body.decode("utf-8", errors="replace")):
@@ -220,14 +276,30 @@ class HttpTransport:
             # else: a 202 Accepted / empty body is valid Streamable-HTTP and
             # means nothing to enqueue (e.g. the reply to a notification).
 
+    def _maybe_enqueue_error(self, line: str, message: str) -> None:
+        """Enqueue a synthesized JSON-RPC error for `line`'s in-flight request —
+        unless `line` is a notification (has no `"id"` key at all), which per
+        JSON-RPC never gets a reply. Enqueuing one anyway would hand the client an
+        unsolicited `id: null` message matching no request it sent, which a strict
+        client could reject or misinterpret as an unmatched response. If `line`
+        isn't valid JSON (shouldn't happen — it came from the client through
+        `note_request`/`pump` unchanged), fail toward reporting the error rather
+        than silently dropping it, since we can't tell whether a reply was expected."""
+        try:
+            parsed = json.loads(line)
+            has_id = isinstance(parsed, dict) and "id" in parsed
+        except (json.JSONDecodeError, ValueError):
+            has_id = True
+        if not has_id:
+            return
+        self._q.put(self._error_reply(line, message))
+
     def _error_reply(self, line: str, message: str) -> str:
         """A JSON-RPC 2.0 error object for the request id parsed out of the
-        outgoing `line`, so the client's matching in-flight call gets a
-        legible failure instead of silence. Best-effort id parse — if `line`
-        isn't valid JSON (shouldn't happen; it came from the client through
-        `note_request`/`pump` unchanged) or carries no id (a notification),
-        reply with `id: null` rather than dropping the error, so the failure
-        is still visible on the wire."""
+        outgoing `line`, so the client's matching in-flight call gets a legible
+        failure instead of silence. Only called via `_maybe_enqueue_error`, which
+        already confirmed `line` carries an id (or couldn't tell) — best-effort
+        re-parse here just extracts that same id."""
         mid = None
         try:
             parsed = json.loads(line)

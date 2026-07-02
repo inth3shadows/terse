@@ -307,6 +307,8 @@ def test_dead_peer_does_not_wedge_broadcast_or_live_routed_calls(tmp_path, capsy
         json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
         json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                    "params": {"name": "gh__gh.api.items"}}),
+        json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                   "params": {"name": "dead__whatever"}}),
     ]) + "\n"
     cin, cout = io.StringIO(requests_text), io.StringIO()
     rc = run_multi_proxy(str(cfg), PLAIN_POLICY, stdin=cin, stdout=cout, broadcast_timeout=0.3)
@@ -321,6 +323,10 @@ def test_dead_peer_does_not_wedge_broadcast_or_live_routed_calls(tmp_path, capsy
     assert 2 in msgs                                     # the live peer still serves routed calls
     text = msgs[2]["result"]["content"][0]["text"]
     assert transforms.decompress(text) == {"result": RECORDS}
+    # a routed call TO the dead peer must not wedge the client forever either —
+    # it gets a timeout error instead of never answering.
+    assert 3 in msgs
+    assert "error" in msgs[3] and "timed out" in msgs[3]["error"]["message"]
 
 
 # --- config loading / validation ---
@@ -451,6 +457,62 @@ def test_build_peers_closes_already_launched_peer_on_partial_failure(monkeypatch
     assert closed == [True]  # the first (already-launched) peer's transport was closed
 
 
+def test_build_peers_closes_already_launched_peer_on_bad_peer_policy(monkeypatch, tmp_path):
+    # Regression: a later peer's malformed policy file raises ValueError from
+    # load_policy, not OSError — _build_peers used to only catch OSError, so this
+    # left an earlier peer's already-launched transport orphaned.
+    from terse import multiproxy as mp
+
+    closed = []
+
+    class _FakeTransport:
+        def inbound(self):
+            return iter([])
+
+        def outbound(self):
+            return io.StringIO()
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(mp, "build_transport", lambda target, headers=None: _FakeTransport())
+    bad_policy = tmp_path / "bad.json"
+    bad_policy.write_text("not valid json", encoding="utf-8")
+    specs = [
+        DownstreamSpec(name="a", target=["a"], headers={}, policy_path=None),
+        DownstreamSpec(name="b", target=["b"], headers={}, policy_path=str(bad_policy)),
+    ]
+    try:
+        _build_peers(specs, PLAIN_POLICY, debug=False, capture=None, audit=None,
+                     store=OrderedDict(), store_lock=Lock(), dropped_bytes=[0])
+        raise AssertionError("expected ValueError for the malformed 2nd peer policy")
+    except ValueError:
+        pass
+    assert closed == [True]  # the first (already-launched) peer's transport was closed
+
+
+def test_build_peers_diff_override_reaches_peer_with_own_policy_path(monkeypatch, tmp_path):
+    # Regression: --diff was applied to `default_policy` only, so a peer with its OWN
+    # policy_path (a freshly-loaded Policy object) silently never got cross-call
+    # diffing enabled, unlike a peer using the default policy.
+    from terse import multiproxy as mp
+
+    monkeypatch.setattr(mp, "build_transport",
+                        lambda target, headers=None: _FakePeerTransport())
+    own_policy = tmp_path / "own.json"
+    own_policy.write_text(json.dumps({"version": 1, "rules": []}), encoding="utf-8")
+    specs = [
+        DownstreamSpec(name="a", target=["a"], headers={}, policy_path=None),
+        DownstreamSpec(name="b", target=["b"], headers={}, policy_path=str(own_policy)),
+    ]
+    peers = _build_peers(specs, PLAIN_POLICY, debug=False, capture=None, audit=None,
+                         store=OrderedDict(), store_lock=Lock(), dropped_bytes=[0],
+                         diff_override=True, diff_keyframe_override=8)
+    assert peers[0].inter.policy.diff is True
+    assert peers[1].inter.policy.diff is True  # peer with its own policy file
+    assert peers[1].inter.policy.diff_keyframe_interval == 8
+
+
 def test_load_multi_config_rejects_name_containing_prefix_sep(tmp_path):
     # Regression: a name like "gh__api" wasn't rejected, so it could shadow a shorter
     # peer name ("gh") under _route_call's first-occurrence "__" split.
@@ -524,6 +586,91 @@ def test_late_broadcast_reply_after_timeout_is_swallowed_not_leaked():
 
     assert result is SWALLOW           # swallowed, not forwarded as an unsolicited message
     assert len(_lines(out)) == 1        # still exactly one reply on the client stream
+
+
+def test_late_routed_call_reply_after_timeout_is_swallowed_not_double_answered():
+    # Regression: a routed tools/call had no timeout at all — a hung/dead peer left it
+    # unanswered forever. Once bounded, a peer's real reply arriving AFTER
+    # _timeout_routed_call already answered the client must be swallowed, not
+    # double-delivered (which would confuse a client tracking one reply per id).
+    t0 = _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)  # never fires on its own
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+             "params": {"name": "a__gh.api.items"}}))
+        assert len(_lines(out)) == 0  # no reply yet — still waiting on the peer
+
+        # force the routed call to time out (as if its timer had fired) before the
+        # peer answers
+        router._timeout_routed_call(7, 0)
+        assert len(_lines(out)) == 1
+        assert "timed out" in _lines(out)[0]["error"]["message"]
+
+        # the peer's real reply arrives LATE
+        result = router.from_peer(0)(json.dumps(
+            {"jsonrpc": "2.0", "id": 7,
+             "result": {"content": [{"type": "text", "text": "late"}]}}))
+    finally:
+        router.close_senders()
+
+    assert result is SWALLOW           # swallowed, not forwarded as a second reply
+    assert len(_lines(out)) == 1        # still exactly one reply on the client stream
+
+
+def test_merge_initialize_protocol_version_uses_arrival_order_not_config_index():
+    # Regression: _merge_initialize iterated peers by fixed config index
+    # (range(len(self.peers))), so the merged protocolVersion always came from
+    # whichever peer had the LOWEST index that answered — not whichever genuinely
+    # replied FIRST, contradicting the method's own documented "first-arriving
+    # peer's" contract. Here peer 1 (higher config index) answers first; the merge
+    # must pick peer 1's protocolVersion, not peer 0's.
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+        # peer 1 (index 1, config-later) answers FIRST
+        router.from_peer(1)(json.dumps(
+            {"jsonrpc": "2.0", "id": "terse-b0-1",
+             "result": {"protocolVersion": "FIRST-ARRIVAL", "capabilities": {}}}))
+        # peer 0 (index 0, config-earlier) answers SECOND
+        router.from_peer(0)(json.dumps(
+            {"jsonrpc": "2.0", "id": "terse-b0-0",
+             "result": {"protocolVersion": "SECOND-ARRIVAL", "capabilities": {}}}))
+    finally:
+        router.close_senders()
+
+    merged = _lines(out)[0]
+    assert merged["result"]["protocolVersion"] == "FIRST-ARRIVAL"
+
+
+def test_broadcast_initialize_does_not_leave_stale_init_id_on_peer():
+    # Regression: note_request set each peer's Interceptor.init_id to the broadcast-
+    # local id (e.g. "terse-b0-1"), but that peer's real reply is swallowed by
+    # _maybe_collect before transform_response ever runs its one-time reset — so
+    # init_id stayed permanently stale (see test_clear_init_id_prevents_stale_reply_
+    # misidentification in test_proxy.py for what that staleness could corrupt).
+    t0 = _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+        assert peers[0].inter.init_id is None  # cleared immediately, not left stale
+
+        # peer answers the broadcast normally — still cleared, not repopulated
+        router.from_peer(0)(json.dumps(
+            {"jsonrpc": "2.0", "id": "terse-b0-0",
+             "result": {"protocolVersion": "2024-11-05", "capabilities": {}}}))
+        assert peers[0].inter.init_id is None
+    finally:
+        router.close_senders()
 
 
 def test_reused_client_id_during_broadcast_resolves_to_correct_broadcast():
