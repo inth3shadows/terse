@@ -84,24 +84,80 @@ def _cmd_measure(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_headers(pairs: list[str] | None) -> dict[str, str]:
+    """Parse repeated `--header NAME=VALUE` flags into a dict (#5, HTTP downstream
+    auth). Raises ValueError with a clear message on a malformed entry (no `=`) rather
+    than crashing with an unpacking error."""
+    headers: dict[str, str] = {}
+    for p in pairs or []:
+        if "=" not in p:
+            raise ValueError(f"--header expects NAME=VALUE, got {p!r}")
+        name, value = p.split("=", 1)
+        headers[name] = value
+    return headers
+
+
 def _cmd_proxy(args: argparse.Namespace) -> int:
     from .policy import default_policy, load_policy
-    from .proxy import run_proxy
 
     cmd = args.cmd
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
-    if not cmd:
+
+    # Validate the cmd/--config/--header combination BEFORE touching the policy file
+    # (or anything else with a side effect): a missing downstream command must always
+    # produce this clean, actionable message regardless of whether --policy also
+    # happens to be bad — checking cmd only after loading the policy let an unrelated
+    # bad --policy path crash with a raw traceback instead.
+    if args.config:
+        # --config (#5 Half B, multi-downstream fan-out) and a positional downstream
+        # command are mutually exclusive: each names ITS downstream(s) a different way,
+        # and silently picking one over the other would hide a likely typo/leftover flag.
+        if cmd:
+            print("proxy: --config and a downstream command (after `--`) are mutually "
+                  "exclusive — use one or the other", file=sys.stderr)
+            return 2
+        if args.header:
+            # --header has no --config equivalent: run_multi_proxy fronts N peers, each
+            # with its own optional "headers" in the config file, so a single flag value
+            # can't apply to all of them unambiguously. Reject loudly rather than
+            # silently dropping a header the user thinks is taking effect.
+            print("proxy: --header has no effect with --config — set a per-downstream "
+                  '"headers" object in the config file instead', file=sys.stderr)
+            return 2
+    elif not cmd:
         print("proxy: provide the downstream server command after `--`, e.g.\n"
               "  terse proxy --policy p.json -- uvx some-mcp-server", file=sys.stderr)
         return 2
-    pol = load_policy(args.policy) if args.policy else default_policy()
+
+    try:
+        pol = load_policy(args.policy) if args.policy else default_policy()
+    except (OSError, ValueError) as e:
+        print(f"proxy: {e}", file=sys.stderr)
+        return 2
     if args.diff:
         pol.diff = True  # CLI opt-in overrides the policy default (off)
     if args.diff_keyframe_interval is not None:
         pol.diff_keyframe_interval = args.diff_keyframe_interval
+
+    if args.config:
+        from .multiproxy import run_multi_proxy
+        try:
+            return run_multi_proxy(args.config, pol, debug=args.debug,
+                                   capture_dir=args.capture_dir, debug_log=args.debug_log)
+        except (OSError, ValueError) as e:
+            print(f"proxy --config: {e}", file=sys.stderr)
+            return 2
+
+    from .proxy import run_proxy
+
+    try:
+        headers = _parse_headers(args.header)
+    except ValueError as e:
+        print(f"proxy: {e}", file=sys.stderr)
+        return 2
     return run_proxy(cmd, pol, debug=args.debug, capture_dir=args.capture_dir,
-                     debug_log=args.debug_log)
+                     debug_log=args.debug_log, headers=headers)
 
 
 def _cmd_policy_generate(args: argparse.Namespace) -> int:
@@ -236,15 +292,63 @@ def _build_answerers(args: argparse.Namespace) -> dict:
     return answerers
 
 
+def _build_tool_answerers(args: argparse.Namespace) -> dict:
+    """The tool-calling twin of `_build_answerers`, for `fluency --drop-eval`. Same env/
+    flag precedence (flags win over env; TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS or
+    --anthropic) so the two eval modes are configured identically — just returns
+    `dropeval.ToolAnswerer`s bound to the synthetic retrieve tool instead of plain
+    fluency.Answerer callables."""
+    import os
+
+    from . import dropeval
+    from .proxy import RETRIEVE_TOOL_DEF
+
+    answerers: dict = {}
+    base = args.base_url or os.environ.get("TERSE_FLUENCY_BASE_URL")
+    key = os.environ.get(args.api_key_env or "TERSE_FLUENCY_API_KEY")
+    models = args.models or os.environ.get("TERSE_FLUENCY_MODELS", "")
+    if base and key and models:
+        for m in (x.strip() for x in models.split(",") if x.strip()):
+            answerers[m] = dropeval.openai_tool_answerer(base, key, m, tools=[RETRIEVE_TOOL_DEF])
+    if args.anthropic:
+        try:
+            answerers[f"anthropic:{args.anthropic_model}"] = dropeval.anthropic_tool_answerer(
+                args.anthropic_model, tools=[RETRIEVE_TOOL_DEF]
+            )
+        except Exception as e:  # missing extra/key — fall back, don't crash the run
+            print(f"[warn] anthropic tool answerer unavailable: {e}", file=sys.stderr)
+    return answerers
+
+
 def _cmd_fluency(args: argparse.Namespace) -> int:
-    from . import fluency
-    from .report import build_diff_report, build_fluency_report
+    from . import dropeval, fluency
+    from .policy import default_policy, load_policy
+    from .report import build_diff_report, build_dropeval_report, build_fluency_report
     from .terminal_report import build_terminal_diff_report, build_terminal_fluency_report
 
     envelopes = load_corpus(args.corpus)
     if not envelopes:
         print(f"no payloads in {args.corpus}/ — capture some first (`terse capture`).")
         return 1
+
+    # Drop-eval mode: does a real tool-calling model call terse.retrieve when a dropped
+    # field is needed, and leave it alone when it isn't? Needs a policy with a
+    # drop-to-retrieve field AND a live tool-capable model — like --diff, this is a
+    # live-model-only behavioral measurement, no pack/offline mode.
+    if args.drop_eval:
+        pol = load_policy(args.policy) if args.policy else default_policy()
+        if not pol.has_drop():
+            print("`fluency --drop-eval` needs a policy with a drop-to-retrieve field "
+                  "(pass --policy).")
+            return 1
+        answerers = _build_tool_answerers(args)
+        if not answerers:
+            print("`fluency --drop-eval` needs a configured model: set TERSE_FLUENCY_BASE_URL/"
+                  "_API_KEY/_MODELS or pass --anthropic.")
+            return 1
+        results = dropeval.run_drop_fluency(envelopes, pol.select, answerers, trials=args.trials)
+        _write_report(build_dropeval_report(results), args.out)
+        return 0
 
     # Diff mode: does a model read a cross-call DIFF as well as the full result? Needs a
     # live model (it measures comprehension of a form, not ground-truth math).
@@ -305,19 +409,54 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
 _SECRET_FLAG = re.compile(r"^--?(api[-_]?key|token|secret|password|passwd|auth|credential)s?$",
                           re.IGNORECASE)
 
+# `--header NAME=VALUE` (#5, HTTP downstream auth) carries its secret in the VALUE half
+# of a single arg, not in a flag NAME `_SECRET_FLAG` matches — so a bare `--header`
+# match would print `Authorization=Bearer xyz` unredacted. Match against the header
+# NAME instead, substring (not anchored like `_SECRET_FLAG`): a header name space is
+# open-ended and caller-defined (`X-Api-Key`, `Proxy-Authorization`, `Cookie`, ...), so
+# over-redacting a borderline name is the safe failure direction for a value that could
+# be printed to a shared terminal.
+_SECRET_HEADER = re.compile(r"(api[-_]?key|token|secret|password|passwd|auth|credential|cookie)",
+                            re.IGNORECASE)
+
+
+def _redact_header_value(entry: str) -> str:
+    """Mask a `--header NAME=VALUE` entry's VALUE when NAME looks secret-shaped.
+    Leaves the entry alone (name AND value) when it doesn't look secret-shaped, and
+    when there's no `=` at all (a malformed entry `_parse_headers` would reject anyway —
+    not this function's job to validate)."""
+    if "=" not in entry:
+        return entry
+    name, _, _value = entry.partition("=")
+    return f"{name}=***" if _SECRET_HEADER.search(name) else entry
+
 
 def _redact_args(args: list) -> list:
     out = []
-    redact_next = False
+    pending: str | None = None  # None | "value" (generic secret flag) | "header"
     for a in args:
-        if redact_next:
+        if pending == "header":
+            out.append(_redact_header_value(a))
+            pending = None
+            continue
+        if pending == "value":
             out.append("***")
-            redact_next = False
+            pending = None
             continue
         flag = a.split("=", 1)[0]
+        if flag == "--header":
+            if "=" in a:
+                # Inline form `--header=NAME=VALUE` (argparse also accepts this): the
+                # first `=` separates the flag from the NAME=VALUE payload.
+                _, rest = a.split("=", 1)
+                out.append(f"--header={_redact_header_value(rest)}")
+            else:
+                out.append(a)
+                pending = "header"  # the NEXT arg is the NAME=VALUE payload
+            continue
         if _SECRET_FLAG.match(flag):
             out.append(f"{flag}=***" if "=" in a else a)
-            redact_next = "=" not in a
+            pending = "value" if "=" not in a else None
             continue
         out.append(a)
     return out
@@ -513,8 +652,18 @@ def main(argv: list[str] | None = None) -> int:
                     help="append a structured raw->decision->emitted record per result to "
                          "this JSONL file for after-the-fact diagnosis/replay (opt-in; never "
                          "affects forwarding)")
+    px.add_argument("--header", action="append", metavar="NAME=VALUE",
+                    help="HTTP header to send to an HTTP/SSE downstream (repeatable), e.g. "
+                         "--header 'Authorization=Bearer xyz'. Ignored for a stdio downstream. "
+                         "Not valid with --config — set headers per-downstream in that file.")
+    px.add_argument("--config", metavar="FILE",
+                    help="JSON file listing multiple downstream peers to front behind "
+                         "one process (#5 Half B, fan-out): "
+                         '{"downstreams":[{"name":"gh","command":[...]},'
+                         '{"name":"kb","url":"https://...","headers":{...}}]}. '
+                         "Mutually exclusive with a positional downstream command.")
     px.add_argument("cmd", nargs=argparse.REMAINDER,
-                    help="-- <downstream MCP server command and args>")
+                    help="-- <downstream MCP server command and args, or a single URL>")
     px.set_defaults(func=_cmd_proxy)
 
     f = sub.add_parser("fluency", help="does a model read the compressed form as "
@@ -529,6 +678,13 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--diff", action="store_true",
                    help="eval whether a model reads a cross-call DIFF as well as the full "
                         "result (needs same-tool corpus pairs + a configured model)")
+    f.add_argument("--drop-eval", action="store_true",
+                   help="behavioral eval: does a real tool-calling model call terse.retrieve "
+                        "when a dropped field is needed (recall), and leave it alone when "
+                        "it isn't (precision)? needs --policy with a drop-to-retrieve field "
+                        "+ a configured model")
+    f.add_argument("--policy", help="policy file with a drop-to-retrieve field (used only "
+                                    "by --drop-eval)")
     f.add_argument("--base-url", help="OpenAI-compatible base URL (else $TERSE_FLUENCY_BASE_URL)")
     f.add_argument("--models", help="comma-separated model ids (else $TERSE_FLUENCY_MODELS)")
     f.add_argument("--api-key-env", default="TERSE_FLUENCY_API_KEY",

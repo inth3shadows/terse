@@ -191,6 +191,60 @@ def test_install_then_uninstall_mcp_roundtrips_via_cli(tmp_path, monkeypatch):
     assert restored == original_entry
 
 
+def test_proxy_cmd_parses_and_forwards_headers(monkeypatch):
+    # #5: --header NAME=VALUE (repeatable) must reach run_proxy as a dict, and the
+    # positional REMAINDER cmd must still come through unchanged (a single URL here).
+    captured = {}
+
+    def fake_run_proxy(cmd, pol, debug=False, stdin=None, stdout=None,
+                       capture_dir=None, debug_log=None, headers=None):
+        captured["cmd"] = cmd
+        captured["headers"] = headers
+        return 0
+
+    monkeypatch.setattr("terse.proxy.run_proxy", fake_run_proxy)
+    rc = main(["proxy", "--header", "Authorization=Bearer xyz", "--header", "X-Id=42",
+              "--", "https://example.com/mcp"])
+    assert rc == 0
+    assert captured["cmd"] == ["https://example.com/mcp"]
+    assert captured["headers"] == {"Authorization": "Bearer xyz", "X-Id": "42"}
+
+
+def test_proxy_cmd_rejects_malformed_header_without_launching(monkeypatch, capsys):
+    def fake_run_proxy(*_a, **_kw):
+        raise AssertionError("run_proxy must not be called on a malformed --header")
+
+    monkeypatch.setattr("terse.proxy.run_proxy", fake_run_proxy)
+    rc = main(["proxy", "--header", "no-equals-sign", "--", "uvx", "some-mcp"])
+    assert rc == 2
+    assert "NAME=VALUE" in capsys.readouterr().err
+
+
+def test_proxy_cmd_missing_command_with_bad_policy_still_shows_clean_error(tmp_path, capsys):
+    # Regression: --policy used to be loaded BEFORE the missing-downstream-command
+    # check, so a bad/missing --policy path crashed with an uncaught traceback (exit 1)
+    # instead of the clean "provide the downstream server command" message (exit 2) —
+    # regardless of whether --policy was even the thing the user got wrong.
+    rc = main(["proxy", "--policy", str(tmp_path / "does-not-exist.json")])
+    assert rc == 2
+    assert "provide the downstream server command" in capsys.readouterr().err
+
+
+def test_proxy_cmd_rejects_header_with_config(tmp_path, monkeypatch, capsys):
+    # Regression: --header was silently discarded when combined with --config (only the
+    # single-downstream branch ever read args.header) — no warning, no error.
+    def fake_run_multi_proxy(*_a, **_kw):
+        raise AssertionError("run_multi_proxy must not be called when --header is "
+                             "combined with --config")
+
+    monkeypatch.setattr("terse.multiproxy.run_multi_proxy", fake_run_multi_proxy)
+    cfg = tmp_path / "peers.json"
+    cfg.write_text("{}", encoding="utf-8")
+    rc = main(["proxy", "--header", "Authorization=Bearer xyz", "--config", str(cfg)])
+    assert rc == 2
+    assert "--header" in capsys.readouterr().err
+
+
 def test_redact_args_masks_two_arg_and_equals_form_secrets():
     # --flag VALUE form: value is the NEXT arg.
     assert _redact_args(["--api-key", "sk-live-abc123", "run"]) == \
@@ -199,6 +253,18 @@ def test_redact_args_masks_two_arg_and_equals_form_secrets():
     assert _redact_args(["--token=sk-live-abc123", "run"]) == ["--token=***", "run"]
     # Non-secret flags/values pass through untouched.
     assert _redact_args(["demo-mcp", "--verbose"]) == ["demo-mcp", "--verbose"]
+
+
+def test_redact_args_masks_secret_shaped_header_values():
+    # `--header NAME=VALUE` (#5) carries its secret in the VALUE half, not a flag NAME
+    # `_SECRET_FLAG` would match — a bearer token must still be masked before printing.
+    assert _redact_args(["--header", "Authorization=Bearer sk-live-abc123", "--", "url"]) == \
+        ["--header", "Authorization=***", "--", "url"]
+    # Inline `--header=NAME=VALUE` form.
+    assert _redact_args(["--header=X-Api-Key=sk-live-abc123"]) == ["--header=X-Api-Key=***"]
+    # A non-secret-shaped header name passes through untouched.
+    assert _redact_args(["--header", "X-Request-Id=abc123"]) == \
+        ["--header", "X-Request-Id=abc123"]
 
 
 def test_install_mcp_print_redacts_secret_in_args(tmp_path, monkeypatch, capsys):

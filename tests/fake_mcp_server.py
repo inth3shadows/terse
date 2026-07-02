@@ -36,8 +36,12 @@ def main() -> None:
         mid = msg.get("id")
         method = msg.get("method")
         if method == "initialize":
+            # "stdio_peer" is a harmless marker key (no test asserts capabilities is
+            # empty) that lets a multiproxy test prove THIS fake was actually reached
+            # by a broadcast, by checking for it in the merged capabilities union.
             resp = {"jsonrpc": "2.0", "id": mid,
-                    "result": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "result": {"protocolVersion": "2024-11-05",
+                               "capabilities": {"stdio_peer": True},
                                "serverInfo": {"name": "fake", "version": "0"}}}
         elif method == "tools/call":
             name = (msg.get("params") or {}).get("name")

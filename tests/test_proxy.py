@@ -498,21 +498,23 @@ def test_terminate_child_is_noop_on_already_exited():
     assert proc.poll() is not None
 
 
-# --- #19: fail-fast on a non-stdio downstream ---
+# --- #19: fail-fast on a downstream with nothing to proxy at all ---
 
-def test_stdio_transport_error_flags_url_and_passes_command():
+def test_stdio_transport_error_only_flags_a_missing_command():
+    # #5: a URL is now a valid, dispatchable downstream (HttpTransport) — no longer
+    # rejected here. Only "nothing after --" remains an error.
     from terse.proxy import stdio_transport_error
 
     assert stdio_transport_error([]) is not None                       # nothing given
-    assert "issue #5" in stdio_transport_error(["https://example.com/mcp"])
-    assert stdio_transport_error(["sse://host/path"]) is not None      # any scheme
+    assert stdio_transport_error(["https://example.com/mcp"]) is None  # URL: now OK
+    assert stdio_transport_error(["sse://host/path"]) is None          # any scheme: OK
     assert stdio_transport_error(["uvx", "some-mcp-server"]) is None   # a real command
     assert stdio_transport_error([sys.executable, str(FAKE)]) is None
 
 
-def test_run_proxy_rejects_url_downstream_without_launching():
+def test_run_proxy_rejects_empty_downstream_without_launching():
     cin, cout = io.StringIO('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'), io.StringIO()
-    rc = run_proxy(["https://example.com/mcp"], FULL, stdin=cin, stdout=cout)
+    rc = run_proxy([], FULL, stdin=cin, stdout=cout)
     assert rc == 2
     assert cout.getvalue() == ""        # nothing launched, nothing forwarded
 
@@ -680,9 +682,9 @@ def test_drop_result_populates_store_and_carries_the_marker():
 def test_reconnect_clears_the_drop_store():
     inter = Interceptor(DROP)
     _emit(inter, 9, "gh.api.items", {"result": [{"id": 1, "body": "B" * 400}]})
-    assert inter.dropped and inter._dropped_bytes > 0
+    assert inter.dropped and inter._dropped_bytes_box[0] > 0
     inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize"}))
-    assert len(inter.dropped) == 0 and inter._dropped_bytes == 0
+    assert len(inter.dropped) == 0 and inter._dropped_bytes_box[0] == 0
 
 
 def test_drop_store_evicts_lru_over_count_cap():
@@ -699,7 +701,7 @@ def test_drop_store_evicts_over_byte_cap():
     inter._drop_put("a", "x" * 10)
     inter._drop_put("b", "y" * 10)
     inter._drop_put("c", "z" * 10)                             # 30 > 25 -> evict oldest (a)
-    assert "a" not in inter.dropped and inter._dropped_bytes == 20
+    assert "a" not in inter.dropped and inter._dropped_bytes_box[0] == 20
 
 
 def test_drop_store_refreshes_recency_on_reinsert():
@@ -709,7 +711,7 @@ def test_drop_store_refreshes_recency_on_reinsert():
     inter._drop_put("b", "y" * 10)
     inter._drop_put("a", "x" * 10)                             # touch a -> most-recent
     inter._drop_put("c", "z" * 10)                             # evict LRU = b
-    assert list(inter.dropped) == ["a", "c"] and inter._dropped_bytes == 20
+    assert list(inter.dropped) == ["a", "c"] and inter._dropped_bytes_box[0] == 20
 
 
 # --- drop-to-retrieve: serving terse.retrieve (#10, Phase 3) ---

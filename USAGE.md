@@ -60,21 +60,53 @@ the results the policy says to shrink, and passes everything else through untouc
 anything ever goes wrong with a compression, terse sends the original result instead, so
 a tool call is never lost. Add `--debug` to see what it compressed.
 
-**One proxy per server (stdio only).** Each `terse proxy` wraps exactly one **stdio**
-MCP server — the kind launched by a command that talks newline-delimited JSON-RPC over
-stdin/stdout. To cover several servers, give each its own wrapper (one `terse proxy --
-<server cmd>` entry per server); `install-mcp` below does this for you. terse does **not**
-proxy HTTP/SSE servers (the kind configured by a `url`); pointed at one it fails fast with
-a clear message instead of hanging, e.g.:
+**One proxy, one downstream, either transport.** By default each `terse proxy` wraps one
+downstream MCP server — either **stdio** (a command that talks newline-delimited JSON-RPC
+over stdin/stdout) or **HTTP/SSE** (MCP Streamable HTTP, configured by a `url`). Point the
+same `proxy` command at a URL instead of a command to proxy a remote server:
 
 ```
-$ uv run terse proxy -- https://example.com/mcp
-[terse-proxy] 'https://example.com/mcp' looks like a URL — terse proxies a stdio MCP
-server (a launchable command), not an HTTP/SSE endpoint. HTTP/SSE transport is not
-supported yet (issue #5).
+uv run terse proxy --policy policy.example.json -- https://example.com/mcp
+
+# add auth/other headers (repeatable); secret-shaped values are redacted wherever
+# terse prints a command line (e.g. install-mcp --print), never in the request itself:
+uv run terse proxy --policy policy.example.json \
+  --header 'Authorization=Bearer sk-...' -- https://example.com/mcp
 ```
 
-Multi-downstream and HTTP/SSE support are tracked in issue #5.
+`install-mcp` (below) wraps a `url`-configured `mcpServers` entry the same way
+automatically. For several servers, either give each its own wrapper (one `terse proxy --
+<server cmd>` entry per server — `install-mcp` does this by default) or front all of them
+from one proxy process with `--config` (see "Fronting multiple servers from one proxy"
+below).
+
+### Fronting multiple servers from one proxy (`--config`)
+
+`--config` fans one `terse proxy` process out to N downstream peers — any mix of stdio and
+HTTP — behind a single policy/primer/process instead of one wrapper per server:
+
+```json
+// peers.json
+{ "downstreams": [
+    { "name": "gh", "policy": "gh-policy.json", "command": ["uvx", "github-mcp"] },
+    { "name": "kb", "policy": "kb-policy.json", "url": "https://kb.example/mcp",
+      "headers": { "Authorization": "Bearer sk-..." } }
+] }
+```
+
+```
+uv run terse proxy --config peers.json
+```
+
+Each peer's tools are advertised prefixed with its `name` (`gh__search_issues`,
+`kb__read`, ...) so the client can tell them apart and call the right one; terse strips
+the prefix before forwarding. The synthetic `terse.retrieve` tool (drop-to-retrieve) is
+advertised once, shared across every peer, regardless of which peer dropped the field.
+This is an ergonomics convenience — MCP clients can already talk to several servers
+directly — so keep expectations proportionate: broadcast requests (`initialize`,
+`tools/list`) wait on every peer up to a bounded timeout before merging what arrived, and
+methods outside `initialize`/`tools/list`/`tools/call` fall back to peer 0 for now (a
+debug-logged, documented v1 limitation, not a silent gap).
 
 ### Wire terse into Claude Code automatically (`install-mcp`)
 
@@ -219,6 +251,23 @@ accuracy with a `±` 95% bound, so the verdict is a tight bound rather than dire
 Add `--bars` for the same verdict as a terminal forest plot — a point + 95% CI track
 per model (best terse-form vs raw, or diff-form vs full-terse under `--diff`) with a
 pass/fail badge, printed straight to the terminal.
+
+### Does the model actually use `terse.retrieve`? (`fluency --drop-eval`)
+
+A field marked `{"lossy":"drop-to-retrieve"}` is provably recoverable — but only *if* the
+model calls the synthetic `terse.retrieve` tool when it needs that field. `--drop-eval`
+measures the actual behavior with a live tool-calling model, not just the round-trip gate:
+
+```
+# needs a policy with a drop-to-retrieve field, and a tool-capable model:
+TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \
+  uv run terse fluency --drop-eval --policy drop-policy.json --corpus corpus
+```
+
+The report scores retrieve-recall (did it call retrieve when the answer needed the dropped
+field), no-overfetch (did it leave the tool alone when the answer didn't need it), and
+final-answer accuracy — gated on the worst model. Run this before enabling
+`drop-to-retrieve` in a policy you'll actually deploy.
 
 ### Cross-call diffing and its fluency check
 

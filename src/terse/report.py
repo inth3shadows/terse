@@ -455,6 +455,91 @@ def build_diff_report(results: dict) -> str:
     return "\n".join(out)
 
 
+def build_dropeval_report(results: dict) -> str:
+    """Render the drop-to-retrieve behavioral eval: does a real tool-calling model call
+    `terse.retrieve` when a dropped field is needed (recall), and leave it alone when it
+    isn't (precision / no-overfetch)?
+
+    `results` is {model: [row,...]} from dropeval.run_drop_fluency; each row carries
+    `kind` ("recall"|"precision") plus retrieve_ok/answer_ok/handle_ok success counts
+    over `trials`. The verdict gates on the WORST model across all three metrics
+    (principle #24) — a policy that's unsafe for one model in the fleet is unsafe,
+    full stop — reusing the same worst-case-gap machinery as build_diff_report/
+    build_fluency_report, with a 100%-ideal control (a real tool call either happens
+    correctly or it doesn't; there's no "raw form" to compare against here).
+    """
+    out: list[str] = ["# terse drop-to-retrieve behavioral eval", ""]
+    out += [
+        "Does a real tool-calling model call `terse.retrieve` when a `__terse_dropped__`",
+        "marker matters (recall), and leave it alone when it doesn't (precision /",
+        "no-overfetch)? Ground truth is deterministic; the loop mirrors the proxy's real",
+        "2-turn retrieve protocol exactly (same primer, same tool, same miss string).",
+        "",
+    ]
+    if not results or not any(results.values()):
+        out += [
+            "No tool-capable model answers, or no drop-marked record payloads in the",
+            "corpus — set a policy with a `drop-to-retrieve` field and configure a model",
+            "(TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS or --anthropic), then re-run",
+            "`terse fluency --drop-eval --policy <file>`.",
+            "",
+        ]
+        return "\n".join(out)
+
+    trials = max((r.get("trials", 1) for rows in results.values() for r in rows), default=1)
+    out += [
+        "## Accuracy by model",
+        "",
+        f"Trials per question: **{trials}**. `±` is the 95% half-width of a pooled "
+        "binomial bound.",
+        "",
+        "| Model | recall q | retrieve-recall | precision (no-overfetch) | final-accuracy "
+        "| handle-accuracy |",
+        "|---|---|---|---|---|---|",
+    ]
+    recall_gate: dict[str, tuple[float, float, float, float]] = {}
+    precision_gate: dict[str, tuple[float, float, float, float]] = {}
+    accuracy_gate: dict[str, tuple[float, float, float, float]] = {}
+    for model, rows in results.items():
+        if not rows:
+            continue
+        recall_rows = [r for r in rows if r["kind"] == "recall"]
+        precision_rows = [r for r in rows if r["kind"] == "precision"]
+        racc, rse = _form_stats(recall_rows, "retrieve_ok") if recall_rows else (0.0, 0.0)
+        pacc, pse = _form_stats(precision_rows, "retrieve_ok") if precision_rows else (0.0, 0.0)
+        aacc, ase = _form_stats(rows, "answer_ok")
+        hacc, hse = _form_stats(recall_rows, "handle_ok") if recall_rows else (0.0, 0.0)
+        # control is a fixed 100% ideal (se=0) — there's no raw/full-terse form to pair
+        # against here, only "did the model do the right thing."
+        recall_gate[model] = (racc, rse, 1.0, 0.0)
+        precision_gate[model] = (pacc, pse, 1.0, 0.0)
+        accuracy_gate[model] = (aacc, ase, 1.0, 0.0)
+        out.append(f"| `{model}` | {len(recall_rows)} | {racc:.0%} ±{_ci(rse) * 100:.0f} "
+                   f"| {pacc:.0%} ±{_ci(pse) * 100:.0f} | {aacc:.0%} ±{_ci(ase) * 100:.0f} "
+                   f"| {hacc:.0%} ±{_ci(hse) * 100:.0f} |")
+    out.append("")
+
+    out += ["## Verdict", ""]
+    recall_worst = _worst_case_gap(recall_gate)
+    precision_worst = _worst_case_gap(precision_gate)
+    accuracy_worst = _worst_case_gap(accuracy_gate)
+    if recall_worst and precision_worst and accuracy_worst:
+        out.append(_format_worst_case_line(recall_worst, _GAP_TOLERANCE, "retrieve-recall",
+                                           "ideal (100%)"))
+        out.append(_format_worst_case_line(precision_worst, _GAP_TOLERANCE, "no-overfetch",
+                                           "ideal (100%)"))
+        out.append(_format_worst_case_line(accuracy_worst, _GAP_TOLERANCE, "final-accuracy",
+                                           "ideal (100%)"))
+        if recall_worst.passed and precision_worst.passed and accuracy_worst.passed:
+            out.append("- Recall, precision, and final accuracy all clear tolerance for the "
+                       "worst model — safe to enable drop-to-retrieve.")
+        else:
+            out.append("- At least one metric misses tolerance for its worst model — keep "
+                       "drop-to-retrieve off until this improves.")
+    out.append("")
+    return "\n".join(out)
+
+
 def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str:
     """Render the format-fluency eval: does the model read terse as well as raw JSON?
 

@@ -1,9 +1,13 @@
 """Install/remove terse in front of Claude Code MCP servers.
 
 Rewrites the `mcpServers` entries of the Claude Code config (`~/.claude.json` by
-default) so a named server's command becomes:
+default) so a named server's command becomes, for a stdio server:
 
     <python> -m terse proxy --policy <policy> -- <original command + args>
+
+or, for an HTTP/SSE server (`url` + optional `headers`, #5):
+
+    <python> -m terse proxy --policy <policy> --header k=v ... -- <original url>
 
 The original entry is preserved verbatim in a sidecar stash so `uninstall` can
 restore it byte-for-byte. The wrap is idempotent (re-running re-wraps from the
@@ -52,9 +56,16 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
          terse_cmd: list[str], capture_dir: str | None = None) -> tuple[dict, dict]:
     """Wrap `server`'s entry with the terse proxy. Idempotent: if already managed
     (present in stash), re-wrap from the stashed original so policy/cmd updates
-    apply cleanly without nesting proxies. Preserves all non-command/args keys
-    (env, cwd, type, …) of the original entry. With `capture_dir`, the wrapped proxy
-    tees raw tool results into that corpus for later measurement (#32)."""
+    apply cleanly without nesting proxies. Preserves all non-command/args (and, for a
+    URL entry, non-url/headers) keys (env, cwd, type, …) of the original entry. With
+    `capture_dir`, the wrapped proxy tees raw tool results into that corpus for later
+    measurement (#32).
+
+    Two shapes of original entry are wrappable: a stdio server (`command` + optional
+    `args`) and an HTTP/SSE server (`url` + optional `headers`, #5) — the latter is
+    proxied by pointing terse's HTTP downstream at that url, with any `headers`
+    forwarded as repeated `--header k=v` (see `transport.HttpTransport`). Anything with
+    neither key is not a valid MCP server entry and can't be wrapped."""
     servers = config.setdefault("mcpServers", {})
     if server in stash:
         original = stash[server]
@@ -64,23 +75,32 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
     else:
         raise KeyError(server)
 
-    orig_cmd = original.get("command")
-    if not orig_cmd:
-        # No 'command' almost always means an HTTP/SSE server (configured by 'url').
-        # terse proxies stdio servers only — name that explicitly so the user isn't
-        # left guessing why a valid-looking server can't be wrapped (#19).
-        hint = " (it is configured by 'url')" if original.get("url") else ""
-        raise ValueError(
-            f"server '{server}' has no 'command' to wrap{hint} — terse proxies stdio "
-            f"MCP servers only; HTTP/SSE transport is not supported yet (issue #5)")
-    orig_args = list(original.get("args", []))
-
     proxy_opts = ["--policy", policy]
     if capture_dir:
         proxy_opts += ["--capture-dir", capture_dir]
-    new_entry = {k: v for k, v in original.items() if k not in ("command", "args")}
-    new_entry["command"] = terse_cmd[0]
-    new_entry["args"] = [*terse_cmd[1:], "proxy", *proxy_opts, "--", orig_cmd, *orig_args]
+
+    orig_cmd = original.get("command")
+    if orig_cmd:
+        orig_args = list(original.get("args", []))
+        new_entry = {k: v for k, v in original.items() if k not in ("command", "args")}
+        new_entry["command"] = terse_cmd[0]
+        new_entry["args"] = [*terse_cmd[1:], "proxy", *proxy_opts, "--", orig_cmd, *orig_args]
+    else:
+        orig_url = original.get("url")
+        if not orig_url:
+            # Neither 'command' nor 'url' — not a launchable stdio server NOR a
+            # dispatchable HTTP one; nothing terse can wrap (#19).
+            raise ValueError(
+                f"server '{server}' has no 'command' or 'url' to wrap — it doesn't "
+                f"look like a valid MCP server entry")
+        orig_headers = original.get("headers") or {}
+        header_opts: list[str] = []
+        for k, v in orig_headers.items():
+            header_opts += ["--header", f"{k}={v}"]
+        new_entry = {k: v for k, v in original.items()
+                    if k not in ("command", "args", "url", "headers")}
+        new_entry["command"] = terse_cmd[0]
+        new_entry["args"] = [*terse_cmd[1:], "proxy", *proxy_opts, *header_opts, "--", orig_url]
     servers[server] = new_entry
     return config, stash
 

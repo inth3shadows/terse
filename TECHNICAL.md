@@ -208,6 +208,17 @@ gitignored because captured tool output may contain real data.
   (needs a model in the proxy) is parsed but deferred — warned and left lossless. All lossy
   is off by default; each mode replaces the round-trip gate with its own acceptable-loss
   gate only where a field is explicitly marked.
+  **Behavioral gate (#46):** `droppable_loss` proves a drop is recoverable *if* the model
+  retrieves it — it says nothing about whether a real tool-calling model actually reaches
+  for `terse.retrieve` when the dropped field is needed, or leaves it alone (no over-fetch)
+  when it isn't. `terse fluency --drop-eval --policy <policy with a drop field>` answers
+  that directly: a live 2-turn tool-loop eval (system primer + the same `RETRIEVE_TOOL_DEF`
+  the proxy injects, the model decides whether to call it, the harness resolves the handle
+  exactly as `Interceptor.answer_retrieve` would) scored on retrieve-recall (called when
+  needed), no-overfetch (didn't call when not needed), and final-answer accuracy — gated on
+  the worst model, same honesty bar as the rest of `fluency.py`. Live-model-only, no
+  offline/pack mode (mirrors `fluency --diff`'s precedent) — run it before recommending
+  `drop-to-retrieve` in a generated policy.
 - **Proxy: the model must understand terse's format.** The proxy compresses tool
   results in place, so the model receives the table/legend form. It is self-describing
   (a `cols` header, an inline legend) and needs no decode step, but a model that has
@@ -235,8 +246,19 @@ gitignored because captured tool output may contain real data.
   N times and reports accuracy with a pooled binomial confidence interval, so the
   verdict is a bound, not a direction. (Parametric SE over N×Q×P Bernoulli draws is
   used rather than the std of N whole-eval runs, which is itself noise at small N.)
-- **Proxy is single-downstream and stdio-only.** One server per proxy instance; no
-  HTTP/SSE transport, no fan-out to multiple servers. Run one proxy per server.
+- **Proxy transport and fan-out (#5).** A `terse proxy` downstream is either a stdio
+  command or an MCP Streamable-HTTP `url` (`transport.py`'s `Transport` abstraction —
+  `Interceptor`/`pump` are transport-agnostic; drop-to-retrieve's swallow-and-reply logic
+  never touches the downstream transport at all, so it needed zero HTTP-specific
+  reimplementation). `--config peers.json` fronts N peers (any mix of stdio/HTTP) behind
+  one policy/primer/process, prefixing each peer's tools (`{peer}__{tool}`) and sharing one
+  content-addressed drop-to-retrieve store across all of them (`multiproxy.py`). v1 scope
+  is proportionate, not exhaustive: HTTP is synchronous POST-then-drain (no cross-request
+  pipelining) with no standalone GET-SSE listener for unsolicited server pushes; multi-peer
+  broadcasts (`initialize`/`tools/list`) wait on every peer up to a bounded timeout before
+  merging, and any client method outside `initialize`/`tools/list`/`tools/call` falls back
+  to peer 0 (debug-logged). Each is a documented v1 limitation, not a silent gap — revisit
+  if a real workload needs it.
 - **Cross-call diffing is built, opt-in (`proxy --diff`).** The probe shows 91% overlap
   between successive same-tool calls; the proxy can now emit a lossless delta against the
   prior result (keyed row diff for record arrays, shallow key diff for objects) instead
