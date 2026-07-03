@@ -255,6 +255,28 @@ Add `--bars` to `measure` or `verify` for the same savings charts as unicode bar
 printed straight to the terminal — no new file, color only when stdout is a tty
 (honors `NO_COLOR`). `fluency` also has a `--bars` flag — see below.
 
+Add `--history <file.jsonl>` to `measure` to track savings over time, not just one
+snapshot — is the win improving, flat, or regressing as the corpus grows? Each run
+appends one line (timestamp, payload count, lossless gate, token totals) to the file,
+then prints a trend table plus a sparkline across every run recorded there so far:
+
+```
+uv run terse measure --corpus corpus --history reports/measure-history.jsonl
+# ...
+# ## Trend across runs
+# | # | timestamp | label | payloads | lossless | raw tok | terse tok | saved % | Δ pts |
+# |---|---|---|---|---|---|---|---|---|
+# | 1 | 2026-07-01T09:00:00+00:00 | corpus | 12 | 12/12 | 4102 | 2380 | +42.0% | — |
+# | 2 | 2026-07-02T09:00:00+00:00 | corpus | 14 | 14/14 | 4890 | 2650 | +45.8% | +3.8 |
+#   ▁█   +42.0% -> +45.8%  (range +42.0% .. +45.8%)
+```
+
+The file is plain JSONL (one JSON object per line, append-only) — diffable, greppable,
+safe to commit if you want savings tracked in git history. It's not currently wired
+into `verify` — verify's no-`--corpus` fallback uses a synthetic, deterministic sample,
+which would just log the same numbers every time; point `--history` at `measure`
+runs over your own captured corpus for a trend that means something.
+
 ### Check that the model still understands the compressed output
 
 Saving tokens is pointless if the model reads the compressed form worse than raw JSON.

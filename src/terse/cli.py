@@ -64,6 +64,29 @@ def _cmd_capture(args: argparse.Namespace) -> int:
     return 0
 
 
+def _record_and_print_trend(history_path: str, rows: list, label: str) -> None:
+    """Append this run's summary to the `--history` jsonl file and print the trend
+    across every run recorded there so far (including this one). The only place
+    in this command that reads the real clock (principle #31: inject nondeterminism
+    at the edge, not inside the pure summarize_run/build_trend_report/
+    trend_sparkline_lines core)."""
+    from datetime import datetime, timezone
+
+    from .history import append_run, load_history, summarize_run
+    from .report import build_trend_report
+    from .terminal_report import trend_sparkline_lines
+
+    path = Path(history_path)
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    run = summarize_run(rows, ts, label=label)
+    all_runs = load_history(path) + [run]
+    append_run(path, run)
+    print("\n" + build_trend_report(all_runs))
+    if len(all_runs) >= 2:
+        print(trend_sparkline_lines(all_runs))
+    print(f"[history: {len(all_runs)} run(s) recorded -> {path}]")
+
+
 def _cmd_measure(args: argparse.Namespace) -> int:
     envelopes = load_corpus(args.corpus)
     if not envelopes:
@@ -81,6 +104,8 @@ def _cmd_measure(args: argparse.Namespace) -> int:
         _write_html_report(build_html_report(rows, cov), out)
     if args.bars:
         print("\n" + build_terminal_report(rows))
+    if args.history:
+        _record_and_print_trend(args.history, rows, args.corpus)
     return 0
 
 
@@ -651,6 +676,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="also write a charted HTML report next to --out (inline SVG, no JS/CDN)")
     m.add_argument("--bars", action="store_true",
                    help="also print terminal bar charts for the savings sections (ANSI if a tty)")
+    m.add_argument("--history", metavar="FILE",
+                   help="append this run's summary to FILE (jsonl) and print the trend "
+                        "across every run recorded there so far (#51 fast-follow)")
     m.set_defaults(func=_cmd_measure)
 
     p = sub.add_parser("probe", help="value-redundancy + cross-call-overlap ceiling probes")

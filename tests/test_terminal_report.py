@@ -11,6 +11,7 @@ from terse.terminal_report import (
     diverging_bar_lines,
     forest_bar_lines,
     stacked_bar_lines,
+    trend_sparkline_lines,
 )
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -170,3 +171,28 @@ def test_build_terminal_dropeval_report_renders_three_metrics():
 
 def test_build_terminal_dropeval_report_empty():
     assert "no data" in build_terminal_dropeval_report({}, color=False)
+
+
+def test_trend_sparkline_lines_needs_at_least_two_runs():
+    text = trend_sparkline_lines([{"saved_pct": 40.0}])
+    assert "need at least two" in text
+
+
+def test_trend_sparkline_lines_shows_first_and_last_pct():
+    runs = [{"saved_pct": 20.0}, {"saved_pct": 30.0}, {"saved_pct": 50.0}]
+    text = trend_sparkline_lines(runs)
+    assert "+20.0% -> +50.0%" in text
+    assert "+20.0% .. +50.0%" in text
+
+
+def test_trend_sparkline_lines_ignores_none_saved_pct():
+    runs = [{"saved_pct": None}, {"saved_pct": 10.0}, {"saved_pct": 20.0}]
+    text = trend_sparkline_lines(runs)
+    assert "+10.0% -> +20.0%" in text
+
+
+def test_trend_sparkline_lines_flat_series_no_crash():
+    # equal values -> span is 0 -> must not divide by zero
+    runs = [{"saved_pct": 40.0}, {"saved_pct": 40.0}, {"saved_pct": 40.0}]
+    text = trend_sparkline_lines(runs)
+    assert "+40.0% -> +40.0%" in text
