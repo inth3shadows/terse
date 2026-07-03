@@ -191,6 +191,26 @@ def test_install_then_uninstall_mcp_roundtrips_via_cli(tmp_path, monkeypatch):
     assert restored == original_entry
 
 
+def test_install_then_uninstall_mcp_scope_project_via_cli(tmp_path, monkeypatch, capsys):
+    # #58: --scope project wraps/unwraps a .mcp.json directly, independent of
+    # $CLAUDE_CONFIG (which stays untouched by a project-scope run).
+    mcp_json = tmp_path / ".mcp.json"
+    original_entry = {"command": "uvx", "args": ["demo-mcp"]}
+    mcp_json.write_text(json.dumps({"mcpServers": {"demo": original_entry}}), encoding="utf-8")
+    policy = _write(tmp_path, "policy.json", json.dumps({"rules": []}))
+
+    rc = main(["install-mcp", "demo", "--policy", str(policy), "--scope", "project",
+              "--file", str(mcp_json)])
+    assert rc == 0
+    assert "scope: project" in capsys.readouterr().out
+    wrapped = json.loads(mcp_json.read_text(encoding="utf-8"))["mcpServers"]["demo"]
+    assert wrapped["command"] != "uvx"
+
+    assert main(["uninstall-mcp", "demo", "--scope", "project", "--file", str(mcp_json)]) == 0
+    restored = json.loads(mcp_json.read_text(encoding="utf-8"))["mcpServers"]["demo"]
+    assert restored == original_entry
+
+
 def test_proxy_cmd_parses_and_forwards_headers(monkeypatch):
     # #5: --header NAME=VALUE (repeatable) must reach run_proxy as a dict, and the
     # positional REMAINDER cmd must still come through unchanged (a single URL here).

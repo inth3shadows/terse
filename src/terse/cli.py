@@ -475,7 +475,8 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
 
     try:
         res = do_install(args.servers, args.policy, dry_run=args.print,
-                         capture_dir=args.capture_dir)
+                         capture_dir=args.capture_dir, scope=args.scope,
+                         file=args.file, repo_path=args.repo_path)
     except (FileNotFoundError, ValueError) as e:
         print(f"install-mcp: {e}", file=sys.stderr)
         return 2
@@ -484,7 +485,7 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
         print(f"{tag} {c['server']}:")
         print(f"    before: {_short_cmd(c['before'])}")
         print(f"    after:  {_short_cmd(c['after'])}")
-    print(f"config: {res['config']}  policy: {res['policy']}")
+    print(f"config: {res['config']}  scope: {res['scope']}  policy: {res['policy']}")
     if res.get("capture_dir"):
         print(f"capture: raw tool results → {res['capture_dir']}")
     if res["backup"]:
@@ -497,7 +498,12 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
 def _cmd_uninstall_mcp(args: argparse.Namespace) -> int:
     from .install_mcp import do_uninstall
 
-    res = do_uninstall(args.servers, all_=args.all, dry_run=args.print)
+    try:
+        res = do_uninstall(args.servers, all_=args.all, dry_run=args.print,
+                           scope=args.scope, file=args.file, repo_path=args.repo_path)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"uninstall-mcp: {e}", file=sys.stderr)
+        return 2
     tag = "[dry-run] would restore" if res["dry_run"] else "restored"
     if not res["changes"]:
         print("nothing to do (no terse-managed servers).")
@@ -699,9 +705,19 @@ def main(argv: list[str] | None = None) -> int:
     f.set_defaults(func=_cmd_fluency)
 
     im = sub.add_parser("install-mcp", help="wrap Claude Code MCP server(s) with the "
-                                            "terse proxy in ~/.claude.json")
+                                            "terse proxy")
     im.add_argument("servers", nargs="+", help="mcpServers name(s) to wrap (e.g. runecho)")
     im.add_argument("--policy", required=True, help="path to the JSON policy file")
+    im.add_argument("--scope", choices=("user", "project", "local"), default="user",
+                    help="MCP config scope (#58): user = ~/.claude.json top-level "
+                         "(default), project = a .mcp.json file, local = this repo's "
+                         "nested block in ~/.claude.json")
+    im.add_argument("--file", help="--scope project: path to the .mcp.json to wrap "
+                                   "(default: ./.mcp.json)")
+    im.add_argument("--repo-path", help="--scope local: the projects.<repo-path> key "
+                                        "to wrap inside ~/.claude.json (default: "
+                                        "resolved via `git rev-parse --git-common-dir`, "
+                                        "the bare-repo root for claudew/codexw worktrees)")
     im.add_argument("--capture-dir", metavar="DIR",
                     help="also tee raw tool results into this corpus dir for later "
                          "`terse measure`/`verify` (opt-in; never affects forwarding)")
@@ -713,6 +729,12 @@ def main(argv: list[str] | None = None) -> int:
                                               "their original command")
     um.add_argument("servers", nargs="*", help="server name(s) to restore (or use --all)")
     um.add_argument("--all", action="store_true", help="restore every terse-managed server")
+    um.add_argument("--scope", choices=("user", "project", "local"), default="user",
+                    help="MCP config scope to restore (#58) — see install-mcp --scope")
+    um.add_argument("--file", help="--scope project: path to the .mcp.json to restore "
+                                   "(default: ./.mcp.json)")
+    um.add_argument("--repo-path", help="--scope local: the projects.<repo-path> key "
+                                        "to restore (default: resolved via git)")
     um.add_argument("--print", action="store_true",
                     help="dry-run: show what would be restored without writing")
     um.set_defaults(func=_cmd_uninstall_mcp)

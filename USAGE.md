@@ -133,6 +133,27 @@ instead of nesting proxies) and never enables `--diff`. It honors `$CLAUDE_CONFI
 if your config isn't at `~/.claude.json`. Start with one high-win, read-only
 server (e.g. `runecho`) and confirm it works before wrapping more.
 
+Claude Code has three MCP scopes, and `--scope` targets any of them (default
+`user`, i.e. today's behavior):
+
+```
+# project scope — a .mcp.json checked into the repo and shared with every clone
+uv run terse install-mcp runecho --policy policy.example.json --scope project
+uv run terse uninstall-mcp runecho --scope project             # --file overrides the path (default ./.mcp.json)
+
+# local scope — personal to one repo on one machine, nested in ~/.claude.json's
+# projects."<repo-path>" block; --repo-path defaults to `git rev-parse
+# --git-common-dir` (the bare-repo root for a claudew/codexw worktree, so every
+# worktree of the same repo shares one entry instead of one per worktree)
+uv run terse install-mcp runecho --policy policy.example.json --scope local
+uv run terse uninstall-mcp runecho --scope local
+```
+
+The sidecar stash is namespaced per scope, so the same server can be
+independently managed in more than one scope at once (e.g. wrapped with a
+stricter policy at `user` scope and a looser one at `local` scope for one repo)
+without the two colliding.
+
 ### Let terse write the policy for you (`policy generate`)
 
 Authoring `policy.json` by hand is the main chore: add a server, see no compression, then

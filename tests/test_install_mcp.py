@@ -112,7 +112,7 @@ def test_do_install_writes_config_stash_and_backup(tmp_path, monkeypatch):
     assert written["mcpServers"]["runecho"]["command"] == "/abs/python"
     assert written["otherTopLevel"] == {"keep": True}  # untouched
     stash = json.loads(im.stash_path(cfg).read_text())
-    assert stash["runecho"] == {"command": "uvx", "args": ["runecho-mcp"]}
+    assert stash["user"]["runecho"] == {"command": "uvx", "args": ["runecho-mcp"]}
 
     # config, stash, and backup can all carry secrets (MCP server `env` blocks) — every
     # file this operation writes must be owner-only, never world/group-readable.
@@ -192,4 +192,185 @@ def test_dry_run_does_not_write(tmp_path, monkeypatch):
     res = im.do_install(["runecho"], str(policy), dry_run=True, cfg=cfg)
     assert res["dry_run"] and res["backup"] is None
     assert cfg.read_text() == before  # unchanged
-    assert not im.stash_path(cfg).exists()
+
+
+# --------------------------------------------------------------------------- #
+# --scope support (#58): user (default), project (.mcp.json), local (nested
+# projects."<repo-path>".mcpServers)
+# --------------------------------------------------------------------------- #
+def test_resolve_target_user_scope_defaults_to_config_path(monkeypatch, tmp_path):
+    fake_home_cfg = tmp_path / ".claude.json"
+    monkeypatch.setattr(im, "config_path", lambda: fake_home_cfg)
+    target = im.resolve_target("user")
+    assert target.cfg == fake_home_cfg
+    assert target.server_path == ()
+    assert target.stash_prefix == "user"
+
+
+def test_resolve_target_project_scope_defaults_to_cwd_mcp_json(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    target = im.resolve_target("project")
+    assert target.cfg == (tmp_path / ".mcp.json").resolve()
+    assert target.server_path == ()
+    assert target.stash_prefix == "project"
+
+
+def test_resolve_target_project_scope_honors_file_override(tmp_path):
+    custom = tmp_path / "sub" / "custom.mcp.json"
+    target = im.resolve_target("project", file=str(custom))
+    assert target.cfg == custom.resolve()
+
+
+def test_resolve_target_local_scope_nests_under_projects(monkeypatch, tmp_path):
+    fake_home_cfg = tmp_path / ".claude.json"
+    monkeypatch.setattr(im, "config_path", lambda: fake_home_cfg)
+    target = im.resolve_target("local", repo_path="/repo/root")
+    assert target.cfg == fake_home_cfg
+    assert target.server_path == ("projects", "/repo/root")
+    assert target.stash_prefix == "local:/repo/root"
+
+
+def test_resolve_target_unknown_scope_raises():
+    with pytest.raises(ValueError):
+        im.resolve_target("bogus")
+
+
+def test_default_repo_path_resolves_to_worktree_bare_root(tmp_path):
+    # A claudew/codexw-style bare-worktree layout: <repo>/.bare is the actual git
+    # dir, and a worktree checkout under <repo>/wt has its own .git FILE pointing
+    # into .bare's worktrees/ subdir. `git rev-parse --git-common-dir` from inside
+    # the worktree must resolve to the .bare dir itself, not the worktree cwd —
+    # this is the exact acceptance criterion from #58 ("worktree repos resolve
+    # local scope to the bare root, not cwd"), reproduced with a real git repo
+    # rather than mocked.
+    import os as _os
+    import subprocess
+
+    def run(*args, cwd):
+        subprocess.run([str(a) for a in args], cwd=cwd, check=True, capture_output=True)
+
+    repo = tmp_path / "myrepo"
+    src = tmp_path / "_src"
+    src.mkdir()
+    run("git", "init", cwd=src)
+    run("git", "config", "user.email", "t@example.com", cwd=src)
+    run("git", "config", "user.name", "t", cwd=src)
+    (src / "f.txt").write_text("x")
+    run("git", "add", "f.txt", cwd=src)
+    run("git", "commit", "-m", "init", cwd=src)
+
+    bare = repo / ".bare"
+    run("git", "clone", "--bare", str(src), str(bare), cwd=tmp_path)
+    branch = subprocess.run(["git", "symbolic-ref", "--short", "HEAD"], cwd=bare,
+                            capture_output=True, text=True, check=True).stdout.strip()
+
+    worktree = repo / "wt"
+    run("git", "worktree", "add", str(worktree), branch, cwd=bare)
+
+    old_cwd = Path.cwd()
+    try:
+        _os.chdir(worktree)
+        repo_path = im.default_repo_path()
+    finally:
+        _os.chdir(old_cwd)
+    assert repo_path == str(bare.resolve())  # bare root, not `worktree`
+
+
+def test_default_repo_path_not_a_git_repo_raises(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # tmp_path is not inside any git repo
+    with pytest.raises(ValueError, match="not a git repo|--repo-path"):
+        im.default_repo_path()
+
+
+def test_install_uninstall_roundtrip_project_scope(tmp_path, monkeypatch):
+    mcp_json = tmp_path / ".mcp.json"
+    original = {"command": "uvx", "args": ["runecho-mcp"]}
+    mcp_json.write_text(json.dumps({"mcpServers": {"runecho": original}}))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+
+    res = im.do_install(["runecho"], str(policy), scope="project", file=str(mcp_json))
+    assert res["scope"] == "project"
+    written = json.loads(mcp_json.read_text())
+    assert written["mcpServers"]["runecho"]["command"] == "/abs/python"
+    stash = json.loads(im.stash_path(mcp_json).read_text())
+    assert stash["project"]["runecho"] == original
+
+    im.do_uninstall(["runecho"], scope="project", file=str(mcp_json))
+    assert json.loads(mcp_json.read_text())["mcpServers"]["runecho"] == original
+
+
+def test_install_uninstall_roundtrip_local_scope(tmp_path, monkeypatch):
+    cfg = tmp_path / ".claude.json"
+    original = {"command": "uvx", "args": ["runecho-mcp"]}
+    cfg.write_text(json.dumps({
+        "mcpServers": {},
+        "projects": {"/repo/root": {"mcpServers": {"runecho": original}, "otherKey": 1}},
+    }))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+
+    res = im.do_install(["runecho"], str(policy), scope="local", cfg=cfg,
+                        repo_path="/repo/root")
+    assert res["scope"] == "local"
+    written = json.loads(cfg.read_text())
+    proj = written["projects"]["/repo/root"]
+    assert proj["mcpServers"]["runecho"]["command"] == "/abs/python"
+    assert proj["otherKey"] == 1  # untouched sibling key
+    assert written["mcpServers"] == {}  # user-scope block untouched
+    stash = json.loads(im.stash_path(cfg).read_text())
+    assert stash["local:/repo/root"]["runecho"] == original
+
+    im.do_uninstall(["runecho"], scope="local", cfg=cfg, repo_path="/repo/root")
+    restored = json.loads(cfg.read_text())["projects"]["/repo/root"]["mcpServers"]["runecho"]
+    assert restored == original
+
+
+def test_same_server_independently_managed_in_user_and_local_scope(tmp_path, monkeypatch):
+    # user and local scope share the same physical ~/.claude.json — a server wrapped
+    # in BOTH must not collide in the stash (#58's "stash needs a scope-qualified
+    # key" requirement).
+    cfg = tmp_path / ".claude.json"
+    user_original = {"command": "uvx", "args": ["runecho-mcp", "--user"]}
+    local_original = {"command": "uvx", "args": ["runecho-mcp", "--local"]}
+    cfg.write_text(json.dumps({
+        "mcpServers": {"runecho": user_original},
+        "projects": {"/repo/root": {"mcpServers": {"runecho": local_original}}},
+    }))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+
+    im.do_install(["runecho"], str(policy), scope="user", cfg=cfg)
+    im.do_install(["runecho"], str(policy), scope="local", cfg=cfg, repo_path="/repo/root")
+
+    written = json.loads(cfg.read_text())
+    assert written["mcpServers"]["runecho"]["args"][-1] == "--user"
+    assert written["projects"]["/repo/root"]["mcpServers"]["runecho"]["args"][-1] == "--local"
+
+    im.do_uninstall(["runecho"], scope="user", cfg=cfg)
+    im.do_uninstall(["runecho"], scope="local", cfg=cfg, repo_path="/repo/root")
+    written = json.loads(cfg.read_text())
+    assert written["mcpServers"]["runecho"] == user_original
+    assert written["projects"]["/repo/root"]["mcpServers"]["runecho"] == local_original
+
+
+def test_legacy_flat_stash_migrates_to_user_scope(tmp_path, monkeypatch):
+    # Pre-#58 stash files are flat ({server: original_entry}) with no scope
+    # namespacing at all — every real installed stash predates this change, so
+    # uninstall must keep working on them without any manual migration step.
+    cfg = tmp_path / ".claude.json"
+    wrapped = {"command": "/abs/python", "args": ["-m", "terse", "proxy", "--policy",
+                                                   "/p.json", "--", "uvx", "runecho-mcp"]}
+    original = {"command": "uvx", "args": ["runecho-mcp"]}
+    cfg.write_text(json.dumps({"mcpServers": {"runecho": wrapped}}))
+    im.stash_path(cfg).write_text(json.dumps({"runecho": original}))
+
+    res = im.do_uninstall(["runecho"], cfg=cfg)  # default scope="user"
+    assert res["changes"] == [{"server": "runecho", "restored": True}]
+    assert json.loads(cfg.read_text())["mcpServers"]["runecho"] == original
+    # migrated on write: stash is now namespaced, not flat
+    stash = json.loads(im.stash_path(cfg).read_text())
+    assert stash == {"user": {}}

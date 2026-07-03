@@ -1,7 +1,7 @@
 """Install/remove terse in front of Claude Code MCP servers.
 
-Rewrites the `mcpServers` entries of the Claude Code config (`~/.claude.json` by
-default) so a named server's command becomes, for a stdio server:
+Rewrites the `mcpServers` entries of a Claude Code config so a named server's
+command becomes, for a stdio server:
 
     <python> -m terse proxy --policy <policy> -- <original command + args>
 
@@ -9,10 +9,26 @@ or, for an HTTP/SSE server (`url` + optional `headers`, #5):
 
     <python> -m terse proxy --policy <policy> --header k=v ... -- <original url>
 
+Claude Code has three MCP scopes (#58), each backed by a different location:
+  - user    — top-level `mcpServers` in `~/.claude.json` (default; #27's original
+              scope).
+  - project — a `.mcp.json` file, normally checked into the repo and shared with
+              every clone.
+  - local   — nested `projects."<repo-path>".mcpServers` inside `~/.claude.json`,
+              personal to one repo on one machine. `<repo-path>` resolves via
+              `git rev-parse --git-common-dir` (see `default_repo_path`), not
+              cwd, so every worktree of a claudew/codexw bare-worktree repo
+              shares one entry instead of one per worktree.
+`resolve_target` maps a scope (+ its scope-specific override flag) to the
+physical file and the key path inside it that holds `mcpServers`.
+
 The original entry is preserved verbatim in a sidecar stash so `uninstall` can
 restore it byte-for-byte. The wrap is idempotent (re-running re-wraps from the
 stashed original rather than double-wrapping) and never enables `--diff`
-implicitly (diff fluency is unverified — see the diff-fluency reports).
+implicitly (diff fluency is unverified — see the diff-fluency reports). The
+stash is namespaced by scope (`Target.stash_prefix`) so the same server can be
+independently managed in more than one scope — user and local both live in
+`~/.claude.json` and would otherwise collide in one flat stash.
 
 The core is pure functions over plain dicts (`wrap`/`unwrap`) so they are unit
 testable without touching the filesystem; the `do_*` helpers add IO + backup.
@@ -21,13 +37,16 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from ._secure_io import write_restricted
 
 STASH_NAME = ".terse-mcp-stash.json"
+VALID_SCOPES = ("user", "project", "local")
 
 
 # --------------------------------------------------------------------------- IO
@@ -39,6 +58,70 @@ def config_path() -> Path:
 
 def stash_path(cfg: Path) -> Path:
     return cfg.parent / STASH_NAME
+
+
+def default_repo_path() -> str:
+    """Local scope's default `projects` key: `git rev-parse --git-common-dir`,
+    absolute. For a plain repo this is `<repo>/.git`'s parent-equivalent identity;
+    for a claudew/codexw bare-worktree layout it resolves to the bare root itself
+    (e.g. `.../runecho/.bare`) regardless of which worktree you're standing in —
+    matching how Claude Code itself keys local-scope entries for such repos (#58),
+    confirmed against a live `~/.claude.json` local entry keyed at exactly that
+    path. Raises ValueError (not a git repo, or git missing) so callers can tell
+    the user to pass --repo-path explicitly instead of crashing on a subprocess
+    error."""
+    try:
+        result = subprocess.run(["git", "rev-parse", "--git-common-dir"],
+                                capture_output=True, text=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        raise ValueError(
+            "local scope resolves its default --repo-path from git, but this "
+            "isn't a git repo (or git isn't installed) — pass --repo-path "
+            "explicitly") from e
+    git_dir = Path(result.stdout.strip())
+    if not git_dir.is_absolute():
+        git_dir = Path.cwd() / git_dir
+    return str(git_dir.resolve())
+
+
+@dataclass(frozen=True)
+class Target:
+    """A resolved scope: `cfg` is the physical file to read/write, `server_path`
+    is the key path to walk from that file's root to the dict which itself holds
+    `mcpServers` (empty for user/project — it sits at the top level; ("projects",
+    "<repo>") for local), and `stash_prefix` namespaces this scope's slice of the
+    sidecar stash."""
+    cfg: Path
+    server_path: tuple[str, ...]
+    stash_prefix: str
+
+
+def resolve_target(scope: str, *, cfg: Path | None = None, file: str | None = None,
+                   repo_path: str | None = None) -> Target:
+    """Map --scope (+ its scope-specific override) to a Target. `cfg` overrides the
+    physical ~/.claude.json location for user/local scope (tests, $CLAUDE_CONFIG);
+    `file` overrides the project-scope .mcp.json path; `repo_path` overrides local
+    scope's `projects` key (else `default_repo_path()`)."""
+    if scope == "user":
+        return Target(cfg or config_path(), (), "user")
+    if scope == "project":
+        path = Path(file).expanduser().resolve() if file else Path(".mcp.json").resolve()
+        return Target(path, (), "project")
+    if scope == "local":
+        repo = repo_path or default_repo_path()
+        return Target(cfg or config_path(), ("projects", repo), f"local:{repo}")
+    raise ValueError(f"unknown scope {scope!r}; must be one of {VALID_SCOPES}")
+
+
+def _servers_root(config: dict, server_path: tuple[str, ...]) -> dict:
+    """Walk `server_path` from `config`'s root, creating intermediate dicts as
+    needed, and return the dict that itself should hold `mcpServers` — `config`
+    itself when `server_path` is empty (user/project scope), else the nested
+    per-repo block (local scope)."""
+    node = config
+    for key in server_path:
+        node = node.setdefault(key, {})
+    return node
 
 
 def terse_invocation() -> list[str]:
@@ -122,6 +205,24 @@ def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
 
+def _load_stash(path: Path) -> dict:
+    """Load the sidecar stash, transparently migrating the pre-#58 flat format
+    ({server: original_entry}) to the scope-namespaced one ({stash_prefix: {server:
+    original_entry}}) — before #58, "user" was the only scope, so every legacy entry
+    is exactly that scope's stash. Detected by shape: a legacy entry's value is an
+    MCP server entry itself (has 'command' or 'url'); a migrated file's top-level
+    values are scope buckets (dicts of server entries), which don't. Migration is
+    in-memory only here — do_install/do_uninstall persist the new shape on their
+    next write, same as any other change."""
+    raw = _load_json(path)
+    if not raw:
+        return {}
+    looks_legacy = any(
+        isinstance(v, dict) and ("command" in v or "url" in v) for v in raw.values()
+    )
+    return {"user": raw} if looks_legacy else raw
+
+
 def _write_json(path: Path, obj: dict, *, trailing_newline: bool = True) -> None:
     # ensure_ascii=False keeps non-ASCII (em-dashes, emoji, …) literal, matching how
     # Claude Code itself serializes ~/.claude.json. With the default (True), the first
@@ -140,14 +241,19 @@ def _backup(cfg: Path) -> Path:
 
 
 def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
-               cfg: Path | None = None, capture_dir: str | None = None) -> dict:
-    cfg = cfg or config_path()
-    if not cfg.exists():
-        raise FileNotFoundError(f"Claude config not found: {cfg}")
-    raw = cfg.read_text(encoding="utf-8")
+               cfg: Path | None = None, capture_dir: str | None = None,
+               scope: str = "user", file: str | None = None,
+               repo_path: str | None = None) -> dict:
+    target = resolve_target(scope, cfg=cfg, file=file, repo_path=repo_path)
+    if not target.cfg.exists():
+        what = ".mcp.json" if scope == "project" else "Claude config"
+        raise FileNotFoundError(f"{what} not found: {target.cfg}")
+    raw = target.cfg.read_text(encoding="utf-8")
     config = json.loads(raw)
     had_nl = raw.endswith("\n")  # preserve trailing-newline state for byte-fidelity
-    stash = _load_json(stash_path(cfg))
+    full_stash = _load_stash(stash_path(target.cfg))
+    stash = full_stash.setdefault(target.stash_prefix, {})
+    node = _servers_root(config, target.server_path)
     policy_abs = str(Path(policy).resolve())
     if not Path(policy_abs).exists():
         raise FileNotFoundError(f"policy not found: {policy_abs}")
@@ -156,7 +262,7 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
     capture_abs = str(Path(capture_dir).resolve()) if capture_dir else None
     terse_cmd = terse_invocation()
 
-    available = sorted((config.get("mcpServers") or {}).keys())
+    available = sorted((node.get("mcpServers") or {}).keys())
     managed = set(stash)
     missing = [s for s in servers if s not in set(available) and s not in managed]
     if missing:
@@ -165,28 +271,32 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
             f"available: {', '.join(available) or '(none)'}")
     changes = []
     for s in servers:
-        before = (config.get("mcpServers") or {}).get(s)
-        wrap(config, stash, s, policy_abs, terse_cmd, capture_dir=capture_abs)
+        before = (node.get("mcpServers") or {}).get(s)
+        wrap(node, stash, s, policy_abs, terse_cmd, capture_dir=capture_abs)
         changes.append({"server": s, "before": before,
-                        "after": config["mcpServers"][s]})
+                        "after": node["mcpServers"][s]})
 
-    result = {"config": str(cfg), "policy": policy_abs, "available": available,
-              "changes": changes, "dry_run": dry_run, "backup": None,
-              "capture_dir": capture_abs}
+    result = {"config": str(target.cfg), "scope": scope, "policy": policy_abs,
+              "available": available, "changes": changes, "dry_run": dry_run,
+              "backup": None, "capture_dir": capture_abs}
     if not dry_run and changes:
-        result["backup"] = str(_backup(cfg))
-        _write_json(cfg, config, trailing_newline=had_nl)
-        _write_json(stash_path(cfg), stash)
+        result["backup"] = str(_backup(target.cfg))
+        _write_json(target.cfg, config, trailing_newline=had_nl)
+        _write_json(stash_path(target.cfg), full_stash)
     return result
 
 
 def do_uninstall(servers: list[str] | None, *, all_: bool = False,
-                 dry_run: bool = False, cfg: Path | None = None) -> dict:
-    cfg = cfg or config_path()
-    raw = cfg.read_text(encoding="utf-8") if cfg.exists() else ""
+                 dry_run: bool = False, cfg: Path | None = None,
+                 scope: str = "user", file: str | None = None,
+                 repo_path: str | None = None) -> dict:
+    target = resolve_target(scope, cfg=cfg, file=file, repo_path=repo_path)
+    raw = target.cfg.read_text(encoding="utf-8") if target.cfg.exists() else ""
     config = json.loads(raw) if raw else {}
     had_nl = raw.endswith("\n") if raw else True  # preserve trailing-newline state
-    stash = _load_json(stash_path(cfg))
+    full_stash = _load_stash(stash_path(target.cfg))
+    stash = full_stash.setdefault(target.stash_prefix, {})
+    node = _servers_root(config, target.server_path)
     targets = sorted(stash.keys()) if all_ else (servers or [])
 
     changes = []
@@ -194,12 +304,13 @@ def do_uninstall(servers: list[str] | None, *, all_: bool = False,
         if not is_managed(stash, s):
             changes.append({"server": s, "restored": False, "reason": "not managed by terse"})
             continue
-        unwrap(config, stash, s)
+        unwrap(node, stash, s)
         changes.append({"server": s, "restored": True})
 
-    result = {"config": str(cfg), "changes": changes, "dry_run": dry_run, "backup": None}
+    result = {"config": str(target.cfg), "scope": scope, "changes": changes,
+              "dry_run": dry_run, "backup": None}
     if not dry_run and any(c.get("restored") for c in changes):
-        result["backup"] = str(_backup(cfg))
-        _write_json(cfg, config, trailing_newline=had_nl)
-        _write_json(stash_path(cfg), stash)
+        result["backup"] = str(_backup(target.cfg))
+        _write_json(target.cfg, config, trailing_newline=had_nl)
+        _write_json(stash_path(target.cfg), full_stash)
     return result
