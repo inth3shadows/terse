@@ -154,6 +154,24 @@ independently managed in more than one scope at once (e.g. wrapped with a
 stricter policy at `user` scope and a looser one at `local` scope for one repo)
 without the two colliding.
 
+With three scopes, "what's wrapped where" is no longer one file to eyeball —
+`mcp-status` checks all three and prints one report, read-only (it never writes
+anything):
+
+```
+uv run terse mcp-status
+# [user] /home/you/.claude.json
+#   runecho              wrapped  policy=/home/you/.config/terse/policy.json
+#   some-other-server    unwrapped
+```
+
+Each server is one of `wrapped` (terse-managed, present), `unwrapped` (present,
+not terse's), or `orphaned-stash` (terse has a stash entry but the `mcpServers`
+entry it should match is gone — usually a sign the config was hand-edited after
+wrapping; `uninstall-mcp --all` won't touch it either since there's nothing to
+restore it *into*). `--file`/`--repo-path` override project/local scope the
+same way `install-mcp` does.
+
 ### Let terse write the policy for you (`policy generate`)
 
 Authoring `policy.json` by hand is the main chore: add a server, see no compression, then

@@ -211,6 +211,36 @@ def test_install_then_uninstall_mcp_scope_project_via_cli(tmp_path, monkeypatch,
     assert restored == original_entry
 
 
+def test_mcp_status_cmd_reports_wrapped_and_unwrapped(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "plain": {"command": "uvx", "args": ["plain-mcp"]},
+    }}), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    monkeypatch.chdir(tmp_path)
+    policy = _write(tmp_path, "policy.json", json.dumps({"rules": []}))
+
+    assert main(["install-mcp", "plain", "--policy", str(policy)]) == 0
+    capsys.readouterr()  # drain install-mcp's own output
+
+    rc = main(["mcp-status"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[user]" in out
+    assert "plain" in out and "wrapped" in out
+
+
+def test_mcp_status_cmd_empty_prints_nothing_found(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    monkeypatch.chdir(tmp_path)
+
+    rc = main(["mcp-status"])
+    assert rc == 0
+    assert "no MCP servers found" in capsys.readouterr().out
+
+
 def test_proxy_cmd_parses_and_forwards_headers(monkeypatch):
     # #5: --header NAME=VALUE (repeatable) must reach run_proxy as a dict, and the
     # positional REMAINDER cmd must still come through unchanged (a single URL here).
