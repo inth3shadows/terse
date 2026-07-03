@@ -102,6 +102,40 @@ def test_measure_cmd_without_bars_flag_prints_no_terminal_bars(tmp_path, capsys)
     assert "█" not in capsys.readouterr().out
 
 
+def test_measure_cmd_history_flag_records_and_prints_trend(tmp_path, capsys):
+    f = _write(tmp_path, "payload.json", PAYLOAD)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "demo", "--corpus", str(corpus)]) == 0
+    out = tmp_path / "report.md"
+    history = tmp_path / "history.jsonl"
+
+    rc1 = main(["measure", "--corpus", str(corpus), "--out", str(out),
+               "--history", str(history)])
+    assert rc1 == 0
+    text1 = capsys.readouterr().out
+    assert "1 run(s) recorded" in text1
+    assert "at least two" in text1  # only one run so far -> no delta table yet
+    assert history.exists()
+    assert len(history.read_text(encoding="utf-8").splitlines()) == 1
+
+    rc2 = main(["measure", "--corpus", str(corpus), "--out", str(out),
+               "--history", str(history)])
+    assert rc2 == 0
+    text2 = capsys.readouterr().out
+    assert "2 run(s) recorded" in text2
+    assert "Trend across runs" in text2
+    assert len(history.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_measure_cmd_without_history_flag_writes_no_history_file(tmp_path):
+    f = _write(tmp_path, "payload.json", PAYLOAD)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "demo", "--corpus", str(corpus)]) == 0
+    out = tmp_path / "report.md"
+    assert main(["measure", "--corpus", str(corpus), "--out", str(out)]) == 0
+    assert not (tmp_path / "history.jsonl").exists()
+
+
 def test_measure_cmd_empty_corpus_errors(tmp_path):
     corpus = tmp_path / "corpus"
     corpus.mkdir()

@@ -421,6 +421,37 @@ def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def build_trend_report(runs: list[dict[str, Any]]) -> str:
+    """Render the `measure --history` trend (#51 fast-follow) — one row per past run,
+    oldest first, so a reader sees whether the win is improving, flat, or regressing
+    as the corpus grows/changes over time. `runs` is `history.load_history()`'s output
+    WITH the current run already appended by the caller — this function only ever
+    displays the persisted summary numbers, never re-derives them, so a rendered trend
+    can never drift from what was actually written to the history file."""
+    out: list[str] = ["## Trend across runs", ""]
+    if len(runs) < 2:
+        out += ["_Only one run recorded so far — trend needs at least two "
+                "`--history` runs to show a delta._", ""]
+        return "\n".join(out)
+    out += [
+        "| # | timestamp | label | payloads | lossless | raw tok | terse tok | saved % | Δ pts |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    prev_pct: float | None = None
+    for i, r in enumerate(runs, start=1):
+        pct = r.get("saved_pct")
+        pct_s = f"{pct:+.1f}%" if pct is not None else "n/a"
+        delta = f"{pct - prev_pct:+.1f}" if pct is not None and prev_pct is not None else "—"
+        gate = f"{r.get('lossless_pass', '?')}/{r.get('n_payloads', '?')}"
+        out.append(
+            f"| {i} | {r.get('ts', '?')} | {r.get('label') or '—'} | {r.get('n_payloads', '?')} "
+            f"| {gate} | {r.get('raw_tok', '?')} | {r.get('compressed_tok', '?')} "
+            f"| {pct_s} | {delta} |")
+        prev_pct = pct
+    out.append("")
+    return "\n".join(out)
+
+
 def build_diff_report(results: dict) -> str:
     """Render the cross-call diff fluency eval: does a model read a diff against the
     prior result as accurately as the full current result?

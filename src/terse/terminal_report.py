@@ -127,6 +127,27 @@ def build_terminal_report(rows: list[dict[str, Any]], color: bool | None = None)
     return "\n".join(out)
 
 
+_SPARK_LEVELS = "▁▂▃▄▅▆▇█"
+
+
+def trend_sparkline_lines(runs: list[dict[str, Any]]) -> str:
+    """One-line sparkline of `measure --history` saved_pct across runs, oldest to
+    newest — the fastest possible glance at "is the win stable, improving, or
+    regressing" without reading report.build_trend_report's full table. A flat
+    reading (all bars level) with real historical data is itself a legitimate,
+    useful signal (a stable win), not a sign something's broken."""
+    pcts = [r.get("saved_pct") for r in runs if r.get("saved_pct") is not None]
+    if len(pcts) < 2:
+        return "  (need at least two --history runs to show a trend)"
+    lo, hi = min(pcts), max(pcts)
+    span = (hi - lo) or 1.0
+    n_levels = len(_SPARK_LEVELS)
+    spark = "".join(
+        _SPARK_LEVELS[min(int((p - lo) / span * (n_levels - 1)), n_levels - 1)] for p in pcts
+    )
+    return f"  {spark}   {pcts[0]:+.1f}% -> {pcts[-1]:+.1f}%  (range {lo:+.1f}% .. {hi:+.1f}%)"
+
+
 def _track(acc: float, ci: float, marker: str) -> str:
     """Fixed-width `_TRACK_WIDTH`+1 char track: '·' background, '─' whisker span over
     the 95% CI, `marker` at the point estimate. Built and clamped BEFORE any coloring
