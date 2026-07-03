@@ -20,6 +20,10 @@ rule_for
 # Same false-positive class as drop_sink/answerer/rule_for above.
 make_openai
 make_anthropic
+# fluency.py's _aggregate_by_model(pairs, answerers, trials, payload_fn) — the eval
+# PARAMETER (run_diff_payload/run_text_diff_payload), called bare as payload_fn(a, b,
+# fn, tool, trials=trials). Same false-positive class as drop_sink/answerer above.
+payload_fn
 # Also mis-flagged: a local variable holding a function REFERENCE, called bare in a
 # monkeypatch wrapper (`real = mod.fn; def wrapper(*a): return real(*a)`), same
 # root cause as the callback-parameter case above — the guard resolves module
@@ -27,6 +31,10 @@ make_anthropic
 real_apply
 real
 orig_send
+# test_run_text_diff_payload_computes_wire_exactly_once's `original = fluency.text_diff.
+# text_diff_wire`, called bare inside its counting_wire wrapper. Same class as real/
+# orig_send above.
+original
 # Also mis-flagged: plain English words inside a docstring that happen to look like
 # `word(...)` bare calls to the guard's pattern match (e.g. "the client's stdin",
 # "server->client", "closes the transport in turn"). Not code at all.
@@ -50,6 +58,12 @@ detail
 scope
 scopes
 implicitly
+# report.py's _build_diff_style_report docstring: "pre-split into lines (not a single
+# string)" — "lines (not" reads as a bare call. Not code.
+lines
+# fluency.py's run_text_diff_payload docstring: "computes the diff wire exactly ONCE
+# (unlike calling gen_text_diff_questions..." — "ONCE (unlike" reads as a bare call.
+ONCE
 # Also mis-flagged: importlib.metadata.version, imported locally inside
 # _attestation_card (html_report.py) the same way report.py's build_verify_header
 # already does — same hunk-splitting false positive as the stdlib symbols above.

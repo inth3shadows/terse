@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from . import text_diff
-from .capture import extract_records
+from .capture import LONG_TEXT, OTHER, classify_shape, extract_records
 from .tokenize import count_cl100k
 from .transforms import compress, compress_structure, dict_encode, diff_wire, minify
 
@@ -391,32 +391,47 @@ def run_diff_payload(prev_obj: Any, curr_obj: Any, answerer: Answerer,
     return out
 
 
+def _iter_consecutive_pairs(envelopes: list[dict]):
+    """Group envelopes by tool, sort each group by sha (for determinism — the order the
+    proxy would see them), and yield consecutive (tool, sha, prev_raw, curr_raw) tuples.
+    Shared pairing scaffold for run_diff_fluency and run_text_diff_fluency; each applies
+    its own JSON/text domain filter on top of this."""
+    by_tool: dict[str, list[dict]] = {}
+    for env in envelopes:
+        by_tool.setdefault(env["tool"], []).append(env)
+    for tool, envs in by_tool.items():
+        envs = sorted(envs, key=lambda e: e.get("sha", ""))
+        for prev_env, curr_env in zip(envs, envs[1:]):
+            yield tool, curr_env.get("sha", "?"), prev_env["raw"], curr_env["raw"]
+
+
+def _aggregate_by_model(pairs: list[tuple], answerers: dict[str, Answerer], trials: int,
+                        payload_fn) -> dict:
+    """Shared per-model aggregation loop for run_diff_fluency/run_text_diff_fluency:
+    run `payload_fn` over every pair for every answerer and collect the rows."""
+    results: dict[str, list[dict]] = {}
+    for name, fn in answerers.items():
+        rows: list[dict] = []
+        for tool, csha, a, b in pairs:
+            for row in payload_fn(a, b, fn, tool, trials=trials):
+                rows.append({"tool": tool, "sha": csha, **row})
+        results[name] = rows
+    return results
+
+
 def run_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
                      trials: int = 1) -> dict:
     """Run the diff-fluency eval over consecutive same-tool payload PAIRS (sorted by sha
     for determinism — the order the proxy would see them). Returns {model: [rows]}."""
-    by_tool: dict[str, list[dict]] = {}
-    for env in envelopes:
-        by_tool.setdefault(env["tool"], []).append(env)
     pairs: list[tuple] = []
-    for tool, envs in by_tool.items():
-        envs = sorted(envs, key=lambda e: e.get("sha", ""))
-        for prev_env, curr_env in zip(envs, envs[1:]):
-            try:
-                prev_obj = json.loads(prev_env["raw"])
-                curr_obj = json.loads(curr_env["raw"])
-            except (json.JSONDecodeError, TypeError):
-                continue
-            pairs.append((tool, curr_env.get("sha", "?"), prev_obj, curr_obj))
-
-    results: dict[str, list[dict]] = {}
-    for name, fn in answerers.items():
-        rows: list[dict] = []
-        for tool, csha, prev_obj, curr_obj in pairs:
-            for row in run_diff_payload(prev_obj, curr_obj, fn, tool, trials=trials):
-                rows.append({"tool": tool, "sha": csha, **row})
-        results[name] = rows
-    return results
+    for tool, csha, prev_raw, curr_raw in _iter_consecutive_pairs(envelopes):
+        try:
+            prev_obj = json.loads(prev_raw)
+            curr_obj = json.loads(curr_raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        pairs.append((tool, csha, prev_obj, curr_obj))
+    return _aggregate_by_model(pairs, answerers, trials, run_diff_payload)
 
 
 # --------------------------------------------------------------------------- #
@@ -432,23 +447,50 @@ def run_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
 # their own module. (dropeval.py earns its own module because drop-to-retrieve is
 # a genuinely different, stateful 2-turn tool-calling protocol; this isn't.)
 # --------------------------------------------------------------------------- #
+def _text_diff_questions_from_lines(curr: str) -> list[Question]:
+    """The anchor questions given curr's lines — assumes the caller already confirmed a
+    lossless text diff applies. An empty target line is excluded from the "last-line"/
+    "mid-line" lookup questions: an empty `expected` would be indistinguishable from
+    `_safe_ask`'s empty-string return on a total answerer failure (a transport error
+    scoring as a correct answer), so those questions are simply not asked when the
+    anchor line would be empty."""
+    lines = curr.splitlines()
+    questions = [
+        Question(qid="line-count", qtype="count", transform="text-diff",
+                 prompt="How many lines does the text contain?",
+                 instruction="Reply with just the number.",
+                 expected=len(lines)),
+    ]
+    if lines and lines[-1]:
+        questions.append(
+            Question(qid="last-line", qtype="lookup", transform="text-diff",
+                     prompt="What is the exact content of the LAST line of the text?",
+                     instruction="Reply with just that line, nothing else.",
+                     expected=lines[-1]),
+        )
+    # A mid-document line stresses a REFERENCED (unchanged) chunk instead of the edited
+    # tail line-count/last-line stress — the part of the reconstruction those two
+    # questions can't catch a regression in (e.g. corrupted chunk references that leave
+    # the line count and final line intact).
+    mid = len(lines) // 2
+    if len(lines) > 2 and lines[mid]:
+        questions.append(
+            Question(qid="mid-line", qtype="lookup", transform="text-diff",
+                     prompt=f"What is the exact content of line {mid + 1} (1-indexed) "
+                            "of the text?",
+                     instruction="Reply with just that line, nothing else.",
+                     expected=lines[mid]),
+        )
+    return questions
+
+
 def gen_text_diff_questions(prev: str, curr: str, tool: str = "") -> list[Question]:
     """Deterministic questions over unstructured text — the text-payload analogue of
     gen_questions (record/column-shaped JSON). [] if no lossless text diff applies
     (mirrors run_diff_payload's `wire is None` gate) — nothing to compare."""
     if text_diff.text_diff_wire(prev, curr, tool) is None:
         return []
-    lines = curr.splitlines()
-    return [
-        Question(qid="line-count", qtype="count", transform="text-diff",
-                 prompt="How many lines does the text contain?",
-                 instruction="Reply with just the number.",
-                 expected=len(lines)),
-        Question(qid="last-line", qtype="lookup", transform="text-diff",
-                 prompt="What is the exact content of the LAST line of the text?",
-                 instruction="Reply with just that line, nothing else.",
-                 expected=lines[-1] if lines else ""),
-    ]
+    return _text_diff_questions_from_lines(curr)
 
 
 def run_text_diff_payload(prev: str, curr: str, answerer: Answerer,
@@ -461,11 +503,15 @@ def run_text_diff_payload(prev: str, curr: str, answerer: Answerer,
     Field names stay terse_ok/diff_ok anyway (not raw_ok/diff_ok) so the row shape is
     identical to run_diff_payload's — that identity is what lets diff_gap_rows/
     build_terminal_diff_report be reused UNCHANGED for text-diff-eval (a deliberate
-    reuse-over-duplication tradeoff)."""
-    questions = gen_text_diff_questions(prev, curr, tool)
-    if not questions:
-        return []
+    reuse-over-duplication tradeoff).
+
+    Computes the diff wire exactly ONCE (unlike calling gen_text_diff_questions, whose
+    own gate would otherwise recompute the same content-defined-chunking diff a second
+    time) — text_diff_encode's chunk+hash+round-trip-proof cost is not free."""
     wire = text_diff.text_diff_wire(prev, curr, tool)
+    if wire is None:
+        return []
+    questions = _text_diff_questions_from_lines(curr)
     diff_data = f"PREVIOUS RESULT:\n{prev}\n\nUPDATE (diff against it):\n{wire}"
     out: list[dict] = []
     for q in questions:
@@ -481,31 +527,19 @@ def run_text_diff_payload(prev: str, curr: str, answerer: Answerer,
 
 def run_text_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
                           trials: int = 1) -> dict:
-    """Same tool-pairing loop as run_diff_fluency, inverted: only pairs envelopes
-    whose raw text is NOT valid JSON (text-diff's domain; JSON payloads are
-    run_diff_fluency's domain instead)."""
-    by_tool: dict[str, list[dict]] = {}
-    for env in envelopes:
-        by_tool.setdefault(env["tool"], []).append(env)
+    """Same tool-pairing loop as run_diff_fluency, inverted: only pairs envelopes whose
+    raw text is NOT valid JSON on EITHER side (text-diff's domain; JSON payloads are
+    run_diff_fluency's domain instead) — classify_shape (already used by measure.py)
+    catches the Python-3.11 RecursionError on deeply-nested JSON that a bare
+    json.loads/except wouldn't."""
     pairs: list[tuple] = []
-    for tool, envs in by_tool.items():
-        envs = sorted(envs, key=lambda e: e.get("sha", ""))
-        for prev_env, curr_env in zip(envs, envs[1:]):
-            try:
-                json.loads(curr_env["raw"])
-                continue  # valid JSON -> run_diff_fluency's domain, not this one's
-            except (json.JSONDecodeError, TypeError):
-                pass
-            pairs.append((tool, curr_env.get("sha", "?"), prev_env["raw"], curr_env["raw"]))
-
-    results: dict[str, list[dict]] = {}
-    for name, fn in answerers.items():
-        rows: list[dict] = []
-        for tool, csha, prev_raw, curr_raw in pairs:
-            for row in run_text_diff_payload(prev_raw, curr_raw, fn, tool, trials=trials):
-                rows.append({"tool": tool, "sha": csha, **row})
-        results[name] = rows
-    return results
+    for tool, csha, prev_raw, curr_raw in _iter_consecutive_pairs(envelopes):
+        if classify_shape(curr_raw) not in (LONG_TEXT, OTHER):
+            continue  # curr is JSON-shaped -> run_diff_fluency's domain, not this one's
+        if classify_shape(prev_raw) not in (LONG_TEXT, OTHER):
+            continue  # prev is JSON-shaped -> not a text-to-text transition
+        pairs.append((tool, csha, prev_raw, curr_raw))
+    return _aggregate_by_model(pairs, answerers, trials, run_text_diff_payload)
 
 
 def build_pack(envelopes: list[dict], primer: str = PRIMER, trials: int = 1) -> dict:

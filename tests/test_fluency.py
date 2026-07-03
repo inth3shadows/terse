@@ -299,16 +299,28 @@ TEXT_PREV = "\n".join(f"line {i}: some repeated filler content for chunking" for
 TEXT_CURR = TEXT_PREV + "\na brand new appended line at the very end"
 
 
-def test_gen_text_diff_questions_returns_two_deterministic_questions():
+def test_gen_text_diff_questions_returns_deterministic_questions():
     qs = {q.qid: q for q in fluency.gen_text_diff_questions(TEXT_PREV, TEXT_CURR, tool="demo")}
-    assert set(qs) == {"line-count", "last-line"}
+    assert set(qs) == {"line-count", "last-line", "mid-line"}
     assert qs["line-count"].expected == len(TEXT_CURR.splitlines())
     assert qs["last-line"].expected == "a brand new appended line at the very end"
+    # mid-line stresses a REFERENCED (unchanged) chunk, not the edited tail
+    mid = len(TEXT_CURR.splitlines()) // 2
+    assert qs["mid-line"].expected == TEXT_CURR.splitlines()[mid]
 
 
 def test_gen_text_diff_questions_empty_when_no_diff_applies():
     # prev="" -> text_diff_encode's `if not prev_chunks: return None` -> no diff applies
     assert fluency.gen_text_diff_questions("", "some new text") == []
+
+
+def test_gen_text_diff_questions_omits_last_line_when_blank():
+    # A blank final line would give expected="", indistinguishable from _safe_ask's
+    # empty-string return on a total answerer failure — so it must not be asked.
+    curr = TEXT_PREV + "\n\n"
+    qs = {q.qid: q for q in fluency.gen_text_diff_questions(TEXT_PREV, curr, tool="demo")}
+    assert "last-line" not in qs
+    assert "line-count" in qs
 
 
 def test_run_text_diff_payload_structure_and_forms():
@@ -325,6 +337,19 @@ def test_run_text_diff_payload_empty_when_no_diff_applies():
     assert fluency.run_text_diff_payload("", "some new text", lambda s, u: "x") == []
 
 
+def test_run_text_diff_payload_computes_wire_exactly_once(monkeypatch):
+    calls = []
+    original = fluency.text_diff.text_diff_wire
+
+    def counting_wire(prev, curr, tool=""):
+        calls.append(1)
+        return original(prev, curr, tool)
+
+    monkeypatch.setattr(fluency.text_diff, "text_diff_wire", counting_wire)
+    fluency.run_text_diff_payload(TEXT_PREV, TEXT_CURR, lambda s, u: "x", tool="demo", trials=1)
+    assert len(calls) == 1
+
+
 def test_run_text_diff_fluency_only_pairs_non_json_payloads():
     import json
     envs = [
@@ -336,6 +361,18 @@ def test_run_text_diff_fluency_only_pairs_non_json_payloads():
     results = fluency.run_text_diff_fluency(envs, {"m": lambda s, u: "21"}, trials=1)
     assert results["m"], "the one non-JSON pair produces rows"
     assert all(r["tool"] == "text-tool" for r in results["m"])
+
+
+def test_run_text_diff_fluency_excludes_json_prev_text_curr_pair():
+    # Both sides must be non-JSON — a JSON prev paired with a text curr is not a
+    # text-to-text transition the proxy would ever emit a text-diff for.
+    import json
+    envs = [
+        {"tool": "mixed-tool", "sha": "aaa", "raw": json.dumps(DIFF_PREV)},
+        {"tool": "mixed-tool", "sha": "bbb", "raw": TEXT_CURR},
+    ]
+    results = fluency.run_text_diff_fluency(envs, {"m": lambda s, u: "21"}, trials=1)
+    assert results["m"] == []
 
 
 def test_build_text_diff_report_verdict_and_empty():
@@ -355,3 +392,11 @@ def test_build_diff_report_unchanged_by_the_refactor():
     # behavior to prove the refactor is a no-op for JSON diff-eval.
     test_build_diff_report_verdict_and_empty()
     test_diff_gap_rows_matches_build_diff_report_verdict()
+
+
+def test_build_diff_report_empty_hint_preserves_two_line_wrap():
+    # Pin build_diff_report's original two-physical-line empty-corpus hint — the
+    # _build_diff_style_report extraction must not collapse it into one long line.
+    from terse.report import build_diff_report
+    report = build_diff_report({})
+    assert "Capture a tool\n2+ times (an agent loop)" in report

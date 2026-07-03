@@ -453,15 +453,16 @@ def build_trend_report(runs: list[dict[str, Any]]) -> str:
 
 
 def _build_diff_style_report(results: dict, title: str, intro: list[str],
-                             empty_hint: str, control_label: str = "full-terse") -> str:
+                             empty_hint: list[str], control_label: str = "full-terse") -> str:
     """Shared body for build_diff_report and build_text_diff_report — the row shape
     ({qid, qtype, transform, trials, terse_ok, diff_ok}) and verdict math are identical
     for both; only the title/intro/empty-hint copy and the control column's label
-    differ."""
+    differ. `empty_hint` is pre-split into lines (not a single string) so each caller
+    controls its own line-wrapping exactly, the same way `intro` already does."""
     out: list[str] = [title, ""]
     out += intro
     if not results or not any(results.values()):
-        out += [empty_hint, ""]
+        out += [*empty_hint, ""]
         return "\n".join(out)
 
     trials = max((r.get("trials", 1) for rows in results.values() for r in rows), default=1)
@@ -517,8 +518,9 @@ def build_diff_report(results: dict) -> str:
         ["Does a model read a diff against the prior same-tool result as accurately as the",
          "full current result? Same questions, paired per question; ground truth is",
          "deterministic. Risk-item check for `proxy --diff` before turning it on.", ""],
-        "No model answers, or no same-tool payload PAIRS in the corpus. Capture a tool "
-        "2+ times (an agent loop) and configure a backend, then re-run `terse fluency --diff`.",
+        ["No model answers, or no same-tool payload PAIRS in the corpus. Capture a tool",
+         "2+ times (an agent loop) and configure a backend, then re-run "
+         "`terse fluency --diff`."],
     )
 
 
@@ -537,9 +539,9 @@ def build_text_diff_report(results: dict) -> str:
          "text-diff) as from the full current text? Tier 0 doesn't compress non-JSON text",
          "at all, so the control form here is the raw text, not a compressed one. Risk-item",
          "check before enabling `proxy --diff` for text-heavy tools.", ""],
-        "No model answers, or no same-tool TEXT payload PAIRS in the corpus (JSON pairs are "
-        "`--diff`'s domain, not this one's). Capture a text-producing tool 2+ times, then "
-        "re-run `terse fluency --text-diff-eval`.",
+        ["No model answers, or no same-tool TEXT payload PAIRS in the corpus (JSON pairs "
+         "are `--diff`'s domain, not this one's). Capture a text-producing tool 2+ times, "
+         "then re-run `terse fluency --text-diff-eval`."],
         control_label="raw text",
     )
 
