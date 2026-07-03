@@ -289,12 +289,15 @@ gitignored because captured tool output may contain real data.
   base (`Interceptor.last_text`) so a tool that alternates JSON and text results never
   mixes bases. Round-trip correctness is test-covered (`tests/test_text_diff.py`) and a
   live proxy run confirms ~90-93% token savings on a mostly-unchanged 200-line log
-  re-read or append. **Not yet done:** the model-fluency question `terse fluency --diff`
-  answers for the JSON row/key diff — does a model reconstruct the text-diff form as
-  accurately as the raw text — has no text-diff equivalent yet; `fluency.gen_questions`
-  is built around record/column-shaped payloads and doesn't generalize to unstructured
-  text without its own question-generation design. Track as a follow-on before enabling
-  `--diff` for text-heavy tools against a real model consumer.
+  re-read or append.
+  **Behavioral gate:** `terse fluency --text-diff-eval` answers for the text-diff codec
+  the same question `--diff` answers for the JSON row/key diff — does a model reconstruct
+  the current text as accurately from (previous text + text-diff) as from the full
+  current text? Two deterministic questions (line count, exact last line — the part most
+  likely new in an append-only log tail) over any same-tool TEXT payload pair in the
+  corpus, paired scoring against the worst model, same honesty bar as the rest of
+  `fluency.py`. Live-model-only, no offline/pack mode (mirrors `--diff`'s precedent) — run
+  it before enabling `proxy --diff` for text-heavy tools against a real model consumer.
 - **Marker collision.** A payload that genuinely contains a reserved
   `__terse_table__` / `__terse_dict__` / `__terse_diff__` key (at any depth) can't be
   compressed without the consumer mis-reading the user's own dict as a terse envelope —
