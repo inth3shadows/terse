@@ -520,6 +520,27 @@ def _cmd_uninstall_mcp(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mcp_status(args: argparse.Namespace) -> int:
+    from .install_mcp import scan_scopes
+
+    rows = scan_scopes(file=args.file, repo_path=args.repo_path)
+    if not rows:
+        print("no MCP servers found in any scope (user/project/local).")
+        return 0
+    by_scope: dict[str, list[dict]] = {}
+    for r in rows:
+        by_scope.setdefault(r["scope"], []).append(r)
+    for scope in ("user", "project", "local"):
+        scope_rows = by_scope.get(scope)
+        if not scope_rows:
+            continue
+        print(f"[{scope}] {scope_rows[0]['config']}")
+        for r in scope_rows:
+            policy = f"  policy={r['policy']}" if r["policy"] else ""
+            print(f"  {r['server']:<20} {r['state']}{policy}")
+    return 0
+
+
 def _cmd_verify(args: argparse.Namespace) -> int:
     """Self-contained verification report: lossless gate + token savings + an attestation
     header pointing at the checks terse can't self-certify (tests, no-egress, fail-open).
@@ -738,6 +759,16 @@ def main(argv: list[str] | None = None) -> int:
     um.add_argument("--print", action="store_true",
                     help="dry-run: show what would be restored without writing")
     um.set_defaults(func=_cmd_uninstall_mcp)
+
+    ms = sub.add_parser("mcp-status", help="list terse-wrapped MCP servers across all "
+                                           "three scopes (user/project/local) — "
+                                           "read-only, writes nothing")
+    ms.add_argument("--file", help="project scope: path to the .mcp.json to check "
+                                   "(default: ./.mcp.json)")
+    ms.add_argument("--repo-path", help="local scope: the projects.<repo-path> key to "
+                                        "check (default: resolved via git; silently "
+                                        "skipped if not in a git repo)")
+    ms.set_defaults(func=_cmd_mcp_status)
 
     vf = sub.add_parser("verify", help="self-contained verification report: lossless gate "
                                        "+ token savings, and how to verify the rest")

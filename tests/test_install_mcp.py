@@ -374,3 +374,104 @@ def test_legacy_flat_stash_migrates_to_user_scope(tmp_path, monkeypatch):
     # migrated on write: stash is now namespaced, not flat
     stash = json.loads(im.stash_path(cfg).read_text())
     assert stash == {"user": {}}
+
+
+# --------------------------------------------------------------------------- #
+# scan_scopes / mcp-status: read-only enumeration across all three scopes
+# --------------------------------------------------------------------------- #
+def test_scan_scopes_reports_wrapped_unwrapped_and_orphaned(tmp_path, monkeypatch):
+    cfg = tmp_path / ".claude.json"
+    wrapped = {"command": "/abs/python", "args": ["-m", "terse", "proxy", "--policy",
+                                                   "/p.json", "--", "uvx", "runecho-mcp"]}
+    cfg.write_text(json.dumps({
+        "mcpServers": {
+            "runecho": wrapped,           # managed + present -> wrapped
+            "plain": {"command": "uvx", "args": ["plain-mcp"]},  # unmanaged -> unwrapped
+        },
+    }))
+    # a stash entry with NO matching mcpServers entry -> orphaned-stash
+    im.stash_path(cfg).write_text(json.dumps(
+        {"user": {"runecho": {"command": "uvx", "args": ["runecho-mcp"]},
+                  "ghost": {"command": "uvx", "args": ["ghost-mcp"]}}}))
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+    monkeypatch.chdir(tmp_path)  # no .mcp.json here -> project scope contributes nothing
+
+    rows = im.scan_scopes()
+    by_name = {r["server"]: r for r in rows if r["scope"] == "user"}
+    assert by_name["runecho"]["state"] == "wrapped"
+    assert by_name["runecho"]["policy"] == "/p.json"
+    assert by_name["plain"]["state"] == "unwrapped"
+    assert by_name["plain"]["policy"] is None
+    assert by_name["ghost"]["state"] == "orphaned-stash"
+    assert by_name["ghost"]["policy"] is None
+    assert not any(r["scope"] == "project" for r in rows)
+
+
+def test_scan_scopes_includes_project_and_local_when_present(tmp_path, monkeypatch):
+    # cfg (user+local, ~/.claude.json) and .mcp.json (project) live in DIFFERENT
+    # directories -- each has its own sidecar stash (STASH_NAME is a fixed filename
+    # next to its config), so sharing one dir would collide the two stashes.
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+
+    cfg = home_dir / ".claude.json"
+    cfg.write_text(json.dumps({
+        "mcpServers": {},
+        "projects": {"/repo/root": {"mcpServers": {
+            "demo": {"command": "/abs/python", "args": ["-m", "terse", "proxy",
+                                                         "--policy", "/local.json",
+                                                         "--", "demo-mcp"]}}}},
+    }))
+    im.stash_path(cfg).write_text(json.dumps(
+        {"local:/repo/root": {"demo": {"command": "demo-mcp", "args": []}}}))
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+
+    mcp_json = proj_dir / ".mcp.json"
+    mcp_json.write_text(json.dumps({"mcpServers": {
+        "proj-demo": {"command": "/abs/python", "args": ["-m", "terse", "proxy",
+                                                          "--policy", "/proj.json",
+                                                          "--", "proj-mcp"]}}}))
+    im.stash_path(mcp_json).write_text(json.dumps(
+        {"project": {"proj-demo": {"command": "proj-mcp", "args": []}}}))
+    monkeypatch.chdir(proj_dir)
+
+    rows = im.scan_scopes(repo_path="/repo/root")
+    by_scope = {(r["scope"], r["server"]): r for r in rows}
+    assert by_scope[("local", "demo")]["state"] == "wrapped"
+    assert by_scope[("local", "demo")]["policy"] == "/local.json"
+    assert by_scope[("project", "proj-demo")]["state"] == "wrapped"
+    assert by_scope[("project", "proj-demo")]["policy"] == "/proj.json"
+
+
+def test_scan_scopes_never_raises_when_local_scope_unresolvable(tmp_path, monkeypatch):
+    # Not inside a git repo, no --repo-path given -> local scope is silently omitted,
+    # not an error (this is the common case: most invocations aren't in a repo at all).
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {}}))
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+    monkeypatch.chdir(tmp_path)  # tmp_path is not inside any git repo
+    rows = im.scan_scopes()
+    assert not any(r["scope"] == "local" for r in rows)
+
+
+def test_scan_scopes_missing_files_return_empty_not_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(im, "config_path", lambda: tmp_path / "nonexistent.json")
+    monkeypatch.chdir(tmp_path)
+    assert im.scan_scopes() == []
+
+
+def test_scan_scopes_is_read_only(tmp_path, monkeypatch):
+    # A scan must never write the config, the stash, or fabricate a backup — same
+    # write-nothing contract as do_uninstall(dry_run=True).
+    cfg = tmp_path / ".claude.json"
+    before = json.dumps({"mcpServers": {"demo": {"command": "uvx", "args": []}}})
+    cfg.write_text(before)
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+    monkeypatch.chdir(tmp_path)
+
+    im.scan_scopes()
+    assert cfg.read_text() == before
+    assert not im.stash_path(cfg).exists()
+    assert list(tmp_path.glob("*.bak-*")) == []

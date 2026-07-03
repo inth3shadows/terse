@@ -286,6 +286,73 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
     return result
 
 
+# ------------------------------------------------------------------ read-only status
+def _read_servers_root(config: dict, server_path: tuple[str, ...]) -> dict:
+    """Non-mutating counterpart to `_servers_root` — a status scan must never create
+    the intermediate dicts `setdefault` would, or every `mcp-status` run on a repo
+    with no local-scope entry yet would spuriously fabricate one in memory (harmless
+    since never written, but wrong to even construct)."""
+    node: object = config
+    for key in server_path:
+        if not isinstance(node, dict):
+            return {}
+        node = node.get(key, {})
+    return node if isinstance(node, dict) else {}
+
+
+def _scan_target(target: Target, scope: str) -> list[dict]:
+    if not target.cfg.exists():
+        return []
+    config = _load_json(target.cfg)
+    node = _read_servers_root(config, target.server_path)
+    servers = node.get("mcpServers") or {}
+    full_stash = _load_stash(stash_path(target.cfg))
+    stash = full_stash.get(target.stash_prefix, {})
+
+    rows = []
+    for name in sorted(set(servers) | set(stash)):
+        managed = name in stash
+        present = name in servers
+        if managed and present:
+            state = "wrapped"
+        elif managed and not present:
+            # A stash entry with no matching mcpServers entry — the entry was removed
+            # or edited by hand after terse wrapped it. Surfacing this is the whole
+            # point of #58: this exact kind of scope/state drift is what prompted it.
+            state = "orphaned-stash"
+        else:
+            state = "unwrapped"
+        policy = None
+        if present:
+            args = servers[name].get("args") or []
+            if "--policy" in args:
+                policy = args[args.index("--policy") + 1]
+        rows.append({"scope": scope, "server": name, "state": state, "policy": policy,
+                    "config": str(target.cfg)})
+    return rows
+
+
+def scan_scopes(*, cfg: Path | None = None, file: str | None = None,
+                repo_path: str | None = None) -> list[dict]:
+    """Enumerate every terse-relevant mcpServers entry across all three scopes,
+    read-only — no writes, no directory creation, never raises. One row per
+    (scope, server): {scope, server, state, policy, config}, state one of "wrapped"
+    (terse-managed and present), "orphaned-stash" (managed but the entry vanished —
+    see `_scan_target`), or "unwrapped" (present, not terse's). Local scope is
+    silently omitted, not an error, when it doesn't resolve (not in a git repo and
+    no --repo-path given) — "no local scope here" is the common case, not a failure."""
+    rows: list[dict] = []
+    rows += _scan_target(resolve_target("user", cfg=cfg), "user")
+    rows += _scan_target(resolve_target("project", file=file), "project")
+    try:
+        local_target = resolve_target("local", cfg=cfg, repo_path=repo_path)
+    except ValueError:
+        local_target = None
+    if local_target is not None:
+        rows += _scan_target(local_target, "local")
+    return rows
+
+
 def do_uninstall(servers: list[str] | None, *, all_: bool = False,
                  dry_run: bool = False, cfg: Path | None = None,
                  scope: str = "user", file: str | None = None,
