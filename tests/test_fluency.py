@@ -290,3 +290,68 @@ def _gt(q: dict) -> str:
 def fluency_raw() -> str:
     import json
     return json.dumps(PAYLOAD)
+
+
+# --------------------------------------------------------------------------- #
+# Text-diff fluency — the text-payload analogue of the diff tests above.
+# --------------------------------------------------------------------------- #
+TEXT_PREV = "\n".join(f"line {i}: some repeated filler content for chunking" for i in range(20))
+TEXT_CURR = TEXT_PREV + "\na brand new appended line at the very end"
+
+
+def test_gen_text_diff_questions_returns_two_deterministic_questions():
+    qs = {q.qid: q for q in fluency.gen_text_diff_questions(TEXT_PREV, TEXT_CURR, tool="demo")}
+    assert set(qs) == {"line-count", "last-line"}
+    assert qs["line-count"].expected == len(TEXT_CURR.splitlines())
+    assert qs["last-line"].expected == "a brand new appended line at the very end"
+
+
+def test_gen_text_diff_questions_empty_when_no_diff_applies():
+    # prev="" -> text_diff_encode's `if not prev_chunks: return None` -> no diff applies
+    assert fluency.gen_text_diff_questions("", "some new text") == []
+
+
+def test_run_text_diff_payload_structure_and_forms():
+    def oracle(system, user):
+        return "21"  # the new line count; other questions may score wrong here
+    rows = fluency.run_text_diff_payload(TEXT_PREV, TEXT_CURR, oracle, tool="demo", trials=2)
+    assert rows, "a text pair with a representable diff yields rows"
+    assert all("terse_ok" in r and "diff_ok" in r and r["trials"] == 2 for r in rows)
+    count_row = next(r for r in rows if r["qid"] == "line-count")
+    assert count_row["terse_ok"] == 2 and count_row["diff_ok"] == 2
+
+
+def test_run_text_diff_payload_empty_when_no_diff_applies():
+    assert fluency.run_text_diff_payload("", "some new text", lambda s, u: "x") == []
+
+
+def test_run_text_diff_fluency_only_pairs_non_json_payloads():
+    import json
+    envs = [
+        {"tool": "json-tool", "sha": "aaa", "raw": json.dumps(DIFF_PREV)},
+        {"tool": "json-tool", "sha": "bbb", "raw": json.dumps(DIFF_CURR)},
+        {"tool": "text-tool", "sha": "aaa", "raw": TEXT_PREV},
+        {"tool": "text-tool", "sha": "bbb", "raw": TEXT_CURR},
+    ]
+    results = fluency.run_text_diff_fluency(envs, {"m": lambda s, u: "21"}, trials=1)
+    assert results["m"], "the one non-JSON pair produces rows"
+    assert all(r["tool"] == "text-tool" for r in results["m"])
+
+
+def test_build_text_diff_report_verdict_and_empty():
+    from terse.report import build_text_diff_report
+    assert "No model answers" in build_text_diff_report({})
+    rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "text-diff",
+             "trials": 1, "terse_ok": 1, "diff_ok": 1} for i in range(10)]
+    report = build_text_diff_report({"m": rows})
+    assert "raw text" in report
+    verdict = report.split("## Verdict", 1)[1]
+    assert "PASS" in verdict and "FAIL" not in verdict
+
+
+def test_build_diff_report_unchanged_by_the_refactor():
+    # The _build_diff_style_report extraction must not change build_diff_report's own
+    # output for its existing callers — re-run the two tests that already pin its
+    # behavior to prove the refactor is a no-op for JSON diff-eval.
+    test_build_diff_report_verdict_and_empty()
+    test_diff_gap_rows_matches_build_diff_report_verdict()
