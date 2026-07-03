@@ -351,28 +351,6 @@ questions and PASS/FAILs on the worst model — run it before enabling `proxy --
 your consumer. The diff is always lossless and only sent when smaller; it falls back to
 the full compressed form whenever no diff applies or the prior result isn't available.
 
-### Text diffing and its fluency check (`fluency --text-diff-eval`)
-
-The diff above only reasons about JSON. Non-JSON tool output (file reads, source
-excerpts, log tails) gets its own diff codec (Tier 0.7, `text_diff.py`) — same
-lossless/opt-in/falls-back-to-full contract, applied to unstructured text instead of
-records. `--text-diff-eval` is its behavioral check, the text-payload analogue of
-`--diff`:
-
-```
-# needs same-tool TEXT payload PAIRS in the corpus (capture a text-producing tool
-# 2+ times) + a configured model:
-TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \
-  uv run terse fluency --text-diff-eval --corpus corpus
-```
-
-It asks whether a model reconstructs the current text as accurately from (previous text
-+ text-diff) as from the full current text, and PASS/FAILs on the worst model — run it
-before enabling `proxy --diff` for text-heavy tools. There's no separate proxy flag: the
-same `proxy --diff` above already emits a text diff instead of a JSON diff whenever the
-payload isn't JSON, so this eval is a risk-item check on that existing behavior, not a
-new switch.
-
 ### Building a sample set
 
 To measure your own tools, capture their outputs first:
