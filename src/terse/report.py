@@ -452,29 +452,17 @@ def build_trend_report(runs: list[dict[str, Any]]) -> str:
     return "\n".join(out)
 
 
-def build_diff_report(results: dict) -> str:
-    """Render the cross-call diff fluency eval: does a model read a diff against the
-    prior result as accurately as the full current result?
-
-    `results` is {model: [row,...]} from fluency.run_diff_fluency; each row carries
-    full-terse (`terse_ok`) and diff-form (`diff_ok`) success counts over the same
-    questions. The verdict gates on the worst model (principle #24): the proxy emits a
-    diff only when smaller, so this bounds the comprehension cost of enabling it.
-    """
-    out: list[str] = ["# terse cross-call diff fluency", ""]
-    out += [
-        "Does a model read a diff against the prior same-tool result as accurately as the",
-        "full current result? Same questions, paired per question; ground truth is",
-        "deterministic. Risk-item check for `proxy --diff` before turning it on.",
-        "",
-    ]
+def _build_diff_style_report(results: dict, title: str, intro: list[str],
+                             empty_hint: list[str], control_label: str = "full-terse") -> str:
+    """Shared body for build_diff_report and build_text_diff_report — the row shape
+    ({qid, qtype, transform, trials, terse_ok, diff_ok}) and verdict math are identical
+    for both; only the title/intro/empty-hint copy and the control column's label
+    differ. `empty_hint` is pre-split into lines (not a single string) so each caller
+    controls its own line-wrapping exactly, the same way `intro` already does."""
+    out: list[str] = [title, ""]
+    out += intro
     if not results or not any(results.values()):
-        out += [
-            "No model answers, or no same-tool payload PAIRS in the corpus. Capture a tool",
-            "2+ times (an agent loop) and configure a backend, then re-run "
-            "`terse fluency --diff`.",
-            "",
-        ]
+        out += [*empty_hint, ""]
         return "\n".join(out)
 
     trials = max((r.get("trials", 1) for rows in results.values() for r in rows), default=1)
@@ -484,7 +472,7 @@ def build_diff_report(results: dict) -> str:
         f"Trials per question: **{trials}**. `±` is the 95% half-width of a pooled "
         "binomial bound.",
         "",
-        "| Model | q | full-terse | diff | regressions |",
+        f"| Model | q | {control_label} | diff | regressions |",
         "|---|---|---|---|---|",
     ]
     gap_rows: dict[str, tuple[float, float, float, float]] = {}
@@ -496,7 +484,7 @@ def build_diff_report(results: dict) -> str:
         dacc, dse = _form_stats(rows, "diff_ok")
         regr = sum(1 for r in rows if int(r["terse_ok"]) == r.get("trials", 1)
                    and int(r["diff_ok"]) < r.get("trials", 1))
-        gap_rows[model] = (dacc, dse, facc, fse)  # form=diff, control=full-terse
+        gap_rows[model] = (dacc, dse, facc, fse)  # form=diff, control=control_label
         out.append(f"| `{model}` | {n} | {facc:.0%} ±{_ci(fse) * 100:.0f} "
                    f"| {dacc:.0%} ±{_ci(dse) * 100:.0f} | {regr} |")
     out.append("")
@@ -504,7 +492,7 @@ def build_diff_report(results: dict) -> str:
     out += ["## Verdict", ""]
     worst = _worst_case_gap(gap_rows)
     if worst:
-        out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "diff-form", "full-terse"))
+        out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "diff-form", control_label))
         if worst.passed:
             out.append("- Reading the diff costs no comprehension beyond tolerance — safe to "
                        "enable `proxy --diff` for the tested models.")
@@ -513,6 +501,49 @@ def build_diff_report(results: dict) -> str:
                        "`proxy --diff` off, or restrict it to tools whose diffs stay legible.")
     out.append("")
     return "\n".join(out)
+
+
+def build_diff_report(results: dict) -> str:
+    """Render the cross-call diff fluency eval: does a model read a diff against the
+    prior result as accurately as the full current result?
+
+    `results` is {model: [row,...]} from fluency.run_diff_fluency; each row carries
+    full-terse (`terse_ok`) and diff-form (`diff_ok`) success counts over the same
+    questions. The verdict gates on the worst model (principle #24): the proxy emits a
+    diff only when smaller, so this bounds the comprehension cost of enabling it.
+    """
+    return _build_diff_style_report(
+        results,
+        "# terse cross-call diff fluency",
+        ["Does a model read a diff against the prior same-tool result as accurately as the",
+         "full current result? Same questions, paired per question; ground truth is",
+         "deterministic. Risk-item check for `proxy --diff` before turning it on.", ""],
+        ["No model answers, or no same-tool payload PAIRS in the corpus. Capture a tool",
+         "2+ times (an agent loop) and configure a backend, then re-run "
+         "`terse fluency --diff`."],
+    )
+
+
+def build_text_diff_report(results: dict) -> str:
+    """Render the text-diff fluency eval: does a model reconstruct the current TEXT as
+    accurately from (previous text + text-diff) as from the full current text?
+
+    `results` is {model: [row,...]} from fluency.run_text_diff_fluency. Unlike
+    build_diff_report, the control form is raw text, not full-terse — Tier 0 doesn't
+    compress non-JSON text at all — so the control column is labeled accordingly.
+    """
+    return _build_diff_style_report(
+        results,
+        "# terse text-diff fluency",
+        ["Does a model reconstruct the current text as accurately from (previous text +",
+         "text-diff) as from the full current text? Tier 0 doesn't compress non-JSON text",
+         "at all, so the control form here is the raw text, not a compressed one. Risk-item",
+         "check before enabling `proxy --diff` for text-heavy tools.", ""],
+        ["No model answers, or no same-tool TEXT payload PAIRS in the corpus (JSON pairs "
+         "are `--diff`'s domain, not this one's). Capture a text-producing tool 2+ times, "
+         "then re-run `terse fluency --text-diff-eval`."],
+        control_label="raw text",
+    )
 
 
 def build_dropeval_report(results: dict) -> str:

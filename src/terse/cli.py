@@ -327,7 +327,12 @@ def _build_answerers(args: argparse.Namespace, make_openai, make_anthropic, *,
 def _cmd_fluency(args: argparse.Namespace) -> int:
     from . import dropeval, fluency
     from .policy import default_policy, load_policy
-    from .report import build_diff_report, build_dropeval_report, build_fluency_report
+    from .report import (
+        build_diff_report,
+        build_dropeval_report,
+        build_fluency_report,
+        build_text_diff_report,
+    )
     from .terminal_report import (
         build_terminal_diff_report,
         build_terminal_dropeval_report,
@@ -380,6 +385,21 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         _write_report(build_diff_report(results), args.out)
         if args.bars:
             print("\n" + build_terminal_diff_report(results))
+        return 0
+
+    # Text-diff mode: does a model reconstruct the current TEXT as well from (previous
+    # text + text-diff) as from the full current text? The text-payload analogue of
+    # --diff above (text_diff.py, Tier 0.7 — non-JSON tool output).
+    if args.text_diff_eval:
+        answerers = _build_answerers(args, fluency.openai_answerer, fluency.anthropic_answerer)
+        if not answerers:
+            print("`fluency --text-diff-eval` needs a configured model: set "
+                  "TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS or pass --anthropic.")
+            return 1
+        results = fluency.run_text_diff_fluency(envelopes, answerers, trials=args.trials)
+        _write_report(build_text_diff_report(results), args.out)
+        if args.bars:
+            print("\n" + build_terminal_diff_report(results, control_label="raw text"))
         return 0
 
     # Score mode: an externally-collected responses file against a previously-written pack.
@@ -734,6 +754,10 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--diff", action="store_true",
                    help="eval whether a model reads a cross-call DIFF as well as the full "
                         "result (needs same-tool corpus pairs + a configured model)")
+    f.add_argument("--text-diff-eval", action="store_true",
+                   help="behavioral eval: does a model reconstruct the current TEXT as "
+                        "accurately from (previous text + text-diff) as from the full "
+                        "text? needs same-tool TEXT corpus pairs + a configured model")
     f.add_argument("--drop-eval", action="store_true",
                    help="behavioral eval: does a real tool-calling model call terse.retrieve "
                         "when a dropped field is needed (recall), and leave it alone when "
