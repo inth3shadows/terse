@@ -143,6 +143,16 @@ def test_content_overlap_high_when_real_content_shared():
     assert res["content_overlap_ratio"] > 0
 
 
+def test_cross_server_redundancy_handles_empty_records():
+    # Text/source-only corpus yields no record-shaped payloads -> Lever A is empty. It must
+    # degrade to zeros without dividing by zero, so Lever B can still carry the verdict.
+    res = cross_server_redundancy({})
+    assert res["per_server"] == []
+    assert res["cross_server_increment_tokens"] == 0
+    assert res["increment_frac_of_corpus"] == 0.0
+    assert res["increment_frac_over_per_peer"] == 0.0
+
+
 def test_cross_server_overlap_pairs_across_servers_and_caps():
     raws = {
         "kb": [(f"{i:02x}", json.dumps([{"id": i, "v": "x"}])) for i in range(50)],

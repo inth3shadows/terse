@@ -299,12 +299,20 @@ def build_cross_server_probe_report(
     thin = any(r["record_lists_folded"] < 30 for r in redundancy["per_server"])
     inconclusive = len(lever_a_servers) < 2 or bool(missing)
 
-    if missing:
+    if missing and not lever_a_servers:
+        out += [
+            f"> ⚠ **Coverage gap:** no server produced record-shaped payloads "
+            f"({', '.join(f'`{m}`' for m in missing)} all emit text/source or pre-compressed "
+            "output), so **Lever A is empty** — the verdict rests entirely on Lever B's "
+            "framing-netted content overlap.",
+            "",
+        ]
+    elif missing:
         out += [
             f"> ⚠ **Coverage gap:** {', '.join(f'`{m}`' for m in missing)} present in the "
             "corpus but produced **no record-shaped payloads** (text/source or pre-compressed "
-            "output), so Lever A cannot see them. The increment below is measured only across "
-            f"{', '.join(f'`{s}`' for s in sorted(lever_a_servers))}.",
+            "output), so Lever A cannot see them. Its increment above is measured only across "
+            f"{', '.join(f'`{s}`' for s in sorted(lever_a_servers))}; Lever B spans all servers.",
             "",
         ]
 
@@ -314,23 +322,23 @@ def build_cross_server_probe_report(
     # Corpus caveat stays: these payloads are cross-session, so co-resident recurrence (the
     # case a shared session dict most helps) is UNDER-represented — a low number here is a
     # floor, not a ceiling.
+    blind = ", ".join(f"`{m}`" for m in missing)
     if inconclusive:
         if content_median >= 0.15:
-            verdict = ("**INCONCLUSIVE, leaning BUILD.** Lever A is blind to "
-                       f"{', '.join(f'`{m}`' for m in missing)}, but the framing-netted content "
-                       f"overlap is **{content_median:.1%}** across all servers — non-trivial shared "
-                       "content a per-peer coder misses. Confirm with a co-resident capture before "
-                       "committing to the L build.")
+            verdict = (f"**LEAN BUILD.** Lever A is blind to {blind}, but the framing-netted content "
+                       f"overlap is **{content_median:.1%}** across all servers — substantial shared "
+                       "content a per-peer coder misses. A shared cross-peer legend has real headroom; "
+                       "proceed to design Phase 1, verifying the pattern holds on an independent capture.")
         elif content_median < 0.05:
             verdict = ("**LEAN CLOSE.** Lever A saw no cross-server value; Lever B's framing-netted "
                        f"content overlap is only **{content_median:.1%}** — even net of JSON structure, "
                        "different servers barely share content. A shared legend is unlikely to pay. "
-                       "One co-resident capture (same entities across peers) would make this decisive; "
-                       "on cross-session data this is already the optimistic floor.")
+                       "If this corpus is cross-session, re-run on a co-resident capture (same entities "
+                       "across peers) to confirm before closing — that number is the optimistic floor.")
         else:
             verdict = (f"**INCONCLUSIVE ({content_median:.1%} content overlap).** Lever A blind to "
-                       f"{', '.join(f'`{m}`' for m in missing)}; Lever B is in the grey band. Capture "
-                       "one real co-resident session (all peers, same codebase) and re-run before deciding.")
+                       f"{blind}; Lever B sits in the grey band. If the corpus is cross-session, capture "
+                       "one co-resident session (all peers, same codebase) and re-run before deciding.")
     elif thin:
         verdict = ("**WEAK — lean CLOSE, re-run to confirm.** Increment is "
                    f"{frac_corpus:+.1%} of corpus, but <30 record-lists on a peer makes it "

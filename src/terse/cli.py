@@ -325,9 +325,14 @@ def _cmd_probe_cross_server(args: argparse.Namespace, envelopes: list[dict]) -> 
         if records:
             records_by_server.setdefault(srv, []).extend(records)
 
-    if len(records_by_server) < 2:
-        print("need record-shaped payloads from ≥2 servers to probe cross-server "
-              f"redundancy — found {sorted(records_by_server)}.")
+    # Gate on RAW payloads, not record-shaped ones: Lever B (framing-normalized overlap)
+    # works on any payload shape and is the decisive signal when servers emit text/source
+    # (codegraph) rather than record lists. Requiring 2 record-shaped servers would wrongly
+    # block Lever B exactly when it matters most. Lever A degrades gracefully to empty and
+    # the report's coverage guard flags it blind.
+    if len(raws_by_server) < 2:
+        print("need payloads from ≥2 servers to probe cross-server redundancy — found "
+              f"{sorted(raws_by_server)}.")
         return 1
 
     redundancy = cross_server_redundancy(records_by_server)
