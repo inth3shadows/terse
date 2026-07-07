@@ -5,7 +5,15 @@ from __future__ import annotations
 import json
 
 from terse.capture import extract_records
-from terse.probes import cross_call_overlap, field_profiles, value_redundancy
+from terse.probes import (
+    cross_call_overlap,
+    cross_server_overlap,
+    cross_server_redundancy,
+    field_profiles,
+    server_of_tool,
+    token_idf,
+    value_redundancy,
+)
 
 
 def test_value_redundancy_flags_repeated_values():
@@ -69,6 +77,82 @@ def test_extract_records_requires_uniform_keys():
     # columns and would KeyError otherwise.
     assert extract_records([{"a": 1}, {"b": 2}]) is None
     assert extract_records({"result": [{"id": 1, "x": 0}, {"id": 2}]}) is None
+
+
+def test_server_of_tool_maps_the_three_known_servers():
+    assert server_of_tool("kb.read.search") == "kb"
+    assert server_of_tool("codegraph_explore") == "codegraph"
+    assert server_of_tool("locate") == "runecho"
+    assert server_of_tool("structure") == "runecho"
+    # Unknown server degrades to its leading token, never crashes.
+    assert server_of_tool("weather.forecast") == "weather"
+
+
+def test_cross_server_redundancy_positive_when_value_shared_across_peers():
+    # "us-east-1" appears in BOTH servers -> a shared legend folds it once; two
+    # per-peer legends each keep their own copy. So pooled > per-peer.
+    by_server = {
+        "kb": [{"id": i, "region": "us-east-1"} for i in range(5)],
+        "codegraph": [{"node": i, "region": "us-east-1"} for i in range(5)],
+    }
+    res = cross_server_redundancy(by_server)
+    assert res["cross_server_increment_tokens"] > 0
+    assert res["increment_frac_of_corpus"] > 0
+    assert len(res["per_server"]) == 2
+
+
+def test_cross_server_redundancy_zero_when_no_value_shared_across_peers():
+    # Disjoint values between servers -> a shared legend buys nothing over per-peer.
+    by_server = {
+        "kb": [{"id": i, "tag": f"kb-only-{i}"} for i in range(5)],
+        "codegraph": [{"id": i, "tag": f"cg-only-{i}"} for i in range(5)],
+    }
+    res = cross_server_redundancy(by_server)
+    assert res["cross_server_increment_tokens"] == 0
+
+
+def test_token_idf_zeroes_ubiquitous_tokens():
+    # A token in EVERY payload (framing) gets idf 0; a token in one payload gets idf > 0.
+    raws = [json.dumps({"framing": "here", "uniq": f"only-{i}-zzz"}) for i in range(8)]
+    idf = token_idf(raws)
+    # No token should have negative idf; at least one rare content token must be positive.
+    assert all(v >= 0 for v in idf.values())
+    assert max(idf.values()) > 0
+
+
+def test_content_overlap_nets_out_framing():
+    # Two payloads that share ONLY framing/structure but no content values: idf-weighted
+    # content overlap must be far below the raw overlap (which framing inflates).
+    idf = token_idf([
+        json.dumps([{"k": f"aaa-{i}"} for i in range(20)]),
+        json.dumps([{"k": f"bbb-{i}"} for i in range(20)]),
+    ])
+    a = json.dumps([{"k": f"aaa-{i}"} for i in range(20)])
+    b = json.dumps([{"k": f"bbb-{i}"} for i in range(20)])
+    res = cross_call_overlap(a, b, idf=idf)
+    assert res["content_overlap_ratio"] < res["overlap_ratio"]
+
+
+def test_content_overlap_high_when_real_content_shared():
+    # Same rare content token present in both -> content overlap should be clearly positive.
+    corpus = [json.dumps({"sym": "SharedSymbolXYZ", "n": i}) for i in range(6)]
+    idf = token_idf(corpus + [json.dumps({"other": "unrelated"})])
+    a = json.dumps({"sym": "SharedSymbolXYZ", "n": 1})
+    b = json.dumps({"sym": "SharedSymbolXYZ", "n": 2})
+    res = cross_call_overlap(a, b, idf=idf)
+    assert res["content_overlap_ratio"] > 0
+
+
+def test_cross_server_overlap_pairs_across_servers_and_caps():
+    raws = {
+        "kb": [(f"{i:02x}", json.dumps([{"id": i, "v": "x"}])) for i in range(50)],
+        "codegraph": [(f"{i:02x}", json.dumps([{"id": i, "v": "x"}])) for i in range(50)],
+    }
+    res = cross_server_overlap(raws, cap_per_pair=10)
+    assert res["capped"] is True
+    assert res["pairs"] == 10          # one server-pair, capped to 10 positional pairs
+    assert 0.0 <= res["median_overlap"] <= 1.0
+    assert 0.0 <= res["median_content_overlap"] <= 1.0
 
 
 def test_field_profiles_size_and_cardinality():

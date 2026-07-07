@@ -69,3 +69,15 @@ ONCE
 # already does — same hunk-splitting false positive as the stdlib symbols above.
 # Confirmed resolving correctly: `terse verify --html` prints the real version.
 version
+# probes.py / cli.py #64 cross-server probe: hunk-split import + same-file false
+# positives — the guard parses `from X import Y` only within the staged hunk and does not
+# resolve same-file top-level defs (e.g. value_redundancy called inside cross_server_*).
+# All confirmed defined/imported; a genuinely missing one is caught by pytest/import.
+combinations
+extract_records
+encode_cl100k
+value_redundancy
+DEFAULT_PROBE_REPORT
+# probes.py cross_call_overlap docstring: "When `idf` is supplied (from `token_idf`)" —
+# "supplied (from" reads as a bare call to the guard's pattern match. Not code.
+supplied

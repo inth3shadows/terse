@@ -218,6 +218,138 @@ def build_probe_report(
     return "\n".join(out)
 
 
+def build_cross_server_probe_report(
+    redundancy: dict[str, Any], overlap: dict[str, Any],
+    corpus_servers: list[str] | None = None,
+) -> str:
+    """Render the #64 Phase 0 cross-server redundancy probe with an explicit go/no-go.
+
+    Primary gate = the record-value dictionary increment (shared content across peers).
+    Raw-token overlap is corroborating only (framing-inflated). Thresholds mirror the
+    plan: <3% of corpus -> close Phase 1; >=10% -> build; between -> lean close.
+    """
+    out: list[str] = ["# terse #64 Phase 0 — cross-server redundancy probe", ""]
+
+    out += [
+        "## Lever A — cross-server value dictionary (primary gate)",
+        "",
+        "Does one legend shared across peers fold more repeated record VALUES than",
+        "independent per-peer legends? `increment` = pooled saving − Σ per-peer saving,",
+        "i.e. values repeated across ≥2 distinct servers. Upper bound.",
+        "",
+        "| Server | record-lists | cells | redundancy | est per-peer dict saving |",
+        "|---|---|---|---|---|",
+    ]
+    for r in redundancy["per_server"]:
+        out.append(
+            f"| `{r['server']}` | {r['record_lists_folded']} | {r['cells']} "
+            f"| {r['redundancy_ratio']:.1%} | {r['est_dict_saving_tokens']} |"
+        )
+    inc = redundancy["cross_server_increment_tokens"]
+    frac_corpus = redundancy["increment_frac_of_corpus"]
+    frac_peer = redundancy["increment_frac_over_per_peer"]
+    out += [
+        "",
+        f"- per-peer saving (today): **{redundancy['per_peer_saving_tokens']} tok**",
+        f"- pooled shared-legend saving: **{redundancy['pooled_saving_tokens']} tok**",
+        f"- **cross-server increment: {inc} tok** "
+        f"({frac_corpus:+.1%} of corpus value-tokens; {frac_peer:+.1%} over per-peer)",
+        "",
+    ]
+
+    content_median = overlap.get("median_content_overlap", 0.0)
+    out += [
+        "## Lever B — cross-server overlap, framing-normalized (spans all servers)",
+        "",
+        "Token overlap between payloads of *different* servers. `raw` is inflated by shared",
+        "JSON framing; `content` re-weights by idf so ubiquitous framing tokens drop out and",
+        "only shared CONTENT counts — the headroom a shared cross-peer dictionary (but not",
+        "per-peer coding) could harvest. Unlike Lever A this sees text/source servers.",
+        "",
+    ]
+    if overlap["rows"]:
+        cap_note = " (capped per server-pair)" if overlap["capped"] else ""
+        out += [
+            f"Median overlap — raw **{overlap['median_overlap']:.1%}** vs "
+            f"content **{content_median:.1%}** (framing-netted) "
+            f"across {overlap['pairs']} payload pairs{cap_note} (cap {overlap['cap_per_pair']}/pair).",
+            "",
+            "| A | B | curr tok | shared | raw overlap | content overlap |",
+            "|---|---|---|---|---|---|",
+        ]
+        for r in overlap["rows"][:15]:
+            out.append(
+                f"| `{r['server_a']}` | `{r['server_b']}` | {r['curr_tokens']} "
+                f"| {r['shared_tokens']} | {r['overlap_ratio']:.1%} "
+                f"| {r.get('content_overlap_ratio', 0.0):.1%} |"
+            )
+        if len(overlap["rows"]) > 15:
+            out.append(f"| … | | | | | _{len(overlap['rows']) - 15} more rows omitted_ |")
+        out.append("")
+    else:
+        out += ["_Fewer than two servers with record/raw payloads — nothing to cross._", ""]
+
+    # Coverage guard: Lever A only sees record-shaped payloads. A server whose output is
+    # text/source (codegraph) or pre-compressed contributes nothing, so a low increment may
+    # just mean the lever is blind — not that redundancy is absent. Surface this BEFORE the
+    # verdict so a thin sample can't read as a confident "close".
+    lever_a_servers = {r["server"] for r in redundancy["per_server"]}
+    seen = set(corpus_servers or lever_a_servers)
+    missing = sorted(seen - lever_a_servers)
+    thin = any(r["record_lists_folded"] < 30 for r in redundancy["per_server"])
+    inconclusive = len(lever_a_servers) < 2 or bool(missing)
+
+    if missing:
+        out += [
+            f"> ⚠ **Coverage gap:** {', '.join(f'`{m}`' for m in missing)} present in the "
+            "corpus but produced **no record-shaped payloads** (text/source or pre-compressed "
+            "output), so Lever A cannot see them. The increment below is measured only across "
+            f"{', '.join(f'`{s}`' for s in sorted(lever_a_servers))}.",
+            "",
+        ]
+
+    # Verdict. When Lever A has full coverage, its content-value increment is the gate.
+    # When it's blind (a text/source server missing), fall back to Lever B's framing-netted
+    # content overlap — it spans ALL servers and, post-idf, is no longer framing-inflated.
+    # Corpus caveat stays: these payloads are cross-session, so co-resident recurrence (the
+    # case a shared session dict most helps) is UNDER-represented — a low number here is a
+    # floor, not a ceiling.
+    if inconclusive:
+        if content_median >= 0.15:
+            verdict = ("**INCONCLUSIVE, leaning BUILD.** Lever A is blind to "
+                       f"{', '.join(f'`{m}`' for m in missing)}, but the framing-netted content "
+                       f"overlap is **{content_median:.1%}** across all servers — non-trivial shared "
+                       "content a per-peer coder misses. Confirm with a co-resident capture before "
+                       "committing to the L build.")
+        elif content_median < 0.05:
+            verdict = ("**LEAN CLOSE.** Lever A saw no cross-server value; Lever B's framing-netted "
+                       f"content overlap is only **{content_median:.1%}** — even net of JSON structure, "
+                       "different servers barely share content. A shared legend is unlikely to pay. "
+                       "One co-resident capture (same entities across peers) would make this decisive; "
+                       "on cross-session data this is already the optimistic floor.")
+        else:
+            verdict = (f"**INCONCLUSIVE ({content_median:.1%} content overlap).** Lever A blind to "
+                       f"{', '.join(f'`{m}`' for m in missing)}; Lever B is in the grey band. Capture "
+                       "one real co-resident session (all peers, same codebase) and re-run before deciding.")
+    elif thin:
+        verdict = ("**WEAK — lean CLOSE, re-run to confirm.** Increment is "
+                   f"{frac_corpus:+.1%} of corpus, but <30 record-lists on a peer makes it "
+                   "noisy. Close only if a fuller capture holds the same near-zero increment.")
+    elif frac_corpus < 0.03:
+        verdict = ("**CLOSE #64 Phase 1** — cross-server redundancy is negligible "
+                   "(<3% of corpus). The gateway stays pure ergonomics; ship only Phase 2 "
+                   "(fan-out gaps).")
+    elif frac_corpus >= 0.10:
+        verdict = ("**BUILD Phase 1** — a shared cross-peer legend has real headroom "
+                   "(≥10% over per-peer). Proceed to design the shared session dictionary.")
+    else:
+        verdict = ("**MARGINAL (3–10%)** — lean CLOSE: the increment is unlikely to pay for "
+                   "the shared-legend complexity (cross-stream diff-desync #20, marker-collision "
+                   "#6 across peers). Revisit only with an evenly-captured corpus.")
+    out += ["## Verdict", "", verdict, ""]
+    return "\n".join(out)
+
+
 def build_tokenizer_report(rows: list[dict[str, Any]]) -> str:
     """Render cross-tokenizer invariance — cl100k vs o200k savings % per tool.
 

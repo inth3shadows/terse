@@ -25,9 +25,20 @@ from . import transforms
 from ._secure_io import write_restricted
 from .capture import capture_payload, classify_shape, coverage, extract_records, load_corpus
 from .measure import cross_tokenizer_savings, measure_corpus
-from .probes import cross_call_overlap, value_redundancy
+from .probes import (
+    cross_call_overlap,
+    cross_server_overlap,
+    cross_server_redundancy,
+    server_of_tool,
+    value_redundancy,
+)
 from .html_report import build_html_report
-from .report import build_probe_report, build_report, build_tokenizer_report
+from .report import (
+    build_cross_server_probe_report,
+    build_probe_report,
+    build_report,
+    build_tokenizer_report,
+)
 from .terminal_report import build_terminal_report
 from .tokenize import count_cl100k
 
@@ -266,6 +277,9 @@ def _cmd_probe(args: argparse.Namespace) -> int:
         print(f"no payloads in {args.corpus}/ — capture some first (`terse capture`).")
         return 1
 
+    if getattr(args, "cross_server", False):
+        return _cmd_probe_cross_server(args, envelopes)
+
     vr_rows = []
     for env in envelopes:
         try:
@@ -290,6 +304,38 @@ def _cmd_probe(args: argparse.Namespace) -> int:
 
     report = build_probe_report(vr_rows, overlap_rows)
     out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(report, encoding="utf-8")
+    print(report)
+    print(f"\n[report written to {out}]")
+    return 0
+
+
+def _cmd_probe_cross_server(args: argparse.Namespace, envelopes: list[dict]) -> int:
+    """#64 Phase 0: group the corpus by origin server, measure cross-peer redundancy."""
+    records_by_server: dict[str, list[dict]] = {}
+    raws_by_server: dict[str, list[tuple[str, str]]] = {}
+    for env in envelopes:
+        srv = server_of_tool(env["tool"])
+        raws_by_server.setdefault(srv, []).append((env.get("sha", ""), env["raw"]))
+        try:
+            records = extract_records(_json.loads(env["raw"]))
+        except (ValueError, TypeError):
+            records = None
+        if records:
+            records_by_server.setdefault(srv, []).extend(records)
+
+    if len(records_by_server) < 2:
+        print("need record-shaped payloads from ≥2 servers to probe cross-server "
+              f"redundancy — found {sorted(records_by_server)}.")
+        return 1
+
+    redundancy = cross_server_redundancy(records_by_server)
+    overlap = cross_server_overlap(raws_by_server, cap_per_pair=args.cap)
+    report = build_cross_server_probe_report(
+        redundancy, overlap, corpus_servers=sorted(raws_by_server)
+    )
+    out = Path(args.out if args.out != DEFAULT_PROBE_REPORT else "reports/cross-server-probe.md")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report, encoding="utf-8")
     print(report)
@@ -704,6 +750,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("probe", help="value-redundancy + cross-call-overlap ceiling probes")
     p.add_argument("--corpus", default=DEFAULT_CORPUS)
     p.add_argument("--out", default=DEFAULT_PROBE_REPORT)
+    p.add_argument("--cross-server", action="store_true",
+                   help="#64 Phase 0: cross-peer dictionary headroom (writes "
+                        "reports/cross-server-probe.md unless --out is set)")
+    p.add_argument("--cap", type=int, default=20,
+                   help="max payloads per server-pair for the raw-overlap lever (default 20)")
     p.set_defaults(func=_cmd_probe)
 
     v = sub.add_parser("validate", help="cross-tokenizer invariance (cl100k vs o200k)")
