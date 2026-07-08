@@ -50,7 +50,7 @@ def test_one_session_dict_shared_across_peers_is_the_seam():
     # Two independent SessionDicts do NOT share (each redefines); one shared instance does.
     a = {"path": "a/very/long/shared/path/value.py", "k": 1}
     b = {"path": "a/very/long/shared/path/value.py", "k": 2}
-    sep1, sep2 = SessionDict(), SessionDict()
+    sep2 = SessionDict()
     _, defs_b_sep = sess_encode(b, sep2) or (None, {})
     # with a separate dict, b must redefine the path
     assert any(v == "a/very/long/shared/path/value.py" for v in defs_b_sep.values())
