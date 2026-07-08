@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -144,15 +145,28 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path) -> Path:
     """Persist one captured payload as a shape-tagged envelope. Idempotent by sha."""
     corpus = Path(corpus_dir)
     corpus.mkdir(parents=True, exist_ok=True)
+    safe_tool = _SANITIZE.sub("_", tool).strip("_") or "unknown"
+    path = corpus / f"{safe_tool}__{_sha8(raw)}.json"
+    # `captured_at` records the chronological CAPTURE order (nanoseconds), which is the
+    # session/gateway order a cross-call replay (measure --session-dict, #64) must honor —
+    # the sha-based filename does NOT preserve it. Preserved on rewrite so the value is
+    # stable at a payload's FIRST sighting and re-capturing the same content stays idempotent.
+    captured_at = time.time_ns()
+    if path.exists():
+        try:
+            prior = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(prior, dict) and isinstance(prior.get("captured_at"), int):
+                captured_at = prior["captured_at"]
+        except (json.JSONDecodeError, OSError):
+            pass
     envelope = {
         "tool": tool,
         "shape": classify_shape(raw),
         "bytes": len(raw),
         "sha": _sha8(raw),
+        "captured_at": captured_at,
         "raw": raw,
     }
-    safe_tool = _SANITIZE.sub("_", tool).strip("_") or "unknown"
-    path = corpus / f"{safe_tool}__{envelope['sha']}.json"
     # Captured payloads are real MCP tool traffic (README/TECHNICAL: "may contain real
     # data") — restrict permissions the same as terse-managed config/secrets (#42).
     write_restricted(path, json.dumps(envelope, ensure_ascii=False, indent=2))
@@ -174,17 +188,27 @@ def append_audit(record: dict[str, Any], log_path: str | Path) -> None:
 
 
 def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
-    """Load every captured envelope from corpus/, skipping the .gitkeep placeholder."""
+    """Load every captured envelope from corpus/, in CAPTURE order.
+
+    Ordered by `captured_at` (the chronological session/gateway order), so an
+    order-dependent replay — `measure --session-dict` (#64), where a value must be defined
+    by an EARLIER payload to be elided by a later one — sees the real sequence, not the
+    sha-alphabetical filename order the glob yields. Legacy envelopes with no `captured_at`
+    sort first (as 0) in filename order, preserving prior behavior for old corpora; every
+    order-independent measure is unaffected. Skips the .gitkeep placeholder and non-envelopes.
+    """
     corpus = Path(corpus_dir)
-    out: list[dict[str, Any]] = []
-    for path in sorted(corpus.glob("*.json")):
+    loaded: list[tuple[int, str, dict[str, Any]]] = []
+    for path in corpus.glob("*.json"):
         try:
             env = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             continue
         if isinstance(env, dict) and "raw" in env and "tool" in env:
-            out.append(env)
-    return out
+            seq = env["captured_at"] if isinstance(env.get("captured_at"), int) else 0
+            loaded.append((seq, path.name, env))
+    loaded.sort(key=lambda t: (t[0], t[1]))
+    return [env for _, _, env in loaded]
 
 
 def coverage(envelopes: list[dict[str, Any]]) -> dict[str, Any]:
