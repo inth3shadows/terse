@@ -30,7 +30,7 @@ import hashlib
 import json
 from collections import Counter, OrderedDict
 from threading import Lock
-from typing import Any
+from typing import Any, Optional
 
 from .tokenize import count_cl100k
 
@@ -376,6 +376,11 @@ class SessionDict:
         self._alias: "OrderedDict[tuple, str]" = OrderedDict()  # (kind,payload) -> alias, LRU order
         self._value: dict[str, Any] = {}                        # alias -> real value (string or subtree)
         self._alias_set: set = set()                            # all assigned aliases (fast disjoint check)
+        # alias -> consecutive references emitted WITHOUT re-sending its definition. Bounds
+        # how far a session reference can drift from a self-contained definition the client
+        # can reconstruct from scratch — the per-entry analogue of the diff tier's #8
+        # keyframe. Reset to 0 on (re)definition; a re-emit fires when it exceeds the bound.
+        self._refs: dict[str, int] = {}
         self._counter = 0
         self._bytes = 0
         self._max_entries = max_entries
@@ -415,9 +420,39 @@ class SessionDict:
             self._alias[key] = cand
             self._value[cand] = real
             self._alias_set.add(cand)
+            self._refs[cand] = 0  # a fresh definition re-anchors the keyframe counter
             self._bytes += _entry_bytes(key, cand)
             self._evict_if_needed()
             return cand
+
+    def note_ref(self, alias: str, bound: int) -> bool:
+        """Record one reference-without-redefine of `alias` and report whether its
+        definition is now due for re-emission (a legend keyframe, #8-analogue). `bound`
+        <= 0 disables re-emission (reference forever). On a due hit the counter resets, so
+        the next `bound` references are again elided. Idempotent for an unknown alias."""
+        with self._lock:
+            n = self._refs.get(alias, 0) + 1
+            if bound > 0 and n > bound:
+                self._refs[alias] = 0
+                return True
+            self._refs[alias] = n
+            return False
+
+    def drop(self, key: tuple) -> None:
+        """Remove a single entry by its `(kind,payload)` key — the rollback primitive that
+        makes `sess_encode` transactional: an encode that interns candidates but then bows
+        out (nothing emitted, or the round-trip self-verify fails) must leave the shared
+        table exactly as it found it, or a later payload would reference a definition the
+        client never received. `_counter` is intentionally NOT rewound (aliases are only
+        required to be unique, and monotonic gaps are harmless)."""
+        with self._lock:
+            alias = self._alias.pop(key, None)
+            if alias is None:
+                return
+            self._value.pop(alias, None)
+            self._alias_set.discard(alias)
+            self._refs.pop(alias, None)
+            self._bytes -= _entry_bytes(key, alias)
 
     def legend_snapshot(self) -> dict:
         """alias -> real value for every live entry: the legend the client is assumed to
@@ -432,6 +467,7 @@ class SessionDict:
             self._alias.clear()
             self._value.clear()
             self._alias_set.clear()
+            self._refs.clear()
             self._counter = 0
             self._bytes = 0
 
@@ -444,10 +480,12 @@ class SessionDict:
             old_key, old_alias = self._alias.popitem(last=False)
             self._value.pop(old_alias, None)
             self._alias_set.discard(old_alias)
+            self._refs.pop(old_alias, None)
             self._bytes -= _entry_bytes(old_key, old_alias)
 
 
-def sess_encode(structure: Any, sess: "SessionDict") -> Any:
+def sess_encode(structure: Any, sess: "SessionDict", keyframe: int = 0,
+                *, _pretabularized: bool = False) -> Any:
     """Fold value-nodes into the SESSION legend `sess`, returning (data, new_defs) or None.
 
     A value already interned emits as a bare alias with its definition ELIDED — that
@@ -456,6 +494,15 @@ def sess_encode(structure: Any, sess: "SessionDict") -> Any:
     interned and its definition emitted inline in `new_defs` (first use). `data` is the
     structure with value-nodes replaced by aliases; the client resolves them against the
     legend it accumulates across `new_defs` from every payload.
+
+    `keyframe` (>0) bounds how many payloads may reference an entry without re-sending its
+    definition: once exceeded, the definition is RE-EMITTED in `new_defs` even though the
+    entry is already interned (a legend keyframe, #8-analogue), so a client that compacted
+    the original definition out re-anchors. 0 disables re-emission.
+
+    TRANSACTIONAL: any candidate this call newly interns is rolled back (`sess.drop`) on
+    every bail path, so a bailed encode leaves the shared table byte-for-byte as it found
+    it — otherwise a later payload could reference a definition the client never received.
 
     Returns None (caller falls back to the per-call form) when session coding is unsafe or
     unprofitable:
@@ -466,7 +513,12 @@ def sess_encode(structure: Any, sess: "SessionDict") -> Any:
       - nothing was aliased;
       - the round-trip self-verify against the client's full cumulative legend fails.
     """
-    if has_terse_marker(structure):
+    # Bail on a reserved terse marker in the payload (a collision would be mis-decoded).
+    # `_pretabularized` says `structure` is terse's OWN tabularized output — its only marker is
+    # the `__terse_table__` we just introduced (legitimately present and safe to fold over) —
+    # and the caller (`sess_compress`) has already screened the RAW payload for every marker,
+    # so no recheck is needed. Every direct (untabularized) caller keeps the strict check.
+    if not _pretabularized and has_terse_marker(structure):
         return None
     avoid: set = set()
     _collect_all_strings(structure, avoid)
@@ -479,6 +531,7 @@ def sess_encode(structure: Any, sess: "SessionDict") -> Any:
     alias_for_str: dict = {}
     alias_for_json: dict = {}
     new_defs: dict = {}
+    interned: list = []  # keys this call newly interned — the rollback set for any bail
     # Biggest-value candidates first so the cheapest aliases (and the scarce byte budget on
     # intern) land on the largest wins, mirroring dict_encode's ordering.
     for key, n in sorted(counts.items(), key=lambda kn: (kn[1]) * _node_tok(kn[0]), reverse=True):
@@ -498,13 +551,20 @@ def sess_encode(structure: Any, sess: "SessionDict") -> Any:
                 continue
             real = payload if kind == "s" else json.loads(payload)
             alias = sess.intern(key, real, avoid)
+            interned.append((key, alias))
             new_defs[alias] = real
+        elif keyframe and sess.note_ref(alias, keyframe):
+            # Already interned but its definition is due for re-anchoring — re-emit it so a
+            # client that compacted the first definition out can still resolve the alias.
+            new_defs[alias] = payload if kind == "s" else json.loads(payload)
         if kind == "s":
             alias_for_str[payload] = alias
         else:
             alias_for_json[payload] = alias
 
     if not (alias_for_str or alias_for_json):
+        for key, _ in interned:
+            sess.drop(key)
         return None
     data = _replace_nodes(structure, alias_for_str, alias_for_json)
 
@@ -514,6 +574,8 @@ def sess_encode(structure: Any, sess: "SessionDict") -> Any:
     # out rather than ship an unresolvable payload.
     legend = {**sess.legend_snapshot(), **new_defs}
     if dict_decode(data, legend) != structure:
+        for key, _ in interned:
+            sess.drop(key)
         return None
 
     # Prune first-use defs down to those actually referenced in `data`; a value whose only
@@ -521,6 +583,15 @@ def sess_encode(structure: Any, sess: "SessionDict") -> Any:
     used: set = set()
     _collect_used_aliases(data, legend, used)
     new_defs = {a: v for a, v in new_defs.items() if a in used}
+    # A first-use entry whose definition was just pruned (its alias swallowed by an aliased
+    # parent subtree) was interned but its definition never transmitted — so it must NOT
+    # stay in the table, or a later payload's bare reference to it would dangle against a
+    # definition the client never saw. Drop it; it re-defines cleanly if it ever recurs
+    # outside a folded parent. (Entries whose defs survived, and prior-payload entries
+    # referenced this turn, are correctly retained.)
+    for key, alias in interned:
+        if alias not in used:
+            sess.drop(key)
     return data, new_defs
 
 
@@ -530,6 +601,39 @@ def sess_decode(data: Any, legend: dict) -> Any:
     identical to the per-call dictionary, so this is `dict_decode` — named separately to
     document that the legend here is session-cumulative, not single-payload."""
     return dict_decode(data, legend)
+
+
+def sess_compress(obj: Any, sess: "SessionDict", keyframe: int = 0) -> Optional[tuple]:
+    """Session-dictionary wire for one payload, or None to fall back to the full form.
+
+    Mirrors `compress_with`'s pipeline — tabularize first (`compress_structure`), THEN fold
+    values — but against the shared, session-cumulative `sess` instead of a fresh per-call
+    legend. Returns `(envelope_text, new_defs)` where `envelope_text` is the minified
+    `{"__terse_sess__":1,"def":new_defs,"data":data}` and `new_defs` is exactly the
+    definitions transmitted this payload (for the caller to retrieve-back). Returns None
+    when `sess_encode` bows out (terse marker / alias-literal collision / nothing aliased /
+    self-verify fail), leaving `sess` untouched — the caller then emits the ordinary full
+    compressed form.
+
+    No cost-vs-full comparison here BY DESIGN: `sess_encode` commits its interns iff it
+    returns non-None, so the envelope is always the emitted form on a non-None return —
+    second-guessing it at the caller would strand committed definitions the client never
+    receives. A first-use or keyframe payload may therefore cost a few tokens more than the
+    full form (the speculative-intern bet / re-anchor), repaid on the next reference; the
+    `measure` path reports the net across the session, not a single turn.
+    """
+    # Screen the RAW payload for reserved markers here (a collision anywhere is unsafe);
+    # after this, tabularize is free to introduce its own `__terse_table__`, which the
+    # session fold then treats as ordinary structure (see `sess_encode(_pretabularized=)`).
+    if has_terse_marker(obj):
+        return None
+    structure = compress_structure(obj)
+    res = sess_encode(structure, sess, keyframe, _pretabularized=True)
+    if res is None:
+        return None
+    data, new_defs = res
+    envelope = minify({SESS_MARKER: 1, "def": new_defs, "data": data})
+    return envelope, new_defs
 
 
 # --------------------------------------------------------------------------- #
@@ -738,6 +842,13 @@ def decompress(text: str) -> Any:
     parsed = json.loads(text)
     if isinstance(parsed, dict) and parsed.get(DICT_MARKER) == 1:
         data = dict_decode(parsed["data"], parsed["legend"])
+        return decompress_structure(data)
+    if isinstance(parsed, dict) and parsed.get(SESS_MARKER) == 1:
+        # Session envelope (#64): expand against THIS payload's `def` block. A live client
+        # resolves against the legend it has accumulated across every prior payload's defs;
+        # a standalone `decompress` sees only the defs shipped here, which is exactly right
+        # for a self-contained (all-defs-present) payload and for the encode self-verify.
+        data = sess_decode(parsed["data"], parsed.get("def", {}))
         return decompress_structure(data)
     return decompress_structure(parsed)
 

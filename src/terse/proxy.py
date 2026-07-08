@@ -76,6 +76,12 @@ TERSE_PRIMER = (
     'POSITIONAL — its i-th value belongs to the i-th name in "cols". "n" is the exact count.\n'
     '- Dict {"__terse_dict__":1,"legend":{"~0":value,...},"data":...}: every "~K" token '
     'inside "data" stands for legend["~K"] — substitute it back.\n'
+    '- Session {"__terse_sess__":1,"def":{"~K":value,...},"data":...}: like Dict, but the '
+    'legend is CUMULATIVE across every result this session — a "~K" in "data" is defined '
+    'either in THIS "def" or in an EARLIER result\'s "def" (a value first seen before, its '
+    'definition sent once and elided since). Resolve each "~K" against the definitions you '
+    'have accumulated. If a "~K" was never defined (its defining result scrolled out of '
+    'context), call terse.retrieve with {"handle":"~K"} to fetch its value.\n'
     '- Diff {"__terse_diff__":1,"shape":"rows","by":COL,"set":[...],"new":[...],"del":[...],'
     '"n":N}: update the PREVIOUS same-tool result — from its records drop ids in "del", '
     'overwrite/insert each record in "set" matched by its "by" field, append ids in "new"; '
@@ -124,6 +130,12 @@ class Interceptor:
                  dropped_bytes: Optional[list[int]] = None,
                  session_dict: Optional["transforms.SessionDict"] = None):
         self.policy = pol
+        # Cross-peer session dictionary active for this peer iff BOTH the policy opts in
+        # AND a shared SessionDict was injected (#64 Phase 1). A None session_dict (every
+        # single-peer/legacy caller that doesn't pass one) forces this False — behavior-
+        # preserving. Mutually exclusive with diff below: the session path, when on, is the
+        # sole cross-call wire and skips diffing entirely.
+        self.session = bool(pol.session_dict) and session_dict is not None
         # id -> (policy_tool, capture_tool): policy_tool drives compression/policy-tier
         # lookup and MUST be the bare name the policy's rules match against; capture_tool
         # is what capture()/audit() see and defaults to policy_tool, but multiproxy
@@ -252,6 +264,15 @@ class Interceptor:
                 with self._store_lock:
                     self.dropped.clear()
                     self._dropped_bytes_box[0] = 0
+                # The cross-peer session legend (#64) resets for the SAME reason as the diff
+                # bases and drop store: a re-handshake means the client rebuilt its context,
+                # so it no longer holds any accumulated definition a later reference could
+                # resolve against. Clearing recycles the alias namespace safely (every entry
+                # re-defines on next use). Its lock is a leaf — safe to take here under
+                # _local_lock. Shared across peers, so the first peer's reset clears it for
+                # all; later peers' broadcast-initialize resets are then no-ops.
+                if self.session_dict is not None:
+                    self.session_dict.clear()
                 if mid is not None:
                     self.init_id = mid
                 return
@@ -309,7 +330,10 @@ class Interceptor:
                 # we advertise the synthetic terse.retrieve tool so the model knows
                 # how to fetch a dropped field back (#10) — only for the untracked
                 # case, never for a tracked call's error reply.
-                if tracked is None and self.policy.has_drop():
+                # ...or when session-dict is active: its definitions are retrieve-backed too
+                # (#64 "Beyond"), so the model must be able to call terse.retrieve for a "~K"
+                # whose defining result scrolled out of context.
+                if tracked is None and (self.policy.has_drop() or self.session):
                     injected = self._inject_retrieve_tool(msg)
                     if injected is not None:
                         return injected
@@ -342,10 +366,11 @@ class Interceptor:
             raw_texts = [b["text"] for b in text_blocks] if self.audit is not None else None
 
             changed = False
-            # Diffing reasons about ONE logical payload, so it only engages for a single
-            # text block (the overwhelmingly common tool-result shape); multi-block results
-            # take the plain per-block compression path.
-            if self.diff and len(text_blocks) == 1:
+            # Diffing AND the session dictionary both reason about ONE logical payload, so
+            # they only engage for a single text block (the overwhelmingly common tool-result
+            # shape); multi-block results take the plain per-block compression path. The two
+            # are mutually exclusive; `_compress_or_diff` dispatches to whichever is active.
+            if (self.diff or self.session) and len(text_blocks) == 1:
                 changed = self._compress_or_diff(text_blocks[0], tool)
             else:
                 for block in text_blocks:
@@ -394,7 +419,26 @@ class Interceptor:
             curr = json.loads(text)
         except (json.JSONDecodeError, ValueError):
             curr = None
-        if curr is not None:
+        if curr is not None and self.session:
+            # Cross-peer session dictionary (#64): fold this payload's values into the shared
+            # session legend, referencing (definition elided) anything already defined by an
+            # earlier payload — the cross-server win diff can't do. This is the SOLE cross-call
+            # wire when on: it and diff are mutually exclusive, so no diff base is kept here.
+            # sess_compress commits its interns iff it returns non-None, so we always emit its
+            # envelope on a hit (never second-guess it — that would strand a committed def the
+            # client never received). Every definition sent this payload is also retrieve-backed
+            # (below) so a compacted-out def stays recoverable via terse.retrieve.
+            res = transforms.sess_compress(curr, self.session_dict, self.keyframe_interval)
+            if res is not None:
+                sess_text, new_defs = res
+                for alias, real in new_defs.items():
+                    self._drop_put(alias, real)  # retrieve-backing (#64 "Beyond")
+                chosen = sess_text
+                if self.debug:
+                    sys.stderr.write(
+                        f"[terse-proxy] {tool}: session-dict {_cost(applied.text)}->"
+                        f"{_cost(sess_text)} tok, {len(new_defs)} def(s) sent\n")
+        elif curr is not None:
             prev = self.last.get(tool)
             emitted_diff = False
             # A keyframe is due once K diffs have chained off the last full result; force
@@ -790,7 +834,13 @@ def run_proxy(
 
     capture, audit = _build_capture_and_audit(capture_dir, debug_log, debug, "[terse-proxy]")
 
-    inter = Interceptor(pol, debug=debug, capture=capture, audit=audit)
+    # A single-peer proxy has no cross-PEER sharing, but the session dictionary still gives
+    # cross-CALL elision (a value defined by one result, referenced by later ones this
+    # session), so honor `session_dict` here too by minting a private instance (#64). None
+    # when off — behavior-preserving for every existing single-peer caller.
+    session_dict = transforms.SessionDict() if pol.session_dict else None
+    inter = Interceptor(pol, debug=debug, capture=capture, audit=audit,
+                        session_dict=session_dict)
 
     try:
         transport = build_transport(cmd, headers=headers)
@@ -828,7 +878,7 @@ def run_proxy(
                 # `pending`, since we don't call note_request for it). This never touches
                 # `transport` at all — retrieve is a pure client<->proxy exchange, which is
                 # exactly why it needed zero HTTP-specific reimplementation for #5.
-                if inter.policy.has_drop():
+                if inter.policy.has_drop() or inter.session:
                     reply = inter.answer_retrieve(line)
                     if reply is not None:
                         with out_lock:

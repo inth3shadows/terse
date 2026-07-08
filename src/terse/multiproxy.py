@@ -288,10 +288,11 @@ class Router:
         self.out_lock = out_lock
         self.debug = debug
         self.broadcast_timeout = broadcast_timeout
-        # True if ANY peer's policy enables drop-to-retrieve — gates whether the merged
-        # tools/list advertises the single synthetic terse.retrieve tool at all, mirroring
-        # single-peer Interceptor.policy.has_drop() (#10).
-        self.has_drop = any(p.inter.policy.has_drop() for p in peers)
+        # True if ANY peer's policy enables drop-to-retrieve OR has the session dictionary
+        # active — either one makes terse.retrieve reachable (session definitions are
+        # retrieve-backed too, #64 "Beyond"), so the merged tools/list must advertise the
+        # single synthetic terse.retrieve tool. Mirrors single-peer proxy.py's gate.
+        self.has_drop = any(p.inter.policy.has_drop() or p.inter.session for p in peers)
         # One background sender per peer (index-aligned with `peers`) so a slow HTTP
         # peer's blocking send can't stall routing to any other peer — see _PeerSender.
         self._senders = [_PeerSender(p.transport, debug=debug) for p in peers]
@@ -800,7 +801,8 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                  dropped_bytes: list[int],
                  session_dict: Optional["transforms.SessionDict"] = None,
                  diff_override: bool = False,
-                 diff_keyframe_override: Optional[int] = None) -> list[Peer]:
+                 diff_keyframe_override: Optional[int] = None,
+                 session_dict_override: bool = False) -> list[Peer]:
     """Build every `Peer`: its own `Transport` (stdio or HTTP, via `build_transport`)
     and its own `Interceptor` (per-peer diff/compress state, but the drop store —
     including its byte-eviction counter — is injected shared). Raises on a bad spec —
@@ -822,6 +824,8 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                 pol.diff = True
             if diff_keyframe_override is not None:
                 pol.diff_keyframe_interval = diff_keyframe_override
+            if session_dict_override:
+                pol.session_dict = True  # proxy-wide opt-in, applied even to a peer's own policy
             inter = Interceptor(pol, debug=debug, capture=capture, audit=audit,
                                 store=store, store_lock=store_lock,
                                 dropped_bytes=dropped_bytes, session_dict=session_dict)
@@ -846,6 +850,7 @@ def run_multi_proxy(
     broadcast_timeout: float = BROADCAST_TIMEOUT,
     diff_override: bool = False,
     diff_keyframe_override: Optional[int] = None,
+    session_dict_override: bool = False,
 ) -> int:
     """Load `config_path`, build one `Peer` per downstream (own `Transport` + own
     `Interceptor`, all sharing one drop store), spawn one `pump()` reader thread per
@@ -877,9 +882,11 @@ def run_multi_proxy(
     store_lock = Lock()
     dropped_bytes: list[int] = [0]
     # One session legend spanning every peer (#64 Phase 1), minted here alongside the other
-    # cross-peer state and injected into each Interceptor. Inert until the live-wiring stage
-    # reads it — this stage establishes the shared instance so a value defined by one peer
-    # is visible to all.
+    # cross-peer state and injected into each Interceptor. Cheap when unused: a peer only
+    # writes to it when ITS policy opts in (`session_dict` true, via the peer's own policy or
+    # the proxy-wide `session_dict_override`); peers that don't opt in never touch it and
+    # emit the ordinary full form. Sharing one instance is the whole point — a value defined
+    # by one peer is then referenced (definition elided) by every other.
     session_dict = transforms.SessionDict()
 
     try:
@@ -887,7 +894,8 @@ def run_multi_proxy(
                              audit=audit, store=store, store_lock=store_lock,
                              dropped_bytes=dropped_bytes, session_dict=session_dict,
                              diff_override=diff_override,
-                             diff_keyframe_override=diff_keyframe_override)
+                             diff_keyframe_override=diff_keyframe_override,
+                             session_dict_override=session_dict_override)
     except OSError as exc:
         sys.stderr.write(f"[terse-multiproxy] failed to launch a downstream peer: {exc}\n")
         return 127

@@ -114,3 +114,65 @@ def measure_corpus(
         row["bytes"] = env.get("bytes", len(env["raw"]))
         rows.append(row)
     return rows
+
+
+def measure_session_dict(
+    envelopes: list[dict[str, Any]], keyframe: int = 5
+) -> dict[str, Any]:
+    """Replay the corpus through ONE shared session dictionary (#64) IN CAPTURE ORDER and
+    report the token saving over the per-call baseline.
+
+    The baseline is `compress()` — today's default, a fresh per-call legend every payload.
+    The session run threads a single `SessionDict` across every payload (as the live
+    multiproxy shares one across all peers), so a value first defined by an earlier payload
+    is REFERENCED (definition elided) by later ones — the cross-call/cross-peer win a
+    per-call legend structurally can't capture. Capture order matters: the saving only
+    accrues to payloads that follow the one that first defined a shared value.
+
+    Non-JSON payloads (no `compress` structure) contribute equally to both totals, so they
+    neither help nor distort the delta. Every session payload is self-verified inside
+    `sess_encode`; a payload that fails falls back to the full form, exactly as live.
+
+    Returns totals + the realized percentage. A saving materially above what per-call
+    compression already banks is the evidence Phase 1 set out to produce."""
+    sess = transforms.SessionDict()
+    base_tok = 0
+    sess_tok = 0
+    applicable = 0  # JSON payloads the session path could actually act on
+    elided = 0      # payloads where the session form beat the per-call full form
+    for env in envelopes:
+        raw = env["raw"]
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            # Non-JSON: identical under both paths; count once into each so the delta is
+            # driven purely by JSON payloads.
+            tok = count_cl100k(raw) or 0
+            base_tok += tok
+            sess_tok += tok
+            continue
+        full = transforms.compress(obj)
+        full_tok = count_cl100k(full) or 0
+        base_tok += full_tok
+        applicable += 1
+        res = transforms.sess_compress(obj, sess, keyframe)
+        if res is None:
+            sess_tok += full_tok
+            continue
+        envelope, _ = res
+        env_tok = count_cl100k(envelope) or 0
+        sess_tok += env_tok
+        if env_tok < full_tok:
+            elided += 1
+    saved = base_tok - sess_tok
+    pct = (saved / base_tok * 100) if base_tok else 0.0
+    return {
+        "payloads": len(envelopes),
+        "applicable": applicable,
+        "elided_wins": elided,
+        "baseline_cl100k": base_tok,
+        "session_cl100k": sess_tok,
+        "saved_cl100k": saved,
+        "saved_pct": pct,
+        "keyframe": keyframe,
+    }

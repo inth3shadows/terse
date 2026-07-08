@@ -67,6 +67,14 @@ class Policy:
     # chained diff can never drift more than K turns from an anchor the model can
     # reconstruct from scratch. 0 disables keyframing (diff whenever it wins).
     diff_keyframe_interval: int = 5
+    # Cross-peer session dictionary (#64 Phase 1): a shared legend spanning every peer, so a
+    # value defined by one payload is referenced (definition elided) by later ones. Like
+    # `diff`, it is a stateful cross-call scheme with an unproven-in-practice desync risk, so
+    # OFF by default: enable per-policy (`"session_dict": true`) or with `proxy --session-dict`.
+    # Mutually exclusive with `diff` (both are cross-call wires competing for the same slot);
+    # the CLI rejects setting both. Reuses `diff_keyframe_interval` as its per-entry re-emit
+    # bound. The proxy always falls back to the full compressed form when it doesn't apply.
+    session_dict: bool = False
 
     def select(self, tool: str) -> Rule:
         """First rule whose glob matches the tool name, else the lossless default.
@@ -123,7 +131,8 @@ def load_policy(path: str | Path) -> Policy:
         rules.append(Rule(tool_glob=glob, tiers=_coerce_tiers(r.get("tiers", []), f"policies[{i}]"),
                           fields=r.get("fields", {})))
     return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", False)),
-                  diff_keyframe_interval=int(doc.get("diff_keyframe_interval", 5)))
+                  diff_keyframe_interval=int(doc.get("diff_keyframe_interval", 5)),
+                  session_dict=bool(doc.get("session_dict", False)))
 
 
 @dataclass

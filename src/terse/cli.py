@@ -117,6 +117,16 @@ def _cmd_measure(args: argparse.Namespace) -> int:
         print("\n" + build_terminal_report(rows))
     if args.history:
         _record_and_print_trend(args.history, rows, args.corpus)
+    if args.session_dict:
+        from .measure import measure_session_dict
+        s = measure_session_dict(envelopes, keyframe=args.session_keyframe)
+        print(
+            f"\n[session dictionary #64 — shared cross-peer legend, keyframe={s['keyframe']}]\n"
+            f"  payloads {s['payloads']} ({s['applicable']} JSON, {s['elided_wins']} beat per-call)\n"
+            f"  per-call baseline : {s['baseline_cl100k']:>10,} cl100k tok\n"
+            f"  session dictionary: {s['session_cl100k']:>10,} cl100k tok\n"
+            f"  cross-peer saving : {s['saved_cl100k']:>10,} tok  ({s['saved_pct']:+.1f}% vs per-call)"
+        )
     return 0
 
 
@@ -171,8 +181,16 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
     except (OSError, ValueError) as e:
         print(f"proxy: {e}", file=sys.stderr)
         return 2
+    if args.diff and args.session_dict:
+        # Both are cross-call wires competing for the one emitted form; enabling both is
+        # almost certainly a mistake, and letting one silently win would hide it.
+        print("proxy: --diff and --session-dict are mutually exclusive — choose one "
+              "cross-call scheme", file=sys.stderr)
+        return 2
     if args.diff:
         pol.diff = True  # CLI opt-in overrides the policy default (off)
+    if args.session_dict:
+        pol.session_dict = True  # CLI opt-in overrides the policy default (off)
     if args.diff_keyframe_interval is not None:
         pol.diff_keyframe_interval = args.diff_keyframe_interval
 
@@ -185,7 +203,8 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
             return run_multi_proxy(args.config, pol, debug=args.debug,
                                    capture_dir=args.capture_dir, debug_log=args.debug_log,
                                    diff_override=args.diff,
-                                   diff_keyframe_override=args.diff_keyframe_interval)
+                                   diff_keyframe_override=args.diff_keyframe_interval,
+                                   session_dict_override=args.session_dict)
         except (OSError, ValueError) as e:
             print(f"proxy --config: {e}", file=sys.stderr)
             return 2
@@ -750,6 +769,13 @@ def main(argv: list[str] | None = None) -> int:
     m.add_argument("--history", metavar="FILE",
                    help="append this run's summary to FILE (jsonl) and print the trend "
                         "across every run recorded there so far (#51 fast-follow)")
+    m.add_argument("--session-dict", action="store_true",
+                   help="also replay the corpus through one shared cross-peer session "
+                        "dictionary (#64) and report the token saving over per-call "
+                        "compression (capture order matters — the win accrues across payloads)")
+    m.add_argument("--session-keyframe", type=int, default=5, metavar="K",
+                   help="with --session-dict, re-emit a definition after K references "
+                        "(default 5; 0 = never re-emit)")
     m.set_defaults(func=_cmd_measure)
 
     p = sub.add_parser("probe", help="value-redundancy + cross-call-overlap ceiling probes")
@@ -776,6 +802,11 @@ def main(argv: list[str] | None = None) -> int:
     px.add_argument("--diff", action="store_true",
                     help="enable cross-call diffing (stateful; emits a lossless delta vs the "
                          "prior same-tool result when smaller). Opt-in: fluency unverified")
+    px.add_argument("--session-dict", action="store_true",
+                    help="enable the cross-peer session dictionary (#64): a shared legend so a "
+                         "value defined by one server's result is referenced (definition elided) "
+                         "by later results across ALL peers. Stateful, opt-in, mutually exclusive "
+                         "with --diff; reuses --diff-keyframe-interval as its re-emit bound")
     px.add_argument("--debug", action="store_true", help="log compressions to stderr")
     px.add_argument("--capture-dir", metavar="DIR",
                     help="tee each raw tool-result payload into this corpus dir for later "
