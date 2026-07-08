@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 import stat
 
-from terse.capture import append_audit, capture_payload, find_record_list_with_path
+from terse.capture import (
+    append_audit,
+    capture_payload,
+    find_record_list_with_path,
+    load_corpus,
+)
 
 
 def test_capture_payload_writes_owner_only_file(tmp_path):
@@ -22,6 +27,26 @@ def test_capture_payload_is_idempotent_by_sha_and_stays_restricted(tmp_path):
     p2 = capture_payload("demo.tool", raw, corpus)
     assert p1 == p2
     assert stat.S_IMODE(p1.stat().st_mode) == 0o600
+
+
+def test_load_corpus_replays_in_capture_order_not_filename(tmp_path):
+    # capture_payload stamps a monotonic captured_at; load_corpus must return that order,
+    # even when the sha-based filenames sort the other way (the #64 session replay depends
+    # on it). "zzz" is captured FIRST but its filename sorts LAST.
+    corpus = tmp_path / "corpus"
+    capture_payload("t", json.dumps({"v": "zzz"}), corpus)
+    capture_payload("t", json.dumps({"v": "aaa"}), corpus)
+    order = [json.loads(e["raw"])["v"] for e in load_corpus(corpus)]
+    assert order == ["zzz", "aaa"]                       # capture order, not sorted filename
+
+
+def test_capture_payload_preserves_captured_at_on_rewrite(tmp_path):
+    # Re-capturing identical content must keep the FIRST-sighting timestamp (idempotency).
+    corpus = tmp_path / "corpus"
+    p = capture_payload("t", json.dumps({"v": 1}), corpus)
+    first = json.loads(p.read_text(encoding="utf-8"))["captured_at"]
+    capture_payload("t", json.dumps({"v": 1}), corpus)
+    assert json.loads(p.read_text(encoding="utf-8"))["captured_at"] == first
 
 
 def test_append_audit_writes_owner_only_and_appends(tmp_path):

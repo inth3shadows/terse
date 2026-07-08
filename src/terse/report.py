@@ -224,9 +224,14 @@ def build_cross_server_probe_report(
 ) -> str:
     """Render the #64 Phase 0 cross-server redundancy probe with an explicit go/no-go.
 
-    Primary gate = the record-value dictionary increment (shared content across peers).
-    Raw-token overlap is corroborating only (framing-inflated). Thresholds mirror the
-    plan: <3% of corpus -> close Phase 1; >=10% -> build; between -> lean close.
+    Primary gate = the record-value dictionary increment (shared whole VALUES across peers) —
+    the ONLY quantity a value dictionary can actually elide. Lever B's idf token overlap is
+    corroborating context ONLY: it measures shared SUBWORD tokens, which do NOT imply shared
+    elidable values and must never on their own trigger a BUILD. (Verified the hard way in
+    #64 Phase 1: a 20.9% Lever-B token overlap coincided with ZERO cross-server value overlap
+    and a −17.7% realized result — token overlap is not value-elision headroom.) Thresholds
+    on Lever A mirror the plan: <3% of corpus -> close; >=10% -> build; between -> lean close.
+    When Lever A is blind, the verdict is INCONCLUSIVE — never a Lever-B BUILD.
     """
     out: list[str] = ["# terse #64 Phase 0 — cross-server redundancy probe", ""]
 
@@ -262,9 +267,12 @@ def build_cross_server_probe_report(
         "## Lever B — cross-server overlap, framing-normalized (spans all servers)",
         "",
         "Token overlap between payloads of *different* servers. `raw` is inflated by shared",
-        "JSON framing; `content` re-weights by idf so ubiquitous framing tokens drop out and",
-        "only shared CONTENT counts — the headroom a shared cross-peer dictionary (but not",
-        "per-peer coding) could harvest. Unlike Lever A this sees text/source servers.",
+        "JSON framing; `content` re-weights by idf so ubiquitous framing tokens drop out.",
+        "Unlike Lever A this sees text/source servers. **CAVEAT (do not gate BUILD on this):**",
+        "these are shared SUBWORD tokens, not shared whole VALUES. A value dictionary can only",
+        "elide entire repeated values; two servers can share high token mass (both mention",
+        "'Interceptor', 'proxy', 'src/terse') while sharing ZERO complete values. Lever B is a",
+        "loose upper bound / corroboration signal, never realizable headroom on its own (#64).",
         "",
     ]
     if overlap["rows"]:
@@ -316,29 +324,23 @@ def build_cross_server_probe_report(
             "",
         ]
 
-    # Verdict. When Lever A has full coverage, its content-value increment is the gate.
-    # When it's blind (a text/source server missing), fall back to Lever B's framing-netted
-    # content overlap — it spans ALL servers and, post-idf, is no longer framing-inflated.
-    # Corpus caveat stays: these payloads are cross-session, so co-resident recurrence (the
-    # case a shared session dict most helps) is UNDER-represented — a low number here is a
-    # floor, not a ceiling.
+    # Verdict. Lever A's shared whole-VALUE increment is the ONLY gate that can say BUILD,
+    # because it is the only quantity a value dictionary can elide. When Lever A is blind (a
+    # server emits text/source or non-record payloads), the verdict is INCONCLUSIVE — NOT a
+    # fallback BUILD on Lever B. Lever B is idf-weighted SUBWORD-token overlap; #64 Phase 1
+    # proved it does not track value overlap (20.9% Lever B → 0 cross-server value → −17.7%
+    # realized). A high Lever B with a blind Lever A means "capture a corpus where whole-value
+    # overlap is measurable," never "build."
     blind = ", ".join(f"`{m}`" for m in missing)
     if inconclusive:
-        if content_median >= 0.15:
-            verdict = (f"**LEAN BUILD.** Lever A is blind to {blind}, but the framing-netted content "
-                       f"overlap is **{content_median:.1%}** across all servers — substantial shared "
-                       "content a per-peer coder misses. A shared cross-peer legend has real headroom; "
-                       "proceed to design Phase 1, verifying the pattern holds on an independent capture.")
-        elif content_median < 0.05:
-            verdict = ("**LEAN CLOSE.** Lever A saw no cross-server value; Lever B's framing-netted "
-                       f"content overlap is only **{content_median:.1%}** — even net of JSON structure, "
-                       "different servers barely share content. A shared legend is unlikely to pay. "
-                       "If this corpus is cross-session, re-run on a co-resident capture (same entities "
-                       "across peers) to confirm before closing — that number is the optimistic floor.")
-        else:
-            verdict = (f"**INCONCLUSIVE ({content_median:.1%} content overlap).** Lever A blind to "
-                       f"{blind}; Lever B sits in the grey band. If the corpus is cross-session, capture "
-                       "one co-resident session (all peers, same codebase) and re-run before deciding.")
+        verdict = (f"**INCONCLUSIVE — do NOT build on Lever B.** Lever A (shared whole-value "
+                   f"increment, the only realizable gate) is blind to {blind}. Lever B's "
+                   f"framing-netted content overlap is **{content_median:.1%}**, but that is shared "
+                   "SUBWORD-token mass, not shared elidable VALUES — #64 Phase 1 confirmed a high "
+                   "Lever B can sit atop ZERO value overlap and realize NEGATIVE savings. To decide, "
+                   "capture a corpus where Lever A can see whole-value overlap across peers (record- "
+                   "or scalar-value payloads from ≥2 servers about the same entities) and re-run. "
+                   "Do not greenlight a value dictionary on token overlap.")
     elif thin:
         verdict = ("**WEAK — lean CLOSE, re-run to confirm.** Increment is "
                    f"{frac_corpus:+.1%} of corpus, but <30 record-lists on a peer makes it "
