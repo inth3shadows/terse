@@ -145,8 +145,9 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path) -> Path:
     """Persist one captured payload as a shape-tagged envelope. Idempotent by sha."""
     corpus = Path(corpus_dir)
     corpus.mkdir(parents=True, exist_ok=True)
+    sha = _sha8(raw)
     safe_tool = _SANITIZE.sub("_", tool).strip("_") or "unknown"
-    path = corpus / f"{safe_tool}__{_sha8(raw)}.json"
+    path = corpus / f"{safe_tool}__{sha}.json"
     # `captured_at` records the chronological CAPTURE order (nanoseconds), which is the
     # session/gateway order a cross-call replay (measure --session-dict, #64) must honor —
     # the sha-based filename does NOT preserve it. Preserved on rewrite so the value is
@@ -163,7 +164,7 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path) -> Path:
         "tool": tool,
         "shape": classify_shape(raw),
         "bytes": len(raw),
-        "sha": _sha8(raw),
+        "sha": sha,
         "captured_at": captured_at,
         "raw": raw,
     }
