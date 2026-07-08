@@ -121,7 +121,8 @@ class Interceptor:
                  audit: Optional[Callable[[dict], None]] = None,
                  store: Optional["OrderedDict[str, Any]"] = None,
                  store_lock: Optional[Lock] = None,
-                 dropped_bytes: Optional[list[int]] = None):
+                 dropped_bytes: Optional[list[int]] = None,
+                 session_dict: Optional["transforms.SessionDict"] = None):
         self.policy = pol
         # id -> (policy_tool, capture_tool): policy_tool drives compression/policy-tier
         # lookup and MUST be the bare name the policy's rules match against; capture_tool
@@ -202,6 +203,15 @@ class Interceptor:
         # with no nesting, so a future method extending that pattern must not also reach
         # for `_local_lock` while still holding `_store_lock`.
         self._store_lock = store_lock if store_lock is not None else Lock()
+        # Shared cross-peer session legend (#64 Phase 1). Like `store`/`store_lock`, one
+        # instance is minted in multiproxy and injected into EVERY peer's Interceptor, so a
+        # value defined by one peer can be referenced (definition elided) by another — the
+        # cross-server compression a native client multiplex can't do. Safe to share because
+        # it is VALUE-keyed, not tool-keyed. Its own lock is a leaf (see SessionDict), so it
+        # never entangles with `_local_lock`/`_store_lock`. Default None = no session legend:
+        # 100% behavior-preserving for single-peer callers, and inert until the live-wiring
+        # stage reads it (this stage only threads it through the plumbing).
+        self.session_dict = session_dict
 
     def note_request(self, line: str, *, tool_name: Optional[str] = None) -> None:
         """Record id -> tool name for tools/call requests, and the initialize request id

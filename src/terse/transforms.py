@@ -28,7 +28,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from collections import Counter
+from collections import Counter, OrderedDict
+from threading import Lock
 from typing import Any
 
 from .tokenize import count_cl100k
@@ -41,13 +42,29 @@ DIFF_MARKER = "__terse_diff__"
 # produced by the lossy layer and consumed by the proxy's retrieve handler — but it lives
 # in this registry so all `__terse_*` wire keys have one home and are reserved together.
 DROPPED_MARKER = "__terse_dropped__"
+# Session-legend envelope marker (#64 Phase 1). Wraps a payload whose value-nodes were
+# folded into a session-scoped, cross-peer legend: {"__terse_sess__":1,"def":{alias:val},
+# "data":<data-with-aliases>}. `def` carries only the FIRST-USE definitions introduced by
+# this payload; references to values defined by an earlier payload (or another peer) ride
+# as bare aliases in `data`, resolved against the legend the client has accumulated. The
+# wire wrapping + client-side accumulation land in a later stage; this stage ships the
+# codec (SessionDict + sess_encode) that the wrapping will call.
+SESS_MARKER = "__terse_sess__"
 ALIAS_SIGIL = "~"
 
 # Keys reserved for terse's own envelopes. A real payload that already contains one
 # can't be safely compressed: the consumer reads these markers per the format primer,
 # so it would mis-reconstruct the user's literal dict as a terse envelope. The codec
 # has no escape convention, so the only lossless move is to leave such a payload alone.
-_RESERVED_MARKERS = frozenset({TABLE_MARKER, DICT_MARKER, DIFF_MARKER, DROPPED_MARKER})
+_RESERVED_MARKERS = frozenset({TABLE_MARKER, DICT_MARKER, DIFF_MARKER, DROPPED_MARKER, SESS_MARKER})
+
+# A value-position node is worth interning into the session legend on its FIRST sighting
+# (a speculative cross-call/cross-peer bet that it recurs) only when its own token cost
+# clears this bar — below it, the one-time definition never pays back even if referenced
+# again. Values repeated WITHIN a single payload are aliased regardless (that saving is
+# immediate, exactly like the per-call dictionary). Deliberately conservative; the live
+# wiring stage tunes it against the measured co-resident corpus.
+SESS_MIN_TOK = 8
 
 
 def has_terse_marker(obj: Any) -> bool:
@@ -331,6 +348,188 @@ def dict_decode(node: Any, legend: dict) -> Any:
     if isinstance(node, dict):
         return {k: dict_decode(v, legend) for k, v in node.items()}
     return node
+
+
+def _entry_bytes(key: tuple, alias: str) -> int:
+    """Rough retained size of one session-legend entry, for the byte cap. The value's
+    canonical string (key[1]) dominates; the alias is a handful of chars."""
+    return len(key[1]) + len(alias)
+
+
+class SessionDict:
+    """Session-scoped, cross-peer value->alias intern table for the #64 Phase 1 shared
+    legend. VALUE-keyed (a value is a value regardless of which peer emitted it), which is
+    exactly why one instance is safe to share across every peer's Interceptor — unlike the
+    TOOL-keyed diff base, whose correctness depends on per-peer instance isolation.
+
+    Bounded + LRU-evicted like the drop store, so a long session can't grow it without
+    limit. Thread-safe via its own lock, which is a LEAF: it is never held while any
+    Interceptor lock is held and never calls back into the Interceptor, so it introduces
+    no lock-ordering constraint against `_local_lock`/`_store_lock`.
+
+    Aliases are monotonic within a session generation; `clear()` (called on reconnect,
+    when the client's accumulated legend resets too) is the only point that recycles the
+    namespace, so an alias never silently changes meaning mid-session.
+    """
+
+    def __init__(self, max_entries: int = 4096, max_bytes: int = 1 << 20):
+        self._alias: "OrderedDict[tuple, str]" = OrderedDict()  # (kind,payload) -> alias, LRU order
+        self._value: dict[str, Any] = {}                        # alias -> real value (string or subtree)
+        self._alias_set: set = set()                            # all assigned aliases (fast disjoint check)
+        self._counter = 0
+        self._bytes = 0
+        self._max_entries = max_entries
+        self._max_bytes = max_bytes
+        self._lock = Lock()
+
+    def aliases(self) -> set:
+        """A copy of every currently-assigned alias — for the per-payload #6 guard: the
+        client's legend is cumulative, so a payload literal equal to ANY live alias would
+        be mis-expanded, and session coding must bow out for that payload."""
+        with self._lock:
+            return set(self._alias_set)
+
+    def alias_for(self, key: tuple) -> Any:
+        """The alias already interned for `key`, or None. Marks it most-recently-used."""
+        with self._lock:
+            a = self._alias.get(key)
+            if a is not None:
+                self._alias.move_to_end(key)
+            return a
+
+    def intern(self, key: tuple, real: Any, avoid: set) -> Any:
+        """Assign (or return the existing) alias for `key`, whose real value is `real`.
+        The fresh alias avoids every string in `avoid` (this payload's literals) and every
+        alias already assigned, so it can never collide with a literal or another entry.
+        Evicts LRU entries to stay within the caps. Returns the alias."""
+        with self._lock:
+            a = self._alias.get(key)
+            if a is not None:
+                self._alias.move_to_end(key)
+                return a
+            while True:
+                cand = ALIAS_SIGIL + _b36(self._counter)
+                self._counter += 1
+                if cand not in avoid and cand not in self._value:
+                    break
+            self._alias[key] = cand
+            self._value[cand] = real
+            self._alias_set.add(cand)
+            self._bytes += _entry_bytes(key, cand)
+            self._evict_if_needed()
+            return cand
+
+    def legend_snapshot(self) -> dict:
+        """alias -> real value for every live entry: the legend the client is assumed to
+        hold. Used to self-verify an encode against the client's full cumulative view."""
+        with self._lock:
+            return dict(self._value)
+
+    def clear(self) -> None:
+        """Drop the whole table — called on reconnect, when the client's accumulated
+        legend resets too, so recycling the alias namespace is safe."""
+        with self._lock:
+            self._alias.clear()
+            self._value.clear()
+            self._alias_set.clear()
+            self._counter = 0
+            self._bytes = 0
+
+    def _evict_if_needed(self) -> None:
+        """Caller holds the lock. Evict LRU entries until within both caps. Eviction only
+        stops FUTURE references to that value; a client that already received the value
+        keeps it, so eviction never breaks an in-flight reference."""
+        while self._alias and (len(self._alias) > self._max_entries
+                               or self._bytes > self._max_bytes):
+            old_key, old_alias = self._alias.popitem(last=False)
+            self._value.pop(old_alias, None)
+            self._alias_set.discard(old_alias)
+            self._bytes -= _entry_bytes(old_key, old_alias)
+
+
+def sess_encode(structure: Any, sess: "SessionDict") -> Any:
+    """Fold value-nodes into the SESSION legend `sess`, returning (data, new_defs) or None.
+
+    A value already interned emits as a bare alias with its definition ELIDED — that
+    elision (paid for once in an earlier payload, possibly by another peer) is the entire
+    cross-server win. A new value clears `SESS_MIN_TOK` (or repeats within this payload) is
+    interned and its definition emitted inline in `new_defs` (first use). `data` is the
+    structure with value-nodes replaced by aliases; the client resolves them against the
+    legend it accumulates across `new_defs` from every payload.
+
+    Returns None (caller falls back to the per-call form) when session coding is unsafe or
+    unprofitable:
+      - the payload already carries a terse marker (same rule as compress);
+      - a payload literal collides with ANY live session alias (#6: the client's legend is
+        cumulative, so that literal would be mis-expanded) — a conservative whole-payload
+        bail, backstopped by the round-trip check below;
+      - nothing was aliased;
+      - the round-trip self-verify against the client's full cumulative legend fails.
+    """
+    if has_terse_marker(structure):
+        return None
+    avoid: set = set()
+    _collect_all_strings(structure, avoid)
+    if not sess.aliases().isdisjoint(avoid):
+        return None
+
+    counts: Counter = Counter()
+    _count_value_nodes(structure, counts)
+
+    alias_for_str: dict = {}
+    alias_for_json: dict = {}
+    new_defs: dict = {}
+    # Biggest-value candidates first so the cheapest aliases (and the scarce byte budget on
+    # intern) land on the largest wins, mirroring dict_encode's ordering.
+    for key, n in sorted(counts.items(), key=lambda kn: (kn[1]) * _node_tok(kn[0]), reverse=True):
+        kind, payload = key
+        alias = sess.alias_for(key)
+        if alias is None:
+            t = _node_tok(key)
+            # Worth a FIRST-USE definition when either: it repeats within this payload
+            # (immediate saving, any kind, exactly like the per-call dictionary); OR it is
+            # a lone high-token STRING — a speculative bet it recurs across later payloads
+            # or peers. A lone SUBTREE is never speculatively interned: a whole unique
+            # object (e.g. this payload's top-level record) rarely recurs verbatim, and its
+            # definition would cost the entire subtree for a reference that never comes —
+            # and top-down replacement would swallow the shared leaves inside it.
+            worth = (n >= 2 and (n - 1) * t > 0) or (kind == "s" and t >= SESS_MIN_TOK)
+            if not worth:
+                continue
+            real = payload if kind == "s" else json.loads(payload)
+            alias = sess.intern(key, real, avoid)
+            new_defs[alias] = real
+        if kind == "s":
+            alias_for_str[payload] = alias
+        else:
+            alias_for_json[payload] = alias
+
+    if not (alias_for_str or alias_for_json):
+        return None
+    data = _replace_nodes(structure, alias_for_str, alias_for_json)
+
+    # Self-verify against the FULL legend the client will hold (accumulated snapshot ∪ the
+    # defs shipped now). This is the hard lossless guarantee: any mis-alias — a literal that
+    # slipped the #6 guard, a subtree key-order edge — makes decode != original, and we bow
+    # out rather than ship an unresolvable payload.
+    legend = {**sess.legend_snapshot(), **new_defs}
+    if dict_decode(data, legend) != structure:
+        return None
+
+    # Prune first-use defs down to those actually referenced in `data`; a value whose only
+    # occurrences were swallowed by an aliased parent subtree costs nothing.
+    used: set = set()
+    _collect_used_aliases(data, legend, used)
+    new_defs = {a: v for a, v in new_defs.items() if a in used}
+    return data, new_defs
+
+
+def sess_decode(data: Any, legend: dict) -> Any:
+    """Client-side reconstruction: expand session aliases in `data` against `legend`, the
+    union of every `new_defs` the client has accumulated this session. Alias resolution is
+    identical to the per-call dictionary, so this is `dict_decode` — named separately to
+    document that the legend here is session-cumulative, not single-payload."""
+    return dict_decode(data, legend)
 
 
 # --------------------------------------------------------------------------- #

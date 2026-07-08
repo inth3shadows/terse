@@ -48,6 +48,7 @@ from typing import Any, Callable, Optional, TextIO
 
 from . import lossy as lossy_mod
 from . import policy as policy_mod
+from . import transforms
 from .proxy import (
     RETRIEVE_TOOL_DEF,
     SWALLOW,
@@ -796,7 +797,9 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                  debug: bool, capture: Optional[Callable[[str, str], None]],
                  audit: Optional[Callable[[dict], None]],
                  store: "OrderedDict[str, Any]", store_lock: Lock,
-                 dropped_bytes: list[int], diff_override: bool = False,
+                 dropped_bytes: list[int],
+                 session_dict: Optional["transforms.SessionDict"] = None,
+                 diff_override: bool = False,
                  diff_keyframe_override: Optional[int] = None) -> list[Peer]:
     """Build every `Peer`: its own `Transport` (stdio or HTTP, via `build_transport`)
     and its own `Interceptor` (per-peer diff/compress state, but the drop store —
@@ -821,7 +824,7 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                 pol.diff_keyframe_interval = diff_keyframe_override
             inter = Interceptor(pol, debug=debug, capture=capture, audit=audit,
                                 store=store, store_lock=store_lock,
-                                dropped_bytes=dropped_bytes)
+                                dropped_bytes=dropped_bytes, session_dict=session_dict)
             transport = build_transport(spec.target, headers=spec.headers or None)
             peers.append(Peer(name=spec.name, transport=transport, inter=inter))
     except Exception:
@@ -873,11 +876,17 @@ def run_multi_proxy(
     store: "OrderedDict[str, Any]" = OrderedDict()
     store_lock = Lock()
     dropped_bytes: list[int] = [0]
+    # One session legend spanning every peer (#64 Phase 1), minted here alongside the other
+    # cross-peer state and injected into each Interceptor. Inert until the live-wiring stage
+    # reads it — this stage establishes the shared instance so a value defined by one peer
+    # is visible to all.
+    session_dict = transforms.SessionDict()
 
     try:
         peers = _build_peers(specs, default_policy, debug=debug, capture=capture,
                              audit=audit, store=store, store_lock=store_lock,
-                             dropped_bytes=dropped_bytes, diff_override=diff_override,
+                             dropped_bytes=dropped_bytes, session_dict=session_dict,
+                             diff_override=diff_override,
                              diff_keyframe_override=diff_keyframe_override)
     except OSError as exc:
         sys.stderr.write(f"[terse-multiproxy] failed to launch a downstream peer: {exc}\n")
