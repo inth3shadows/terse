@@ -145,7 +145,8 @@ def test_content_overlap_high_when_real_content_shared():
 
 def test_cross_server_redundancy_handles_empty_records():
     # Text/source-only corpus yields no record-shaped payloads -> Lever A is empty. It must
-    # degrade to zeros without dividing by zero, so Lever B can still carry the verdict.
+    # degrade to zeros without dividing by zero. (Lever B does NOT then carry a BUILD verdict —
+    # see test_blind_lever_a_never_builds_on_token_overlap.)
     res = cross_server_redundancy({})
     assert res["per_server"] == []
     assert res["cross_server_increment_tokens"] == 0
@@ -163,6 +164,30 @@ def test_cross_server_overlap_pairs_across_servers_and_caps():
     assert res["pairs"] == 10          # one server-pair, capped to 10 positional pairs
     assert 0.0 <= res["median_overlap"] <= 1.0
     assert 0.0 <= res["median_content_overlap"] <= 1.0
+
+
+def test_blind_lever_a_never_builds_on_token_overlap():
+    # The #64 regression guard: with Lever A blind (no record-shaped payloads) and a HIGH
+    # Lever B token overlap, the verdict must be INCONCLUSIVE, never a BUILD. Token (subword)
+    # overlap is not value-elision headroom — 20.9% Lever B once sat atop 0 value overlap.
+    from terse.report import build_cross_server_probe_report
+    redundancy = {
+        "per_server": [],  # Lever A blind
+        "per_peer_saving_tokens": 0, "pooled_saving_tokens": 0,
+        "cross_server_increment_tokens": 0, "increment_frac_of_corpus": 0.0,
+        "increment_frac_over_per_peer": 0.0,
+    }
+    overlap = {
+        "rows": [{"server_a": "kb", "server_b": "runecho", "curr_tokens": 100,
+                  "shared_tokens": 40, "overlap_ratio": 0.4, "content_overlap_ratio": 0.30}],
+        "median_overlap": 0.4, "median_content_overlap": 0.30,  # a HIGH Lever B
+        "pairs": 1, "capped": False, "cap_per_pair": 10,
+    }
+    report = build_cross_server_probe_report(redundancy, overlap,
+                                             corpus_servers=["kb", "runecho"])
+    verdict = report.split("## Verdict", 1)[1]
+    assert "INCONCLUSIVE" in verdict
+    assert "BUILD" not in verdict.replace("do NOT build", "").replace("Do not", "")
 
 
 def test_field_profiles_size_and_cardinality():
