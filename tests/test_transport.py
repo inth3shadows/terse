@@ -16,8 +16,10 @@ import threading
 from terse import transforms
 from terse.lossy import _handle, _serialize
 from terse.policy import Policy, Rule
+import pytest
+
 from terse.proxy import Interceptor, run_proxy
-from terse.transport import HttpTransport
+from terse.transport import HttpTransport, build_transport
 
 RECORDS = [{"id": i, "status": "active", "url": "https://x.example/api/items"} for i in range(20)]
 
@@ -340,3 +342,37 @@ def test_http_transport_half_close_ends_inbound_and_wait_is_zero():
     t.half_close()  # no persistent connection — closes outright
     assert list(t.inbound()) == []  # sentinel already drained; iterator ends immediately
     assert t.wait() == 0  # no process — always 0
+
+
+# --- URL scheme allowlist: no local-file read / SSRF via a config-supplied url ---
+
+@pytest.mark.parametrize("bad_url", [
+    "file:///etc/passwd",              # local-file read
+    "ftp://example.com/x",             # urllib honors ftp too
+    "data:text/plain,pwned",           # inline data
+    "gopher://example.com/",           # classic SSRF smuggling scheme
+])
+def test_http_transport_rejects_non_http_scheme(bad_url):
+    with pytest.raises(ValueError, match="not allowed"):
+        HttpTransport(bad_url)
+
+
+def test_build_transport_rejects_file_url_scheme():
+    # build_transport routes anything containing "://" to HttpTransport, so the scheme
+    # guard there is what stops a `file://` "url" from ever being opened.
+    with pytest.raises(ValueError, match="not allowed"):
+        build_transport(["file:///etc/passwd"])
+
+
+def test_build_transport_still_allows_http_and_https():
+    # HttpTransport.__init__ does no I/O, so these construct without connecting.
+    assert isinstance(build_transport(["http://localhost:1/mcp"]), HttpTransport)
+    assert isinstance(build_transport(["https://example.com/mcp"]), HttpTransport)
+
+
+def test_run_proxy_rejects_file_url_scheme_as_config_error(capsys):
+    # End-to-end: a disallowed scheme is a clean config error (exit 2), not a traceback
+    # and not a silent file read into the client stream.
+    rc = run_proxy(["file:///etc/passwd"], FULL, stdin=io.StringIO(""), stdout=io.StringIO())
+    assert rc == 2
+    assert "not allowed" in capsys.readouterr().err

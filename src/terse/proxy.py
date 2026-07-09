@@ -787,12 +787,16 @@ def run_proxy(
     except OSError as exc:
         # Mistyped path, non-executable, or otherwise unlaunchable STDIO downstream —
         # report it as a config error instead of an uncaught traceback (#19). 127 = the
-        # shell convention for "command not found". (An HTTP target never raises here:
-        # HttpTransport.__init__ does no I/O — a bad URL/host only ever surfaces later,
-        # fail-open, as a synthesized per-request error — see transport.py.)
+        # shell convention for "command not found".
         sys.stderr.write(f"[terse-proxy] failed to launch downstream server {cmd[0]!r}: "
                          f"{exc}\n")
         return 127
+    except ValueError as exc:
+        # An HTTP target does no I/O in __init__, but it DOES now reject a disallowed URL
+        # scheme (file://, ftp://, …) up front — a config error, so exit 2 like any other
+        # bad downstream spec rather than crashing on the traceback (see transport.py).
+        sys.stderr.write(f"[terse-proxy] {exc}\n")
+        return 2
 
     # `half_close()`/`wait()` (Transport methods) hide every transport-specific
     # teardown/exit-code detail behind polymorphism — no isinstance check needed for
