@@ -883,15 +883,17 @@ def test_slow_peer_write_does_not_block_routing_to_other_peers():
 
 
 def test_unknown_method_forwards_to_peer_0_and_logs_without_debug(capsys):
-    # Regression: this v1-scope fallback's explanatory stderr note was gated behind
+    # Regression: this scope fallback's explanatory stderr note was gated behind
     # --debug, so by default an operator saw N-1 peers' data silently vanish from the
-    # reply with no indication anything was dropped.
+    # reply with no indication anything was dropped. `completion/complete` is a real
+    # MCP method with no bespoke merge (unlike resources/list, now broadcast) — so it
+    # exercises the genuine peer-0-only fallback that survived Phase 2.
     t0, t1 = _FakePeerTransport(), _FakePeerTransport()
     peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
     router = Router(peers, io.StringIO(), Lock(), debug=False)
     try:
         router.route_client_line(json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "method": "resources/list", "params": {}}))
+            {"jsonrpc": "2.0", "id": 1, "method": "completion/complete", "params": {}}))
         deadline = time.monotonic() + 2.0
         while t0.out.getvalue() == "" and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -899,4 +901,183 @@ def test_unknown_method_forwards_to_peer_0_and_logs_without_debug(capsys):
         router.close_senders()
     assert t0.out.getvalue() != "" and t1.out.getvalue() == ""  # forwarded to peer 0 only
     err = capsys.readouterr().err
-    assert "resources/list" in err and "peer 0" in err  # logged even without --debug
+    assert "completion/complete" in err and "peer 0" in err  # logged even without --debug
+
+
+# --- Phase 2 (#64): broadcast/merge resources|prompts|ping + route reads ---
+
+def _drive_broadcast(router, out, client_msg, peer_replies):
+    """Send `client_msg` (a broadcast), then feed each peer's reply as a
+    `terse-b0-<i>` broadcast-local id (seq 0 — the first broadcast on a fresh Router),
+    and return the single merged client-facing message. Each `from_peer` reply must be
+    SWALLOWed (a broadcast-local id is never forwarded as-is); the final one finishes
+    the broadcast and writes the merged reply to `out`."""
+    router.route_client_line(json.dumps(client_msg))
+    for i, reply in enumerate(peer_replies):
+        got = router.from_peer(i)(json.dumps({**reply, "id": f"terse-b0-{i}"}))
+        assert got is SWALLOW
+    msgs = _lines(out)
+    assert len(msgs) == 1
+    return msgs[0]
+
+
+def test_resources_list_merges_concat_without_prefix():
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        merged = _drive_broadcast(
+            router, out,
+            {"jsonrpc": "2.0", "id": 3, "method": "resources/list", "params": {}},
+            [{"result": {"resources": [{"uri": "a://1", "name": "a1"}]}},
+             {"result": {"resources": [{"uri": "b://1", "name": "b1"}]}}])
+    finally:
+        router.close_senders()
+    assert merged["id"] == 3
+    # both peers' resources concatenated; a uri is NOT peer-prefixed (unlike a tool name)
+    assert [r["uri"] for r in merged["result"]["resources"]] == ["a://1", "b://1"]
+
+
+def test_resource_templates_list_merges_concat():
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        merged = _drive_broadcast(
+            router, out,
+            {"jsonrpc": "2.0", "id": 4, "method": "resources/templates/list", "params": {}},
+            [{"result": {"resourceTemplates": [{"uriTemplate": "a://{x}"}]}},
+             {"result": {"resourceTemplates": [{"uriTemplate": "b://{x}"}]}}])
+    finally:
+        router.close_senders()
+    assert [t["uriTemplate"] for t in merged["result"]["resourceTemplates"]] == \
+        ["a://{x}", "b://{x}"]
+
+
+def test_prompts_list_merges_with_peer_prefix():
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        merged = _drive_broadcast(
+            router, out,
+            {"jsonrpc": "2.0", "id": 5, "method": "prompts/list", "params": {}},
+            [{"result": {"prompts": [{"name": "greet"}]}},
+             {"result": {"prompts": [{"name": "farewell"}]}}])
+    finally:
+        router.close_senders()
+    # prompt names ARE peer-prefixed (like tool names) so prompts/get can route by prefix
+    assert [p["name"] for p in merged["result"]["prompts"]] == ["a__greet", "b__farewell"]
+
+
+def test_ping_broadcast_replies_empty_result():
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        merged = _drive_broadcast(
+            router, out,
+            {"jsonrpc": "2.0", "id": 6, "method": "ping", "params": {}},
+            [{"result": {}}, {"result": {}}])
+    finally:
+        router.close_senders()
+    assert merged == {"jsonrpc": "2.0", "id": 6, "result": {}}
+
+
+def test_prompts_get_routes_by_prefix_and_strips_it():
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 9, "method": "prompts/get",
+             "params": {"name": "b__greet", "arguments": {"who": "x"}}}))
+        deadline = time.monotonic() + 2.0
+        while t1.out.getvalue() == "" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert t0.out.getvalue() == ""            # routed to the ONE named peer, not fanned out
+        sent = json.loads(t1.out.getvalue().strip())
+        assert sent["params"]["name"] == "greet"  # prefix stripped before the peer sees it
+        assert sent["params"]["arguments"] == {"who": "x"}  # rest of params preserved
+        assert sent["id"] == 9                     # client id passes through (single-peer route)
+        # the peer's reply is forwarded back to the client (passthrough, not merged)
+        forwarded = router.from_peer(1)(json.dumps(
+            {"jsonrpc": "2.0", "id": 9,
+             "result": {"messages": [{"role": "user", "content": {"type": "text", "text": "hi"}}]}}))
+    finally:
+        router.close_senders()
+    fwd = json.loads(forwarded)
+    assert fwd["id"] == 9 and fwd["result"]["messages"][0]["content"]["text"] == "hi"
+
+
+def test_prompts_get_unknown_prefix_returns_error():
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock())
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 10, "method": "prompts/get",
+             "params": {"name": "nope__greet"}}))
+    finally:
+        router.close_senders()
+    assert t0.out.getvalue() == "" and t1.out.getvalue() == ""  # never reached any peer
+    msgs = _lines(out)
+    assert len(msgs) == 1 and msgs[0]["id"] == 10
+    assert msgs[0]["error"]["code"] == -32601 and "unknown prompt" in msgs[0]["error"]["message"]
+
+
+def test_resources_read_scatter_gather_first_success_wins():
+    # A resource uri isn't peer-namespaced, so resources/read is fanned out to EVERY
+    # peer; the one that owns the uri returns a result, the others error, and the first
+    # success is forwarded to the client.
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 7, "method": "resources/read",
+             "params": {"uri": "b://res"}}))
+        for t in (t0, t1):  # fanned out to BOTH peers, not peer-0-only
+            deadline = time.monotonic() + 2.0
+            while t.out.getvalue() == "" and time.monotonic() < deadline:
+                time.sleep(0.01)
+        assert "resources/read" in t0.out.getvalue() and "resources/read" in t1.out.getvalue()
+        # peer 0 doesn't own the uri (error, discarded); peer 1 owns it (result, wins)
+        assert router.from_peer(0)(json.dumps(
+            {"jsonrpc": "2.0", "id": "terse-b0-0",
+             "error": {"code": -32002, "message": "resource not found"}})) is SWALLOW
+        assert router.from_peer(1)(json.dumps(
+            {"jsonrpc": "2.0", "id": "terse-b0-1",
+             "result": {"contents": [{"uri": "b://res", "text": "hello"}]}})) is SWALLOW
+    finally:
+        router.close_senders()
+    msgs = _lines(out)
+    assert len(msgs) == 1 and msgs[0]["id"] == 7
+    assert "error" not in msgs[0]
+    assert msgs[0]["result"]["contents"][0]["text"] == "hello"
+
+
+def test_resources_read_scatter_gather_all_error_surfaces_first_error():
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        merged = _drive_broadcast(
+            router, out,
+            {"jsonrpc": "2.0", "id": 8, "method": "resources/read",
+             "params": {"uri": "z://none"}},
+            [{"error": {"code": -32002, "message": "not found on a"}},
+             {"error": {"code": -32002, "message": "not found on b"}}])
+    finally:
+        router.close_senders()
+    assert merged["id"] == 8 and "result" not in merged
+    # the first-arriving error is surfaced, not a synthesized one
+    assert merged["error"]["message"] == "not found on a"
