@@ -13,13 +13,28 @@ proportionate. Documented limitations are fine; silent gaps are not:
     (`route_client_line`'s method-is-None branch) — an id whose peer isn't known
     (unrecognized, already answered, or evicted past `_SERVER_REQ_MAX`) is dropped
     rather than guessed at.
-  - Any client method other than `initialize`/`tools/list` (broadcast+merge) or
-    `tools/call` (routed by prefix) — e.g. `resources/list`, `prompts/list`, `ping` —
-    is forwarded to peer 0 ONLY, not broadcast/merged, and this is logged to stderr
-    unconditionally (not gated behind --debug — silently dropping N-1 peers' data
-    from the reply is exactly the kind of gap this file promises not to hide).
-    Building full N-way broadcast/merge logic for every possible MCP method is
-    disproportionate for a feature the issue itself calls "ergonomics, modest value".
+  - `initialize`, `tools/list`, `prompts/list`, `resources/list`,
+    `resources/templates/list`, and `ping` are BROADCAST to every peer and their
+    replies AGGREGATED into one (concat the lists — `tools`/`prompts` names gain a
+    `{peer}__` prefix, `resources` keep their own `uri`; union the capabilities; a
+    single format primer). `tools/call` and `prompts/get` are ROUTED to the one peer
+    named by that `{peer}__` prefix. `resources/read`, `resources/subscribe`, and
+    `resources/unsubscribe` are fanned out SCATTER-GATHER — a resource `uri` isn't
+    peer-namespaced, so every peer is asked and the first success `result` is the one
+    kept — a peer that doesn't own the `uri` errors and is discarded; on a `uri` owned
+    by two peers, the first-arriving success is kept — a documented tie-break, not a
+    silent one. A scatter-gathered
+    reply is forwarded verbatim from the winning peer — it does NOT pass through that
+    peer's Interceptor, so resource-read payloads are not terse-compressed (reads
+    aren't the compression target, and diffing a payload picked non-deterministically
+    across peers would be incorrect anyway).
+  - Any OTHER client method that still carries an id (e.g. `completion/complete`,
+    `logging/setLevel`) is forwarded to peer 0 ONLY, logged to stderr unconditionally
+    (not gated behind --debug — silently dropping N-1 peers' data from the reply is
+    exactly the kind of gap this file promises not to hide); a caller who needs one of
+    those merged can front that server alone. Building bespoke merge logic for every
+    remaining MCP method is disproportionate for a feature the issue calls
+    "ergonomics, modest value".
   - A broadcast (`initialize`/`tools/list`) blocks on every peer up to
     `BROADCAST_TIMEOUT` seconds; a peer that never answers can't wedge it — the reply
     goes out with whatever DID arrive, and the missing peer(s) are logged to stderr.
@@ -71,10 +86,20 @@ PREFIX_SEP = policy_mod.PREFIX_SEP
 # test that waited the real default would need 30+ seconds of real time for no reason).
 BROADCAST_TIMEOUT = 30.0
 
-# Client methods that fan out to every peer and get merged into ONE reply. Anything
-# else that still carries an id (not tools/call, not one of these) falls through to
-# the documented v1 "forward to peer 0 only" path.
-_BROADCAST_METHODS = ("initialize", "tools/list")
+# Client methods whose N peer replies are AGGREGATED into one merged reply (concat the
+# lists / union the capabilities / one primer). Each has a branch in `_merge_broadcast`.
+_AGGREGATE_METHODS = ("initialize", "tools/list", "prompts/list",
+                      "resources/list", "resources/templates/list", "ping")
+# Client methods fanned out to every peer but resolved SCATTER-GATHER: the first peer
+# to return a success `result` wins, the rest are swallowed. Used for by-`uri` reads,
+# whose owning peer can't be known from the request alone the way a prefixed
+# tools/call's / prompts/get's can (a resource `uri` isn't peer-namespaced).
+_SCATTER_METHODS = ("resources/read", "resources/subscribe", "resources/unsubscribe")
+# Everything that fans out through `_broadcast` — aggregate and scatter share the same
+# id-remap/collect/timeout machinery and differ only in `_merge_broadcast`. Anything
+# else that still carries an id (not tools/call, not prompts/get, not one of these)
+# falls through to the documented "forward to peer 0 only" path.
+_BROADCAST_METHODS = _AGGREGATE_METHODS + _SCATTER_METHODS
 
 # Bound on `Router._local_id_map` (broadcast-local id -> broadcast seq). Entries are
 # deliberately NOT popped as soon as a broadcast finishes (a late, post-finish reply
@@ -354,6 +379,13 @@ class Router:
             self._route_call(msg)
             return
 
+        if method == "prompts/get":
+            # Routed by name-prefix exactly like tools/call: the merged prompts/list
+            # advertised each prompt as `<peer>__<name>`, so the client's get carries
+            # that prefix and names the one peer to route to.
+            self._route_prompt_get(msg)
+            return
+
         if method in _BROADCAST_METHODS:
             self._broadcast(msg, method)
             return
@@ -385,17 +417,17 @@ class Router:
                                  "no peer is waiting on it; dropped\n")
             return
 
-        # v1 scope decision (see module docstring): anything else that still carries an
-        # id — resources/list, prompts/list, ping, ... — is NOT worth full broadcast/
-        # merge machinery. Forward to peer 0 only, and say so on stderr (unconditionally
-        # — silently dropping N-1 peers' data from the reply is exactly the kind of gap
-        # this file promises not to hide); a caller who needs more can front that server
-        # alone.
+        # Scope decision (see module docstring): anything else that still carries an id
+        # — completion/complete, logging/setLevel, ... (the list/read/ping methods are
+        # handled above) — is NOT worth bespoke broadcast/merge machinery. Forward to
+        # peer 0 only, and say so on stderr (unconditionally — silently dropping N-1
+        # peers' data from the reply is exactly the kind of gap this file promises not
+        # to hide); a caller who needs more can front that server alone.
         if self.peers:
             sys.stderr.write(
-                f"[terse-multiproxy] {method!r} isn't tools/call or a broadcast "
-                f"method; forwarding to peer 0 ({self.peers[0].name!r}) only "
-                "(v1 scope — see multiproxy.py's module docstring)\n")
+                f"[terse-multiproxy] {method!r} has no broadcast/route handler; "
+                f"forwarding to peer 0 ({self.peers[0].name!r}) only "
+                "(scope — see multiproxy.py's module docstring)\n")
             self._write_peer(0, line)
 
     def _route_call(self, msg: dict) -> None:
@@ -429,27 +461,7 @@ class Router:
                 # tools into one corpus bucket, even though the wire line sent to the
                 # downstream uses the bare name it actually expects.
                 self.peers[idx].inter.note_request(rewritten_line, tool_name=name)
-                if mid is not None:
-                    # Bound the wait — a hung/dead peer must not wedge this call
-                    # forever, matching _broadcast's BROADCAST_TIMEOUT guarantee.
-                    # Registered BEFORE the peer write below (mirroring _broadcast's own
-                    # bookkeeping-then-send order): a peer fast enough to reply before
-                    # this line ran would otherwise race from_peer's pop against this
-                    # registration, leaving an orphaned timer that later fires a
-                    # spurious timeout at a client who already got the real answer.
-                    # Cancel-and-replace any prior timer for this id the same way
-                    # _broadcast's _active_seq handling does, in case a client reuses an
-                    # id (a protocol violation, but one worth failing safe against).
-                    timer = threading.Timer(self.broadcast_timeout,
-                                            self._timeout_routed_call, args=(mid, idx))
-                    timer.daemon = True
-                    with self._pending_lock:
-                        prior = self._routed_timers.pop(mid, None)
-                        if prior is not None:
-                            prior.cancel()
-                        self._routed_timers[mid] = timer
-                    timer.start()
-                self._write_peer(idx, rewritten_line)
+                self._dispatch_routed(idx, rewritten_line, mid)
                 return
 
         # Unknown peer prefix (or no prefix at all) — a legible JSON-RPC error, not a
@@ -462,6 +474,61 @@ class Router:
                               f"'<peer>{PREFIX_SEP}<tool>' for one of: "
                               f"{', '.join(self.by_name)})"}},
                 separators=(",", ":"), ensure_ascii=False))
+
+    def _route_prompt_get(self, msg: dict) -> None:
+        """Route a `prompts/get` to the single peer named by its `<peer>__<prompt>`
+        name prefix — the prompts counterpart to `_route_call`. The merged prompts/list
+        (`_merge_prompts_list`) prefixed every prompt name the same way `_merge_tools_list`
+        prefixes tool names, so a client's get carries the prefix that names the peer.
+        Unlike `_route_call` this does NOT `note_request`: note_request only tracks
+        tools/call (a prompts/get reply is a plain passthrough through the peer's
+        Interceptor), so registering it would be a no-op anyway."""
+        params = msg.get("params") or {}
+        name = params.get("name")
+        mid = msg.get("id")
+        if isinstance(name, str) and PREFIX_SEP in name:
+            peer_name, _, bare = name.partition(PREFIX_SEP)
+            if peer_name in self.by_name:
+                idx = self.by_name[peer_name]
+                rewritten = dict(msg)
+                rewritten["params"] = {**params, "name": bare}
+                rewritten_line = json.dumps(rewritten, separators=(",", ":"),
+                                            ensure_ascii=False)
+                self._dispatch_routed(idx, rewritten_line, mid)
+                return
+        if mid is not None:
+            self._write_client(json.dumps(
+                {"jsonrpc": "2.0", "id": mid, "error": {
+                    "code": -32601,
+                    "message": f"terse-multiproxy: unknown prompt {name!r} (expected "
+                              f"'<peer>{PREFIX_SEP}<prompt>' for one of: "
+                              f"{', '.join(self.by_name)})"}},
+                separators=(",", ":"), ensure_ascii=False))
+
+    def _dispatch_routed(self, idx: int, line: str, mid: Any) -> None:
+        """Send an already-rewritten routed request to peer `idx` and, if it carries an
+        id, arm the dead-peer timeout for it — shared by `_route_call` (tools/call) and
+        `_route_prompt_get` (prompts/get)."""
+        if mid is not None:
+            # Bound the wait — a hung/dead peer must not wedge this call forever,
+            # matching _broadcast's BROADCAST_TIMEOUT guarantee. Registered BEFORE the
+            # peer write below (mirroring _broadcast's own bookkeeping-then-send order):
+            # a peer fast enough to reply before this line ran would otherwise race
+            # from_peer's pop against this registration, leaving an orphaned timer that
+            # later fires a spurious timeout at a client who already got the real answer.
+            # Cancel-and-replace any prior timer for this id the same way _broadcast's
+            # _active_seq handling does, in case a client reuses an id (a protocol
+            # violation, but one worth failing safe against).
+            timer = threading.Timer(self.broadcast_timeout,
+                                    self._timeout_routed_call, args=(mid, idx))
+            timer.daemon = True
+            with self._pending_lock:
+                prior = self._routed_timers.pop(mid, None)
+                if prior is not None:
+                    prior.cancel()
+                self._routed_timers[mid] = timer
+            timer.start()
+        self._write_peer(idx, line)
 
     def _broadcast(self, msg: dict, kind: str) -> None:
         if not self.peers:
@@ -723,13 +790,33 @@ class Router:
             # so a reply that arrives after this point still resolves to "seq not in
             # _pending" and is safely swallowed instead of leaking to the client.
 
-        merged = (self._merge_initialize(pb) if pb.kind == "initialize"
-                 else self._merge_tools_list(pb))
+        body = self._merge_broadcast(pb)
         self._write_client(json.dumps(
-            {"jsonrpc": "2.0", "id": pb.client_id, "result": merged},
+            {"jsonrpc": "2.0", "id": pb.client_id, **body},
             separators=(",", ":"), ensure_ascii=False))
 
     # ---------- broadcast merges ----------
+
+    def _merge_broadcast(self, pb: _PendingBroadcast) -> dict:
+        """Turn a finished broadcast's collected peer parts into the JSON-RPC reply BODY
+        — a `{"result": ...}` for the aggregate methods, or `{"result"|"error": ...}`
+        for a scatter-gather one (first success wins; if every peer errored, the first
+        error is surfaced). Returned as the reply's result-or-error half so
+        `_finish_broadcast` can splice in the client id and jsonrpc envelope."""
+        kind = pb.kind
+        if kind == "initialize":
+            return {"result": self._merge_initialize(pb)}
+        if kind == "tools/list":
+            return {"result": self._merge_tools_list(pb)}
+        if kind == "prompts/list":
+            return {"result": self._merge_prompts_list(pb)}
+        if kind == "resources/list":
+            return {"result": self._merge_list(pb, "resources")}
+        if kind == "resources/templates/list":
+            return {"result": self._merge_list(pb, "resourceTemplates")}
+        if kind == "ping":
+            return {"result": {}}  # MCP ping's result is an empty object
+        return self._scatter_first_success(pb)  # _SCATTER_METHODS
 
     def _merge_tools_list(self, pb: _PendingBroadcast) -> dict:
         """Concat every peer's tools with `{peer}__` prefixes; append the single
@@ -790,6 +877,55 @@ class Router:
             "serverInfo": {"name": "terse", "version": __version__},
             "instructions": instructions,
         }
+
+    def _merge_prompts_list(self, pb: _PendingBroadcast) -> dict:
+        """Concat every peer's prompts with `{peer}__` name prefixes — the prompts
+        analogue of `_merge_tools_list` (a prompt is invoked by `prompts/get` name, so
+        prefixing lets `_route_prompt_get` route it back to the owning peer exactly like
+        a prefixed tools/call). Pagination cursors are dropped, same as tools/list."""
+        prompts: list[dict] = []
+        for i, peer in enumerate(self.peers):
+            result = pb.parts.get(i, {}).get("result")
+            peer_prompts = result.get("prompts") if isinstance(result, dict) else None
+            if not isinstance(peer_prompts, list):
+                continue  # peer errored, never answered, or replied oddly — skip it
+            for p in peer_prompts:
+                if not (isinstance(p, dict) and isinstance(p.get("name"), str)):
+                    continue
+                prompts.append({**p, "name": f"{peer.name}{PREFIX_SEP}{p['name']}"})
+        return {"prompts": prompts}
+
+    def _merge_list(self, pb: _PendingBroadcast, key: str) -> dict:
+        """Concat every peer's list under `key` (`resources` / `resourceTemplates`).
+        Unlike tools/prompts these are NOT prefixed: a resource is addressed by its own
+        `uri`, which has scheme structure a `{peer}__` prefix would corrupt — so
+        `resources/read` is fanned out scatter-gather (see `_scatter_first_success`)
+        rather than routed by prefix. Pagination cursors are dropped, same as
+        tools/list; a config-index iteration order keeps merged output deterministic."""
+        items: list[dict] = []
+        for i in range(len(self.peers)):
+            result = pb.parts.get(i, {}).get("result")
+            peer_items = result.get(key) if isinstance(result, dict) else None
+            if isinstance(peer_items, list):
+                items.extend(it for it in peer_items if isinstance(it, dict))
+        return {key: items}
+
+    def _scatter_first_success(self, pb: _PendingBroadcast) -> dict:
+        """Resolve a scatter-gathered method (`resources/read` & friends): return the
+        first peer reply carrying a `result` (in arrival order — `pb.parts` is insertion-
+        ordered by real arrival, see `_merge_initialize`), forwarded verbatim. A peer
+        that doesn't own the `uri` answers with an `error`, which is discarded; only if
+        EVERY peer errored (or none answered) is an error surfaced — the first peer's
+        error if there is one, else a synthesized timeout-style error."""
+        for part in pb.parts.values():
+            if isinstance(part, dict) and "result" in part:
+                return {"result": part["result"]}
+        for part in pb.parts.values():
+            if isinstance(part, dict) and isinstance(part.get("error"), dict):
+                return {"error": part["error"]}
+        return {"error": {
+            "code": -32001,
+            "message": f"terse-multiproxy: no peer answered {pb.kind!r}"}}
 
 
 def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy, *,
