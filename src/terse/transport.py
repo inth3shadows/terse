@@ -19,7 +19,16 @@ import queue
 import subprocess
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from typing import Any, Iterator, Optional, Protocol, TextIO
+
+# The only downstream URL schemes terse will dial. `urllib.request.urlopen` also
+# honors `file://`, `ftp://`, `data:` and more — so an unrestricted scheme turns a
+# config-supplied "url" into a local-file read (`file:///home/you/.ssh/id_rsa`) or an
+# SSRF primitive (`http://169.254.169.254/…`) whose response is fed straight into the
+# model's context. A downstream target can come from an untrusted, repo-committed
+# project-scoped `.mcp.json` (see install_mcp.py), so this is not purely operator input.
+_ALLOWED_URL_SCHEMES = ("http", "https")
 
 
 class Transport(Protocol):
@@ -199,6 +208,16 @@ class HttpTransport:
     a reply rather than silence."""
 
     def __init__(self, url: str, headers: Optional[dict[str, str]] = None, timeout: int = 60):
+        scheme = urlsplit(url).scheme.lower()
+        if scheme not in _ALLOWED_URL_SCHEMES:
+            # Raised at construction (before any I/O), so build_transport's callers
+            # surface it as a clean config error (proxy exit 2 / multiproxy bad-peer),
+            # not an uncaught traceback or, worse, a silent file read.
+            raise ValueError(
+                f"terse: downstream URL scheme {scheme or '(none)'!r} is not allowed — "
+                f"only {'/'.join(_ALLOWED_URL_SCHEMES)} (urllib would otherwise honor "
+                "file://, ftp://, data:, turning a config-supplied URL into a local-file "
+                "read or SSRF vector)")
         self.url = url
         self.headers = dict(headers or {})
         self.timeout = timeout

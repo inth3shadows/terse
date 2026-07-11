@@ -48,6 +48,12 @@ from ._secure_io import write_restricted
 STASH_NAME = ".terse-mcp-stash.json"
 VALID_SCOPES = ("user", "project", "local")
 
+# How many timestamped config backups to retain per config file. Each backup is a full
+# copy of the config, whose MCP `env` blocks can hold API keys — so an unbounded pile of
+# them is long-lived secret sprawl (a rotated key lingers in old backups forever). Keep a
+# short rollback window; prune the rest. 0 would disable pruning.
+_MAX_BACKUPS = 5
+
 
 # --------------------------------------------------------------------------- IO
 def config_path() -> Path:
@@ -234,9 +240,27 @@ def _write_json(path: Path, obj: dict, *, trailing_newline: bool = True) -> None
     write_restricted(path, text + ("\n" if trailing_newline else ""))
 
 
+def _prune_backups(cfg: Path, keep: int = _MAX_BACKUPS) -> None:
+    """Keep only the `keep` most-recent `<cfg>.bak-*` files, deleting older ones — they
+    hold copies of the config's secrets, so they must not accumulate without bound. No-op
+    when `keep <= 0` (pruning disabled). Ordered by mtime so it's robust to the epoch-
+    timestamp digit width changing; a same-second overwrite just leaves fewer to prune.
+    Best-effort: a file that vanishes or can't be unlinked (race, permissions) is skipped,
+    never fatal to the install/uninstall that triggered the backup."""
+    if keep <= 0:
+        return
+    backups = sorted(cfg.parent.glob(f"{cfg.name}.bak-*"), key=lambda p: p.stat().st_mtime)
+    for old in backups[:-keep]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
 def _backup(cfg: Path) -> Path:
     bak = cfg.with_name(f"{cfg.name}.bak-{int(time.time())}")
     write_restricted(bak, cfg.read_text(encoding="utf-8"))  # backup mirrors cfg's secrets
+    _prune_backups(cfg)
     return bak
 
 

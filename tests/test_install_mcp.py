@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -180,6 +181,54 @@ def test_do_install_unknown_server_raises_with_available(tmp_path, monkeypatch):
     with pytest.raises(ValueError) as e:
         im.do_install(["nope"], str(policy), cfg=cfg)
     assert "runecho" in str(e.value)  # lists available
+
+
+def test_prune_backups_keeps_only_most_recent(tmp_path):
+    # Config backups hold copies of the config's secrets (MCP `env` blocks), so they must
+    # not accumulate without bound — keep a short rollback window, delete the rest.
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text("{}")
+    made = []
+    for i in range(im._MAX_BACKUPS + 3):
+        b = cfg.with_name(f"{cfg.name}.bak-{1000 + i}")
+        b.write_text(f"backup {i}")
+        os.utime(b, (1000 + i, 1000 + i))  # deterministic oldest->newest mtimes
+        made.append(b)
+
+    im._prune_backups(cfg)
+
+    remaining = sorted(cfg.parent.glob(f"{cfg.name}.bak-*"))
+    assert len(remaining) == im._MAX_BACKUPS          # window enforced
+    assert not made[0].exists() and not made[2].exists()  # 3 oldest pruned
+    assert made[-1].exists() and made[3].exists()     # newest _MAX_BACKUPS survive
+    assert cfg.read_text() == "{}"                    # the config itself is never touched
+
+
+def test_prune_backups_disabled_when_keep_zero(tmp_path):
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text("{}")
+    for i in range(4):
+        cfg.with_name(f"{cfg.name}.bak-{2000 + i}").write_text("x")
+    im._prune_backups(cfg, keep=0)  # 0 = pruning off
+    assert len(list(cfg.parent.glob(f"{cfg.name}.bak-*"))) == 4
+
+
+def test_do_install_prunes_old_backups(tmp_path, monkeypatch):
+    # Integration: a real install triggers _backup, which prunes down to the window even
+    # when a pile of stale backups already exists.
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+    for i in range(im._MAX_BACKUPS + 2):  # more stale backups than the window allows
+        b = cfg.with_name(f"{cfg.name}.bak-{500 + i}")
+        b.write_text("stale")
+        os.utime(b, (500 + i, 500 + i))  # all older than the one do_install will make
+
+    im.do_install(["runecho"], str(policy), cfg=cfg)
+
+    assert len(list(cfg.parent.glob(f"{cfg.name}.bak-*"))) == im._MAX_BACKUPS
 
 
 def test_dry_run_does_not_write(tmp_path, monkeypatch):
