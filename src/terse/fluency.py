@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import re
 import urllib.request
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -41,6 +42,10 @@ from . import text_diff
 from .capture import LONG_TEXT, OTHER, classify_shape, extract_records
 from .tokenize import count_cl100k
 from .transforms import compress, compress_structure, dict_encode, diff_wire, minify
+
+# Loopback hosts where cleartext http is safe (never leaves the machine), so a Bearer
+# key over http to one of these is fine — a local LiteLLM/CCR gateway is a common setup.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 # An answerer takes (system_prompt, user_prompt) and returns the model's reply text.
 # Empty system_prompt means "no system message".
@@ -639,6 +644,14 @@ def openai_answerer(base_url: str, api_key: str, model: str,
     """OpenAI-compatible /chat/completions answerer over stdlib urllib. Covers the
     broker pool (OpenRouter et al.) without an SDK dependency. temperature 0 for
     reproducibility."""
+    parts = urlsplit(base_url)
+    if api_key and parts.scheme == "http" and (parts.hostname or "").lower() not in _LOOPBACK_HOSTS:
+        # An http:// base URL sends `Authorization: Bearer <key>` in cleartext — refuse
+        # it for a non-loopback host rather than silently leak the key on the wire. A
+        # loopback host (localhost LiteLLM/CCR) never leaves the machine, so it's allowed.
+        raise ValueError(
+            f"terse fluency: refusing to send an API key over cleartext http to "
+            f"{parts.hostname!r} — use https, or a loopback host for a local gateway")
     url = base_url.rstrip("/") + "/chat/completions"
 
     def ask(system: str, user: str) -> str:

@@ -4,8 +4,10 @@ version = "0.0.1"
 description = "Lossless-first compression layer for AI-agent tool outputs — byte-faithful on fields you mark critical, configurable lossy reduction only where you opt in."
 requires-python = ">=3.11"
 dependencies = [
-    # tiktoken: cl100k_base token counts for headroom-eval parity. Pinned by uv.lock.
-    "tiktoken",
+    # tiktoken: cl100k_base token counts for headroom-eval parity. uv.lock pins the exact
+    # version for this repo; the floor here gives a lockfile-less `pip install terse` a
+    # sane lower bound instead of resolving to an arbitrarily old release.
+    "tiktoken>=0.7",
 ]
 
 [project.optional-dependencies]
