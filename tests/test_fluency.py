@@ -5,6 +5,8 @@ offline with no network or key; live model backends are thin and not unit-tested
 
 from __future__ import annotations
 
+import pytest
+
 from terse import fluency
 
 # A record-shaped payload that exercises both stressed transforms:
@@ -400,3 +402,26 @@ def test_build_diff_report_empty_hint_preserves_two_line_wrap():
     from terse.report import build_diff_report
     report = build_diff_report({})
     assert "Capture a tool\n2+ times (an agent loop)" in report
+
+
+# --- openai_answerer TLS guard: never send an API key over cleartext http to a
+#     remote host (a local loopback gateway over http is fine — never leaves the box) ---
+
+def test_openai_answerer_refuses_cleartext_key_to_remote_host():
+    with pytest.raises(ValueError, match="cleartext http"):
+        fluency.openai_answerer("http://api.example.com/v1", "sk-secret", "gpt-x")
+
+
+def test_openai_answerer_allows_http_to_loopback_with_key():
+    # a local LiteLLM/CCR gateway over loopback http carries no wire-exposure risk
+    assert callable(fluency.openai_answerer("http://127.0.0.1:3456/v1", "sk-secret", "gpt-x"))
+    assert callable(fluency.openai_answerer("http://localhost:1234/v1", "sk-secret", "gpt-x"))
+
+
+def test_openai_answerer_allows_https_with_key():
+    assert callable(fluency.openai_answerer("https://api.example.com/v1", "sk-secret", "gpt-x"))
+
+
+def test_openai_answerer_allows_http_without_key():
+    # no key set -> nothing secret to leak, so plain http is permitted
+    assert callable(fluency.openai_answerer("http://api.example.com/v1", "", "gpt-x"))

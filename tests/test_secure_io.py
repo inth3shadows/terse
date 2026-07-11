@@ -125,3 +125,32 @@ def test_append_restricted_reraises_on_fchmod_failure_without_masking(tmp_path, 
     with pytest.raises(OSError, match="boom"):
         sio.append_restricted(path, "hello")
     assert path.read_text(encoding="utf-8") == ""
+
+
+# --- symlink refusal (O_NOFOLLOW): a secret-bearing write must not be redirected
+#     through a pre-planted symlink onto an attacker-chosen target ---
+
+_needs_nofollow = pytest.mark.skipif(
+    not hasattr(os, "O_NOFOLLOW"), reason="platform has no O_NOFOLLOW")
+
+
+@_needs_nofollow
+def test_write_restricted_refuses_to_follow_a_symlink(tmp_path):
+    target = tmp_path / "target.txt"
+    target.write_text("original", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    link.symlink_to(target)
+    with pytest.raises(OSError):
+        sio.write_restricted(link, "pwned")
+    assert target.read_text(encoding="utf-8") == "original"  # target never truncated/written
+
+
+@_needs_nofollow
+def test_append_restricted_refuses_to_follow_a_symlink(tmp_path):
+    target = tmp_path / "target.txt"
+    target.write_text("original", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    link.symlink_to(target)
+    with pytest.raises(OSError):
+        sio.append_restricted(link, "pwned")
+    assert target.read_text(encoding="utf-8") == "original"
