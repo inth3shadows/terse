@@ -5,6 +5,8 @@ offline with no network or key; live model backends are thin and not unit-tested
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from terse import fluency
@@ -80,6 +82,90 @@ def test_no_questions_for_non_record_payloads():
     assert fluency.gen_questions({"just": "an object"}) == []
     assert fluency.gen_questions([1, 2, 3]) == []
     assert fluency.gen_questions("a string") == []
+
+
+# A runecho.structure-shaped payload (#71): `files` is a dict-map of file records, each
+# holding a NON-UNIFORM `symbols` list — imports carry only name/kind, functions also carry
+# line/hash. terse's strict identical-keyset extractor skips this, so gen_questions must
+# fall through to _nested_questions, scoping to the first file and its intersection columns.
+STRUCTURE = {
+    "detail": "symbols",
+    "file_count": 2,
+    "files": {
+        "a/first.py": {
+            "hash": "h0",
+            "symbols": [
+                {"name": "alpha", "kind": "function", "line": 10, "hash": "x1"},
+                {"name": "beta", "kind": "function", "line": 20, "hash": "x2"},
+                {"name": "os", "kind": "import"},  # non-uniform: no line/hash
+            ],
+        },
+        "b/second.py": {
+            "hash": "h1",
+            "symbols": [
+                {"name": "gamma", "kind": "class", "line": 5, "hash": "y1"},
+                {"name": "delta", "kind": "function", "line": 8, "hash": "y2"},
+            ],
+        },
+    },
+    "repo": "demo",
+}
+
+
+def test_structure_uses_group_scoped_nested_questions():
+    # Even though b/second.py's symbols ARE uniform (so extract_records finds a list),
+    # a dict-map payload must use GROUP-SCOPED questions — an unscoped count would be
+    # ambiguous across files. Group-scoping wins over the uniform extractor (#71).
+    qs = {q.qtype: q for q in fluency.gen_questions(STRUCTURE)}
+    assert set(qs) == {"count", "enumerate", "lookup"}
+    # scoped to the first file (map order), its 3 non-uniform symbols
+    assert qs["count"].expected == 3
+    assert qs["enumerate"].expected == ["alpha", "beta", "os"]  # 'name' = most-distinct id col
+    assert qs["lookup"].expected == "function"                  # alpha's kind
+    # no aggregate: 'line' is absent from the import symbol, so it isn't an intersection col
+    assert "aggregate" not in qs
+    for q in qs.values():
+        assert 'files["a/first.py"]' in q.prompt
+
+
+def test_nested_group_uses_intersection_columns_only():
+    grp = fluency._nested_record_group(STRUCTURE)
+    assert grp is not None
+    label, records, cols = grp
+    assert label == 'files["a/first.py"]'
+    assert cols == ["kind", "name"]  # sorted intersection; line/hash excluded (non-uniform)
+    assert len(records) == 3
+
+
+def test_nested_questions_are_self_consistent():
+    for q in fluency.gen_questions(STRUCTURE):
+        reply = q.expected if isinstance(q.expected, str) else json.dumps(q.expected)
+        assert fluency.score(q.qtype, q.expected, reply)
+
+
+def test_nested_aggregate_appears_when_a_numeric_col_is_shared():
+    # every symbol carries `line` (only `hash` varies) -> line is an intersection col -> aggregate
+    obj = {"files": {"f": {"symbols": [
+        {"name": "a", "kind": "fn", "line": 3, "hash": "h"},
+        {"name": "b", "kind": "fn", "line": 9},          # no hash -> still non-uniform
+        {"name": "c", "kind": "var", "line": 1, "hash": "h2"}]}}}
+    from terse.capture import extract_records
+    assert extract_records(obj) is None
+    qs = {q.qtype: q for q in fluency.gen_questions(obj)}
+    assert qs["aggregate"].expected == 9
+
+
+def test_run_diff_payload_now_exercises_structure_pairs():
+    # the #71 payoff: a structure diff yields the same questions in both forms, so
+    # `terse fluency --diff` can finally measure structure comprehension.
+    curr = json.loads(json.dumps(STRUCTURE))
+    curr["files"]["a/first.py"]["symbols"].append(
+        {"name": "epsilon", "kind": "function", "line": 40, "hash": "x9"})
+    rows = fluency.run_diff_payload(STRUCTURE, curr, lambda s, u: "",
+                                    tool="runecho.structure", trials=1)
+    assert rows  # non-empty: structure now generates questions -> diff is testable
+    assert {r["qid"] for r in rows} >= {"count", "enumerate"}
+    assert all("terse_ok" in r and "diff_ok" in r for r in rows)
 
 
 def test_score_count_and_aggregate_tolerate_prose_and_check_value():

@@ -41,7 +41,7 @@ from typing import Any, Callable
 from . import text_diff
 from .capture import LONG_TEXT, OTHER, classify_shape, extract_records
 from .tokenize import count_cl100k
-from .transforms import compress, compress_structure, dict_encode, diff_wire, minify
+from .transforms import compress, compress_structure, dict_encode, diff_wire, minify, _uniform_dict_list
 
 # Loopback hosts where cleartext http is safe (never leaves the machine), so a Bearer
 # key over http to one of these is fine — a local LiteLLM/CCR gateway is a common setup.
@@ -144,12 +144,118 @@ def _pick_numeric_col(records: list[dict], cols: list[str], exclude: str | None 
     return fallback
 
 
+def _intersection_cols(records: list[dict]) -> list[str]:
+    """Keys present in EVERY record, sorted for determinism. For a non-uniform record
+    list (e.g. structure symbols, where only some carry line/hash) these are the only
+    columns safe to index across all records."""
+    common = set(records[0].keys())
+    for r in records[1:]:
+        common &= set(r.keys())
+    return sorted(common)
+
+
+def _nested_record_group(obj: Any) -> tuple[str, list[dict], list[str]] | None:
+    """Reach a record list that terse's STRICT uniform extractor skips: a dict-map of
+    parent records each holding a child list of dicts (runecho.structure's
+    `files{path: {symbols: [...]}}`), where the child list is non-uniform (symbol kinds
+    carry different keys). Returns (label, records, common_cols) deterministically — first
+    match in source order, first parent in map order — else None.
+
+    Fluency-local by design: it does NOT touch `extract_records`/`_uniform_dict_list`,
+    which the tabularizer, probe, and drop-path logic (#47) share — widening their notion
+    of a record would change what the codec folds. This only widens what the fluency
+    harness can ASK about, so `proxy --diff` gets exercised on structure-shaped output
+    (issue #71).
+
+    Preferred OVER the uniform extractor for the dict-map case: an unscoped "how many
+    records" is ambiguous when the payload holds many groups, and `extract_records` would
+    otherwise return whichever group's child list happens to be uniform — a valid list but
+    the wrong (unlabelled) question. So group-scoped questions win when a dict-map is
+    present, regardless of any single group's uniformity."""
+    if not isinstance(obj, dict):
+        return None
+
+    def _records_of(lst: Any) -> list[str] | None:
+        if not isinstance(lst, list) or len(lst) < 2:
+            return None
+        if not all(isinstance(x, dict) for x in lst):
+            return None
+        return _intersection_cols(lst) or None
+
+    for k, v in obj.items():
+        # dict-map of parent records -> the first parent (map order) with a child record list
+        if isinstance(v, dict) and v and all(isinstance(pv, dict) for pv in v.values()):
+            for pkey, parent in v.items():
+                for ck, cv in parent.items():
+                    if _records_of(cv):
+                        return f"{k}[{json.dumps(pkey, ensure_ascii=False)}]", cv, _intersection_cols(cv)
+        # a NON-uniform top-level list of dicts (uniform ones are extract_records' domain)
+        if isinstance(v, list) and _records_of(v) and not _uniform_dict_list(v):
+            return k, v, _intersection_cols(v)
+    return None
+
+
+def _nested_questions(obj: Any) -> list[Question]:
+    """Questions for structure-shaped payloads (dict-map of records with non-uniform child
+    lists) that `gen_questions`' uniform path can't reach — count/enumerate/lookup over the
+    columns shared by every record, plus aggregate if a shared numeric column exists. Same
+    deterministic, programmatically-checkable contract as `gen_questions` (issue #71)."""
+    grp = _nested_record_group(obj)
+    if grp is None:
+        return []
+    label, records, cols = grp
+    n = len(records)
+    qs: list[Question] = [Question(
+        "count", "count", "nested",
+        f"How many records are listed under {label}?",
+        "Reply with only the integer count.", n)]
+
+    # identifier: the shared string column with the most distinct values (most id-like);
+    # deterministic — ties resolve to sorted-column order via max()'s stable first-max.
+    str_cols = [c for c in cols if all(isinstance(r[c], str) for r in records)]
+    idcol = max(str_cols, key=lambda c: len({r[c] for r in records})) if str_cols else None
+    if idcol is not None:
+        qs.append(Question(
+            "enumerate", "enumerate", "nested",
+            f"List the {idcol!r} of every record under {label}, in order.",
+            "Reply with a JSON array of the values and nothing else.",
+            [r[idcol] for r in records]))
+        tgt = next((c for c in cols if c != idcol), None)
+        if tgt is not None:
+            vals = [r[idcol] for r in records]
+            ri = next((i for i in range(n) if vals.count(vals[i]) == 1), n // 2)
+            qs.append(Question(
+                "lookup", "lookup", "nested",
+                f"Under {label}, for the record whose {idcol!r} is "
+                f"{json.dumps(records[ri][idcol], ensure_ascii=False)}, "
+                f"what is the value of {tgt!r}?",
+                "Reply with only the value, with no quotes and no extra words.",
+                records[ri][tgt]))
+
+    numcol = next((c for c in cols if all(_is_number(r[c]) for r in records)), None)
+    if numcol is not None:
+        qs.append(Question(
+            "aggregate", "aggregate", "nested",
+            f"What is the maximum value of {numcol!r} across the records under {label}?",
+            "Reply with only the number.",
+            max(r[numcol] for r in records)))
+    return qs
+
+
 def gen_questions(obj: Any) -> list[Question]:
     """Generate deterministic, programmatically-checkable questions for a payload.
 
-    Only record-shaped payloads (what terse transforms) yield questions; everything
-    else returns []. Selection is fully deterministic so a re-run is reproducible.
+    Uniform record-shaped payloads (what terse tabularizes) yield questions directly;
+    payloads whose records the strict extractor skips (structure's dict-map of non-uniform
+    symbol lists) fall through to `_nested_questions` (#71); everything else returns [].
+    Selection is fully deterministic so a re-run is reproducible.
     """
+    # Structure-shaped payloads (a dict-map of records) need GROUP-SCOPED questions; prefer
+    # them over the uniform extractor, which would otherwise emit an unscoped, ambiguous
+    # question from whichever group's child list happens to be uniform (#71).
+    nested = _nested_questions(obj)
+    if nested:
+        return nested
     records = extract_records(obj)
     if not records:
         return []
