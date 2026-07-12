@@ -24,9 +24,9 @@ Method (the honesty bar, principle #24):
     cross-tokenizer divergence rather than averaging it away).
 
 The answerer is a pluggable `(system, user) -> reply` callable, so the pure core
-(question generation + scoring) runs offline with no network or key. Live backends
-(`openai_answerer` over stdlib urllib for the broker pool; `anthropic_answerer` via
-the existing optional extra for the real consumer) add zero new dependencies.
+(question generation + scoring) runs offline with no network or key. The live backend
+(`openai_answerer` over stdlib urllib) reaches any OpenAI-compatible endpoint — the
+broker pool or a loopback gateway — and adds zero new dependencies.
 """
 
 from __future__ import annotations
@@ -671,25 +671,5 @@ def openai_answerer(base_url: str, api_key: str, model: str,
         if "choices" not in data:
             raise RuntimeError(f"{model}: no choices in response: {data.get('error', data)}")
         return data["choices"][0]["message"]["content"] or ""
-
-    return ask
-
-
-def anthropic_answerer(model: str = "claude-opus-4-8", max_tokens: int = 1024) -> Answerer:
-    """The real-consumer answerer via the optional `anthropic` extra. Raises at
-    construction if the extra/key is absent, so the CLI can fall back cleanly."""
-    import anthropic
-
-    client = anthropic.Anthropic()
-
-    def ask(system: str, user: str) -> str:
-        kwargs: dict[str, Any] = {
-            "model": model, "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": user}],
-        }
-        if system:
-            kwargs["system"] = system
-        resp = client.messages.create(**kwargs)
-        return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
 
     return ask

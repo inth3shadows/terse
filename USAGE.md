@@ -294,7 +294,7 @@ uv run terse fluency --corpus corpus-stress
 # 2b. with models (one OpenAI-compatible endpoint, e.g. OpenRouter):
 TERSE_FLUENCY_BASE_URL=https://openrouter.ai/api/v1 \
 TERSE_FLUENCY_API_KEY=sk-... \
-TERSE_FLUENCY_MODELS=google/gemini-2.5-flash,anthropic/claude-haiku-4.5 \
+TERSE_FLUENCY_MODELS=google/gemini-2.5-flash,deepseek/deepseek-chat \
   uv run terse fluency --corpus corpus-stress
 
 # 2c. tighten the verdict: repeat each question N times for a confidence interval
@@ -447,7 +447,7 @@ it never has to "fetch" anything that was removed.
 Because it was measured to only pay off on some. Compressing already-tidy output wastes
 effort, so the policy turns it off there. You control this in the policy file.
 
-**Do I need an Anthropic or OpenAI key?**
-No. Everything runs locally. A key is only needed for one optional command that
-double-checks token counts against Anthropic directly, and you never need it for normal
-use.
+**Do I need an API key?**
+No. Everything runs locally. A key is only needed for the optional live fluency eval
+(`fluency --diff`/`--drop-eval`), which calls any OpenAI-compatible endpoint you point
+it at (broker pool or a loopback gateway). You never need it for normal use.

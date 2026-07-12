@@ -1,8 +1,8 @@
-"""Token counting: cl100k (headroom-eval parity) + Anthropic count_tokens (truth).
+"""Token counting: cl100k (headroom-eval parity) + o200k (cross-tokenizer invariance).
 
-Both are optional at import time so the spike can run on whatever is installed:
-each counter returns None when its backend is unavailable, and the report shows
-the gap explicitly rather than silently substituting one for the other.
+Counters are optional at import time so the spike can run on whatever is installed:
+each returns None when tiktoken is unavailable, and the report shows the gap
+explicitly rather than silently substituting one for the other.
 """
 
 from __future__ import annotations
@@ -41,22 +41,3 @@ def encode_cl100k(text: str) -> Optional[list[int]]:
     about token-level overlap/redundancy, not just counts."""
     enc = _enc(CL100K)
     return enc.encode(text) if enc is not None else None
-
-
-def count_anthropic(text: str, model: str = "claude-opus-4-8") -> Optional[int]:
-    """Ground-truth token count for the real consumer, or None if unavailable.
-
-    Requires the `anthropic` extra and credentials. Network call; the spike
-    batches these. Left lazy + best-effort so a no-key environment still runs.
-    """
-    try:
-        import anthropic
-
-        client = anthropic.Anthropic()
-        resp = client.messages.count_tokens(
-            model=model,
-            messages=[{"role": "user", "content": text}],
-        )
-        return resp.input_tokens
-    except Exception:
-        return None

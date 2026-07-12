@@ -10,11 +10,6 @@ dependencies = [
     "tiktoken>=0.7",
 ]
 
-[project.optional-dependencies]
-# Anthropic count_tokens = ground-truth token count for the real consumer.
-# Optional so the spike runs without an API key / network; tokenize.py imports it lazily.
-anthropic = ["anthropic"]
-
 [project.scripts]
 terse = "terse.cli:main"
 

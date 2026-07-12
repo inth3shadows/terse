@@ -23,11 +23,11 @@ from typing import Any, Optional
 
 from . import transforms
 from .capture import classify_shape
-from .tokenize import CL100K, O200K, count, count_anthropic, count_cl100k
+from .tokenize import CL100K, O200K, count, count_cl100k
 
 
-def measure_payload(raw: str, use_anthropic: bool = False) -> dict[str, Any]:
-    """Measure one raw payload: shape, gate, and per-tier cl100k (+ optional Anthropic)."""
+def measure_payload(raw: str) -> dict[str, Any]:
+    """Measure one raw payload: shape, gate, and per-tier cl100k token deltas."""
     shape = classify_shape(raw)
     try:
         obj = json.loads(raw)
@@ -42,9 +42,6 @@ def measure_payload(raw: str, use_anthropic: bool = False) -> dict[str, Any]:
             "cl100k": {"raw": raw_tok, "minified": raw_tok, "tabular": raw_tok, "compressed": raw_tok},
             "saved_cl100k": {"minify": 0, "tabularize": 0, "dictionary": 0, "tier_total": 0},
         }
-        if use_anthropic:
-            a = count_anthropic(raw)
-            row["anthropic"] = {"raw": a, "compressed": a, "saved": 0}
         return row
 
     minified = transforms.minify(obj)
@@ -72,10 +69,6 @@ def measure_payload(raw: str, use_anthropic: bool = False) -> dict[str, Any]:
             "tier_total": _saved(raw_tok, cmp_tok),
         },
     }
-    if use_anthropic:
-        a_raw = count_anthropic(raw)
-        a_cmp = count_anthropic(compressed)
-        row["anthropic"] = {"raw": a_raw, "compressed": a_cmp, "saved": _saved(a_raw, a_cmp)}
     return row
 
 
@@ -102,13 +95,11 @@ def cross_tokenizer_savings(envelopes: list[dict[str, Any]]) -> list[dict[str, A
     return out
 
 
-def measure_corpus(
-    envelopes: list[dict[str, Any]], use_anthropic: bool = False
-) -> list[dict[str, Any]]:
+def measure_corpus(envelopes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Measure every captured payload; attach tool/sha for traceability in the report."""
     rows = []
     for env in envelopes:
-        row = measure_payload(env["raw"], use_anthropic=use_anthropic)
+        row = measure_payload(env["raw"])
         row["tool"] = env.get("tool", "?")
         row["sha"] = env.get("sha", "?")
         row["bytes"] = env.get("bytes", len(env["raw"]))
