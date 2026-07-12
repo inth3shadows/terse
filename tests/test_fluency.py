@@ -143,6 +143,25 @@ def test_nested_questions_are_self_consistent():
         assert fluency.score(q.qtype, q.expected, reply)
 
 
+def test_nested_lookup_skipped_when_no_column_uniquely_addresses_a_record():
+    # Both `name` and `kind` repeat within the file, so no column uniquely identifies a
+    # record — a lookup prompt would be ambiguous and a truthful answer about a different
+    # matching record would score as a false-negative regression. lookup must be OMITTED;
+    # count + enumerate (which tolerate duplicates) still fire.
+    obj = {"files": {"x.py": {"symbols": [
+        {"name": "X", "kind": "function"},
+        {"name": "Y", "kind": "function"},
+        {"name": "X", "kind": "class"},
+        {"name": "Y", "kind": "class"}]}}}
+    qs = {q.qtype: q for q in fluency.gen_questions(obj)}
+    assert "lookup" not in qs
+    assert qs["count"].expected == 4
+    assert "enumerate" in qs
+    # the enumerate ground truth stays exactly checkable even with repeated values
+    assert fluency.score("enumerate", qs["enumerate"].expected,
+                         json.dumps(qs["enumerate"].expected))
+
+
 def test_nested_aggregate_appears_when_a_numeric_col_is_shared():
     # every symbol carries `line` (only `hash` varies) -> line is an intersection col -> aggregate
     obj = {"files": {"f": {"symbols": [

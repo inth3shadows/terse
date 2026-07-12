@@ -210,20 +210,27 @@ def _nested_questions(obj: Any) -> list[Question]:
         f"How many records are listed under {label}?",
         "Reply with only the integer count.", n)]
 
-    # identifier: the shared string column with the most distinct values (most id-like);
-    # deterministic — ties resolve to sorted-column order via max()'s stable first-max.
+    # enumerate lists a column in order — duplicates are fine (order/count is the check).
+    # Use the most-distinct string column (most informative); deterministic — ties resolve
+    # to sorted-column order via max()'s stable first-max.
     str_cols = [c for c in cols if all(isinstance(r[c], str) for r in records)]
-    idcol = max(str_cols, key=lambda c: len({r[c] for r in records})) if str_cols else None
-    if idcol is not None:
+    if str_cols:
+        enum_col = max(str_cols, key=lambda c: len({r[c] for r in records}))
         qs.append(Question(
             "enumerate", "enumerate", "nested",
-            f"List the {idcol!r} of every record under {label}, in order.",
+            f"List the {enum_col!r} of every record under {label}, in order.",
             "Reply with a JSON array of the values and nothing else.",
-            [r[idcol] for r in records]))
+            [r[enum_col] for r in records]))
+
+    # lookup needs a column that UNIQUELY addresses one record — otherwise the prompt is
+    # ambiguous and a truthful answer about a different matching record scores wrong. Reuse
+    # the uniform path's uniqueness rule (`_pick_id_col`); skip lookup when none is unique
+    # (common in structure: `kind` and even overloaded `name` repeat within a file).
+    idcol = _pick_id_col(records, cols)
+    if idcol is not None:
         tgt = next((c for c in cols if c != idcol), None)
         if tgt is not None:
-            vals = [r[idcol] for r in records]
-            ri = next((i for i in range(n) if vals.count(vals[i]) == 1), n // 2)
+            ri = n // 2  # idcol is unique, so any index gives an unambiguous prompt
             qs.append(Question(
                 "lookup", "lookup", "nested",
                 f"Under {label}, for the record whose {idcol!r} is "
