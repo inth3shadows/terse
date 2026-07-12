@@ -28,3 +28,4 @@ reports/
 
 # Ad-hoc experiment harnesses (e.g. the fidelity probe) — not part of the lib
 scratch_fidelity/
+.codegraph

@@ -363,16 +363,16 @@ def build_cross_server_probe_report(
 def build_tokenizer_report(rows: list[dict[str, Any]]) -> str:
     """Render cross-tokenizer invariance — cl100k vs o200k savings % per tool.
 
-    True Anthropic ground truth needs the count_tokens API (a key we don't have, and
-    Claude has no public local tokenizer). Invariance across two different vocabs is
-    the keyless substitute: if the savings % barely moves, it's robust to Claude's.
+    Claude has no public local tokenizer, so there is no ground-truth token count to
+    check against. Invariance across two different vocabs is the substitute: if the
+    savings % barely moves, it's robust to Claude's.
     """
     from .tokenize import CL100K, O200K
 
     out: list[str] = [
         "# terse cross-tokenizer invariance",
         "",
-        "No Anthropic key available (Claude Code uses OAuth; no public Claude tokenizer).",
+        "No public Claude tokenizer exists, so cl100k is only an estimate.",
         "Substitute: savings % under two different BPE vocabularies. Stability => robust",
         "to Claude's tokenizer, because structural folding removes tokens in any vocab.",
         "",
@@ -396,10 +396,6 @@ def build_tokenizer_report(rows: list[dict[str, Any]]) -> str:
         verdict = "savings are tokenizer-invariant" if worst <= 3.0 else "savings vary by tokenizer — investigate"
         out += [
             f"Max divergence: **{worst:.1f} pts**, mean **{mean:.1f} pts** → {verdict}.",
-            "",
-            "_To get a real Anthropic point-check: provide a key and run "
-            "`terse measure --anthropic` (recommend gh-only — public data — to avoid "
-            "sending private payloads externally)._",
             "",
         ]
     return "\n".join(out)
@@ -548,17 +544,6 @@ def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
         d = _sum(sub, "saved_cl100k", "dictionary")
         out.append(f"| {shape} | {m:+d} | {t:+d} | {d:+d} | {m + t + d:+d} |")
     out.append("")
-
-    # --- Anthropic ground truth (if measured) ---
-    if any("anthropic" in r for r in rows):
-        a_raw = _sum(rows, "anthropic", "raw")
-        a_cmp = _sum(rows, "anthropic", "compressed")
-        out += [
-            "## Anthropic count_tokens (ground truth)",
-            "",
-            f"raw {a_raw} -> terse {a_cmp} = {a_raw - a_cmp:+d} ({_pct(a_raw - a_cmp, a_raw)})",
-            "",
-        ]
 
     return "\n".join(out)
 
@@ -713,7 +698,7 @@ def build_dropeval_report(results: dict) -> str:
         out += [
             "No tool-capable model answers, or no drop-marked record payloads in the",
             "corpus — set a policy with a `drop-to-retrieve` field and configure a model",
-            "(TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS or --anthropic), then re-run",
+            "(TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS), then re-run",
             "`terse fluency --drop-eval --policy <file>`.",
             "",
         ]
@@ -791,8 +776,7 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     if not results or not any(results.values()):
         out += [
             "No model answers provided. Configure a backend and re-run:",
-            "  - broker pool: set TERSE_FLUENCY_BASE_URL / TERSE_FLUENCY_API_KEY / TERSE_FLUENCY_MODELS",
-            "  - real consumer: pass --anthropic (needs the anthropic extra + key)",
+            "  - broker pool / loopback gateway: set TERSE_FLUENCY_BASE_URL / TERSE_FLUENCY_API_KEY / TERSE_FLUENCY_MODELS",
             "  - offline: `terse fluency` writes an eval pack you can drive by hand and score later.",
             "",
         ]

@@ -3,7 +3,7 @@
 Subcommands:
   gate <file|->            run the lossless round-trip gate on a JSON payload
   capture --tool N <file|-> persist a tool output to corpus/ + bucket by shape
-  measure [--anthropic]    token delta per tier per shape bucket over the corpus
+  measure                  token delta per tier per shape bucket over the corpus
   probe                    value-redundancy + cross-call-overlap ceiling probes
   validate                 cross-tokenizer invariance (cl100k vs o200k)
   compress --tool N        compress one tool output through a policy (the shell)
@@ -103,7 +103,7 @@ def _cmd_measure(args: argparse.Namespace) -> int:
     if not envelopes:
         print(f"no payloads in {args.corpus}/ — capture some first (`terse capture`).")
         return 1
-    rows = measure_corpus(envelopes, use_anthropic=args.anthropic)
+    rows = measure_corpus(envelopes)
     cov = coverage(envelopes)
     report = build_report(rows, cov)
     out = Path(args.out)
@@ -348,14 +348,15 @@ def _cmd_probe_cross_server(args: argparse.Namespace, envelopes: list[dict]) -> 
     return 0
 
 
-def _build_answerers(args: argparse.Namespace, make_openai, make_anthropic, *,
-                     warn_label: str = "anthropic") -> dict:
+def _build_answerers(args: argparse.Namespace, make_openai) -> dict:
     """Assemble named answerers from env + flags. Empty means keyless (pack) mode.
 
     Shared by plain `fluency` (`make_openai=fluency.openai_answerer`) and
     `fluency --drop-eval` (`make_openai` bound to `dropeval.openai_tool_answerer` +
     the retrieve tool) so the two eval modes stay configured identically — only the
-    answerer FACTORY differs, never the env/flag precedence."""
+    answerer FACTORY differs, never the env/flag precedence. Every model is reached over
+    the OpenAI-compatible path (the broker pool or a loopback gateway) — there is no
+    other model backend."""
     import os
 
     # Flags win over env so a credential-injecting launcher (e.g. secret_inject_env,
@@ -367,11 +368,6 @@ def _build_answerers(args: argparse.Namespace, make_openai, make_anthropic, *,
     if base and key and models:
         for m in (x.strip() for x in models.split(",") if x.strip()):
             answerers[m] = make_openai(base, key, m)
-    if args.anthropic:
-        try:
-            answerers[f"anthropic:{args.anthropic_model}"] = make_anthropic(args.anthropic_model)
-        except Exception as e:  # missing extra/key — fall back, don't crash the run
-            print(f"[warn] {warn_label} answerer unavailable: {e}", file=sys.stderr)
     return answerers
 
 
@@ -411,12 +407,10 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             args,
             lambda base, key, m: dropeval.openai_tool_answerer(base, key, m,
                                                                 tools=[RETRIEVE_TOOL_DEF]),
-            lambda model: dropeval.anthropic_tool_answerer(model, tools=[RETRIEVE_TOOL_DEF]),
-            warn_label="anthropic tool",
         )
         if not answerers:
             print("`fluency --drop-eval` needs a configured model: set TERSE_FLUENCY_BASE_URL/"
-                  "_API_KEY/_MODELS or pass --anthropic.")
+                  "_API_KEY/_MODELS.")
             return 1
         results = dropeval.run_drop_fluency(envelopes, pol.select, answerers, trials=args.trials)
         _write_report(build_dropeval_report(results), args.out)
@@ -427,10 +421,10 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
     # Diff mode: does a model read a cross-call DIFF as well as the full result? Needs a
     # live model (it measures comprehension of a form, not ground-truth math).
     if args.diff:
-        answerers = _build_answerers(args, fluency.openai_answerer, fluency.anthropic_answerer)
+        answerers = _build_answerers(args, fluency.openai_answerer)
         if not answerers:
             print("`fluency --diff` needs a configured model: set TERSE_FLUENCY_BASE_URL/"
-                  "_API_KEY/_MODELS or pass --anthropic.")
+                  "_API_KEY/_MODELS.")
             return 1
         results = fluency.run_diff_fluency(envelopes, answerers, trials=args.trials)
         _write_report(build_diff_report(results), args.out)
@@ -442,10 +436,10 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
     # text + text-diff) as from the full current text? The text-payload analogue of
     # --diff above (text_diff.py, Tier 0.7 — non-JSON tool output).
     if args.text_diff_eval:
-        answerers = _build_answerers(args, fluency.openai_answerer, fluency.anthropic_answerer)
+        answerers = _build_answerers(args, fluency.openai_answerer)
         if not answerers:
             print("`fluency --text-diff-eval` needs a configured model: set "
-                  "TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS or pass --anthropic.")
+                  "TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS.")
             return 1
         results = fluency.run_text_diff_fluency(envelopes, answerers, trials=args.trials)
         _write_report(build_text_diff_report(results), args.out)
@@ -464,7 +458,7 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             print("\n" + build_terminal_fluency_report(results))
         return 0
 
-    answerers = _build_answerers(args, fluency.openai_answerer, fluency.anthropic_answerer)
+    answerers = _build_answerers(args, fluency.openai_answerer)
     if not answerers:
         # Keyless default: write the eval pack and explain how to drive it. The pack
         # embeds each payload's RAW captured text (fluency.build_pack) — the same
@@ -477,8 +471,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         nq = sum(len(p["questions"]) for p in pack["payloads"])
         print(f"no model configured — wrote {nq} questions over {len(pack['payloads'])} "
               f"record-shaped payloads to {out}.")
-        print("To run a model: set TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS (broker pool) "
-              "or pass --anthropic, then re-run.")
+        print("To run a model: set TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS (broker pool), "
+              "then re-run.")
         print(f"Or drive the pack by hand and score it: `terse fluency --responses <file> "
               f"--pack {out}`.")
         return 0
@@ -679,7 +673,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         label = ("bundled deterministic sample — synthetic; capture real traffic with "
                  "`terse capture` for your own numbers")
 
-    rows = measure_corpus(envelopes, use_anthropic=False)
+    rows = measure_corpus(envelopes)
     cov = coverage(envelopes)
     report = build_verify_header(label, len(envelopes)) + build_report(rows, cov)
     _write_report(report, args.out)
@@ -742,7 +736,6 @@ def main(argv: list[str] | None = None) -> int:
     m = sub.add_parser("measure", help="token delta per tier per shape bucket over the corpus")
     m.add_argument("--corpus", default=DEFAULT_CORPUS)
     m.add_argument("--out", default=DEFAULT_REPORT)
-    m.add_argument("--anthropic", action="store_true", help="also count with Anthropic (network)")
     m.add_argument("--html", action="store_true",
                    help="also write a charted HTML report next to --out (inline SVG, no JS/CDN)")
     m.add_argument("--bars", action="store_true",
@@ -825,9 +818,6 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--models", help="comma-separated model ids (else $TERSE_FLUENCY_MODELS)")
     f.add_argument("--api-key-env", default="TERSE_FLUENCY_API_KEY",
                    help="env var holding the API key (default TERSE_FLUENCY_API_KEY)")
-    f.add_argument("--anthropic", action="store_true",
-                   help="also test the real consumer (needs the anthropic extra + key)")
-    f.add_argument("--anthropic-model", default="claude-opus-4-8")
     f.add_argument("--bars", action="store_true",
                    help="also print a terminal forest plot (accuracy + 95%% CI per model, "
                         "ANSI if a tty)")

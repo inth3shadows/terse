@@ -76,8 +76,7 @@ raw tool output (JSON text)
   estimators for whether higher-ceiling levers (dictionary, cross-call diffing) are
   worth building. They measure, they do not compress.
 - **`tokenize.py`** — `count(text, encoding)` over named tiktoken vocabs (cl100k,
-  o200k), `encode_cl100k` (token ids for probes), `count_anthropic` (optional, needs
-  a key).
+  o200k) and `encode_cl100k` (token ids for probes).
 - **`report.py`** — markdown renderers: `build_report` (savings by shape + per-tool +
   tier attribution + coverage + gate banner), `build_probe_report`,
   `build_tokenizer_report`.
@@ -106,12 +105,9 @@ raw tool output (JSON text)
 
 - **tiktoken (local)** — token counting under `cl100k_base` and `o200k_base`. No
   network at runtime after the one-time vocab download. Used for measurement and for
-  the dictionary coder's cost-aware aliasing threshold.
-- **Anthropic `count_tokens` (optional)** — `count_anthropic` calls the Messages
-  `count_tokens` endpoint if the `anthropic` extra is installed and a key is present.
-  There is **no public local tokenizer for Claude 3+**, so this is the only way to
-  get true Claude token counts; it is off by default. Sending a payload to this
-  endpoint transmits it to Anthropic — run it on public data only.
+  the dictionary coder's cost-aware aliasing threshold. There is **no public local
+  tokenizer for Claude 3+**, so cl100k is an estimate; cross-tokenizer invariance
+  (cl100k vs o200k) is the keyless robustness check rather than a true Claude count.
 - No other external services. terse does not call any tool APIs itself; it compresses
   output that is piped or passed to it.
 
@@ -152,8 +148,9 @@ full tiers, kb drops dictionary, `*.rate_limit` skipped).
 
 ### Environment
 
-- `ANTHROPIC_API_KEY` — only read by `count_anthropic` / `terse measure --anthropic`.
-  Absent by default; everything else runs without it.
+- `TERSE_FLUENCY_BASE_URL` / `TERSE_FLUENCY_API_KEY` / `TERSE_FLUENCY_MODELS` — the
+  OpenAI-compatible endpoint, key, and model list for the live fluency eval (broker
+  pool or a loopback gateway). Absent by default; the pure core runs without them.
 
 ## Deployment
 

@@ -56,8 +56,6 @@ the model's input — a denser but still-readable representation, not an offload
 - Python 3.11+
 - [uv](https://docs.astral.sh/uv/) for dependency management
 - `tiktoken` (installed via `uv sync`) for token counting
-- Optional: the `anthropic` extra + an API key, only if you want a real
-  Anthropic `count_tokens` point-check (not required; see USAGE)
 
 ## Quick Start
 
@@ -88,7 +86,7 @@ src/terse/
   measure.py     per-payload + cross-tokenizer token measurement
   probes.py      value-redundancy + cross-call-overlap ceiling probes
   fluency.py     does a model read the compressed form as accurately as raw JSON?
-  tokenize.py    cl100k / o200k token counting (+ optional Anthropic)
+  tokenize.py    cl100k / o200k token counting
   report.py      markdown reports (savings, per-tool, probes, tokenizer, fluency)
   html_report.py charted HTML companion (inline SVG, no JS/CDN) for measure/verify
   cli.py         entrypoint: gate / capture / measure / probe / validate / compress / proxy / fluency
