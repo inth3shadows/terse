@@ -4,8 +4,8 @@
 The pure core (question generation, the 2-turn loop driver, scoring) is exercised
 offline with scripted `ToolAnswerer` fakes standing in for a live model — the same
 fake-answerer idiom test_fluency.py uses for the single-shot Answerer protocol. Live
-backends (openai_tool_answerer / anthropic_tool_answerer) are thin urllib/SDK adapters
-and are not unit-tested here, mirroring fluency.py's own precedent.
+backend (openai_tool_answerer) is a thin urllib adapter and is not unit-tested here,
+mirroring fluency.py's own precedent.
 """
 
 from __future__ import annotations

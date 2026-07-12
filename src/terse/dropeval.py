@@ -336,8 +336,8 @@ def run_drop_fluency(envelopes: list[dict], rule_for: Callable[[str], Any],
 
 
 # --------------------------------------------------------------------------- #
-# Tool-capable live backends — zero new dependencies (mirrors fluency.py's urllib/
-# anthropic-extra pattern exactly, just carrying a `tools` param + parsing tool_calls).
+# Tool-capable live backend — zero new dependencies (mirrors fluency.openai_answerer's
+# urllib pattern, just carrying a `tools` param + parsing tool_calls).
 # --------------------------------------------------------------------------- #
 def _to_openai_tool(tool_def: dict) -> dict:
     """RETRIEVE_TOOL_DEF's MCP `inputSchema` shape -> OpenAI function-calling `parameters`."""
@@ -383,72 +383,5 @@ def openai_tool_answerer(base_url: str, api_key: str, model: str, tools: list[di
             calls.append(ToolCall(call_id=tc.get("id", ""), name=fn.get("name", ""),
                                   arguments=arguments))
         return Turn(text=msg.get("content") or "", tool_calls=calls)
-
-    return ask
-
-
-def _to_anthropic_tool(tool_def: dict) -> dict:
-    return {
-        "name": tool_def["name"],
-        "description": tool_def.get("description", ""),
-        "input_schema": tool_def.get("inputSchema", {}),
-    }
-
-
-def _to_anthropic_messages(messages: list[dict]) -> tuple[str, list[dict]]:
-    """Convert the neutral OpenAI-style running conversation into Anthropic's system
-    string + tool_use/tool_result content-block message shape."""
-    system = ""
-    out: list[dict] = []
-    for m in messages:
-        role = m["role"]
-        if role == "system":
-            system = m.get("content", "")
-        elif role == "user":
-            out.append({"role": "user", "content": m.get("content", "")})
-        elif role == "assistant":
-            content: list[dict] = []
-            if m.get("content"):
-                content.append({"type": "text", "text": m["content"]})
-            for tc in m.get("tool_calls", []):
-                fn = tc.get("function", {})
-                try:
-                    arguments = json.loads(fn.get("arguments") or "{}")
-                except json.JSONDecodeError:
-                    arguments = {}
-                content.append({"type": "tool_use", "id": tc.get("id", ""),
-                                "name": fn.get("name", ""), "input": arguments})
-            out.append({"role": "assistant", "content": content})
-        elif role == "tool":
-            out.append({"role": "user", "content": [{
-                "type": "tool_result", "tool_use_id": m.get("tool_call_id", ""),
-                "content": m.get("content", ""),
-            }]})
-    return system, out
-
-
-def anthropic_tool_answerer(model: str, tools: list[dict],
-                            max_tokens: int = 1024) -> ToolAnswerer:
-    """The real-consumer tool-calling answerer via the optional `anthropic` extra. Raises
-    at construction if the extra/key is absent, so the CLI can warn and fall back cleanly
-    — mirrors fluency.anthropic_answerer's contract exactly."""
-    import anthropic
-
-    client = anthropic.Anthropic()
-    anthropic_tools = [_to_anthropic_tool(t) for t in tools]
-
-    def ask(messages: list[dict]) -> Turn:
-        system, anth_messages = _to_anthropic_messages(messages)
-        kwargs: dict[str, Any] = {
-            "model": model, "max_tokens": max_tokens, "messages": anth_messages,
-            "tools": anthropic_tools,
-        }
-        if system:
-            kwargs["system"] = system
-        resp = client.messages.create(**kwargs)
-        text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
-        calls = [ToolCall(call_id=b.id, name=b.name, arguments=b.input)
-                for b in resp.content if getattr(b, "type", None) == "tool_use"]
-        return Turn(text=text, tool_calls=calls)
 
     return ask
