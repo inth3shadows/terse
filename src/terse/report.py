@@ -673,6 +673,97 @@ def build_text_diff_report(results: dict) -> str:
     )
 
 
+def build_diff_soak_report(results: dict) -> str:
+    """Render the diff-chain soak: does comprehension DRIFT as a model reads deeper
+    chains of consecutive diffs off one full anchor (#8/#20 follow-up)?
+
+    `results` is {model: [row,...]} from fluency.run_diff_soak; rows carry the
+    run_diff_payload shape plus `depth` (how many diffs were chained). The overall
+    verdict gates on the worst model across ALL depths (principle #24); the by-depth
+    table is the drift signal itself — production caps chains at the keyframe
+    interval (default 5), so the deepest tested depth is the deployed worst case."""
+    out: list[str] = ["# terse diff-chain soak", ""]
+    out += [
+        "Does a model answer questions about the LATEST state as accurately from",
+        "(one full result + k consecutive diffs, applied in order) as from the full",
+        "current result — and does accuracy drift as k grows? Chains are real",
+        "consecutive same-tool corpus payloads (chronological), exactly what",
+        "`proxy --diff` emits between keyframes. No system primer (production",
+        "condition).", "",
+    ]
+    if not results or not any(results.values()):
+        out += [
+            "No model answers, or no same-tool diffable RUNS in the corpus. Capture a",
+            "tool 3+ times with small changes between calls, then re-run",
+            "`terse fluency --diff-soak`.", "",
+        ]
+        return "\n".join(out)
+
+    trials = max((r.get("trials", 1) for rows in results.values() for r in rows), default=1)
+    depths = sorted({r["depth"] for rows in results.values() for r in rows})
+    out += [
+        "## Accuracy by chain depth",
+        "",
+        f"Trials per question: **{trials}**. `±` is the 95% half-width of a pooled "
+        "binomial bound. depth = diffs chained after the full anchor.",
+        "",
+        "| Model | depth | q | full-terse | chain | gap |",
+        "|---|---|---|---|---|---|",
+    ]
+    for model, rows in results.items():
+        for depth in depths:
+            drows = [r for r in rows if r["depth"] == depth]
+            if not drows:
+                continue
+            facc, fse = _form_stats(drows, "terse_ok")
+            dacc, dse = _form_stats(drows, "diff_ok")
+            out.append(f"| `{model}` | {depth} | {len(drows)} "
+                       f"| {facc:.0%} ±{_ci(fse) * 100:.0f} "
+                       f"| {dacc:.0%} ±{_ci(dse) * 100:.0f} | {dacc - facc:+.0%} |")
+    out.append("")
+
+    gap_rows: dict[str, tuple[float, float, float, float]] = {}
+    for model, rows in results.items():
+        if not rows:
+            continue
+        facc, fse = _form_stats(rows, "terse_ok")
+        dacc, dse = _form_stats(rows, "diff_ok")
+        gap_rows[model] = (dacc, dse, facc, fse)
+
+    out += ["## Verdict", ""]
+    worst = _worst_case_gap(gap_rows)
+    if worst:
+        out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "chain-form",
+                                           "full-terse"))
+        # The soak-specific signal on top of the overall gate: the worst model's gap
+        # at the DEEPEST depth, since a clean average can hide a depth-correlated slide.
+        deep = depths[-1] if depths else 0
+        deep_rows = {m: r for m, r in
+                     ((m, [x for x in rs if x["depth"] == deep])
+                      for m, rs in results.items()) if r}
+        deep_gaps = {}
+        for m, rs in deep_rows.items():
+            facc, fse = _form_stats(rs, "terse_ok")
+            dacc, dse = _form_stats(rs, "diff_ok")
+            deep_gaps[m] = (dacc, dse, facc, fse)
+        deepest = _worst_case_gap(deep_gaps)
+        if deepest:
+            out.append(f"- At the deepest tested depth ({deep}): worst model "
+                       f"`{deepest.model}` chain {deepest.form_acc:.0%} vs full "
+                       f"{deepest.control_acc:.0%} (gap {deepest.gap:+.0%} "
+                       f"±{deepest.gap_ci * 100:.0f} pts). "
+                       f"**{'PASS' if deepest.passed else 'FAIL'}** at "
+                       f"{_GAP_TOLERANCE:.0%} tolerance.")
+        if worst.passed and (deepest is None or deepest.passed):
+            out.append("- No depth-correlated comprehension drift within tolerance — "
+                       "chained diffs up to the tested depth read as well as fulls.")
+        else:
+            out.append("- Comprehension drifts beyond tolerance somewhere in the chain — "
+                       "keep the keyframe interval at or below the deepest PASSING depth.")
+    out.append("")
+    return "\n".join(out)
+
+
 def build_dropeval_report(results: dict) -> str:
     """Render the drop-to-retrieve behavioral eval: does a real tool-calling model call
     `terse.retrieve` when a dropped field is needed (recall), and leave it alone when it

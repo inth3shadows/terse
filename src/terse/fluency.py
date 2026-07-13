@@ -41,7 +41,8 @@ from typing import Any, Callable
 from . import text_diff
 from .capture import LONG_TEXT, OTHER, classify_shape, extract_records
 from .tokenize import count_cl100k
-from .transforms import compress, compress_structure, dict_encode, diff_wire, minify, _uniform_dict_list
+from .transforms import (compress, compress_structure, dict_encode, diff_wire,
+                         has_terse_marker, minify, _uniform_dict_list)
 
 # Loopback hosts where cleartext http is safe (never leaves the machine), so a Bearer
 # key over http to one of these is fine — a local LiteLLM/CCR gateway is a common setup.
@@ -249,13 +250,54 @@ def _nested_questions(obj: Any) -> list[Question]:
     return qs
 
 
+def _flat_record_questions(obj: Any) -> list[Question]:
+    """Questions for a SINGLE flat record — a dict of mostly scalar fields (a search
+    hit, a status receipt, one KB row). These payloads tabularize to nothing, but they
+    are a real diff surface: consecutive single-record results diff via the keys shape,
+    and before this generator the soak/diff evals were blind to every such chain.
+    Same contract as the other sources: deterministic, programmatically checkable,
+    fluency-local (the codec/tabularizer rules are untouched)."""
+    if not isinstance(obj, dict) or has_terse_marker(obj):
+        return []
+    # int/float lookups are unambiguous; strings must be short, non-empty scalars —
+    # an empty expected would be indistinguishable from _safe_ask's empty-string
+    # error return (same exclusion the text-diff questions apply).
+    lookable = {
+        k: v for k, v in obj.items()
+        if (isinstance(v, (int, float)) and not isinstance(v, bool))
+        or (isinstance(v, str) and 0 < len(v) <= 60)
+    }
+    if len(lookable) < 3:
+        return []
+    qs: list[Question] = [Question(
+        "keys-count", "count", "flat-record",
+        "How many top-level keys does the object have?",
+        "Reply with only the integer count.",
+        len(obj),
+    )]
+    keys = sorted(lookable)
+    num_key = next((k for k in keys
+                    if isinstance(lookable[k], (int, float))), None)
+    str_key = next((k for k in keys if isinstance(lookable[k], str)), None)
+    for i, k in enumerate(x for x in (num_key, str_key) if x is not None):
+        qs.append(Question(
+            f"field-{i}", "lookup", "flat-record",
+            f"What is the value of the top-level field {k!r}?",
+            "Reply with only the value, with no quotes and no extra words.",
+            lookable[k],
+        ))
+    return qs
+
+
 def gen_questions(obj: Any) -> list[Question]:
     """Generate deterministic, programmatically-checkable questions for a payload.
 
     Uniform record-shaped payloads (what terse tabularizes) yield questions directly;
     payloads whose records the strict extractor skips (structure's dict-map of non-uniform
-    symbol lists) fall through to `_nested_questions` (#71); everything else returns [].
-    Selection is fully deterministic so a re-run is reproducible.
+    symbol lists) fall through to `_nested_questions` (#71); a SINGLE flat record (a
+    search hit, a receipt) falls through to `_flat_record_questions` — the keys-diff
+    surface the chain soak needs; everything else returns []. Selection is fully
+    deterministic so a re-run is reproducible.
     """
     # Structure-shaped payloads (a dict-map of records) need GROUP-SCOPED questions; prefer
     # them over the uniform extractor, which would otherwise emit an unscoped, ambiguous
@@ -265,7 +307,7 @@ def gen_questions(obj: Any) -> list[Question]:
         return nested
     records = extract_records(obj)
     if not records:
-        return []
+        return _flat_record_questions(obj)
     cols = list(records[0].keys())
     n = len(records)
     aliased = _aliased_strings(obj)
@@ -452,8 +494,8 @@ def run_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
     """Run the eval for each named answerer over every record-shaped payload.
 
     Returns {model_name: [scored_row, ...]} where each row carries tool/sha plus the
-    per-form success counts and trial count. Non-record payloads are skipped (they
-    generate no questions — terse does not transform them).
+    per-form success counts and trial count. Payloads that generate no questions
+    (no record list, no nested dict-map, not a flat record) are skipped.
     """
     results: dict[str, list[dict]] = {}
     for name, fn in answerers.items():
@@ -550,6 +592,134 @@ def run_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
             continue
         pairs.append((tool, csha, prev_obj, curr_obj))
     return _aggregate_by_model(pairs, answerers, trials, run_diff_payload)
+
+
+# --------------------------------------------------------------------------- #
+# Diff-chain soak — the DEPTH dimension run_diff_fluency can't see (#8/#20 follow-up).
+# run_diff_payload tests one hop (full + 1 diff). In production a model reads up to
+# `diff_keyframe_interval` (default 5) consecutive diffs off one full anchor before
+# the proxy re-anchors — so the open question before any default-flip is whether
+# comprehension DRIFTS with chain depth. These functions build real depth-k windows
+# from the corpus (chronological order, #67) and score the same final-state questions
+# at every depth, so the report can show accuracy as a function of depth.
+# --------------------------------------------------------------------------- #
+def build_chain_windows(envelopes: list[dict], max_depth: int = 5,
+                        per_depth_cap: int = 6) -> list[tuple]:
+    """Depth-k windows (k = 1..max_depth) of consecutive same-tool payloads where
+    EVERY hop admits a lossless diff and the final payload generates questions —
+    the exact between-keyframe chains `proxy --diff` emits. Envelope order is
+    preserved (load_corpus replays chronologically, #67), so windows are real
+    session sequences, not synthetic evolutions.
+
+    Sampling per depth is round-robin across tools (one window per tool per pass,
+    starts spread along each tool's maximal diffable run) until `per_depth_cap` —
+    tool diversity beats stacking one chatty tool's windows. Returns
+    [(tool, final_sha, depth, [obj_0 .. obj_k])]."""
+    runs: dict[str, list[list[tuple]]] = {}   # tool -> maximal runs of (sha, obj)
+    by_tool: dict[str, list[dict]] = {}
+    for env in envelopes:
+        by_tool.setdefault(env["tool"], []).append(env)
+    for tool, envs in by_tool.items():
+        seq: list[tuple] = []
+        for e in envs:
+            try:
+                seq.append((e.get("sha", "?"), json.loads(e["raw"])))
+            except (json.JSONDecodeError, TypeError):
+                seq.append((e.get("sha", "?"), None))
+        cur: list[tuple] = []
+        for (psha, p), (csha, c) in zip(seq, seq[1:]):
+            ok = (p is not None and c is not None
+                  and diff_wire(p, c, tool) is not None)
+            if ok:
+                if not cur:
+                    cur = [(psha, p)]
+                cur.append((csha, c))
+            elif cur:
+                runs.setdefault(tool, []).append(cur)
+                cur = []
+        if cur:
+            runs.setdefault(tool, []).append(cur)
+
+    windows: list[tuple] = []
+    for depth in range(1, max_depth + 1):
+        # every eligible start per tool, spread over its runs; then round-robin
+        candidates: dict[str, list[tuple]] = {}
+        for tool, tool_runs in sorted(runs.items()):
+            starts: list[tuple] = []
+            for run in tool_runs:
+                for i in range(0, len(run) - depth, depth):   # non-overlapping
+                    window = run[i:i + depth + 1]
+                    if gen_questions(window[-1][1]):
+                        starts.append(window)
+            if starts:
+                candidates[tool] = starts
+        picked = 0
+        idx = 0
+        while picked < per_depth_cap and candidates:
+            for tool in sorted(list(candidates)):
+                starts = candidates[tool]
+                if idx >= len(starts):
+                    del candidates[tool]
+                    continue
+                window = starts[idx]
+                windows.append((tool, window[-1][0], depth,
+                                [obj for _, obj in window]))
+                picked += 1
+                if picked >= per_depth_cap:
+                    break
+            idx += 1
+    return windows
+
+
+def run_chain_payload(objs: list, answerer: Answerer, tool: str = "",
+                      trials: int = 1) -> list[dict]:
+    """run_diff_payload generalized to a depth-N chain: the same questions about the
+    FINAL state, control = full-terse of the final result, form = the base full-terse
+    plus every intermediate diff wire in order — exactly the context a model has
+    accumulated after N consecutive diffs, with no system primer (production
+    condition). [] if any hop stops admitting a lossless diff or no questions."""
+    questions = gen_questions(objs[-1])
+    if not questions:
+        return []
+    wires: list[str] = []
+    for prev, curr in zip(objs, objs[1:]):
+        wire = diff_wire(prev, curr, tool)
+        if wire is None:
+            return []
+        wires.append(wire)
+    curr_terse = compress(objs[-1])
+    chain_data = f"PREVIOUS RESULT:\n{compress(objs[0])}" + "".join(
+        f"\n\nUPDATE (diff against the result above, applied in order):\n{w}"
+        for w in wires)
+    out: list[dict] = []
+    for q in questions:
+        full_u = _user_prompt(q.prompt, q.instruction, curr_terse)
+        chain_u = _user_prompt(q.prompt, q.instruction, chain_data)
+        out.append({
+            "qid": q.qid, "qtype": q.qtype, "transform": q.transform, "trials": trials,
+            "depth": len(wires),
+            "terse_ok": _ask_n(answerer, "", full_u, q.qtype, q.expected, trials),
+            "diff_ok": _ask_n(answerer, "", chain_u, q.qtype, q.expected, trials),
+        })
+    return out
+
+
+def run_diff_soak(envelopes: list[dict], answerers: dict[str, Answerer],
+                  trials: int = 1, max_depth: int = 5,
+                  per_depth_cap: int = 6) -> dict:
+    """Score every answerer over the same depth-1..max_depth chain windows.
+    Returns {model: [row,...]} where each row also carries `depth` — the report
+    aggregates by it to show comprehension as a function of chain depth."""
+    windows = build_chain_windows(envelopes, max_depth=max_depth,
+                                  per_depth_cap=per_depth_cap)
+    results: dict[str, list[dict]] = {}
+    for name, fn in answerers.items():
+        rows: list[dict] = []
+        for tool, sha, _depth, objs in windows:
+            for row in run_chain_payload(objs, fn, tool, trials=trials):
+                rows.append({"tool": tool, "sha": sha, **row})
+        results[name] = rows
+    return results
 
 
 # --------------------------------------------------------------------------- #
