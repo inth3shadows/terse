@@ -148,6 +148,53 @@ def test_do_install_capture_dir_adds_proxy_flag(tmp_path, monkeypatch):
         "command": "uvx", "args": ["runecho-mcp"]}
 
 
+def test_wrap_diff_adds_proxy_flags_and_rewrap_drops_them():
+    config = _cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})
+    stash: dict = {}
+
+    im.wrap(config, stash, "runecho", "/p/policy.json", TERSE_CMD,
+            diff=True, diff_keyframe_interval=3)
+    args = config["mcpServers"]["runecho"]["args"]
+    assert "--diff" in args
+    ki = args.index("--diff-keyframe-interval")
+    assert args[ki + 1] == "3"
+    assert args.index("--diff") < args.index("--")      # opts, not downstream args
+
+    # keyframe interval only rides along with --diff
+    im.wrap(config, stash, "runecho", "/p/policy.json", TERSE_CMD,
+            diff=False, diff_keyframe_interval=3)
+    args = config["mcpServers"]["runecho"]["args"]
+    assert "--diff" not in args and "--diff-keyframe-interval" not in args
+
+    # and the original is still restored untouched
+    im.unwrap(config, stash, "runecho")
+    assert config["mcpServers"]["runecho"] == {"command": "uvx", "args": ["runecho-mcp"]}
+
+
+def test_do_install_diff_adds_flag_and_reinstall_without_it_drops_it(tmp_path, monkeypatch):
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+
+    res = im.do_install(["runecho"], str(policy), cfg=cfg, diff=True)
+    args = json.loads(cfg.read_text())["mcpServers"]["runecho"]["args"]
+    assert "--diff" in args and args.index("--diff") < args.index("--")
+    assert "--diff-keyframe-interval" not in args       # default left to the proxy
+    assert res["diff"] is True
+
+    # flags reflect the latest install: a re-install without --diff removes it
+    res = im.do_install(["runecho"], str(policy), cfg=cfg)
+    args = json.loads(cfg.read_text())["mcpServers"]["runecho"]["args"]
+    assert "--diff" not in args
+    assert res["diff"] is False
+
+    im.do_uninstall(["runecho"], cfg=cfg)
+    assert json.loads(cfg.read_text())["mcpServers"]["runecho"] == {
+        "command": "uvx", "args": ["runecho-mcp"]}
+
+
 def test_roundtrip_byte_identical_with_non_ascii(tmp_path, monkeypatch):
     # The real ~/.claude.json holds non-ASCII (em-dashes, emoji, arrows) and is written
     # by Claude Code with indent=2, ensure_ascii=False, and NO trailing newline. #27's

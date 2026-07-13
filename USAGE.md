@@ -129,9 +129,12 @@ uv run terse uninstall-mcp --all          # every terse-managed server
 the entry's `env`/`cwd`/etc. The original is saved verbatim in a sidecar stash
 (`.terse-mcp-stash.json` next to the config), so `uninstall-mcp` restores it
 byte-for-byte. It's **idempotent** (re-running re-wraps from the stashed original
-instead of nesting proxies) and never enables `--diff`. It honors `$CLAUDE_CONFIG`
-if your config isn't at `~/.claude.json`. Start with one high-win, read-only
-server (e.g. `runecho`) and confirm it works before wrapping more.
+instead of nesting proxies) and never enables `--diff` implicitly — pass
+`install-mcp --diff` (optionally `--diff-keyframe-interval K`) to wrap with
+cross-call diffing on; a re-install without the flag drops it again. It honors
+`$CLAUDE_CONFIG` if your config isn't at `~/.claude.json`. Start with one
+high-win, read-only server (e.g. `runecho`) and confirm it works before
+wrapping more.
 
 Claude Code has three MCP scopes, and `--scope` targets any of them (default
 `user`, i.e. today's behavior):
