@@ -160,11 +160,20 @@ def test_wrap_diff_adds_proxy_flags_and_rewrap_drops_them():
     assert args[ki + 1] == "3"
     assert args.index("--diff") < args.index("--")      # opts, not downstream args
 
-    # keyframe interval only rides along with --diff
+    # tri-state: None (default) writes no diff flags at all — the entry inherits the
+    # proxy default; a re-wrap from an explicit state drops the old flags.
+    im.wrap(config, stash, "runecho", "/p/policy.json", TERSE_CMD,
+            diff=None, diff_keyframe_interval=3)
+    args = config["mcpServers"]["runecho"]["args"]
+    assert "--diff" not in args and "--no-diff" not in args
+    assert "--diff-keyframe-interval" in args           # keyframe is diff-independent now
+
+    # False bakes an explicit opt-out (and a keyframe interval would be dead weight)
     im.wrap(config, stash, "runecho", "/p/policy.json", TERSE_CMD,
             diff=False, diff_keyframe_interval=3)
     args = config["mcpServers"]["runecho"]["args"]
-    assert "--diff" not in args and "--diff-keyframe-interval" not in args
+    assert "--no-diff" in args and "--diff" not in args
+    assert "--diff-keyframe-interval" not in args
 
     # and the original is still restored untouched
     im.unwrap(config, stash, "runecho")
@@ -184,10 +193,17 @@ def test_do_install_diff_adds_flag_and_reinstall_without_it_drops_it(tmp_path, m
     assert "--diff-keyframe-interval" not in args       # default left to the proxy
     assert res["diff"] is True
 
-    # flags reflect the latest install: a re-install without --diff removes it
+    # flags reflect the latest install: a plain re-install (tri-state None) removes
+    # the explicit flag and the entry inherits the proxy default again
     res = im.do_install(["runecho"], str(policy), cfg=cfg)
     args = json.loads(cfg.read_text())["mcpServers"]["runecho"]["args"]
-    assert "--diff" not in args
+    assert "--diff" not in args and "--no-diff" not in args
+    assert res["diff"] is None
+
+    # an explicit opt-out bakes --no-diff
+    res = im.do_install(["runecho"], str(policy), cfg=cfg, diff=False)
+    args = json.loads(cfg.read_text())["mcpServers"]["runecho"]["args"]
+    assert "--no-diff" in args and args.index("--no-diff") < args.index("--")
     assert res["diff"] is False
 
     im.do_uninstall(["runecho"], cfg=cfg)

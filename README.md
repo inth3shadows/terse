@@ -29,12 +29,13 @@ then (optionally) serves it through a per-tool policy that decides which tiers r
 - **Tier 0.5 — dictionary code**: repeated string values *and repeated whole subtrees*
   are folded into an inline legend (`~0`, `~1`, …) proven disjoint from every literal in
   the payload. Committed only when it actually saves tokens, so it never regresses.
-- **Tier 0.7 — cross-call diff (opt-in, stateful)**: when the same tool is called
-  repeatedly, the proxy can emit a lossless delta against the prior result instead of
+- **Tier 0.7 — cross-call diff (stateful, ON by default)**: when the same tool is called
+  repeatedly, the proxy emits a lossless delta against the prior result instead of
   the full payload (the 91%-overlap headroom). Self-describing, verified to reconstruct
-  exactly, and emitted only when smaller — falls back to the full form otherwise. OFF by
-  default (`proxy --diff`, or `install-mcp --diff` when wrapping Claude Code servers);
-  its model-fluency is validated by `terse fluency --diff`.
+  exactly, and emitted only when smaller — falls back to the full form otherwise.
+  Default-on since its validation program completed (fluency, nested-record coverage,
+  and the drift soak — see Status); opt out with `proxy --no-diff` / `install-mcp
+  --no-diff` or a policy-file `"diff": false`.
   Record-shaped JSON gets a row/key diff; non-JSON results (file reads, source excerpts,
   log tails) get a separate content-defined-chunking (CDC) diff — a rolling hash cuts
   chunk boundaries by content, not position, so an edit anywhere only perturbs the
@@ -123,13 +124,13 @@ stdio proxy. The proxy's open question — *does a model read the compressed for
 well as raw JSON?* — now has a measured answer: on a stress corpus, Claude Haiku 4.5
 and Gemini 2.5 Flash match raw-JSON accuracy on the compressed form (100% paired) at a
 37% token saving (`terse fluency`; see TECHNICAL.md). Whole-subtree aliasing (folding
-repeated objects, not just strings) is built. Cross-call diffing is built as an
-**opt-in** lossless tier (`proxy --diff` / `install-mcp --diff`); its fluency gate
-(`fluency --diff`) has passed on both the record surface (4-model panel, 100%) and the
-nested-record surface (`structure`: diff 100% vs full-terse 94%), so it's cleared for
-live use. Long-chain drift is soaked from both sides: mechanically
+repeated objects, not just strings) is built. Cross-call diffing is a lossless tier
+that is now **on by default** — its full validation program passed: pair fluency
+(`fluency --diff`, 4-model panel 100%), the nested-record surface (`structure`: diff
+100% vs full-terse 94%), and long-chain drift soaked from both sides — mechanically
 (`tests/test_diff_soak.py` — exact reconstruction hundreds of chained hops deep) and
-behaviorally (`fluency --diff-soak` — model accuracy vs chain depth up to the keyframe
-bound). The Tier 1 lossy modes `truncate` and
+behaviorally (`fluency --diff-soak` — no depth-correlated accuracy loss up to the
+keyframe bound). Opt out per proxy (`--no-diff`) or per policy (`"diff": false`).
+The Tier 1 lossy modes `truncate` and
 `drop-to-retrieve` are built (opt-in, off by default); `summarize` remains designed but
 not yet built — see TECHNICAL.md "Known Limitations".

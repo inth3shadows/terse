@@ -932,7 +932,7 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                  debug: bool, capture: Optional[Callable[[str, str], None]],
                  audit: Optional[Callable[[dict], None]],
                  store: "OrderedDict[str, Any]", store_lock: Lock,
-                 dropped_bytes: list[int], diff_override: bool = False,
+                 dropped_bytes: list[int], diff_override: Optional[bool] = None,
                  diff_keyframe_override: Optional[int] = None) -> list[Peer]:
     """Build every `Peer`: its own `Transport` (stdio or HTTP, via `build_transport`)
     and its own `Interceptor` (per-peer diff/compress state, but the drop store —
@@ -945,14 +945,15 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
 
     `diff_override`/`diff_keyframe_override` are applied to EVERY peer's policy, not
     just `default_policy`-derived ones — otherwise a peer with its own `policy_path`
-    silently never sees the CLI's `--diff` opt-in, unlike a peer using the default."""
+    silently never sees the CLI's `--diff`/`--no-diff` (None = no CLI flag, leave
+    each peer's own policy value alone), unlike a peer using the default."""
     peers: list[Peer] = []
     try:
         for spec in specs:
             pol = (policy_mod.load_policy(spec.policy_path) if spec.policy_path
                   else default_policy)
-            if diff_override:
-                pol.diff = True
+            if diff_override is not None:
+                pol.diff = diff_override
             if diff_keyframe_override is not None:
                 pol.diff_keyframe_interval = diff_keyframe_override
             inter = Interceptor(pol, debug=debug, capture=capture, audit=audit,
@@ -977,7 +978,7 @@ def run_multi_proxy(
     capture_dir: Optional[str] = None,
     debug_log: Optional[str] = None,
     broadcast_timeout: float = BROADCAST_TIMEOUT,
-    diff_override: bool = False,
+    diff_override: Optional[bool] = None,
     diff_keyframe_override: Optional[int] = None,
 ) -> int:
     """Load `config_path`, build one `Peer` per downstream (own `Transport` + own
@@ -986,9 +987,10 @@ def run_multi_proxy(
     block until the client's stdin hits EOF. `broadcast_timeout` overrides
     `BROADCAST_TIMEOUT` — a test-only knob so a dead-peer test doesn't need to wait out
     the real 30s default. `diff_override`/`diff_keyframe_override` mirror cli.py's
-    single-peer `--diff`/`--diff-keyframe-interval` CLI opt-in — applied to EVERY
-    peer's policy in `_build_peers`, including one loaded from its own `policy_path`,
-    so `--diff` is proxy-wide (not silently skipped for a peer with a custom policy).
+    single-peer `--diff`/`--no-diff`/`--diff-keyframe-interval` CLI flags — applied to
+    EVERY peer's policy in `_build_peers`, including one loaded from its own
+    `policy_path`, so the flag is proxy-wide (not silently skipped for a peer with a
+    custom policy); None means no flag was given and each policy keeps its own value.
 
     Return code: 2 for a bad/missing config (mirrors `run_proxy`'s `stdio_transport_error`
     path), 127 if a stdio peer can't be launched (mirrors `run_proxy`'s OSError path), 0

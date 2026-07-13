@@ -171,8 +171,14 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
     except (OSError, ValueError) as e:
         print(f"proxy: {e}", file=sys.stderr)
         return 2
-    if args.diff:
-        pol.diff = True  # CLI opt-in overrides the policy default (off)
+    # tri-state: --diff / --no-diff override the policy value; neither flag = keep it
+    # (the Policy default is ON since the validation program completed — see #75).
+    if args.diff and args.no_diff:
+        print("proxy: --diff and --no-diff are mutually exclusive", file=sys.stderr)
+        return 2
+    diff_override = True if args.diff else (False if args.no_diff else None)
+    if diff_override is not None:
+        pol.diff = diff_override
     if args.diff_keyframe_interval is not None:
         pol.diff_keyframe_interval = args.diff_keyframe_interval
 
@@ -180,11 +186,11 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         from .multiproxy import run_multi_proxy
         try:
             # diff_override/diff_keyframe_override (not just the mutated `pol` above)
-            # so --diff also applies to a peer with its OWN policy_path, not just
-            # peers using this default policy.
+            # so --diff/--no-diff also applies to a peer with its OWN policy_path,
+            # not just peers using this default policy.
             return run_multi_proxy(args.config, pol, debug=args.debug,
                                    capture_dir=args.capture_dir, debug_log=args.debug_log,
-                                   diff_override=args.diff,
+                                   diff_override=diff_override,
                                    diff_keyframe_override=args.diff_keyframe_interval)
         except (OSError, ValueError) as e:
             print(f"proxy --config: {e}", file=sys.stderr)
@@ -581,9 +587,13 @@ def _short_cmd(entry) -> str:
 def _cmd_install_mcp(args: argparse.Namespace) -> int:
     from .install_mcp import do_install
 
+    if args.diff and args.no_diff:
+        print("install-mcp: --diff and --no-diff are mutually exclusive", file=sys.stderr)
+        return 2
+    diff = True if args.diff else (False if args.no_diff else None)
     try:
         res = do_install(args.servers, args.policy, dry_run=args.print,
-                         capture_dir=args.capture_dir, diff=args.diff,
+                         capture_dir=args.capture_dir, diff=diff,
                          diff_keyframe_interval=args.diff_keyframe_interval,
                          scope=args.scope, file=args.file, repo_path=args.repo_path)
     except (FileNotFoundError, ValueError) as e:
@@ -597,8 +607,10 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
     print(f"config: {res['config']}  scope: {res['scope']}  policy: {res['policy']}")
     if res.get("capture_dir"):
         print(f"capture: raw tool results → {res['capture_dir']}")
-    if res.get("diff"):
-        print("diff: cross-call diffing enabled (proxy --diff)")
+    if res.get("diff") is True:
+        print("diff: explicit --diff baked in (overrides a policy-file opt-out)")
+    elif res.get("diff") is False:
+        print("diff: DISABLED for these server(s) (--no-diff baked in)")
     if res["backup"]:
         print(f"backup: {res['backup']}")
     if not res["dry_run"] and res["changes"]:
@@ -788,9 +800,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="with --diff, force a full result every K consecutive diffs per tool "
                          "to bound dangling-reference drift (default 5; 0 disables)")
     px.add_argument("--diff", action="store_true",
-                    help="enable cross-call diffing (stateful; emits a lossless delta vs the "
-                         "prior same-tool result when smaller). Opt-in; model-fluency "
-                         "validated by `terse fluency --diff`/`--text-diff-eval`")
+                    help="force cross-call diffing ON, overriding a policy file's "
+                         '"diff": false (diffing is the DEFAULT since #75, so this is '
+                         "only needed against such a policy)")
+    px.add_argument("--no-diff", action="store_true",
+                    help="disable cross-call diffing (emit the full compressed form "
+                         "every call), overriding the default and any policy value")
     px.add_argument("--debug", action="store_true", help="log compressions to stderr")
     px.add_argument("--capture-dir", metavar="DIR",
                     help="tee each raw tool-result payload into this corpus dir for later "
@@ -873,11 +888,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="also tee raw tool results into this corpus dir for later "
                          "`terse measure`/`verify` (opt-in; never affects forwarding)")
     im.add_argument("--diff", action="store_true",
-                    help="wrap with cross-call diffing enabled (`proxy --diff`); a "
-                         "re-install without this flag drops it again")
+                    help="bake an explicit `--diff` into the wrapped entry (diffing is "
+                         "already the proxy DEFAULT since #75 — only needed to override "
+                         'a policy file\'s "diff": false)')
+    im.add_argument("--no-diff", action="store_true",
+                    help="bake `--no-diff` into the wrapped entry: this server gets "
+                         "full results every call, no cross-call diffing")
     im.add_argument("--diff-keyframe-interval", type=int, default=None, metavar="K",
-                    help="with --diff, force a full result every K consecutive diffs "
-                         "per tool (default 5; 0 disables)")
+                    help="force a full result every K consecutive diffs per tool "
+                         "(default 5; 0 disables)")
     im.add_argument("--print", action="store_true",
                     help="dry-run: show the before/after without writing")
     im.set_defaults(func=_cmd_install_mcp)

@@ -256,17 +256,19 @@ gitignored because captured tool output may contain real data.
   merging, and any client method outside `initialize`/`tools/list`/`tools/call` falls back
   to peer 0 (debug-logged). Each is a documented v1 limitation, not a silent gap — revisit
   if a real workload needs it.
-- **Cross-call diffing is built, opt-in (`proxy --diff`).** The probe shows 91% overlap
-  between successive same-tool calls; the proxy can now emit a lossless delta against the
-  prior result (keyed row diff for record arrays, shallow key diff for objects) instead
-  of the full payload. It is stateful (per-tool last result), self-verifying (a diff is
-  sent only when it provably reconstructs the result), and fail-open (full form whenever
-  a diff doesn't apply or isn't smaller — the dangling-reference fallback). It ships OFF
-  by default because two risks are model-side, not codec-side: (1) the round-trip gate
-  proves the diff reconstructs but **not** that a model *reads* it as well as the full
-  form — checked by `terse fluency --diff`; (2) the diff references the prior result in
-  the model's context, which a context compaction could evict. Enable only after the diff
-  fluency check passes for your consumer. Risk (2) is bounded by **keyframes**: the proxy
+- **Cross-call diffing is built and ON by default (`proxy --no-diff` / policy
+  `"diff": false` to opt out).** The probe shows 91% overlap between successive
+  same-tool calls; the proxy emits a lossless delta against the prior result (keyed row
+  diff for record arrays, shallow key diff for objects) instead of the full payload. It
+  is stateful (per-tool last result), self-verifying (a diff is sent only when it
+  provably reconstructs the result), and fail-open (full form whenever a diff doesn't
+  apply or isn't smaller — the dangling-reference fallback). It shipped opt-in until its
+  two model-side risks were measured, and flipped default-on when that program completed:
+  (1) the round-trip gate proves the diff reconstructs but **not** that a model *reads*
+  it as well as the full form — since PASSED by `terse fluency --diff` (4-model panel,
+  incl. the nested-record surface, #72) and at chain depth by `fluency --diff-soak`
+  (#75); (2) the diff references the prior result in the model's context, which a
+  context compaction could evict. Risk (2) is bounded by **keyframes**: the proxy
   forces a self-contained full result after every K consecutive diffs per tool, so a
   chained diff can never drift more than K turns from an anchor a model can reconstruct
   from scratch (`diff_keyframe_interval` policy field / `proxy --diff-keyframe-interval K`,
@@ -279,8 +281,8 @@ gitignored because captured tool output may contain real data.
   unbounded chain — with an independent client-side reconstructor asserting exactness at
   every hop; `terse fluency --diff-soak` measures the model-side analogue (accuracy vs
   chain depth, up to the keyframe bound). The residual gap — a context *compaction* with
-  no reconnect — is unobservable over stdio, and is the standing reason `--diff` is
-  opt-in.
+  no reconnect — is unobservable over stdio; keyframes cap its blast radius at K turns,
+  and `--no-diff` remains the escape hatch for a consumer where that residual matters.
 - **Text diff (Tier 0.7 text, #25) covers non-JSON results, but only the codec side is
   measured so far.** File reads, source excerpts, and log tails get `applicable: False`
   in `measure_payload` — zero Tier-0 compression — and used to get zero cross-call
