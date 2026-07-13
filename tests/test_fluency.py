@@ -530,3 +530,117 @@ def test_openai_answerer_allows_https_with_key():
 def test_openai_answerer_allows_http_without_key():
     # no key set -> nothing secret to leak, so plain http is permitted
     assert callable(fluency.openai_answerer("http://api.example.com/v1", "", "gpt-x"))
+
+
+# --- diff-chain soak (#8/#20 follow-up): depth-k windows + chained-diff form ---
+
+def _soak_envs(tool="gh.items", n=8, start_id=0):
+    """n consecutive envelopes for one tool, each a small mutation of the last —
+    every hop admits a lossless row diff (update-in-place, append at the end)."""
+    envs = []
+    rows = [{"id": i, "status": "active", "score": i % 7} for i in range(start_id, start_id + 20)]
+    for k in range(n):
+        if k:
+            rows[k % len(rows)]["status"] = f"state-{k}"
+            rows.append({"id": start_id + 20 + k, "status": "new", "score": k})
+        envs.append({"tool": tool, "sha": f"s{k:02d}",
+                     "raw": json.dumps({"result": [dict(r) for r in rows]})})
+    return envs
+
+
+def test_build_chain_windows_yields_every_depth_and_valid_hops():
+    from terse.transforms import diff_wire
+
+    windows = fluency.build_chain_windows(_soak_envs(n=8), max_depth=3, per_depth_cap=4)
+    depths = {d for _, _, d, _ in windows}
+    assert depths == {1, 2, 3}
+    for tool, sha, depth, objs in windows:
+        assert len(objs) == depth + 1
+        for prev, curr in zip(objs, objs[1:]):
+            assert diff_wire(prev, curr, tool) is not None   # every hop truly chains
+        assert fluency.gen_questions(objs[-1])               # final state is askable
+
+
+def test_build_chain_windows_never_spans_a_diff_break():
+    # an unrelated payload mid-run splits it: no window may bridge the break, because
+    # in production that hop would have re-anchored as a full, ending the chain.
+    envs = _soak_envs(n=4)
+    envs.insert(2, {"tool": "gh.items", "sha": "sXX",
+                    "raw": json.dumps({"totally": "different", "shape": [1, 2, 3]})})
+    windows = fluency.build_chain_windows(envs, max_depth=3, per_depth_cap=8)
+    from terse.transforms import diff_wire
+    for tool, _sha, _depth, objs in windows:
+        for prev, curr in zip(objs, objs[1:]):
+            assert diff_wire(prev, curr, tool) is not None
+
+
+def test_run_chain_payload_context_carries_one_full_plus_depth_wires():
+    envs = _soak_envs(n=4)
+    objs = [json.loads(e["raw"]) for e in envs]
+    seen: list[str] = []
+
+    def spy(system, user):
+        seen.append(user)
+        return ""
+
+    rows = fluency.run_chain_payload(objs, spy, tool="gh.items", trials=1)
+    assert rows and all(r["depth"] == 3 for r in rows)
+    chain_prompts = [u for u in seen if "UPDATE (diff against the result above" in u]
+    assert chain_prompts                                     # the chain form was asked
+    assert all(u.count("UPDATE (diff against the result above") == 3
+               for u in chain_prompts)                       # exactly depth wires
+    assert all(u.count("PREVIOUS RESULT:") == 1 for u in chain_prompts)  # one anchor
+
+
+def test_run_chain_payload_empty_when_a_hop_stops_diffing():
+    objs = [json.loads(e["raw"]) for e in _soak_envs(n=3)]
+    objs.append({"totally": "different", "shape": [1, 2, 3]})  # last hop can't diff
+    assert fluency.run_chain_payload(objs, lambda s, u: "", tool="gh.items") == []
+
+
+def test_run_diff_soak_rows_carry_depth_per_model():
+    results = fluency.run_diff_soak(_soak_envs(n=8), {"m1": lambda s, u: ""},
+                                    trials=1, max_depth=3, per_depth_cap=2)
+    assert set(results) == {"m1"}
+    assert {r["depth"] for r in results["m1"]} == {1, 2, 3}
+    assert all({"tool", "sha", "qid", "terse_ok", "diff_ok"} <= set(r)
+               for r in results["m1"])
+
+
+def test_build_diff_soak_report_by_depth_table_and_verdicts():
+    from terse.report import build_diff_soak_report
+
+    rows = [{"tool": "gh.items", "sha": "s", "qid": "count", "qtype": "count",
+             "transform": "tabularize", "trials": 1, "depth": d,
+             "terse_ok": 1, "diff_ok": 1} for d in (1, 2, 3) for _ in range(4)]
+    report = build_diff_soak_report({"m1": rows})
+    assert "## Accuracy by chain depth" in report
+    assert "At the deepest tested depth (3)" in report
+    assert "**PASS**" in report and "No depth-correlated comprehension drift" in report
+
+    # a depth-correlated slide beyond tolerance must FAIL the deepest-depth gate
+    bad = [dict(r, diff_ok=0 if r["depth"] == 3 else 1) for r in rows]
+    report = build_diff_soak_report({"m1": bad})
+    assert "**FAIL**" in report
+
+    # empty results explain how to get soakable data
+    assert "diffable RUNS" in build_diff_soak_report({})
+
+
+def test_flat_record_questions_cover_single_record_payloads():
+    # a single flat record (search hit, status receipt, one KB row): keys-count plus
+    # deterministic numeric/string lookups — the diff surface the soak was blind to.
+    obj = {"type": "note", "id": 42, "title": "diff soak", "snippet": "x" * 200,
+           "score": 0.87, "nested": {"skip": True}}
+    qs = fluency.gen_questions(obj)
+    by_qid = {q.qid: q for q in qs}
+    assert by_qid["keys-count"].expected == 6            # counts ALL keys
+    assert by_qid["field-0"].expected == 42              # first numeric by sorted key
+    assert by_qid["field-1"].expected == "diff soak"     # long/nested values not asked
+    assert all(q.transform == "flat-record" for q in qs)
+
+
+def test_flat_record_questions_stay_silent_when_underqualified():
+    assert fluency.gen_questions({"just": "an object", "two": 2}) == []   # <3 lookable
+    assert fluency.gen_questions({"__terse_dict__": 1, "a": 1, "b": 2, "c": 3}) == []
+    assert fluency.gen_questions({"a": "", "b": "y" * 999, "c": None, "d": True}) == []

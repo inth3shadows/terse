@@ -127,6 +127,9 @@ repeated objects, not just strings) is built. Cross-call diffing is built as an
 **opt-in** lossless tier (`proxy --diff` / `install-mcp --diff`); its fluency gate
 (`fluency --diff`) has passed on both the record surface (4-model panel, 100%) and the
 nested-record surface (`structure`: diff 100% vs full-terse 94%), so it's cleared for
-live use. The Tier 1 lossy modes `truncate` and
+live use. Long-chain drift is soaked from both sides: mechanically
+(`tests/test_diff_soak.py` — exact reconstruction hundreds of chained hops deep) and
+behaviorally (`fluency --diff-soak` — model accuracy vs chain depth up to the keyframe
+bound). The Tier 1 lossy modes `truncate` and
 `drop-to-retrieve` are built (opt-in, off by default); `summarize` remains designed but
 not yet built — see TECHNICAL.md "Known Limitations".

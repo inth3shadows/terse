@@ -273,8 +273,14 @@ gitignored because captured tool output may contain real data.
   default 5; 0 disables). A client *reconnect* (a new MCP `initialize`) is a stronger
   reset signal: the proxy drops every per-tool diff base on it, so the next result of
   each tool re-anchors as a full rather than a delta against a base the rebuilt context
-  no longer holds (#20). The residual gap — a context *compaction* with no reconnect — is
-  unobservable over stdio, and is the standing reason `--diff` is opt-in.
+  no longer holds (#20). Both properties are **soaked, not just unit-tested**: the drift
+  soak (`tests/test_diff_soak.py`) drives the real Interceptor hundreds of chained hops
+  deep — interleaved tools, error interludes, a mid-soak reconnect, and a 300-diff
+  unbounded chain — with an independent client-side reconstructor asserting exactness at
+  every hop; `terse fluency --diff-soak` measures the model-side analogue (accuracy vs
+  chain depth, up to the keyframe bound). The residual gap — a context *compaction* with
+  no reconnect — is unobservable over stdio, and is the standing reason `--diff` is
+  opt-in.
 - **Text diff (Tier 0.7 text, #25) covers non-JSON results, but only the codec side is
   measured so far.** File reads, source excerpts, and log tails get `applicable: False`
   in `measure_payload` — zero Tier-0 compression — and used to get zero cross-call

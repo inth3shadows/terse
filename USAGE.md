@@ -354,6 +354,25 @@ questions and PASS/FAILs on the worst model — run it before enabling `proxy --
 your consumer. The diff is always lossless and only sent when smaller; it falls back to
 the full compressed form whenever no diff applies or the prior result isn't available.
 
+### The depth dimension: `fluency --diff-soak`
+
+`--diff` tests one hop (full result + one diff). In production a model reads up to
+`--diff-keyframe-interval` (default 5) **consecutive** diffs off one full anchor
+before the proxy re-anchors — so the question gating a default-flip is whether
+comprehension *drifts* with chain depth:
+
+```
+# real corpus runs, depths 1..5 (6 chain windows per depth, round-robin across tools):
+TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \
+  uv run terse fluency --diff-soak --corpus corpus --trials 3
+```
+
+The report shows accuracy by depth (chain form vs full-terse control on the same
+final-state questions) and PASS/FAILs both overall and at the deepest tested depth,
+worst model. The mechanical half of the same soak — hundreds of chained hops
+reconstructed exactly, keyframe cadence, reconnect resets — is pinned in
+`tests/test_diff_soak.py` and runs in CI.
+
 ### Text diffing and its fluency check (`fluency --text-diff-eval`)
 
 The diff above only reasons about JSON. Non-JSON tool output (file reads, source

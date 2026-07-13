@@ -376,6 +376,7 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
     from .policy import default_policy, load_policy
     from .report import (
         build_diff_report,
+        build_diff_soak_report,
         build_dropeval_report,
         build_fluency_report,
         build_text_diff_report,
@@ -430,6 +431,23 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         _write_report(build_diff_report(results), args.out)
         if args.bars:
             print("\n" + build_terminal_diff_report(results))
+        return 0
+
+    # Diff-chain soak: the DEPTH dimension --diff can't see (#8/#20 follow-up) — does
+    # comprehension drift as consecutive diffs chain off one full anchor? Depth 5 is
+    # the production keyframe bound, so a PASS here covers the deployed worst case.
+    if args.diff_soak:
+        answerers = _build_answerers(args, fluency.openai_answerer)
+        if not answerers:
+            print("`fluency --diff-soak` needs a configured model: set TERSE_FLUENCY_BASE_URL/"
+                  "_API_KEY/_MODELS.")
+            return 1
+        results = fluency.run_diff_soak(envelopes, answerers, trials=args.trials,
+                                        max_depth=args.soak_depth,
+                                        per_depth_cap=args.soak_windows)
+        _write_report(build_diff_soak_report(results), args.out)
+        if args.bars:
+            print("\n" + build_terminal_diff_report(results, form_label="chain-form"))
         return 0
 
     # Text-diff mode: does a model reconstruct the current TEXT as well from (previous
@@ -811,6 +829,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="behavioral eval: does a model reconstruct the current TEXT as "
                         "accurately from (previous text + text-diff) as from the full "
                         "text? needs same-tool TEXT corpus pairs + a configured model")
+    f.add_argument("--diff-soak", action="store_true",
+                   help="drift soak: does comprehension degrade as a model reads chains "
+                        "of consecutive diffs off one full anchor? scores depths "
+                        "1..--soak-depth over real corpus runs (needs a configured model)")
+    f.add_argument("--soak-depth", type=int, default=5, metavar="K",
+                   help="--diff-soak: deepest chain to test (default 5 — the production "
+                        "keyframe interval, i.e. the deployed worst case)")
+    f.add_argument("--soak-windows", type=int, default=6, metavar="N",
+                   help="--diff-soak: max chain windows per depth, round-robin across "
+                        "tools (default 6)")
     f.add_argument("--drop-eval", action="store_true",
                    help="behavioral eval: does a real tool-calling model call terse.retrieve "
                         "when a dropped field is needed (recall), and leave it alone when "
