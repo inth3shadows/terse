@@ -182,9 +182,19 @@ def test_second_same_tool_result_emits_smaller_lossless_diff():
     assert _cost_lt(diff_text, full)                     # and it is smaller
 
 
-def test_diff_off_by_default_sends_full_both_times():
-    inter = Interceptor(FULL)  # diff flag defaults off
+def test_diff_on_by_default_and_policy_false_disables():
+    # Since #75 completed the validation program, Policy.diff defaults ON: a plain
+    # policy diffs the second same-tool result with no flag at all …
+    inter = Interceptor(FULL)
     prev, curr = _records(40), _records(40, change=5)
+    _emit(inter, 1, "gh.api.items", prev)
+    t2 = _emit(inter, 2, "gh.api.items", curr)
+    env = json.loads(t2)
+    assert env.get(transforms.DIFF_MARKER) == 1
+    assert transforms.diff_decode(prev, env) == curr
+    # … and an explicit "diff": false opt-out still sends fulls both times.
+    off = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))], diff=False)
+    inter = Interceptor(off)
     t1 = _emit(inter, 1, "gh.api.items", prev)
     t2 = _emit(inter, 2, "gh.api.items", curr)
     assert transforms.DIFF_MARKER not in t1 and transforms.DIFF_MARKER not in t2
@@ -298,9 +308,17 @@ def test_second_non_json_result_emits_smaller_lossless_text_diff():
     assert raw_first == prev  # sanity: first call was untouched
 
 
-def test_text_diff_off_by_default_sends_raw_both_times():
-    inter = Interceptor(FULL)  # diff flag defaults off
+def test_text_diff_on_by_default_and_policy_false_disables():
+    # Same default flip for the CDC text path: on by default, off via "diff": false.
+    inter = Interceptor(FULL)
     prev, curr = _log_text(80), _log_text(80, changed_line=40)
+    _emit_text(inter, 1, "fs.read", prev)
+    t2 = _emit_text(inter, 2, "fs.read", curr)
+    env = json.loads(t2)
+    assert env.get(text_diff.DIFF_MARKER) == 1
+    assert text_diff.text_diff_decode(prev, env) == curr
+    off = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))], diff=False)
+    inter = Interceptor(off)
     t1 = _emit_text(inter, 1, "fs.read", prev)
     t2 = _emit_text(inter, 2, "fs.read", curr)
     assert t1 == prev and t2 == curr

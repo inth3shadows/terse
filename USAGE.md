@@ -129,12 +129,17 @@ uv run terse uninstall-mcp --all          # every terse-managed server
 the entry's `env`/`cwd`/etc. The original is saved verbatim in a sidecar stash
 (`.terse-mcp-stash.json` next to the config), so `uninstall-mcp` restores it
 byte-for-byte. It's **idempotent** (re-running re-wraps from the stashed original
-instead of nesting proxies) and never enables `--diff` implicitly — pass
-`install-mcp --diff` (optionally `--diff-keyframe-interval K`) to wrap with
-cross-call diffing on; a re-install without the flag drops it again. It honors
-`$CLAUDE_CONFIG` if your config isn't at `~/.claude.json`. Start with one
-high-win, read-only server (e.g. `runecho`) and confirm it works before
-wrapping more.
+instead of nesting proxies). Cross-call diffing is the proxy default, so a plain
+wrap inherits it; pass `install-mcp --no-diff` to bake an opt-out into a server's
+entry (or `--diff` to override a policy-file `"diff": false`), and
+`--diff-keyframe-interval K` to tune re-anchoring. Flags always reflect the latest
+install invocation. It honors `$CLAUDE_CONFIG` if your config isn't at
+`~/.claude.json`. Start with one high-win, read-only server (e.g. `runecho`) and
+confirm it works before wrapping more.
+
+One sharp edge worth knowing: a re-wrap rebuilds the entry from the **stashed
+original**, so any hand-edit you made to the *wrapped* entry (say, an `env.PATH`
+pin) is dropped — apply such edits to the stash original too.
 
 Claude Code has three MCP scopes, and `--scope` targets any of them (default
 `user`, i.e. today's behavior):
@@ -335,31 +340,34 @@ final-answer accuracy — gated on the worst model. Run this before enabling
 
 ### Cross-call diffing and its fluency check
 
-The proxy can emit a lossless **delta** against the prior same-tool result instead of
+The proxy emits a lossless **delta** against the prior same-tool result instead of
 the full payload — big in agent loops that call the same tool repeatedly (~91% overlap).
-It is **opt-in** and stateful:
+It is stateful and **on by default** (its validation program — pair fluency,
+nested-record coverage, and the drift soak — has passed; see TECHNICAL.md):
 
 ```
-# enable it on the proxy (off by default):
-uv run terse proxy --diff -- uvx some-mcp-server
+# nothing to enable — a plain proxy diffs. Opt OUT per proxy:
+uv run terse proxy --no-diff -- uvx some-mcp-server
+# or per policy file: {"diff": false, ...}
 
-# before trusting it, check a model still reads the diff as well as the full result.
+# re-run the fluency gate against your own consumer/model anytime.
 # needs same-tool PAIRS in the corpus (capture a tool 2+ times) + a configured model:
 TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \
   uv run terse fluency --diff --corpus corpus
 ```
 
 `fluency --diff` reports diff-form accuracy vs full-result accuracy on the same
-questions and PASS/FAILs on the worst model — run it before enabling `proxy --diff` for
-your consumer. The diff is always lossless and only sent when smaller; it falls back to
-the full compressed form whenever no diff applies or the prior result isn't available.
+questions and PASS/FAILs on the worst model — re-run it for a new/weaker consumer
+before trusting the default. The diff is always lossless and only sent when smaller;
+it falls back to the full compressed form whenever no diff applies or the prior
+result isn't available.
 
 ### The depth dimension: `fluency --diff-soak`
 
 `--diff` tests one hop (full result + one diff). In production a model reads up to
 `--diff-keyframe-interval` (default 5) **consecutive** diffs off one full anchor
-before the proxy re-anchors — so the question gating a default-flip is whether
-comprehension *drifts* with chain depth:
+before the proxy re-anchors — so the question that gated the default-flip (and gates
+raising the keyframe interval) is whether comprehension *drifts* with chain depth:
 
 ```
 # real corpus runs, depths 1..5 (6 chain windows per depth, round-robin across tools):
@@ -377,9 +385,9 @@ reconstructed exactly, keyframe cadence, reconnect resets — is pinned in
 
 The diff above only reasons about JSON. Non-JSON tool output (file reads, source
 excerpts, log tails) gets its own diff codec (Tier 0.7, `text_diff.py`) — same
-lossless/opt-in/falls-back-to-full contract, applied to unstructured text instead of
-records. `--text-diff-eval` is its behavioral check, the text-payload analogue of
-`--diff`:
+lossless/on-by-default/falls-back-to-full contract, applied to unstructured text
+instead of records. `--text-diff-eval` is its behavioral check, the text-payload
+analogue of `--diff`:
 
 ```
 # needs same-tool TEXT payload PAIRS in the corpus (capture a text-producing tool
@@ -389,11 +397,11 @@ TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \
 ```
 
 It asks whether a model reconstructs the current text as accurately from (previous text
-+ text-diff) as from the full current text, and PASS/FAILs on the worst model — run it
-before enabling `proxy --diff` for text-heavy tools. There's no separate proxy flag: the
-same `proxy --diff` above already emits a text diff instead of a JSON diff whenever the
-payload isn't JSON, so this eval is a risk-item check on that existing behavior, not a
-new switch.
++ text-diff) as from the full current text, and PASS/FAILs on the worst model — re-run
+it for a new consumer of text-heavy tools. There's no separate switch: the same
+default-on diffing emits a text diff instead of a JSON diff whenever the payload isn't
+JSON (and `--no-diff` turns both off together), so this eval is a risk-item check on
+existing behavior.
 
 ### Building a sample set
 

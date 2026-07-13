@@ -24,9 +24,9 @@ physical file and the key path inside it that holds `mcpServers`.
 
 The original entry is preserved verbatim in a sidecar stash so `uninstall` can
 restore it byte-for-byte. The wrap is idempotent (re-running re-wraps from the
-stashed original rather than double-wrapping) and never enables `--diff`
-implicitly — cross-call diffing is opt-in via `install-mcp --diff` (its model-
-fluency is validated by `terse fluency --diff`/`--text-diff-eval`). The
+stashed original rather than double-wrapping). Cross-call diffing is the proxy
+DEFAULT since #75; a plain wrap writes no diff flag and inherits it, while
+`install-mcp --diff`/`--no-diff` bake an explicit override into the entry. The
 stash is namespaced by scope (`Target.stash_prefix`) so the same server can be
 independently managed in more than one scope — user and local both live in
 `~/.claude.json` and would otherwise collide in one flat stash.
@@ -144,16 +144,16 @@ def terse_invocation() -> list[str]:
 # ------------------------------------------------------------------- pure core
 def wrap(config: dict, stash: dict, server: str, policy: str,
          terse_cmd: list[str], capture_dir: str | None = None,
-         diff: bool = False,
+         diff: bool | None = None,
          diff_keyframe_interval: int | None = None) -> tuple[dict, dict]:
     """Wrap `server`'s entry with the terse proxy. Idempotent: if already managed
     (present in stash), re-wrap from the stashed original so policy/cmd updates
     apply cleanly without nesting proxies. Preserves all non-command/args (and, for a
     URL entry, non-url/headers) keys (env, cwd, type, …) of the original entry. With
     `capture_dir`, the wrapped proxy tees raw tool results into that corpus for later
-    measurement (#32). With `diff`, the wrapped proxy runs with cross-call diffing
-    (`proxy --diff`); a re-wrap without it drops the flag again — the flags always
-    reflect the latest install invocation, never accumulate.
+    measurement (#32). `diff` is tri-state: None writes no flag (the entry inherits
+    the proxy default — ON since #75), True/False bake `--diff`/`--no-diff` into the
+    entry; a re-wrap always reflects the latest invocation, flags never accumulate.
 
     Two shapes of original entry are wrappable: a stdio server (`command` + optional
     `args`) and an HTTP/SSE server (`url` + optional `headers`, #5) — the latter is
@@ -172,10 +172,10 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
     proxy_opts = ["--policy", policy]
     if capture_dir:
         proxy_opts += ["--capture-dir", capture_dir]
-    if diff:
-        proxy_opts += ["--diff"]
-        if diff_keyframe_interval is not None:
-            proxy_opts += ["--diff-keyframe-interval", str(diff_keyframe_interval)]
+    if diff is not None:
+        proxy_opts += ["--diff"] if diff else ["--no-diff"]
+    if diff is not False and diff_keyframe_interval is not None:
+        proxy_opts += ["--diff-keyframe-interval", str(diff_keyframe_interval)]
 
     orig_cmd = original.get("command")
     if orig_cmd:
@@ -275,7 +275,7 @@ def _backup(cfg: Path) -> Path:
 
 def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
                cfg: Path | None = None, capture_dir: str | None = None,
-               diff: bool = False, diff_keyframe_interval: int | None = None,
+               diff: bool | None = None, diff_keyframe_interval: int | None = None,
                scope: str = "user", file: str | None = None,
                repo_path: str | None = None) -> dict:
     target = resolve_target(scope, cfg=cfg, file=file, repo_path=repo_path)

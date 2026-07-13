@@ -58,10 +58,12 @@ class Rule:
 class Policy:
     rules: list[Rule]
     default_tiers: tuple[str, ...] = ("minify", "tabularize", "dictionary")
-    # Cross-call diffing is stateful and its model-fluency is unproven, so it is OFF by
-    # default: enable per-policy (`"diff": true`) or with `proxy --diff`. The proxy still
-    # falls back to the full compressed form whenever a diff doesn't apply or win.
-    diff: bool = False
+    # Cross-call diffing is ON by default since its validation program completed —
+    # pair fluency (`fluency --diff`), nested-record coverage (#72), and the drift
+    # soak (#75: mechanical zero-drift, depth-1..5 behavioral PASS). Opt out
+    # per-policy (`"diff": false`) or with `proxy --no-diff`. The proxy still falls
+    # back to the full compressed form whenever a diff doesn't apply or win.
+    diff: bool = True
     # Bound dangling-reference drift (#8): force a self-contained full result (a
     # keyframe, like video I-frames) after this many consecutive diffs per tool, so a
     # chained diff can never drift more than K turns from an anchor the model can
@@ -122,7 +124,7 @@ def load_policy(path: str | Path) -> Policy:
         glob = match.get("tool", "*")
         rules.append(Rule(tool_glob=glob, tiers=_coerce_tiers(r.get("tiers", []), f"policies[{i}]"),
                           fields=r.get("fields", {})))
-    return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", False)),
+    return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", True)),
                   diff_keyframe_interval=int(doc.get("diff_keyframe_interval", 5)))
 
 
