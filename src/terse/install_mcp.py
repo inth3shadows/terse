@@ -25,7 +25,8 @@ physical file and the key path inside it that holds `mcpServers`.
 The original entry is preserved verbatim in a sidecar stash so `uninstall` can
 restore it byte-for-byte. The wrap is idempotent (re-running re-wraps from the
 stashed original rather than double-wrapping) and never enables `--diff`
-implicitly (diff fluency is unverified — see the diff-fluency reports). The
+implicitly — cross-call diffing is opt-in via `install-mcp --diff` (its model-
+fluency is validated by `terse fluency --diff`/`--text-diff-eval`). The
 stash is namespaced by scope (`Target.stash_prefix`) so the same server can be
 independently managed in more than one scope — user and local both live in
 `~/.claude.json` and would otherwise collide in one flat stash.
@@ -142,13 +143,17 @@ def terse_invocation() -> list[str]:
 
 # ------------------------------------------------------------------- pure core
 def wrap(config: dict, stash: dict, server: str, policy: str,
-         terse_cmd: list[str], capture_dir: str | None = None) -> tuple[dict, dict]:
+         terse_cmd: list[str], capture_dir: str | None = None,
+         diff: bool = False,
+         diff_keyframe_interval: int | None = None) -> tuple[dict, dict]:
     """Wrap `server`'s entry with the terse proxy. Idempotent: if already managed
     (present in stash), re-wrap from the stashed original so policy/cmd updates
     apply cleanly without nesting proxies. Preserves all non-command/args (and, for a
     URL entry, non-url/headers) keys (env, cwd, type, …) of the original entry. With
     `capture_dir`, the wrapped proxy tees raw tool results into that corpus for later
-    measurement (#32).
+    measurement (#32). With `diff`, the wrapped proxy runs with cross-call diffing
+    (`proxy --diff`); a re-wrap without it drops the flag again — the flags always
+    reflect the latest install invocation, never accumulate.
 
     Two shapes of original entry are wrappable: a stdio server (`command` + optional
     `args`) and an HTTP/SSE server (`url` + optional `headers`, #5) — the latter is
@@ -167,6 +172,10 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
     proxy_opts = ["--policy", policy]
     if capture_dir:
         proxy_opts += ["--capture-dir", capture_dir]
+    if diff:
+        proxy_opts += ["--diff"]
+        if diff_keyframe_interval is not None:
+            proxy_opts += ["--diff-keyframe-interval", str(diff_keyframe_interval)]
 
     orig_cmd = original.get("command")
     if orig_cmd:
@@ -266,6 +275,7 @@ def _backup(cfg: Path) -> Path:
 
 def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
                cfg: Path | None = None, capture_dir: str | None = None,
+               diff: bool = False, diff_keyframe_interval: int | None = None,
                scope: str = "user", file: str | None = None,
                repo_path: str | None = None) -> dict:
     target = resolve_target(scope, cfg=cfg, file=file, repo_path=repo_path)
@@ -296,13 +306,14 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
     changes = []
     for s in servers:
         before = (node.get("mcpServers") or {}).get(s)
-        wrap(node, stash, s, policy_abs, terse_cmd, capture_dir=capture_abs)
+        wrap(node, stash, s, policy_abs, terse_cmd, capture_dir=capture_abs,
+             diff=diff, diff_keyframe_interval=diff_keyframe_interval)
         changes.append({"server": s, "before": before,
                         "after": node["mcpServers"][s]})
 
     result = {"config": str(target.cfg), "scope": scope, "policy": policy_abs,
               "available": available, "changes": changes, "dry_run": dry_run,
-              "backup": None, "capture_dir": capture_abs}
+              "backup": None, "capture_dir": capture_abs, "diff": diff}
     if not dry_run and changes:
         result["backup"] = str(_backup(target.cfg))
         _write_json(target.cfg, config, trailing_newline=had_nl)

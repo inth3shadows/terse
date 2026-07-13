@@ -565,8 +565,9 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
 
     try:
         res = do_install(args.servers, args.policy, dry_run=args.print,
-                         capture_dir=args.capture_dir, scope=args.scope,
-                         file=args.file, repo_path=args.repo_path)
+                         capture_dir=args.capture_dir, diff=args.diff,
+                         diff_keyframe_interval=args.diff_keyframe_interval,
+                         scope=args.scope, file=args.file, repo_path=args.repo_path)
     except (FileNotFoundError, ValueError) as e:
         print(f"install-mcp: {e}", file=sys.stderr)
         return 2
@@ -578,6 +579,8 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
     print(f"config: {res['config']}  scope: {res['scope']}  policy: {res['policy']}")
     if res.get("capture_dir"):
         print(f"capture: raw tool results → {res['capture_dir']}")
+    if res.get("diff"):
+        print("diff: cross-call diffing enabled (proxy --diff)")
     if res["backup"]:
         print(f"backup: {res['backup']}")
     if not res["dry_run"] and res["changes"]:
@@ -768,7 +771,8 @@ def main(argv: list[str] | None = None) -> int:
                          "to bound dangling-reference drift (default 5; 0 disables)")
     px.add_argument("--diff", action="store_true",
                     help="enable cross-call diffing (stateful; emits a lossless delta vs the "
-                         "prior same-tool result when smaller). Opt-in: fluency unverified")
+                         "prior same-tool result when smaller). Opt-in; model-fluency "
+                         "validated by `terse fluency --diff`/`--text-diff-eval`")
     px.add_argument("--debug", action="store_true", help="log compressions to stderr")
     px.add_argument("--capture-dir", metavar="DIR",
                     help="tee each raw tool-result payload into this corpus dir for later "
@@ -840,6 +844,12 @@ def main(argv: list[str] | None = None) -> int:
     im.add_argument("--capture-dir", metavar="DIR",
                     help="also tee raw tool results into this corpus dir for later "
                          "`terse measure`/`verify` (opt-in; never affects forwarding)")
+    im.add_argument("--diff", action="store_true",
+                    help="wrap with cross-call diffing enabled (`proxy --diff`); a "
+                         "re-install without this flag drops it again")
+    im.add_argument("--diff-keyframe-interval", type=int, default=None, metavar="K",
+                    help="with --diff, force a full result every K consecutive diffs "
+                         "per tool (default 5; 0 disables)")
     im.add_argument("--print", action="store_true",
                     help="dry-run: show the before/after without writing")
     im.set_defaults(func=_cmd_install_mcp)

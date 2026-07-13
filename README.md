@@ -33,7 +33,8 @@ then (optionally) serves it through a per-tool policy that decides which tiers r
   repeatedly, the proxy can emit a lossless delta against the prior result instead of
   the full payload (the 91%-overlap headroom). Self-describing, verified to reconstruct
   exactly, and emitted only when smaller — falls back to the full form otherwise. OFF by
-  default (`proxy --diff`); its model-fluency is checked by `terse fluency --diff`.
+  default (`proxy --diff`, or `install-mcp --diff` when wrapping Claude Code servers);
+  its model-fluency is validated by `terse fluency --diff`.
   Record-shaped JSON gets a row/key diff; non-JSON results (file reads, source excerpts,
   log tails) get a separate content-defined-chunking (CDC) diff — a rolling hash cuts
   chunk boundaries by content, not position, so an edit anywhere only perturbs the
@@ -122,8 +123,10 @@ stdio proxy. The proxy's open question — *does a model read the compressed for
 well as raw JSON?* — now has a measured answer: on a stress corpus, Claude Haiku 4.5
 and Gemini 2.5 Flash match raw-JSON accuracy on the compressed form (100% paired) at a
 37% token saving (`terse fluency`; see TECHNICAL.md). Whole-subtree aliasing (folding
-repeated objects, not just strings) is built. Cross-call diffing is now built as an
-**opt-in** lossless tier (`proxy --diff`), with its own fluency check (`fluency --diff`)
-gating whether it's safe to enable. The Tier 1 lossy modes `truncate` and
+repeated objects, not just strings) is built. Cross-call diffing is built as an
+**opt-in** lossless tier (`proxy --diff` / `install-mcp --diff`); its fluency gate
+(`fluency --diff`) has passed on both the record surface (4-model panel, 100%) and the
+nested-record surface (`structure`: diff 100% vs full-terse 94%), so it's cleared for
+live use. The Tier 1 lossy modes `truncate` and
 `drop-to-retrieve` are built (opt-in, off by default); `summarize` remains designed but
 not yet built — see TECHNICAL.md "Known Limitations".
