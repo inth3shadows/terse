@@ -22,6 +22,7 @@ from typing import Any
 
 from ._secure_io import append_restricted, write_restricted
 from .transforms import (
+    MAX_DEPTH,
     _uniform_dict_list,  # the one canonical "what tabularize folds" rule
 )
 
@@ -40,8 +41,10 @@ _SANITIZE = re.compile(r"[^A-Za-z0-9._-]+")
 # Cap recursion so an adversarially/pathologically nested payload (which json.loads
 # will happily parse) can't blow the stack inside the classifier; real tool output is
 # shallow, and at absurd depth the tabularizer itself would also bail, so returning
-# "no record list" is the safe, mirror-preserving direction (#4).
-_MAX_SHAPE_DEPTH = 200
+# "no record list" is the safe, mirror-preserving direction (#4). The cap is the codec-
+# wide one from transforms (#79) so the classifier and the compression boundaries agree
+# on what "too deep" means.
+_MAX_SHAPE_DEPTH = MAX_DEPTH
 
 
 def _find_record_list(obj: Any, _depth: int = 0) -> list[dict] | None:

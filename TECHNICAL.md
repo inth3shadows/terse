@@ -213,8 +213,8 @@ gitignored because captured tool output may contain real data.
   the proxy injects, the model decides whether to call it, the harness resolves the handle
   exactly as `Interceptor.answer_retrieve` would) scored on retrieve-recall (called when
   needed), no-overfetch (didn't call when not needed), and final-answer accuracy — gated on
-  the worst model, same honesty bar as the rest of `fluency.py`. Live-model-only, no
-  offline/pack mode (mirrors `fluency --diff`'s precedent) — run it before recommending
+  the worst model, same honesty bar as the rest of the `fluency` package. Live-model-only,
+  no offline/pack mode (mirrors `fluency --diff`'s precedent) — run it before recommending
   `drop-to-retrieve` in a generated policy.
 - **Proxy: the model must understand terse's format.** The proxy compresses tool
   results in place, so the model receives the table/legend form. It is self-describing
@@ -300,8 +300,8 @@ gitignored because captured tool output may contain real data.
   the current text as accurately from (previous text + text-diff) as from the full
   current text? Two deterministic questions (line count, exact last line — the part most
   likely new in an append-only log tail) over any same-tool TEXT payload pair in the
-  corpus, paired scoring against the worst model, same honesty bar as the rest of
-  `fluency.py`. Live-model-only, no offline/pack mode (mirrors `--diff`'s precedent) — run
+  corpus, paired scoring against the worst model, same honesty bar as the rest of the
+  `fluency` package. Live-model-only, no offline/pack mode (mirrors `--diff`'s precedent) — run
   it before enabling `proxy --diff` for text-heavy tools against a real model consumer.
 - **Marker collision.** A payload that genuinely contains a reserved
   `__terse_table__` / `__terse_dict__` / `__terse_diff__` key (at any depth) can't be

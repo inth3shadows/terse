@@ -203,9 +203,20 @@ def apply(raw: str, tool: str, policy: Policy,
 
     try:
         obj = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, RecursionError):
+        # RecursionError: nesting so deep even the C parser blows the stack — the
+        # depth guard below can't run on what never parsed.
         return Applied(text=raw, tool=tool, tiers=(), skipped=True,
                        warnings=warnings + ["payload is not JSON; passed through"])
+
+    # Depth guard (#79): the transforms recurse without a depth argument, so a payload
+    # nested past the codec-wide cap is screened out here — same passthrough contract
+    # as the marker guard. Checked iteratively, before any recursive walk (including
+    # has_terse_marker below).
+    if transforms.exceeds_depth(obj):
+        return Applied(text=raw, tool=tool, tiers=(), skipped=True,
+                       warnings=warnings + [f"payload nests deeper than {transforms.MAX_DEPTH} "
+                                            "levels; passed through uncompressed"])
 
     # Marker-collision guard: a payload that already carries a reserved terse marker key
     # can't be compressed without the consumer mis-reading its own data as a terse

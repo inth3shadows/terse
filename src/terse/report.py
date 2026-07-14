@@ -433,7 +433,7 @@ def build_verify_header(corpus_label: str, n_payloads: int) -> str:
         "- **Correctness suite:** `pytest` — the full lossless / diff / proxy test set "
         "(runs in CI on Python 3.11–3.13).",
         '- **No UNEXPECTED egress:** `grep -rE "requests|urllib|socket" src/terse` finds '
-        "real network code in three places — `fluency.py` and `dropeval.py` (each an "
+        "real network code in three places — `fluency/answerers.py` and `dropeval.py` (each an "
         "explicit, opt-in model eval) and `transport.py` (the proxy's own downstream "
         "connection). A stdio-only downstream makes zero network calls; an HTTP/SSE "
         "downstream (opt-in via `--config`/a `url`-configured server) talks only to the "
