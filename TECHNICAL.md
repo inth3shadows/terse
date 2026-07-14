@@ -46,6 +46,14 @@ raw tool output (JSON text)
 - **Selective, fail-closed policy.** Value is per-tool, so a policy gates which tiers
   run. An unmatched tool gets the lossless default and never a lossy op.
 - **Determinism.** No clock/random in the transform path; same input → same output.
+- **Prior art on the primitive vs. the bundle.** Lossless tabularization of uniform
+  JSON arrays is independently published elsewhere (e.g. [TOON](https://toonformat.dev/),
+  MIT-licensed, ~40% reduction, its own benchmark). terse doesn't claim novelty on
+  that transform in isolation. The differentiated surface is the combination: an
+  MCP-transport-agnostic proxy (no client/server changes required), cross-call
+  diffing, a `drop-to-retrieve` lossy escape hatch, and a behavioral fluency gate
+  (`terse fluency`) that every diff/lossy tier had to pass before it shipped on by
+  default — none of the comparable formats or proxies bundle all of that.
 
 ## File Descriptions
 

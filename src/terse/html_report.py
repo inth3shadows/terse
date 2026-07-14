@@ -380,10 +380,10 @@ def build_html_report(rows: list[dict[str, Any]], coverage: dict[str, Any],
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>terse spike report</title>
+<title>terse measurement report</title>
 <style>{_PAGE_CSS}</style></head>
 <body><main>
-<h1>terse spike report</h1>
+<h1>terse measurement report</h1>
 <p class="sub">Token-savings measurement over the captured corpus. Charts are inline
 SVG — no JS, no network. Hover a bar/point for its exact value.</p>
 {_attestation_card(*attestation) if attestation else ""}

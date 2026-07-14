@@ -1,6 +1,6 @@
 """Per-tool / per-type policy — the selective shell in front of arbitrary tool output.
 
-The spike showed terse's value is strongly per-tool (0-30%): big on record/symbol-
+Measurement shows terse's value is strongly per-tool (0-30%): big on record/symbol-
 shaped verbose output (gh APIs, runecho), ~0 on already-projected high-cardinality
 data (kb) and single compact objects. So compression must be SELECTIVE, not blanket.
 

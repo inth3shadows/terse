@@ -17,6 +17,16 @@ strongly per-tool (0–30%): large on record/symbol-shaped verbose output, near-
 on already-minified or already-projected tools. So terse applies per-tool policy
 rather than compressing everything blindly.
 
+Lossless tabularization of uniform JSON arrays isn't unique to terse — formats like
+[TOON](https://toonformat.dev/) publish the same primitive as a standalone, MIT-
+licensed encoding (~40% token reduction, independently benchmarked). terse's
+differentiation isn't the tabularization trick alone; it's the bundle: MCP-native
+proxy packaging (transparent to any downstream server, no client-side reformatting
+required), per-tool policy, cross-call diffing, a fluency-gated lossy escape hatch,
+and self-installing ops tooling (`install-mcp`, `mcp-status`) — combined, and each
+diff/lossy tier validated by a behavioral eval before it was ever turned on by
+default.
+
 ## How It Works
 
 terse transforms a tool's JSON output through a tiered, fully-lossless pipeline,
@@ -120,7 +130,7 @@ terse verify --html --out reports/verify-report.md   # + a charted HTML report a
 
 ## Status
 
-Phase-0 spike: a working, measured, selective **lossless** library, CLI, and MCP
+A working, measured, selective **lossless** library, CLI, and MCP
 stdio proxy. The proxy's open question — *does a model read the compressed form as
 well as raw JSON?* — now has a measured answer: on a stress corpus, Claude Haiku 4.5
 and Gemini 2.5 Flash match raw-JSON accuracy on the compressed form (100% paired) at a

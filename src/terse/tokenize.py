@@ -1,6 +1,6 @@
 """Token counting: cl100k (headroom-eval parity) + o200k (cross-tokenizer invariance).
 
-Counters are optional at import time so the spike can run on whatever is installed:
+Counters are optional at import time so terse can run on whatever is installed:
 each returns None when tiktoken is unavailable, and the report shows the gap
 explicitly rather than silently substituting one for the other.
 """

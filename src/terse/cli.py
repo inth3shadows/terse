@@ -1,4 +1,4 @@
-"""terse CLI — Phase-0 spike entrypoint.
+"""terse CLI entrypoint.
 
 Subcommands:
   gate <file|->            run the lossless round-trip gate on a JSON payload
