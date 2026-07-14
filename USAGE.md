@@ -137,9 +137,11 @@ install invocation. It honors `$CLAUDE_CONFIG` if your config isn't at
 `~/.claude.json`. Start with one high-win, read-only server (e.g. `runecho`) and
 confirm it works before wrapping more.
 
-One sharp edge worth knowing: a re-wrap rebuilds the entry from the **stashed
-original**, so any hand-edit you made to the *wrapped* entry (say, an `env.PATH`
-pin) is dropped — apply such edits to the stash original too.
+Hand-edits to a wrapped entry (say, an `env.PATH` pin) survive re-installs: the
+re-wrap rebuilds `command`/`args` from the stashed original but keeps every other
+live key, and reports what it carried (`kept hand-edited key(s) …`). One edge
+remains: `uninstall-mcp` restores the **pre-terse original**, which does not carry
+such edits — put them on the original entry too if they must survive an uninstall.
 
 Claude Code has three MCP scopes, and `--scope` targets any of them (default
 `user`, i.e. today's behavior):

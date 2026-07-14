@@ -107,13 +107,13 @@ def text_diff_encode(prev: str, curr: str) -> dict[str, Any] | None:
             literal.clear()
 
     for ch in curr_chunks:
-        idx = by_fp.get(_fingerprint(ch))
-        if idx is not None and prev_chunks[idx] == ch:
+        ref = by_fp.get(_fingerprint(ch))
+        if ref is not None and prev_chunks[ref] == ch:
             _flush()
-            if ops and ops[-1][0] == "=" and ops[-1][2] == idx - 1:
-                ops[-1][2] = idx
+            if ops and ops[-1][0] == "=" and ops[-1][2] == ref - 1:
+                ops[-1][2] = ref
             else:
-                ops.append(["=", idx, idx])
+                ops.append(["=", ref, ref])
             continue
         literal.append(ch)
     _flush()

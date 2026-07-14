@@ -242,7 +242,7 @@ def test_shared_drop_store_across_peers(tmp_path):
         gh_transport = build_transport([sys.executable, str(FAKE)])
         http_transport = build_transport([_url(srv)])
         try:
-            store: "OrderedDict[str, object]" = OrderedDict()
+            store: OrderedDict[str, object] = OrderedDict()
             store_lock = Lock()
             gh_inter = Interceptor(DROP_POLICY, store=store, store_lock=store_lock)
             http_inter = Interceptor(DROP_POLICY, store=store, store_lock=store_lock)
@@ -384,7 +384,7 @@ def test_interceptor_default_store_is_private_and_unaffected():
 
 
 def test_interceptor_injected_store_is_actually_shared():
-    store: "OrderedDict[str, object]" = OrderedDict()
+    store: OrderedDict[str, object] = OrderedDict()
     lock = Lock()
     a = Interceptor(DROP_POLICY, store=store, store_lock=lock)
     b = Interceptor(DROP_POLICY, store=store, store_lock=lock)
@@ -401,7 +401,7 @@ def test_shared_dropped_bytes_evicts_over_combined_cap_across_peers():
     # DICT was shared (multiproxy._build_peers), so the DROPPED_MAX_BYTES cap never saw
     # the true combined size — two peers each individually under-cap could jointly blow
     # way past it. A shared `dropped_bytes` box fixes that.
-    store: "OrderedDict[str, object]" = OrderedDict()
+    store: OrderedDict[str, object] = OrderedDict()
     lock = Lock()
     dropped_bytes: list[int] = [0]
     a = Interceptor(DROP_POLICY, store=store, store_lock=lock, dropped_bytes=dropped_bytes)
@@ -500,7 +500,7 @@ def test_build_peers_diff_override_reaches_peer_with_own_policy_path(monkeypatch
     monkeypatch.setattr(mp, "build_transport",
                         lambda target, headers=None: _FakePeerTransport())
     own_policy = tmp_path / "own.json"
-    own_policy.write_text(json.dumps({"version": 1, "rules": []}), encoding="utf-8")
+    own_policy.write_text(json.dumps({"version": 1, "policies": []}), encoding="utf-8")  # ("rules" was a schema typo the loader used to swallow — now rejected)
     specs = [
         DownstreamSpec(name="a", target=["a"], headers={}, policy_path=None),
         DownstreamSpec(name="b", target=["b"], headers={}, policy_path=str(own_policy)),

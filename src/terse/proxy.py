@@ -27,13 +27,13 @@ import signal
 import subprocess
 import sys
 from collections import OrderedDict
+from collections.abc import Callable, Iterable
 from threading import Lock, Thread
-from typing import Any, Callable, Optional, TextIO
+from typing import Any, TextIO
 
 from . import lossy as lossy_mod
 from . import policy as policy_mod
-from . import text_diff
-from . import transforms
+from . import text_diff, transforms
 from .tokenize import count_cl100k
 from .transport import HttpTransport, build_transport
 
@@ -117,11 +117,11 @@ class Interceptor:
     DROPPED_MAX_BYTES = 8 << 20  # 8 MiB
 
     def __init__(self, pol: policy_mod.Policy, debug: bool = False,
-                 capture: Optional[Callable[[str, str], None]] = None,
-                 audit: Optional[Callable[[dict], None]] = None,
-                 store: Optional["OrderedDict[str, Any]"] = None,
-                 store_lock: Optional[Lock] = None,
-                 dropped_bytes: Optional[list[int]] = None):
+                 capture: Callable[[str, str], None] | None = None,
+                 audit: Callable[[dict], None] | None = None,
+                 store: OrderedDict[str, Any] | None = None,
+                 store_lock: Lock | None = None,
+                 dropped_bytes: list[int] | None = None):
         self.policy = pol
         # id -> (policy_tool, capture_tool): policy_tool drives compression/policy-tier
         # lookup and MUST be the bare name the policy's rules match against; capture_tool
@@ -164,7 +164,7 @@ class Interceptor:
         # which peer answers it. Default (None) is 100% behavior-preserving for every
         # existing single-peer caller: a fresh private OrderedDict + Lock, exactly as
         # before this parameter existed.
-        self.dropped: "OrderedDict[str, Any]" = store if store is not None else OrderedDict()
+        self.dropped: OrderedDict[str, Any] = store if store is not None else OrderedDict()
         # `dropped_bytes` (#5 Half B): a 1-element box, not a plain int, specifically so
         # it can be SHARED the same way `store` is. `self.dropped` can be one dict shared
         # across N Interceptors, but a plain `self._dropped_bytes = 0` would still be
@@ -203,7 +203,7 @@ class Interceptor:
         # for `_local_lock` while still holding `_store_lock`.
         self._store_lock = store_lock if store_lock is not None else Lock()
 
-    def note_request(self, line: str, *, tool_name: Optional[str] = None) -> None:
+    def note_request(self, line: str, *, tool_name: str | None = None) -> None:
         """Record id -> tool name for tools/call requests, and the initialize request id
         (so its reply can carry the format primer). Side-effect only.
 
@@ -415,7 +415,7 @@ class Interceptor:
             return True
         return False
 
-    def _augment_initialize(self, msg: dict) -> Optional[str]:
+    def _augment_initialize(self, msg: dict) -> str | None:
         """Prepend the terse format primer to the initialize result's `instructions` (#13),
         preserving any the downstream server set. Idempotent. Returns the reserialized
         line, or None to forward unchanged."""
@@ -432,7 +432,7 @@ class Interceptor:
                              "initialize.instructions\n")
         return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
 
-    def _diff_wire(self, prev: Any, curr: Any, tool: str) -> Optional[str]:
+    def _diff_wire(self, prev: Any, curr: Any, tool: str) -> str | None:
         """The on-the-wire diff envelope, or None if no lossless diff applies. Self-
         describing: it names the prior result (already in the model's context) and
         carries the changes inline, so the model reconstructs without an out-of-band
@@ -466,7 +466,7 @@ class Interceptor:
         self.last_text[tool] = text
         return changed
 
-    def _text_diff_wire(self, prev: str, curr: str, tool: str) -> Optional[str]:
+    def _text_diff_wire(self, prev: str, curr: str, tool: str) -> str | None:
         """Fail-open wrapper mirroring `_diff_wire`, for the CDC text-diff codec."""
         try:
             return text_diff.text_diff_wire(prev, curr, tool)
@@ -507,7 +507,7 @@ class Interceptor:
                 _, evicted = self.dropped.popitem(last=False)
                 self._dropped_bytes_box[0] -= len(lossy_mod._serialize(evicted))
 
-    def _inject_retrieve_tool(self, msg: dict) -> Optional[str]:
+    def _inject_retrieve_tool(self, msg: dict) -> str | None:
         """If `msg` is a tools/list result, append the synthetic terse.retrieve tool so the
         model can fetch a drop-to-retrieve field back by handle (#10). Idempotent. Returns
         the reserialized line, or None to forward unchanged (not a tools/list, or already
@@ -525,7 +525,7 @@ class Interceptor:
             sys.stderr.write(f"[terse-proxy] injected {lossy_mod.RETRIEVE_TOOL} into tools/list\n")
         return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
 
-    def answer_retrieve(self, line: str) -> Optional[str]:
+    def answer_retrieve(self, line: str) -> str | None:
         """If `line` is a client tools/call for the synthetic terse.retrieve tool, produce the
         JSON-RPC reply here — from the drop store — instead of forwarding it downstream, which
         has no such tool (#10). Returns the reply line to write back to the client, or None if
@@ -542,6 +542,8 @@ class Interceptor:
             return None
         mid = msg.get("id")
         handle = (params.get("arguments") or {}).get("handle")
+        if not isinstance(handle, str):
+            handle = ""  # a malformed/absent handle can only ever be a miss below
         value = None
         with self._store_lock:
             hit = handle in self.dropped
@@ -565,7 +567,7 @@ class Interceptor:
 
     def _emit_audit(self, tool: str, mid: Any, raw_texts: list[str],
                     text_blocks: list[dict], changed: bool, *,
-                    display_tool: Optional[str] = None) -> None:
+                    display_tool: str | None = None) -> None:
         """Hand the audit callback one replay record per result (#23). Strictly a side
         effect: any error is swallowed so an audit-log write can never change what the
         client receives — same fail-open contract as capture.
@@ -582,10 +584,13 @@ class Interceptor:
             "tiers": list(self.policy.select(tool).tiers),
             "changed": changed,
             "blocks": [{"raw": raw, "emitted": b["text"]}
-                       for raw, b in zip(raw_texts, text_blocks)],
+                       for raw, b in zip(raw_texts, text_blocks, strict=True)],
         }
+        audit = self.audit
+        if audit is None:
+            return  # caller already gates on this; kept for local type-narrowing too
         try:
-            self.audit(record)  # type: ignore[misc]  — only called when set
+            audit(record)
         except Exception as exc:  # noqa: BLE001 — audit is never load-bearing
             if self.debug:
                 sys.stderr.write(f"[terse-proxy] {shown_tool}: audit skipped: {exc}\n")
@@ -597,8 +602,8 @@ class Interceptor:
 SWALLOW: Any = object()
 
 
-def pump(src: TextIO, dst: TextIO, transform: Callable[[str], Any],
-         lock: "Optional[Lock]" = None) -> None:
+def pump(src: Iterable[str], dst: Any, transform: Callable[[str], Any],
+         lock: Lock | None = None) -> None:
     """Read lines from src, apply transform, write to dst with a single trailing newline.
     transform returns: a string to write, None to forward the line unchanged, or SWALLOW to
     write nothing (the transform handled it out-of-band). Stops at EOF. With `lock`, each
@@ -622,7 +627,7 @@ def pump(src: TextIO, dst: TextIO, transform: Callable[[str], Any],
             dst.flush()
 
 
-def stdio_transport_error(cmd: list[str]) -> Optional[str]:
+def stdio_transport_error(cmd: list[str]) -> str | None:
     """Return a clear error if `cmd` can't be a proxy downstream target at all, else
     None (#19). Currently the only such case is nothing given after `--`. A URL is no
     longer rejected here — `transport.build_transport` dispatches a single `"://"`
@@ -633,7 +638,7 @@ def stdio_transport_error(cmd: list[str]) -> Optional[str]:
     return None
 
 
-def _terminate_child(proc: "subprocess.Popen[Any]", timeout: float = 2.0) -> None:
+def _terminate_child(proc: subprocess.Popen[Any], timeout: float = 2.0) -> None:
     """Reap the downstream server if it is still running, so it shares the proxy's
     lifecycle and is never orphaned (#21). SIGTERM first, then SIGKILL on timeout."""
     if proc.poll() is not None:
@@ -700,15 +705,15 @@ def _restore_sigterm(token: Any) -> None:
 
 
 def _build_capture_and_audit(
-    capture_dir: Optional[str], debug_log: Optional[str], debug: bool, log_prefix: str
-) -> tuple[Optional[Callable[[str, str], None]], Optional[Callable[[dict], None]]]:
+    capture_dir: str | None, debug_log: str | None, debug: bool, log_prefix: str
+) -> tuple[Callable[[str, str], None] | None, Callable[[dict], None] | None]:
     """Build the (capture, audit) callback pair from --capture-dir/--debug-log, shared
     by `run_proxy` and `multiproxy.run_multi_proxy` (identical logic, differing only in
     which process's downstream target they're wired to). Both callbacks are strictly
     side effects — a read-only or full disk must never break the proxy — so a failure
     is swallowed with only a --debug-gated stderr line, tagged with `log_prefix` (e.g.
     `"[terse-proxy]"` vs `"[terse-multiproxy]"`) so the failure's origin stays legible."""
-    capture: Optional[Callable[[str, str], None]] = None
+    capture: Callable[[str, str], None] | None = None
     if capture_dir is not None:
         from .capture import capture_payload
 
@@ -719,7 +724,7 @@ def _build_capture_and_audit(
                 if debug:
                     sys.stderr.write(f"{log_prefix} capture_payload failed: {exc}\n")
 
-    audit: Optional[Callable[[dict], None]] = None
+    audit: Callable[[dict], None] | None = None
     if debug_log is not None:
         from .capture import append_audit
 
@@ -737,11 +742,11 @@ def run_proxy(
     cmd: list[str],
     pol: policy_mod.Policy,
     debug: bool = False,
-    stdin: Optional[TextIO] = None,
-    stdout: Optional[TextIO] = None,
-    capture_dir: Optional[str] = None,
-    debug_log: Optional[str] = None,
-    headers: Optional[dict[str, str]] = None,
+    stdin: TextIO | None = None,
+    stdout: TextIO | None = None,
+    capture_dir: str | None = None,
+    debug_log: str | None = None,
+    headers: dict[str, str] | None = None,
 ) -> int:
     """Launch the downstream MCP peer `cmd` and proxy JSON-RPC through `Interceptor`.
     `cmd` is either a stdio launch command, or a single-element list holding a URL — in

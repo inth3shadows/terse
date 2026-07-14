@@ -56,10 +56,11 @@ import sys
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any, Callable, Optional, TextIO
+from typing import Any, TextIO
 
 from . import lossy as lossy_mod
 from . import policy as policy_mod
@@ -150,7 +151,7 @@ class DownstreamSpec:
     name: str
     target: list[str]              # a stdio command, or a single-element [url]
     headers: dict[str, str]
-    policy_path: Optional[str]     # resolved relative to the config file; None = use the default
+    policy_path: str | None     # resolved relative to the config file; None = use the default
 
 
 def load_multi_config(path: str) -> list[DownstreamSpec]:
@@ -244,7 +245,7 @@ class _PendingBroadcast:
     client_id: Any
     remaining: set[int]
     parts: dict[int, dict] = field(default_factory=dict)
-    timer: Optional[threading.Timer] = None
+    timer: threading.Timer | None = None
     done: bool = False
 
 
@@ -268,7 +269,7 @@ class _PeerSender:
     def __init__(self, transport: Transport, debug: bool = False):
         self._transport = transport
         self._debug = debug
-        self._q: "queue.Queue[Any]" = queue.Queue()
+        self._q: queue.Queue[Any] = queue.Queue()
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -338,13 +339,13 @@ class Router:
         # went out must still resolve here and be swallowed (see _maybe_collect), not
         # fall through to a peer's Interceptor as an unsolicited message. Bounded by
         # _LOCAL_ID_MAP_MAX eviction instead of eager per-broadcast cleanup.
-        self._local_id_map: "OrderedDict[Any, int]" = OrderedDict()
+        self._local_id_map: OrderedDict[Any, int] = OrderedDict()
         # router-local id -> (peer_idx, original id), for a server-initiated request
         # forwarded to the client (see _rewrite_server_request) so the client's eventual
         # reply can be routed back to the peer that actually asked, with its original id
         # restored — instead of the prior v1 gap (misdelivered to peer 0). Bounded by
         # _SERVER_REQ_MAX eviction.
-        self._server_requests: "OrderedDict[str, tuple[int, Any]]" = OrderedDict()
+        self._server_requests: OrderedDict[str, tuple[int, Any]] = OrderedDict()
         self._server_req_seq = 0
         # client id -> Timer, for a routed (single-peer) tools/call awaiting reply —
         # mirrors _broadcast's BROADCAST_TIMEOUT guarantee ("a dead peer can't wedge
@@ -357,7 +358,7 @@ class Router:
         # monotonic time that happened — the peer's eventual real (late) reply must be
         # swallowed here, not double-delivered. Aged out by `_routed_timed_out_ttl`, not
         # by population count (see `_ROUTED_TIMED_OUT_MAX`'s comment above).
-        self._routed_timed_out: "OrderedDict[Any, float]" = OrderedDict()
+        self._routed_timed_out: OrderedDict[Any, float] = OrderedDict()
         self._routed_timed_out_ttl = broadcast_timeout * 4
 
     # ---------- client -> server ----------
@@ -846,7 +847,7 @@ class Router:
         meaningful). `instructions` = ONE `TERSE_PRIMER`, first, then each peer's own
         non-empty instructions (skipping one that already carries the primer, so a peer
         that is ITSELF a terse proxy doesn't duplicate it)."""
-        protocol_version: Optional[str] = None
+        protocol_version: str | None = None
         capabilities: dict = {}
         instructions_parts: list[str] = []
         # Iterate pb.parts in ITS OWN (insertion) order, not range(len(self.peers))
@@ -929,11 +930,11 @@ class Router:
 
 
 def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy, *,
-                 debug: bool, capture: Optional[Callable[[str, str], None]],
-                 audit: Optional[Callable[[dict], None]],
-                 store: "OrderedDict[str, Any]", store_lock: Lock,
-                 dropped_bytes: list[int], diff_override: Optional[bool] = None,
-                 diff_keyframe_override: Optional[int] = None) -> list[Peer]:
+                 debug: bool, capture: Callable[[str, str], None] | None,
+                 audit: Callable[[dict], None] | None,
+                 store: OrderedDict[str, Any], store_lock: Lock,
+                 dropped_bytes: list[int], diff_override: bool | None = None,
+                 diff_keyframe_override: int | None = None) -> list[Peer]:
     """Build every `Peer`: its own `Transport` (stdio or HTTP, via `build_transport`)
     and its own `Interceptor` (per-peer diff/compress state, but the drop store —
     including its byte-eviction counter — is injected shared). Raises on a bad spec —
@@ -973,13 +974,13 @@ def run_multi_proxy(
     default_policy: policy_mod.Policy,
     *,
     debug: bool = False,
-    stdin: Optional[TextIO] = None,
-    stdout: Optional[TextIO] = None,
-    capture_dir: Optional[str] = None,
-    debug_log: Optional[str] = None,
+    stdin: TextIO | None = None,
+    stdout: TextIO | None = None,
+    capture_dir: str | None = None,
+    debug_log: str | None = None,
     broadcast_timeout: float = BROADCAST_TIMEOUT,
-    diff_override: Optional[bool] = None,
-    diff_keyframe_override: Optional[int] = None,
+    diff_override: bool | None = None,
+    diff_keyframe_override: int | None = None,
 ) -> int:
     """Load `config_path`, build one `Peer` per downstream (own `Transport` + own
     `Interceptor`, all sharing one drop store), spawn one `pump()` reader thread per
@@ -1008,7 +1009,7 @@ def run_multi_proxy(
 
     capture, audit = _build_capture_and_audit(capture_dir, debug_log, debug, "[terse-multiproxy]")
 
-    store: "OrderedDict[str, Any]" = OrderedDict()
+    store: OrderedDict[str, Any] = OrderedDict()
     store_lock = Lock()
     dropped_bytes: list[int] = [0]
 

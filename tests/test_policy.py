@@ -145,3 +145,37 @@ def test_unsupported_version_rejected(tmp_path):
     bad.write_text(json.dumps({"version": 2}))
     with pytest.raises(ValueError):
         load_policy(bad)
+
+
+def test_load_policy_rejects_unknown_keys_at_every_level(tmp_path):
+    # A typo'd key silently reverting to default behavior is a trap — the loader
+    # rejects unknown keys loudly at every level (audit fix #3). "_"-prefixed
+    # annotation keys (policy_gen's _comment/_suggested_fields*) stay exempt.
+    import pytest
+
+    from terse.policy import load_policy
+
+    def _write(doc):
+        p = tmp_path / "p.json"
+        p.write_text(json.dumps(doc))
+        return p
+
+    base = {"version": 1, "defaults": {"tiers": ["minify"]}, "policies": []}
+
+    for doc, needle in [
+        ({**base, "polices": []}, "polices"),                        # top-level typo
+        ({**base, "diff_keyframe_intervall": 3}, "intervall"),       # top-level typo
+        ({**base, "defaults": {"tiers": ["minify"], "teirs": []}}, "teirs"),
+        ({**base, "policies": [{"match": {"tool": "x"}, "tiers": [], "feilds": {}}]}, "feilds"),
+        ({**base, "policies": [{"match": {"tool": "x", "name": "y"}, "tiers": []}]}, "name"),
+    ]:
+        with pytest.raises(ValueError, match=needle):
+            load_policy(_write(doc))
+
+    # underscore-prefixed annotations pass at every level (the policy_gen convention)
+    ok = {"version": 1, "_comment": "hi",
+          "defaults": {"tiers": ["minify"], "_note": "x"},
+          "policies": [{"_comment": "c", "match": {"tool": "x", "_why": "w"},
+                        "tiers": [], "_suggested_fields": {"a": {}}}]}
+    pol = load_policy(_write(ok))
+    assert pol.rules[0].tool_glob == "x"

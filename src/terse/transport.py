@@ -19,8 +19,9 @@ import queue
 import subprocess
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
+from typing import Any, Protocol, TextIO
 from urllib.parse import urlsplit
-from typing import Any, Iterator, Optional, Protocol, TextIO
 
 # The only downstream URL schemes terse will dial. `urllib.request.urlopen` also
 # honors `file://`, `ftp://`, `data:` and more — so an unrestricted scheme turns a
@@ -29,6 +30,19 @@ from typing import Any, Iterator, Optional, Protocol, TextIO
 # model's context. A downstream target can come from an untrusted, repo-committed
 # project-scoped `.mcp.json` (see install_mcp.py), so this is not purely operator input.
 _ALLOWED_URL_SCHEMES = ("http", "https")
+
+# Hosts where cleartext http is safe (it never leaves the machine) — the same set
+# fluency.openai_answerer's TLS guard exempts, for the same local-gateway use case.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+# Header names that carry credentials. A downstream with one of these over cleartext
+# http to a REMOTE host would put the secret on the wire unencrypted — refuse at
+# construction, mirroring fluency's answerer guard (parity noted in the 07-14 audit).
+_SENSITIVE_HEADER_TOKENS = ("authorization", "token", "secret", "key", "cookie")
+
+
+def _has_sensitive_header(headers: dict[str, str]) -> bool:
+    return any(t in name.lower() for name in headers for t in _SENSITIVE_HEADER_TOKENS)
 
 
 class Transport(Protocol):
@@ -122,7 +136,7 @@ class _HttpSendWriter:
     differently-behaved caller still gets one POST per JSON-RPC line rather
     than one POST of concatenated lines."""
 
-    def __init__(self, transport: "HttpTransport"):
+    def __init__(self, transport: HttpTransport):
         self._transport = transport
         self._buf = ""
 
@@ -207,7 +221,7 @@ class HttpTransport:
     in-flight request's id and enqueues THAT instead, so the client always gets
     a reply rather than silence."""
 
-    def __init__(self, url: str, headers: Optional[dict[str, str]] = None, timeout: int = 60):
+    def __init__(self, url: str, headers: dict[str, str] | None = None, timeout: int = 60):
         scheme = urlsplit(url).scheme.lower()
         if scheme not in _ALLOWED_URL_SCHEMES:
             # Raised at construction (before any I/O), so build_transport's callers
@@ -220,13 +234,21 @@ class HttpTransport:
                 "read or SSRF vector)")
         self.url = url
         self.headers = dict(headers or {})
+        split = urlsplit(url)
+        if (scheme == "http" and split.hostname not in _LOOPBACK_HOSTS
+                and _has_sensitive_header(self.headers)):
+            # Same construction-time, before-any-I/O contract as the scheme check above.
+            raise ValueError(
+                f"terse: refusing to send credential header(s) over cleartext http to "
+                f"{split.hostname!r} — use https, or a loopback gateway "
+                f"({'/'.join(sorted(_LOOPBACK_HOSTS))})")
         self.timeout = timeout
-        self._q: "queue.Queue[Any]" = queue.Queue()
+        self._q: queue.Queue[Any] = queue.Queue()
         # MCP Streamable HTTP session affinity: some servers pin a client to
         # server-side state via this header, set on a prior response. Captured
         # opportunistically and echoed back on every subsequent POST — never
         # required, since plenty of servers don't use it at all.
-        self.session: Optional[str] = None
+        self.session: str | None = None
 
     def inbound(self) -> Iterator[str]:
         return iter(self._q.get, _SENTINEL)
@@ -339,7 +361,7 @@ class HttpTransport:
         )
 
 
-def build_transport(target: list[str], *, headers: Optional[dict[str, str]] = None) -> Transport:
+def build_transport(target: list[str], *, headers: dict[str, str] | None = None) -> Transport:
     """Build the right `Transport` for a proxy `cmd`/downstream target.
 
     A single element containing `"://"` is a URL -> `HttpTransport`; anything

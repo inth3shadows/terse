@@ -149,7 +149,9 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
     """Wrap `server`'s entry with the terse proxy. Idempotent: if already managed
     (present in stash), re-wrap from the stashed original so policy/cmd updates
     apply cleanly without nesting proxies. Preserves all non-command/args (and, for a
-    URL entry, non-url/headers) keys (env, cwd, type, …) of the original entry. With
+    URL entry, non-url/headers) keys (env, cwd, type, …) of the original entry — and,
+    on a re-wrap, hand-edits made to those keys on the LIVE wrapped entry win over the
+    stashed original's values (the drift guard below). With
     `capture_dir`, the wrapped proxy tees raw tool results into that corpus for later
     measurement (#32). `diff` is tri-state: None writes no flag (the entry inherits
     the proxy default — ON since #75), True/False bake `--diff`/`--no-diff` into the
@@ -161,10 +163,11 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
     forwarded as repeated `--header k=v` (see `transport.HttpTransport`). Anything with
     neither key is not a valid MCP server entry and can't be wrapped."""
     servers = config.setdefault("mcpServers", {})
+    live = servers.get(server)
     if server in stash:
         original = stash[server]
-    elif server in servers:
-        original = servers[server]
+    elif live is not None:
+        original = live
         stash[server] = original
     else:
         raise KeyError(server)
@@ -199,6 +202,18 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
                     if k not in ("command", "args", "url", "headers")}
         new_entry["command"] = terse_cmd[0]
         new_entry["args"] = [*terse_cmd[1:], "proxy", *proxy_opts, *header_opts, "--", orig_url]
+
+    if live is not None and live is not original:
+        # Drift guard: a re-wrap used to rebuild the entry purely from the stashed
+        # original, silently reverting any hand-edit made to the WRAPPED entry since
+        # the last install (a scoped env.PATH pin, a cwd) — that reverted codegraph's
+        # node pin in production on 2026-07-13. command/args are terse-owned and always
+        # rebuilt (flags must reflect this invocation); url/headers never appear on a
+        # wrapped entry (they're folded into args), so a drifted live copy of them must
+        # not be resurrected either. Everything else on the live entry wins.
+        for k, v in live.items():
+            if k not in ("command", "args", "url", "headers"):
+                new_entry[k] = v
     servers[server] = new_entry
     return config, stash
 
@@ -306,10 +321,19 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
     changes = []
     for s in servers:
         before = (node.get("mcpServers") or {}).get(s)
+        # Hand-edits = non-terse-owned keys on the live WRAPPED entry that differ from
+        # the stashed original — the drift guard in wrap() carries them forward; name
+        # them in the result so the operator sees what survived (and what to move into
+        # the original entry if it should also survive an uninstall).
+        preserved = sorted(
+            k for k in (before or {})
+            if k not in ("command", "args", "url", "headers")
+            and s in stash and (before or {}).get(k) != stash[s].get(k)
+        )
         wrap(node, stash, s, policy_abs, terse_cmd, capture_dir=capture_abs,
              diff=diff, diff_keyframe_interval=diff_keyframe_interval)
         changes.append({"server": s, "before": before,
-                        "after": node["mcpServers"][s]})
+                        "after": node["mcpServers"][s], "preserved": preserved})
 
     result = {"config": str(target.cfg), "scope": scope, "policy": policy_abs,
               "available": available, "changes": changes, "dry_run": dry_run,

@@ -587,3 +587,70 @@ def test_scan_scopes_is_read_only(tmp_path, monkeypatch):
     assert cfg.read_text() == before
     assert not im.stash_path(cfg).exists()
     assert list(tmp_path.glob("*.bak-*")) == []
+
+
+def test_rewrap_preserves_hand_edits_on_wrapped_entry():
+    # The 2026-07-13 production incident: a scoped env.PATH pin hand-added to the
+    # WRAPPED entry was silently reverted by a re-install, because wrap() rebuilt
+    # purely from the stashed (pre-pin) original. The drift guard keeps live
+    # non-terse-owned keys on a re-wrap.
+    config = _cfg(codegraph={"command": "/usr/local/bin/codegraph",
+                             "args": ["serve", "--mcp"], "type": "stdio"})
+    stash: dict = {}
+    im.wrap(config, stash, "codegraph", "/p/policy.json", TERSE_CMD)
+    # operator pins node@22 on the wrapped entry by hand
+    config["mcpServers"]["codegraph"]["env"] = {"PATH": "/opt/node22/bin:/usr/bin"}
+
+    im.wrap(config, stash, "codegraph", "/p/policy.json", TERSE_CMD, diff=False)
+    entry = config["mcpServers"]["codegraph"]
+    assert entry["env"] == {"PATH": "/opt/node22/bin:/usr/bin"}   # pin survived
+    assert "--no-diff" in entry["args"]                            # flags still rebuilt
+    assert entry["command"] == "/abs/python"                       # command still terse's
+
+    # a live hand-edit also WINS over the stashed original's value for the same key
+    config["mcpServers"]["codegraph"]["type"] = "http"             # hand-changed
+    im.wrap(config, stash, "codegraph", "/p/policy.json", TERSE_CMD)
+    assert config["mcpServers"]["codegraph"]["type"] == "http"
+
+    # the guard never leaks the hand-edit into the stash: uninstall restores pristine
+    im.unwrap(config, stash, "codegraph")
+    assert config["mcpServers"]["codegraph"] == {
+        "command": "/usr/local/bin/codegraph", "args": ["serve", "--mcp"], "type": "stdio"}
+
+
+def test_rewrap_never_resurrects_url_headers_from_a_drifted_live_entry():
+    # If someone hand-replaces a managed server's live entry with a raw url entry,
+    # a re-wrap must not copy url/headers onto the wrapped shape (an entry with both
+    # args and url is broken) — those keys are always folded into args from the stash.
+    original = {"url": "https://example.com/mcp", "headers": {"X": "1"}}
+    config = _cfg(remote=dict(original))
+    stash: dict = {}
+    im.wrap(config, stash, "remote", "/p/policy.json", TERSE_CMD)
+    config["mcpServers"]["remote"] = dict(original)                # hand-reverted
+    im.wrap(config, stash, "remote", "/p/policy.json", TERSE_CMD)
+    entry = config["mcpServers"]["remote"]
+    assert "url" not in entry and "headers" not in entry
+    assert entry["args"][-1] == "https://example.com/mcp"
+
+
+def test_do_install_reports_preserved_hand_edits(tmp_path, monkeypatch):
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+
+    im.do_install(["runecho"], str(policy), cfg=cfg)
+    written = json.loads(cfg.read_text())
+    written["mcpServers"]["runecho"]["env"] = {"PATH": "/pin"}     # hand-edit
+    cfg.write_text(json.dumps(written))
+
+    res = im.do_install(["runecho"], str(policy), cfg=cfg)
+    change = res["changes"][0]
+    assert change["preserved"] == ["env"]
+    assert json.loads(cfg.read_text())["mcpServers"]["runecho"]["env"] == {"PATH": "/pin"}
+    # the edit stays live-only (never leaks into the stash), so EVERY later re-wrap
+    # keeps carrying — and keeps reporting — it; that persistence is the guard working
+    res = im.do_install(["runecho"], str(policy), cfg=cfg)
+    assert res["changes"][0]["preserved"] == ["env"]
+    assert json.loads(cfg.read_text())["mcpServers"]["runecho"]["env"] == {"PATH": "/pin"}

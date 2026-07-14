@@ -81,3 +81,6 @@ DEFAULT_PROBE_REPORT
 # probes.py cross_call_overlap docstring: "When `idf` is supplied (from `token_idf`)" —
 # "supplied (from" reads as a bare call to the guard's pattern match. Not code.
 supplied
+# proxy.py _emit_audit: `audit = self.audit` narrowed local (mypy baseline, audit
+# fix #1), called bare — same local-variable false-positive class as real/orig_send.
+audit

@@ -34,15 +34,23 @@ from __future__ import annotations
 import json
 import re
 import urllib.request
-from urllib.parse import urlsplit
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
+from urllib.parse import urlsplit
 
 from . import text_diff
 from .capture import LONG_TEXT, OTHER, classify_shape, extract_records
 from .tokenize import count_cl100k
-from .transforms import (compress, compress_structure, dict_encode, diff_wire,
-                         has_terse_marker, minify, _uniform_dict_list)
+from .transforms import (
+    _uniform_dict_list,
+    compress,
+    compress_structure,
+    dict_encode,
+    diff_wire,
+    has_terse_marker,
+    minify,
+)
 
 # Loopback hosts where cleartext http is safe (never leaves the machine), so a Bearer
 # key over http to one of these is fine — a local LiteLLM/CCR gateway is a common setup.
@@ -187,7 +195,7 @@ def _nested_record_group(obj: Any) -> tuple[str, list[dict], list[str]] | None:
         # dict-map of parent records -> the first parent (map order) with a child record list
         if isinstance(v, dict) and v and all(isinstance(pv, dict) for pv in v.values()):
             for pkey, parent in v.items():
-                for ck, cv in parent.items():
+                for _ck, cv in parent.items():
                     if _records_of(cv):
                         return f"{k}[{json.dumps(pkey, ensure_ascii=False)}]", cv, _intersection_cols(cv)
         # a NON-uniform top-level list of dicts (uniform ones are extract_records' domain)
@@ -561,7 +569,7 @@ def _iter_consecutive_pairs(envelopes: list[dict]):
         by_tool.setdefault(env["tool"], []).append(env)
     for tool, envs in by_tool.items():
         envs = sorted(envs, key=lambda e: e.get("sha", ""))
-        for prev_env, curr_env in zip(envs, envs[1:]):
+        for prev_env, curr_env in zip(envs, envs[1:], strict=False):  # sliding pairs
             yield tool, curr_env.get("sha", "?"), prev_env["raw"], curr_env["raw"]
 
 
@@ -627,7 +635,7 @@ def build_chain_windows(envelopes: list[dict], max_depth: int = 5,
             except (json.JSONDecodeError, TypeError):
                 seq.append((e.get("sha", "?"), None))
         cur: list[tuple] = []
-        for (psha, p), (csha, c) in zip(seq, seq[1:]):
+        for (psha, p), (csha, c) in zip(seq, seq[1:], strict=False):  # sliding pairs
             ok = (p is not None and c is not None
                   and diff_wire(p, c, tool) is not None)
             if ok:
@@ -643,9 +651,9 @@ def build_chain_windows(envelopes: list[dict], max_depth: int = 5,
     windows: list[tuple] = []
     for depth in range(1, max_depth + 1):
         # every eligible start per tool, spread over its runs; then round-robin
-        candidates: dict[str, list[tuple]] = {}
+        candidates: dict[str, list[list[tuple]]] = {}
         for tool, tool_runs in sorted(runs.items()):
-            starts: list[tuple] = []
+            starts: list[list[tuple]] = []
             for run in tool_runs:
                 for i in range(0, len(run) - depth, depth):   # non-overlapping
                     window = run[i:i + depth + 1]
@@ -656,7 +664,7 @@ def build_chain_windows(envelopes: list[dict], max_depth: int = 5,
         picked = 0
         idx = 0
         while picked < per_depth_cap and candidates:
-            for tool in sorted(list(candidates)):
+            for tool in sorted(candidates):
                 starts = candidates[tool]
                 if idx >= len(starts):
                     del candidates[tool]
@@ -682,7 +690,7 @@ def run_chain_payload(objs: list, answerer: Answerer, tool: str = "",
     if not questions:
         return []
     wires: list[str] = []
-    for prev, curr in zip(objs, objs[1:]):
+    for prev, curr in zip(objs, objs[1:], strict=False):  # sliding pairs
         wire = diff_wire(prev, curr, tool)
         if wire is None:
             return []

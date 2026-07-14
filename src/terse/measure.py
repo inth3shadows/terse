@@ -19,7 +19,7 @@ savings (you cannot bank tokens you lost data to).
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any
 
 from . import transforms
 from .capture import classify_shape
@@ -54,10 +54,10 @@ def measure_payload(raw: str) -> dict[str, Any]:
     tab_tok = count_cl100k(tabular)
     cmp_tok = count_cl100k(compressed)
 
-    def _saved(a: Optional[int], b: Optional[int]) -> Optional[int]:
+    def _saved(a: int | None, b: int | None) -> int | None:
         return None if a is None or b is None else a - b
 
-    row = {
+    return {
         "shape": shape,
         "applicable": True,
         "roundtrip_ok": gate,
@@ -69,7 +69,6 @@ def measure_payload(raw: str) -> dict[str, Any]:
             "tier_total": _saved(raw_tok, cmp_tok),
         },
     }
-    return row
 
 
 def cross_tokenizer_savings(envelopes: list[dict[str, Any]]) -> list[dict[str, Any]]:
