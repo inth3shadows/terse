@@ -87,7 +87,8 @@ src/terse/
   capture.py     corpus capture (shape-tagged envelopes) + shape classifier
   measure.py     per-payload + cross-tokenizer token measurement
   probes.py      value-redundancy + cross-call-overlap ceiling probes
-  fluency.py     does a model read the compressed form as accurately as raw JSON?
+  fluency/       does a model read the compressed form as accurately as raw JSON?
+                 (questions / scoring / answerers / harnesses / pack behind one facade)
   tokenize.py    cl100k / o200k token counting
   report.py      markdown reports (savings, per-tool, probes, tokenizer, fluency)
   html_report.py charted HTML companion (inline SVG, no JS/CDN) for measure/verify
