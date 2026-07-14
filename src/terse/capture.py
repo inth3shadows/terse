@@ -21,8 +21,9 @@ from pathlib import Path
 from typing import Any
 
 from ._secure_io import append_restricted, write_restricted
-
-from .transforms import _uniform_dict_list  # the one canonical "what tabularize folds" rule
+from .transforms import (
+    _uniform_dict_list,  # the one canonical "what tabularize folds" rule
+)
 
 # Shape buckets. classify_shape returns one of these.
 PRETTY_JSON = "pretty-json"

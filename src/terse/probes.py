@@ -23,8 +23,8 @@ from collections import Counter
 from itertools import combinations
 from typing import Any
 
-from .transforms import minify
 from .tokenize import count_cl100k, encode_cl100k
+from .transforms import minify
 
 # Reverse-map a captured tool name to its origin server. The capture envelope stores
 # only `tool` (#64 Phase 0): the corpus was captured by separate per-server proxies
@@ -234,7 +234,7 @@ def cross_server_overlap(
         capped = capped or len(la) > cap_per_pair or len(lb) > cap_per_pair
         sa = sorted(la, key=lambda t: t[0])[:cap_per_pair]
         sb = sorted(lb, key=lambda t: t[0])[:cap_per_pair]
-        for (sha_a, raw_a), (sha_b, raw_b) in zip(sa, sb):
+        for (sha_a, raw_a), (sha_b, raw_b) in zip(sa, sb, strict=False):  # pair up to shorter
             res = cross_call_overlap(raw_a, raw_b, idf=idf)
             if res.get("available"):
                 rows.append({"server_a": a, "server_b": b, "sha_a": sha_a, "sha_b": sha_b, **res})

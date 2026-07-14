@@ -554,9 +554,9 @@ def test_build_chain_windows_yields_every_depth_and_valid_hops():
     windows = fluency.build_chain_windows(_soak_envs(n=8), max_depth=3, per_depth_cap=4)
     depths = {d for _, _, d, _ in windows}
     assert depths == {1, 2, 3}
-    for tool, sha, depth, objs in windows:
+    for tool, _sha, depth, objs in windows:
         assert len(objs) == depth + 1
-        for prev, curr in zip(objs, objs[1:]):
+        for prev, curr in zip(objs, objs[1:], strict=False):
             assert diff_wire(prev, curr, tool) is not None   # every hop truly chains
         assert fluency.gen_questions(objs[-1])               # final state is askable
 
@@ -570,7 +570,7 @@ def test_build_chain_windows_never_spans_a_diff_break():
     windows = fluency.build_chain_windows(envs, max_depth=3, per_depth_cap=8)
     from terse.transforms import diff_wire
     for tool, _sha, _depth, objs in windows:
-        for prev, curr in zip(objs, objs[1:]):
+        for prev, curr in zip(objs, objs[1:], strict=False):
             assert diff_wire(prev, curr, tool) is not None
 
 

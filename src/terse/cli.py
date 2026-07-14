@@ -15,15 +15,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import json as _json
 import re
 import sys
+from datetime import UTC
 from pathlib import Path
-
-import json as _json
 
 from . import transforms
 from ._secure_io import write_restricted
-from .capture import capture_payload, classify_shape, coverage, extract_records, load_corpus
+from .capture import (
+    capture_payload,
+    classify_shape,
+    coverage,
+    extract_records,
+    load_corpus,
+)
+from .html_report import build_html_report
 from .measure import cross_tokenizer_savings, measure_corpus
 from .probes import (
     cross_call_overlap,
@@ -32,7 +39,6 @@ from .probes import (
     server_of_tool,
     value_redundancy,
 )
-from .html_report import build_html_report
 from .report import (
     build_cross_server_probe_report,
     build_probe_report,
@@ -81,14 +87,14 @@ def _record_and_print_trend(history_path: str, rows: list, label: str) -> None:
     in this command that reads the real clock (principle #31: inject nondeterminism
     at the edge, not inside the pure summarize_run/build_trend_report/
     trend_sparkline_lines core)."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from .history import append_run, load_history, summarize_run
     from .report import build_trend_report
     from .terminal_report import trend_sparkline_lines
 
     path = Path(history_path)
-    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    ts = datetime.now(UTC).isoformat(timespec="seconds")
     run = summarize_run(rows, ts, label=label)
     all_runs = load_history(path) + [run]
     append_run(path, run)
@@ -302,7 +308,7 @@ def _cmd_probe(args: argparse.Namespace) -> int:
         by_tool.setdefault(env["tool"], []).append(env)
     for tool, envs in by_tool.items():
         envs = sorted(envs, key=lambda e: e.get("sha", ""))
-        for prev, curr in zip(envs, envs[1:]):
+        for prev, curr in zip(envs, envs[1:], strict=False):  # sliding pairs
             res = cross_call_overlap(prev["raw"], curr["raw"])
             if res.get("available"):
                 overlap_rows.append({"tool": tool, "prev_sha": prev.get("sha", "?"),
@@ -604,6 +610,10 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
         print(f"{tag} {c['server']}:")
         print(f"    before: {_short_cmd(c['before'])}")
         print(f"    after:  {_short_cmd(c['after'])}")
+        if c.get("preserved"):
+            print(f"    kept hand-edited key(s) from the live entry: "
+                  f"{', '.join(c['preserved'])} (note: uninstall restores the "
+                  f"pre-terse original, which does NOT carry them)")
     print(f"config: {res['config']}  scope: {res['scope']}  policy: {res['policy']}")
     if res.get("capture_dir"):
         print(f"capture: raw tool results → {res['capture_dir']}")

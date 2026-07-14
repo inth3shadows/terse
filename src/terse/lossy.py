@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Callable, Iterator
+from collections.abc import Callable, Iterator
+from functools import partial
+from typing import Any
 
 from .transforms import DROPPED_MARKER as DROP_KEY
 
@@ -103,7 +105,7 @@ def _copy_at(dst: Any, src: Any, tokens: list[str]) -> Any:
     if head == "[]":
         if not (isinstance(dst, list) and isinstance(src, list) and len(dst) == len(src)):
             raise PathError("list length/shape mismatch at '[]'")
-        return [_copy_at(d, s, rest) for d, s in zip(dst, src)]
+        return [_copy_at(d, s, rest) for d, s in zip(dst, src, strict=True)]  # len-checked above
     if not (isinstance(dst, dict) and isinstance(src, dict)):
         raise PathError(f"object mismatch at {head!r}")
     if head not in dst:
@@ -122,7 +124,7 @@ def _leaf_pairs(orig: Any, out: Any, tokens: list[str]) -> Iterator[tuple[Any, A
     if head == "[]":
         if not (isinstance(orig, list) and isinstance(out, list) and len(orig) == len(out)):
             raise PathError("list length/shape mismatch at '[]'")
-        for o, t in zip(orig, out):
+        for o, t in zip(orig, out, strict=True):  # len-checked above
             yield from _leaf_pairs(o, t, rest)
         return
     if not (isinstance(orig, dict) and isinstance(out, dict)):
@@ -149,7 +151,7 @@ def apply_lossy(obj: Any, rule: Any) -> Any:
     out = obj
     for path, spec in _truncate_specs(rule):
         max_len = int(spec.get("max", DEFAULT_MAX))
-        out = _apply_at(out, _parse_path(path), lambda v, m=max_len: _truncate(v, m))
+        out = _apply_at(out, _parse_path(path), partial(_truncate, max_len=max_len))
     return out
 
 
@@ -188,7 +190,7 @@ def _handle(tool: str, path: str, serialized: str) -> str:
     """Content-addressed handle for a dropped value. Includes tool+path so identical bytes
     under different fields get distinct handles (clearer provenance), and is stable across
     runs (no RNG) so the same value dropped twice reuses one store slot."""
-    digest = hashlib.sha1(f"{tool}\x00{path}\x00{serialized}".encode("utf-8")).hexdigest()
+    digest = hashlib.sha1(f"{tool}\x00{path}\x00{serialized}".encode()).hexdigest()
     return digest[:HANDLE_LEN]
 
 
@@ -223,7 +225,7 @@ def apply_drops(obj: Any, rule: Any, tool: str, sink: Callable[[str, Any], None]
     for path, spec in _drop_specs(rule):
         min_len = int(spec.get("min", DEFAULT_DROP_MIN))
         out = _apply_at(out, _parse_path(path),
-                        lambda v, _p=path, _m=min_len: _drop(v, tool, _p, _m, sink))
+                        partial(_drop, tool=tool, path=path, min_len=min_len, sink=sink))
     return out
 
 

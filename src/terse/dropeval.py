@@ -26,14 +26,15 @@ from __future__ import annotations
 
 import json
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any
 
-from . import capture
-from . import fluency
+from . import capture, fluency
 from . import lossy as lossy_mod
 from . import policy as policy_mod
 from .proxy import TERSE_PRIMER
+
 
 # --------------------------------------------------------------------------- #
 # Tool-loop answerer protocol — the existing fluency.Answerer (system, user) -> str
@@ -94,7 +95,7 @@ def _staged_apply(obj: Any, rule: Any, tool: str) -> tuple[policy_mod.Applied, d
 
 def _questions_and_staging(
     obj: Any, rule: Any, tool: str
-) -> tuple[list[DropQuestion], Optional[policy_mod.Applied], Optional[dict[str, Any]]]:
+) -> tuple[list[DropQuestion], policy_mod.Applied | None, dict[str, Any] | None]:
     """Shared core of `gen_drop_questions`: generates the (recall, precision) question
     pair AND returns the `(applied, staging)` that `_staged_apply` computed along the
     way, so `run_drop_payload` can reuse them instead of a second `policy.apply()` pass
@@ -190,7 +191,7 @@ def gen_drop_questions(obj: Any, rule: Any, tool: str) -> list[DropQuestion]:
 # --------------------------------------------------------------------------- #
 # The 2-turn tool-loop driver — mirrors the real proxy's retrieve protocol exactly
 # --------------------------------------------------------------------------- #
-def _miss_text(handle: str) -> str:
+def _miss_text(handle: Any) -> str:
     """The exact miss string `proxy.Interceptor.answer_retrieve` emits for an unresolved
     handle, copied verbatim so this eval's miss-handling matches production behavior — a
     model that has learned to recover from a real miss must see the same words here."""

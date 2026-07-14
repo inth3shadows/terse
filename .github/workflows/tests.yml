@@ -17,6 +17,7 @@ jobs:
           enable-cache: true
       - run: uv sync --dev          # no anthropic extra: keeps CI keyless, matches design
       - run: uv run ruff check .
+      - run: uv run mypy            # checked annotations (audit fix #1); config in pyproject
   pytest:
     runs-on: ubuntu-latest
     strategy:

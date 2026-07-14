@@ -17,6 +17,7 @@ re-deriving it, so the verdict a reader sees here always matches the markdown re
 from __future__ import annotations
 
 import html as _html
+from collections.abc import Sequence
 from typing import Any
 
 from .report import _ci, _form_stats, _pct, _sum, _worst_case_gap
@@ -147,7 +148,7 @@ def diverging_bar_chart(items: list[tuple[str, float]], unit: str = "%") -> str:
     return "".join(out)
 
 
-def stacked_bar_chart(items: list[tuple[str, list[float]]],
+def stacked_bar_chart(items: Sequence[tuple[str, Sequence[float]]],
                        series_labels: tuple[str, ...],
                        series_colors: tuple[str, ...] = ("var(--series-1)", "var(--series-2)", "var(--series-3)")
                        ) -> str:
@@ -187,7 +188,7 @@ def stacked_bar_chart(items: list[tuple[str, list[float]]],
     zero_x = sx(0.0)
     out = [_svg_open(width, height)]
     lx, ly = label_w, 14
-    for name, color in zip(series_labels, series_colors):
+    for name, color in zip(series_labels, series_colors, strict=True):
         out.append(f'<rect x="{lx}" y="{ly - 9}" width="10" height="10" rx="2" fill="{color}"/>')
         out.append(f'<text x="{lx + 15}" y="{ly}" class="axis-label">{_esc(name)}</text>')
         lx += 18 + 9 * len(name)

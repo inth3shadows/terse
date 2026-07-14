@@ -13,9 +13,17 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Sequence
 from typing import Any
 
-from .report import _GAP_TOLERANCE, _ci, _sum, diff_gap_rows, dropeval_gap_rows, fluency_gap_rows
+from .report import (
+    _GAP_TOLERANCE,
+    _ci,
+    _sum,
+    diff_gap_rows,
+    dropeval_gap_rows,
+    fluency_gap_rows,
+)
 
 _BAR_WIDTH = 24
 _BLOCK = "█"
@@ -55,7 +63,7 @@ def diverging_bar_lines(items: list[tuple[str, float]], unit: str = "%",
     return "\n".join(lines)
 
 
-def stacked_bar_lines(items: list[tuple[str, list[float]]], series_labels: tuple[str, ...],
+def stacked_bar_lines(items: Sequence[tuple[str, Sequence[float]]], series_labels: tuple[str, ...],
                        series_sgr: tuple[str, ...] = ("34", "32", "33"),
                        color: bool | None = None) -> str:
     """One row per item: proportional multi-color bar across series_labels, sized by
@@ -69,13 +77,13 @@ def stacked_bar_lines(items: list[tuple[str, list[float]]], series_labels: tuple
     enabled = _color_enabled() if color is None else color
     label_w = min(max((len(label) for label, _ in items), default=0), 28)
     legend = "  " + "  ".join(
-        f"{_c(sgr, _BLOCK, enabled)} {name}" for sgr, name in zip(series_sgr, series_labels)
+        f"{_c(sgr, _BLOCK, enabled)} {name}" for sgr, name in zip(series_sgr, series_labels, strict=True)
     )
     lines = [legend]
     for label, vals in items:
         denom = sum(abs(v) for v in vals) or 1
         segs, used = [], 0
-        for sgr, v in zip(series_sgr, vals):
+        for sgr, v in zip(series_sgr, vals, strict=True):
             n = round(abs(v) / denom * _BAR_WIDTH)
             used += n
             glyph = _BLOCK if v >= 0 else _NEG_BLOCK
@@ -136,7 +144,7 @@ def trend_sparkline_lines(runs: list[dict[str, Any]]) -> str:
     regressing" without reading report.build_trend_report's full table. A flat
     reading (all bars level) with real historical data is itself a legitimate,
     useful signal (a stable win), not a sign something's broken."""
-    pcts = [r.get("saved_pct") for r in runs if r.get("saved_pct") is not None]
+    pcts = [float(r["saved_pct"]) for r in runs if r.get("saved_pct") is not None]
     if len(pcts) < 2:
         return "  (need at least two --history runs to show a trend)"
     lo, hi = min(pcts), max(pcts)

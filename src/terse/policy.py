@@ -110,17 +110,42 @@ def _coerce_tiers(raw: Any, where: str) -> tuple[str, ...]:
     return tuple(raw)
 
 
+# The keys load_policy understands, per level. Anything else (except an "_"-prefixed
+# comment/annotation key, the convention policy_gen's `_comment`/`_suggested_fields*`
+# already use) is rejected loudly: this file governs what gets rewritten on the wire,
+# so a typo'd key ("polices", "diff_keyframe_intervall") silently reverting to default
+# behavior is a trap, not a convenience.
+_TOP_KEYS = frozenset({"version", "defaults", "policies", "diff", "diff_keyframe_interval"})
+_DEFAULTS_KEYS = frozenset({"tiers"})
+_RULE_KEYS = frozenset({"match", "tiers", "fields"})
+_MATCH_KEYS = frozenset({"tool"})
+
+
+def _reject_unknown_keys(obj: Any, allowed: frozenset[str], where: str) -> None:
+    if not isinstance(obj, dict):
+        raise ValueError(f"{where}: must be an object, got {type(obj).__name__}")
+    unknown = sorted(k for k in obj if k not in allowed and not k.startswith("_"))
+    if unknown:
+        raise ValueError(f"{where}: unknown key(s) {unknown}; allowed: {sorted(allowed)} "
+                         "(prefix a key with '_' for a comment/annotation)")
+
+
 def load_policy(path: str | Path) -> Policy:
-    """Parse + validate a JSON policy file. Raises ValueError on a malformed policy."""
+    """Parse + validate a JSON policy file. Raises ValueError on a malformed policy —
+    including any unknown key (see `_reject_unknown_keys`): fail loudly on a typo
+    rather than silently running with default behavior."""
     doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    _reject_unknown_keys(doc, _TOP_KEYS, str(path))
     if doc.get("version") != 1:
         raise ValueError(f"unsupported policy version: {doc.get('version')!r} (expected 1)")
-    default_tiers = _coerce_tiers(
-        doc.get("defaults", {}).get("tiers", list(VALID_TIERS)), "defaults"
-    )
+    defaults = doc.get("defaults", {})
+    _reject_unknown_keys(defaults, _DEFAULTS_KEYS, "defaults")
+    default_tiers = _coerce_tiers(defaults.get("tiers", list(VALID_TIERS)), "defaults")
     rules: list[Rule] = []
     for i, r in enumerate(doc.get("policies", [])):
+        _reject_unknown_keys(r, _RULE_KEYS, f"policies[{i}]")
         match = r.get("match", {})
+        _reject_unknown_keys(match, _MATCH_KEYS, f"policies[{i}].match")
         glob = match.get("tool", "*")
         rules.append(Rule(tool_glob=glob, tiers=_coerce_tiers(r.get("tiers", []), f"policies[{i}]"),
                           fields=r.get("fields", {})))

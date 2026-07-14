@@ -14,7 +14,7 @@ dependencies = [
 terse = "terse.cli:main"
 
 [dependency-groups]
-dev = ["pytest", "ruff"]
+dev = ["pytest", "ruff", "mypy"]
 
 [build-system]
 requires = ["hatchling"]
@@ -22,3 +22,27 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/terse"]
+
+[tool.ruff.lint]
+# Curated beyond ruff's minimal default (E4/E7/E9/F): import order, real bug
+# patterns, modern-syntax upgrades, comprehension and simplification wins. Style-only
+# packs are deliberately left out — the gate is for defects, not formatting taste.
+select = ["E4", "E7", "E9", "F", "I", "B", "UP", "C4", "SIM", "RET", "PLE"]
+ignore = [
+    "SIM108",  # ternary-vs-if is a readability call, not a defect
+    "SIM105",  # contextlib.suppress: try/except-pass is clearer at fail-open sites
+]
+
+[tool.mypy]
+# Lenient baseline (audit fix #1): the goal is to make the existing annotations a
+# CHECKED contract, not to win strictness awards on day one. Ratchet later.
+python_version = "3.11"
+files = ["src/terse"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "tiktoken"
+ignore_missing_imports = true

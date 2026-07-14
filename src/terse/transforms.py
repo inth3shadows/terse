@@ -360,7 +360,7 @@ def _locate_records(obj: Any) -> tuple[Any, list[dict]] | None:
 def _diff_id_col(prev_recs: list[dict], curr_recs: list[dict]) -> str | None:
     """A column present in every record of both lists whose values are scalar (str/int)
     and unique within each list — usable to align rows across the two calls."""
-    for c in prev_recs[0].keys():
+    for c in prev_recs[0]:
         if not (all(c in r for r in prev_recs) and all(c in r for r in curr_recs)):
             continue
         pv = [r[c] for r in prev_recs]

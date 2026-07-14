@@ -13,11 +13,11 @@ import io
 import json
 import threading
 
+import pytest
+
 from terse import transforms
 from terse.lossy import _handle, _serialize
 from terse.policy import Policy, Rule
-import pytest
-
 from terse.proxy import Interceptor, run_proxy
 from terse.transport import HttpTransport, build_transport
 
@@ -113,7 +113,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                           "result": {"content": [{"type": "text", "text": "first"}]}})
         ev2 = json.dumps({"jsonrpc": "2.0", "method": "notifications/progress",
                           "params": {"pct": 50}})
-        payload = f"data: {ev1}\n\ndata: {ev2}\n\n".encode("utf-8")
+        payload = f"data: {ev1}\n\ndata: {ev2}\n\n".encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(payload)))
@@ -376,3 +376,19 @@ def test_run_proxy_rejects_file_url_scheme_as_config_error(capsys):
     rc = run_proxy(["file:///etc/passwd"], FULL, stdin=io.StringIO(""), stdout=io.StringIO())
     assert rc == 2
     assert "not allowed" in capsys.readouterr().err
+
+
+def test_http_transport_refuses_credential_headers_over_remote_cleartext():
+    # Parity with fluency.openai_answerer's TLS guard (audit fix #3): a Bearer/token
+    # header over http to a remote host puts the credential on the wire unencrypted.
+    import pytest
+
+    for name in ("Authorization", "X-Api-Key", "Proxy-Token", "Cookie", "client-secret"):
+        with pytest.raises(ValueError, match="cleartext http"):
+            HttpTransport("http://api.example.com/mcp", headers={name: "v"})
+    # https, loopback http, and non-sensitive headers over http all still construct
+    assert HttpTransport("https://api.example.com/mcp", headers={"Authorization": "v"})
+    assert HttpTransport("http://127.0.0.1:4000/mcp", headers={"Authorization": "v"})
+    assert HttpTransport("http://localhost:4000/mcp", headers={"X-Api-Key": "v"})
+    assert HttpTransport("http://api.example.com/mcp", headers={"X-Trace-Id": "v"})
+    assert HttpTransport("http://api.example.com/mcp")
