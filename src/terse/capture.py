@@ -1,6 +1,6 @@
 """Corpus capture + shape bucketing.
 
-The spike's verdict is only as good as the captured tools, so coverage is tracked
+Any measurement is only as good as the captured tools, so coverage is tracked
 explicitly (see report.py) — a thin sample must not masquerade as "nothing to
 compress". Shape buckets are the whole point: they expose where each tier is a
 no-op (e.g. compact-JSON, single-object) versus where it pays (array-of-records).
@@ -114,7 +114,7 @@ def find_record_list_with_path(obj: Any, _prefix: tuple[str, ...] = ()) -> tuple
 def classify_shape(raw: str) -> str:
     """Bucket a raw tool-output string by structural shape.
 
-    Heuristic and deliberately simple — the spike refines thresholds against the
+    Heuristic and deliberately simple — thresholds are refined against the
     real corpus. Distinguishes pretty vs compact JSON by whitespace, and flags
     record-shaped payloads (what tabularize targets) separately from single objects.
     """

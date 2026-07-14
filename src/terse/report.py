@@ -1,4 +1,4 @@
-"""Spike report: token delta per shape bucket with tier attribution.
+"""Measurement report: token delta per shape bucket with tier attribution.
 
 Honesty requirements (plan Section 7, principle #24):
   - every shape bucket is shown, including near-zero / negative ones — never
@@ -451,7 +451,7 @@ def build_verify_header(corpus_label: str, n_payloads: int) -> str:
 
 
 def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
-    out: list[str] = ["# terse spike report", ""]
+    out: list[str] = ["# terse measurement report", ""]
 
     # --- Lossless gate (gates everything) ---
     failures = [r for r in rows if not r.get("roundtrip_ok", False)]

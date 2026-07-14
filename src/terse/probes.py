@@ -1,8 +1,8 @@
 """Lossless-ceiling probes (build order B).
 
 These do NOT compress anything. They measure whether the higher-ceiling lossless
-levers (Tier 0.5) are worth building, at near-zero cost on the corpus the spike
-already captures:
+levers of Tier 0.5 are worth building, at near-zero cost on the corpus already
+captured:
 
   - value_redundancy: how many tokens are repeated VALUES across cells (beyond the
     repeated KEYS that tabularize already collapses). High -> a dictionary coder
