@@ -49,6 +49,31 @@ ALIAS_SIGIL = "~"
 # has no escape convention, so the only lossless move is to leave such a payload alone.
 _RESERVED_MARKERS = frozenset({TABLE_MARKER, DICT_MARKER, DIFF_MARKER, DROPPED_MARKER})
 
+# Nesting cap shared by every codec boundary (capture's shape classifier, policy.apply,
+# the proxy's diff path, measure). The transforms themselves recurse without a depth
+# argument, so a boundary must check `exceeds_depth` BEFORE handing a payload in; a
+# payload past the cap is treated like a marker collision — passed through untouched.
+# 200 sits far under CPython's ~1000 recursion limit, leaving headroom for the frames
+# the codec adds per level.
+MAX_DEPTH = 200
+
+
+def exceeds_depth(obj: Any, cap: int = MAX_DEPTH) -> bool:
+    """True if obj nests containers deeper than `cap`. Iterative — safe to call on the
+    pathological payloads it exists to screen out."""
+    stack: list[tuple[Any, int]] = [(obj, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            if depth > cap:
+                return True
+            stack.extend((v, depth + 1) for v in node.values())
+        elif isinstance(node, list):
+            if depth > cap:
+                return True
+            stack.extend((x, depth + 1) for x in node)
+    return False
+
 
 def has_terse_marker(obj: Any) -> bool:
     """True if obj contains, at ANY depth, a dict key reserved for a terse envelope.
@@ -178,6 +203,50 @@ def _tok(s: str) -> int:
 # subtree's minified JSON — equal-by-value subtrees with the same key order collapse;
 # a different key order is just a missed fold, never a correctness risk (the legend
 # stores the real node, so decode is exact).
+#
+# Canonical forms are computed ONCE per node in a bottom-up pass (`_build_canon_memo`)
+# and shared by the counting and replacement walks below. Calling `minify(node)` at
+# every container level instead re-serializes the whole subtree per level — O(n·depth)
+# json.dumps traversals, done twice over — which is the #79 hot-path cost on
+# codegraph-scale payloads.
+def _canon_memo_walk(node: Any, memo: dict[int, str]) -> str:
+    if isinstance(node, list):
+        got = memo.get(id(node))
+        if got is None:
+            got = "[" + ",".join(_canon_memo_walk(x, memo) for x in node) + "]"
+            memo[id(node)] = got
+        return got
+    if isinstance(node, dict):
+        got = memo.get(id(node))
+        if got is None:
+            if all(isinstance(k, str) for k in node):
+                got = "{" + ",".join(
+                    json.dumps(k, ensure_ascii=False) + ":" + _canon_memo_walk(v, memo)
+                    for k, v in node.items()) + "}"
+            else:
+                # Non-str keys (impossible off the wire — json.loads only makes str
+                # keys): delegate the key coercion (int/float/bool/None -> string,
+                # incl. Infinity/NaN spellings) to json.dumps rather than replicate it.
+                for v in node.values():
+                    _canon_memo_walk(v, memo)
+                got = minify(node)
+            memo[id(node)] = got
+        return got
+    return minify(node)  # scalar; separators are moot, so this equals json.dumps
+
+
+def _build_canon_memo(structure: Any) -> tuple[str, dict[int, str]]:
+    """(canonical form of `structure`, id(node) -> canonical form for every container).
+
+    Each container's minified JSON is assembled once from its children's already-built
+    forms, byte-identical to `minify(node)` (pinned by test). id-keying is safe because
+    the caller holds `structure` alive for the memo's whole lifetime.
+    """
+    memo: dict[int, str] = {}
+    root = _canon_memo_walk(structure, memo)
+    return root, memo
+
+
 def _node_tok(key: tuple) -> int:
     """Token cost of a candidate in its VALUE position: a quoted string, or the raw
     (already-minified) JSON of a subtree."""
@@ -185,20 +254,20 @@ def _node_tok(key: tuple) -> int:
     return _tok(payload) if kind == "s" else _tok_text(payload)
 
 
-def _count_value_nodes(node: Any, counter: Counter) -> None:
+def _count_value_nodes(node: Any, counter: Counter, memo: dict[int, str]) -> None:
     """Count VALUE-position nodes (not dict keys) by canonical form, recursively.
-    Strings count as ("s", str); dicts/lists count as ("j", minified) AND recurse,
+    Strings count as ("s", str); dicts/lists count as ("j", canonical) AND recurse,
     so a repeated whole subtree and a repeated string inside it are both seen."""
     if isinstance(node, str):
         counter[("s", node)] += 1
     elif isinstance(node, list):
-        counter[("j", minify(node))] += 1
+        counter[("j", memo[id(node)])] += 1
         for x in node:
-            _count_value_nodes(x, counter)
+            _count_value_nodes(x, counter, memo)
     elif isinstance(node, dict):
-        counter[("j", minify(node))] += 1
+        counter[("j", memo[id(node)])] += 1
         for v in node.values():
-            _count_value_nodes(v, counter)
+            _count_value_nodes(v, counter, memo)
     # scalars (int/float/bool/None) are too cheap to alias
 
 
@@ -236,7 +305,8 @@ def _alias_gen(avoid: set):
             yield a
 
 
-def _replace_nodes(node: Any, alias_for_str: dict, alias_for_json: dict) -> Any:
+def _replace_nodes(node: Any, alias_for_str: dict, alias_for_json: dict,
+                   memo: dict[int, str]) -> Any:
     """Replace value-position strings AND whole subtrees with their alias; keys left
     untouched. Top-down: a matched container is replaced before descending, so an
     aliased subtree is folded as a unit (nested candidates inside it are captured by
@@ -244,12 +314,13 @@ def _replace_nodes(node: Any, alias_for_str: dict, alias_for_json: dict) -> Any:
     if isinstance(node, str):
         return alias_for_str.get(node, node)
     if isinstance(node, (list, dict)):
-        alias = alias_for_json.get(minify(node))
+        alias = alias_for_json.get(memo[id(node)])
         if alias is not None:
             return alias
         if isinstance(node, list):
-            return [_replace_nodes(x, alias_for_str, alias_for_json) for x in node]
-        return {k: _replace_nodes(v, alias_for_str, alias_for_json) for k, v in node.items()}
+            return [_replace_nodes(x, alias_for_str, alias_for_json, memo) for x in node]
+        return {k: _replace_nodes(v, alias_for_str, alias_for_json, memo)
+                for k, v in node.items()}
     return node
 
 
@@ -267,7 +338,7 @@ def _collect_used_aliases(node: Any, legend: dict, out: set) -> None:
             _collect_used_aliases(v, legend, out)
 
 
-def dict_encode(structure: Any) -> tuple[Any, dict]:
+def dict_encode(structure: Any, memo: dict[int, str] | None = None) -> tuple[Any, dict]:
     """Fold repeated value-strings AND repeated whole subtrees into an inline legend.
     Returns (data, legend).
 
@@ -275,9 +346,14 @@ def dict_encode(structure: Any) -> tuple[Any, dict]:
     reference cost. legend maps alias -> original string-or-subtree; an empty legend
     means dictionary coding didn't pay. Unused aliases (a string whose every occurrence
     was swallowed by an aliased parent subtree) are pruned so they never cost tokens.
+
+    `memo` is the canon memo from `_build_canon_memo(structure)`; pass it when the
+    caller already built one (compress_with does), else it is built here.
     """
+    if memo is None:
+        _, memo = _build_canon_memo(structure)
     counts: Counter = Counter()
-    _count_value_nodes(structure, counts)
+    _count_value_nodes(structure, counts, memo)
     candidates = [(key, n) for key, n in counts.items()
                   if n >= 2 and (n - 1) * _node_tok(key) > 0]
     if not candidates:
@@ -311,7 +387,7 @@ def dict_encode(structure: Any) -> tuple[Any, dict]:
 
     if not (alias_for_str or alias_for_json):
         return structure, {}
-    data = _replace_nodes(structure, alias_for_str, alias_for_json)
+    data = _replace_nodes(structure, alias_for_str, alias_for_json, memo)
     used: set = set()
     _collect_used_aliases(data, legend, used)
     legend = {a: v for a, v in legend.items() if a in used}
@@ -515,17 +591,18 @@ def compress_with(obj: Any, tabularize: bool = True, dictionary: bool = True) ->
     always applied (it is the serialization). Pass both False for minify-only.
     """
     structure = compress_structure(obj) if tabularize else obj
-    base = minify(structure)
-    if dictionary:
-        data, legend = dict_encode(structure)
-        if legend:
-            coded = minify({DICT_MARKER: 1, "legend": legend, "data": data})
-            # Net-token guard: with whole-subtree aliasing the per-candidate estimate
-            # can mis-rank under nesting overlap, so commit the dict block only when it
-            # is actually smaller. Losslessness is independent (the round-trip gate);
-            # this guards SIZE — the dict tier can never regress the payload.
-            if _tok_text(coded) < _tok_text(base):
-                return coded
+    if not dictionary:
+        return minify(structure)
+    base, memo = _build_canon_memo(structure)  # root canon doubles as the minified base
+    data, legend = dict_encode(structure, memo)
+    if legend:
+        coded = minify({DICT_MARKER: 1, "legend": legend, "data": data})
+        # Net-token guard: with whole-subtree aliasing the per-candidate estimate
+        # can mis-rank under nesting overlap, so commit the dict block only when it
+        # is actually smaller. Losslessness is independent (the round-trip gate);
+        # this guards SIZE — the dict tier can never regress the payload.
+        if _tok_text(coded) < _tok_text(base):
+            return coded
     return base
 
 

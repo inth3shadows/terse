@@ -382,7 +382,12 @@ class Interceptor:
         chosen = applied.text
         try:
             curr = json.loads(text)
-        except (json.JSONDecodeError, ValueError):
+            # Depth guard (#79): a payload past the codec-wide cap must not become the
+            # diff base — the diff encoders/decoders recurse and deep-compare without a
+            # depth argument. Treat it like non-JSON: no diff in, no base stored.
+            if transforms.exceeds_depth(curr):
+                curr = None
+        except (json.JSONDecodeError, ValueError, RecursionError):
             curr = None
         if curr is not None:
             prev = self.last.get(tool)

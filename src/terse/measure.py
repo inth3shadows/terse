@@ -29,11 +29,20 @@ from .tokenize import CL100K, O200K, count, count_cl100k
 def measure_payload(raw: str) -> dict[str, Any]:
     """Measure one raw payload: shape, gate, and per-tier cl100k token deltas."""
     shape = classify_shape(raw)
+    applicable = True
+    obj: Any = None
     try:
         obj = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        # Non-JSON (long-text / other): Tier-0 is a pass-through. Lossless trivially;
-        # any real saving here would come from the (unbuilt, opt-in) lossy tier.
+        # Depth guard (#79): past the codec-wide cap the transforms would RecursionError,
+        # and the proxy passes such a payload through anyway — report it the same way,
+        # as not-applicable with zero savings, instead of crashing `terse measure`.
+        if transforms.exceeds_depth(obj):
+            applicable = False
+    except (json.JSONDecodeError, TypeError, RecursionError):
+        applicable = False
+    if not applicable:
+        # Non-JSON (long-text / other) or too-deep: Tier-0 is a pass-through. Lossless
+        # trivially; any real saving here would come from the (unbuilt, opt-in) lossy tier.
         raw_tok = count_cl100k(raw)
         row: dict[str, Any] = {
             "shape": shape,

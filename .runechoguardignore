@@ -84,3 +84,6 @@ supplied
 # proxy.py _emit_audit: `audit = self.audit` narrowed local (mypy baseline, audit
 # fix #1), called bare — same local-variable false-positive class as real/orig_send.
 audit
+# test_codec_hotpath.py's counting wrapper: `real_minify = transforms.minify`, called
+# bare inside the monkeypatch lambda. Same local-variable class as real/orig_send.
+real_minify
