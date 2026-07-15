@@ -85,8 +85,11 @@ raw tool output (JSON text)
   crashed writer is self-healed with a newline before the next append).
   `load_stats`/`aggregate`/`build_stats_report` back the `stats` subcommand; token
   totals sum only fully-tokenized records (`untokenized` counts the rest — reported,
-  never blended). Default path `$XDG_STATE_HOME/terse/stats.jsonl`; the proxy wires
-  it via `build_stats_writer` (same never-load-bearing, failures-swallowed contract
+  never blended). The record's `server` is `proxy --server-name` when given (the config's
+  own name — truthful, and what `install-mcp` bakes in), else `server_label`'s guess from
+  the command basename, which misreads a launcher-wrapped server (kb behind secret-broker
+  labels itself `sb-run`) — #83. Default path `$XDG_STATE_HOME/terse/stats.jsonl`; the
+  proxy wires it via `build_stats_writer` (same never-load-bearing, failures-swallowed contract
   as capture/audit). ON by default in `cli.py` (`--no-stats` / `--stats-log FILE`);
   the `run_proxy`/`run_multi_proxy` API default stays None (disabled) so library
   callers opt in explicitly.
@@ -157,7 +160,20 @@ raw tool output (JSON text)
 ```
 
 - **Matching:** rules are evaluated in order; the first whose `match.tool` glob
-  matches wins. No match → `defaults.tiers`.
+  matches wins. No match → `defaults.tiers`. A rule is matched against, in order: the
+  server-qualified name `{server}.{tool}` (when the server is known — see below), the
+  tool name as given, then the bare part after multiproxy's `__` peer prefix. The first
+  rule matching any candidate wins, so a server-scoped rule outranks a bare-name one.
+- **Server-scoped globs need the server name (#83).** A rule like `runecho.*` is
+  matching a *server*, but MCP tool names don't inherently carry one: kb names its own
+  tools `kb.read.search` (so `kb.*` matches unaided), while runecho calls its tool plain
+  `structure` (so `runecho.*` matched nothing and silently fell through to `defaults` —
+  the rule looked authored and did nothing). Tell the proxy who the downstream is and
+  the qualified candidate makes such a rule work for every server: `proxy --server-name
+  runecho`, which `install-mcp` bakes in automatically from the config's own server name,
+  and which multiproxy supplies per-peer from each peer's `name`. Without it, matching is
+  unchanged (bare names only). A tool that already self-prefixes is never double-qualified
+  (`kb.read.search` under server `kb` stays `kb.read.search`, not `kb.kb.read.search`).
 - **Tiers:** any subset of `minify` / `tabularize` / `dictionary`. `minify` is implied
   by serialization (a warning is emitted if omitted). `[]` = passthrough.
 - **`critical`:** a denylist against lossy ops — a `critical` field is never truncated

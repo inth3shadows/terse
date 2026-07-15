@@ -96,3 +96,11 @@ default
 writer
 quiet
 loud
+# policy.py select / proxy.py run_proxy docstrings (#83): English prose the guard's
+# pattern match reads as bare calls — "when `server` is known (#83)", "self-prefix
+# their own tool names (kb names ...)", "a server-scoped rule (`runecho.*`)", "the
+# command basename (kb behind ...)". Not code.
+known
+names
+rule
+basename

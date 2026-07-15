@@ -281,7 +281,8 @@ def test_proxy_cmd_parses_and_forwards_headers(monkeypatch):
     captured = {}
 
     def fake_run_proxy(cmd, pol, debug=False, stdin=None, stdout=None,
-                       capture_dir=None, debug_log=None, headers=None, stats_log=None):
+                       capture_dir=None, debug_log=None, headers=None, stats_log=None,
+                       server_name=None):
         captured["cmd"] = cmd
         captured["headers"] = headers
         captured["stats_log"] = stats_log
@@ -330,6 +331,35 @@ def test_proxy_cmd_rejects_header_with_config(tmp_path, monkeypatch, capsys):
     rc = main(["proxy", "--header", "Authorization=Bearer xyz", "--config", str(cfg)])
     assert rc == 2
     assert "--header" in capsys.readouterr().err
+
+
+def test_proxy_cmd_forwards_server_name(monkeypatch):
+    captured = {}
+
+    def fake_run_proxy(cmd, pol, **kw):
+        captured.update(kw)
+        return 0
+
+    monkeypatch.setattr("terse.proxy.run_proxy", fake_run_proxy)
+    assert main(["proxy", "--server-name", "runecho", "--", "uvx", "runecho-mcp"]) == 0
+    assert captured["server_name"] == "runecho"
+    # absent by default — no flag means pre-#83 matching, not a guessed name
+    assert main(["proxy", "--", "uvx", "runecho-mcp"]) == 0
+    assert captured["server_name"] is None
+
+
+def test_proxy_cmd_rejects_server_name_with_config(tmp_path, monkeypatch, capsys):
+    # A single flag can't name N peers; run_multi_proxy uses each peer's config "name"
+    # instead. Reject loudly rather than silently ignoring it (as --header already does).
+    def fake_run_multi_proxy(*_a, **_kw):
+        raise AssertionError("run_multi_proxy must not be called with --server-name")
+
+    monkeypatch.setattr("terse.multiproxy.run_multi_proxy", fake_run_multi_proxy)
+    cfg = tmp_path / "peers.json"
+    cfg.write_text("{}", encoding="utf-8")
+    rc = main(["proxy", "--server-name", "gh", "--config", str(cfg)])
+    assert rc == 2
+    assert "--server-name" in capsys.readouterr().err
 
 
 def test_proxy_cmd_no_stats_disables_ledger(monkeypatch):

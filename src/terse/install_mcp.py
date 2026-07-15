@@ -173,7 +173,11 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
     else:
         raise KeyError(server)
 
-    proxy_opts = ["--policy", policy]
+    # The config's own name for this server is the one identity terse can state rather
+    # than guess (#83): it makes a server-scoped policy rule (`runecho.*`) match even
+    # when the server's tools aren't self-prefixed, and labels the stats ledger with the
+    # real server instead of the launch command's basename (kb behind `sb-run`).
+    proxy_opts = ["--policy", policy, "--server-name", server]
     if capture_dir:
         proxy_opts += ["--capture-dir", capture_dir]
     if no_stats:

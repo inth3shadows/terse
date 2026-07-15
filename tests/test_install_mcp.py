@@ -27,6 +27,7 @@ def test_wrap_then_unwrap_roundtrips_exactly():
     entry = config["mcpServers"]["runecho"]
     assert entry["command"] == "/abs/python"
     assert entry["args"] == ["-m", "terse", "proxy", "--policy", "/p/policy.json",
+                             "--server-name", "runecho",
                              "--", "uvx", "runecho-mcp", "--flag"]
     # non-command/args keys preserved
     assert entry["env"] == {"X": "1"} and entry["cwd"] == "/some/dir"
@@ -65,7 +66,7 @@ def test_wrap_url_server_proxies_the_url_with_headers():
     entry = config["mcpServers"]["remote"]
     assert entry["command"] == "/abs/python"
     assert entry["args"] == [
-        "-m", "terse", "proxy", "--policy", "/p/policy.json",
+        "-m", "terse", "proxy", "--policy", "/p/policy.json", "--server-name", "remote",
         "--header", "Authorization=Bearer secret-token",
         "--", "https://example.com/mcp",
     ]
@@ -176,6 +177,20 @@ def test_wrap_diff_adds_proxy_flags_and_rewrap_drops_them():
     assert "--diff-keyframe-interval" not in args
 
     # and the original is still restored untouched
+    im.unwrap(config, stash, "runecho")
+    assert config["mcpServers"]["runecho"] == {"command": "uvx", "args": ["runecho-mcp"]}
+
+
+def test_wrap_bakes_the_config_server_name(tmp_path):
+    # #83: the config's own name is the one server identity terse can state rather than
+    # guess from the launch command — it makes a server-scoped policy rule match and
+    # labels the stats ledger truthfully.
+    config = _cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})
+    stash: dict = {}
+    im.wrap(config, stash, "runecho", "/p/policy.json", TERSE_CMD)
+    args = config["mcpServers"]["runecho"]["args"]
+    assert args[args.index("--server-name") + 1] == "runecho"
+    assert args.index("--server-name") < args.index("--")   # a proxy opt, not a downstream arg
     im.unwrap(config, stash, "runecho")
     assert config["mcpServers"]["runecho"] == {"command": "uvx", "args": ["runecho-mcp"]}
 

@@ -47,6 +47,61 @@ def test_select_falls_back_to_bare_name_for_multiproxy_peer_qualified_tool():
     assert p.select("unknown.tool").tiers == ("minify", "tabularize", "dictionary")
 
 
+def test_select_server_scoped_rule_matches_a_server_that_does_not_self_prefix():
+    # Regression (#83): a server-scoped rule like "runecho.*" only ever matched servers
+    # that happen to self-prefix their own tool names. runecho calls its tool plain
+    # "structure", so the rule silently missed and fell through to the defaults — and
+    # nothing said so. With the server known, the qualified candidate makes it match.
+    p = Policy(rules=[Rule(tool_glob="runecho.*", tiers=("minify",))])
+    assert p.select("structure").tiers == ("minify", "tabularize", "dictionary")  # pre-#83
+    assert p.select("structure", server="runecho").tiers == ("minify",)           # fixed
+    # a server whose rule doesn't match still falls through to the defaults
+    assert p.select("structure", server="codegraph").tiers == ("minify", "tabularize",
+                                                               "dictionary")
+
+
+def test_select_does_not_double_qualify_a_self_prefixed_tool():
+    # kb names its OWN tools "kb.read.*", so qualifying by server must not synthesize
+    # "kb.kb.read.search" and miss the "kb.*" rule the user actually wrote.
+    p = _policy()
+    assert p.select("kb.read.search", server="kb").tiers == ("minify", "tabularize")
+
+
+def test_select_server_qualified_candidate_outranks_a_bare_rule():
+    # A server-scoped rule is the more specific intent, so it wins over a bare-name rule
+    # regardless of declaration order — mirroring how multiproxy's peer-qualified
+    # candidate already outranks its bare fallback.
+    p = Policy(rules=[Rule(tool_glob="structure", tiers=()),
+                      Rule(tool_glob="runecho.*", tiers=("minify",))])
+    assert p.select("structure", server="runecho").tiers == ("minify",)
+    assert p.select("structure").tiers == ()          # no server: bare rule still wins
+
+
+def test_select_server_none_is_byte_identical_to_pre_83_behavior():
+    # The whole change is additive: every existing candidate is still tried in its
+    # original order, so a policy that matched before matches the same rule now.
+    p = _policy()
+    for tool in ("gh.api.repos", "kb.read.search", "gh.api.rate_limit", "unknown.tool",
+                 "gh__gh.api.repos", "gh__kb.read.search"):
+        assert p.select(tool).tiers == p.select(tool, server=None).tiers
+
+
+def test_select_server_scoped_rule_matches_a_multiproxy_peer_qualified_tool():
+    # multiproxy passes the peer's config name as `server`, and its tool arrives
+    # peer-qualified ("runecho__structure"). The qualified candidate is built from the
+    # BARE part, so a "runecho.*" rule matches there too — the separator is "__", so
+    # without this the peer-qualified name would miss the dot-globbed rule as well.
+    p = Policy(rules=[Rule(tool_glob="runecho.*", tiers=("minify",))])
+    assert p.select("runecho__structure", server="runecho").tiers == ("minify",)
+
+
+def test_apply_passes_server_through_to_rule_selection():
+    p = Policy(rules=[Rule(tool_glob="runecho.*", tiers=())])   # () = passthrough
+    raw = json.dumps({"result": [{"id": 1, "k": "v"}, {"id": 2, "k": "v"}]})
+    assert apply(raw, "structure", p).text != raw                        # defaults ran
+    assert apply(raw, "structure", p, server="runecho").skipped is True  # rule matched
+
+
 def test_apply_is_lossless_for_every_tier_combo():
     p = _policy()
     for tool in ("gh.api.repos", "kb.read.search", "totally.unknown"):
