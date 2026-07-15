@@ -87,3 +87,12 @@ audit
 # test_codec_hotpath.py's counting wrapper: `real_minify = transforms.minify`, called
 # bare inside the monkeypatch lambda. Same local-variable class as real/orig_send.
 real_minify
+# proxy.py run_proxy docstring (stats ledger): "record per result (sizes + decision"
+# and "ON by default (cli.py resolves" — English words reading as bare calls. Not code.
+result
+default
+# test_stats.py locals holding build_stats_writer's returned closure, called bare
+# (writer(...) / quiet(...) / loud(...)). Same local-variable class as real/orig_send.
+writer
+quiet
+loud

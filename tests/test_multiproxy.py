@@ -178,6 +178,23 @@ def _log_text(n, changed_line=None):
     return "\n".join(lines)
 
 
+def test_stats_ledger_records_peer_name_and_qualified_tool(tmp_path):
+    from terse.stats import load_stats
+    cfg = _write_config(tmp_path, [{"name": "gh", "command": [sys.executable, str(FAKE)]}])
+    log = tmp_path / "stats.jsonl"
+    cin = io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                  "params": {"name": "gh__gh.api.items"}}) + "\n")
+    cout = io.StringIO()
+    rc = run_multi_proxy(str(cfg), PLAIN_POLICY, stdin=cin, stdout=cout,
+                         stats_log=str(log))
+    assert rc == 0
+    recs = load_stats(log)
+    assert len(recs) == 1
+    # server = the peer's config name; tool = the peer-qualified name the client sees
+    assert recs[0]["server"] == "gh" and recs[0]["tool"] == "gh__gh.api.items"
+    assert "active" not in log.read_text(encoding="utf-8")   # payload-free
+
+
 def test_tools_call_routes_by_prefix_and_strips_it(tmp_path):
     with _fake_http() as srv:
         cfg = _write_config(tmp_path, [

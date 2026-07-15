@@ -8,6 +8,7 @@ Subcommands:
   validate                 cross-tokenizer invariance (cl100k vs o200k)
   compress --tool N        compress one tool output through a policy (the shell)
   proxy -- <cmd>           MCP stdio proxy: compress a downstream server's results
+  stats                    live savings report from the proxy's payload-free ledger
   fluency                  does a model read the compressed form as well as raw JSON?
 """
 
@@ -18,6 +19,7 @@ import json
 import json as _json
 import re
 import sys
+import time
 from datetime import UTC
 from pathlib import Path
 
@@ -187,6 +189,17 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         pol.diff = diff_override
     if args.diff_keyframe_interval is not None:
         pol.diff_keyframe_interval = args.diff_keyframe_interval
+    if args.no_stats and args.stats_log:
+        print("proxy: --no-stats and --stats-log are mutually exclusive", file=sys.stderr)
+        return 2
+    # The ledger is payload-free (sizes + decisions only — see stats.py), so unlike
+    # capture/audit it defaults ON; --no-stats disables, --stats-log redirects.
+    if args.no_stats:
+        stats_log = None
+    else:
+        from .stats import default_stats_log
+
+        stats_log = args.stats_log or str(default_stats_log())
 
     if args.config:
         from .multiproxy import run_multi_proxy
@@ -197,7 +210,8 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
             return run_multi_proxy(args.config, pol, debug=args.debug,
                                    capture_dir=args.capture_dir, debug_log=args.debug_log,
                                    diff_override=diff_override,
-                                   diff_keyframe_override=args.diff_keyframe_interval)
+                                   diff_keyframe_override=args.diff_keyframe_interval,
+                                   stats_log=stats_log)
         except (OSError, ValueError) as e:
             print(f"proxy --config: {e}", file=sys.stderr)
             return 2
@@ -210,7 +224,37 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         print(f"proxy: {e}", file=sys.stderr)
         return 2
     return run_proxy(cmd, pol, debug=args.debug, capture_dir=args.capture_dir,
-                     debug_log=args.debug_log, headers=headers)
+                     debug_log=args.debug_log, headers=headers, stats_log=stats_log)
+
+
+def _cmd_stats(args: argparse.Namespace) -> int:
+    from .stats import (
+        aggregate,
+        build_stats_report,
+        default_stats_log,
+        load_stats,
+        parse_window,
+    )
+
+    log_path = args.log or str(default_stats_log())
+    since_ts: int | None = None
+    if args.since:
+        try:
+            since_ts = int(time.time()) - parse_window(args.since)
+        except ValueError as e:
+            print(f"stats: {e}", file=sys.stderr)
+            return 2
+    if not Path(log_path).exists() and not Path(log_path + ".1").exists():
+        print(f"stats: no ledger at {log_path} — a terse-wrapped server writes one "
+              f"automatically on its next tool call (unless run with --no-stats)",
+              file=sys.stderr)
+        return 2
+    agg = aggregate(load_stats(log_path, since_ts))
+    if args.json:
+        print(json.dumps(agg, indent=2))
+    else:
+        print(build_stats_report(agg, log_path=log_path, window=args.since), end="")
+    return 0
 
 
 def _cmd_policy_generate(args: argparse.Namespace) -> int:
@@ -601,7 +645,8 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
         res = do_install(args.servers, args.policy, dry_run=args.print,
                          capture_dir=args.capture_dir, diff=diff,
                          diff_keyframe_interval=args.diff_keyframe_interval,
-                         scope=args.scope, file=args.file, repo_path=args.repo_path)
+                         scope=args.scope, file=args.file, repo_path=args.repo_path,
+                         no_stats=args.no_stats)
     except (FileNotFoundError, ValueError) as e:
         print(f"install-mcp: {e}", file=sys.stderr)
         return 2
@@ -621,6 +666,8 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
         print("diff: explicit --diff baked in (overrides a policy-file opt-out)")
     elif res.get("diff") is False:
         print("diff: DISABLED for these server(s) (--no-diff baked in)")
+    if res.get("no_stats"):
+        print("stats: DISABLED for these server(s) (--no-stats baked in)")
     if res["backup"]:
         print(f"backup: {res['backup']}")
     if not res["dry_run"] and res["changes"]:
@@ -824,6 +871,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="append a structured raw->decision->emitted record per result to "
                          "this JSONL file for after-the-fact diagnosis/replay (opt-in; never "
                          "affects forwarding)")
+    px.add_argument("--stats-log", metavar="FILE",
+                    help="path for the payload-free savings ledger read by `terse stats` "
+                         "(default: $XDG_STATE_HOME/terse/stats.jsonl; sizes + decisions "
+                         "only, never payload content; never affects forwarding)")
+    px.add_argument("--no-stats", action="store_true",
+                    help="disable the savings ledger (it is ON by default — safe because "
+                         "it stores no payload content)")
     px.add_argument("--header", action="append", metavar="NAME=VALUE",
                     help="HTTP header to send to an HTTP/SSE downstream (repeatable), e.g. "
                          "--header 'Authorization=Bearer xyz'. Ignored for a stdio downstream. "
@@ -837,6 +891,18 @@ def main(argv: list[str] | None = None) -> int:
     px.add_argument("cmd", nargs=argparse.REMAINDER,
                     help="-- <downstream MCP server command and args, or a single URL>")
     px.set_defaults(func=_cmd_proxy)
+
+    st = sub.add_parser("stats", help="live savings report from the proxy's always-on "
+                                      "payload-free ledger")
+    st.add_argument("--log", metavar="FILE",
+                    help="ledger path (default: $XDG_STATE_HOME/terse/stats.jsonl — "
+                         "where `terse proxy` writes unless --stats-log/--no-stats)")
+    st.add_argument("--since", metavar="WINDOW",
+                    help="only count records newer than this window, e.g. 30m, 24h, 7d "
+                         "(default: all recorded history)")
+    st.add_argument("--json", action="store_true",
+                    help="emit the aggregate as JSON instead of the text report")
+    st.set_defaults(func=_cmd_stats)
 
     f = sub.add_parser("fluency", help="does a model read the compressed form as "
                                        "accurately as raw JSON? (proxy's open question)")
@@ -907,6 +973,10 @@ def main(argv: list[str] | None = None) -> int:
     im.add_argument("--diff-keyframe-interval", type=int, default=None, metavar="K",
                     help="force a full result every K consecutive diffs per tool "
                          "(default 5; 0 disables)")
+    im.add_argument("--no-stats", action="store_true",
+                    help="bake `--no-stats` into the wrapped entry: no savings-ledger "
+                         "records for this server (the ledger is otherwise the proxy "
+                         "default — payload-free, read by `terse stats`)")
     im.add_argument("--print", action="store_true",
                     help="dry-run: show the before/after without writing")
     im.set_defaults(func=_cmd_install_mcp)

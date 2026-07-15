@@ -119,6 +119,7 @@ class Interceptor:
     def __init__(self, pol: policy_mod.Policy, debug: bool = False,
                  capture: Callable[[str, str], None] | None = None,
                  audit: Callable[[dict], None] | None = None,
+                 stats: Callable[[str, str, str, bool], None] | None = None,
                  store: OrderedDict[str, Any] | None = None,
                  store_lock: Lock | None = None,
                  dropped_bytes: list[int] | None = None):
@@ -139,6 +140,11 @@ class Interceptor:
         # (#23). Like capture, the callback owns I/O and its failures are swallowed: an
         # audit-log write must NEVER change what the client receives.
         self.audit = audit
+        # Optional payload-FREE savings ledger callback: (tool, raw, emitted,
+        # passthrough) per result block (see stats.py). Unlike capture/audit it is safe
+        # to leave always-on — it records sizes and decisions, never content — but it
+        # keeps their exact contract: callback owns I/O, failures are swallowed.
+        self.stats = stats
         self.last: dict[str, Any] = {}  # tool -> previous result object (the diff base)
         # tool -> consecutive diffs emitted since the last full (keyframe) result. Bounds
         # how far a chained diff can drift from a self-contained anchor (#8).
@@ -328,8 +334,10 @@ class Interceptor:
                                 f"[terse-proxy] {capture_tool}: capture skipped: {exc}\n")
 
             # Snapshot the raw block texts before any transform mutates them in place, so
-            # the audit log can pair each raw payload with what terse actually emitted (#23).
-            raw_texts = [b["text"] for b in text_blocks] if self.audit is not None else None
+            # the audit log can pair each raw payload with what terse actually emitted
+            # (#23) and the stats ledger can size the raw side of each result.
+            wants_raw = self.audit is not None or self.stats is not None
+            raw_texts = [b["text"] for b in text_blocks] if wants_raw else None
 
             changed = False
             # Diffing reasons about ONE logical payload, so it only engages for a single
@@ -349,6 +357,8 @@ class Interceptor:
             if self.audit is not None and raw_texts is not None:
                 self._emit_audit(tool, msg["id"], raw_texts, text_blocks, changed,
                                  display_tool=capture_tool)
+            if self.stats is not None and raw_texts is not None:
+                self._emit_stats(tool, raw_texts, text_blocks, display_tool=capture_tool)
 
             if not changed:
                 return line
@@ -600,6 +610,24 @@ class Interceptor:
             if self.debug:
                 sys.stderr.write(f"[terse-proxy] {shown_tool}: audit skipped: {exc}\n")
 
+    def _emit_stats(self, tool: str, raw_texts: list[str], text_blocks: list[dict], *,
+                    display_tool: str | None = None) -> None:
+        """Hand the stats callback one (tool, raw, emitted, passthrough) per result
+        block, for the payload-free savings ledger (stats.py). Same fail-open contract
+        as capture/audit: the callback owns I/O and a failure can never change what the
+        client receives. `tool`/`display_tool` split as in `_emit_audit`."""
+        stats = self.stats
+        if stats is None:
+            return
+        shown_tool = display_tool if display_tool is not None else tool
+        passthrough = not self.policy.select(tool).tiers
+        for raw, b in zip(raw_texts, text_blocks, strict=True):
+            try:
+                stats(shown_tool, raw, b["text"], passthrough)
+            except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
+                if self.debug:
+                    sys.stderr.write(f"[terse-proxy] {shown_tool}: stats skipped: {exc}\n")
+
 
 # Sentinel a transform returns to SWALLOW a line — write nothing to dst — as distinct from
 # None, which forwards the line unchanged. Used when the client->server side answers a
@@ -752,6 +780,7 @@ def run_proxy(
     capture_dir: str | None = None,
     debug_log: str | None = None,
     headers: dict[str, str] | None = None,
+    stats_log: str | None = None,
 ) -> int:
     """Launch the downstream MCP peer `cmd` and proxy JSON-RPC through `Interceptor`.
     `cmd` is either a stdio launch command, or a single-element list holding a URL — in
@@ -772,6 +801,12 @@ def run_proxy(
     to that JSONL path (#23) for after-the-fact diagnosis/replay of a silent compression
     bug — same opt-in, side-effect-only contract.
 
+    With `stats_log`, a payload-FREE savings record per result (sizes + decision, never
+    content — see stats.py) is appended to that JSONL ledger for `terse stats`. Unlike
+    the two above this is ON by default (cli.py resolves the default path; None here
+    means disabled) — safe because no payload content is stored — but it keeps the
+    identical side-effect-only, fail-open contract.
+
     Return code: for a stdio downstream, the child's real exit code (or 127 if it could
     never be launched — #19), exactly as before this function grew a second transport.
     For an HTTP downstream there is no child process to exit; 0 means the client
@@ -790,7 +825,13 @@ def run_proxy(
 
     capture, audit = _build_capture_and_audit(capture_dir, debug_log, debug, "[terse-proxy]")
 
-    inter = Interceptor(pol, debug=debug, capture=capture, audit=audit)
+    stats = None
+    if stats_log is not None:
+        from .stats import build_stats_writer, server_label
+
+        stats = build_stats_writer(stats_log, server_label(cmd), debug, "[terse-proxy]")
+
+    inter = Interceptor(pol, debug=debug, capture=capture, audit=audit, stats=stats)
 
     try:
         transport = build_transport(cmd, headers=headers)

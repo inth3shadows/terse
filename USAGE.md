@@ -245,6 +245,27 @@ no-op (`changed:false`) is logged, so you can confirm terse left a suspect paylo
 Replay any line through `terse compress --tool <tool>` on its `raw` to reproduce. Opt-in
 and side-effect-only: a log-write failure never affects what the client receives.
 
+### How much is terse actually saving me? (`terse stats`)
+
+Every proxy keeps a **live savings ledger** by default — one small JSON line per tool
+result recording sizes, token counts, and what terse did (`compressed`, `diff`,
+`unchanged`, `passthrough`). It stores **no payload content whatsoever** (that's what
+makes always-on safe — unlike the replay log above), it's bounded (rotated at 10 MB,
+one prior generation kept), and a write failure can never affect a tool call.
+
+```bash
+uv run terse stats               # all recorded history
+uv run terse stats --since 7d    # just the last week (30m / 24h / 7d / 1w forms)
+uv run terse stats --json        # the raw aggregate, for scripts
+```
+
+The report shows total tokens saved, the decision mix (how often the cross-call diff
+actually fired), and a per-server/per-tool breakdown — real numbers from your real
+sessions, complementing the synthetic-corpus `measure` report. The ledger lives at
+`$XDG_STATE_HOME/terse/stats.jsonl` (usually `~/.local/state/terse/stats.jsonl`);
+redirect it with `proxy --stats-log FILE` or disable it with `proxy --no-stats`
+(bake the opt-out into a wrapped entry with `install-mcp --no-stats`).
+
 ### See how well it does across many tools
 
 If you've collected sample outputs (see "Building a sample set" below), these produce
