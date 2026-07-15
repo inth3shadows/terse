@@ -725,6 +725,81 @@ def test_append_audit_writes_one_json_line_per_call(tmp_path):
     assert [json.loads(line)["id"] for line in lines] == [1, 2]
 
 
+# --- #85: policy `"capture": false` — never persist this tool's payloads ---
+
+SECRET = json.dumps({"credential": "sk-live-super-secret-value"})
+# One proxy, two tools: only the credential-returning one is capture-gated. This shape
+# is the point — the gate is per RULE, not per proxy (which `--capture-dir`'s presence
+# or absence already gives you).
+CAPTURE_GATED = Policy(rules=[Rule("secret.*", (), capture=False),
+                             Rule("gh.*", ("minify", "tabularize", "dictionary"))])
+
+
+def test_capture_false_blocks_the_corpus_tee_but_a_sibling_tool_still_captures():
+    captured = []
+    inter = Interceptor(CAPTURE_GATED, capture=lambda tool, raw: captured.append((tool, raw)))
+    _note_call(inter, 1, "secret.reveal")
+    inter.transform_response(_result_msg(1, SECRET))
+    assert captured == []                                  # nothing persisted at all
+    _note_call(inter, 2, "gh.api.items")
+    inter.transform_response(_result_msg(2, _records_text()))
+    assert [t for t, _ in captured] == ["gh.api.items"]    # sibling unaffected
+
+
+def test_capture_false_blocks_the_audit_replay_log_too():
+    # The audit record embeds the raw payload in blocks:[{raw, emitted}] — the identical
+    # exposure. Gating only the corpus tee would be half a guard.
+    records = []
+    inter = Interceptor(CAPTURE_GATED, audit=records.append)
+    _note_call(inter, 1, "secret.reveal")
+    inter.transform_response(_result_msg(1, SECRET))
+    assert records == []
+    _note_call(inter, 2, "gh.api.items")
+    inter.transform_response(_result_msg(2, _records_text()))
+    assert [r["tool"] for r in records] == ["gh.api.items"]
+
+
+def test_capture_false_still_counts_in_the_payload_free_stats_ledger():
+    # The ledger records sizes + decision, never content — so a capture-gated tool is
+    # still measured, just never quoted. Losing the row would be a needless blind spot.
+    seen = []
+    inter = Interceptor(CAPTURE_GATED, stats=lambda *a: seen.append(a))
+    _note_call(inter, 1, "secret.reveal")
+    inter.transform_response(_result_msg(1, SECRET))
+    assert len(seen) == 1
+    tool, raw, emitted, passthrough = seen[0]
+    assert tool == "secret.reveal" and passthrough is True
+    assert raw == SECRET and emitted == SECRET             # passthrough: untouched
+
+
+def test_capture_false_does_not_change_what_the_client_receives():
+    plain = Interceptor(Policy(rules=[Rule("secret.*", ())]))
+    gated = Interceptor(CAPTURE_GATED)
+    _note_call(plain, 1, "secret.reveal")
+    _note_call(gated, 1, "secret.reveal")
+    assert plain.transform_response(_result_msg(1, SECRET)) == \
+        gated.transform_response(_result_msg(1, SECRET))
+
+
+def test_run_proxy_capture_false_writes_no_corpus_file_for_that_tool(tmp_path):
+    # End-to-end through the real proxy + a real corpus dir: the gated tool's payload
+    # must not exist on disk in any form.
+    from terse.capture import load_corpus
+    pol = Policy(rules=[Rule("gh.*", (), capture=False)])   # fake server's tool is gh.api.items
+    requests = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                           "params": {"name": "gh.api.items"}}) + "\n"
+    cin, cout = io.StringIO(requests), io.StringIO()
+    corpus = tmp_path / "corpus"
+    log = tmp_path / "audit.jsonl"
+    rc = run_proxy([sys.executable, str(FAKE)], pol, stdin=cin, stdout=cout,
+                   capture_dir=str(corpus), debug_log=str(log))
+    assert rc == 0
+    assert load_corpus(corpus) == []                        # no envelope written
+    assert not log.exists() or log.read_text(encoding="utf-8") == ""
+    # and the payload reached the client untouched
+    assert "active" in cout.getvalue()
+
+
 # --- savings-ledger stats callback (payload-free, always-on-able) ---
 
 def test_stats_callback_sees_raw_and_emitted_per_result():

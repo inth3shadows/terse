@@ -95,6 +95,42 @@ def test_select_server_scoped_rule_matches_a_multiproxy_peer_qualified_tool():
     assert p.select("runecho__structure", server="runecho").tiers == ("minify",)
 
 
+def test_capture_defaults_true_and_parses_false(tmp_path):
+    p = tmp_path / "policy.json"
+    p.write_text(json.dumps({
+        "version": 1,
+        "policies": [
+            {"match": {"tool": "secret-broker.*"}, "tiers": [], "capture": False},
+            {"match": {"tool": "gh.*"}, "tiers": ["minify"]},
+        ],
+    }), encoding="utf-8")
+    pol = load_policy(p)
+    assert pol.select("secret-broker.reveal").capture is False
+    assert pol.select("gh.items").capture is True        # omitted -> pre-#85 behavior
+    assert Rule("x", ()).capture is True                 # dataclass default
+
+
+@pytest.mark.parametrize("bad", ["false", "no", 0, 1, None, [], {}])
+def test_capture_rejects_a_non_bool_rather_than_silently_enabling_itself(tmp_path, bad):
+    # THE failure direction that matters (#85): every wrong-typed value in Python is
+    # truthy (`bool("false") is True`), so a lax coercion would silently turn the guard
+    # back ON — writing the very payloads it was written to keep off disk. Fail at load.
+    p = tmp_path / "policy.json"
+    p.write_text(json.dumps({"version": 1,
+                             "policies": [{"match": {"tool": "x.*"}, "tiers": [],
+                                           "capture": bad}]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="'capture' must be true or false"):
+        load_policy(p)
+
+
+def test_capture_is_a_registered_rule_key(tmp_path):
+    # Strict-key validation (#77) rejects unknown keys, so a `capture` that wasn't
+    # registered would make every policy using it fail to load — the guard must be
+    # spelled exactly this way to work at all.
+    from terse.policy import _RULE_KEYS
+    assert "capture" in _RULE_KEYS
+
+
 def test_apply_passes_server_through_to_rule_selection():
     p = Policy(rules=[Rule(tool_glob="runecho.*", tiers=())])   # () = passthrough
     raw = json.dumps({"result": [{"id": 1, "k": "v"}, {"id": 2, "k": "v"}]})
