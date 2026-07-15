@@ -80,6 +80,22 @@ automatically. For several servers, either give each its own wrapper (one `terse
 from one proxy process with `--config` (see "Fronting multiple servers from one proxy"
 below).
 
+**Tell terse which server it's fronting.** If your policy has rules scoped to a server —
+`runecho.*`, `codegraph.*` — add `--server-name` so they actually match:
+
+```
+uv run terse proxy --policy policy.json --server-name runecho -- runecho-mcp
+```
+
+The catch this solves: MCP tool names don't inherently name their server. kb calls its
+tools `kb.read.search`, so a `kb.*` rule matches unaided — but runecho calls its tool
+plain `structure`, so a `runecho.*` rule matched *nothing* and quietly fell through to
+your defaults. The rule looked authored and did nothing. `--server-name` supplies the
+missing half so a server-scoped rule means the same thing for every server; it also
+labels `terse stats` with the real server rather than the launch command's basename.
+`install-mcp` (below) fills it in for you from your MCP config, and `--config` uses each
+peer's `name` — so you only pass this by hand when running `proxy` directly.
+
 ### Fronting multiple servers from one proxy (`--config`)
 
 `--config` fans one `terse proxy` process out to N downstream peers — any mix of stdio and
@@ -444,6 +460,12 @@ The policy file (`policy.example.json`) is a list of rules. Each rule says: for 
 whose name matches this pattern, run these compression tiers. Patterns use `*` as a
 wildcard (`gh.*` matches every GitHub tool). The first matching rule wins, so put more
 specific rules first. An empty tier list means "leave this tool's output alone."
+
+A pattern is matched against the tool's own name — so `gh.*` works only because those
+tools are *called* `gh.something`. If you're scoping a rule to a **server** whose tools
+have plain names (runecho's is just `structure`), the proxy needs `--server-name` to
+connect the two, or the rule silently never fires. `install-mcp` handles this
+automatically; see "Tell terse which server it's fronting" above.
 
 ## What to Do When Something Breaks
 

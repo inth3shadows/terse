@@ -1,6 +1,7 @@
 {
   "version": 1,
   "_comment": "Selective per-tool policy, informed by the spike's measured per-tool savings (gh records +16-30%, runecho +25-29%, kb +2.6%, single objects +0%). First matching rule wins; unmatched tools use defaults. tiers subset of [minify, tabularize, dictionary]; [] = passthrough. Lossless by default. Per-field lossy is opt-in: 'truncate' executes (gated by an acceptable-loss check); 'summarize'/'drop-to-retrieve' are parsed but deferred (warned). A field marked {critical:true} is never made lossy.",
+  "_comment_server_scope": "A SERVER-scoped rule below ('runecho.*', 'codegraph.*') only matches when the proxy knows which server it is fronting: `proxy --server-name runecho` (install-mcp bakes this in from your MCP config; --config uses each peer's name). Without it, only the tool's own name is matched — which is why 'kb.*' works unaided (kb names its tools kb.read.*) while 'runecho.*' would silently miss runecho's plainly-named 'structure' tool and fall through to defaults. See #83.",
   "defaults": {
     "tiers": ["minify", "tabularize", "dictionary"]
   },

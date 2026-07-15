@@ -207,6 +207,13 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
             # diff_override/diff_keyframe_override (not just the mutated `pol` above)
             # so --diff/--no-diff also applies to a peer with its OWN policy_path,
             # not just peers using this default policy.
+            # No --server-name here: run_multi_proxy already knows each peer's own name
+            # from the config file and passes it per-peer (a single flag couldn't name N
+            # peers unambiguously — same reason --header is rejected with --config).
+            if args.server_name:
+                print("proxy: --server-name has no effect with --config — each peer's "
+                      '"name" in the config file is used instead', file=sys.stderr)
+                return 2
             return run_multi_proxy(args.config, pol, debug=args.debug,
                                    capture_dir=args.capture_dir, debug_log=args.debug_log,
                                    diff_override=diff_override,
@@ -224,7 +231,8 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         print(f"proxy: {e}", file=sys.stderr)
         return 2
     return run_proxy(cmd, pol, debug=args.debug, capture_dir=args.capture_dir,
-                     debug_log=args.debug_log, headers=headers, stats_log=stats_log)
+                     debug_log=args.debug_log, headers=headers, stats_log=stats_log,
+                     server_name=args.server_name)
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
@@ -871,6 +879,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="append a structured raw->decision->emitted record per result to "
                          "this JSONL file for after-the-fact diagnosis/replay (opt-in; never "
                          "affects forwarding)")
+    px.add_argument("--server-name", metavar="NAME",
+                    help="this downstream's name in your MCP config (e.g. runecho). Makes "
+                         "a server-scoped policy rule (\"runecho.*\") match a server whose "
+                         "tools aren't self-prefixed, and labels `terse stats` with the "
+                         "real server instead of the command basename. `install-mcp` bakes "
+                         "this in automatically.")
     px.add_argument("--stats-log", metavar="FILE",
                     help="path for the payload-free savings ledger read by `terse stats` "
                          "(default: $XDG_STATE_HOME/terse/stats.jsonl; sizes + decisions "

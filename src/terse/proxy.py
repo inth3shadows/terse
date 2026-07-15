@@ -120,10 +120,17 @@ class Interceptor:
                  capture: Callable[[str, str], None] | None = None,
                  audit: Callable[[dict], None] | None = None,
                  stats: Callable[[str, str, str, bool], None] | None = None,
+                 server_name: str | None = None,
                  store: OrderedDict[str, Any] | None = None,
                  store_lock: Lock | None = None,
                  dropped_bytes: list[int] | None = None):
         self.policy = pol
+        # The downstream server's name, when the caller knows it (`proxy --server-name`,
+        # or a multiproxy peer's config name). Passed to every `policy.select`/`apply` so
+        # a server-scoped rule (`runecho.*`) matches a server that doesn't self-prefix its
+        # own tool names (#83). None = no qualified candidate, i.e. exactly the pre-#83
+        # matching behavior.
+        self.server_name = server_name
         # id -> (policy_tool, capture_tool): policy_tool drives compression/policy-tier
         # lookup and MUST be the bare name the policy's rules match against; capture_tool
         # is what capture()/audit() see and defaults to policy_tool, but multiproxy
@@ -371,7 +378,8 @@ class Interceptor:
         text changed. Fail-open: any error leaves the block untouched and state intact."""
         text = block["text"]
         try:
-            applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put)
+            applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put,
+                                       server=self.server_name)
         except Exception as exc:  # noqa: BLE001 — fail-open is the whole point
             if self.debug:
                 sys.stderr.write(f"[terse-proxy] {tool}: passthrough on error: {exc}\n")
@@ -385,7 +393,7 @@ class Interceptor:
             # result to re-anchor as a full (#8).
             self.last.pop(tool, None)
             self.since_keyframe.pop(tool, None)
-            if not self.policy.select(tool).tiers:
+            if not self.policy.select(tool, self.server_name).tiers:
                 return False  # true passthrough policy: hands off entirely, no state kept
             return self._text_diff_or_store(block, tool, text)
 
@@ -491,7 +499,8 @@ class Interceptor:
     def _compress(self, text: str, tool: str) -> str:
         """policy.apply with a hard fail-open: any error returns the original text."""
         try:
-            applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put)
+            applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put,
+                                       server=self.server_name)
             if self.debug and not applied.skipped and applied.text != text:
                 sys.stderr.write(
                     f"[terse-proxy] {tool}: {len(text)}->{len(applied.text)} bytes "
@@ -587,7 +596,7 @@ class Interceptor:
         effect: any error is swallowed so an audit-log write can never change what the
         client receives — same fail-open contract as capture.
 
-        `tool` drives `self.policy.select(tool)` and MUST be the bare/policy-matching
+        `tool` drives `self.policy.select(tool, self.server_name)` and MUST be the bare/policy-matching
         name. `display_tool`, if given, overrides only the record's `"tool"` field
         (e.g. multiproxy's peer-qualified name) without affecting which policy rule's
         tiers get reported."""
@@ -596,7 +605,7 @@ class Interceptor:
             "tool": shown_tool,
             "id": mid,
             "diff_mode": self.diff,
-            "tiers": list(self.policy.select(tool).tiers),
+            "tiers": list(self.policy.select(tool, self.server_name).tiers),
             "changed": changed,
             "blocks": [{"raw": raw, "emitted": b["text"]}
                        for raw, b in zip(raw_texts, text_blocks, strict=True)],
@@ -620,7 +629,7 @@ class Interceptor:
         if stats is None:
             return
         shown_tool = display_tool if display_tool is not None else tool
-        passthrough = not self.policy.select(tool).tiers
+        passthrough = not self.policy.select(tool, self.server_name).tiers
         for raw, b in zip(raw_texts, text_blocks, strict=True):
             try:
                 stats(shown_tool, raw, b["text"], passthrough)
@@ -781,6 +790,7 @@ def run_proxy(
     debug_log: str | None = None,
     headers: dict[str, str] | None = None,
     stats_log: str | None = None,
+    server_name: str | None = None,
 ) -> int:
     """Launch the downstream MCP peer `cmd` and proxy JSON-RPC through `Interceptor`.
     `cmd` is either a stdio launch command, or a single-element list holding a URL — in
@@ -807,6 +817,10 @@ def run_proxy(
     means disabled) — safe because no payload content is stored — but it keeps the
     identical side-effect-only, fail-open contract.
 
+    `server_name` is this downstream's name in the MCP config. It makes a server-scoped
+    policy rule (`runecho.*`) match a server whose tools aren't self-prefixed, and labels
+    the stats ledger with the real server identity instead of the command basename (#83).
+
     Return code: for a stdio downstream, the child's real exit code (or 127 if it could
     never be launched — #19), exactly as before this function grew a second transport.
     For an HTTP downstream there is no child process to exit; 0 means the client
@@ -829,9 +843,15 @@ def run_proxy(
     if stats_log is not None:
         from .stats import build_stats_writer, server_label
 
-        stats = build_stats_writer(stats_log, server_label(cmd), debug, "[terse-proxy]")
+        # `server_name` (the MCP config's own name for this server) is the truthful
+        # identity when the caller knows it; `server_label(cmd)` is the fallback guess
+        # from the command basename, which misreads a launcher-wrapped server (kb behind
+        # secret-broker's `sb-run` labels itself "sb-run") — #83.
+        label = server_name or server_label(cmd)
+        stats = build_stats_writer(stats_log, label, debug, "[terse-proxy]")
 
-    inter = Interceptor(pol, debug=debug, capture=capture, audit=audit, stats=stats)
+    inter = Interceptor(pol, debug=debug, capture=capture, audit=audit, stats=stats,
+                        server_name=server_name)
 
     try:
         transport = build_transport(cmd, headers=headers)

@@ -966,8 +966,8 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                                         "[terse-multiproxy]")
                      if stats_log is not None else None)
             inter = Interceptor(pol, debug=debug, capture=capture, audit=audit,
-                                stats=stats, store=store, store_lock=store_lock,
-                                dropped_bytes=dropped_bytes)
+                                stats=stats, server_name=spec.name, store=store,
+                                store_lock=store_lock, dropped_bytes=dropped_bytes)
             transport = build_transport(spec.target, headers=spec.headers or None)
             peers.append(Peer(name=spec.name, transport=transport, inter=inter))
     except Exception:

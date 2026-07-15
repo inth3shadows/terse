@@ -812,6 +812,36 @@ def test_run_proxy_stats_log_writes_payload_free_ledger(tmp_path):
     assert "active" not in log.read_text(encoding="utf-8")
 
 
+def test_interceptor_server_name_makes_a_server_scoped_rule_match(tmp_path):
+    # End-to-end of #83 through the real message path: the policy names a server-scoped
+    # rule, the tool arrives bare. Without server_name the rule misses (defaults compress
+    # it); with it, the rule's passthrough tiers take effect.
+    pol = Policy(rules=[Rule("runecho.*", ())])          # () = hands off entirely
+    blind = Interceptor(pol)
+    named = Interceptor(pol, server_name="runecho")
+    _note_call(blind, 1, "structure")
+    _note_call(named, 1, "structure")
+    assert blind.transform_response(_result_msg(1, _records_text())) != \
+        _result_msg(1, _records_text())                  # rule missed -> defaults ran
+    assert named.transform_response(_result_msg(1, _records_text())) == \
+        _result_msg(1, _records_text())                  # rule matched -> passthrough
+
+
+def test_run_proxy_stats_server_name_labels_the_ledger_over_the_command_basename(tmp_path):
+    # The command basename misreads a launcher-wrapped server (kb behind sb-run labels
+    # itself "sb-run"); the config's own name is the truthful identity (#83).
+    from terse.stats import load_stats
+    requests = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                           "params": {"name": "gh.api.items"}}) + "\n"
+    cin, cout = io.StringIO(requests), io.StringIO()
+    log = tmp_path / "stats.jsonl"
+    rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout,
+                   stats_log=str(log), server_name="runecho")
+    assert rc == 0
+    recs = load_stats(log)
+    assert recs[0]["server"] == "runecho"          # not "python" (the basename fallback)
+
+
 def test_run_proxy_stats_default_none_writes_nothing(tmp_path, monkeypatch):
     # The API default is disabled (None) — only cli.py resolves the default-ON path —
     # so a direct run_proxy caller must leave $XDG_STATE_HOME untouched.

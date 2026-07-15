@@ -70,24 +70,43 @@ class Policy:
     # reconstruct from scratch. 0 disables keyframing (diff whenever it wins).
     diff_keyframe_interval: int = 5
 
-    def select(self, tool: str) -> Rule:
+    def select(self, tool: str, server: str | None = None) -> Rule:
         """First rule whose glob matches the tool name, else the lossless default.
 
-        Tries `tool` as given first, then — if it's a multiproxy peer-qualified name
-        (contains PREFIX_SEP) — the bare part after the separator, so a rule authored
-        for a downstream tool's own name still matches a multiproxy-captured corpus
-        entry for it. A single-proxy `tool` (no PREFIX_SEP) is unaffected."""
-        for candidate in self._match_candidates(tool):
+        Candidates are tried in order and the first rule matching any of them wins:
+
+        1. `{server}.{bare tool}` when `server` is known (#83) — a *server-scoped* glob
+           like `runecho.*` only ever matched servers that happen to self-prefix their
+           own tool names (kb names its tools `kb.read.*`; runecho calls its tool plain
+           `structure`), so such a rule silently missed for everyone else and fell
+           through to the defaults. Synthesizing the qualified name makes a
+           server-scoped rule mean the same thing for every server.
+        2. `tool` as given.
+        3. The bare part after PREFIX_SEP, for a multiproxy peer-qualified name, so a
+           rule authored against a downstream tool's own name still matches a
+           multiproxy-captured corpus entry for it.
+
+        Every step is additive: a policy that already matched keeps matching the same
+        rule, since the pre-existing candidates are still tried in their original order.
+        """
+        for candidate in self._match_candidates(tool, server):
             for rule in self.rules:
                 if fnmatch.fnmatch(candidate, rule.tool_glob):
                     return rule
         return Rule(tool_glob="*", tiers=self.default_tiers)
 
     @staticmethod
-    def _match_candidates(tool: str) -> list[str]:
-        if PREFIX_SEP in tool:
-            return [tool, tool.partition(PREFIX_SEP)[2]]
-        return [tool]
+    def _match_candidates(tool: str, server: str | None = None) -> list[str]:
+        bare = tool.partition(PREFIX_SEP)[2] if PREFIX_SEP in tool else tool
+        candidates = [tool] if bare == tool else [tool, bare]
+        # Qualified form first: a server-scoped rule is the more specific intent, so it
+        # should win over a bare-name rule the same way multiproxy's peer-qualified
+        # candidate already outranks its bare fallback. Skipped when the tool already
+        # carries the server as its own prefix (kb's `kb.read.*`), which would otherwise
+        # synthesize a double-qualified `kb.kb.read.search` and miss the `kb.*` rule.
+        if server and not bare.startswith(f"{server}."):
+            candidates.insert(0, f"{server}.{bare}")
+        return candidates
 
     def has_drop(self) -> bool:
         """True if any rule marks a field drop-to-retrieve. Gates whether the proxy injects
@@ -181,7 +200,7 @@ def _lossy_warnings(rule: Rule) -> list[str]:
 
 
 def apply(raw: str, tool: str, policy: Policy,
-          drop_sink: Any = None) -> Applied:
+          drop_sink: Any = None, server: str | None = None) -> Applied:
     """Compress one raw payload per policy. Lossless by default; a field marked
     `truncate` (and not `critical`) is reduced, gated by the acceptable-loss invariant.
     Non-JSON passes through.
@@ -190,10 +209,14 @@ def apply(raw: str, tool: str, policy: Policy,
     in the running proxy, per issue #10. When it is None a drop-marked field can't be made
     recoverable, so it is left lossless with a warning instead of silently vanishing.
 
+    `server` — the downstream server's name, when known, so a server-scoped rule
+    (`runecho.*`) matches a server whose tools aren't self-prefixed (#83). See
+    `Policy.select`.
+
     Returns the (possibly unchanged) text plus what was applied — so a caller/proxy
     can log why a payload was or wasn't compressed, and whether anything was dropped.
     """
-    rule = policy.select(tool)
+    rule = policy.select(tool, server)
     warnings = _lossy_warnings(rule)
 
     if not rule.tiers:
