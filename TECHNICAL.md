@@ -150,6 +150,7 @@ raw tool output (JSON text)
     {
       "match": { "tool": "gh.*" },    // fnmatch glob on the tool name
       "tiers": ["minify", "tabularize", "dictionary"],   // [] = passthrough (skip)
+      "capture": false,               // optional; never PERSIST this tool's payloads
       "fields": {                     // optional, per-field
         "result[].id":   { "critical": true },           // denylist: never made lossy
         "result[].body": { "lossy": "drop-to-retrieve" } // evicted to a handle; served by terse.retrieve
@@ -176,6 +177,24 @@ raw tool output (JSON text)
   (`kb.read.search` under server `kb` stays `kb.read.search`, not `kb.kb.read.search`).
 - **Tiers:** any subset of `minify` / `tabularize` / `dictionary`. `minify` is implied
   by serialization (a warning is emitted if omitted). `[]` = passthrough.
+- **`capture` (default `true`, #85):** `false` means *never persist this tool's
+  payloads* — the proxy skips both disk sinks that write raw content: the
+  `--capture-dir` corpus tee and the `--debug-log` replay trace (whose records embed the
+  raw payload too, so gating only the tee would be half a guard). The payload-free stats
+  ledger still counts the tool — sizes and decision, never content — so a gated tool is
+  measured, just never quoted. Nothing about what the client receives changes.
+  This is **not** implied by `"tiers": []`: passthrough only stops compression and diff
+  state; the capture tee sits above the tier logic and would still write to disk.
+  Its purpose is to make "this tool's output must never hit disk" a declarative property
+  of the policy — surviving re-wraps, reviewable in one place, and expressible under
+  `--config` multiproxy (one process, one `capture_dir`, so omitting the flag can't
+  exclude a single peer) — rather than an operator remembering never to pass
+  `--capture-dir` to one particular wrapper. The motivating case is a
+  credential-returning server: secret-broker's `reveal_credential` returns a plaintext
+  value by design. Parsing is deliberately strict (`_coerce_capture`): a non-bool raises
+  at load rather than coercing, because every wrong-typed value in Python is truthy
+  (`bool("false") is True`) and a lax coercion would silently re-enable the guard — the
+  one direction a typo must never fail in.
 - **`critical`:** a denylist against lossy ops — a `critical` field is never truncated
   or dropped, even if also marked `lossy`.
 - **`lossy`:** `truncate` and `drop-to-retrieve` are implemented (opt-in, off by default);

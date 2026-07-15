@@ -328,10 +328,18 @@ class Interceptor:
                            if isinstance(b, dict) and b.get("type") == "text"
                            and isinstance(b.get("text"), str)]
 
+            # `"capture": false` on the matching rule — never PERSIST this tool's payloads
+            # (#85). Gates BOTH sinks that write raw content to disk: the corpus tee just
+            # below and the audit/replay log further down (its records embed the raw
+            # payload too, so gating only the tee would be half a guard). The in-memory
+            # compression path is untouched — this is about what survives on disk, and the
+            # client's result is identical either way.
+            persist = self.policy.select(tool, self.server_name).capture
+
             # Tee the RAW payload before any compression touches it (#32). Strictly a side
             # effect: a capture failure must NEVER affect what the client receives, so it
             # is swallowed here regardless of what the callback does.
-            if self.capture is not None:
+            if self.capture is not None and persist:
                 for b in text_blocks:
                     try:
                         self.capture(capture_tool, b["text"])
@@ -343,7 +351,10 @@ class Interceptor:
             # Snapshot the raw block texts before any transform mutates them in place, so
             # the audit log can pair each raw payload with what terse actually emitted
             # (#23) and the stats ledger can size the raw side of each result.
-            wants_raw = self.audit is not None or self.stats is not None
+            # The stats ledger is payload-FREE (sizes + decision only), so it is never
+            # gated by `capture: false` — a credential-returning tool still gets counted,
+            # just never quoted.
+            wants_raw = (self.audit is not None and persist) or self.stats is not None
             raw_texts = [b["text"] for b in text_blocks] if wants_raw else None
 
             changed = False
@@ -361,7 +372,7 @@ class Interceptor:
 
             # Audit AFTER the transform, regardless of `changed`: a no-op is itself
             # diagnostic — it confirms terse left a suspect payload untouched.
-            if self.audit is not None and raw_texts is not None:
+            if self.audit is not None and raw_texts is not None and persist:
                 self._emit_audit(tool, msg["id"], raw_texts, text_blocks, changed,
                                  display_tool=capture_tool)
             if self.stats is not None and raw_texts is not None:

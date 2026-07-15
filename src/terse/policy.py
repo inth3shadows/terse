@@ -49,6 +49,18 @@ class Rule:
     # Per-field map: {path: {"lossy": mode, "max": N} | {"critical": true}}. `critical`
     # is a field flag (never made lossy); see lossy.critical_paths.
     fields: dict[str, dict] = field(default_factory=dict)
+    # `"capture": false` — never PERSIST this tool's payloads: the proxy skips both the
+    # --capture-dir corpus tee and the --debug-log replay trace for it (#85). Distinct
+    # from `tiers: ()`, which only stops compression/diff state: the capture tee sits
+    # above the tier logic and would otherwise write a payload to disk regardless.
+    #
+    # This exists so "this tool's output must never hit disk" is a declarative property
+    # of the policy — surviving re-wraps and reviewable in one place — instead of an
+    # operator remembering never to pass --capture-dir to one particular wrapper. That
+    # is what makes a credential-returning server (secret-broker's reveal_credential
+    # returns a plaintext value by design) safe to wrap by construction rather than by
+    # discipline. Default True = exactly the pre-#85 behavior.
+    capture: bool = True
 
     def lossy_fields(self) -> list[str]:
         return [k for k, v in self.fields.items() if v.get("lossy")]
@@ -129,6 +141,20 @@ def _coerce_tiers(raw: Any, where: str) -> tuple[str, ...]:
     return tuple(raw)
 
 
+def _coerce_capture(raw: Any, where: str) -> bool:
+    """Strictly a real bool — a mistyped `"capture": "false"` must NOT become True (#85).
+
+    Deliberately stricter than the `bool(...)` coercion the non-security knobs use:
+    `capture` is the switch that keeps a credential-returning tool's payload off disk,
+    and every wrong-typed value in Python is TRUTHY (`bool("false") is True`), so a lax
+    coercion would silently turn the guard back ON — the one direction a typo must never
+    fail in. Fail loudly instead, at load, before a single payload is proxied."""
+    if not isinstance(raw, bool):
+        raise ValueError(f"{where}: 'capture' must be true or false, got "
+                         f"{type(raw).__name__} {raw!r}")
+    return raw
+
+
 # The keys load_policy understands, per level. Anything else (except an "_"-prefixed
 # comment/annotation key, the convention policy_gen's `_comment`/`_suggested_fields*`
 # already use) is rejected loudly: this file governs what gets rewritten on the wire,
@@ -136,7 +162,7 @@ def _coerce_tiers(raw: Any, where: str) -> tuple[str, ...]:
 # behavior is a trap, not a convenience.
 _TOP_KEYS = frozenset({"version", "defaults", "policies", "diff", "diff_keyframe_interval"})
 _DEFAULTS_KEYS = frozenset({"tiers"})
-_RULE_KEYS = frozenset({"match", "tiers", "fields"})
+_RULE_KEYS = frozenset({"match", "tiers", "fields", "capture"})
 _MATCH_KEYS = frozenset({"tool"})
 
 
@@ -167,7 +193,8 @@ def load_policy(path: str | Path) -> Policy:
         _reject_unknown_keys(match, _MATCH_KEYS, f"policies[{i}].match")
         glob = match.get("tool", "*")
         rules.append(Rule(tool_glob=glob, tiers=_coerce_tiers(r.get("tiers", []), f"policies[{i}]"),
-                          fields=r.get("fields", {})))
+                          fields=r.get("fields", {}),
+                          capture=_coerce_capture(r.get("capture", True), f"policies[{i}]")))
     return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", True)),
                   diff_keyframe_interval=int(doc.get("diff_keyframe_interval", 5)))
 

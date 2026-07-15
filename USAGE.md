@@ -246,6 +246,36 @@ turns a +2.6% tool into a +77% one.
 terse measures *tokens*, not comprehension — before relying on a generated policy, confirm
 the model still reads the compressed form with `terse fluency --corpus <dir>` (see below).
 
+### Keeping a tool's output off disk (`"capture": false`)
+
+Some tools return things that should never be written to a file — a credential, a token,
+a private key. terse's two disk sinks (`--capture-dir`'s corpus and `--debug-log`'s
+replay trace) both store **raw** payloads, so for those tools you want them off:
+
+```json
+{ "match": { "tool": "secret-broker.*" },
+  "tiers": [],          // don't compress it (nothing to gain, no state kept)
+  "capture": false }    // ...and never write it to disk
+```
+
+Two things worth knowing:
+
+- **`"tiers": []` alone is not enough.** Passthrough stops compression, but the capture
+  tee runs *before* the tiers and would still write the payload out. You need
+  `"capture": false` to stop that.
+- **You still get the measurement.** The savings ledger (`terse stats`) records sizes and
+  decisions only — never content — so a gated tool is still counted, just never quoted.
+
+Why put it in the policy rather than just leaving `--capture-dir` off that server? Because
+the policy is durable and reviewable: it survives a re-wrap, it's visible next to
+everything else you decided, and it's the only way to express the exclusion when one
+proxy fronts several servers (`--config` has a single capture dir). A flag you have to
+remember not to pass is one copy-pasted command away from writing secrets to disk.
+
+Terse only ever sees what's already in a tool's result — i.e. what your model was going
+to read anyway — so wrapping a server doesn't expose anything new to the *model*. What
+`capture: false` controls is what **survives on disk** afterwards.
+
 ### When a result looks wrong: the replay log
 
 If a compressed result ever looks misshapen, add `--debug-log FILE` to the proxy and it
@@ -260,6 +290,9 @@ Each line has `{tool, id, diff_mode, tiers, changed, blocks:[{raw, emitted}]}`. 
 no-op (`changed:false`) is logged, so you can confirm terse left a suspect payload alone.
 Replay any line through `terse compress --tool <tool>` on its `raw` to reproduce. Opt-in
 and side-effect-only: a log-write failure never affects what the client receives.
+
+Because those records embed the raw payload, a tool with `"capture": false` in the policy
+(above) is skipped here too — one declaration covers both disk sinks.
 
 ### How much is terse actually saving me? (`terse stats`)
 
