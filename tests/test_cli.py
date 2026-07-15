@@ -281,9 +281,10 @@ def test_proxy_cmd_parses_and_forwards_headers(monkeypatch):
     captured = {}
 
     def fake_run_proxy(cmd, pol, debug=False, stdin=None, stdout=None,
-                       capture_dir=None, debug_log=None, headers=None):
+                       capture_dir=None, debug_log=None, headers=None, stats_log=None):
         captured["cmd"] = cmd
         captured["headers"] = headers
+        captured["stats_log"] = stats_log
         return 0
 
     monkeypatch.setattr("terse.proxy.run_proxy", fake_run_proxy)
@@ -292,6 +293,8 @@ def test_proxy_cmd_parses_and_forwards_headers(monkeypatch):
     assert rc == 0
     assert captured["cmd"] == ["https://example.com/mcp"]
     assert captured["headers"] == {"Authorization": "Bearer xyz", "X-Id": "42"}
+    # the savings ledger defaults ON, resolved to the XDG path (see stats.py)
+    assert captured["stats_log"].endswith("terse/stats.jsonl")
 
 
 def test_proxy_cmd_rejects_malformed_header_without_launching(monkeypatch, capsys):
@@ -327,6 +330,67 @@ def test_proxy_cmd_rejects_header_with_config(tmp_path, monkeypatch, capsys):
     rc = main(["proxy", "--header", "Authorization=Bearer xyz", "--config", str(cfg)])
     assert rc == 2
     assert "--header" in capsys.readouterr().err
+
+
+def test_proxy_cmd_no_stats_disables_ledger(monkeypatch):
+    captured = {}
+
+    def fake_run_proxy(cmd, pol, **kw):
+        captured.update(kw)
+        return 0
+
+    monkeypatch.setattr("terse.proxy.run_proxy", fake_run_proxy)
+    rc = main(["proxy", "--no-stats", "--", "uvx", "some-mcp"])
+    assert rc == 0
+    assert captured["stats_log"] is None
+
+
+def test_proxy_cmd_rejects_no_stats_with_stats_log(monkeypatch, capsys):
+    def fake_run_proxy(*_a, **_kw):
+        raise AssertionError("run_proxy must not be called on contradictory stats flags")
+
+    monkeypatch.setattr("terse.proxy.run_proxy", fake_run_proxy)
+    rc = main(["proxy", "--no-stats", "--stats-log", "/x/s.jsonl", "--", "uvx", "some-mcp"])
+    assert rc == 2
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
+def test_stats_cmd_reports_over_a_ledger(tmp_path, capsys):
+    from terse.stats import append_stats
+    log = tmp_path / "stats.jsonl"
+    append_stats({"ts": 1, "server": "runecho", "tool": "structure",
+                  "decision": "diff", "raw_chars": 400, "out_chars": 40,
+                  "raw_tokens": 100, "out_tokens": 10}, log)
+    rc = main(["stats", "--log", str(log)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "saved 90" in out and "runecho" in out and "structure" in out
+
+
+def test_stats_cmd_json_output(tmp_path, capsys):
+    from terse.stats import append_stats
+    log = tmp_path / "stats.jsonl"
+    append_stats({"ts": 1, "server": "s", "tool": "t", "decision": "compressed",
+                  "raw_chars": 400, "out_chars": 40,
+                  "raw_tokens": 100, "out_tokens": 10}, log)
+    rc = main(["stats", "--log", str(log), "--json"])
+    assert rc == 0
+    agg = json.loads(capsys.readouterr().out)
+    assert agg["total"]["results"] == 1 and agg["total"]["raw_tokens"] == 100
+
+
+def test_stats_cmd_missing_ledger_is_a_clean_error(tmp_path, capsys):
+    rc = main(["stats", "--log", str(tmp_path / "absent.jsonl")])
+    assert rc == 2
+    assert "no ledger" in capsys.readouterr().err
+
+
+def test_stats_cmd_rejects_bad_since_window(tmp_path, capsys):
+    log = tmp_path / "stats.jsonl"
+    log.write_text("", encoding="utf-8")
+    rc = main(["stats", "--log", str(log), "--since", "fortnight"])
+    assert rc == 2
+    assert "bad --since window" in capsys.readouterr().err
 
 
 def test_redact_args_masks_two_arg_and_equals_form_secrets():

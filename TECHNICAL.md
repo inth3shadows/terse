@@ -74,6 +74,22 @@ raw tool output (JSON text)
   fail-open (any error forwards the original), and frame-safe. `run_proxy` launches
   the downstream server as a subprocess and wires `Interceptor` to stdio with two
   pump threads.
+- **`stats.py`** — the live savings ledger + `terse stats`. `build_record` /
+  `classify_decision` produce one payload-FREE line per result (ts, server, tool,
+  decision, char + cl100k token sizes — never content, which is what makes always-on
+  safe where capture/audit must stay opt-in); the decision label is derived by
+  sniffing the emitted text's envelope head (diff/textdiff marker, `== raw`,
+  policy-tiers-empty), not by threading state out of the compression paths.
+  `append_stats` rotates at 10 MB (one prior generation kept; single O_APPEND writes
+  under PIPE_BUF stay atomic across concurrent proxies, and a torn tail from a
+  crashed writer is self-healed with a newline before the next append).
+  `load_stats`/`aggregate`/`build_stats_report` back the `stats` subcommand; token
+  totals sum only fully-tokenized records (`untokenized` counts the rest — reported,
+  never blended). Default path `$XDG_STATE_HOME/terse/stats.jsonl`; the proxy wires
+  it via `build_stats_writer` (same never-load-bearing, failures-swallowed contract
+  as capture/audit). ON by default in `cli.py` (`--no-stats` / `--stats-log FILE`);
+  the `run_proxy`/`run_multi_proxy` API default stays None (disabled) so library
+  callers opt in explicitly.
 - **`capture.py`** — `classify_shape` (pretty/compact JSON, array-of-records,
   long-text), `capture_payload` (writes a sha-idempotent envelope to `corpus/`),
   `load_corpus`, `coverage`, `extract_records`.
@@ -107,7 +123,7 @@ raw tool output (JSON text)
   ANSI color only when stdout is a tty and `NO_COLOR` is unset (piped/CI output keeps
   the shape of the win, just uncolored). Wired via `--bars` on `measure`/`verify`/
   `fluency`, printed straight to the terminal (nothing written to disk).
-- **`cli.py`** — argparse dispatch for the six subcommands.
+- **`cli.py`** — argparse dispatch for the subcommands.
 
 ## API Integrations
 
@@ -192,6 +208,7 @@ uv run pytest -q tests/test_roundtrip.py   # just the lossless gate
 uv run terse measure          # token savings report over corpus/ -> reports/
 uv run terse probe            # ceiling probes (value redundancy, cross-call overlap)
 uv run terse validate         # cross-tokenizer invariance (cl100k vs o200k)
+uv run terse stats --since 7d # live savings from real proxy sessions (payload-free ledger)
 ```
 
 Reports are written under `reports/` (gitignored). The corpus under `corpus/` is

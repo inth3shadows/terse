@@ -180,6 +180,24 @@ def test_wrap_diff_adds_proxy_flags_and_rewrap_drops_them():
     assert config["mcpServers"]["runecho"] == {"command": "uvx", "args": ["runecho-mcp"]}
 
 
+def test_wrap_no_stats_bakes_opt_out_and_rewrap_drops_it():
+    # The ledger is the proxy default, so only the opt-out is bakeable — and like the
+    # diff flags it reflects the LATEST invocation, never accumulating.
+    config = _cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})
+    stash: dict = {}
+
+    im.wrap(config, stash, "runecho", "/p/policy.json", TERSE_CMD, no_stats=True)
+    args = config["mcpServers"]["runecho"]["args"]
+    assert "--no-stats" in args and args.index("--no-stats") < args.index("--")
+
+    im.wrap(config, stash, "runecho", "/p/policy.json", TERSE_CMD)
+    args = config["mcpServers"]["runecho"]["args"]
+    assert "--no-stats" not in args                     # default: inherit the proxy's ON
+
+    im.unwrap(config, stash, "runecho")
+    assert config["mcpServers"]["runecho"] == {"command": "uvx", "args": ["runecho-mcp"]}
+
+
 def test_do_install_diff_adds_flag_and_reinstall_without_it_drops_it(tmp_path, monkeypatch):
     cfg = tmp_path / ".claude.json"
     cfg.write_text(json.dumps(_cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})))

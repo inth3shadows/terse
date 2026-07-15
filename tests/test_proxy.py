@@ -725,6 +725,105 @@ def test_append_audit_writes_one_json_line_per_call(tmp_path):
     assert [json.loads(line)["id"] for line in lines] == [1, 2]
 
 
+# --- savings-ledger stats callback (payload-free, always-on-able) ---
+
+def test_stats_callback_sees_raw_and_emitted_per_result():
+    from terse.stats import classify_decision
+    seen = []
+    inter = Interceptor(FULL, stats=lambda *a: seen.append(a))
+    _note_call(inter, 1, "gh.api.items")
+    out = inter.transform_response(_result_msg(1, _records_text()))
+    assert len(seen) == 1
+    tool, raw, emitted, passthrough = seen[0]
+    assert tool == "gh.api.items" and passthrough is False
+    assert raw == _records_text()                       # true pre-transform snapshot
+    assert emitted == json.loads(out)["result"]["content"][0]["text"]
+    assert classify_decision(raw, emitted, passthrough) == "compressed"
+
+
+def test_stats_callback_works_without_audit_and_labels_a_diff():
+    # stats alone must trigger the raw-text snapshot (it used to be audit-gated), and a
+    # second same-tool call that ships a cross-call delta classifies as "diff".
+    from terse.stats import classify_decision
+    seen = []
+    inter = Interceptor(FULL, stats=lambda *a: seen.append(a))
+    first = {"result": [{"id": i, "status": "active", "url": "https://x.example/api/items"}
+                        for i in range(20)]}
+    second = json.loads(json.dumps(first))
+    second["result"][0]["status"] = "closed"
+    _note_call(inter, 1, "gh.api.items")
+    inter.transform_response(_result_msg(1, json.dumps(first)))
+    _note_call(inter, 2, "gh.api.items")
+    inter.transform_response(_result_msg(2, json.dumps(second)))
+    assert [classify_decision(r, e, p) for (_t, r, e, p) in seen] == ["compressed", "diff"]
+
+
+def test_stats_passthrough_tool_is_labeled_passthrough():
+    from terse.stats import classify_decision
+    seen = []
+    inter = Interceptor(Policy(rules=[Rule("gh.*", ())]), stats=lambda *a: seen.append(a))
+    _note_call(inter, 5, "gh.api.items")
+    inter.transform_response(_result_msg(5, _records_text()))
+    (tool, raw, emitted, passthrough), = seen
+    assert passthrough is True and raw == emitted
+    assert classify_decision(raw, emitted, passthrough) == "passthrough"
+
+
+def test_stats_failure_never_breaks_forwarding():
+    def boom(*_a):
+        raise RuntimeError("disk full")
+    inter = Interceptor(FULL, stats=boom)
+    _note_call(inter, 9, "gh.api.items")
+    out = inter.transform_response(_result_msg(9, _records_text()))
+    text = json.loads(out)["result"]["content"][0]["text"]
+    assert transforms.decompress(text) == json.loads(_records_text())
+
+
+def test_no_stats_callback_is_byte_identical():
+    plain = Interceptor(FULL)
+    counted = Interceptor(FULL, stats=lambda *_a: None)
+    _note_call(plain, 3, "gh.api.items")
+    _note_call(counted, 3, "gh.api.items")
+    assert plain.transform_response(_result_msg(3, _records_text())) == \
+        counted.transform_response(_result_msg(3, _records_text()))
+
+
+def test_run_proxy_stats_log_writes_payload_free_ledger(tmp_path):
+    from terse.stats import load_stats
+    requests = "\n".join([
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "gh.api.items"}}),
+    ]) + "\n"
+    cin, cout = io.StringIO(requests), io.StringIO()
+    log = tmp_path / "stats.jsonl"
+    rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout,
+                   stats_log=str(log))
+    assert rc == 0
+    recs = load_stats(log)
+    # exactly the one tools/call result was recorded (initialize is not a tool call)
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec["tool"] == "gh.api.items"
+    assert rec["server"] == pathlib.Path(sys.executable).name  # downstream identity
+    assert rec["decision"] == "compressed"
+    assert rec["raw_chars"] > rec["out_chars"] > 0
+    # payload-free: nothing from the fake server's records leaks into the ledger
+    assert "active" not in log.read_text(encoding="utf-8")
+
+
+def test_run_proxy_stats_default_none_writes_nothing(tmp_path, monkeypatch):
+    # The API default is disabled (None) — only cli.py resolves the default-ON path —
+    # so a direct run_proxy caller must leave $XDG_STATE_HOME untouched.
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    requests = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                           "params": {"name": "gh.api.items"}}) + "\n"
+    cin, cout = io.StringIO(requests), io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout)
+    assert rc == 0
+    assert not (tmp_path / "terse").exists()
+
+
 # --- drop-to-retrieve: store + tools/list injection (#10, Phase 2) ---
 
 DROP = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"),

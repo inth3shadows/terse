@@ -145,7 +145,8 @@ def terse_invocation() -> list[str]:
 def wrap(config: dict, stash: dict, server: str, policy: str,
          terse_cmd: list[str], capture_dir: str | None = None,
          diff: bool | None = None,
-         diff_keyframe_interval: int | None = None) -> tuple[dict, dict]:
+         diff_keyframe_interval: int | None = None,
+         no_stats: bool = False) -> tuple[dict, dict]:
     """Wrap `server`'s entry with the terse proxy. Idempotent: if already managed
     (present in stash), re-wrap from the stashed original so policy/cmd updates
     apply cleanly without nesting proxies. Preserves all non-command/args (and, for a
@@ -175,6 +176,10 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
     proxy_opts = ["--policy", policy]
     if capture_dir:
         proxy_opts += ["--capture-dir", capture_dir]
+    if no_stats:
+        # Only the opt-out is bakeable: the savings ledger is the proxy DEFAULT (it is
+        # payload-free — see stats.py), so an entry needs a flag only to turn it off.
+        proxy_opts += ["--no-stats"]
     if diff is not None:
         proxy_opts += ["--diff"] if diff else ["--no-diff"]
     if diff is not False and diff_keyframe_interval is not None:
@@ -292,7 +297,7 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
                cfg: Path | None = None, capture_dir: str | None = None,
                diff: bool | None = None, diff_keyframe_interval: int | None = None,
                scope: str = "user", file: str | None = None,
-               repo_path: str | None = None) -> dict:
+               repo_path: str | None = None, no_stats: bool = False) -> dict:
     target = resolve_target(scope, cfg=cfg, file=file, repo_path=repo_path)
     if not target.cfg.exists():
         what = ".mcp.json" if scope == "project" else "Claude config"
@@ -331,13 +336,15 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
             and s in stash and (before or {}).get(k) != stash[s].get(k)
         )
         wrap(node, stash, s, policy_abs, terse_cmd, capture_dir=capture_abs,
-             diff=diff, diff_keyframe_interval=diff_keyframe_interval)
+             diff=diff, diff_keyframe_interval=diff_keyframe_interval,
+             no_stats=no_stats)
         changes.append({"server": s, "before": before,
                         "after": node["mcpServers"][s], "preserved": preserved})
 
     result = {"config": str(target.cfg), "scope": scope, "policy": policy_abs,
               "available": available, "changes": changes, "dry_run": dry_run,
-              "backup": None, "capture_dir": capture_abs, "diff": diff}
+              "backup": None, "capture_dir": capture_abs, "diff": diff,
+              "no_stats": no_stats}
     if not dry_run and changes:
         result["backup"] = str(_backup(target.cfg))
         _write_json(target.cfg, config, trailing_newline=had_nl)

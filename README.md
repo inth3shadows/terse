@@ -63,6 +63,11 @@ Every transform has an exact inverse, and a round-trip gate asserts
 `decompress(compress(x)) == x` over the whole corpus. The transformed bytes *are*
 the model's input — a denser but still-readable representation, not an offload.
 
+The proxy also keeps a **live savings ledger** (on by default; `--no-stats` to opt
+out): one payload-free JSONL record per result — sizes, tokens, and the decision
+taken, never content — so `terse stats` can answer "how much did terse actually save
+me this week?" from real sessions, not just the synthetic corpus.
+
 ## Prerequisites
 
 - Python 3.11+
@@ -94,6 +99,7 @@ src/terse/
   transforms.py  lossless tiers (minify, tabularize, dict coding) + round-trip gate
   policy.py      selective per-tool policy: load, match, apply
   proxy.py       MCP stdio middleware: compress a downstream server's tool results
+  stats.py       live savings ledger (payload-free) + the `terse stats` aggregation
   capture.py     corpus capture (shape-tagged envelopes) + shape classifier
   measure.py     per-payload + cross-tokenizer token measurement
   probes.py      value-redundancy + cross-call-overlap ceiling probes
@@ -102,7 +108,7 @@ src/terse/
   tokenize.py    cl100k / o200k token counting
   report.py      markdown reports (savings, per-tool, probes, tokenizer, fluency)
   html_report.py charted HTML companion (inline SVG, no JS/CDN) for measure/verify
-  cli.py         entrypoint: gate / capture / measure / probe / validate / compress / proxy / fluency
+  cli.py         entrypoint: gate / capture / measure / probe / validate / compress / proxy / stats / fluency
 scripts/
   gen_stress_corpus.py  synthetic stress corpus for the fluency eval
 tests/           round-trip, measurement, probe, policy, and fluency tests
