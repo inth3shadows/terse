@@ -687,3 +687,17 @@ def test_do_install_reports_preserved_hand_edits(tmp_path, monkeypatch):
     res = im.do_install(["runecho"], str(policy), cfg=cfg)
     assert res["changes"][0]["preserved"] == ["env"]
     assert json.loads(cfg.read_text())["mcpServers"]["runecho"]["env"] == {"PATH": "/pin"}
+
+
+def test_classify_server_sensitivity():
+    from terse.install_mcp import classify_server_sensitivity
+    # obvious by name
+    assert classify_server_sensitivity("secret-broker")
+    assert classify_server_sensitivity("acme-vault")
+    assert classify_server_sensitivity("my-authgw")
+    # caught via the launch command even when the name is innocuous
+    assert classify_server_sensitivity("store", ["python", "-m", "credential_daemon"])
+    # not flagged — operator must add these to never_lossy_servers by hand (kb, sb-run)
+    assert not classify_server_sensitivity("runecho")
+    assert not classify_server_sensitivity("kb")
+    assert not classify_server_sensitivity("sb-run")
