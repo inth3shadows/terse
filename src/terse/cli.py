@@ -800,8 +800,24 @@ def _write_html_report(html: str, md_out_path: Path) -> None:
     print(f"[html report written to {out}]")
 
 
+def _terse_version() -> str:
+    """Installed distribution version, falling back to the package `__version__` when
+    terse is run from a source tree that was never `pip install`ed (e.g. `python -m terse`
+    in a checkout). importlib.metadata reflects the ACTUAL installed dist, so it stays
+    correct once tag-derived versioning lands."""
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _dist_version
+    try:
+        return _dist_version("terse")
+    except PackageNotFoundError:
+        from . import __version__
+        return __version__
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="terse", description=__doc__)
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {_terse_version()}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     g = sub.add_parser("gate", help="run the lossless round-trip gate on a JSON file")
