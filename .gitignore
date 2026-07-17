@@ -30,3 +30,6 @@ reports/
 scratch_fidelity/
 .codegraph
 .coverage
+
+# hatch-vcs build-time version file (generated from the git tag; never committed)
+src/terse/_version.py
