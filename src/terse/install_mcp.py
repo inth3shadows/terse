@@ -57,6 +57,19 @@ _MAX_BACKUPS = 5
 
 
 # --------------------------------------------------------------------------- IO
+def classify_server_sensitivity(name: str, command: object = "") -> bool:
+    """Install-time best-effort guess: does this server carry credentials/personal data,
+    so lossy transforms should be forbidden on it? Matches the server name and its launch
+    command against `policy.SENSITIVE_SERVER_RE`. This is a SUGGESTION that should PROMPT
+    the operator to confirm baking the server into `never_lossy_servers` — never an
+    automatic decision: the operator knows sensitive servers whose names the pattern can't
+    catch (a personal KB, a launcher alias), and this only surfaces the obvious ones. The
+    runtime floor (PR #89) independently forbids lossy on pattern-matching names regardless."""
+    from .policy import SENSITIVE_SERVER_RE
+    parts = [name, *(command if isinstance(command, list) else [command])]
+    return bool(SENSITIVE_SERVER_RE.search(" ".join(str(p) for p in parts)))
+
+
 def config_path() -> Path:
     """Claude Code config location. Honors $CLAUDE_CONFIG, else ~/.claude.json."""
     env = os.environ.get("CLAUDE_CONFIG")
