@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,18 @@ LOSSY_MODES = ("truncate", "drop-to-retrieve")  # implemented; summarize is stil
 # every rule silently misses for a multiproxy-captured corpus (fnmatch("gh__search",
 # "search") is False), and drop-eval/measure would score it as having nothing to test.
 PREFIX_SEP = "__"
+
+# Non-overridable floor for the never-lossy exclusion: a server whose NAME matches this
+# is treated as carrying secrets and can NEVER receive a lossy transform, no matter what a
+# policy file says. This is the belt-and-suspenders the security review required — for the
+# one class of data (credentials) where "policy typo" and "leak" are the same failure, a
+# policy-file exclusion alone is not a strong enough boundary. The install-time classifier
+# and the policy's `never_lossy_servers` list are the PRIMARY, per-server mechanism (they
+# also catch sensitive servers whose names don't match, e.g. a personal KB or a launcher
+# alias); this pattern is the additional structural backstop that cannot be turned off.
+SENSITIVE_SERVER_RE = re.compile(
+    r"secret|credential|vault|passwd|password|token|api[-_ ]?key|keyring|auth", re.I
+)
 
 
 @dataclass
@@ -81,6 +94,24 @@ class Policy:
     # chained diff can never drift more than K turns from an anchor the model can
     # reconstruct from scratch. 0 disables keyframing (diff whenever it wins).
     diff_keyframe_interval: int = 5
+    # Servers on which lossy transforms are structurally forbidden (forced 100% lossless,
+    # regardless of any field marked lossy). Populated at `install-mcp` time by the
+    # sensitivity classifier — the point where terse knows the server's identity and can
+    # confirm with the operator — so the decision is baked per-server, reviewable in one
+    # place, and never re-derived by a runtime heuristic. See `server_never_lossy`, which
+    # ORs this with the non-overridable SENSITIVE_SERVER_RE floor.
+    never_lossy_servers: frozenset[str] = frozenset()
+
+    def server_never_lossy(self, server: str | None) -> bool:
+        """True when lossy transforms must be suppressed for this server. Two layers: the
+        baked-at-install `never_lossy_servers` list (primary — catches sensitive servers by
+        identity, including ones whose names look innocuous), OR the non-overridable
+        SENSITIVE_SERVER_RE name floor (structural backstop a policy typo cannot defeat).
+        A None/empty server (identity unknown) is NOT auto-excluded — the exclusion is a
+        deliberate, identified decision, and lossy is opt-in per field regardless."""
+        if not server:
+            return False
+        return server in self.never_lossy_servers or bool(SENSITIVE_SERVER_RE.search(server))
 
     def select(self, tool: str, server: str | None = None) -> Rule:
         """First rule whose glob matches the tool name, else the lossless default.
@@ -160,7 +191,8 @@ def _coerce_capture(raw: Any, where: str) -> bool:
 # already use) is rejected loudly: this file governs what gets rewritten on the wire,
 # so a typo'd key ("polices", "diff_keyframe_intervall") silently reverting to default
 # behavior is a trap, not a convenience.
-_TOP_KEYS = frozenset({"version", "defaults", "policies", "diff", "diff_keyframe_interval"})
+_TOP_KEYS = frozenset({"version", "defaults", "policies", "diff", "diff_keyframe_interval",
+                       "never_lossy_servers"})
 _DEFAULTS_KEYS = frozenset({"tiers"})
 _RULE_KEYS = frozenset({"match", "tiers", "fields", "capture"})
 _MATCH_KEYS = frozenset({"tool"})
@@ -196,7 +228,8 @@ def load_policy(path: str | Path) -> Policy:
                           fields=r.get("fields", {}),
                           capture=_coerce_capture(r.get("capture", True), f"policies[{i}]")))
     return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", True)),
-                  diff_keyframe_interval=int(doc.get("diff_keyframe_interval", 5)))
+                  diff_keyframe_interval=int(doc.get("diff_keyframe_interval", 5)),
+                  never_lossy_servers=frozenset(doc.get("never_lossy_servers", ())))
 
 
 @dataclass
@@ -246,6 +279,16 @@ def apply(raw: str, tool: str, policy: Policy,
     rule = policy.select(tool, server)
     warnings = _lossy_warnings(rule)
 
+    # Server-level lossy exclusion: on a never-lossy server (credential/personal store),
+    # lossy transforms are structurally forbidden — forced 100% lossless — even if a rule
+    # marks a field lossy. Enforced here on the VERIFIED server identity (#83), not on a
+    # tool-name match, so a mislabeled/renamed rule cannot leak a credential payload through
+    # a truncate/drop. Warn (not silently) when this actually suppresses a lossy request.
+    never_lossy = policy.server_never_lossy(server)
+    if never_lossy and rule.lossy_fields():
+        warnings.append(f"lossy fields suppressed: server '{server}' is never-lossy "
+                        "(credential/personal store) — kept fully lossless")
+
     if not rule.tiers:
         return Applied(text=raw, tool=tool, tiers=(), skipped=True, warnings=warnings)
     if "minify" not in rule.tiers:
@@ -279,7 +322,7 @@ def apply(raw: str, tool: str, policy: Policy,
     # Tier-1 lossy (truncate) runs BEFORE the lossless tiers and is fail-closed: any
     # path that doesn't resolve, or a gate failure, keeps the fully-lossless object.
     data = obj
-    if lossy_mod._truncate_specs(rule):
+    if not never_lossy and lossy_mod._truncate_specs(rule):
         try:
             cand = lossy_mod.apply_lossy(obj, rule)
             if cand is not obj and cand != obj and lossy_mod.acceptable_loss(obj, cand, rule):
@@ -294,7 +337,7 @@ def apply(raw: str, tool: str, policy: Policy,
     # persist the original to the session store, so the model can fetch it back on demand.
     # Same fail-closed contract as truncate, plus: writes are STAGED and committed to the
     # real store only after the gate passes, so a gate failure leaves no orphan handles.
-    if lossy_mod._drop_specs(rule):
+    if not never_lossy and lossy_mod._drop_specs(rule):
         if drop_sink is None:
             warnings.append("lossy: drop-to-retrieve needs the proxy store; left lossless")
         else:

@@ -270,3 +270,48 @@ def test_load_policy_rejects_unknown_keys_at_every_level(tmp_path):
                         "tiers": [], "_suggested_fields": {"a": {}}}]}
     pol = load_policy(_write(ok))
     assert pol.rules[0].tool_glob == "x"
+
+
+def test_never_lossy_server_suppresses_a_lossy_field():
+    # On a never-lossy server (credential/personal store), a field marked lossy is kept
+    # fully lossless — the structural floor from the security review. Enforced on the
+    # verified server identity, not a tool-name match.
+    raw = json.dumps({"result": [{"id": 1, "body": "x" * 200}]})
+    rule = Rule(tool_glob="*", tiers=("minify", "tabularize"),
+                fields={"result[].body": {"lossy": "truncate", "max": 5}})
+
+    # (a) baked never_lossy list — identity-based, catches a store whose name looks innocuous
+    pol = Policy(rules=[rule], never_lossy_servers=frozenset({"kb"}))
+    kb = apply(raw, "kb.read.x", pol, server="kb")
+    assert transforms.decompress(kb.text) == json.loads(raw)          # fully lossless
+    assert any("never-lossy" in w for w in kb.warnings)
+
+    # (b) non-overridable name floor — server not in the list, but its name screams secrets
+    sec = apply(raw, "reveal", pol, server="secret-broker")
+    assert transforms.decompress(sec.text) == json.loads(raw)
+    assert any("never-lossy" in w for w in sec.warnings)
+
+    # (c) an ordinary server: the same lossy field IS applied (truncated -> not lossless)
+    ok = apply(raw, "x", pol, server="runecho")
+    assert any("truncated" in w for w in ok.warnings)
+    assert "x" * 200 not in ok.text                                   # the long body was cut
+
+
+def test_server_never_lossy_predicate():
+    pol = Policy(rules=[], never_lossy_servers=frozenset({"kb", "sb-run"}))
+    assert pol.server_never_lossy("kb")                 # baked list
+    assert pol.server_never_lossy("sb-run")             # baked list (launcher alias, no secret word)
+    assert pol.server_never_lossy("secret-broker")      # floor: "secret"
+    assert pol.server_never_lossy("acme-vault")         # floor: "vault"
+    assert pol.server_never_lossy("my-authgw")          # floor: "auth"
+    assert not pol.server_never_lossy("runecho")
+    assert not pol.server_never_lossy(None)              # unknown identity is NOT auto-excluded
+    assert not pol.server_never_lossy("")
+
+
+def test_never_lossy_servers_loads_from_policy_json(tmp_path):
+    p = tmp_path / "policy.json"
+    p.write_text(json.dumps({"version": 1, "never_lossy_servers": ["kb", "sb-run"],
+                             "policies": []}), encoding="utf-8")
+    pol = load_policy(p)
+    assert pol.server_never_lossy("kb") and pol.server_never_lossy("sb-run")
