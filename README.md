@@ -223,6 +223,7 @@ diffing* — not breadth of adoption.
 - [Verify it yourself](VERIFY.md) — prove losslessness, savings, and no-egress locally
 - [Technical Reference](TECHNICAL.md) — architecture, pipeline, policy schema, limitations
 - [Usage Guide](USAGE.md) — running the CLI day-to-day and reading its output
+- [Changelog](CHANGELOG.md) — notable changes per release
 
 ## Status
 
