@@ -33,7 +33,7 @@ from .capture import (
     extract_records,
     load_corpus,
 )
-from .html_report import build_html_report
+from .html_report import build_html_diff_report, build_html_report
 from .measure import cross_tokenizer_savings, measure_corpus
 from .probes import (
     cross_call_overlap,
@@ -601,6 +601,12 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         print(f"no payloads in {args.corpus}/ — capture some first (`terse capture`).")
         return 1
 
+    # --html renders the forest plot, which only the paired diff-family evals produce;
+    # flag it as ignored elsewhere rather than let it be a silent no-op.
+    if args.html and not (args.diff or args.diff_soak or args.text_diff_eval):
+        print("note: fluency --html applies only to --diff / --diff-soak / --text-diff-eval "
+              "(the forest-plot evals); ignoring it here.")
+
     # Drop-eval mode: does a real tool-calling model call terse.retrieve when a dropped
     # field is needed, and leave it alone when it isn't? Needs a policy with a
     # drop-to-retrieve field AND a live tool-capable model — like --diff, this is a
@@ -638,6 +644,7 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             return 1
         results = fluency.run_diff_fluency(envelopes, answerers, trials=args.trials)
         _write_report(build_diff_report(results), args.out)
+        _maybe_write_diff_html(args, results)
         if args.bars:
             print("\n" + build_terminal_diff_report(results))
         return 0
@@ -655,6 +662,7 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
                                         max_depth=args.soak_depth,
                                         per_depth_cap=args.soak_windows)
         _write_report(build_diff_soak_report(results), args.out)
+        _maybe_write_diff_html(args, results, form_label="chain-form")
         if args.bars:
             print("\n" + build_terminal_diff_report(results, form_label="chain-form"))
         return 0
@@ -670,6 +678,7 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             return 1
         results = fluency.run_text_diff_fluency(envelopes, answerers, trials=args.trials)
         _write_report(build_text_diff_report(results), args.out)
+        _maybe_write_diff_html(args, results, control_label="raw text")
         if args.bars:
             print("\n" + build_terminal_diff_report(results, control_label="raw text"))
         return 0
@@ -976,6 +985,17 @@ def _write_html_report(html: str, md_out_path: Path) -> None:
     print(f"[html report written to {out}]")
 
 
+def _maybe_write_diff_html(args: argparse.Namespace, results: dict,
+                           form_label: str = "diff-form",
+                           control_label: str = "full-terse") -> None:
+    """With `fluency --html`, write the forest-plot HTML companion for a diff-family eval
+    next to --out. Labels mirror the terminal report's so the two never disagree. No-op
+    without --html."""
+    if getattr(args, "html", False):
+        _write_html_report(build_html_diff_report(results, form_label, control_label),
+                           Path(args.out))
+
+
 def _terse_version() -> str:
     """Installed distribution version, falling back to the package `__version__` when
     terse is run from a source tree that was never `pip install`ed (e.g. `python -m terse`
@@ -1150,6 +1170,9 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--bars", action="store_true",
                    help="also print a terminal forest plot (accuracy + 95%% CI per model, "
                         "ANSI if a tty)")
+    f.add_argument("--html", action="store_true",
+                   help="also write a charted HTML forest plot next to --out (inline SVG, "
+                        "no JS/CDN); applies to --diff / --diff-soak / --text-diff-eval")
     f.set_defaults(func=_cmd_fluency)
 
     tn = sub.add_parser("tune", help="one-command lossy tuning: analyze a captured corpus, "
