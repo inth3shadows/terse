@@ -459,10 +459,16 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
               "_MODELS (or --base-url/--models).", file=sys.stderr)
         return 1
     active = activate_suggestions(doc)
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=True) as tf:
+    # Write inside the `with` (so the handle is CLOSED after it), then load by name: Windows
+    # forbids reopening a temp file whose handle is still open, so a `delete=True` block that
+    # loaded inside it would crash there. delete=False keeps the closed file for the reload.
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
         tf.write(_json.dumps(active))
-        tf.flush()
-        pol = load_policy(tf.name)
+        tmp_name = tf.name
+    try:
+        pol = load_policy(tmp_name)
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
     if not pol.has_drop():
         print("--drop-eval: no drop suggestions to verify.")
         return 0
@@ -492,8 +498,11 @@ def _cmd_tune(args: argparse.Namespace) -> int:
     cands = [{"tool": r["tool"], **dr} for r in rows for dr in r.get("drop_rows", [])]
 
     if args.out:
-        Path(args.out).write_text(_json.dumps(doc, ensure_ascii=False, indent=2) + "\n",
-                                  encoding="utf-8")
+        from .policy import load_policy
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(_json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        load_policy(out)  # fail loud if we just wrote a policy our own loader rejects
 
     print(f"# terse tune — {len(envelopes)} payload(s), {len(rows)} tool(s), "
           f"{len(cands)} drop candidate(s)")

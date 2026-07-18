@@ -533,7 +533,7 @@ def test_tune_cmd_surfaces_drop_candidate_and_writes_policy(tmp_path, capsys):
     f = _write(tmp_path, "p.json", payload)
     corpus = tmp_path / "corpus"
     assert main(["capture", str(f), "--tool", "kb.x", "--corpus", str(corpus)]) == 0
-    out_pol = tmp_path / "policy.json"
+    out_pol = tmp_path / "new_dir" / "policy.json"     # parent doesn't exist -> must be created
     assert main(["tune", "--corpus", str(corpus), "--out", str(out_pol)]) == 0
     out = capsys.readouterr().out
     assert "drop candidate" in out
