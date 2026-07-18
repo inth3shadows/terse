@@ -266,9 +266,18 @@ terse tune --corpus corpus/ --out policy.json
 # # terse tune — 40 payload(s), 6 tool(s), 3 drop candidate(s)
 # SAFE candidates — supporting prose, enable after a dropeval pass:
 #   kb.read.nodes    result[].description   ~41% tok, 100% uniq  [prose]
+#   → enabling all 1 here: ≈12,400 tok, ~18% of corpus (gross, before the per-record retrieve-handle cost)
 # REVIEW candidates — role unknown, may be LOAD-BEARING; verify carefully:
 #   kb.read.list_principles  result[].principle  ~36% tok, 100% uniq  [unknown]
+#   → enabling all 1 here: ≈9,800 tok, ~14% of corpus (gross, before the per-record retrieve-handle cost)
 ```
+
+Each bucket ends with a **rollup** — the estimated gross tokens dropping that whole
+bucket would evict (`mean field tokens × record count`, summed) and its share of the
+corpus's raw tokens. That's the number that answers "is turning on the SAFE set worth
+it?" — a per-field `~% tok` alone can't, since it's relative to each tool's own record
+list. It's a gross estimate: each dropped field leaves a small `terse.retrieve` handle
+behind, so the realized saving is slightly lower.
 
 - **`[prose]`** (evidence, rationale, description, notes, body…) — supporting text, the safe
   drop candidate.

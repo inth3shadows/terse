@@ -596,6 +596,24 @@ def test_tune_cmd_surfaces_drop_candidate_and_writes_policy(tmp_path, capsys):
     assert "result[].description" in entry["_suggested_fields"]      # written INACTIVE
 
 
+def test_tune_cmd_shows_bucket_savings_rollup(tmp_path, capsys):
+    # Beyond each candidate's individual token share, the SAFE bucket gets a rollup:
+    # the estimated gross tokens dropping the whole bucket would evict + its corpus
+    # share — the number an operator needs to decide "is enabling the SAFE set worth it?"
+    import re
+
+    payload = json.dumps({"result": [{"id": i, "description": "d" * 250 + str(i)}
+                                     for i in range(20)]})
+    f = _write(tmp_path, "p.json", payload)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "kb.x", "--corpus", str(corpus)]) == 0
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    out = capsys.readouterr().out
+    assert "enabling all 1 here" in out and "of corpus" in out and "gross" in out
+    m = re.search(r"≈([\d,]+) tok", out)             # a real, non-zero estimate rendered
+    assert m and int(m.group(1).replace(",", "")) > 0
+
+
 def test_tune_cmd_reports_no_candidates(tmp_path, capsys):
     payload = json.dumps({"result": [{"id": i, "status": "ok"} for i in range(5)]})
     f = _write(tmp_path, "p.json", payload)
