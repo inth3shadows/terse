@@ -128,6 +128,7 @@ report (lossless gate + per-tool token savings) in one command:
 terse verify --out reports/verify-report.md          # bundled sample, zero setup
 terse verify --corpus corpus --out report.md         # your own captured traffic
 terse verify --html --out reports/verify-report.md   # + a charted HTML report alongside it
+terse verify --corpus corpus --json                  # machine-readable gate + savings (CI-checkable)
 ```
 
 ## Benchmarks: terse vs alternatives
