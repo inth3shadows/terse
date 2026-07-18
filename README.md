@@ -86,29 +86,78 @@ out): one payload-free JSONL record per result — sizes, tokens, and the decisi
 taken, never content — so `terse stats` can answer "how much did terse actually save
 me this week?" from real sessions, not just the synthetic corpus.
 
-## Prerequisites
+## Install
 
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/) for dependency management
-- `tiktoken` (installed via `uv sync`) for token counting
-
-## Quick Start
+Needs Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-uv sync
-
-# Is a payload losslessly compressible, and by how much?
-echo '[{"id":1,"name":"a"},{"id":2,"name":"b"},{"id":3,"name":"c"}]' | uv run terse gate -
-
-# Compress a tool output through a per-tool policy
-some-tool-emitting-json | uv run terse compress --tool gh.api.repos --policy policy.example.json -
-
-# Run an MCP server behind terse: it compresses that server's tool results live
-uv run terse proxy --policy policy.example.json -- uvx some-mcp-server --flags
-
-# Run the test suite (it IS the lossless gate)
-uv run pytest
+uv tool install "git+https://github.com/inth3shadows/terse.git@v0.2.0"   # global `terse`
+# → becomes `pipx install terse-mcp` once it lands on PyPI (see Status).
 ```
+
+## Quick Start (under a minute)
+
+terse sits between your MCP client and a server and shrinks the server's tool results in
+flight. **No config needed** — the proxy is lossless-everywhere by default:
+
+```bash
+# 1. Wrap ANY stdio MCP server. Your agent talks to it exactly as before;
+#    terse compresses the results it returns, losslessly.
+terse proxy -- uvx some-mcp-server --flags
+
+# 2. See what it saved (the payload-free ledger is on by default):
+terse stats
+```
+
+Want to eyeball the codec first, no server involved?
+
+```bash
+echo '[{"id":1,"state":"open","repo":"acme/widgets"},{"id":2,"state":"open","repo":"acme/widgets"},{"id":3,"state":"open","repo":"acme/widgets"},{"id":4,"state":"open","repo":"acme/widgets"},{"id":5,"state":"open","repo":"acme/widgets"},{"id":6,"state":"open","repo":"acme/widgets"}]' | terse gate -
+# → round-trip lossless: PASS ; ~36% fewer cl100k tokens
+```
+
+(Savings grow with record count and repetition; on a single tiny object terse correctly
+declines and passes it through unchanged — it never inflates what it can't shrink.)
+
+## Does terse help my server?
+
+The win is per-tool and terse only keeps what pays, so it never hurts — but it helps a lot
+more on some shapes than others. Point it at a server and run `terse stats` to see for real;
+as a rule of thumb:
+
+| terse helps most | terse barely moves |
+|---|---|
+| record/array JSON (lists of objects) | already-minified or already-projected output |
+| repeated values or nested repeated subtrees | free-text-dominated results (logs, prose, diffs) |
+| verbose REST-ish payloads (GitHub, Jira, DB rows) | tiny single objects |
+| tools you call repeatedly (cross-call diff) | binary / non-JSON blobs (passed through untouched) |
+
+## Wire it into your MCP client (permanent)
+
+`install-mcp` rewrites your MCP config to launch a server *through* terse — reversible, and
+transparent to the client. It needs a per-tool policy; the smallest useful one is:
+
+```bash
+echo '{"version":1,"defaults":{"tiers":["minify","tabularize","dictionary"]}}' > terse-policy.json
+```
+
+```bash
+# Claude Code, user scope (~/.claude.json) — wrap a server you've already registered by name:
+terse install-mcp --policy terse-policy.json <server-name>
+
+# Project scope (a committed .mcp.json instead):
+terse install-mcp --policy terse-policy.json --scope project --file .mcp.json <server-name>
+
+terse mcp-status                       # confirm what's wrapped
+terse uninstall-mcp <server-name>      # cleanly restore the original entry
+```
+
+Other MCP clients (Cursor, etc.) read the same config shape — wherever a server is launched
+as `cmd --flags`, launch it as `terse proxy -- cmd --flags` to get the same effect.
+See [USAGE.md](USAGE.md) for tuning a policy (`terse tune`) and reading `terse stats`.
+
+**From source** (contributors): `uv sync` then `uv run terse ...`; `uv run pytest` is the
+lossless gate.
 
 ## Project Structure
 
