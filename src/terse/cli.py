@@ -924,7 +924,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
     from .capture import coverage, load_corpus
     from .measure import measure_corpus
-    from .report import build_report, build_verify_header
+    from .report import build_report, build_verify_header, verify_summary
 
     if args.corpus:
         envelopes = load_corpus(args.corpus)
@@ -958,6 +958,14 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
     rows = measure_corpus(envelopes)
     cov = coverage(envelopes)
+    if args.json:
+        # Machine mode: emit the aggregate and stop — no markdown/html/bars artifacts
+        # (parity with `stats --json` / `mcp-status --json`).
+        if args.html or args.bars:
+            print("note: verify --json emits JSON only; --html/--bars are ignored.",
+                  file=sys.stderr)
+        print(_json.dumps(verify_summary(rows, cov, label), indent=2))
+        return 0
     report = build_verify_header(label, len(envelopes)) + build_report(rows, cov)
     _write_report(report, args.out)
     if args.html:
@@ -1268,6 +1276,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="also write a charted HTML report next to --out (inline SVG, no JS/CDN)")
     vf.add_argument("--bars", action="store_true",
                     help="also print terminal bar charts for the savings sections (ANSI if a tty)")
+    vf.add_argument("--json", action="store_true",
+                    help="emit the gate verdict + savings as JSON to stdout instead of the "
+                         "report (scriptable / CI-checkable; no file/html/bars written)")
     vf.set_defaults(func=_cmd_verify)
 
     args = parser.parse_args(argv)
