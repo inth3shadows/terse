@@ -1,21 +1,22 @@
 name: release
-# Fires when a version tag is pushed (e.g. `v0.1.0`). Builds the sdist+wheel and
-# publishes a GitHub Release with auto-generated notes and the artifacts attached.
+# Fires when a version tag is pushed (e.g. `v0.1.0`). Builds the sdist+wheel, cuts a
+# GitHub Release, and publishes to PyPI via Trusted Publishing (OIDC — no stored token).
 # The tag IS the version (hatch-vcs) — a build here resolves to the tag, byte-for-byte.
 #
-# No PyPI publish here: this only cuts a GitHub Release. The distribution name is
-# `terse-mcp` (the bare `terse` is taken on PyPI); PyPI upload is a separate manual step.
+# The distribution name is `terse-mcp` (the bare `terse` is taken on PyPI); it normalizes
+# to `terse_mcp` in wheel filenames (e.g. v0.3.0 -> terse_mcp-0.3.0-*.whl).
 on:
   push:
     tags:
       - "v*"
 
-permissions:
-  contents: write # create the GitHub Release + upload artifacts; nothing more
+permissions: {} # least privilege — each job opts into exactly what it needs
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release + upload artifacts; nothing more
     steps:
       # fetch-depth: 0 is REQUIRED — hatch-vcs derives the version from `git describe`,
       # which needs full history + the tag. A shallow checkout yields a wrong/dev version.
@@ -29,15 +30,42 @@ jobs:
         run: uv build
       - name: Sanity-check the built version matches the tag
         # Fail loudly if hatch-vcs and the tag disagree — the artifact name must contain
-        # the tag without its leading `v`. The distribution name is `terse-mcp`, which
-        # normalizes to `terse_mcp` in wheel filenames (e.g. v0.3.0 -> terse_mcp-0.3.0-*.whl).
+        # the tag without its leading `v`.
         run: |
           expected="${GITHUB_REF_NAME#v}"
           if ! ls dist/terse_mcp-"${expected}"-*.whl >/dev/null 2>&1; then
             echo "::error::built wheel does not match tag ${GITHUB_REF_NAME} (expected version ${expected})"; ls -1 dist/; exit 1
           fi
           echo "built version ${expected} matches tag ${GITHUB_REF_NAME}"
+      # Build ONCE — the same artifacts go to both the GitHub Release and PyPI.
+      - name: Upload dist for the publish job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "${GITHUB_REF_NAME}" dist/* --generate-notes --title "${GITHUB_REF_NAME}"
+
+  pypi-publish:
+    needs: release
+    runs-on: ubuntu-latest
+    # `pypi` MUST match the Trusted Publisher's environment on PyPI, or the OIDC exchange is
+    # rejected. Gate it with a required reviewer in Settings -> Environments for human approval.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/terse-mcp/
+    permissions:
+      id-token: write # OIDC is the ONLY credential — no PyPI token is stored anywhere
+    steps:
+      - name: Download the built dist
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist/
+      # Trusted Publishing is automatic (no `with:` creds); PEP 740 attestations default on;
+      # uploads everything in dist/ (packages-dir defaults to dist/).
+      - name: Publish to PyPI (Trusted Publishing + attestations)
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
