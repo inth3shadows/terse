@@ -9,6 +9,8 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-17
+
 ### Added
 - `mcp-status`: each wrapped server now shows what it actually fronts
   (`wraps=<downstream cmd/url>`), whether the cross-call diff tier is
