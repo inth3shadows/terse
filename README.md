@@ -88,12 +88,13 @@ me this week?" from real sessions, not just the synthetic corpus.
 
 ## Install
 
-Needs Python 3.11+ and [uv](https://docs.astral.sh/uv/).
+Needs Python 3.11+.
 
 ```bash
-uv tool install "git+https://github.com/inth3shadows/terse.git@v0.2.0"   # global `terse`
-# → becomes `pipx install terse-mcp` once it lands on PyPI (see Status).
+uv tool install terse-mcp   # global `terse` CLI  (or: pipx install terse-mcp)
 ```
+
+Or `pip install terse-mcp` into a virtualenv for library/embedded use.
 
 ## Quick Start (under a minute)
 
@@ -287,7 +288,7 @@ is on top of the single-shot reduction above, and stacks with it.
 | **Anthropic context editing** / OpenAI equivalents | **Native, server-side, lossy** history-pruning (drop oldest tool results past a threshold), no local artifact to run keylessly. This — not any third-party tool — is the real strategic overlap with terse for first-party API users. |
 | **Atlassian mcp-compressor** (97★) | Primarily compresses tool **schemas/descriptions** at connect time (lossless deferred-disclosure) — complementary and stackable with terse (`terse proxy -- mcp-compressor -- <server>`). Caveat: an opt-in `--toonify` flag *does* reformat call **results** into TOON, so "schemas only" isn't strictly true — but that path is off by default and is a single static pass with no diffing, per-tool policy, or cross-call state, out-competed by terse's codec on that axis. |
 
-Adoption honesty: terse is new (pre-PyPI, few/no stars); TOON (24.9k★) and headroom
+Adoption honesty: terse is new (just published to PyPI, few/no stars); TOON (24.9k★) and headroom
 (widely adopted, star figures cited vary ~29–49k) are far more established. terse's
 defensible wedge is narrow and specific — *unconditionally lossless (no expiring
 retrieve-cache), no ML dependency, MCP-transparent, plus cross-call diffing* — not breadth
