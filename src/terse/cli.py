@@ -537,6 +537,17 @@ def _cmd_tune(args: argparse.Namespace) -> int:
             print(f"policy written to {args.out} (lossless).")
         return 0
 
+    # Denominator for the rollup: every analyzed tool's raw token volume, so a bucket's
+    # estimated drop can be stated as a share of the whole corpus, not just per field.
+    corpus_raw = sum(r.get("raw_tok", 0) or 0 for r in rows)
+
+    def _est_tokens(items: list) -> float:
+        # Gross tokens a bucket's drops would evict: mean field tokens x record count,
+        # summed. dimensionally clean across tools (unlike summing per-tool tok_share,
+        # whose denominators differ). Net is slightly less — each drop leaves a small
+        # retrieve handle in place of the field.
+        return sum((c.get("mean_tok") or 0) * (c.get("n") or 0) for c in items)
+
     def _show(label: str, items: list) -> None:
         if not items:
             return
@@ -545,6 +556,10 @@ def _cmd_tune(args: argparse.Namespace) -> int:
             print(f"  {c['tool']:<28} {c['path']:<26} "
                   f"~{c['tok_share'] * 100:.0f}% tok, {c['uniq_ratio'] * 100:.0f}% uniq  "
                   f"[{c.get('role', 'unknown')}]")
+        est = _est_tokens(items)
+        share = f", ~{est / corpus_raw * 100:.0f}% of corpus" if corpus_raw else ""
+        print(f"  → enabling all {len(items)} here: ≈{est:,.0f} tok{share} "
+              "(gross, before the per-record retrieve-handle cost)")
 
     _show("SAFE candidates — supporting prose, enable after a dropeval pass",
           [c for c in cands if c.get("role") == "prose"])
