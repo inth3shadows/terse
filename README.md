@@ -181,10 +181,28 @@ structural* gain, the hardest honest case:
 - **Neither tool helps much when free text dominates** (`gh_commits_flat`: long commit
   messages, ~2% either way) or on tiny single objects — matching terse's own "selective,
   0–30%, per-tool" claim rather than contradicting it.
-- **terse has an axis no stateless encoding has: cross-call diffing.** On a modeled
-  repeated call over the real `gh_pulls` list (2 records changed, 1 appended), the second
-  call costs **59.5% fewer tokens** as a lossless delta vs a full re-send. TOON, minify,
-  and terse's own single-shot codec all pay the full payload every call.
+**Cross-call diff — the axis no stateless encoding has.** When the same tool is called
+again (poll a list, re-read a file), terse emits a lossless *delta* against the prior
+result instead of the whole payload. TOON, minify, and terse's own single-shot codec all
+pay the full column every call. Modeling one repeated call per payload (two records
+changed, one appended — the poll-again pattern), the **second** call costs
+(`uv run scripts/bench/diff_demo.py`):
+
+| repeated call | records | full re-send (terse) | diff | diff smaller |
+|---|--:|--:|--:|--:|
+| gh_commits_flat | 30 | 10,681 | 812 | **92.4%** |
+| gh_commits | 30 | 51,623 | 6,273 | **87.8%** |
+| gh_issues | 30 | 32,608 | 4,448 | **86.4%** |
+| gh_dir_listing | 24 | 4,779 | 977 | **79.6%** |
+| gh_pulls | 30 | 37,776 | 15,292 | **59.5%** |
+| gh_workflow_runs | 20 | 15,370 | 12,336 | 19.7% |
+| **weighted total** | | 152,837 | 40,138 | **73.7%** |
+
+The diff cost scales with *what changed*, not with payload size — so its win compounds
+exactly where token cost otherwise does: a long agent loop re-fetching mostly-unchanged
+results. (`gh_workflow_runs` is lower here only because its records are large and this
+model changed a big nested field; a status/timestamp churn would diff far smaller.) This
+is on top of the single-shot reduction above, and stacks with it.
 
 **Tools not benchmarked head-to-head, and why (no invented numbers):**
 
