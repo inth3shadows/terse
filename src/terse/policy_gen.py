@@ -37,6 +37,7 @@ transform. The CLI surfaces that pointer; it is not a hard gate here.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from . import probes
@@ -46,6 +47,45 @@ from .measure import measure_payload
 # Tiers are cumulative in the codec (minify ⊂ tabularize ⊂ dictionary). minify is implied
 # by re-serialization, so it never ships alone — tabularize always carries it.
 _BASE_TIERS = ["minify", "tabularize"]
+
+# Field-role classification steers drop-to-retrieve suggestions away from load-bearing
+# fields (the step-1 finding: the size+uniqueness heuristic alone confidently suggested
+# dropping kb's `principle` — the very field the model reasons over — because it was the
+# biggest unique blob). `identity` = a key/essence field the record needs IN-LINE (never a
+# drop candidate); `prose` = supporting free text, the safe candidate (ranked first);
+# `unknown` = the name doesn't reveal the role, so it MAY be load-bearing → still suggested
+# but flagged for the dropeval gate. A name-only heuristic cannot catch a DOMAIN essence
+# field (`principle`, `verdict`, `answer`) — those fall to `unknown` by design, which is
+# why the behavioral dropeval gate, not this classifier, is the real safety net.
+_IDENTITY_TOKENS = frozenset({
+    "id", "ids", "key", "keys", "name", "title", "slug", "uuid", "guid", "hash", "type",
+    "kind", "status", "state", "path", "url", "uri", "command", "cmd", "version", "ref",
+    "sha", "label", "tag", "count", "size", "timestamp", "date", "time"})
+_PROSE_TOKENS = frozenset({
+    "evidence", "rationale", "note", "notes", "description", "desc", "summary", "detail",
+    "details", "body", "text", "content", "comment", "comments", "explanation", "context",
+    "snippet", "message", "msg", "reason", "readme", "abstract", "excerpt", "bio", "blurb"})
+
+
+def _field_tokens(name: str) -> set[str]:
+    """Lowercase word tokens of a field path's leaf key (drop the record path and `[]`,
+    split camelCase + snake/space/hyphen). `result[].bodyText` -> {'body', 'text'}."""
+    leaf = name.rsplit(".", 1)[-1].replace("[]", "")
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", leaf)
+    return {t for t in re.split(r"[\s_\-]+", spaced.lower()) if t}
+
+
+def classify_field_role(name: str) -> str:
+    """Best-effort role of a record field from its NAME: 'identity' | 'prose' | 'unknown'.
+    See _IDENTITY_TOKENS / _PROSE_TOKENS. Identity wins over prose on a tie (a field that is
+    both a key and prose-shaped is treated as load-bearing — the safer call)."""
+    toks = _field_tokens(name)
+    if toks & _IDENTITY_TOKENS:
+        return "identity"
+    if toks & _PROSE_TOKENS:
+        return "prose"
+    return "unknown"
+
 
 # drop-to-retrieve candidate thresholds (#47). A field is suggested only when all three hold:
 _DROP_MIN_MEAN_TOK = 50.0    # large: ~200 serialized chars, matching lossy.DEFAULT_DROP_MIN
@@ -100,13 +140,24 @@ def _drop_candidates(
 
     suggestion: dict[str, dict] = {}
     rows: list[dict[str, Any]] = []
-    # Highest token-share first: the report and the suggestion read by impact.
-    for field, pr in sorted(agg.items(), key=lambda kv: -kv[1]["tok_share"]):
+    # Order safe-first, then by impact: prose (known-safe) fields lead, unknown-role fields
+    # (may be load-bearing) follow, each by descending token-share. `identity` fields are
+    # dropped from the candidate list entirely below — the record needs its keys in-line.
+    _role_rank = {"prose": 0, "unknown": 1}
+    ordered = sorted(
+        agg.items(),
+        key=lambda kv: (_role_rank.get(classify_field_role(f"{path}.{kv[0]}"), 1),
+                        -kv[1]["tok_share"]),
+    )
+    for field, pr in ordered:
+        role = classify_field_role(f"{path}.{field}")
+        if role == "identity":
+            continue  # a key/essence field is never a drop candidate — the record needs it
         if (pr["mean_tok"] >= min_mean_tok and pr["uniq_ratio"] >= min_uniq_ratio
                 and pr["tok_share"] >= min_share):
             fpath = f"{path}.{field}"
             suggestion[fpath] = {"lossy": "drop-to-retrieve"}
-            rows.append({"path": fpath, **pr})
+            rows.append({"path": fpath, "role": role, **pr})
     return suggestion, rows
 
 
@@ -196,12 +247,20 @@ def generate_policy(
         # `_suggested_fields`, so this is a no-op until the operator renames it. Drop is
         # lossy — the human confirms; the generator never enables it.
         if r.get("drop_suggestion"):
-            shares = ", ".join(f"{dr['path']} ~{dr['tok_share']*100:.0f}%" for dr in r["drop_rows"])
+            shares = ", ".join(
+                f"{dr['path']} ~{dr['tok_share']*100:.0f}% [{dr.get('role', 'unknown')}]"
+                for dr in r["drop_rows"])
+            has_unknown = any(dr.get("role") == "unknown" for dr in r["drop_rows"])
+            caution = (" A field tagged [unknown] may be LOAD-BEARING — the name doesn't "
+                       "reveal its role, so dropping it forces the model to call retrieve for "
+                       "it; treat [prose] as safer and verify any [unknown] before enabling."
+                       if has_unknown else "")
             entry["_suggested_fields"] = r["drop_suggestion"]
             entry["_suggested_fields_note"] = (
-                f"LOSSY drop-to-retrieve candidates (large + near-unique: {shares}). "
-                f"Rename '_suggested_fields' -> 'fields' to enable, then confirm the model "
-                f"still answers with `terse fluency`. Off until you do.")
+                f"LOSSY drop-to-retrieve candidates (large + near-unique; safe-first, [role] "
+                f"guessed from the field name): {shares}. Rename '_suggested_fields' -> "
+                f"'fields' to enable, then confirm the model still answers with `terse fluency "
+                f"--drop-eval`. Off until you do.{caution}")
         policies.append(entry)
 
     any_drops = any(r.get("drop_suggestion") for r in rows)
