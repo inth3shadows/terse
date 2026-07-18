@@ -39,7 +39,9 @@ Issues = "https://github.com/inth3shadows/terse/issues"
 terse = "terse.cli:main"
 
 [dependency-groups]
-dev = ["pytest", "ruff", "mypy"]
+# hypothesis: property-based fuzzing of the lossless guarantee (M3 — tests/test_fuzz.py).
+# Dev-only, no runtime dependency. Unpinned like the others; uv.lock carries the exact pin.
+dev = ["pytest", "ruff", "mypy", "hypothesis"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
