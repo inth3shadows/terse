@@ -364,6 +364,26 @@ def test_build_transport_rejects_file_url_scheme():
         build_transport(["file:///etc/passwd"])
 
 
+@pytest.mark.parametrize("bad_url", [
+    "http://169.254.169.254/latest/meta-data/",   # AWS/Azure/GCP/DO instance metadata
+    "http://169.254.169.254/",
+    "https://169.254.169.254/computeMetadata/v1/",
+    "http://metadata.google.internal/computeMetadata/v1/",
+    "http://[fe80::1]/",                           # IPv6 link-local
+])
+def test_http_transport_blocks_link_local_metadata(bad_url):
+    # A downstream URL can come from an untrusted, repo-committed .mcp.json; the cloud
+    # instance-metadata endpoint is never a real MCP server, so it is refused outright.
+    with pytest.raises(ValueError, match="metadata"):
+        HttpTransport(bad_url)
+
+
+def test_http_transport_still_allows_loopback_and_private():
+    # The metadata guard must NOT break the first-class local/homelab MCP use case.
+    assert HttpTransport("http://127.0.0.1:4000/mcp")
+    assert HttpTransport("http://192.168.9.40:8080/mcp")   # ordinary private LAN host
+
+
 def test_build_transport_still_allows_http_and_https():
     # HttpTransport.__init__ does no I/O, so these construct without connecting.
     assert isinstance(build_transport(["http://localhost:1/mcp"]), HttpTransport)

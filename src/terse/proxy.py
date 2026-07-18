@@ -37,6 +37,13 @@ from . import text_diff, transforms
 from .tokenize import count_cl100k
 from .transport import HttpTransport, build_transport
 
+# How long to let the inbound pump finish draining the downstream's final reply after the
+# child process has exited (stdio). Generous: the child's stdout EOF guarantees the pump
+# terminates once buffered data is flushed; this only bounds a pathological stall (e.g. the
+# client stopped reading our stdout) instead of the old 2s cap that could truncate a large
+# final reply outright.
+_STDIO_DRAIN_TIMEOUT = 30.0
+
 # The synthetic tool terse advertises in tools/list when a policy enables drop-to-retrieve
 # (#10). The proxy answers its calls itself from the drop store — the downstream server
 # never sees it.
@@ -152,6 +159,11 @@ class Interceptor:
         # to leave always-on — it records sizes and decisions, never content — but it
         # keeps their exact contract: callback owns I/O, failures are swallowed.
         self.stats = stats
+        # Side-effect sinks (capture/audit/stats) swallow their failures to stay fail-open,
+        # but a sink that fails on EVERY call — a full disk, a bad path — would then stop
+        # writing forever with the failure only visible under --debug. Warn ONCE per sink,
+        # unconditionally, the first time it fails, so a silently-dead ledger is noticed.
+        self._sink_warned: set[str] = set()
         self.last: dict[str, Any] = {}  # tool -> previous result object (the diff base)
         # tool -> consecutive diffs emitted since the last full (keyframe) result. Bounds
         # how far a chained diff can drift from a self-contained anchor (#8).
@@ -344,9 +356,7 @@ class Interceptor:
                     try:
                         self.capture(capture_tool, b["text"])
                     except Exception as exc:  # noqa: BLE001 — capture is never load-bearing
-                        if self.debug:
-                            sys.stderr.write(
-                                f"[terse-proxy] {capture_tool}: capture skipped: {exc}\n")
+                        self._warn_sink("capture", capture_tool, exc)
 
             # Snapshot the raw block texts before any transform mutates them in place, so
             # the audit log can pair each raw payload with what terse actually emitted
@@ -600,6 +610,17 @@ class Interceptor:
         return json.dumps({"jsonrpc": "2.0", "id": mid, "result": result},
                           separators=(",", ":"), ensure_ascii=False)
 
+    def _warn_sink(self, kind: str, tool: str, exc: Exception) -> None:
+        """Announce a side-effect sink failure. The FIRST failure of each kind is written
+        unconditionally — a sink failing on every call (full disk, bad path) would else go
+        silent forever without --debug — and further ones only under --debug, so a
+        persistently-failing sink can't flood stderr on the hot path."""
+        first = kind not in self._sink_warned
+        if first or self.debug:
+            self._sink_warned.add(kind)
+            tail = " (further occurrences silenced unless --debug)" if first else ""
+            sys.stderr.write(f"[terse-proxy] {tool}: {kind} skipped: {exc}{tail}\n")
+
     def _emit_audit(self, tool: str, mid: Any, raw_texts: list[str],
                     text_blocks: list[dict], changed: bool, *,
                     display_tool: str | None = None) -> None:
@@ -627,8 +648,7 @@ class Interceptor:
         try:
             audit(record)
         except Exception as exc:  # noqa: BLE001 — audit is never load-bearing
-            if self.debug:
-                sys.stderr.write(f"[terse-proxy] {shown_tool}: audit skipped: {exc}\n")
+            self._warn_sink("audit", shown_tool, exc)
 
     def _emit_stats(self, tool: str, raw_texts: list[str], text_blocks: list[dict], *,
                     display_tool: str | None = None) -> None:
@@ -645,8 +665,7 @@ class Interceptor:
             try:
                 stats(shown_tool, raw, b["text"], passthrough)
             except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
-                if self.debug:
-                    sys.stderr.write(f"[terse-proxy] {shown_tool}: stats skipped: {exc}\n")
+                self._warn_sink("stats", shown_tool, exc)
 
 
 # Sentinel a transform returns to SWALLOW a line — write nothing to dst — as distinct from
@@ -942,7 +961,18 @@ def run_proxy(
             rc = 0
         else:
             rc = transport.wait()
-            t_down.join(timeout=2.0)
+            # The child has exited, so its stdout reaches EOF and the inbound pump WILL
+            # terminate once it drains the last buffered reply — give it a generous window
+            # to do so. The old 2s cap could kill the daemon thread mid-drain on a large
+            # final reply, silently truncating the client's last message(s). If the drain
+            # still hasn't finished (e.g. the client stopped reading our stdout), announce
+            # it rather than truncating in silence.
+            t_down.join(timeout=_STDIO_DRAIN_TIMEOUT)
+            if t_down.is_alive():
+                sys.stderr.write(
+                    "[terse] downstream exited but its final reply did not finish "
+                    f"draining within {_STDIO_DRAIN_TIMEOUT:.0f}s; last message(s) may "
+                    "be truncated\n")
         return rc
     finally:
         _ignore_sigterm(sigterm_token)

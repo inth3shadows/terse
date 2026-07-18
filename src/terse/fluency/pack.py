@@ -81,10 +81,14 @@ def score_pack(pack: dict, responses: dict) -> dict:
                 rows.append({
                     "tool": meta["tool"], "sha": sha, "qid": qid,
                     "qtype": qtype, "transform": meta["transform"],
-                    # forms are collected with the same trial count (build_pack's hint);
-                    # store the max so an uneven hand-built file still reports sanely.
+                    # `trials` (the max) is the header/display count. The PER-FORM counts
+                    # below are what the accuracy denominator uses: with an uneven
+                    # hand-built pack (one form collected fewer replies), dividing a
+                    # sparser form's successes by the shared max understates it. Each form
+                    # is scored over its OWN trial count instead (see _form_stats).
                     "trials": max(raw_t, terse_t, primer_t, 1),
                     "raw_ok": raw_k, "terse_ok": terse_k, "primer_ok": primer_k,
+                    "raw_trials": raw_t, "terse_trials": terse_t, "primer_trials": primer_t,
                 })
         results[model] = rows
     return results

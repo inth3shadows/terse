@@ -7,19 +7,36 @@ explicitly rather than silently substituting one for the other.
 
 from __future__ import annotations
 
+import sys
 from functools import lru_cache
 
 CL100K = "cl100k_base"   # GPT-3.5/4 — headroom-eval parity
 O200K = "o200k_base"     # GPT-4o — second, very different vocab for invariance checks
 
+_warned_degraded = False
+
 
 @lru_cache(maxsize=4)
 def _enc(name: str):
+    # tiktoken ABSENT is an expected, supported configuration (see module docstring): the
+    # counters return None and the report shows the gap explicitly. tiktoken PRESENT but
+    # failing to load an encoding (corrupt cache, bad name, offline first-fetch) is a real
+    # fault the old blanket `except Exception` hid as an indistinguishable silent None —
+    # every size decision then quietly ran off transforms' len//4 fallback. Warn once for
+    # that case so degraded-mode operation is at least visible; stay silent for absence.
+    global _warned_degraded
     try:
         import tiktoken
-
+    except ImportError:
+        return None
+    try:
         return tiktoken.get_encoding(name)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 — any load failure degrades to the heuristic
+        if not _warned_degraded:
+            _warned_degraded = True
+            sys.stderr.write(
+                f"[terse] tiktoken is installed but encoding {name!r} failed to load "
+                f"({exc}); token counts fall back to a coarse length heuristic\n")
         return None
 
 

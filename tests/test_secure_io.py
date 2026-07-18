@@ -71,7 +71,26 @@ def test_write_restricted_reraises_on_fchmod_failure_without_masking(tmp_path, m
     monkeypatch.setattr(os, "fchmod", _boom)
     with pytest.raises(OSError, match="boom"):
         sio.write_restricted(path, "hello")
-    assert path.read_text(encoding="utf-8") == ""
+    # Atomic write: on failure nothing is committed to the target (no orphan empty
+    # file), and the staging temp is cleaned up — the directory is left as it was.
+    assert not path.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_write_restricted_failed_write_preserves_existing_target(tmp_path, monkeypatch):
+    # The whole point of the atomic write: a crash/error mid-write must leave the
+    # PREVIOUS complete file intact, never a truncated ruin (the ~/.claude.json case).
+    path = tmp_path / "config.json"
+    path.write_text("original-and-valid", encoding="utf-8")
+
+    def _boom(*_a):
+        raise OSError("boom")
+
+    monkeypatch.setattr(os, "fchmod", _boom)
+    with pytest.raises(OSError, match="boom"):
+        sio.write_restricted(path, "new-content-that-fails")
+    assert path.read_text(encoding="utf-8") == "original-and-valid"
+    assert list(tmp_path.iterdir()) == [path]  # no leftover temp
 
 
 # --- append_restricted ---

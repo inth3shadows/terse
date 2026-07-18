@@ -315,3 +315,17 @@ def test_never_lossy_servers_loads_from_policy_json(tmp_path):
                              "policies": []}), encoding="utf-8")
     pol = load_policy(p)
     assert pol.server_never_lossy("kb") and pol.server_never_lossy("sb-run")
+
+
+def test_apply_falls_back_to_lossless_when_codec_self_check_fails(monkeypatch):
+    # Verify-before-emit: if the always-on Tier-0/0.5 codec ever produced output that did
+    # not round-trip, apply() must fall back to the plain lossless minified form rather
+    # than ship a corrupt payload. Simulate a latent codec bug by making decompress return
+    # the wrong value, then assert the emitted text still reconstructs the original exactly.
+    p = _policy()
+    monkeypatch.setattr("terse.policy.transforms.decompress",
+                        lambda _text: {"corrupted": "not the original"})
+    result = apply(RECORDS, "gh.api.repos", p)
+    assert json.loads(result.text) == json.loads(RECORDS)  # lossless despite the "bug"
+    assert result.tiers == ()
+    assert any("self-check failed" in w for w in result.warnings)

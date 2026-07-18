@@ -17,14 +17,47 @@ _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
 def write_restricted(path: str | Path, text: str, *, mode: int = 0o600) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW, mode)
+    # Atomic full-file write: stage into a sibling temp file, fsync, then os.replace()
+    # onto the target. A crash/SIGKILL mid-write can now only leave the temp behind —
+    # the target is either the complete old file or the complete new one, never a
+    # half-truncated ruin. This matters most for the real ~/.claude.json and policy.json
+    # writes routed through here: the previous O_TRUNC-in-place write left a window in
+    # which a crash corrupted the user's live config, recoverable only by hand from a
+    # .bak. os.replace is atomic within a filesystem, so the temp sits in the same dir.
+    path = Path(path)
+    # Preserve the original O_NOFOLLOW contract: refuse to write onto a symlinked target.
+    # os.replace() below would itself be safe (it replaces a destination symlink rather
+    # than following it, so a secret can't be redirected onto an attacker's target), but
+    # refusing keeps the loud, unchanged behavior — a planted symlink is surfaced, and a
+    # legitimately symlinked config is never silently converted into a regular file.
+    if _NOFOLLOW and path.is_symlink():
+        raise OSError(f"terse: refusing to write through a symlink at {path}")
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    # O_EXCL: never adopt a pre-planted temp; O_NOFOLLOW: don't follow a symlink at the
+    # temp name either.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, mode)
     try:
-        os.fchmod(fd, mode)  # also tightens a file that pre-existed at looser permissions
+        os.fchmod(fd, mode)  # pin the mode before content, independent of umask
     except OSError:
         os.close(fd)
+        _silent_unlink(tmp)
         raise
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:  # takes ownership of fd
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        _silent_unlink(tmp)
+        raise
+
+
+def _silent_unlink(path: str | Path) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def append_restricted(path: str | Path, text: str, *, mode: int = 0o600) -> None:

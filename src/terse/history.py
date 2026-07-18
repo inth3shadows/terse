@@ -18,7 +18,14 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ._secure_io import append_restricted
 from .report import _sum
+
+# One JSONL line per real `measure --history` run — tiny, but unbounded over a project's
+# life. Rotate a single generation once the live file passes this so it can't grow forever
+# (the archived `.1` isn't read into the trend; at this size that's tens of thousands of
+# runs away and purely a safety bound, not routine behaviour).
+MAX_HISTORY_BYTES = 5_000_000
 
 
 def summarize_run(rows: list[dict[str, Any]], ts: str, *, label: str | None = None) -> dict[str, Any]:
@@ -42,11 +49,17 @@ def summarize_run(rows: list[dict[str, Any]], ts: str, *, label: str | None = No
 
 
 def append_run(path: Path, run: dict[str, Any]) -> None:
-    """Append one run summary as a single JSONL line. Creates the file (and its
-    parent dir) on first use."""
+    """Append one run summary as a single JSONL line. Creates the file (and its parent
+    dir) on first use. Written via append_restricted (0600) for perms parity with the
+    corpus/ledger — a run row can embed an operator-supplied `label`. Rotates one
+    generation once the file passes MAX_HISTORY_BYTES so it can't grow without bound."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(run, ensure_ascii=False) + "\n")
+    try:
+        if path.stat().st_size >= MAX_HISTORY_BYTES:
+            path.replace(path.with_name(path.name + ".1"))
+    except FileNotFoundError:
+        pass  # first run — nothing to rotate
+    append_restricted(path, json.dumps(run, ensure_ascii=False) + "\n")
 
 
 def load_history(path: Path) -> list[dict[str, Any]]:

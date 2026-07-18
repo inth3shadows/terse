@@ -92,8 +92,9 @@ def default_repo_path() -> str:
     error."""
     try:
         result = subprocess.run(["git", "rev-parse", "--git-common-dir"],
-                                capture_output=True, text=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                                capture_output=True, text=True, check=True, timeout=10)
+    except (subprocess.CalledProcessError, FileNotFoundError,
+            subprocess.TimeoutExpired) as e:
         raise ValueError(
             "local scope resolves its default --repo-path from git, but this "
             "isn't a git repo (or git isn't installed) — pass --repo-path "
