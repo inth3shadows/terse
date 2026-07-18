@@ -9,10 +9,33 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-18
+
 ### Added
+- Automated PyPI publishing via GitHub Actions **Trusted Publishing** (OIDC) with
+  PEP 740 provenance attestations — tagged releases upload to PyPI with no stored
+  token. This is the first PyPI release of `terse-mcp`. (#111)
+
+### Fixed
+- `release` workflow: corrected the built-wheel name check for the `terse-mcp`
+  rename (`terse_mcp-*.whl`), which had blocked the tagged release run. (#110)
+
+## [0.3.0] - 2026-07-18
+
+### Added
+- **Installable package** — MIT license and PyPI-ready metadata. The distribution is
+  named `terse-mcp` (the bare `terse` is taken on PyPI); the import package stays
+  `terse`, so `python -m terse` is unchanged. (#103)
 - `verify --json`: emit the lossless-gate verdict and cl100k savings totals as JSON
   on stdout instead of the markdown report — CI-checkable (`… | jq -e
   .lossless_gate.ok`), parity with `stats --json` / `mcp-status --json`. (#107)
+- diff-moat instrumentation: `stats` records why the cross-call diff tier did or did
+  not fire per call, to measure the diff feature's real-world reach (Phase 0+1). (#101)
+- Property-based fuzzing of the lossless round-trip guarantee. (#105)
+
+### Documentation
+- Onboarding quickstart + per-client install recipes. (#108)
+- Codeshot architecture diagram embedded in TECHNICAL.md. (#104)
 
 ## [0.2.0] - 2026-07-17
 
