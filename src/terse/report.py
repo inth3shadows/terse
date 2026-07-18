@@ -29,7 +29,13 @@ def _form_stats(rows: list[dict[str, Any]], form: str) -> tuple[float, float]:
     tot_t = tot_k = 0
     var = 0.0
     for r in rows:
-        t = r.get("trials", 1)
+        # Prefer a per-form trial count ("terse_ok" -> "terse_trials") when the row
+        # carries one — an uneven hand-built pack can collect fewer replies for one form,
+        # and dividing that form's successes by the shared per-row `trials` would
+        # understate it. Falls back to the shared count, so the live/uniform path (no
+        # per-form keys) reports exactly as before.
+        t_key = form[:-3] + "_trials" if form.endswith("_ok") else ""
+        t = r.get(t_key, r.get("trials", 1))
         k = int(r[form])
         tot_t += t
         tot_k += k

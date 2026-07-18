@@ -33,3 +33,6 @@ scratch_fidelity/
 
 # hatch-vcs build-time version file (generated from the git tag; never committed)
 src/terse/_version.py
+
+# Benchmark: pinned TOON encoder deps (regenerate with `cd scripts/bench && npm install`)
+scripts/bench/node_modules/

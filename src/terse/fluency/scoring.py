@@ -11,7 +11,11 @@ import json
 import re
 from typing import Any
 
-_NUM = re.compile(r"-?\d+(?:\.\d+)?")
+# A standalone number: not glued to a letter/digit/underscore on either side, so the
+# expected value can't be spuriously "found" inside an identifier or version string
+# (e.g. expected 6 must not match the "6" in "record_6" or "v6.2"). Trailing sentence
+# punctuation (". ,)") is fine — only alnum/underscore neighbours disqualify a match.
+_NUM = re.compile(r"(?<![A-Za-z0-9_.])-?\d+(?:\.\d+)?(?![A-Za-z0-9_])")
 
 
 def _is_number(x: Any) -> bool:
@@ -38,9 +42,10 @@ def _parse_list(reply: str) -> list | None:
 
 
 def _matches_number(reply: str, expected: Any) -> bool:
-    """True iff the expected number appears anywhere in the reply. Matching ANY number
-    (not just the first) tolerates prose like "there are 6 records" without being fooled
-    by a leading incidental number."""
+    """True iff the expected number appears as a standalone token anywhere in the reply.
+    Matching ANY standalone number (not just the first) tolerates prose like "there are 6
+    records" without being fooled by a leading incidental number; the standalone rule (see
+    _NUM) additionally rejects a value merely embedded in an identifier/version string."""
     return any(abs(float(tok) - float(expected)) < 1e-9 for tok in _NUM.findall(reply))
 
 

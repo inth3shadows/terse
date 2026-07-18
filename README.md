@@ -111,6 +111,8 @@ src/terse/
   cli.py         entrypoint: gate / capture / measure / probe / validate / compress / proxy / stats / fluency
 scripts/
   gen_stress_corpus.py  synthetic stress corpus for the fluency eval
+  bench/                terse-vs-TOON token benchmark on a real GitHub-API corpus
+                        (fetch_corpus.sh, benchmark.py, diff_demo.py, toon_encode.mjs)
 tests/           round-trip, measurement, probe, policy, and fluency tests
 policy.example.json   selective policy encoding the measured per-tool insight
 corpus/          captured tool outputs (gitignored; may contain real data)
@@ -127,6 +129,76 @@ terse verify --out reports/verify-report.md          # bundled sample, zero setu
 terse verify --corpus corpus --out report.md         # your own captured traffic
 terse verify --html --out reports/verify-report.md   # + a charted HTML report alongside it
 ```
+
+## Benchmarks: terse vs alternatives
+
+A head-to-head token-reduction benchmark on a corpus of **real, public GitHub API
+payloads** (`scripts/bench/`) — the nested, record-shaped output that dominates real MCP
+tool traffic. Everything below is **lossless and verified per payload** (a row is dropped
+from the total if either encoder fails its round-trip), counted in `cl100k_base` (the same
+tokenizer terse uses). Reproduce end-to-end:
+
+```bash
+cd scripts/bench && npm install          # pins the official @toon-format/toon encoder
+./fetch_corpus.sh                        # OR use the committed corpus snapshot as-is
+uv run scripts/bench/benchmark.py        # terse vs TOON vs baselines
+uv run scripts/bench/diff_demo.py        # terse's cross-call diff (its own axis)
+```
+
+The only directly-comparable public tool is **[TOON](https://toonformat.dev/)** — a
+lossless encoding that shares terse's tabularization primitive. The corpus is compact JSON
+(no pretty-print whitespace), so `minify` saves ~0% and every number below is *pure
+structural* gain, the hardest honest case:
+
+| payload (real GitHub API) | records | raw tok | terse | TOON |
+|---|--:|--:|--:|--:|
+| gh_pulls | 30 | 151,165 | **76.1%** | −8.4% |
+| gh_workflow_runs | 20 | 76,032 | **80.3%** | −7.5% |
+| gh_issues | 30 | 48,032 | **32.7%** | −8.0% |
+| gh_commits | 30 | 69,652 | **26.5%** | −4.5% |
+| gh_dir_listing | 24 | 6,736 | **31.4%** | −7.7% |
+| gh_rate_limit | 1 obj | 357 | **13.4%** | −36.7% |
+| gh_repo_single | 1 obj | 1,652 | 0.0% | −4.4% |
+| gh_commits_flat | 30 | 10,886 | **2.4%** | 1.7% |
+| gh_labels | 9 | 632 | 15.2% | **19.0%** |
+| **weighted total** | | 365,144 | **58.3%** | **−7.1%** |
+
+*(% = fewer cl100k tokens than raw; higher is better; **bold** = winner.)*
+
+**Honest reading of this:**
+
+- **On real nested API records, terse wins decisively and TOON regresses** (−7.1% overall
+  — *worse* than raw). TOON is built for **flat, uniform arrays**; GitHub records are
+  deeply nested and non-uniform (a PR embeds repeated `user`/`head`/`base`/`repo`
+  subtrees), which terse's dictionary tier folds and TOON's tabular layout cannot — it
+  adds key-path overhead instead. terse's headline 76% on `gh_pulls` is exactly this:
+  60 repeated copies of the same repo object collapsed to one legend entry.
+- **TOON is not beaten everywhere — and we show where it wins.** On `gh_labels` (a flat,
+  short-valued uniform table — TOON's designed sweet spot) TOON leads, **+19.0% vs terse's
+  +15.2%**. TOON's own published ~40% figures are real *for that input shape*; this corpus
+  deliberately tests the different thing (nested tool output), so treat this as
+  "different niche," not "terse strictly dominant."
+- **Neither tool helps much when free text dominates** (`gh_commits_flat`: long commit
+  messages, ~2% either way) or on tiny single objects — matching terse's own "selective,
+  0–30%, per-tool" claim rather than contradicting it.
+- **terse has an axis no stateless encoding has: cross-call diffing.** On a modeled
+  repeated call over the real `gh_pulls` list (2 records changed, 1 appended), the second
+  call costs **59.5% fewer tokens** as a lossless delta vs a full re-send. TOON, minify,
+  and terse's own single-shot codec all pay the full payload every call.
+
+**Tools not benchmarked head-to-head, and why (no invented numbers):**
+
+| Tool | Why not a like-for-like row |
+|---|---|
+| **headroom** (headroomlabs-ai, ~60k★) | The closest *product* competitor and far more adopted, but its default JSON path is **lossy** (an ML model) with a `retrieve` round-trip — a different guarantee than terse's lossless-first, not comparable on a lossless token axis. (The `headroom` package on PyPI is an unrelated CLI assistant.) |
+| **LLMLingua-2** (Microsoft, 6.4k★) | Lossy prompt compression via a trained classifier; operates on **input prompts**, not structured tool output. Different axis. |
+| **Anthropic context editing** / OpenAI equivalents | **Native, server-side, lossy** history-pruning (drop oldest tool results past a threshold), no local artifact to run keylessly. This — not any third-party tool — is the real strategic overlap with terse for first-party API users. |
+| **Atlassian mcp-compressor** (97★) | Compresses tool **schemas/descriptions** at connect time, not call **results** — adjacent, not competing. |
+
+Adoption honesty: terse is new (pre-PyPI, few/no stars); TOON (24.9k★) and headroom
+(~60k★) are far more established. terse's defensible wedge is narrow and specific —
+*lossless-first, no retrieve round-trip, no ML dependency, MCP-transparent, plus cross-call
+diffing* — not breadth of adoption.
 
 ## Related Documentation
 

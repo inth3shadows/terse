@@ -266,6 +266,27 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _warn_if_dropping_capture_rules(out: Path) -> None:
+    """`policy generate` emits a fresh document that never sets `capture: false`. If the
+    target already holds hand-authored capture:false privacy rules (#85), overwriting them
+    silently would re-enable payload persistence for those tools. Warn loudly and name
+    them so the user re-adds any they still want — regeneration deliberately does NOT merge
+    (a merge could resurrect a stale rule the operator removed on purpose)."""
+    if not out.exists():
+        return
+    try:
+        prior = _json.loads(out.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    guarded = [(p.get("match", {}) or {}).get("tool", "?")
+               for p in (prior.get("policies") or [])
+               if isinstance(p, dict) and p.get("capture") is False]
+    if guarded:
+        print(f"[warn] {out} already sets \"capture\": false for {len(guarded)} rule(s) "
+              f"({', '.join(guarded)}); regeneration does NOT preserve them — re-add any "
+              "you still want before relying on this file", file=sys.stderr)
+
+
 def _cmd_policy_generate(args: argparse.Namespace) -> int:
     from .policy import load_policy
     from .policy_gen import generate_policy
@@ -294,7 +315,10 @@ def _cmd_policy_generate(args: argparse.Namespace) -> int:
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(text + "\n", encoding="utf-8")
+        _warn_if_dropping_capture_rules(out)  # before we overwrite it
+        # Atomic + O_EXCL temp write (see _secure_io): a crash mid-write can't leave a
+        # half-truncated policy.json. mode 0o644 — a policy is config, not a secret.
+        write_restricted(out, text + "\n", mode=0o644)
         # Fail loudly if we just wrote a policy our own loader rejects — a generated file
         # that can't be loaded is worse than none.
         load_policy(out)

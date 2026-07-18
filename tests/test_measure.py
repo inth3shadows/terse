@@ -122,3 +122,16 @@ def test_measure_corpus_attaches_provenance(tmp_path):
     rows = measure_corpus(capture.load_corpus(tmp_path))
     assert rows[0]["tool"] == "gh.issues"
     assert "sha" in rows[0]
+
+
+def test_failed_lossless_gate_zeroes_banked_savings(monkeypatch):
+    # "You cannot bank tokens you lost data to": if the round-trip gate fails, the row's
+    # saved_cl100k must be zeroed at the source so a downstream aggregator that forgot to
+    # filter on roundtrip_ok can't inflate the headline % with a broken payload's savings.
+    raw = json.dumps({"result": [{"id": i, "name": f"n{i}", "ok": True} for i in range(20)]})
+    monkeypatch.setattr("terse.measure.transforms.roundtrip_ok", lambda _obj: False)
+    row = measure_payload(raw)
+    assert row["roundtrip_ok"] is False
+    assert set(row["saved_cl100k"].values()) == {0}
+    # raw token counts stay for transparency — only the *banked savings* are zeroed.
+    assert row["cl100k"]["raw"] > 0

@@ -332,6 +332,9 @@ def apply(raw: str, tool: str, policy: Policy,
                 warnings.append("lossy step skipped: acceptable-loss gate failed (kept lossless)")
         except lossy_mod.PathError as exc:
             warnings.append(f"lossy step skipped: {exc} (kept lossless)")
+        for bad in lossy_mod.unsupported_truncate_paths(obj, rule):
+            warnings.append(f"lossy: field {bad!r} is marked truncate but is not a "
+                            "string/list; truncate left it unchanged")
 
     # Tier-1 lossy (drop-to-retrieve, #10): replace a marked field with a handle marker and
     # persist the original to the session store, so the model can fetch it back on demand.
@@ -360,4 +363,23 @@ def apply(raw: str, tool: str, policy: Policy,
         tabularize="tabularize" in rule.tiers,
         dictionary="dictionary" in rule.tiers,
     )
-    return Applied(text=text, tool=tool, tiers=rule.tiers, skipped=False, warnings=warnings)
+
+    # Verify-before-emit for the always-on Tier-0/0.5 codec. The diff tier already
+    # self-checks inline (diff_encode only returns a delta that decodes back exactly),
+    # but tabularize/dictionary shipped here WITHOUT the same inline gate — a latent
+    # codec bug would then reach the model silently, defeating the whole lossless-first
+    # premise. Re-parse what we're about to emit and confirm it reconstructs `data`; on
+    # any mismatch (or a decode error) fall back to the plain minified form, which is
+    # lossless by construction, and record why. This is the codec's counterpart to the
+    # lossy tiers' acceptable_loss/droppable_loss gates: fail closed to lossless.
+    try:
+        emit_ok = transforms.decompress(text) == data
+    except Exception:  # noqa: BLE001 — any decode failure is a failed self-check
+        emit_ok = False
+    tiers: tuple[str, ...] = rule.tiers
+    if not emit_ok:
+        text = transforms.minify(data)
+        warnings.append("codec self-check failed (tabularize/dictionary did not "
+                        "round-trip); emitted minified-lossless form instead")
+        tiers = ()
+    return Applied(text=text, tool=tool, tiers=tiers, skipped=False, warnings=warnings)
