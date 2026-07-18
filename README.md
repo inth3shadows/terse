@@ -1,31 +1,49 @@
 # terse
 
-Lossless-first compression layer for AI-agent tool outputs — byte-faithful on
-fields you mark critical, configurable lossy reduction only where you opt in.
+The **lossless-first** MCP compression proxy: it makes tool output smaller without
+ever changing what your agent reads — byte-faithful by default, lossy only where you
+explicitly opt in.
 
-terse is lossless-first. Unlike blanket lossy offload (e.g. headroom's "drop to a
-retrieve-cache"), it keeps everything **resident and legible** by default and removes
-only *structural* overhead: pretty-print whitespace, keys repeated once per record,
-repeated values, repeated nested schema. Tokens go down; nothing the model needs
-leaves the window; there is no decode step. Lossy reduction is strictly opt-in, per
-field — including `drop-to-retrieve`, a deliberate escape hatch that evicts a marked
-field to a handle the model can fetch back with a `terse.retrieve` tool. It is off by
-default and never the rule.
+terse reduces tokens two ways, and they are not equally easy to copy. That split is
+the whole positioning.
+
+**1. The lossless codec — the reach.** terse removes only *structural* overhead:
+pretty-print whitespace, keys repeated once per record, repeated values, repeated
+nested schema. The transformed bytes **are** the model's input — a denser but still
+legible representation, not an offload. There is no decode step, no ML model in the
+loop, and every transform has an exact inverse (a round-trip gate asserts
+`decompress(compress(x)) == x` over the whole corpus). This is the guarantee most
+tools in this space decline to make: headroom's JSON path is lossless on uniform arrays
+but **falls back to dropping rows** on larger/irregular record sets, recoverable only via
+a `retrieve` round-trip against a cache that expires (verified, v0.32.0; default 30-min
+TTL); Anthropic/OpenAI context-editing **drops** old tool results server-side. terse
+never silently mutates what the model sees — and
+"lossless" is the category, not the token count. The tabularization primitive itself
+is public (formats like [TOON](https://toonformat.dev/) publish it standalone, MIT-
+licensed, ~40% on flat arrays), so the codec is terse's *demo*, not its moat: a
+motivated competitor could clone it.
+
+**2. The stateful cross-call diff — the moat.** When the same tool is called again —
+poll a list, re-read a file — terse emits a lossless *delta* against the prior result
+instead of the whole payload (**73% smaller on repeated calls** in the benchmark
+below). This is the one axis a stateless encoder **architecturally cannot reach**:
+TOON, headroom's stateless per-call compressor, and server-side history-pruning all pay
+the full column every call because none of them remember the last result. terse can only do it
+because it lives in the session as a transparent proxy. Cloning the codec is a
+weekend; cloning the diff means becoming a session-spanning proxy — a different
+product. Default-on since its validation program completed (see Status).
+
+Around those two sits the **bundle** that turns a byte filter into a control plane you
+don't want to rip out: MCP-native proxy packaging (transparent to any downstream
+server, no client-side reformatting), a **live savings ledger** (`terse stats`), a
+fluency-gated lossy escape hatch, and self-installing ops tooling (`install-mcp`,
+`mcp-status`) — each diff/lossy tier validated by a behavioral eval before it was ever
+turned on by default.
 
 It is **selective by design**. Measurement on real tool output showed the win is
 strongly per-tool (0–30%): large on record/symbol-shaped verbose output, near-zero
 on already-minified or already-projected tools. So terse applies per-tool policy
 rather than compressing everything blindly.
-
-Lossless tabularization of uniform JSON arrays isn't unique to terse — formats like
-[TOON](https://toonformat.dev/) publish the same primitive as a standalone, MIT-
-licensed encoding (~40% token reduction, independently benchmarked). terse's
-differentiation isn't the tabularization trick alone; it's the bundle: MCP-native
-proxy packaging (transparent to any downstream server, no client-side reformatting
-required), per-tool policy, cross-call diffing, a fluency-gated lossy escape hatch,
-and self-installing ops tooling (`install-mcp`, `mcp-status`) — combined, and each
-diff/lossy tier validated by a behavioral eval before it was ever turned on by
-default.
 
 ## How It Works
 
@@ -177,6 +195,7 @@ report (lossless gate + per-tool token savings) in one command:
 terse verify --out reports/verify-report.md          # bundled sample, zero setup
 terse verify --corpus corpus --out report.md         # your own captured traffic
 terse verify --html --out reports/verify-report.md   # + a charted HTML report alongside it
+terse verify --corpus corpus --json                  # machine-readable gate + savings (CI-checkable)
 ```
 
 ## Benchmarks: terse vs alternatives
@@ -222,11 +241,17 @@ structural* gain, the hardest honest case:
   subtrees), which terse's dictionary tier folds and TOON's tabular layout cannot — it
   adds key-path overhead instead. terse's headline 76% on `gh_pulls` is exactly this:
   60 repeated copies of the same repo object collapsed to one legend entry.
-- **TOON is not beaten everywhere — and we show where it wins.** On `gh_labels` (a flat,
-  short-valued uniform table — TOON's designed sweet spot) TOON leads, **+19.0% vs terse's
-  +15.2%**. TOON's own published ~40% figures are real *for that input shape*; this corpus
-  deliberately tests the different thing (nested tool output), so treat this as
-  "different niche," not "terse strictly dominant."
+- **TOON is not beaten everywhere — and the boundary is value repetition, not column
+  width.** On `gh_labels` (9 records × 7 columns — TOON's designed sweet spot) TOON leads,
+  **+19.0% vs terse's +15.2%**. terse's decisive corpus win comes from **nested repeated
+  subtrees and long repeated string values** — its dictionary and subtree-aliasing tiers fold
+  them, TOON's flat tabular layout cannot — which is exactly what real GitHub records carry.
+  On *stripped-flat synthetic tables* with none of that redundancy, the two converge: a seeded
+  column-width sweep (`uv run scripts/bench/width_sweep.py`) shows them within a few points at
+  every width, trading the lead by parity, with **no clean column-count crossover** (an earlier
+  claim of a ≤3/≥4 boundary did not reproduce — see BENCHMARKS.md). So the honest frame is:
+  terse wins where records repeat or nest (real tool output); TOON stays competitive on flat,
+  low-redundancy uniform tables — "different niche," not "terse strictly dominant."
 - **Neither tool helps much when free text dominates** (`gh_commits_flat`: long commit
   messages, ~2% either way) or on tiny single objects — matching terse's own "selective,
   0–30%, per-tool" claim rather than contradicting it.
@@ -257,18 +282,20 @@ is on top of the single-shot reduction above, and stacks with it.
 
 | Tool | Why not a like-for-like row |
 |---|---|
-| **headroom** (headroomlabs-ai, ~60k★) | The closest *product* competitor and far more adopted, but its default JSON path is **lossy** (an ML model) with a `retrieve` round-trip — a different guarantee than terse's lossless-first, not comparable on a lossless token axis. (The `headroom` package on PyPI is an unrelated CLI assistant.) |
-| **LLMLingua-2** (Microsoft, 6.4k★) | Lossy prompt compression via a trained classifier; operates on **input prompts**, not structured tool output. Different axis. |
+| **headroom** (`headroom-ai`, headroomlabs-ai) | The closest *product* competitor and far more adopted (star figures cited vary, ~29–49k — unverified). But its JSON compressor is a **deterministic Rust transform, not an ML model** (verified, v0.32.0): lossless on uniform arrays, yet **falling back to dropping rows** on larger/irregular record sets, recoverable only via a `retrieve` round-trip against a **time-boxed, backend-dependent cache** (default 30-min TTL; SQLite in the proxy path, in-memory if constructed directly — gone after expiry, eviction, or process exit). A separate, optional text/log compressor *is* ML (a keyless model download). Not comparable on a lossless token axis: terse's guarantee is unconditional — no cache, no TTL, no ML, no egress. (The `headroom` package on PyPI is a different, unrelated CLI.) |
+| **LLMLingua-2** (Microsoft, 6.4k★) | Lossy prompt compression via a trained token-classifier; operates on **input prompts**, not structured tool output. Verified on a JSON payload it strips the syntax (`{`, `}`, `:`, `"`) as low-information and emits **invalid, unparseable JSON** (and silently truncates past its 512-token window). Different axis entirely. |
 | **Anthropic context editing** / OpenAI equivalents | **Native, server-side, lossy** history-pruning (drop oldest tool results past a threshold), no local artifact to run keylessly. This — not any third-party tool — is the real strategic overlap with terse for first-party API users. |
-| **Atlassian mcp-compressor** (97★) | Compresses tool **schemas/descriptions** at connect time, not call **results** — adjacent, not competing. |
+| **Atlassian mcp-compressor** (97★) | Primarily compresses tool **schemas/descriptions** at connect time (lossless deferred-disclosure) — complementary and stackable with terse (`terse proxy -- mcp-compressor -- <server>`). Caveat: an opt-in `--toonify` flag *does* reformat call **results** into TOON, so "schemas only" isn't strictly true — but that path is off by default and is a single static pass with no diffing, per-tool policy, or cross-call state, out-competed by terse's codec on that axis. |
 
 Adoption honesty: terse is new (pre-PyPI, few/no stars); TOON (24.9k★) and headroom
-(~60k★) are far more established. terse's defensible wedge is narrow and specific —
-*lossless-first, no retrieve round-trip, no ML dependency, MCP-transparent, plus cross-call
-diffing* — not breadth of adoption.
+(widely adopted, star figures cited vary ~29–49k) are far more established. terse's
+defensible wedge is narrow and specific — *unconditionally lossless (no expiring
+retrieve-cache), no ML dependency, MCP-transparent, plus cross-call diffing* — not breadth
+of adoption.
 
 ## Related Documentation
 
+- [Benchmarks](BENCHMARKS.md) — dated, reproducible terse-vs-TOON + competitor numbers
 - [Verify it yourself](VERIFY.md) — prove losslessness, savings, and no-egress locally
 - [Technical Reference](TECHNICAL.md) — architecture, pipeline, policy schema, limitations
 - [Usage Guide](USAGE.md) — running the CLI day-to-day and reading its output

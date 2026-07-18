@@ -22,6 +22,7 @@ The pure message logic lives in `Interceptor` (unit-tested without any I/O). The
 
 from __future__ import annotations
 
+import hashlib
 import json
 import signal
 import subprocess
@@ -67,6 +68,22 @@ def _cost(text: str) -> int:
     """Token cost, falling back to byte length where tiktoken is unavailable."""
     c = count_cl100k(text)
     return c if c is not None else len(text)
+
+
+def _args_key(arguments: Any) -> str:
+    """Stable short digest of a tools/call's `arguments`, used to ATTRIBUTE each diff base
+    to the call that produced it (Phase 1 instrumentation). Canonical (sorted keys) so
+    equal arguments always collide; empty/absent/unserializable -> "". Recorded only — the
+    diff base is still keyed by tool name alone at this phase; whether to key ON this is the
+    Phase 2 decision the ledger's `diff_reason` breakdown informs."""
+    if not arguments:
+        return ""
+    try:
+        canon = json.dumps(arguments, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False)
+    except (TypeError, ValueError):
+        return ""
+    return hashlib.sha1(canon.encode("utf-8")).hexdigest()[:12]
 
 
 # A one-time, system-level explanation of terse's wire forms, injected into the MCP
@@ -126,7 +143,7 @@ class Interceptor:
     def __init__(self, pol: policy_mod.Policy, debug: bool = False,
                  capture: Callable[[str, str], None] | None = None,
                  audit: Callable[[dict], None] | None = None,
-                 stats: Callable[[str, str, str, bool], None] | None = None,
+                 stats: Callable[[str, str, str, bool, str | None], None] | None = None,
                  server_name: str | None = None,
                  store: OrderedDict[str, Any] | None = None,
                  store_lock: Lock | None = None,
@@ -143,7 +160,7 @@ class Interceptor:
         # is what capture()/audit() see and defaults to policy_tool, but multiproxy
         # overrides it to a peer-qualified name (see note_request's tool_name) so two
         # peers' same-named tools don't collide into one capture-corpus bucket.
-        self.pending: dict[Any, tuple[str, str]] = {}
+        self.pending: dict[Any, tuple[str, str, str]] = {}
         self.debug = debug
         self.diff = pol.diff
         # Optional tee of each RAW (pre-compression) tool-result text, keyed by tool name
@@ -165,6 +182,11 @@ class Interceptor:
         # unconditionally, the first time it fails, so a silently-dead ledger is noticed.
         self._sink_warned: set[str] = set()
         self.last: dict[str, Any] = {}  # tool -> previous result object (the diff base)
+        # tool -> args-key of the call that produced the base above (Phase 1). Recorded
+        # only, to classify WHY a diff did/didn't fire (same-args miss vs different-args
+        # base); the base itself is still keyed by tool name alone. Cleared everywhere
+        # `last` is (skip path, reconnect) so the two never disagree.
+        self.last_args: dict[str, str] = {}
         # tool -> consecutive diffs emitted since the last full (keyframe) result. Bounds
         # how far a chained diff can drift from a self-contained anchor (#8).
         self.keyframe_interval = pol.diff_keyframe_interval
@@ -256,6 +278,7 @@ class Interceptor:
                 # reconnect is unobservable over stdio; that residual risk is why --diff
                 # stays opt-in.
                 self.last.clear()
+                self.last_args.clear()
                 self.since_keyframe.clear()
                 self.last_text.clear()
                 self.since_text_keyframe.clear()
@@ -272,9 +295,11 @@ class Interceptor:
                 return
             if method != "tools/call":
                 return
-            name = (msg.get("params") or {}).get("name")
+            params = msg.get("params") or {}
+            name = params.get("name")
             if mid is not None and isinstance(name, str):
-                self.pending[mid] = (name, tool_name if tool_name is not None else name)
+                self.pending[mid] = (name, tool_name if tool_name is not None else name,
+                                     _args_key(params.get("arguments")))
                 # dict preserves insertion order; drop the oldest tracked id(s) once over
                 # cap so abandoned (timed-out) entries can't accumulate (#22). Safe under
                 # the lock — no concurrent mutation during the iterate-then-pop.
@@ -329,7 +354,7 @@ class Interceptor:
                     if injected is not None:
                         return injected
                 return line
-            tool, capture_tool = tracked
+            tool, capture_tool, args_key = tracked
 
             result = msg.get("result")
             content = result.get("content") if isinstance(result, dict) else None
@@ -368,17 +393,21 @@ class Interceptor:
             raw_texts = [b["text"] for b in text_blocks] if wants_raw else None
 
             changed = False
+            diff_reason: str | None = None
             # Diffing reasons about ONE logical payload, so it only engages for a single
             # text block (the overwhelmingly common tool-result shape); multi-block results
             # take the plain per-block compression path.
             if self.diff and len(text_blocks) == 1:
-                changed = self._compress_or_diff(text_blocks[0], tool)
+                changed, diff_reason = self._compress_or_diff(text_blocks[0], tool, args_key)
             else:
                 for block in text_blocks:
                     new_text = self._compress(block["text"], tool)
                     if new_text != block["text"]:
                         block["text"] = new_text
                         changed = True
+                # No cross-call diff path ran: distinguish "diffing off" from "shape the
+                # diff path skips" so the ledger accounts for every result.
+                diff_reason = "multiblock" if len(text_blocks) != 1 else "diff_off"
 
             # Audit AFTER the transform, regardless of `changed`: a no-op is itself
             # diagnostic — it confirms terse left a suspect payload untouched.
@@ -386,17 +415,22 @@ class Interceptor:
                 self._emit_audit(tool, msg["id"], raw_texts, text_blocks, changed,
                                  display_tool=capture_tool)
             if self.stats is not None and raw_texts is not None:
-                self._emit_stats(tool, raw_texts, text_blocks, display_tool=capture_tool)
+                self._emit_stats(tool, raw_texts, text_blocks, display_tool=capture_tool,
+                                 diff_reason=diff_reason)
 
             if not changed:
                 return line
             # Re-serialize compactly. JSON-RPC is semantics, not formatting; no newlines.
             return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
 
-    def _compress_or_diff(self, block: dict, tool: str) -> bool:
+    def _compress_or_diff(self, block: dict, tool: str,
+                          args_key: str = "") -> tuple[bool, str]:
         """Compress one block, preferring a lossless delta vs the prior same-tool result
-        when it is smaller. Updates the per-tool diff base. Returns whether the block
-        text changed. Fail-open: any error leaves the block untouched and state intact."""
+        when it is smaller. Updates the per-tool diff base. Returns `(changed, reason)`,
+        where `reason` is the Phase 1 instrumentation datum — a short label for WHY the
+        diff did/didn't fire (no_prior | keyframe | emitted | not_smaller_same_args |
+        not_smaller_diff_args | text_emitted | non_json | passthrough | error), for the
+        ledger. Fail-open: any error leaves the block untouched and state intact."""
         text = block["text"]
         try:
             applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put,
@@ -404,7 +438,7 @@ class Interceptor:
         except Exception as exc:  # noqa: BLE001 — fail-open is the whole point
             if self.debug:
                 sys.stderr.write(f"[terse-proxy] {tool}: passthrough on error: {exc}\n")
-            return False
+            return False, "error"
         if applied.skipped:
             # Skipped = a passthrough tool (empty tiers) OR a non-JSON result (e.g. an
             # upstream error string, a file read, a log tail) for a normally-compressed
@@ -413,12 +447,18 @@ class Interceptor:
             # stale JSON diff base and reset its keyframe counter, forcing the next JSON
             # result to re-anchor as a full (#8).
             self.last.pop(tool, None)
+            self.last_args.pop(tool, None)
             self.since_keyframe.pop(tool, None)
             if not self.policy.select(tool, self.server_name).tiers:
-                return False  # true passthrough policy: hands off entirely, no state kept
-            return self._text_diff_or_store(block, tool, text)
+                return False, "passthrough"  # true passthrough: hands off, no state kept
+            # A CDC text diff that actually shipped is a real diff hit — bucket it as
+            # `text_emitted`, not `non_json`, or the ledger's emitted-vs-non_json split
+            # misreports file-read/log-tail traffic.
+            changed = self._text_diff_or_store(block, tool, text)
+            return changed, ("text_emitted" if changed else "non_json")
 
         chosen = applied.text
+        reason = "non_json"  # curr unparseable/too-deep: no JSON diff decision was possible
         try:
             curr = json.loads(text)
             # Depth guard (#79): a payload past the codec-wide cap must not become the
@@ -430,20 +470,34 @@ class Interceptor:
             curr = None
         if curr is not None:
             prev = self.last.get(tool)
+            prev_args = self.last_args.get(tool)
             emitted_diff = False
             # A keyframe is due once K diffs have chained off the last full result; force
             # the full compressed form so the chain re-anchors (#8). interval 0 = never.
             keyframe_due = (self.keyframe_interval > 0
                             and self.since_keyframe.get(tool, 0) >= self.keyframe_interval)
-            if prev is not None and not keyframe_due:
+            if prev is None:
+                reason = "no_prior"          # tool not seen this session: nothing to diff
+            elif keyframe_due:
+                reason = "keyframe"          # forced full to re-anchor the chain
+            else:
                 wire = self._diff_wire(prev, curr, tool)
                 if wire is not None and _cost(wire) < _cost(applied.text):
                     chosen = wire
                     emitted_diff = True
+                    reason = "emitted"
                     if self.debug:
                         sys.stderr.write(
                             f"[terse-proxy] {tool}: diff {_cost(applied.text)}->{_cost(wire)} "
                             f"tok vs full compressed\n")
+                else:
+                    # A base existed but the delta didn't win. Split by whether that base
+                    # came from a DIFFERENT-args call (arg-keying could offer a better,
+                    # same-args base — the Phase 2 opportunity) or the SAME args (a genuine
+                    # encoding miss that arg-keying would not fix). This split is the whole
+                    # point of the Phase 1 measurement.
+                    reason = ("not_smaller_diff_args" if prev_args != args_key
+                              else "not_smaller_same_args")
             if self.debug and keyframe_due:
                 sys.stderr.write(f"[terse-proxy] {tool}: keyframe (full) after "
                                  f"{self.since_keyframe.get(tool, 0)} diffs\n")
@@ -453,11 +507,12 @@ class Interceptor:
             # Base the NEXT diff on the true current value, whichever form we emit:
             # the model's reconstructable state after this turn is `curr` either way.
             self.last[tool] = curr
+            self.last_args[tool] = args_key
 
         if chosen != text:
             block["text"] = chosen
-            return True
-        return False
+            return True, reason
+        return False, reason
 
     def _augment_initialize(self, msg: dict) -> str | None:
         """Prepend the terse format primer to the initialize result's `instructions` (#13),
@@ -651,11 +706,13 @@ class Interceptor:
             self._warn_sink("audit", shown_tool, exc)
 
     def _emit_stats(self, tool: str, raw_texts: list[str], text_blocks: list[dict], *,
-                    display_tool: str | None = None) -> None:
-        """Hand the stats callback one (tool, raw, emitted, passthrough) per result
-        block, for the payload-free savings ledger (stats.py). Same fail-open contract
-        as capture/audit: the callback owns I/O and a failure can never change what the
-        client receives. `tool`/`display_tool` split as in `_emit_audit`."""
+                    display_tool: str | None = None, diff_reason: str | None = None) -> None:
+        """Hand the stats callback one (tool, raw, emitted, passthrough, diff_reason) per
+        result block, for the payload-free savings ledger (stats.py). Same fail-open
+        contract as capture/audit: the callback owns I/O and a failure can never change
+        what the client receives. `tool`/`display_tool` split as in `_emit_audit`. The
+        diff decision is per-result (one JSON payload), so `diff_reason` is attributed to
+        every block of the result — meaningful for the common single-block shape."""
         stats = self.stats
         if stats is None:
             return
@@ -663,7 +720,7 @@ class Interceptor:
         passthrough = not self.policy.select(tool, self.server_name).tiers
         for raw, b in zip(raw_texts, text_blocks, strict=True):
             try:
-                stats(shown_tool, raw, b["text"], passthrough)
+                stats(shown_tool, raw, b["text"], passthrough, diff_reason)
             except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
                 self._warn_sink("stats", shown_tool, exc)
 

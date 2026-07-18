@@ -1,20 +1,47 @@
 [project]
-name = "terse"
+# Distribution name (`pip install terse-mcp`) — the bare `terse` is taken on PyPI by an
+# unrelated CLI. The IMPORT package stays `terse` (see [tool.hatch.build.targets.wheel]);
+# install_mcp bakes `-m terse` into wrapped configs, so that name must not change.
+name = "terse-mcp"
 dynamic = ["version"]
 description = "Lossless-first compression layer for AI-agent tool outputs — byte-faithful on fields you mark critical, configurable lossy reduction only where you opt in."
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Eric Minish", email = "eric.minish@gmail.com" }]
+keywords = ["mcp", "llm", "tokens", "compression", "lossless", "json", "proxy", "agent", "context-window"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Utilities",
+]
 dependencies = [
     # tiktoken: cl100k_base token counts for headroom-eval parity. uv.lock pins the exact
-    # version for this repo; the floor here gives a lockfile-less `pip install terse` a
+    # version for this repo; the floor here gives a lockfile-less `pip install terse-mcp` a
     # sane lower bound instead of resolving to an arbitrarily old release.
     "tiktoken>=0.7",
 ]
+
+[project.urls]
+Homepage = "https://github.com/inth3shadows/terse"
+Repository = "https://github.com/inth3shadows/terse"
+Issues = "https://github.com/inth3shadows/terse/issues"
 
 [project.scripts]
 terse = "terse.cli:main"
 
 [dependency-groups]
-dev = ["pytest", "ruff", "mypy"]
+# hypothesis: property-based fuzzing of the lossless guarantee (M3 — tests/test_fuzz.py).
+# Dev-only, no runtime dependency. Unpinned like the others; uv.lock carries the exact pin.
+dev = ["pytest", "ruff", "mypy", "hypothesis"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

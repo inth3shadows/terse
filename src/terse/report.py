@@ -456,6 +456,41 @@ def build_verify_header(corpus_label: str, n_payloads: int) -> str:
     ])
 
 
+def verify_summary(rows: list[dict[str, Any]], coverage: dict[str, Any],
+                   corpus_label: str) -> dict[str, Any]:
+    """Machine-readable counterpart to build_verify_header + build_report: the same
+    lossless-gate verdict and cl100k savings the markdown shows, as a dict for
+    `terse verify --json` (scriptable / CI-checkable). Numbers come from the same
+    `_sum` path as the report, so the JSON can never disagree with it."""
+    failures = [r for r in rows if not r.get("roundtrip_ok", False)]
+    total = len(rows)
+
+    def _bucket(sub: list[dict[str, Any]]) -> dict[str, Any]:
+        raw = _sum(sub, "cl100k", "raw")
+        cmp_ = _sum(sub, "cl100k", "compressed")
+        return {"n": len(sub), "raw_tokens": raw, "terse_tokens": cmp_,
+                "saved_tokens": raw - cmp_,
+                "saved_pct": round((raw - cmp_) / raw * 100, 1) if raw else 0.0}
+
+    return {
+        "corpus": corpus_label,
+        "payloads": total,
+        "lossless_gate": {
+            "ok": not failures,
+            "passed": total - len(failures),
+            "total": total,
+            "failures": [{"tool": r.get("tool"), "sha": r.get("sha"),
+                          "shape": r.get("shape")} for r in failures],
+        },
+        "tokens_cl100k": _bucket(rows),
+        "by_shape": {s: _bucket([r for r in rows if r["shape"] == s])
+                     for s in sorted({r["shape"] for r in rows})},
+        "coverage": {"total": coverage.get("total", 0),
+                     "by_tool": dict(coverage.get("by_tool", {})),
+                     "by_shape": dict(coverage.get("by_shape", {}))},
+    }
+
+
 def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
     out: list[str] = ["# terse measurement report", ""]
 

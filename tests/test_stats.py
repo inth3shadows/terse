@@ -112,10 +112,13 @@ def test_parse_window_units_and_rejects_garbage():
 # --- aggregation ---
 
 def _rec(server="s", tool="t", decision="compressed", raw_t=100, out_t=40,
-         raw_c=400, out_c=160, ts=1):
-    return {"ts": ts, "server": server, "tool": tool, "decision": decision,
-            "raw_chars": raw_c, "out_chars": out_c,
-            "raw_tokens": raw_t, "out_tokens": out_t}
+         raw_c=400, out_c=160, ts=1, diff_reason=None):
+    rec = {"ts": ts, "server": server, "tool": tool, "decision": decision,
+           "raw_chars": raw_c, "out_chars": out_c,
+           "raw_tokens": raw_t, "out_tokens": out_t}
+    if diff_reason is not None:
+        rec["diff_reason"] = diff_reason
+    return rec
 
 
 def test_aggregate_totals_decisions_and_per_tool_rows():
@@ -146,6 +149,22 @@ def test_aggregate_ignores_non_ledger_records():
     assert aggregate([{"ts": 1, "something": "else"}])["total"]["results"] == 0
 
 
+def test_aggregate_tallies_diff_reasons_and_tolerates_their_absence():
+    # Phase 1: the diff_reason breakdown counts only records that carry the field, so a
+    # ledger mixing old (no reason) and new records aggregates cleanly.
+    agg = aggregate([
+        _rec(diff_reason="emitted"),
+        _rec(diff_reason="no_prior"),
+        _rec(diff_reason="not_smaller_diff_args"),
+        _rec(),  # older record, no diff_reason — must not become a phantom bucket
+    ])
+    assert agg["diff_reasons"] == {"emitted": 1, "no_prior": 1, "not_smaller_diff_args": 1}
+
+
+def test_aggregate_diff_reasons_empty_when_no_record_has_one():
+    assert aggregate([_rec(), _rec()])["diff_reasons"] == {}
+
+
 # --- report rendering ---
 
 def test_report_shows_savings_and_per_tool_rows():
@@ -155,6 +174,20 @@ def test_report_shows_savings_and_per_tool_rows():
     assert "last 7d" in out
     assert "1,000 -> 100" in out and "saved 900" in out and "90.0%" in out
     assert "runecho" in out and "structure" in out and "diff=1" in out
+
+
+def test_report_shows_diff_reason_breakdown_when_present():
+    agg = aggregate([_rec(decision="diff", diff_reason="emitted"),
+                     _rec(decision="compressed", diff_reason="not_smaller_diff_args")])
+    out = build_stats_report(agg, log_path="/x/stats.jsonl")
+    assert "diff reasons:" in out
+    assert "emitted=1" in out and "not_smaller_diff_args=1" in out
+
+
+def test_report_omits_diff_reason_line_for_legacy_ledger():
+    # A ledger of only pre-Phase-1 records has no reasons — the line must not appear.
+    out = build_stats_report(aggregate([_rec()]), log_path="/x/stats.jsonl")
+    assert "diff reasons:" not in out
 
 
 def test_report_empty_ledger_says_so():
