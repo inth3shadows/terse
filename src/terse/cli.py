@@ -643,7 +643,7 @@ def _short_cmd(entry) -> str:
 
 
 def _cmd_install_mcp(args: argparse.Namespace) -> int:
-    from .install_mcp import do_install
+    from .install_mcp import classify_server_sensitivity, do_install
 
     if args.diff and args.no_diff:
         print("install-mcp: --diff and --no-diff are mutually exclusive", file=sys.stderr)
@@ -654,7 +654,7 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
                          capture_dir=args.capture_dir, diff=diff,
                          diff_keyframe_interval=args.diff_keyframe_interval,
                          scope=args.scope, file=args.file, repo_path=args.repo_path,
-                         no_stats=args.no_stats)
+                         no_stats=args.no_stats, never_lossy=args.never_lossy)
     except (FileNotFoundError, ValueError) as e:
         print(f"install-mcp: {e}", file=sys.stderr)
         return 2
@@ -676,6 +676,22 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
         print("diff: DISABLED for these server(s) (--no-diff baked in)")
     if res.get("no_stats"):
         print("stats: DISABLED for these server(s) (--no-stats baked in)")
+    baked = res.get("never_lossy_added") or []
+    if baked:
+        verb = "would bake" if res["dry_run"] else "baked"
+        print(f"never-lossy: {verb} {', '.join(baked)} into the policy's never_lossy_servers "
+              f"— lossy transforms are now forbidden on them")
+    elif not args.never_lossy:
+        # Surface the classifier as a HINT for servers NOT explicitly marked: a
+        # credential/personal-looking server is already floor-protected (PR #89), but
+        # listing it makes the intent explicit and covers names the floor can't catch.
+        for c in res["changes"]:
+            before = c.get("before") or {}
+            cmd_parts = [before.get("command", ""), *before.get("args", [])]
+            if classify_server_sensitivity(c["server"], cmd_parts):
+                print(f"hint: '{c['server']}' looks credential/personal — re-run with "
+                      f"--never-lossy (or add it to never_lossy_servers) to forbid lossy "
+                      f"on it explicitly.", file=sys.stderr)
     if res["backup"]:
         print(f"backup: {res['backup']}")
     if not res["dry_run"] and res["changes"]:
@@ -1007,6 +1023,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="bake `--no-stats` into the wrapped entry: no savings-ledger "
                          "records for this server (the ledger is otherwise the proxy "
                          "default — payload-free, read by `terse stats`)")
+    im.add_argument("--never-lossy", action="store_true",
+                    help="mark the wrapped server(s) as never-lossy: bake them into the "
+                         "policy's never_lossy_servers so lossy transforms are structurally "
+                         "forbidden on them. Use for a credential/personal store whose name "
+                         "the built-in secret-pattern floor can't catch (e.g. a personal KB)")
     im.add_argument("--print", action="store_true",
                     help="dry-run: show the before/after without writing")
     im.set_defaults(func=_cmd_install_mcp)

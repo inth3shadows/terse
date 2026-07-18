@@ -701,3 +701,32 @@ def test_classify_server_sensitivity():
     assert not classify_server_sensitivity("runecho")
     assert not classify_server_sensitivity("kb")
     assert not classify_server_sensitivity("sb-run")
+
+
+def test_add_never_lossy_server_pure():
+    doc: dict = {}
+    assert im.add_never_lossy_server(doc, "kb") is True
+    assert doc["never_lossy_servers"] == ["kb"]
+    assert im.add_never_lossy_server(doc, "kb") is False          # dedup -> no change
+    assert im.add_never_lossy_server(doc, "sb-run") is True
+    assert doc["never_lossy_servers"] == ["kb", "sb-run"]          # sorted
+
+
+def test_do_install_never_lossy_bakes_into_policy(tmp_path, monkeypatch):
+    from terse.policy import load_policy
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})))
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"version": 1, "policies": []}))
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+
+    res = im.do_install(["runecho"], str(policy), cfg=cfg, never_lossy=True)
+    assert res["never_lossy_added"] == ["runecho"]
+    # runecho's name is NOT secret-shaped, so this proves the BAKED list did the work:
+    assert load_policy(policy).server_never_lossy("runecho") is True
+
+    # dry-run reports what it would add but does NOT write the policy file
+    policy.write_text(json.dumps({"version": 1, "policies": []}))
+    res2 = im.do_install(["runecho"], str(policy), cfg=cfg, never_lossy=True, dry_run=True)
+    assert res2["never_lossy_added"] == ["runecho"]
+    assert load_policy(policy).server_never_lossy("runecho") is False
