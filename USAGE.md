@@ -365,8 +365,11 @@ uv run terse stats --json        # the raw aggregate, for scripts
 ```
 
 The report shows total tokens saved, the decision mix (how often the cross-call diff
-actually fired), and a per-server/per-tool breakdown — real numbers from your real
-sessions, complementing the synthetic-corpus `measure` report. The ledger lives at
+actually fired), and a per-server/per-tool breakdown — with a `diff%` column (that
+tool's cross-call diff hit rate) so you can see *which* tools the diff tier is actually
+paying off on. When tiktoken wasn't available at record time the per-tool columns fall
+back to characters (`chr raw`/`chr out`), matching the header rather than showing zeros.
+Real numbers from your real sessions, complementing the synthetic-corpus `measure` report. The ledger lives at
 `$XDG_STATE_HOME/terse/stats.jsonl` (usually `~/.local/state/terse/stats.jsonl`);
 redirect it with `proxy --stats-log FILE` or disable it with `proxy --no-stats`
 (bake the opt-out into a wrapped entry with `install-mcp --no-stats`).
