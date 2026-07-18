@@ -143,7 +143,7 @@ class Interceptor:
     def __init__(self, pol: policy_mod.Policy, debug: bool = False,
                  capture: Callable[[str, str], None] | None = None,
                  audit: Callable[[dict], None] | None = None,
-                 stats: Callable[[str, str, str, bool], None] | None = None,
+                 stats: Callable[[str, str, str, bool, str | None], None] | None = None,
                  server_name: str | None = None,
                  store: OrderedDict[str, Any] | None = None,
                  store_lock: Lock | None = None,
@@ -160,7 +160,7 @@ class Interceptor:
         # is what capture()/audit() see and defaults to policy_tool, but multiproxy
         # overrides it to a peer-qualified name (see note_request's tool_name) so two
         # peers' same-named tools don't collide into one capture-corpus bucket.
-        self.pending: dict[Any, tuple[str, str]] = {}
+        self.pending: dict[Any, tuple[str, str, str]] = {}
         self.debug = debug
         self.diff = pol.diff
         # Optional tee of each RAW (pre-compression) tool-result text, keyed by tool name
