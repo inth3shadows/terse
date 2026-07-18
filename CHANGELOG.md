@@ -9,6 +9,11 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Added
+- `verify --json`: emit the lossless-gate verdict and cl100k savings totals as JSON
+  on stdout instead of the markdown report — CI-checkable (`… | jq -e
+  .lossless_gate.ok`), parity with `stats --json` / `mcp-status --json`.
+
 ## [0.2.0] - 2026-07-17
 
 ### Added

@@ -413,6 +413,12 @@ Add `--bars` to `measure` or `verify` for the same savings charts as unicode bar
 printed straight to the terminal — no new file, color only when stdout is a tty
 (honors `NO_COLOR`). `fluency` also has a `--bars` flag — see below.
 
+Add `--json` to `verify` for a machine-readable aggregate on stdout instead of the
+report — the lossless-gate verdict (`lossless_gate.ok`), cl100k savings totals, and
+per-shape/coverage breakdown, from the same numbers as the markdown. Handy in CI:
+`terse verify --corpus corpus --json | jq -e .lossless_gate.ok`. It writes no
+file/HTML/bars (machine mode), mirroring `stats --json` / `mcp-status --json`.
+
 Add `--history <file.jsonl>` to `measure` to track savings over time, not just one
 snapshot — is the win improving, flat, or regressing as the corpus grows? Each run
 appends one line (timestamp, payload count, lossless gate, token totals) to the file,
