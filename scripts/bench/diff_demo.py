@@ -3,16 +3,20 @@
 
 A stateless encoding (TOON, minify, terse's own single-shot codec) must resend the whole
 payload every call. terse's diff tier, when the SAME tool is called repeatedly, emits a
-lossless delta against the prior result instead — the agent-loop pattern (a list that
-grows/changes by a few records between calls). No competitor here has an equivalent, so
-this isn't a head-to-head; it's the extra axis, quantified on real data.
+lossless delta against the prior result instead — the agent-loop pattern (a list polled or
+re-listed between calls, changing by a few records). No competitor here has an equivalent,
+so this isn't a head-to-head; it's the extra axis, quantified on the same real corpus.
 
-We model one realistic repeated call on the real gh_pulls corpus: the base result, then a
-`curr` that changes two records' `state`/`updated_at` and appends one new record — exactly
-what a poll-again loop sees. We report the cost of the second call under each strategy.
+For every list-shaped payload we model ONE realistic repeated call: the base result, then a
+`curr` with two records' fields changed and one new record appended (a poll-again delta).
+We report the SECOND call's cost as a lossless terse diff vs a full terse re-send. Stateless
+encoders have no second-call form — they pay the full column every call, forever.
+
+Run: uv run scripts/bench/diff_demo.py   (add --json for machine-readable)
 """
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 from pathlib import Path
@@ -21,40 +25,123 @@ from terse import transforms
 from terse.tokenize import count_cl100k
 
 CORPUS = Path(__file__).resolve().parent / "corpus"
+_ID_PREFERENCE = ("id", "sha", "number", "node_id", "name")
+
+
+def _id_col(records: list[dict]) -> str | None:
+    """A column whose values are unique + hashable across records — the diff's stable key."""
+    keys = set(records[0])
+    for cand in _ID_PREFERENCE:
+        if cand in keys and _unique_scalar(records, cand):
+            return cand
+    for cand in records[0]:
+        if _unique_scalar(records, cand):
+            return cand
+    return None
+
+
+def _unique_scalar(records: list[dict], col: str) -> bool:
+    vals = [r.get(col) for r in records]
+    if any(not isinstance(v, (str, int)) or isinstance(v, bool) for v in vals):
+        return False
+    return len(set(vals)) == len(vals)
+
+
+def _churn(rec: dict, records: list[dict]) -> bool:
+    """Change ONE value in `rec` to model a mutable-state edit, WITHOUT touching a column
+    the row differ might use as its stable key. Preference: a top-level scalar whose values
+    repeat across records (a real state field, never a key) → a scalar leaf inside a nested
+    object (changes the record without touching any top-level key) → give up. Returns True
+    if it changed something."""
+    nonunique = [k for k, v in records[0].items()
+                 if isinstance(v, (str, int)) and not isinstance(v, bool)
+                 and len({r.get(k) for r in records}) < len(records)]
+    if nonunique:
+        _bump(rec, nonunique[0])
+        return True
+    for v in rec.values():  # nested-leaf fallback (e.g. a commit's nested `commit` dict)
+        if isinstance(v, dict):
+            for kk, vv in v.items():
+                if isinstance(vv, (str, int)) and not isinstance(vv, bool):
+                    _bump(v, kk)
+                    return True
+    return False
+
+
+def _bump(d: dict, col: str) -> None:
+    v = d.get(col)
+    if isinstance(v, str):
+        d[col] = v + "~changed"
+    elif isinstance(v, int) and not isinstance(v, bool):
+        d[col] = v + 1
+
+
+def _appended(base_rec: dict, idcol: str, records: list[dict]) -> dict:
+    """A new record (copy of base_rec) with a fresh unique id — a row that just appeared."""
+    new = copy.deepcopy(base_rec)
+    cur = base_rec[idcol]
+    if isinstance(cur, int) and not isinstance(cur, bool):
+        new[idcol] = max(r[idcol] for r in records) + 1
+    else:
+        new[idcol] = f"{cur}-appended"
+    return new
+
+
+def measure_diff(name: str, base: list) -> dict | None:
+    if not (isinstance(base, list) and len(base) >= 3
+            and all(isinstance(r, dict) for r in base)):
+        return None
+    idcol = _id_col(base)
+    if idcol is None:
+        return None
+    curr = copy.deepcopy(base)
+    if not (_churn(curr[0], base) and _churn(curr[1], base)):
+        return None
+    curr.append(_appended(base[0], idcol, base))
+
+    full = count_cl100k(transforms.compress(curr))
+    wire = transforms.diff_wire(base, curr, tool=name)
+    if wire is None or not transforms.diff_roundtrip_ok(base, curr):
+        return {"name": name, "records": len(base), "full_terse": full, "diff": None,
+                "smaller_pct": None}
+    diff = count_cl100k(wire)
+    return {"name": name, "records": len(base), "full_terse": full, "diff": diff,
+            "smaller_pct": round(100 * (1 - diff / full), 1) if full else 0.0}
 
 
 def main() -> int:
-    base = json.loads((CORPUS / "gh_pulls.json").read_text())
-    if not isinstance(base, list) or len(base) < 3:
-        print("gh_pulls corpus not a list of >=3 records; run fetch_corpus.sh")
-        return 2
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
 
-    # curr = the same list, two records mutated + one new record appended (the poll-again
-    # delta). Built from real records so the diff operates on genuine structure.
-    curr = copy.deepcopy(base)
-    curr[0]["state"] = "closed"
-    curr[0]["updated_at"] = "2026-07-17T00:00:00Z"
-    curr[1]["state"] = "closed"
-    new = copy.deepcopy(base[0])
-    new["id"] = base[0]["id"] + 1
-    new["number"] = base[0]["number"] + 1000
-    curr.append(new)
+    rows = []
+    for p in sorted(CORPUS.glob("*.json")):
+        r = measure_diff(p.stem, json.loads(p.read_text()))
+        if r is not None:
+            rows.append(r)
 
-    full_terse = count_cl100k(transforms.compress(curr))
-    diff_wire = transforms.diff_wire(base, curr, tool="gh_pulls")
-    diff_ok = diff_wire is not None and transforms.diff_roundtrip_ok(base, curr)
-    diff_tok = count_cl100k(diff_wire) if diff_wire else None
+    tot_full = sum(r["full_terse"] for r in rows if r["diff"] is not None)
+    tot_diff = sum(r["diff"] for r in rows if r["diff"] is not None)
+    tot_pct = round(100 * (1 - tot_diff / tot_full), 1) if tot_full else 0.0
 
-    print("\nterse cross-call diff — second call cost on real gh_pulls "
+    if args.json:
+        print(json.dumps({"rows": rows, "total_smaller_pct": tot_pct}, indent=2))
+        return 0
+
+    print("\nterse cross-call diff — SECOND-call cost on real list payloads "
           "(2 records changed, 1 appended)\n")
-    print(f"  full re-send, terse single-shot codec : {full_terse:>7} tok")
-    if diff_tok is not None:
-        print(f"  terse cross-call diff (lossless={diff_ok})   : {diff_tok:>7} tok"
-              f"   ({100 * (1 - diff_tok / full_terse):.1f}% smaller than a full re-send)")
-    else:
-        print("  terse cross-call diff                  : (no diff applied)")
-    print("\n  TOON / minify / any stateless encoding has no cross-call form — it pays the "
-          "full re-send column every call.")
+    hdr = f"{'payload':<20}{'records':>8}{'full re-send':>13}{'diff':>8}{'diff smaller':>14}"
+    print(hdr)
+    print("-" * len(hdr))
+    for r in rows:
+        d = f"{r['diff']:>8}" if r["diff"] is not None else f"{'n/a':>8}"
+        s = f"{r['smaller_pct']:>13.1f}%" if r["smaller_pct"] is not None else f"{'—':>14}"
+        print(f"{r['name']:<20}{r['records']:>8}{r['full_terse']:>13}{d}{s}")
+    print("-" * len(hdr))
+    print(f"{'WEIGHTED TOTAL':<20}{'':>8}{tot_full:>13}{tot_diff:>8}{tot_pct:>13.1f}%")
+    print("\n'full re-send' = terse single-shot codec on the whole new result (what a "
+          "stateless encoding pays EVERY call). 'diff' = the lossless delta terse emits on "
+          "the repeated call instead. TOON / minify have no diff form.")
     return 0
 
 
