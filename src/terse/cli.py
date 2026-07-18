@@ -858,6 +858,10 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
     from .install_mcp import scan_scopes
 
     rows = scan_scopes(file=args.file, repo_path=args.repo_path)
+    if args.json:
+        # Scriptable/CI-checkable parity with `terse stats --json`; [] on no servers.
+        print(json.dumps(rows, indent=2))
+        return 0
     if not rows:
         print("no MCP servers found in any scope (user/project/local).")
         return 0
@@ -870,8 +874,19 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
             continue
         print(f"[{scope}] {scope_rows[0]['config']}")
         for r in scope_rows:
-            policy = f"  policy={r['policy']}" if r["policy"] else ""
+            policy = ""
+            if r["policy"]:
+                miss = " (MISSING)" if r.get("policy_missing") else ""
+                policy = f"  policy={r['policy']}{miss}"
             print(f"  {r['server']:<20} {r['state']}{policy}")
+            # For a wrapped entry, a second indented line surfaces what it actually
+            # fronts and the tiers baked into the entry — the diagnostic the flat
+            # "wrapped policy=…" line couldn't answer when a server misbehaves.
+            if r["state"] == "wrapped":
+                stats = "on" if r.get("stats") else "off"
+                detail = (f"wraps={r.get('wraps') or '?'}  "
+                          f"diff={r.get('diff') or '?'}  stats={stats}")
+                print(f"  {'':<20} {detail}")
     return 0
 
 
@@ -1201,6 +1216,9 @@ def main(argv: list[str] | None = None) -> int:
     ms.add_argument("--repo-path", help="local scope: the projects.<repo-path> key to "
                                         "check (default: resolved via git; silently "
                                         "skipped if not in a git repo)")
+    ms.add_argument("--json", action="store_true",
+                    help="emit the rows as JSON instead of the text report "
+                         "(scriptable/CI-checkable; [] when no servers)")
     ms.set_defaults(func=_cmd_mcp_status)
 
     vf = sub.add_parser("verify", help="self-contained verification report: lossless gate "

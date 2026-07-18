@@ -431,12 +431,37 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
         else:
             state = "unwrapped"
         policy = None
-        if present:
+        policy_missing = False
+        wraps = None
+        diff = None
+        stats_on = None
+        if state == "wrapped":
+            # A terse-wrapped entry's args are
+            #   [-m terse] proxy <proxy-opts> -- <downstream cmd/url + args>
+            # so the downstream it actually fronts, and the diff/stats flags baked in,
+            # are all recoverable from here — none of which the old status line showed,
+            # leaving no way to spot e.g. a --no-diff or a wrong downstream from status.
             args = servers[name].get("args") or []
             if "--policy" in args:
-                policy = args[args.index("--policy") + 1]
+                i = args.index("--policy")
+                if i + 1 < len(args):
+                    policy = args[i + 1]
+                    # Only an absolute policy path is unambiguously checkable: a relative
+                    # one resolves against the MCP launcher's cwd, which a status scan
+                    # can't know, so we never false-flag it (see #58's drift lineage — the
+                    # point is to surface real drift, not manufacture noise).
+                    if os.path.isabs(policy) and not os.path.exists(policy):
+                        policy_missing = True
+            if "--" in args:
+                downstream = args[args.index("--") + 1:]
+                if downstream:
+                    wraps = " ".join(downstream)
+            diff = "off" if "--no-diff" in args else ("on" if "--diff" in args
+                                                      else "default")
+            stats_on = "--no-stats" not in args
         rows.append({"scope": scope, "server": name, "state": state, "policy": policy,
-                    "config": str(target.cfg)})
+                    "policy_missing": policy_missing, "wraps": wraps, "diff": diff,
+                    "stats": stats_on, "config": str(target.cfg)})
     return rows
 
 
@@ -444,9 +469,11 @@ def scan_scopes(*, cfg: Path | None = None, file: str | None = None,
                 repo_path: str | None = None) -> list[dict]:
     """Enumerate every terse-relevant mcpServers entry across all three scopes,
     read-only — no writes, no directory creation, never raises. One row per
-    (scope, server): {scope, server, state, policy, config}, state one of "wrapped"
-    (terse-managed and present), "orphaned-stash" (managed but the entry vanished —
-    see `_scan_target`), or "unwrapped" (present, not terse's). Local scope is
+    (scope, server): {scope, server, state, policy, policy_missing, wraps, diff,
+    stats, config}, state one of "wrapped" (terse-managed and present),
+    "orphaned-stash" (managed but the entry vanished — see `_scan_target`), or
+    "unwrapped" (present, not terse's). The wrapped-only fields (policy_missing,
+    wraps, diff, stats) are None/False for non-wrapped rows. Local scope is
     silently omitted, not an error, when it doesn't resolve (not in a git repo and
     no --repo-path given) — "no local scope here" is the common case, not a failure."""
     rows: list[dict] = []

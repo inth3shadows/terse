@@ -275,6 +275,59 @@ def test_mcp_status_cmd_empty_prints_nothing_found(tmp_path, monkeypatch, capsys
     assert "no MCP servers found" in capsys.readouterr().out
 
 
+def test_mcp_status_cmd_json_emits_empty_list_when_no_servers(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["mcp-status", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_mcp_status_cmd_shows_detail_line_and_json(tmp_path, monkeypatch, capsys):
+    # The wrapped entry gets a second line surfacing what it fronts + the tiers baked
+    # in — and --json exposes the same fields for scripts.
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "plain": {"command": "uvx", "args": ["plain-mcp"]},
+    }}), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    monkeypatch.chdir(tmp_path)
+    policy = _write(tmp_path, "policy.json", json.dumps({"rules": []}))
+    assert main(["install-mcp", "plain", "--policy", str(policy), "--no-diff"]) == 0
+    capsys.readouterr()  # drain install-mcp output
+
+    assert main(["mcp-status"]) == 0
+    out = capsys.readouterr().out
+    # wraps carries the full downstream command (orig command + its args)
+    assert "wraps=uvx plain-mcp" in out and "diff=off" in out and "stats=on" in out
+
+    assert main(["mcp-status", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    row = next(r for r in rows if r["server"] == "plain")
+    assert row["wraps"] == "uvx plain-mcp" and row["diff"] == "off" and row["stats"] is True
+    assert row["policy_missing"] is False
+
+
+def test_mcp_status_cmd_flags_a_missing_policy_file(tmp_path, monkeypatch, capsys):
+    # A wrapped server whose policy file was deleted/moved after install would fail to
+    # start (the proxy raises on load), but the flat status line showed it as normal.
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "plain": {"command": "uvx", "args": ["plain-mcp"]},
+    }}), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    monkeypatch.chdir(tmp_path)
+    policy = _write(tmp_path, "policy.json", json.dumps({"rules": []}))
+    assert main(["install-mcp", "plain", "--policy", str(policy)]) == 0
+    capsys.readouterr()
+    policy.unlink()  # the policy vanishes after install -> proxy would fail to launch
+
+    assert main(["mcp-status"]) == 0
+    assert "(MISSING)" in capsys.readouterr().out
+
+
 def test_proxy_cmd_parses_and_forwards_headers(monkeypatch):
     # #5: --header NAME=VALUE (repeatable) must reach run_proxy as a dict, and the
     # positional REMAINDER cmd must still come through unchanged (a single URL here).

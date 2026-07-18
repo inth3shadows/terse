@@ -590,6 +590,63 @@ def test_scan_scopes_includes_project_and_local_when_present(tmp_path, monkeypat
     assert by_scope[("project", "proj-demo")]["policy"] == "/proj.json"
 
 
+def test_scan_scopes_surfaces_wraps_diff_stats_and_missing_policy(tmp_path, monkeypatch):
+    cfg = tmp_path / ".claude.json"
+    missing = tmp_path / "gone.json"          # never created -> policy_missing
+    present = tmp_path / "here.json"
+    present.write_text("{}")
+    cfg.write_text(json.dumps({"mcpServers": {
+        # diff off, stats off, absolute policy that does not exist
+        "codegraph": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", "--policy", str(missing), "--server-name",
+            "codegraph", "--no-diff", "--no-stats", "--", "codegraph-mcp", "serve"]},
+        # default diff (no flag), stats on, policy present
+        "runecho": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", "--policy", str(present), "--", "runecho-mcp"]},
+    }}))
+    im.stash_path(cfg).write_text(json.dumps({"user": {
+        "codegraph": {"command": "codegraph-mcp", "args": ["serve"]},
+        "runecho": {"command": "runecho-mcp", "args": []}}}))
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+    monkeypatch.chdir(tmp_path)
+
+    by = {r["server"]: r for r in im.scan_scopes() if r["scope"] == "user"}
+    cg = by["codegraph"]
+    assert cg["wraps"] == "codegraph-mcp serve"
+    assert cg["diff"] == "off" and cg["stats"] is False
+    assert cg["policy_missing"] is True
+    ru = by["runecho"]
+    assert ru["wraps"] == "runecho-mcp"
+    assert ru["diff"] == "default" and ru["stats"] is True
+    assert ru["policy_missing"] is False
+
+
+def test_scan_scopes_never_flags_a_relative_policy_as_missing(tmp_path, monkeypatch):
+    # A relative policy resolves against the MCP launcher's cwd, which a status scan
+    # can't know — so it must never be reported MISSING even when absent here.
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "s": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", "--policy", "rel/policy.json", "--", "s-mcp"]}}}))
+    im.stash_path(cfg).write_text(json.dumps({"user": {"s": {"command": "s-mcp", "args": []}}}))
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+    monkeypatch.chdir(tmp_path)
+    row = next(r for r in im.scan_scopes() if r["server"] == "s")
+    assert row["policy"] == "rel/policy.json" and row["policy_missing"] is False
+
+
+def test_scan_scopes_wrapped_only_fields_are_none_for_non_wrapped(tmp_path, monkeypatch):
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "plain": {"command": "uvx", "args": ["plain-mcp"]}}}))  # unwrapped
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+    monkeypatch.chdir(tmp_path)
+    row = next(r for r in im.scan_scopes() if r["server"] == "plain")
+    assert row["state"] == "unwrapped"
+    assert row["wraps"] is None and row["diff"] is None and row["stats"] is None
+    assert row["policy_missing"] is False
+
+
 def test_scan_scopes_never_raises_when_local_scope_unresolvable(tmp_path, monkeypatch):
     # Not inside a git repo, no --repo-path given -> local scope is silently omitted,
     # not an error (this is the common case: most invocations aren't in a repo at all).
