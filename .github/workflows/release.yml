@@ -3,8 +3,8 @@ name: release
 # publishes a GitHub Release with auto-generated notes and the artifacts attached.
 # The tag IS the version (hatch-vcs) — a build here resolves to the tag, byte-for-byte.
 #
-# No PyPI publish: terse is distributed via `uv tool install git+<repo>@<tag>` for now
-# (the name `terse` is taken on PyPI, and publishing is a separate, deferred decision).
+# No PyPI publish here: this only cuts a GitHub Release. The distribution name is
+# `terse-mcp` (the bare `terse` is taken on PyPI); PyPI upload is a separate manual step.
 on:
   push:
     tags:
@@ -29,10 +29,11 @@ jobs:
         run: uv build
       - name: Sanity-check the built version matches the tag
         # Fail loudly if hatch-vcs and the tag disagree — the artifact name must contain
-        # the tag without its leading `v` (e.g. tag v0.1.0 -> terse-0.1.0-*.whl).
+        # the tag without its leading `v`. The distribution name is `terse-mcp`, which
+        # normalizes to `terse_mcp` in wheel filenames (e.g. v0.3.0 -> terse_mcp-0.3.0-*.whl).
         run: |
           expected="${GITHUB_REF_NAME#v}"
-          if ! ls dist/terse-"${expected}"-*.whl >/dev/null 2>&1; then
+          if ! ls dist/terse_mcp-"${expected}"-*.whl >/dev/null 2>&1; then
             echo "::error::built wheel does not match tag ${GITHUB_REF_NAME} (expected version ${expected})"; ls -1 dist/; exit 1
           fi
           echo "built version ${expected} matches tag ${GITHUB_REF_NAME}"
