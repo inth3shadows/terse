@@ -93,6 +93,23 @@ _DROP_MIN_UNIQ_RATIO = 0.9   # near-unique: the dictionary tier can't fold it, s
 _DROP_MIN_SHARE = 0.10       # worth a retrieve round-trip: >=10% of the record list's tokens
 
 
+def activate_suggestions(doc: dict) -> dict:
+    """Return a deep COPY of a generated policy doc with every entry's INACTIVE
+    `_suggested_fields` promoted to active `fields` (merged over any existing fields), and
+    the `_suggested_fields_note` dropped. Used by `terse tune --drop-eval` to verify the
+    suggested drops AS IF enabled, without mutating the doc written to disk (which stays
+    inactive until the operator opts in). Pure — no I/O."""
+    import copy
+
+    out = copy.deepcopy(doc)
+    for entry in out.get("policies", []):
+        sug = entry.pop("_suggested_fields", None)
+        entry.pop("_suggested_fields_note", None)
+        if sug:
+            entry["fields"] = {**entry.get("fields", {}), **sug}
+    return out
+
+
 def _drop_candidates(
     raws: list[str],
     min_mean_tok: float = _DROP_MIN_MEAN_TOK,

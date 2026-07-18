@@ -246,6 +246,62 @@ turns a +2.6% tool into a +77% one.
 terse measures *tokens*, not comprehension — before relying on a generated policy, confirm
 the model still reads the compressed form with `terse fluency --corpus <dir>` (see below).
 
+### One-command lossy tuning (`terse tune`)
+
+`terse tune` chains the whole lossy-adoption loop into one command: it runs the generator,
+then presents drop-to-retrieve candidates **safe-first**, classified by field role:
+
+```bash
+terse tune --corpus corpus/ --out policy.json
+# # terse tune — 40 payload(s), 6 tool(s), 3 drop candidate(s)
+# SAFE candidates — supporting prose, enable after a dropeval pass:
+#   kb.read.nodes    result[].description   ~41% tok, 100% uniq  [prose]
+# REVIEW candidates — role unknown, may be LOAD-BEARING; verify carefully:
+#   kb.read.list_principles  result[].principle  ~36% tok, 100% uniq  [unknown]
+```
+
+- **`[prose]`** (evidence, rationale, description, notes, body…) — supporting text, the safe
+  drop candidate.
+- **`[unknown]`** — the name doesn't reveal the role, so it *may be load-bearing* (dropping it
+  forces the model to call `terse.retrieve` for it). A field the model reasons over, like a
+  `principle` or a `verdict`, lands here on purpose — a name heuristic can't know it's the
+  essence of the record.
+- **`[identity]`** fields (id, name, key, path, title…) are never suggested — the record
+  needs them in-line.
+
+Verify before enabling — the token win is real, but only a live model can tell you whether a
+dropped field was actually needed:
+
+```bash
+# runs the real 2-turn retrieve eval on the suggested drops and prints the verdict:
+terse tune --corpus corpus/ --out policy.json --drop-eval \
+  --base-url $URL --models glm-5.2,deepseek-v4-flash
+```
+
+If the worst-case model **PASSES**, enable a field by renaming that tool's
+`_suggested_fields` → `fields`. Start with `[prose]`; leave any `[unknown]` that fails.
+The dropeval gate — not the role guess — is the real safety net.
+
+### Forbidding lossy on a credential/personal server (`--never-lossy`)
+
+Lossy transforms are **structurally forbidden** on a *never-lossy* server (a credential or
+personal store), even if a policy marks one of its fields lossy — a policy typo can't leak a
+credential payload through a truncate/drop. Two layers:
+
+- A **built-in name floor** always forbids lossy on servers whose name looks secret-shaped
+  (`secret`/`credential`/`vault`/`token`/`password`/`key`/`auth`) — non-overridable.
+- For a sensitive store the floor can't catch (a personal KB, a launcher alias), **declare it
+  at install** so it's baked into the policy:
+
+```bash
+terse install-mcp kb --policy policy.json --never-lossy
+# never-lossy: baked kb into the policy's never_lossy_servers — lossy is now forbidden on it
+```
+
+`install-mcp` also prints a *hint* when a server looks sensitive but wasn't marked. The
+enforcement keys off the server's verified identity (the `--server-name` terse bakes into the
+wrap), so it can't be defeated by a mislabeled rule.
+
 ### Keeping a tool's output off disk (`"capture": false`)
 
 Some tools return things that should never be written to a file — a credential, a token,

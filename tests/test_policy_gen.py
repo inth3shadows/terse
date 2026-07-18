@@ -182,3 +182,19 @@ def test_identity_field_excluded_and_prose_ranked_first():
     note = rule["_suggested_fields_note"]
     assert "[prose]" in note and "[unknown]" in note
     assert "--drop-eval" in note and "LOAD-BEARING" in note
+
+
+def test_activate_suggestions_promotes_inactive_to_fields():
+    from terse.policy_gen import activate_suggestions
+    doc = {"version": 1, "policies": [
+        {"match": {"tool": "kb.x"}, "tiers": ["minify"],
+         "_suggested_fields": {"result[].body": {"lossy": "drop-to-retrieve"}},
+         "_suggested_fields_note": "n"},
+        {"match": {"tool": "gh.y"}, "tiers": ["minify"]},
+    ]}
+    out = activate_suggestions(doc)
+    p0 = out["policies"][0]
+    assert p0["fields"] == {"result[].body": {"lossy": "drop-to-retrieve"}}   # promoted
+    assert "_suggested_fields" not in p0 and "_suggested_fields_note" not in p0
+    assert "fields" not in out["policies"][1]                                  # untouched
+    assert "_suggested_fields" in doc["policies"][0]                           # original intact (deep copy)
