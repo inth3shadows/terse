@@ -80,14 +80,20 @@ def classify_decision(raw: str, emitted: str, passthrough: bool) -> str:
 
 
 def build_record(server: str, tool: str, raw: str, emitted: str,
-                 passthrough: bool) -> dict[str, Any]:
+                 passthrough: bool, diff_reason: str | None = None) -> dict[str, Any]:
     """One ledger line. Sizes and labels only — never payload content (the property
-    that makes always-on safe). Token counts are None without tiktoken."""
+    that makes always-on safe). Token counts are None without tiktoken.
+
+    `diff_reason` (Phase 1 instrumentation, #TBD) records WHY the cross-call diff did or
+    did not fire for this result — the datum that decides whether arg-keying the diff base
+    is worth building. See proxy `_compress_or_diff` for the value set. None on older
+    records (the field post-dates them) and on writers that don't supply it."""
     return {
         "ts": int(time.time()),
         "server": server,
         "tool": tool,
         "decision": classify_decision(raw, emitted, passthrough),
+        "diff_reason": diff_reason,
         "raw_chars": len(raw),
         "out_chars": len(emitted),
         "raw_tokens": count_cl100k(raw),
@@ -168,6 +174,8 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     total = {"results": 0, "raw_chars": 0, "out_chars": 0,
              "raw_tokens": 0, "out_tokens": 0, "untokenized": 0}
     decisions: dict[str, int] = {}
+    # Phase 1: why the cross-call diff did/didn't fire (only present on newer records).
+    diff_reasons: dict[str, int] = {}
     tools: dict[tuple[str, str], dict[str, int]] = {}
     for rec in records:
         raw_c, out_c = rec.get("raw_chars"), rec.get("out_chars")
@@ -178,6 +186,9 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         total["out_chars"] += out_c
         decision = str(rec.get("decision", "unknown"))
         decisions[decision] = decisions.get(decision, 0) + 1
+        reason = rec.get("diff_reason")
+        if isinstance(reason, str):
+            diff_reasons[reason] = diff_reasons.get(reason, 0) + 1
         key = (str(rec.get("server", "unknown")), str(rec.get("tool", "unknown")))
         row = tools.setdefault(key, {"results": 0, "raw_tokens": 0, "out_tokens": 0,
                                      "raw_chars": 0, "out_chars": 0, "diffs": 0})
@@ -194,7 +205,7 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             row["out_tokens"] += out_t
         else:
             total["untokenized"] += 1
-    return {"total": total, "decisions": decisions,
+    return {"total": total, "decisions": decisions, "diff_reasons": diff_reasons,
             "tools": [{"server": s, "tool": t, **row}
                       for (s, t), row in sorted(
                           tools.items(),
@@ -233,6 +244,14 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
     tok_raw, tok_out = total["raw_tokens"], total["out_tokens"]
     lines.append(f"results: {total['results']}   "
                  f"decisions: " + ", ".join(f"{k}={v}" for k, v in sorted(decisions.items())))
+    diff_reasons = agg.get("diff_reasons") or {}
+    if diff_reasons:
+        # Phase 1: the diff hit-rate breakdown. `no_prior` = tool never re-called;
+        # `not_smaller_diff_args` = base was a different-args call (arg-keying opportunity);
+        # `not_smaller_same_args` = same-args base but the delta didn't win (encoding, not
+        # keying); `emitted` = a diff shipped; `keyframe` = forced full to re-anchor.
+        lines.append("diff reasons: "
+                     + ", ".join(f"{k}={v}" for k, v in sorted(diff_reasons.items())))
     if tok_raw or tok_out:
         lines.append(f"tokens (cl100k): {tok_raw:,} -> {tok_out:,}   "
                      f"saved {tok_raw - tok_out:,} ({_pct_saved(tok_raw, tok_out).strip()})")
@@ -273,9 +292,11 @@ def build_stats_writer(stats_log: str | Path, server: str, debug: bool,
 
     err = stderr if stderr is not None else sys.stderr
 
-    def stats(tool: str, raw: str, emitted: str, passthrough: bool) -> None:
+    def stats(tool: str, raw: str, emitted: str, passthrough: bool,
+              diff_reason: str | None = None) -> None:
         try:
-            append_stats(build_record(server, tool, raw, emitted, passthrough), stats_log)
+            append_stats(build_record(server, tool, raw, emitted, passthrough, diff_reason),
+                         stats_log)
         except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
             if debug:
                 err.write(f"{log_prefix} append_stats failed: {exc}\n")

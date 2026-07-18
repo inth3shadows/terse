@@ -1,31 +1,47 @@
 # terse
 
-Lossless-first compression layer for AI-agent tool outputs — byte-faithful on
-fields you mark critical, configurable lossy reduction only where you opt in.
+The **lossless-first** MCP compression proxy: it makes tool output smaller without
+ever changing what your agent reads — byte-faithful by default, lossy only where you
+explicitly opt in.
 
-terse is lossless-first. Unlike blanket lossy offload (e.g. headroom's "drop to a
-retrieve-cache"), it keeps everything **resident and legible** by default and removes
-only *structural* overhead: pretty-print whitespace, keys repeated once per record,
-repeated values, repeated nested schema. Tokens go down; nothing the model needs
-leaves the window; there is no decode step. Lossy reduction is strictly opt-in, per
-field — including `drop-to-retrieve`, a deliberate escape hatch that evicts a marked
-field to a handle the model can fetch back with a `terse.retrieve` tool. It is off by
-default and never the rule.
+terse reduces tokens two ways, and they are not equally easy to copy. That split is
+the whole positioning.
+
+**1. The lossless codec — the reach.** terse removes only *structural* overhead:
+pretty-print whitespace, keys repeated once per record, repeated values, repeated
+nested schema. The transformed bytes **are** the model's input — a denser but still
+legible representation, not an offload. There is no decode step, no ML model in the
+loop, and every transform has an exact inverse (a round-trip gate asserts
+`decompress(compress(x)) == x` over the whole corpus). This is the guarantee most
+tools in this space decline to make: headroom's default JSON path is a **lossy** ML
+model behind a `retrieve` round-trip; Anthropic/OpenAI context-editing **drops** old
+tool results server-side. terse never silently mutates what the model sees — and
+"lossless" is the category, not the token count. The tabularization primitive itself
+is public (formats like [TOON](https://toonformat.dev/) publish it standalone, MIT-
+licensed, ~40% on flat arrays), so the codec is terse's *demo*, not its moat: a
+motivated competitor could clone it.
+
+**2. The stateful cross-call diff — the moat.** When the same tool is called again —
+poll a list, re-read a file — terse emits a lossless *delta* against the prior result
+instead of the whole payload (**73% smaller on repeated calls** in the benchmark
+below). This is the one axis a stateless encoder **architecturally cannot reach**:
+TOON, headroom's per-call model, and server-side history-pruning all pay the full
+column every call because none of them remember the last result. terse can only do it
+because it lives in the session as a transparent proxy. Cloning the codec is a
+weekend; cloning the diff means becoming a session-spanning proxy — a different
+product. Default-on since its validation program completed (see Status).
+
+Around those two sits the **bundle** that turns a byte filter into a control plane you
+don't want to rip out: MCP-native proxy packaging (transparent to any downstream
+server, no client-side reformatting), a **live savings ledger** (`terse stats`), a
+fluency-gated lossy escape hatch, and self-installing ops tooling (`install-mcp`,
+`mcp-status`) — each diff/lossy tier validated by a behavioral eval before it was ever
+turned on by default.
 
 It is **selective by design**. Measurement on real tool output showed the win is
 strongly per-tool (0–30%): large on record/symbol-shaped verbose output, near-zero
 on already-minified or already-projected tools. So terse applies per-tool policy
 rather than compressing everything blindly.
-
-Lossless tabularization of uniform JSON arrays isn't unique to terse — formats like
-[TOON](https://toonformat.dev/) publish the same primitive as a standalone, MIT-
-licensed encoding (~40% token reduction, independently benchmarked). terse's
-differentiation isn't the tabularization trick alone; it's the bundle: MCP-native
-proxy packaging (transparent to any downstream server, no client-side reformatting
-required), per-tool policy, cross-call diffing, a fluency-gated lossy escape hatch,
-and self-installing ops tooling (`install-mcp`, `mcp-status`) — combined, and each
-diff/lossy tier validated by a behavioral eval before it was ever turned on by
-default.
 
 ## How It Works
 
