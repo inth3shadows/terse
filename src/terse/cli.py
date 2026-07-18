@@ -10,6 +10,7 @@ Subcommands:
   proxy -- <cmd>           MCP stdio proxy: compress a downstream server's results
   stats                    live savings report from the proxy's payload-free ledger
   fluency                  does a model read the compressed form as well as raw JSON?
+  tune                     analyze a corpus -> safe-first drop candidates (+ optional verify)
 """
 
 from __future__ import annotations
@@ -457,6 +458,111 @@ def _build_answerers(args: argparse.Namespace, make_openai) -> dict:
         for m in (x.strip() for x in models.split(",") if x.strip()):
             answerers[m] = make_openai(base, key, m)
     return answerers
+
+
+def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int:
+    """Verify the generated drop suggestions with a live tool-calling model: promote the
+    suggestions in-memory, run the real 2-turn retrieve eval, and print the verdict. Does
+    NOT auto-enable — the operator enables after seeing the report (a model verdict must not
+    silently edit a policy). Reuses the exact `fluency --drop-eval` machinery."""
+    import tempfile
+
+    from . import dropeval
+    from .policy import load_policy
+    from .policy_gen import activate_suggestions
+    from .proxy import RETRIEVE_TOOL_DEF
+    from .report import build_dropeval_report
+
+    answerers = _build_answerers(
+        args,
+        lambda base, key, m: dropeval.openai_tool_answerer(base, key, m,
+                                                            tools=[RETRIEVE_TOOL_DEF]),
+    )
+    if not answerers:
+        print("--drop-eval needs a configured model: set TERSE_FLUENCY_BASE_URL/_API_KEY/"
+              "_MODELS (or --base-url/--models).", file=sys.stderr)
+        return 1
+    active = activate_suggestions(doc)
+    # Write inside the `with` (so the handle is CLOSED after it), then load by name: Windows
+    # forbids reopening a temp file whose handle is still open, so a `delete=True` block that
+    # loaded inside it would crash there. delete=False keeps the closed file for the reload.
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+        tf.write(_json.dumps(active))
+        tmp_name = tf.name
+    try:
+        pol = load_policy(tmp_name)
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
+    if not pol.has_drop():
+        print("--drop-eval: no drop suggestions to verify.")
+        return 0
+    print("\nverifying the suggested drops with a live model (does it call terse.retrieve "
+          "when the dropped field is needed, and skip it when not?)...")
+    results = dropeval.run_drop_fluency(envelopes, pol.select, answerers, trials=args.trials)
+    print("\n" + build_dropeval_report(results))
+    print("If the worst-case model PASSES, enable the verified fields by renaming that tool's "
+          "'_suggested_fields' -> 'fields' in the policy.")
+    return 0
+
+
+def _cmd_tune(args: argparse.Namespace) -> int:
+    """One-command lossy tuning: analyze a captured corpus, surface safe-first drop-to-
+    retrieve candidates (role-classified — prose is safe, unknown may be load-bearing), write
+    the generated policy (suggestions INACTIVE), and optionally verify them with a live model.
+    Chains `policy generate` + the drop-eval into the single flow an operator would otherwise
+    assemble by hand."""
+    from .policy_gen import generate_policy
+
+    envelopes = load_corpus(args.corpus)
+    if not envelopes:
+        print(f"no payloads in {args.corpus}/ — capture some first (`terse capture` or "
+              f"`proxy --capture-dir`).", file=sys.stderr)
+        return 1
+    doc, rows = generate_policy(envelopes, threshold=args.threshold)
+    cands = [{"tool": r["tool"], **dr} for r in rows for dr in r.get("drop_rows", [])]
+
+    if args.out:
+        from .policy import load_policy
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(_json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        load_policy(out)  # fail loud if we just wrote a policy our own loader rejects
+
+    print(f"# terse tune — {len(envelopes)} payload(s), {len(rows)} tool(s), "
+          f"{len(cands)} drop candidate(s)")
+    if not cands:
+        print("no drop-to-retrieve candidates — the lossless tiers already cover these tools, "
+              "or every large field is a key/identity (never dropped).")
+        if args.out:
+            print(f"policy written to {args.out} (lossless).")
+        return 0
+
+    def _show(label: str, items: list) -> None:
+        if not items:
+            return
+        print(f"\n{label}:")
+        for c in items:
+            print(f"  {c['tool']:<28} {c['path']:<26} "
+                  f"~{c['tok_share'] * 100:.0f}% tok, {c['uniq_ratio'] * 100:.0f}% uniq  "
+                  f"[{c.get('role', 'unknown')}]")
+
+    _show("SAFE candidates — supporting prose, enable after a dropeval pass",
+          [c for c in cands if c.get("role") == "prose"])
+    _show("REVIEW candidates — role unknown, may be LOAD-BEARING; verify carefully",
+          [c for c in cands if c.get("role") != "prose"])
+    if args.out:
+        print(f"\npolicy written to {args.out} — drop suggestions are INACTIVE "
+              "(`_suggested_fields`) until you opt in.")
+
+    if args.drop_eval:
+        return _tune_drop_eval(args, doc, envelopes)
+    print("\nNext — verify, then enable:")
+    tgt = args.out or "<policy.json>"
+    print(f"  terse tune --corpus {args.corpus} --out {tgt} --drop-eval --models ...  "
+          "# verify with a live model")
+    print(f"  then in {tgt}: rename a tool's '_suggested_fields' -> 'fields' (start with "
+          "[prose]; leave any [unknown] that fails dropeval).")
+    return 0
 
 
 def _cmd_fluency(args: argparse.Namespace) -> int:
@@ -1015,6 +1121,23 @@ def main(argv: list[str] | None = None) -> int:
                    help="also print a terminal forest plot (accuracy + 95%% CI per model, "
                         "ANSI if a tty)")
     f.set_defaults(func=_cmd_fluency)
+
+    tn = sub.add_parser("tune", help="one-command lossy tuning: analyze a captured corpus, "
+                                     "surface safe-first drop-to-retrieve candidates, write the "
+                                     "policy, and optionally verify with a live model")
+    tn.add_argument("--corpus", default=DEFAULT_CORPUS)
+    tn.add_argument("--out", help="write the generated policy here (suggestions inactive)")
+    tn.add_argument("--threshold", type=float, default=5.0, metavar="PCT",
+                    help="min total savings %% to compress a tool at all (default 5.0)")
+    tn.add_argument("--drop-eval", action="store_true",
+                    help="also verify the suggested drops with a live tool-calling model "
+                         "(needs TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS or --base-url/--models)")
+    tn.add_argument("--trials", type=int, default=1, help="drop-eval trials per question")
+    tn.add_argument("--base-url", help="OpenAI-compatible base URL (else $TERSE_FLUENCY_BASE_URL)")
+    tn.add_argument("--models", help="comma-separated model ids (else $TERSE_FLUENCY_MODELS)")
+    tn.add_argument("--api-key-env", default="TERSE_FLUENCY_API_KEY",
+                    help="env var holding the API key (else TERSE_FLUENCY_API_KEY)")
+    tn.set_defaults(func=_cmd_tune)
 
     im = sub.add_parser("install-mcp", help="wrap Claude Code MCP server(s) with the "
                                             "terse proxy")
