@@ -70,6 +70,18 @@ def classify_server_sensitivity(name: str, command: object = "") -> bool:
     return bool(SENSITIVE_SERVER_RE.search(" ".join(str(p) for p in parts)))
 
 
+def add_never_lossy_server(policy_doc: dict, name: str) -> bool:
+    """Add `name` to a policy doc's `never_lossy_servers` (deduped + sorted); return True if
+    the doc changed. Pure — the caller owns reading/writing the file. `name` is the server's
+    config key, which install-mcp also bakes as `--server-name`, so it matches the identity
+    `policy.apply` sees at runtime — making lossy structurally forbidden on it (PR #89)."""
+    existing = list(policy_doc.get("never_lossy_servers", []))
+    if name in existing:
+        return False
+    policy_doc["never_lossy_servers"] = sorted([*existing, name])
+    return True
+
+
 def config_path() -> Path:
     """Claude Code config location. Honors $CLAUDE_CONFIG, else ~/.claude.json."""
     env = os.environ.get("CLAUDE_CONFIG")
@@ -314,7 +326,8 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
                cfg: Path | None = None, capture_dir: str | None = None,
                diff: bool | None = None, diff_keyframe_interval: int | None = None,
                scope: str = "user", file: str | None = None,
-               repo_path: str | None = None, no_stats: bool = False) -> dict:
+               repo_path: str | None = None, no_stats: bool = False,
+               never_lossy: bool = False) -> dict:
     target = resolve_target(scope, cfg=cfg, file=file, repo_path=repo_path)
     if not target.cfg.exists():
         what = ".mcp.json" if scope == "project" else "Claude config"
@@ -361,11 +374,22 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
     result = {"config": str(target.cfg), "scope": scope, "policy": policy_abs,
               "available": available, "changes": changes, "dry_run": dry_run,
               "backup": None, "capture_dir": capture_abs, "diff": diff,
-              "no_stats": no_stats}
+              "no_stats": no_stats, "never_lossy_added": []}
     if not dry_run and changes:
         result["backup"] = str(_backup(target.cfg))
         _write_json(target.cfg, config, trailing_newline=had_nl)
         _write_json(stash_path(target.cfg), full_stash)
+
+    # --never-lossy: bake the wrapped server(s) into the POLICY file's never_lossy_servers
+    # (a separate file from the Claude config above), so lossy transforms are structurally
+    # forbidden on them at runtime (PR #89). Computed even under dry-run for reporting, but
+    # only written when not a dry-run and something actually changed.
+    if never_lossy:
+        pol_doc = json.loads(Path(policy_abs).read_text(encoding="utf-8"))
+        added = [s for s in servers if add_never_lossy_server(pol_doc, s)]
+        result["never_lossy_added"] = added
+        if added and not dry_run:
+            _write_json(Path(policy_abs), pol_doc)
     return result
 
 
