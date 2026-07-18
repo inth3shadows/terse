@@ -3,7 +3,38 @@
 report.py's existing markdown builders."""
 from __future__ import annotations
 
-from terse.report import build_trend_report
+from terse.report import build_trend_report, verify_summary
+
+
+def test_verify_summary_passing_corpus_totals_and_gate():
+    rows = [
+        {"tool": "t", "sha": "a", "shape": "array-of-records", "roundtrip_ok": True,
+         "cl100k": {"raw": 100, "compressed": 40}},
+        {"tool": "t", "sha": "b", "shape": "array-of-records", "roundtrip_ok": True,
+         "cl100k": {"raw": 100, "compressed": 60}},
+    ]
+    cov = {"total": 2, "by_tool": {"t": 2}, "by_shape": {"array-of-records": 2}}
+    s = verify_summary(rows, cov, "my corpus")
+    assert s["corpus"] == "my corpus" and s["payloads"] == 2
+    assert s["lossless_gate"] == {"ok": True, "passed": 2, "total": 2, "failures": []}
+    assert s["tokens_cl100k"]["raw_tokens"] == 200
+    assert s["tokens_cl100k"]["saved_tokens"] == 100
+    assert s["tokens_cl100k"]["saved_pct"] == 50.0
+    assert s["by_shape"]["array-of-records"]["n"] == 2
+    assert s["coverage"]["by_tool"] == {"t": 2}
+
+
+def test_verify_summary_flags_gate_failures():
+    rows = [
+        {"tool": "t", "sha": "ok", "shape": "s", "roundtrip_ok": True,
+         "cl100k": {"raw": 10, "compressed": 5}},
+        {"tool": "t", "sha": "bad", "shape": "s", "roundtrip_ok": False,
+         "cl100k": {"raw": 10, "compressed": 5}},
+    ]
+    s = verify_summary(rows, {"total": 2}, "c")
+    assert s["lossless_gate"]["ok"] is False
+    assert s["lossless_gate"]["passed"] == 1
+    assert s["lossless_gate"]["failures"] == [{"tool": "t", "sha": "bad", "shape": "s"}]
 
 _RUN_A = {"ts": "t1", "label": "corpus", "n_payloads": 3, "lossless_pass": 3,
           "raw_tok": 300, "compressed_tok": 180, "saved_tok": 120, "saved_pct": 40.0}
