@@ -505,7 +505,7 @@ wheels = [
 ]
 
 [[package]]
-name = "terse"
+name = "terse-mcp"
 source = { editable = "." }
 dependencies = [
     { name = "tiktoken" },
