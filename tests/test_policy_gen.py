@@ -144,3 +144,41 @@ def test_generated_policy_loads_back(tmp_path):
     # the high-savings tool resolves to a compressing rule; the compact one to passthrough
     assert policy.select("gh.items").tiers
     assert policy.select("status.ping").tiers == ()
+
+
+def test_classify_field_role():
+    from terse.policy_gen import classify_field_role
+    for n in ["id", "result[].name", "path", "commandLine", "uuid", "status"]:
+        assert classify_field_role(n) == "identity", n
+    for n in ["evidence", "result[].bodyText", "notes", "description", "rationale"]:
+        assert classify_field_role(n) == "prose", n
+    for n in ["principle", "embedding", "result[].verdict", "foobar"]:
+        assert classify_field_role(n) == "unknown", n
+
+
+# A record with a large+unique IDENTITY field (name), a PROSE field, and an UNKNOWN field —
+# all three clear the size/uniqueness/share thresholds, so only role distinguishes them.
+def _mixed_records(n=20):
+    return {"result": [{"id": i,
+                        "name": "n" * 250 + str(i),          # identity, large -> must be EXCLUDED
+                        "description": "d" * 250 + str(i),   # prose -> ranked first
+                        "principle": "p" * 250 + str(i)}     # unknown -> after prose, flagged
+                       for i in range(n)]}
+
+
+def test_identity_field_excluded_and_prose_ranked_first():
+    doc, rows = generate_policy([_env("kb.x", _mixed_records()) for _ in range(2)])
+    rule = next(p for p in doc["policies"] if p["match"]["tool"] == "kb.x")
+    sug = rule["_suggested_fields"]
+    assert "result[].description" in sug and "result[].principle" in sug
+    assert "result[].name" not in sug        # identity excluded despite large+unique+high-share
+    assert "result[].id" not in sug
+    # prose ranks before unknown in both the suggestion and the report rows
+    keys = list(sug.keys())
+    assert keys.index("result[].description") < keys.index("result[].principle")
+    dr = next(r for r in rows if r["tool"] == "kb.x")["drop_rows"]
+    assert [d["role"] for d in dr] == ["prose", "unknown"]
+    # the note carries the role tags, the dropeval gate, and the load-bearing caution
+    note = rule["_suggested_fields_note"]
+    assert "[prose]" in note and "[unknown]" in note
+    assert "--drop-eval" in note and "LOAD-BEARING" in note
