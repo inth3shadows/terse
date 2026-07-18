@@ -84,7 +84,7 @@ def build_record(server: str, tool: str, raw: str, emitted: str,
     """One ledger line. Sizes and labels only — never payload content (the property
     that makes always-on safe). Token counts are None without tiktoken.
 
-    `diff_reason` (Phase 1 instrumentation, #TBD) records WHY the cross-call diff did or
+    `diff_reason` (Phase 1 instrumentation) records WHY the cross-call diff did or
     did not fire for this result — the datum that decides whether arg-keying the diff base
     is worth building. See proxy `_compress_or_diff` for the value set. None on older
     records (the field post-dates them) and on writers that don't supply it."""
@@ -249,7 +249,8 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
         # Phase 1: the diff hit-rate breakdown. `no_prior` = tool never re-called;
         # `not_smaller_diff_args` = base was a different-args call (arg-keying opportunity);
         # `not_smaller_same_args` = same-args base but the delta didn't win (encoding, not
-        # keying); `emitted` = a diff shipped; `keyframe` = forced full to re-anchor.
+        # keying); `emitted` = a JSON diff shipped; `text_emitted` = a CDC text diff
+        # shipped; `keyframe` = forced full to re-anchor.
         lines.append("diff reasons: "
                      + ", ".join(f"{k}={v}" for k, v in sorted(diff_reasons.items())))
     if tok_raw or tok_out:

@@ -427,9 +427,10 @@ class Interceptor:
                           args_key: str = "") -> tuple[bool, str]:
         """Compress one block, preferring a lossless delta vs the prior same-tool result
         when it is smaller. Updates the per-tool diff base. Returns `(changed, reason)`,
-        where `reason` is the Phase 1 instrumentation datum (see `_DIFF_REASON*` below) —
-        WHY the JSON diff did/didn't fire, for the ledger. Fail-open: any error leaves the
-        block untouched and state intact."""
+        where `reason` is the Phase 1 instrumentation datum — a short label for WHY the
+        diff did/didn't fire (no_prior | keyframe | emitted | not_smaller_same_args |
+        not_smaller_diff_args | text_emitted | non_json | passthrough | error), for the
+        ledger. Fail-open: any error leaves the block untouched and state intact."""
         text = block["text"]
         try:
             applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put,
@@ -450,7 +451,11 @@ class Interceptor:
             self.since_keyframe.pop(tool, None)
             if not self.policy.select(tool, self.server_name).tiers:
                 return False, "passthrough"  # true passthrough: hands off, no state kept
-            return self._text_diff_or_store(block, tool, text), "non_json"
+            # A CDC text diff that actually shipped is a real diff hit — bucket it as
+            # `text_emitted`, not `non_json`, or the ledger's emitted-vs-non_json split
+            # misreports file-read/log-tail traffic.
+            changed = self._text_diff_or_store(block, tool, text)
+            return changed, ("text_emitted" if changed else "non_json")
 
         chosen = applied.text
         reason = "non_json"  # curr unparseable/too-deep: no JSON diff decision was possible
