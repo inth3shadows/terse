@@ -182,6 +182,86 @@ def test_second_same_tool_result_emits_smaller_lossless_diff():
     assert _cost_lt(diff_text, full)                     # and it is smaller
 
 
+# --- Phase 0: the in-context invariant (a diff base is per-session, never persisted) ---
+
+def _disjoint(n, base):
+    """n records whose ids start at `base` — two calls with different bases share no
+    record, so a diff between them is never smaller than the full (the base 'lost')."""
+    return {"result": [{"id": base + i, "status": "active",
+                        "url": "https://x.example/api/items"} for i in range(n)]}
+
+
+def test_diff_base_is_not_shared_across_interceptors():
+    # A base lives only in the Interceptor that produced it — never persisted to disk, never
+    # shared across sessions — so a fresh session's FIRST sight of a tool re-anchors as a
+    # full. This pins the invariant that makes the diff safe: it names "the prior result
+    # already in the model's context", which a cross-session base would not be.
+    prev, curr = _records(40), _records(40, change=5)
+    a = Interceptor(DIFF)
+    _emit(a, 1, "gh.api.items", prev)
+    assert transforms.DIFF_MARKER in _emit(a, 2, "gh.api.items", curr)   # A diffs
+    b = Interceptor(DIFF)                                                # new session
+    assert transforms.DIFF_MARKER not in _emit(b, 1, "gh.api.items", curr)  # no shared base
+
+
+def test_reconnect_clears_diff_base_and_args_so_next_result_re_anchors():
+    # An `initialize` means the client rebuilt its context window, so no prior result a diff
+    # could reference survives — every base (and its args attribution) must drop.
+    inter = Interceptor(DIFF)
+    prev, curr = _records(40), _records(40, change=5)
+    _emit(inter, 1, "gh.api.items", prev)
+    assert transforms.DIFF_MARKER in _emit(inter, 2, "gh.api.items", curr)
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 99, "method": "initialize"}))
+    assert inter.last == {} and inter.last_args == {}
+    assert transforms.DIFF_MARKER not in _emit(inter, 3, "gh.api.items", _records(40, change=7))
+
+
+# --- Phase 1: the diff_reason ledger datum (why a diff did/didn't fire) ---
+
+def _req_args(mid, name, args=None):
+    params = {"name": name}
+    if args is not None:
+        params["arguments"] = args
+    return json.dumps({"jsonrpc": "2.0", "id": mid, "method": "tools/call", "params": params})
+
+
+def _emit_args(inter, mid, tool, payload, args=None):
+    inter.note_request(_req_args(mid, tool, args))
+    inter.transform_response(_result_msg(mid, json.dumps(payload)))
+
+
+def _capture_stats():
+    reasons: list = []
+
+    def stats(tool, raw, emitted, passthrough, diff_reason=None):
+        reasons.append(diff_reason)
+
+    return reasons, stats
+
+
+def test_diff_reason_no_prior_then_emitted():
+    reasons, stats = _capture_stats()
+    inter = Interceptor(DIFF, stats=stats)
+    _emit_args(inter, 1, "gh.api.items", _records(40), {"q": "a"})
+    assert reasons[-1] == "no_prior"                       # tool unseen this session
+    _emit_args(inter, 2, "gh.api.items", _records(40, change=5), {"q": "a"})
+    assert reasons[-1] == "emitted"                        # small change diffs smaller
+
+
+def test_diff_reason_splits_same_vs_different_args_when_delta_loses():
+    # Disjoint record sets never diff smaller than the full, so the base "loses". The datum
+    # that decides whether arg-keying is worth building: was that losing base a DIFFERENT-
+    # args call (arg-keying could offer a same-args base instead) or the SAME args (an
+    # encoding miss keying would not fix)?
+    reasons, stats = _capture_stats()
+    inter = Interceptor(DIFF, stats=stats)
+    _emit_args(inter, 1, "gh.api.items", _disjoint(40, 0), {"page": 1})
+    _emit_args(inter, 2, "gh.api.items", _disjoint(40, 1000), {"page": 2})
+    assert reasons[-1] == "not_smaller_diff_args"          # base was the page=1 call
+    _emit_args(inter, 3, "gh.api.items", _disjoint(40, 2000), {"page": 2})
+    assert reasons[-1] == "not_smaller_same_args"          # base now the page=2 call
+
+
 def test_diff_on_by_default_and_policy_false_disables():
     # Since #75 completed the validation program, Policy.diff defaults ON: a plain
     # policy diffs the second same-tool result with no flag at all …
@@ -767,8 +847,8 @@ def test_capture_false_still_counts_in_the_payload_free_stats_ledger():
     _note_call(inter, 1, "secret.reveal")
     inter.transform_response(_result_msg(1, SECRET))
     assert len(seen) == 1
-    tool, raw, emitted, passthrough = seen[0]
-    assert tool == "secret.reveal" and passthrough is True
+    tool, raw, emitted, passthrough, reason = seen[0]
+    assert tool == "secret.reveal" and passthrough is True and reason == "passthrough"
     assert raw == SECRET and emitted == SECRET             # passthrough: untouched
 
 
@@ -809,8 +889,8 @@ def test_stats_callback_sees_raw_and_emitted_per_result():
     _note_call(inter, 1, "gh.api.items")
     out = inter.transform_response(_result_msg(1, _records_text()))
     assert len(seen) == 1
-    tool, raw, emitted, passthrough = seen[0]
-    assert tool == "gh.api.items" and passthrough is False
+    tool, raw, emitted, passthrough, reason = seen[0]
+    assert tool == "gh.api.items" and passthrough is False and reason == "no_prior"
     assert raw == _records_text()                       # true pre-transform snapshot
     assert emitted == json.loads(out)["result"]["content"][0]["text"]
     assert classify_decision(raw, emitted, passthrough) == "compressed"
@@ -830,7 +910,8 @@ def test_stats_callback_works_without_audit_and_labels_a_diff():
     inter.transform_response(_result_msg(1, json.dumps(first)))
     _note_call(inter, 2, "gh.api.items")
     inter.transform_response(_result_msg(2, json.dumps(second)))
-    assert [classify_decision(r, e, p) for (_t, r, e, p) in seen] == ["compressed", "diff"]
+    assert [classify_decision(r, e, p) for (_t, r, e, p, _rsn) in seen] == ["compressed", "diff"]
+    assert [s[4] for s in seen] == ["no_prior", "emitted"]   # the diff_reason datum agrees
 
 
 def test_stats_passthrough_tool_is_labeled_passthrough():
@@ -839,8 +920,8 @@ def test_stats_passthrough_tool_is_labeled_passthrough():
     inter = Interceptor(Policy(rules=[Rule("gh.*", ())]), stats=lambda *a: seen.append(a))
     _note_call(inter, 5, "gh.api.items")
     inter.transform_response(_result_msg(5, _records_text()))
-    (tool, raw, emitted, passthrough), = seen
-    assert passthrough is True and raw == emitted
+    (tool, raw, emitted, passthrough, reason), = seen
+    assert passthrough is True and raw == emitted and reason == "passthrough"
     assert classify_decision(raw, emitted, passthrough) == "passthrough"
 
 
