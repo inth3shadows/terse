@@ -1,0 +1,8 @@
+{
+  "name": "terse-bench-toon",
+  "private": true,
+  "description": "Throwaway workspace: pins the official TOON encoder for the terse-vs-TOON benchmark. node_modules is gitignored; run `npm install` in this dir to reproduce.",
+  "dependencies": {
+    "@toon-format/toon": "2.3.1"
+  }
+}

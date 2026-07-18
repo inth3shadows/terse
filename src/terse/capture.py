@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -204,14 +205,23 @@ def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
     """
     corpus = Path(corpus_dir)
     loaded: list[tuple[int, str, dict[str, Any]]] = []
+    skipped = 0
     for path in corpus.glob("*.json"):
         try:
             env = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
+            # A corrupt/torn envelope was previously dropped silently, so it just
+            # disappeared from coverage with no signal. Skipping is still correct (one
+            # bad file mustn't fail the whole measure), but count and surface it.
+            skipped += 1
             continue
         if isinstance(env, dict) and "raw" in env and "tool" in env:
             seq = env["captured_at"] if isinstance(env.get("captured_at"), int) else 0
             loaded.append((seq, path.name, env))
+    if skipped:
+        sys.stderr.write(
+            f"[terse] load_corpus: skipped {skipped} unreadable envelope(s) in "
+            f"{corpus} (corrupt JSON)\n")
     loaded.sort(key=lambda t: (t[0], t[1]))
     return [env for _, _, env in loaded]
 

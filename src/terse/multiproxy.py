@@ -111,6 +111,11 @@ _BROADCAST_METHODS = _AGGREGATE_METHODS + _SCATTER_METHODS
 # in this codebase. Sized generously (a broadcast is a rare event, not a hot path).
 _LOCAL_ID_MAP_MAX = 4096
 
+# Max backlog per peer's outbound sender queue. Past this a peer is not draining (a
+# stalled/hung HTTP peer); further lines are dropped for THAT peer rather than growing
+# proxy memory without bound — see _PeerSender.send.
+_PEER_QUEUE_MAX = 10_000
+
 # Bound on `Router._server_requests` (router-local id -> (peer_idx, original id)),
 # mirroring `_LOCAL_ID_MAP_MAX`'s reasoning: a peer that keeps issuing server-initiated
 # requests (sampling/createMessage, roots) the client never answers can't grow this
@@ -270,12 +275,27 @@ class _PeerSender:
     def __init__(self, transport: Transport, debug: bool = False):
         self._transport = transport
         self._debug = debug
-        self._q: queue.Queue[Any] = queue.Queue()
+        # BOUNDED: an unbounded queue let a client hammering one stalled HTTP peer grow
+        # memory without limit (its single worker drains slower than sends arrive). The
+        # bound turns that runaway into a dropped line for the already-broken peer instead
+        # — other peers' senders are independent, so healthy peers are unaffected.
+        self._q: queue.Queue[Any] = queue.Queue(maxsize=_PEER_QUEUE_MAX)
+        self._overflowed = False
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def send(self, line: str) -> None:
-        self._q.put(line)
+        try:
+            self._q.put_nowait(line)
+        except queue.Full:
+            # Peer worker can't keep up (stalled/hung peer). Drop rather than block the
+            # shared routing thread or grow memory. Announce the first drop so a silently
+            # falling-behind peer is visible; stay quiet after to avoid a stderr flood.
+            if not self._overflowed:
+                self._overflowed = True
+                sys.stderr.write(
+                    f"[terse-multiproxy] peer send queue full ({_PEER_QUEUE_MAX}); this "
+                    "peer is not draining — dropping line(s) to bound memory\n")
 
     def _run(self) -> None:
         while True:
@@ -292,7 +312,18 @@ class _PeerSender:
                     sys.stderr.write(f"[terse-multiproxy] send failed: {exc}\n")
 
     def close(self) -> None:
-        self._q.put(self._STOP)
+        # Enqueue STOP without ever blocking: against a FULL bounded queue a plain put()
+        # would deadlock shutdown behind a stalled peer. No more sends happen after close,
+        # so evicting a queued line to make room is safe — we're tearing this peer down.
+        while True:
+            try:
+                self._q.put_nowait(self._STOP)
+                break
+            except queue.Full:
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    pass
         self._thread.join(timeout=2.0)
 
 

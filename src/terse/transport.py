@@ -14,6 +14,7 @@ work over this new downstream (verified by test_transport.py).
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import queue
 import subprocess
@@ -22,6 +23,12 @@ import urllib.request
 from collections.abc import Iterator
 from typing import Any, Protocol, TextIO
 from urllib.parse import urlsplit
+
+# Upper bound on a single downstream HTTP response body held in memory. A misbehaving or
+# hostile server (the URL can come from an untrusted, repo-committed .mcp.json) could
+# otherwise stream an unbounded body and exhaust memory. Generous — real tool outputs are
+# large — but finite; an over-limit response becomes a legible JSON-RPC error, not an OOM.
+_MAX_RESPONSE_BYTES = 128 * 1024 * 1024
 
 # The only downstream URL schemes terse will dial. `urllib.request.urlopen` also
 # honors `file://`, `ftp://`, `data:` and more — so an unrestricted scheme turns a
@@ -43,6 +50,24 @@ _SENSITIVE_HEADER_TOKENS = ("authorization", "token", "secret", "key", "cookie")
 
 def _has_sensitive_header(headers: dict[str, str]) -> bool:
     return any(t in name.lower() for name in headers for t in _SENSITIVE_HEADER_TOKENS)
+
+
+def _is_metadata_host(hostname: str | None) -> bool:
+    """True for a link-local target — the cloud instance-metadata SSRF endpoint
+    (169.254.169.254 across AWS/Azure/GCP/DO, fe80::/10, and GCP's
+    metadata.google.internal alias). Never a legitimate MCP server, so refusing it costs
+    nothing while closing the highest-value SSRF target. Loopback and ordinary private/LAN
+    addresses stay allowed — local and homelab MCP servers are a first-class use case, and
+    a DNS name isn't resolved here (rebinding is a deeper problem out of this guard's scope)."""
+    if not hostname:
+        return False
+    if hostname.lower().rstrip(".") == "metadata.google.internal":
+        return True
+    try:
+        ip = ipaddress.ip_address(hostname.strip("[]"))
+    except ValueError:
+        return False  # a DNS name / non-literal — not classifiable without resolving
+    return ip.is_link_local
 
 
 class Transport(Protocol):
@@ -235,6 +260,12 @@ class HttpTransport:
         self.url = url
         self.headers = dict(headers or {})
         split = urlsplit(url)
+        if _is_metadata_host(split.hostname):
+            # Same construction-time, before-any-I/O contract as the checks around it.
+            raise ValueError(
+                f"terse: refusing to connect to link-local/metadata address "
+                f"{split.hostname!r} — this is the cloud instance-metadata SSRF target, "
+                "never a legitimate MCP endpoint")
         if (scheme == "http" and split.hostname not in _LOOPBACK_HOSTS
                 and _has_sensitive_header(self.headers)):
             # Same construction-time, before-any-I/O contract as the scheme check above.
@@ -293,7 +324,15 @@ class HttpTransport:
                 if sid:
                     self.session = sid
                 ctype = resp.headers.get("Content-Type", "")
-                body = resp.read()
+                # Bounded read: one byte past the cap tells us it overflowed without
+                # trusting a (possibly absent/lying) Content-Length. An over-limit body
+                # is refused with a legible error rather than being buffered to OOM.
+                body = resp.read(_MAX_RESPONSE_BYTES + 1)
+                if len(body) > _MAX_RESPONSE_BYTES:
+                    self._maybe_enqueue_error(
+                        line, f"terse: downstream response exceeded "
+                        f"{_MAX_RESPONSE_BYTES} bytes; refused")
+                    return
         except urllib.error.HTTPError as exc:
             # A 4xx/5xx status. Per MCP Streamable-HTTP the server MAY still have sent
             # a legitimate JSON-RPC error object in the body (e.g. "missing

@@ -66,17 +66,27 @@ def measure_payload(raw: str) -> dict[str, Any]:
     def _saved(a: int | None, b: int | None) -> int | None:
         return None if a is None or b is None else a - b
 
+    # "You cannot bank tokens you lost data to" (module docstring). If the lossless
+    # gate FAILED, the compressed form is not a legal substitute for raw, so its token
+    # deltas must not count toward any headline reduction — a downstream aggregator that
+    # forgot to filter on roundtrip_ok would otherwise inflate the reported % with
+    # savings from a payload the proxy would never actually emit. Zero the banked
+    # savings here at the source; the raw cl100k counts stay for transparency.
+    saved = {
+        "minify": _saved(raw_tok, min_tok),
+        "tabularize": _saved(min_tok, tab_tok),
+        "dictionary": _saved(tab_tok, cmp_tok),
+        "tier_total": _saved(raw_tok, cmp_tok),
+    }
+    if not gate:
+        saved = dict.fromkeys(saved, 0)
+
     return {
         "shape": shape,
         "applicable": True,
         "roundtrip_ok": gate,
         "cl100k": {"raw": raw_tok, "minified": min_tok, "tabular": tab_tok, "compressed": cmp_tok},
-        "saved_cl100k": {
-            "minify": _saved(raw_tok, min_tok),
-            "tabularize": _saved(min_tok, tab_tok),
-            "dictionary": _saved(tab_tok, cmp_tok),
-            "tier_total": _saved(raw_tok, cmp_tok),
-        },
+        "saved_cl100k": saved,
     }
 
 

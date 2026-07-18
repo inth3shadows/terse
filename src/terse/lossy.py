@@ -41,7 +41,12 @@ DEFAULT_MAX = 120  # default truncate length when a field spec omits "max"
 # worth saving a handful of tokens.
 RETRIEVE_TOOL = "terse.retrieve"
 DEFAULT_DROP_MIN = 200  # min serialized length (chars) of a value worth dropping
-HANDLE_LEN = 12         # sha1 hex prefix; 48 bits, ample for a per-session store
+# sha1 hex prefix. 64 bits: a collision would make one dropped value's handle overwrite
+# another's slot in the session store and later serve the wrong original back — the drop
+# GATE catches this within a single payload (resolve!=orig fails closed), but a COLLISION
+# ACROSS calls (handle reused for a different value) is only made negligibly unlikely, not
+# gated, so the width matters. 16 hex is still short enough to stay a cheap inline marker.
+HANDLE_LEN = 16
 
 # A loss annotation is appended so a reader (human or model) sees the field was cut and
 # by how much. Distinctive enough not to collide with real content.
@@ -145,6 +150,22 @@ def _truncate_specs(rule: Any) -> list[tuple[str, dict]]:
             if isinstance(s, dict) and s.get("lossy") == "truncate" and p not in crit]
 
 
+def unsupported_truncate_paths(obj: Any, rule: Any) -> list[str]:
+    """Truncate-marked paths whose resolved leaf/leaves are all of a type `_truncate` can
+    never reduce (dict/number/bool/None — only str and list truncate). Surfaced as a
+    warning so a field marked truncate that silently no-ops isn't mistaken for 'reduced'.
+    Absent fields and shape mismatches are omitted (the apply/gate layer reports those)."""
+    bad: list[str] = []
+    for path, _ in _truncate_specs(rule):
+        try:
+            present = [o for o, _ in _leaf_pairs(obj, obj, _parse_path(path))]
+        except PathError:
+            continue
+        if present and all(not isinstance(v, (str, list)) for v in present):
+            bad.append(path)
+    return bad
+
+
 def apply_lossy(obj: Any, rule: Any) -> Any:
     """Apply every truncate spec to `obj`, returning a new structure. Critical fields are
     never touched. Raises PathError if a path doesn't resolve (caller falls back)."""
@@ -190,7 +211,13 @@ def _handle(tool: str, path: str, serialized: str) -> str:
     """Content-addressed handle for a dropped value. Includes tool+path so identical bytes
     under different fields get distinct handles (clearer provenance), and is stable across
     runs (no RNG) so the same value dropped twice reuses one store slot."""
-    digest = hashlib.sha1(f"{tool}\x00{path}\x00{serialized}".encode()).hexdigest()
+    # Hash an UNAMBIGUOUS encoding of (tool, path, serialized). A bare-string value can
+    # itself contain the \x00 previously used as the field separator, so the old
+    # f"{tool}\x00{path}\x00{serialized}" let two distinct (tool,path,value) triples
+    # collide by shifting the boundary. json.dumps of a list is injection-proof: the
+    # structure, not an in-band delimiter, delimits the fields.
+    key = json.dumps([tool, path, serialized], ensure_ascii=False)
+    digest = hashlib.sha1(key.encode()).hexdigest()  # noqa: S324 — dedup key, not a MAC
     return digest[:HANDLE_LEN]
 
 
