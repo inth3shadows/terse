@@ -77,6 +77,17 @@ def test_write_restricted_reraises_on_fchmod_failure_without_masking(tmp_path, m
     assert list(tmp_path.iterdir()) == []
 
 
+def test_write_restricted_survives_a_stale_temp_from_a_crashed_run(tmp_path):
+    # A prior process SIGKILL'd mid-write can leave a staging temp behind. With a unique
+    # (mkstemp) temp name, a later write to the same target must NOT collide with it —
+    # a fixed pid-based name did (O_EXCL FileExistsError permanently broke the write).
+    target = tmp_path / "config.json"
+    target.write_text("original", encoding="utf-8")
+    (tmp_path / f".{target.name}.leftover.tmp").write_text("junk from a crash", encoding="utf-8")
+    sio.write_restricted(target, "new")  # must succeed, not raise FileExistsError
+    assert target.read_text(encoding="utf-8") == "new"
+
+
 def test_write_restricted_failed_write_preserves_existing_target(tmp_path, monkeypatch):
     # The whole point of the atomic write: a crash/error mid-write must leave the
     # PREVIOUS complete file intact, never a truncated ruin (the ~/.claude.json case).

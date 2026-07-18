@@ -6,6 +6,7 @@ before any content is written, so the restrictive mode is in place first, not af
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 # Refuse to open a symlink as the final path component, so a pre-planted symlink in a
@@ -32,13 +33,17 @@ def write_restricted(path: str | Path, text: str, *, mode: int = 0o600) -> None:
     # legitimately symlinked config is never silently converted into a regular file.
     if _NOFOLLOW and path.is_symlink():
         raise OSError(f"terse: refusing to write through a symlink at {path}")
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    # O_EXCL: never adopt a pre-planted temp; O_NOFOLLOW: don't follow a symlink at the
-    # temp name either.
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, mode)
+    # mkstemp gives a GUARANTEED-UNIQUE temp name in the target dir, created O_EXCL at
+    # 0600. A fixed `.name.tmp-<pid>` name would collide: a prior process SIGKILL'd
+    # mid-write leaves that temp, and since Linux reuses PIDs, a later write to the same
+    # path would hit O_EXCL -> FileExistsError and stay permanently broken until the stale
+    # temp is removed by hand. A random name also removes any symlink-preplant angle at the
+    # temp (its name is unpredictable), so dropping _NOFOLLOW on it is safe.
+    fd, tmpname = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp = Path(tmpname)
     try:
         os.fchmod(fd, mode)  # pin the mode before content, independent of umask
-    except OSError:
+    except BaseException:
         os.close(fd)
         _silent_unlink(tmp)
         raise
