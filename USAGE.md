@@ -188,15 +188,25 @@ anything):
 uv run terse mcp-status
 # [user] /home/you/.claude.json
 #   runecho              wrapped  policy=/home/you/.config/terse/policy.json
+#                        wraps=runecho-mcp  diff=default  stats=on
+#   codegraph            wrapped  policy=/home/you/.config/terse/gone.json (MISSING)
+#                        wraps=codegraph serve --mcp  diff=off  stats=on
 #   some-other-server    unwrapped
+uv run terse mcp-status --json   # the same rows as JSON, for scripts / CI checks
 ```
 
 Each server is one of `wrapped` (terse-managed, present), `unwrapped` (present,
 not terse's), or `orphaned-stash` (terse has a stash entry but the `mcpServers`
 entry it should match is gone — usually a sign the config was hand-edited after
 wrapping; `uninstall-mcp --all` won't touch it either since there's nothing to
-restore it *into*). `--file`/`--repo-path` override project/local scope the
-same way `install-mcp` does.
+restore it *into*). For a `wrapped` server a second line shows **what it actually
+fronts** (`wraps=…`), whether the cross-call **diff** tier is on/off/default, and
+whether the **stats** ledger is on — the things you need when a wrapped server
+misbehaves and the bare `wrapped` line can't tell you why. A policy file that has
+gone missing since install is flagged `(MISSING)` (the proxy would fail to launch
+without it); a *relative* policy path is never flagged, since it resolves against
+the launcher's cwd, which a status scan can't know. `--file`/`--repo-path` override
+project/local scope the same way `install-mcp` does.
 
 ### Let terse write the policy for you (`policy generate`)
 
