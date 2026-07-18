@@ -192,17 +192,17 @@ structural* gain, the hardest honest case:
   subtrees), which terse's dictionary tier folds and TOON's tabular layout cannot — it
   adds key-path overhead instead. terse's headline 76% on `gh_pulls` is exactly this:
   60 repeated copies of the same repo object collapsed to one legend entry.
-- **TOON is not beaten everywhere — and the real dividing axis is schema *width*, not
-  nesting.** On `gh_labels` (9 records × 7 columns — TOON's designed sweet spot) TOON leads,
-  **+19.0% vs terse's +15.2%**. A controlled synthetic sweep (rows held fixed, column count
-  varied) locates the crossover: terse wins at **≤3 columns per record**, TOON pulls ahead at
-  **≥4** and stabilizes ~6pp ahead by 8–12 columns. The mechanism explains it — terse's win
-  tracks row count and value repetition (dictionary hits), TOON's tracks column count (header
-  hoisting once per table instead of per record). So "flat vs nested" is the wrong frame;
-  "narrow vs wide records" is the right one. (The exact 3/4 boundary is construction-specific
-  — short key names shift it — so read it as "a few columns," not a constant.) TOON's own
-  published ~40% figures are real *for wide, uniform input*; this corpus deliberately tests
-  the other regime, so treat it as "different niche," not "terse strictly dominant."
+- **TOON is not beaten everywhere — and the boundary is value repetition, not column
+  width.** On `gh_labels` (9 records × 7 columns — TOON's designed sweet spot) TOON leads,
+  **+19.0% vs terse's +15.2%**. terse's decisive corpus win comes from **nested repeated
+  subtrees and long repeated string values** — its dictionary and subtree-aliasing tiers fold
+  them, TOON's flat tabular layout cannot — which is exactly what real GitHub records carry.
+  On *stripped-flat synthetic tables* with none of that redundancy, the two converge: a seeded
+  column-width sweep (`uv run scripts/bench/width_sweep.py`) shows them within a few points at
+  every width, trading the lead by parity, with **no clean column-count crossover** (an earlier
+  claim of a ≤3/≥4 boundary did not reproduce — see BENCHMARKS.md). So the honest frame is:
+  terse wins where records repeat or nest (real tool output); TOON stays competitive on flat,
+  low-redundancy uniform tables — "different niche," not "terse strictly dominant."
 - **Neither tool helps much when free text dominates** (`gh_commits_flat`: long commit
   messages, ~2% either way) or on tiny single objects — matching terse's own "selective,
   0–30%, per-tool" claim rather than contradicting it.
@@ -246,6 +246,7 @@ of adoption.
 
 ## Related Documentation
 
+- [Benchmarks](BENCHMARKS.md) — dated, reproducible terse-vs-TOON + competitor numbers
 - [Verify it yourself](VERIFY.md) — prove losslessness, savings, and no-egress locally
 - [Technical Reference](TECHNICAL.md) — architecture, pipeline, policy schema, limitations
 - [Usage Guide](USAGE.md) — running the CLI day-to-day and reading its output
