@@ -206,6 +206,13 @@ def _pct_saved(raw: int, out: int) -> str:
     return f"{(raw - out) / raw * 100:5.1f}%" if raw else "    –"
 
 
+def _hit_rate(diffs: int, results: int) -> str:
+    """diffs / results as a percent — the cross-call diff hit rate this ledger exists
+    to measure (a raw count alone is meaningless without its denominator). Blank on a
+    zero denominator, which can't happen per-row but keeps the helper total."""
+    return f"{diffs / results * 100:4.0f}%" if results else "    –"
+
+
 def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
                        window: str | None = None) -> str:
     """Human-readable rollup. Tokens are the headline when available; chars are the
@@ -214,8 +221,14 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
     scope = f"last {window}" if window else "all time"
     lines = [f"terse stats — {scope}  (ledger: {log_path})", ""]
     if total["results"] == 0:
-        lines.append("no results recorded — has a terse-wrapped server handled a "
-                     "tool call since stats shipped?")
+        if window:
+            # The ledger isn't necessarily empty — the window filtered everything out.
+            # Point at the window, not at "nothing ever recorded" (the wrong cause).
+            lines.append(f"no results in the last {window} — widen --since or drop it "
+                         "(older results may still be in the ledger).")
+        else:
+            lines.append("no results recorded — has a terse-wrapped server handled a "
+                         "tool call since stats shipped?")
         return "\n".join(lines) + "\n"
     tok_raw, tok_out = total["raw_tokens"], total["out_tokens"]
     lines.append(f"results: {total['results']}   "
@@ -232,13 +245,21 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
     lines.append(f"chars: {total['raw_chars']:,} -> {total['out_chars']:,} "
                  f"({_pct_saved(total['raw_chars'], total['out_chars']).strip()} saved)")
     lines.append("")
+    # Mirror the header's unit choice per-row: tokens when the ledger has any, else
+    # chars — otherwise a tiktoken-less ledger renders the whole (most useful) per-tool
+    # table as a wall of zeros while the header above honestly shows char savings.
+    use_tokens = bool(tok_raw or tok_out)
+    raw_col, out_col = ("tok raw", "tok out") if use_tokens else ("chr raw", "chr out")
     lines.append(f"{'server':<18} {'tool':<34} {'results':>7} {'diffs':>5} "
-                 f"{'tok raw':>10} {'tok out':>10} {'saved':>6}")
+                 f"{'diff%':>5} {raw_col:>10} {out_col:>10} {'saved':>6}")
     for row in tools:
+        raw_n = row["raw_tokens"] if use_tokens else row["raw_chars"]
+        out_n = row["out_tokens"] if use_tokens else row["out_chars"]
         lines.append(f"{row['server'][:18]:<18} {row['tool'][:34]:<34} "
                      f"{row['results']:>7} {row['diffs']:>5} "
-                     f"{row['raw_tokens']:>10,} {row['out_tokens']:>10,} "
-                     f"{_pct_saved(row['raw_tokens'], row['out_tokens']):>6}")
+                     f"{_hit_rate(row['diffs'], row['results']):>5} "
+                     f"{raw_n:>10,} {out_n:>10,} "
+                     f"{_pct_saved(raw_n, out_n):>6}")
     return "\n".join(lines) + "\n"
 
 

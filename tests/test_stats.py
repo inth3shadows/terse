@@ -162,10 +162,47 @@ def test_report_empty_ledger_says_so():
     assert "no results recorded" in out
 
 
+def test_report_empty_window_points_at_the_window_not_at_nothing_ever():
+    # A --since window that filters everything out isn't the same as an empty ledger:
+    # the old message ("no results recorded") pointed at the wrong cause.
+    out = build_stats_report(aggregate([]), log_path="/x", window="30m")
+    assert "no results in the last 30m" in out
+    assert "widen --since" in out
+    assert "no results recorded" not in out
+
+
 def test_report_all_untokenized_falls_back_to_chars_explicitly():
     agg = aggregate([_rec(raw_t=None, out_t=None, raw_c=1000, out_c=100)])
     out = build_stats_report(agg, log_path="/x")
     assert "tokens: unavailable" in out and "1,000 -> 100" in out
+
+
+def test_report_per_tool_table_uses_chars_when_untokenized_not_all_zeros():
+    # Without tiktoken at record time, the per-tool table used to render every token
+    # column as 0 while the header honestly showed char savings — the most useful part
+    # of the report went blank. It must mirror the header and fall back to chars.
+    agg = aggregate([_rec(server="rune", tool="structure",
+                          raw_t=None, out_t=None, raw_c=1000, out_c=100)])
+    out = build_stats_report(agg, log_path="/x")
+    assert "chr raw" in out and "chr out" in out  # table switched units, labeled
+    assert "tok raw" not in out                    # no token column shown at all
+    # the per-tool row carries real char numbers + a computed saving, not zeros
+    table = out.splitlines()[-1]
+    assert "structure" in table and "1,000" in table and "90.0%" in table
+
+
+def test_report_shows_diff_hit_rate_per_tool():
+    # The diff hit rate (diffs / results) is the metric the ledger exists for; a bare
+    # count is meaningless without its denominator.
+    agg = aggregate([_rec(tool="a", decision="diff"),
+                     _rec(tool="a", decision="diff"),
+                     _rec(tool="a", decision="compressed"),
+                     _rec(tool="a", decision="compressed")])
+    out = build_stats_report(agg, log_path="/x")
+    assert "diff%" in out
+    table = out.splitlines()[-1]
+    assert table.split()[2] == "4" and table.split()[3] == "2"  # results, diffs
+    assert "50%" in table                                       # 2 / 4 hit rate
 
 
 # --- the proxy-side writer callback ---
