@@ -109,11 +109,13 @@ raw tool output (JSON text)
   `build_tokenizer_report`.
 - **`html_report.py`** — `build_html_report`'s charted HTML counterpart to
   `build_report`: inline-SVG diverging bars (savings), stacked bars (tier
-  attribution), and a forest plot (`forest_plot`, per-model accuracy + 95% CI,
-  reserved for a future `fluency --diff --html`). Pure stdlib string templates —
-  no JS, no CDN, no new dependency — reuses `report.py`'s `_form_stats` /
-  `_worst_case_gap` so the verdict never diverges from the markdown. Wired via
-  `--html` on `measure`/`verify` (writes next to `--out`, same basename, `.html`
+  attribution), and a forest plot (`forest_plot`, per-model accuracy + 95% CI).
+  `build_html_diff_report` wraps the forest plot into the comprehension-gap page
+  behind `fluency --diff --html` (and `--diff-soak` / `--text-diff-eval`, whose
+  paired results share the same shape). Pure stdlib string templates — no JS, no
+  CDN, no new dependency — reuses `report.py`'s `_form_stats` / `_worst_case_gap`
+  so the verdict never diverges from the markdown. Wired via `--html` on
+  `measure`/`verify`/`fluency` (writes next to `--out`, same basename, `.html`
   suffix).
 - **`terminal_report.py`** — zero-new-artifact bar-chart counterpart to `report.py`'s
   markdown. `build_terminal_report` covers `build_report`'s savings-by-shape /

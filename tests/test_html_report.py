@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from terse.html_report import (
+    build_html_diff_report,
     build_html_report,
     diverging_bar_chart,
     forest_plot,
@@ -95,3 +96,18 @@ def test_forest_plot_pass_fail_badges():
     svg = forest_plot(rows, "diff-form", "full-terse")
     assert "PASS" in svg and "FAIL" in svg
     assert svg.count("<circle") >= 4  # 2 models x 2 series
+
+
+def test_build_html_diff_report_renders_verdict_and_forest():
+    # Paired diff-family results (terse_ok = control, diff_ok = form) -> a forest plot
+    # + a PASS/FAIL verdict gated on the worst model. This is what `fluency --diff --html`
+    # writes; it was built but had no wiring or test until now.
+    rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
+             "trials": 1, "terse_ok": 1, "diff_ok": 1} for i in range(10)]
+    html = build_html_diff_report({"m": rows}, "diff-form", "full-terse")
+    assert "<!doctype html>" in html
+    assert "diff-form" in html and "full-terse" in html
+    assert "PASS" in html and "<svg" in html
+    # no scripts / external fetches (the SVG xmlns is not egress) — matches the
+    # no-network contract the main report is held to.
+    assert "<script" not in html and "fetch(" not in html

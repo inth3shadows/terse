@@ -469,7 +469,10 @@ accuracy with a `±` 95% bound, so the verdict is a tight bound rather than dire
 
 Add `--bars` for the same verdict as a terminal forest plot — a point + 95% CI track
 per model (best terse-form vs raw, or diff-form vs full-terse under `--diff`) with a
-pass/fail badge, printed straight to the terminal.
+pass/fail badge, printed straight to the terminal. For a charted HTML version of that
+forest plot, add `--html` to any of the paired diff-family evals (`--diff`,
+`--diff-soak`, `--text-diff-eval`) — it writes next to `--out` with a `.html` suffix,
+same inline-SVG/no-JS/no-CDN form as `measure --html`.
 
 ### Does the model actually use `terse.retrieve`? (`fluency --drop-eval`)
 

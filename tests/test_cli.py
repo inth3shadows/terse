@@ -580,6 +580,48 @@ def test_fluency_cmd_keyless_pack_is_written_with_restricted_permissions(tmp_pat
         assert mode == 0o600, f"pack file mode {oct(mode)} is not restricted to 0600"
 
 
+def test_fluency_diff_html_writes_forest_plot(tmp_path, monkeypatch, capsys):
+    # `fluency --diff --html` writes the forest-plot companion next to --out. The diff
+    # eval needs a live model, so stub the answerer factory with a canned one — this
+    # exercises the real parser flag -> branch -> _maybe_write_diff_html wiring.
+    from terse import cli
+
+    monkeypatch.setattr(cli, "_build_answerers", lambda args, make: {"m": lambda s, u: "9"})
+    corpus = tmp_path / "corpus"
+    prev = json.dumps([{"id": i, "status": "active-long-status-value", "score": i}
+                       for i in range(8)])
+    curr = json.dumps([{"id": i, "status": "active-long-status-value", "score": i}
+                       for i in range(8)] + [{"id": 8, "status": "active-long-status-value",
+                                              "score": 99}])
+    assert main(["capture", str(_write(tmp_path, "prev.json", prev)),
+                 "--tool", "demo", "--corpus", str(corpus)]) == 0
+    assert main(["capture", str(_write(tmp_path, "curr.json", curr)),
+                 "--tool", "demo", "--corpus", str(corpus)]) == 0
+    capsys.readouterr()
+
+    out_md = tmp_path / "rep" / "diff.md"
+    assert main(["fluency", "--diff", "--html", "--corpus", str(corpus),
+                 "--out", str(out_md)]) == 0
+    assert out_md.exists()
+    html = out_md.with_suffix(".html")
+    assert html.exists()
+    text = html.read_text(encoding="utf-8")
+    assert "<svg" in text and "diff-form" in text and "full-terse" in text
+
+
+def test_fluency_html_flag_ignored_in_base_mode_prints_note(tmp_path, capsys):
+    # --html only renders in the paired diff-family evals; elsewhere it must say so
+    # rather than be a silent no-op.
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(_write(tmp_path, "p.json", PAYLOAD)),
+                 "--tool", "demo", "--corpus", str(corpus)]) == 0
+    capsys.readouterr()
+    rc = main(["fluency", "--html", "--corpus", str(corpus),
+               "--pack", str(tmp_path / "pack.json"), "--out", str(tmp_path / "rep.md")])
+    assert rc == 0
+    assert "applies only to --diff" in capsys.readouterr().out
+
+
 def test_tune_cmd_surfaces_drop_candidate_and_writes_policy(tmp_path, capsys):
     payload = json.dumps({"result": [{"id": i, "description": "d" * 250 + str(i)}
                                      for i in range(20)]})
