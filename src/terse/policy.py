@@ -290,11 +290,15 @@ def _lossy_warnings(rule: Rule) -> list[str]:
     for path in lossy_mod.unknown_text_selectors(rule):
         out.append(f"field '{path}': unknown text selector; known: "
                    f"{sorted(lossy_mod.TEXT_SELECTORS)} (ignored)")
+    for path, mode in lossy_mod.unsupported_text_modes(rule):
+        out.append(f"field '{path}': lossy mode '{mode}' is not span-addressable; a text "
+                   "selector supports only 'drop-to-retrieve' (ignored)")
     return out
 
 
 def apply(raw: str, tool: str, policy: Policy,
-          drop_sink: Any = None, server: str | None = None) -> Applied:
+          drop_sink: Any = None, server: str | None = None,
+          force_lossless: bool = False) -> Applied:
     """Compress one raw payload per policy. Lossless by default; a field marked
     `truncate` (and not `critical`) is reduced, gated by the acceptable-loss invariant.
     Non-JSON passes through.
@@ -318,7 +322,10 @@ def apply(raw: str, tool: str, policy: Policy,
     # marks a field lossy. Enforced here on the VERIFIED server identity (#83), not on a
     # tool-name match, so a mislabeled/renamed rule cannot leak a credential payload through
     # a truncate/drop. Warn (not silently) when this actually suppresses a lossy request.
-    never_lossy = policy.server_never_lossy(server)
+    # `force_lossless` is the caller-side twin of the never-lossy SERVER floor: the proxy
+    # sets it per-RESULT for an `isError` payload, which no policy could express because
+    # it is a property of the response, not of the server or tool.
+    never_lossy = policy.server_never_lossy(server) or force_lossless
     if never_lossy and rule.lossy_fields():
         warnings.append(f"lossy fields suppressed: server '{server}' is never-lossy "
                         "(credential/personal store) — kept fully lossless")
