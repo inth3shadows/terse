@@ -9,6 +9,24 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Fixed
+- **`$`-prefixed JSON keys are drop-eligible again.** Reserving the whole `$` sigil for
+  text selectors silently disabled `drop-to-retrieve` on ordinary JSON keys like
+  `$schema`/`$ref`/`$id` (every JSON Schema payload has them). Only the `$text.` prefix
+  is reserved now. Regression introduced with the text selector, caught in review before
+  any release carried it.
+- **A known text selector carrying an unsupported mode now warns** instead of doing
+  nothing silently — `{"$text.code_blocks": {"lossy": "truncate"}}` was the one config
+  that failed with no signal at all.
+- **Fence scanning follows CommonMark 4.5**: a backtick fence's info string may not
+  contain backticks. Permitting them let an inline-code prose line (```` ```py``` ````)
+  open a phantom fence, so a prose region was evicted as if it were source. The recovery
+  gate could not catch this — it proves a span is restorable, never that it was code.
+- **`isError` tool results are never evicted to a handle.** An error is what the model
+  must read to recover; a lossy transform must not put a retrieve round-trip in front of
+  it. Added a per-result `force_lossless` override, the response-level twin of the
+  never-lossy server floor.
+
 ### Added
 - **`drop-to-retrieve` for non-JSON payloads, addressed by span.** A policy field can now
   name `"$text.code_blocks"`, which evicts each fenced code block over `min` chars from a

@@ -111,9 +111,9 @@ def _text_questions_and_staging(
     JSON field is one value among many; a dropped fenced code block is a chunk of source
     the surrounding prose may explicitly tell the model it has "already read" — so the
     recall question asks for an EXACT line of a dropped block (unanswerable without
-    retrieving, and un-guessable), while the precision question asks how many blocks were
-    omitted (answerable by counting visible markers, so any retrieve call here is a pure
-    over-fetch). Both are computed from `apply()`'s own sink, never guessed.
+    retrieving, and un-guessable), while the precision question totals the visible markers'
+    `bytes` fields (readable off the emitted text without ever needing the dropped content,
+    so any retrieve call here is a pure over-fetch). Both come from `apply()`'s own sink.
     """
     if not lossy_mod._text_drop_specs(rule):
         return [], None, None  # no text selector on this rule -> nothing to test
@@ -152,12 +152,19 @@ def _text_questions_and_staging(
         needs_retrieve=True,
         expected_handle=handle,
     )
+    # Anchored on the SUM of the visible markers' `bytes` fields, not the marker count:
+    # a count is 1 on the common single-drop payload and so is answerable by guessing,
+    # which inflated answer accuracy while proving nothing. A byte total has to be read
+    # off the emitted text, yet still never requires the dropped content itself — so it
+    # stays a clean no-over-fetch probe, the way the JSON path's record-count anchor is.
+    total_bytes = sum(len(staging[h]) for h in dict.fromkeys(markers) if h in staging)
     precision_q = DropQuestion(
         qid="drop-text-precision",
         kind="precision",
-        prompt="How many blocks were omitted from this payload?",
+        prompt=("Summing the \"bytes\" field of every omitted-block marker shown in this "
+                "payload, what is the total?"),
         instruction="Reply with a single integer and nothing else.",
-        expected=len(markers),
+        expected=total_bytes,
         needs_retrieve=False,
         expected_handle=None,
     )

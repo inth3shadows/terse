@@ -208,9 +208,106 @@ def test_text_drop_questions_are_grounded_in_the_real_store():
     assert recall.expected_handle in store
     assert recall.expected in store[recall.expected_handle]  # the line really is in the span
     assert recall.needs_retrieve and not precision.needs_retrieve
-    assert precision.expected == 1
+    assert precision.expected == sum(len(v) for v in store.values())
 
 
 def test_no_questions_when_nothing_was_dropped():
     assert dropeval.gen_text_drop_questions("no fences here", _drop_rule(), "t") == []
     assert dropeval.gen_text_drop_questions(DOC, _rule({}), "t") == []
+
+
+# --------------------------------------------------------------------------- #
+# Regressions from the post-merge review of #115
+# --------------------------------------------------------------------------- #
+def test_dollar_prefixed_json_key_is_still_a_json_field_path():
+    """`$schema`/`$ref`/`$id` are ordinary JSON keys. Reserving the whole `$` sigil for
+    text selectors silently disabled drop-to-retrieve on them — only `$text.` is ours."""
+    obj = {"$schema": "x" * 900, "name": "t"}
+    rule = _rule({"$schema": {"lossy": "drop-to-retrieve"}})
+    applied, store = _apply(json.dumps(obj), rule)
+    assert len(store) == 1
+    assert lossy.DROP_KEY in applied.text
+    assert store[next(iter(store))] == "x" * 900
+    assert not any("unknown text selector" in w for w in _lossy_warnings(rule))
+
+
+def test_known_selector_with_unsupported_mode_warns_instead_of_going_silent():
+    rule = _rule({lossy.TEXT_SELECTOR_CODE_BLOCKS: {"lossy": "truncate", "max": 100}})
+    applied, store = _apply(DOC, rule)
+    assert applied.text == DOC and store == {}
+    assert any("not span-addressable" in w for w in _lossy_warnings(rule))
+
+
+def test_inline_code_prose_line_does_not_open_a_phantom_fence():
+    """CommonMark 4.5: a backtick fence's info string may not contain backticks. Allowing
+    it made ```` ```py``` ```` open a fence and swallow the prose that followed."""
+    prose = "\n".join(f"real prose line {i} that must stay visible" for i in range(15))
+    text = f"intro\n```py```\n{prose}\n```\nafter\n"
+    applied, store = _apply(text, _drop_rule(min=100))
+    assert applied.text == text and store == {}
+    # The trailing bare ``` legitimately opens an unterminated fence (CommonMark), but it
+    # starts AFTER the prose — the bug was the prose itself landing inside a span.
+    assert all(start > text.index("real prose line 0") for start, _ in lossy.fenced_spans(text))
+    assert "real prose line 7 that must stay visible" in applied.text
+
+
+def test_tilde_fence_may_still_carry_backticks_in_its_info_string():
+    text = f"~~~`weird`\n{CODE}\n~~~\n"
+    assert [text[s:e] for s, e in lossy.fenced_spans(text)] == [text]
+
+
+def test_error_results_are_never_evicted_to_a_handle():
+    """An isError payload is what the model must READ to recover; a lossy transform must
+    not put a retrieve round-trip in front of it."""
+    applied, store = _apply(DOC, _drop_rule(), policy=Policy(rules=[_drop_rule()]))
+    assert applied.text != DOC  # sanity: it WOULD drop without the override
+    forced = apply(DOC, "codegraph_explore", Policy(rules=[_drop_rule()]),
+                   drop_sink={}.__setitem__, force_lossless=True)
+    assert forced.text == DOC
+
+
+def test_drop_marker_shape_is_shared_by_both_paths():
+    """One constructor for the wire form, so the text regex can never drift from what the
+    JSON path emits."""
+    marker = lossy.drop_marker("abc", 12)
+    assert marker == {lossy.DROP_KEY: "abc", "bytes": 12, "retrieve": lossy.RETRIEVE_TOOL}
+    wire = json.dumps(lossy.drop_marker("a" * 16, 12), separators=(",", ":"))
+    assert lossy._TEXT_MARKER_RE.match(wire)
+
+
+def test_precision_question_requires_reading_the_payload():
+    """A marker COUNT is 1 on a single-drop payload — guessable. The byte total is not."""
+    rule = _drop_rule()
+    text = DOC + "\n#### src/b.py\n\n```go\n" + CODE + "\n```\n"
+    _, precision = dropeval.gen_text_drop_questions(text, rule, "codegraph_explore")
+    _, store = _apply(text, rule)
+    assert precision.expected == sum(len(v) for v in store.values())
+    assert precision.expected > len(store)  # not the count
+
+
+def test_run_drop_fluency_scores_a_text_payload():
+    """The text branch of the live-model harness, end to end with a scripted answerer."""
+    rule = _drop_rule()
+    envelopes = [{"tool": "codegraph_explore", "raw": DOC, "sha": "deadbeef"}]
+    recall, _ = dropeval.gen_text_drop_questions(DOC, rule, "codegraph_explore")
+
+    def answerer(messages):
+        last = messages[-1]
+        if last["role"] == "tool":                      # retrieved: answer from the span
+            return dropeval.Turn(text=json.dumps(recall.expected))
+        return dropeval.Turn(text="", tool_calls=[dropeval.ToolCall(
+            call_id="c1", name=lossy.RETRIEVE_TOOL,
+            arguments={"handle": recall.expected_handle})])
+
+    rows = dropeval.run_drop_fluency(envelopes, lambda _t: rule, {"m": answerer})["m"]
+    recall_row = next(r for r in rows if r["kind"] == "recall")
+    assert recall_row["retrieve_ok"] == 1 and recall_row["handle_ok"] == 1
+    assert recall_row["answer_ok"] == 1
+    assert recall_row["tool"] == "codegraph_explore" and recall_row["sha"] == "deadbeef"
+
+
+def test_run_drop_text_payload_is_the_single_payload_entry_point():
+    rule = _drop_rule()
+    rows = dropeval.run_drop_text_payload(
+        DOC, rule, "codegraph_explore", lambda _m: dropeval.Turn(text="nope"))
+    assert [r["kind"] for r in rows] == ["recall", "precision"]

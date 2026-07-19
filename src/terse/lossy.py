@@ -62,10 +62,13 @@ _LIST_MARK = "…⟨+{n} items⟩"
 # structurally unreachable by drop-to-retrieve. A `$`-sigil path names a SPAN SELECTOR
 # over the raw text instead: `$text.code_blocks` = every fenced block in the payload.
 #
-# The sigil (not a bare name) is what keeps the two path languages from colliding: `.`
-# is the JSON path separator, so a selector had to be un-parseable as a field path or a
-# payload with a literal top-level "text" key would silently claim the selector's meaning.
-TEXT_PATH_SIGIL = "$"
+# What separates the two path languages is the FULL `$text.` prefix, not a bare `$`.
+# `$` alone is not reserved: `$schema`, `$ref` and `$id` are ordinary JSON keys (every
+# JSON Schema payload has them, including MCP's own `inputSchema`), and treating any
+# `$`-prefixed path as a text selector silently disabled drop-to-retrieve on those fields
+# — a regression for policies that predate text selectors entirely. Reserve the narrowest
+# thing that does the job: a `$text.` prefix, which no real JSON key carries.
+TEXT_PATH_PREFIX = "$text."
 TEXT_SELECTOR_CODE_BLOCKS = "$text.code_blocks"
 TEXT_SELECTORS = frozenset({TEXT_SELECTOR_CODE_BLOCKS})
 # Higher than DEFAULT_DROP_MIN: a text span costs a whole retrieve round-trip AND the
@@ -79,8 +82,18 @@ _TEXT_MARKER_RE = re.compile(
     r'"bytes":\d+,"retrieve":"[^"]*"\}$', re.M)
 # CommonMark fences: three-or-more backticks or tildes, optionally indented, the opener
 # optionally carrying an info string. A closing fence is the same character, at least as
-# long, with no info string.
-_FENCE_OPEN_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<fence>`{3,}|~{3,})(?P<info>[^\n]*)$")
+# long, with no info string. A backtick fence's info string may NOT contain backticks (CommonMark 4.5) — permitting
+# them made an inline-code prose line like ```` ```py``` ```` open a phantom fence, so an
+# entire prose region was evicted as if it were source. The recovery gate cannot catch
+# that: it proves a span is restorable, never that the span was code. Tilde fences do
+# allow backticks in their info string. Only `fence` is ever read.
+_FENCE_OPEN_RE = re.compile(r"^[ \t]*(?:(?P<fence>`{3,})[^`\n]*|(?P<tfence>~{3,})[^\n]*)$")
+
+
+def is_text_path(path: str) -> bool:
+    """True for a path in the text-selector namespace, known or misspelled. The single
+    predicate both path languages branch on, so they can never disagree about ownership."""
+    return path.startswith(TEXT_PATH_PREFIX)
 
 
 class PathError(ValueError):
@@ -259,7 +272,16 @@ def _drop(value: Any, tool: str, path: str, min_len: int,
         return value
     handle = _handle(tool, path, serialized)
     sink(handle, value)
-    return {DROP_KEY: handle, "bytes": len(serialized), "retrieve": RETRIEVE_TOOL}
+    return drop_marker(handle, len(serialized))
+
+
+def drop_marker(handle: str, size: int) -> dict:
+    """THE drop marker's wire shape — one constructor for both the JSON and the text path,
+    and the shape `_TEXT_MARKER_RE` is written against. Previously each emit site built
+    this dict independently, so adding a key (or changing serializer spacing) would have
+    silently stopped the text regex matching, degrading the feature to a permanent,
+    errorless passthrough."""
+    return {DROP_KEY: handle, "bytes": size, "retrieve": RETRIEVE_TOOL}
 
 
 def _is_drop_marker(v: Any) -> bool:
@@ -274,7 +296,7 @@ def _drop_specs(rule: Any) -> list[tuple[str, dict]]:
     crit = critical_paths(rule)
     return [(p, s) for p, s in rule.fields.items()
             if isinstance(s, dict) and s.get("lossy") == "drop-to-retrieve"
-            and p not in crit and not p.startswith(TEXT_PATH_SIGIL)]
+            and p not in crit and not is_text_path(p)]
 
 
 def apply_drops(obj: Any, rule: Any, tool: str, sink: Callable[[str, Any], None]) -> Any:
@@ -320,7 +342,20 @@ def unknown_text_selectors(rule: Any) -> list[str]:
     so a typo'd `$text.codeblocks` fails loudly instead of quietly compressing nothing."""
     return sorted(p for p, s in rule.fields.items()
                   if isinstance(s, dict) and s.get("lossy")
-                  and p.startswith(TEXT_PATH_SIGIL) and p not in TEXT_SELECTORS)
+                  and is_text_path(p) and p not in TEXT_SELECTORS)
+
+
+def unsupported_text_modes(rule: Any) -> list[tuple[str, str]]:
+    """(path, mode) for a KNOWN text selector asked to run a mode the text path cannot
+    execute. Only drop-to-retrieve is span-addressable: truncate/summarize operate on a
+    parsed value. Without this, a correctly-spelled selector carrying the wrong mode was
+    the one config that failed completely silently — `_text_drop_specs` filtered it out,
+    and `unknown_text_selectors` skipped it because the NAME was valid."""
+    crit = critical_paths(rule)
+    return sorted((p, s["lossy"]) for p, s in rule.fields.items()
+                  if isinstance(s, dict) and s.get("lossy")
+                  and p in TEXT_SELECTORS and p not in crit
+                  and s["lossy"] != "drop-to-retrieve")
 
 
 def fenced_spans(text: str) -> list[tuple[int, int]]:
@@ -344,7 +379,7 @@ def fenced_spans(text: str) -> list[tuple[int, int]]:
         if open_at is None:
             m = _FENCE_OPEN_RE.match(stripped)
             if m:
-                open_at, fence = start, m.group("fence")
+                open_at, fence = start, (m.group("fence") or m.group("tfence"))
             continue
         # Inside a block: a closer is the same fence character, at least as long, alone
         # on its line. Anything else (including a longer run of the OTHER char) is content.
@@ -366,19 +401,25 @@ def apply_text_drops(text: str, rule: Any, tool: str,
     out = text
     for path, spec in _text_drop_specs(rule):
         min_len = int(spec.get("min", DEFAULT_TEXT_DROP_MIN))
-        # Splice back-to-front so earlier spans' offsets stay valid as later ones shrink.
-        for start, end in reversed(fenced_spans(out)):
+        # One forward pass building segments, joined once at the end: splicing per span
+        # recopied the whole payload each time (O(payload x spans)) on the proxy hot path.
+        parts: list[str] = []
+        cursor = 0
+        for start, end in fenced_spans(out):
             span = out[start:end]
             if len(span) < min_len:
                 continue
             handle = _handle(tool, path, span)
             sink(handle, span)
-            marker = json.dumps({DROP_KEY: handle, "bytes": len(span),
-                                 "retrieve": RETRIEVE_TOOL},
+            marker = json.dumps(drop_marker(handle, len(span)),
                                 separators=(",", ":"), ensure_ascii=False)
             # Keep the span's own trailing newline so the surrounding prose's line
             # structure (and therefore the restore splice) is unambiguous.
-            out = out[:start] + marker + ("\n" if span.endswith("\n") else "") + out[end:]
+            parts.append(out[cursor:start])
+            parts.append(marker + ("\n" if span.endswith("\n") else ""))
+            cursor = end
+        parts.append(out[cursor:])
+        out = "".join(parts)
     return out
 
 

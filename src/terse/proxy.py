@@ -365,6 +365,14 @@ class Interceptor:
                            if isinstance(b, dict) and b.get("type") == "text"
                            and isinstance(b.get("text"), str)]
 
+            # An `isError` result is a failure the model has to READ to act on — a stack
+            # trace or a "server said no" message. Compression is fine (it's lossless and
+            # the text stays legible), but a LOSSY transform must not put an extra
+            # retrieve round-trip between the model and an error at exactly the moment it
+            # is trying to recover. Forced fully lossless, same suppression the never-lossy
+            # server floor applies, so an error payload is never evicted to a handle.
+            error_result = bool(result.get("isError")) if isinstance(result, dict) else False
+
             # `"capture": false` on the matching rule — never PERSIST this tool's payloads
             # (#85). Gates BOTH sinks that write raw content to disk: the corpus tee just
             # below and the audit/replay log further down (its records embed the raw
@@ -398,10 +406,12 @@ class Interceptor:
             # text block (the overwhelmingly common tool-result shape); multi-block results
             # take the plain per-block compression path.
             if self.diff and len(text_blocks) == 1:
-                changed, diff_reason = self._compress_or_diff(text_blocks[0], tool, args_key)
+                changed, diff_reason = self._compress_or_diff(
+                    text_blocks[0], tool, args_key, force_lossless=error_result)
             else:
                 for block in text_blocks:
-                    new_text = self._compress(block["text"], tool)
+                    new_text = self._compress(block["text"], tool,
+                                              force_lossless=error_result)
                     if new_text != block["text"]:
                         block["text"] = new_text
                         changed = True
@@ -423,8 +433,8 @@ class Interceptor:
             # Re-serialize compactly. JSON-RPC is semantics, not formatting; no newlines.
             return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
 
-    def _compress_or_diff(self, block: dict, tool: str,
-                          args_key: str = "") -> tuple[bool, str]:
+    def _compress_or_diff(self, block: dict, tool: str, args_key: str = "",
+                          force_lossless: bool = False) -> tuple[bool, str]:
         """Compress one block, preferring a lossless delta vs the prior same-tool result
         when it is smaller. Updates the per-tool diff base. Returns `(changed, reason)`,
         where `reason` is the Phase 1 instrumentation datum — a short label for WHY the
@@ -435,7 +445,8 @@ class Interceptor:
         text = block["text"]
         try:
             applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put,
-                                       server=self.server_name)
+                                       server=self.server_name,
+                                       force_lossless=force_lossless)
         except Exception as exc:  # noqa: BLE001 — fail-open is the whole point
             if self.debug:
                 sys.stderr.write(f"[terse-proxy] {tool}: passthrough on error: {exc}\n")
@@ -584,11 +595,12 @@ class Interceptor:
         except Exception:  # noqa: BLE001 — fail-open
             return None
 
-    def _compress(self, text: str, tool: str) -> str:
+    def _compress(self, text: str, tool: str, force_lossless: bool = False) -> str:
         """policy.apply with a hard fail-open: any error returns the original text."""
         try:
             applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put,
-                                       server=self.server_name)
+                                       server=self.server_name,
+                                       force_lossless=force_lossless)
             if self.debug and not applied.skipped and applied.text != text:
                 sys.stderr.write(
                     f"[terse-proxy] {tool}: {len(text)}->{len(applied.text)} bytes "
