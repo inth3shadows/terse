@@ -4,34 +4,39 @@ The **lossless-first** MCP compression proxy: it makes tool output smaller witho
 ever changing what your agent reads — byte-faithful by default, lossy only where you
 explicitly opt in.
 
-terse reduces tokens two ways, and they are not equally easy to copy. That split is
-the whole positioning.
+terse reduces tokens two ways: one that carries the day-to-day value, and one that is
+harder for a competitor to copy. Keeping those straight is the whole positioning.
 
-**1. The lossless codec — the reach.** terse removes only *structural* overhead:
-pretty-print whitespace, keys repeated once per record, repeated values, repeated
-nested schema. The transformed bytes **are** the model's input — a denser but still
-legible representation, not an offload. There is no decode step, no ML model in the
-loop, and every transform has an exact inverse (a round-trip gate asserts
-`decompress(compress(x)) == x` over the whole corpus). This is the guarantee most
-tools in this space decline to make: headroom's JSON path is lossless on uniform arrays
-but **falls back to dropping rows** on larger/irregular record sets, recoverable only via
-a `retrieve` round-trip against a cache that expires (verified, v0.32.0; default 30-min
-TTL); Anthropic/OpenAI context-editing **drops** old tool results server-side. terse
-never silently mutates what the model sees — and
-"lossless" is the category, not the token count. The tabularization primitive itself
-is public (formats like [TOON](https://toonformat.dev/) publish it standalone, MIT-
-licensed, ~40% on flat arrays), so the codec is terse's *demo*, not its moat: a
-motivated competitor could clone it.
+**1. The lossless codec — the value.** This is the lever that does the work. terse
+removes only *structural* overhead: pretty-print whitespace, keys repeated once per
+record, repeated values, repeated nested schema. The transformed bytes **are** the
+model's input — a denser but still legible representation, not an offload. There is no
+decode step, no ML model in the loop, and every transform has an exact inverse (a
+round-trip gate asserts `decompress(compress(x)) == x` over the whole corpus). This is
+the guarantee most tools in this space decline to make: headroom's JSON path is lossless
+on uniform arrays but **falls back to dropping rows** on larger/irregular record sets,
+recoverable only via a `retrieve` round-trip against a cache that expires (verified,
+v0.32.0; default 30-min TTL); Anthropic/OpenAI context-editing **drops** old tool results
+server-side. terse never silently mutates what the model sees — and "lossless" is the
+category, not the token count. In terse's own production ledger this codec is where
+essentially all the savings come from (see Status). Its one honest caveat: the
+tabularization primitive is public (formats like [TOON](https://toonformat.dev/) publish
+it standalone, MIT-licensed, ~40% on flat arrays), so a motivated competitor could clone
+the codec in a weekend.
 
-**2. The stateful cross-call diff — the moat.** When the same tool is called again —
-poll a list, re-read a file — terse emits a lossless *delta* against the prior result
-instead of the whole payload (**73% smaller on repeated calls** in the benchmark
-below). This is the one axis a stateless encoder **architecturally cannot reach**:
-TOON, headroom's stateless per-call compressor, and server-side history-pruning all pay
-the full column every call because none of them remember the last result. terse can only do it
-because it lives in the session as a transparent proxy. Cloning the codec is a
-weekend; cloning the diff means becoming a session-spanning proxy — a different
-product. Default-on since its validation program completed (see Status).
+**2. The stateful cross-call diff — the defensible axis.** When the same tool is called
+again — poll a list, re-read a file — terse emits a lossless *delta* against the prior
+result instead of the whole payload (**~73% smaller on the repeated call** in the model
+below). This is the one axis a stateless encoder **architecturally cannot reach**: TOON,
+headroom's stateless per-call compressor, and server-side history-pruning all pay the
+full column every call because none of them remember the last result — terse can only do
+it because it lives in the session as a transparent proxy. That makes it the harder half
+to copy. But it is a **bonus tier, not the headline**: it only pays off when a workload
+actually repeats a call with a similar-enough payload, which is rarer than it sounds — in
+terse's own 7-day production traffic the diff tier fired on ~0.4% of results (2 of 464).
+When your loop *does* re-fetch mostly-unchanged results it compounds hard; when it
+doesn't, it costs nothing (lossless, and emitted only when smaller). Default-on since its
+validation program completed (see Status).
 
 Around those two sits the **bundle** that turns a byte filter into a control plane you
 don't want to rip out: MCP-native proxy packaging (transparent to any downstream
@@ -277,7 +282,11 @@ The diff cost scales with *what changed*, not with payload size — so its win c
 exactly where token cost otherwise does: a long agent loop re-fetching mostly-unchanged
 results. (`gh_workflow_runs` is lower here only because its records are large and this
 model changed a big nested field; a status/timestamp churn would diff far smaller.) This
-is on top of the single-shot reduction above, and stacks with it.
+is on top of the single-shot reduction above, and stacks with it. These figures are the
+diff's win *when it fires* on a repeated call; how often that actually happens is a
+separate question — in terse's own production ledger it is ~0.4% of results, so treat
+this as a defensible bonus tier, not the headline lever (that's the codec — see the
+positioning note at the top and Status).
 
 **Tools not benchmarked head-to-head, and why (no invented numbers):**
 
