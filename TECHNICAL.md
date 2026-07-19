@@ -155,7 +155,10 @@ raw tool output (JSON text)
       "capture": false,               // optional; never PERSIST this tool's payloads
       "fields": {                     // optional, per-field
         "result[].id":   { "critical": true },           // denylist: never made lossy
-        "result[].body": { "lossy": "drop-to-retrieve" } // evicted to a handle; served by terse.retrieve
+        "result[].body": { "lossy": "drop-to-retrieve" },// evicted to a handle; served by terse.retrieve
+        // `$`-sigil paths select SPANS of a non-JSON payload instead of fields of an
+        // object — the only lossy reach into long-text results. v1 selector: code_blocks.
+        "$text.code_blocks": { "lossy": "drop-to-retrieve", "min": 400 }
       }
     }
   ]
@@ -263,7 +266,19 @@ gitignored because captured tool output may contain real data.
   answers itself. Its gate `lossy.droppable_loss` accepts a drop only if the handle resolves
   to the exact original (recoverable == acceptable); store writes are staged and committed
   only on gate pass, so a failure leaves no orphan handles. A retrieve miss (evicted, or a
-  pre-reconnect handle) returns a legible `isError`, never a protocol error. `summarize`
+  pre-reconnect handle) returns a legible `isError`, never a protocol error.
+  **`"$text.code_blocks"`** applies the same mode to a payload that never parsed as JSON,
+  addressing spans instead of fields: every fenced code block over `min` chars becomes the
+  same one-line handle marker (one drop form for the primer to teach, not two). It exists
+  because the lossless codec has nothing to fold in prose — 60 captured `codegraph_explore`
+  results measured 0.0% saved with 89.2% of their tokens in fenced source; the selector
+  takes that corpus to 87.0%. Its gate `lossy.text_droppable_loss` is strictly stronger
+  than `droppable_loss`: it restores the WHOLE payload from the emitted text plus the store
+  and demands byte-for-byte equality, so nothing outside a dropped span can have moved. A
+  payload that already contains a marker line therefore fails the gate and passes through
+  untouched — the marker-collision guard falls out of the gate rather than needing its own
+  check. A dropped text payload is never used as a CDC diff base (the base would depend on
+  which spans cleared the size floor); the next raw text re-anchors as a full. `summarize`
   (needs a model in the proxy) is parsed but deferred — warned and left lossless. All lossy
   is off by default; each mode replaces the round-trip gate with its own acceptable-loss
   gate only where a field is explicitly marked.

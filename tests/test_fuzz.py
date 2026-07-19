@@ -140,3 +140,50 @@ def test_fuzz_text_diff_reconstructs_after_serialization(prev, insert, data):
         return
     wire = json.loads(json.dumps(diff))
     assert text_diff.text_diff_decode(prev, wire) == curr
+
+
+# --------------------------------------------------------------------------- #
+# Text drop-to-retrieve (`$text.code_blocks`): the recoverability guarantee under
+# adversarial *markdown*, where the hazard is the fence scanner rather than the codec —
+# ragged indentation, tilde vs backtick fences, unterminated openers, fences nested
+# inside longer fences, and text that already looks like a drop marker.
+# --------------------------------------------------------------------------- #
+_fence = st.sampled_from(["```", "````", "~~~", "```py", "   ```", "\t```", "~~~~"])
+_line = st.one_of(
+    st.text(alphabet=st.characters(blacklist_categories=("Cs",)), max_size=40),
+    _fence,
+    st.just('{"__terse_dropped__":"aaaaaaaaaaaaaaaa","bytes":9,"retrieve":"terse.retrieve"}'),
+)
+
+
+@given(st.lists(_line, max_size=40), st.integers(1, 600))
+@FUZZ
+def test_fuzz_text_drop_is_recoverable_or_untouched(lines, min_len):
+    """The only two legal outcomes: the emitted text restores to the original byte for
+    byte, or nothing was dropped at all. There is no third branch in which a payload is
+    altered without being recoverable — that is the whole lossy-with-a-receipt claim."""
+    from terse import lossy
+    from terse.policy import Policy, Rule, apply
+
+    raw = "\n".join(lines)
+    rule = Rule(tool_glob="*", tiers=("minify", "tabularize", "dictionary"),
+                fields={lossy.TEXT_SELECTOR_CODE_BLOCKS:
+                        {"lossy": "drop-to-retrieve", "min": min_len}})
+    store: dict = {}
+    out = apply(raw, "t", Policy(rules=[rule]), drop_sink=store.__setitem__).text
+    if out == raw:
+        return                       # nothing qualified / gate refused -> original intact
+    assert lossy.restore_text_drops(out, store.__getitem__) == raw
+
+
+@given(st.lists(_line, max_size=40))
+@FUZZ
+def test_fuzz_fenced_spans_are_disjoint_and_ordered(lines):
+    """Spans must partition cleanly: non-overlapping, ascending, and always real slices —
+    an overlap would make the back-to-front splice corrupt a neighbouring block."""
+    from terse import lossy
+
+    text = "\n".join(lines)
+    spans = lossy.fenced_spans(text)
+    assert all(0 <= s < e <= len(text) for s, e in spans)
+    assert all(a[1] <= b[0] for a, b in zip(spans, spans[1:], strict=False))

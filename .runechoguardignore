@@ -104,3 +104,14 @@ known
 names
 rule
 basename
+# lossy.py's text drop-to-retrieve primitives: `sink` (apply_text_drops) and `resolve`
+# (restore_text_drops) are callback PARAMETERS invoked as bare calls — the same
+# false-positive class as drop_sink/answerer/rule_for above. The JSON siblings only ever
+# passed these on via functools.partial, so the pattern is new to this file, not new to
+# the codebase. A genuinely wrong name is caught immediately by pytest.
+sink
+resolve
+# hypothesis's `given` decorator in test_fuzz.py — the import sits at the top of the file,
+# outside the appended hunk, so it reads as unresolved. The original hunk-split class
+# documented at the top of this file; a missing import fails collection immediately.
+given

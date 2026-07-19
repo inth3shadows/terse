@@ -241,6 +241,37 @@ class Applied:
     warnings: list[str]
 
 
+def _apply_text_drops(raw: str, tool: str, rule: Rule, warnings: list[str],
+                      drop_sink: Any, never_lossy: bool) -> str:
+    """Tier-1 lossy (drop-to-retrieve) over a NON-JSON payload, addressed by span.
+
+    Same staged-then-committed contract as the JSON drop path: handles reach the session
+    store only after the gate proves the emitted text restores to the original byte for
+    byte, so a gate failure leaves no orphan handles behind. Returns `raw` unchanged
+    whenever anything at all is off — this is the fail-closed leg of a lossy transform."""
+    if never_lossy or not lossy_mod._text_drop_specs(rule):
+        return raw
+    if drop_sink is None:
+        warnings.append("lossy: drop-to-retrieve needs the proxy store; left lossless")
+        return raw
+    staging: dict[str, Any] = {}
+    try:
+        cand = lossy_mod.apply_text_drops(raw, rule, tool, staging.__setitem__)
+    except Exception as exc:  # noqa: BLE001 — fail closed to the lossless text
+        warnings.append(f"lossy step skipped: {exc} (kept lossless)")
+        return raw
+    if cand == raw:
+        return raw
+    if not lossy_mod.text_droppable_loss(raw, cand, staging.__getitem__):
+        warnings.append("lossy step skipped: text droppable-loss gate failed (kept lossless)")
+        return raw
+    for handle, value in staging.items():
+        drop_sink(handle, value)  # commit only once recoverability is proven
+    warnings.append("lossy: dropped text span(s) to retrieve handle(s) — "
+                    "output is NOT lossless")
+    return cand
+
+
 def _lossy_warnings(rule: Rule) -> list[str]:
     """Warn about field lossy requests that won't be executed as asked: deferred modes,
     unknown modes, and the truncate-vs-critical contradiction."""
@@ -256,6 +287,9 @@ def _lossy_warnings(rule: Rule) -> list[str]:
             out.append(f"field '{path}': unknown lossy mode '{mode}' (ignored)")
         elif path in critical:
             out.append(f"field '{path}': marked '{mode}' AND critical — kept lossless")
+    for path in lossy_mod.unknown_text_selectors(rule):
+        out.append(f"field '{path}': unknown text selector; known: "
+                   f"{sorted(lossy_mod.TEXT_SELECTORS)} (ignored)")
     return out
 
 
@@ -290,6 +324,12 @@ def apply(raw: str, tool: str, policy: Policy,
                         "(credential/personal store) — kept fully lossless")
 
     if not rule.tiers:
+        # `tiers: []` is an explicit hands-off passthrough, so it suppresses the text-drop
+        # path too. Say so: a rule carrying BOTH is a contradiction that would otherwise
+        # look like a working drop config that silently never fires.
+        if lossy_mod._text_drop_specs(rule):
+            warnings.append("text drop selector(s) ignored: rule has 'tiers': [] "
+                            "(explicit passthrough) — remove one or the other")
         return Applied(text=raw, tool=tool, tiers=(), skipped=True, warnings=warnings)
     if "minify" not in rule.tiers:
         warnings.append("'minify' implied by serialization; added")
@@ -299,7 +339,14 @@ def apply(raw: str, tool: str, policy: Policy,
     except (json.JSONDecodeError, TypeError, RecursionError):
         # RecursionError: nesting so deep even the C parser blows the stack — the
         # depth guard below can't run on what never parsed.
-        return Applied(text=raw, tool=tool, tiers=(), skipped=True,
+        #
+        # The lossless codec has nothing to fold in prose, so a long-text payload used to
+        # end here at 0% saved. Tier-1 lossy CAN reach it, addressed by span instead of by
+        # field (`$text.code_blocks`) — same opt-in, same fail-closed contract, same
+        # handle/retrieve protocol. Still `skipped=True`: no JSON tier ran, and the proxy
+        # relies on that flag to reset its JSON diff state for a non-JSON result.
+        text = _apply_text_drops(raw, tool, rule, warnings, drop_sink, never_lossy)
+        return Applied(text=text, tool=tool, tiers=(), skipped=True,
                        warnings=warnings + ["payload is not JSON; passed through"])
 
     # Depth guard (#79): the transforms recurse without a depth argument, so a payload

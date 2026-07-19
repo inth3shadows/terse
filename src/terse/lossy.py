@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Iterator
 from functools import partial
 from typing import Any
@@ -52,6 +53,34 @@ HANDLE_LEN = 16
 # by how much. Distinctive enough not to collide with real content.
 _STR_MARK = "…⟨+{n} chars⟩"
 _LIST_MARK = "…⟨+{n} items⟩"
+
+# --- text-payload drop selectors ---------------------------------------------------- #
+# A JSON field path addresses a field of a parsed object. A non-JSON payload has no
+# fields, so the biggest real-world token sink terse sees — long-text tool results whose
+# bulk is verbatim source (codegraph_explore: measured 89.2% of its tokens in fenced code
+# blocks, and 0.0% saved because the lossless codec has nothing to fold in prose) — was
+# structurally unreachable by drop-to-retrieve. A `$`-sigil path names a SPAN SELECTOR
+# over the raw text instead: `$text.code_blocks` = every fenced block in the payload.
+#
+# The sigil (not a bare name) is what keeps the two path languages from colliding: `.`
+# is the JSON path separator, so a selector had to be un-parseable as a field path or a
+# payload with a literal top-level "text" key would silently claim the selector's meaning.
+TEXT_PATH_SIGIL = "$"
+TEXT_SELECTOR_CODE_BLOCKS = "$text.code_blocks"
+TEXT_SELECTORS = frozenset({TEXT_SELECTOR_CODE_BLOCKS})
+# Higher than DEFAULT_DROP_MIN: a text span costs a whole retrieve round-trip AND the
+# surrounding prose usually still carries the identity (a `#### path/to/file.ts` heading),
+# so the floor should sit above "a couple of lines of code" to be worth the trade.
+DEFAULT_TEXT_DROP_MIN = 400  # min span length (chars) of a fenced block worth dropping
+# A dropped span is replaced by the SAME one-line JSON marker the JSON path emits, so the
+# format primer the proxy already injects (#13) teaches exactly one drop form, not two.
+_TEXT_MARKER_RE = re.compile(
+    r'^\{"' + re.escape(DROP_KEY) + r'":"(?P<handle>[0-9a-f]+)",'
+    r'"bytes":\d+,"retrieve":"[^"]*"\}$', re.M)
+# CommonMark fences: three-or-more backticks or tildes, optionally indented, the opener
+# optionally carrying an info string. A closing fence is the same character, at least as
+# long, with no info string.
+_FENCE_OPEN_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<fence>`{3,}|~{3,})(?P<info>[^\n]*)$")
 
 
 class PathError(ValueError):
@@ -238,10 +267,14 @@ def _is_drop_marker(v: Any) -> bool:
 
 
 def _drop_specs(rule: Any) -> list[tuple[str, dict]]:
-    """The (path, spec) entries that are drop-to-retrieve AND not marked critical."""
+    """The JSON-payload (path, spec) entries that are drop-to-retrieve AND not marked
+    critical. Text selectors (`$text.*`) are deliberately excluded: they address spans of
+    a non-JSON payload, not fields of an object, and feeding one to `_parse_path` would
+    raise PathError and fail the whole drop step closed. See `_text_drop_specs`."""
     crit = critical_paths(rule)
     return [(p, s) for p, s in rule.fields.items()
-            if isinstance(s, dict) and s.get("lossy") == "drop-to-retrieve" and p not in crit]
+            if isinstance(s, dict) and s.get("lossy") == "drop-to-retrieve"
+            and p not in crit and not p.startswith(TEXT_PATH_SIGIL)]
 
 
 def apply_drops(obj: Any, rule: Any, tool: str, sink: Callable[[str, Any], None]) -> Any:
@@ -267,6 +300,115 @@ def _is_drop(orig_leaf: Any, out_leaf: Any, resolve: Callable[[str], Any]) -> bo
         return resolve(out_leaf[DROP_KEY]) == orig_leaf
     except KeyError:
         return False  # handle doesn't resolve -> not recoverable -> fail closed
+
+
+# --------------------------------------------------------------------------- #
+# drop-to-retrieve over a TEXT payload (spans, not fields)
+# --------------------------------------------------------------------------- #
+def _text_drop_specs(rule: Any) -> list[tuple[str, dict]]:
+    """The text-selector (path, spec) entries that are drop-to-retrieve AND not marked
+    critical. The complement of `_drop_specs`; an unknown `$...` selector is dropped from
+    the list here and surfaced as a warning by the policy layer, never applied silently."""
+    crit = critical_paths(rule)
+    return [(p, s) for p, s in rule.fields.items()
+            if isinstance(s, dict) and s.get("lossy") == "drop-to-retrieve"
+            and p not in crit and p in TEXT_SELECTORS]
+
+
+def unknown_text_selectors(rule: Any) -> list[str]:
+    """`$`-sigil paths the rule marks lossy that this version has no selector for. Reported
+    so a typo'd `$text.codeblocks` fails loudly instead of quietly compressing nothing."""
+    return sorted(p for p, s in rule.fields.items()
+                  if isinstance(s, dict) and s.get("lossy")
+                  and p.startswith(TEXT_PATH_SIGIL) and p not in TEXT_SELECTORS)
+
+
+def fenced_spans(text: str) -> list[tuple[int, int]]:
+    """(start, end) character spans of every fenced code block in `text`, fences INCLUDED.
+
+    Fences are included in the span deliberately: the stored original is then the exact
+    substring, so restoring it is a byte-for-byte splice and the recovery gate can be an
+    equality check on the whole payload rather than a reconstruction heuristic.
+
+    An unterminated opening fence (truncated tool output, a stray ``` inside prose) closes
+    at end-of-text — matching CommonMark, and keeping the scan total so no payload shape
+    can make this raise.
+    """
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    open_at: int | None = None
+    fence = ""
+    for line in text.splitlines(keepends=True):
+        start, pos = pos, pos + len(line)
+        stripped = line.rstrip("\r\n")
+        if open_at is None:
+            m = _FENCE_OPEN_RE.match(stripped)
+            if m:
+                open_at, fence = start, m.group("fence")
+            continue
+        # Inside a block: a closer is the same fence character, at least as long, alone
+        # on its line. Anything else (including a longer run of the OTHER char) is content.
+        closer = stripped.strip()
+        if closer and closer[0] == fence[0] and closer == closer[0] * len(closer) \
+                and len(closer) >= len(fence):
+            spans.append((open_at, pos))
+            open_at = None
+    if open_at is not None:
+        spans.append((open_at, len(text)))
+    return spans
+
+
+def apply_text_drops(text: str, rule: Any, tool: str,
+                     sink: Callable[[str, Any], None]) -> str:
+    """Replace every drop-marked text span of `text` with a one-line handle marker,
+    persisting each original span verbatim via `sink(handle, span)`. Returns the new text
+    (unchanged when nothing qualifies). Spans under the size floor are left in place."""
+    out = text
+    for path, spec in _text_drop_specs(rule):
+        min_len = int(spec.get("min", DEFAULT_TEXT_DROP_MIN))
+        # Splice back-to-front so earlier spans' offsets stay valid as later ones shrink.
+        for start, end in reversed(fenced_spans(out)):
+            span = out[start:end]
+            if len(span) < min_len:
+                continue
+            handle = _handle(tool, path, span)
+            sink(handle, span)
+            marker = json.dumps({DROP_KEY: handle, "bytes": len(span),
+                                 "retrieve": RETRIEVE_TOOL},
+                                separators=(",", ":"), ensure_ascii=False)
+            # Keep the span's own trailing newline so the surrounding prose's line
+            # structure (and therefore the restore splice) is unambiguous.
+            out = out[:start] + marker + ("\n" if span.endswith("\n") else "") + out[end:]
+    return out
+
+
+def restore_text_drops(out: str, resolve: Callable[[str], Any]) -> str:
+    """Substitute every handle marker line in `out` back with its stored original span.
+    Raises KeyError if a handle doesn't resolve — the caller fails closed."""
+    def sub(m: re.Match) -> str:
+        value = resolve(m.group("handle"))
+        if not isinstance(value, str):
+            raise KeyError(m.group("handle"))
+        # The marker consumed the span's trailing newline into its own line ending, so
+        # give it back only when the stored span did not carry one.
+        return value[:-1] if value.endswith("\n") else value
+    return _TEXT_MARKER_RE.sub(sub, out)
+
+
+def text_droppable_loss(orig: str, out: str, resolve: Callable[[str], Any]) -> bool:
+    """The text drop GATE — the analogue of `droppable_loss` for a span-addressed payload,
+    and a strictly stronger check than its JSON sibling: rather than proving that only
+    marked paths changed, it reconstructs the ENTIRE payload from what was emitted plus
+    the store and requires byte-for-byte equality with the original. Nothing outside a
+    dropped span can have changed if the whole string comes back identical.
+
+    Fail-closed on anything unresolvable."""
+    if out == orig:
+        return True  # nothing qualified; trivially lossless
+    try:
+        return restore_text_drops(out, resolve) == orig
+    except (KeyError, TypeError, re.error):
+        return False
 
 
 def droppable_loss(orig: Any, out: Any, rule: Any, resolve: Callable[[str], Any]) -> bool:

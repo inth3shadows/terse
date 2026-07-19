@@ -256,6 +256,41 @@ turns a +2.6% tool into a +77% one.
 terse measures *tokens*, not comprehension — before relying on a generated policy, confirm
 the model still reads the compressed form with `terse fluency --corpus <dir>` (see below).
 
+### Reaching a long-text tool (`$text.code_blocks`)
+
+Some tools don't return JSON at all — they return markdown whose bulk is verbatim source
+(`codegraph_explore` is the canonical case). The lossless tiers have nothing to fold in
+prose, so those payloads pass through at **0% saved** no matter how you set `tiers`.
+
+A `$`-sigil field path selects *spans* of the raw text instead of fields of an object:
+
+```json
+{
+  "match": { "tool": "codegraph.*" },
+  "tiers": ["minify", "tabularize", "dictionary"],
+  "fields": {
+    "$text.code_blocks": { "lossy": "drop-to-retrieve", "min": 400 }
+  }
+}
+```
+
+Every fenced code block of at least `min` characters leaves the wire as a `terse.retrieve`
+handle; the exploration summary, blast radius, and file headings stay resident, so the model
+keeps the *intelligence* and fetches the *source* only if it actually needs it. On 60 real
+captured `codegraph_explore` payloads this took a 0.0%-saved tool to **87.0%**.
+
+This is **lossy and opt-in** — the same bar as any drop:
+
+- Everything is recoverable, and the gate proves it: terse restores the entire payload from
+  what it emitted plus the session store and requires byte-for-byte equality with the
+  original, or it emits the untouched text and warns.
+- It is suppressed — with a warning, never silently — on a `--never-lossy` server, on a
+  selector marked `{"critical": true}`, and on a rule with `"tiers": []`.
+- A misspelled selector (`$text.codeblocks`) warns rather than quietly compressing nothing.
+- Confirm the behavior, not just the token count, with `terse fluency --drop` (below): the
+  question that matters for this shape is whether the model *retrieves* the source instead
+  of answering from the surrounding prose.
+
 ### One-command lossy tuning (`terse tune`)
 
 `terse tune` chains the whole lossy-adoption loop into one command: it runs the generator,
