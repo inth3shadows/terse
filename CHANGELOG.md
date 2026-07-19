@@ -9,6 +9,21 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Added
+- **`drop-to-retrieve` for non-JSON payloads, addressed by span.** A policy field can now
+  name `"$text.code_blocks"`, which evicts each fenced code block over `min` chars from a
+  long-text tool result to a `terse.retrieve` handle while leaving the surrounding prose
+  resident. This reaches a payload class the lossless codec structurally cannot help with:
+  measured over 60 real captured `codegraph_explore` results, 89.2% of their tokens were
+  fenced source and terse saved **0.0%**; with the selector enabled the same corpus drops
+  **87.0%** of its tokens, with byte-exact restore verified on all 57 transformed payloads
+  and zero gate failures. Opt-in and off by default — no existing policy changes behavior.
+  The gate is stronger than its JSON sibling's: rather than proving only marked paths
+  changed, it reconstructs the entire payload from the emitted text plus the session store
+  and requires byte-for-byte equality. Suppressed on never-lossy servers, by `critical`,
+  and by `"tiers": []`, each with an explicit warning rather than silence. The behavioral
+  fluency harness (`dropeval`) gained the matching text recall/precision questions.
+
 ## [0.3.1] - 2026-07-18
 
 ### Added

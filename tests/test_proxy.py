@@ -1200,3 +1200,48 @@ def test_run_proxy_answers_retrieve_without_forwarding_downstream():
     resp = json.loads([ln for ln in cout.getvalue().splitlines() if ln.strip()][0])
     assert resp["id"] == 1 and resp["result"]["isError"] is True
     assert '"status"' not in resp["result"]["content"][0]["text"]           # not the fake's records
+
+
+# --- drop-to-retrieve over a TEXT payload (`$text.code_blocks`) --------------------- #
+
+TEXT_DROP = Policy(rules=[Rule("codegraph_*", ("minify", "tabularize", "dictionary"),
+                               fields={"$text.code_blocks":
+                                       {"lossy": "drop-to-retrieve"}})])
+_SRC = "\n".join(f"    line {i} of a source file long enough to matter" for i in range(20))
+_MD = f"## Exploration\n\nFound 3 symbols.\n\n#### src/a.py\n\n```python\n{_SRC}\n```\n"
+
+
+def _emit_text(inter, mid, tool, text):
+    """`_emit` for a non-JSON payload: the raw text goes on the wire as-is."""
+    inter.note_request(_req(mid, tool))
+    out = inter.transform_response(_result_msg(mid, text))
+    return json.loads(out)["result"]["content"][0]["text"]
+
+
+def test_text_drop_emits_marker_stores_original_and_retrieve_serves_it_back():
+    inter = Interceptor(TEXT_DROP)
+    out = _emit_text(inter, 1, "codegraph_explore", _MD)
+    assert transforms.DROPPED_MARKER in out
+    assert "line 10 of a source file" not in out       # the block really left the wire
+    assert "Found 3 symbols." in out                   # the prose really stayed
+    handle = next(iter(inter.dropped))
+    # The retrieve tool must serve back the exact bytes, through the real proxy handler.
+    served = json.loads(inter.answer_retrieve(
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "terse.retrieve",
+                               "arguments": {"handle": handle}}})))
+    assert served["result"]["content"][0]["text"] == f"```python\n{_SRC}\n```\n"
+
+
+def test_text_drop_clears_the_text_diff_base():
+    inter = Interceptor(TEXT_DROP)
+    _emit_text(inter, 1, "codegraph_explore", "plain text result with no fences at all")
+    assert inter.last_text.get("codegraph_explore") is not None   # normal CDC base stored
+    _emit_text(inter, 2, "codegraph_explore", _MD)
+    # A dropped payload must not become a diff base: the next raw text re-anchors full.
+    assert "codegraph_explore" not in inter.last_text
+
+
+def test_text_payload_untouched_without_a_text_selector():
+    inter = Interceptor(FULL)
+    assert _emit_text(inter, 1, "codegraph_explore", _MD) == _MD

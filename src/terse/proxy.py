@@ -429,7 +429,8 @@ class Interceptor:
         when it is smaller. Updates the per-tool diff base. Returns `(changed, reason)`,
         where `reason` is the Phase 1 instrumentation datum — a short label for WHY the
         diff did/didn't fire (no_prior | keyframe | emitted | not_smaller_same_args |
-        not_smaller_diff_args | text_emitted | non_json | passthrough | error), for the
+        not_smaller_diff_args | text_emitted | text_dropped | non_json | passthrough |
+        error), for the
         ledger. Fail-open: any error leaves the block untouched and state intact."""
         text = block["text"]
         try:
@@ -449,6 +450,17 @@ class Interceptor:
             self.last.pop(tool, None)
             self.last_args.pop(tool, None)
             self.since_keyframe.pop(tool, None)
+            if applied.text != text:
+                # A text-payload drop-to-retrieve fired (`$text.code_blocks`): the payload
+                # is non-JSON, so no tier ran and `skipped` stays True, but the emitted
+                # text is NOT the raw text. Emit it and skip the CDC text diff entirely —
+                # chaining a diff onto a dropped payload would make the base depend on
+                # which spans happened to clear the size floor, so clear that state too
+                # and let the next raw text re-anchor as a full.
+                block["text"] = applied.text
+                self.last_text.pop(tool, None)
+                self.since_text_keyframe.pop(tool, None)
+                return True, "text_dropped"
             if not self.policy.select(tool, self.server_name).tiers:
                 return False, "passthrough"  # true passthrough: hands off, no state kept
             # A CDC text diff that actually shipped is a real diff hit — bucket it as

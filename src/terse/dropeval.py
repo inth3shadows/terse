@@ -93,6 +93,93 @@ def _staged_apply(obj: Any, rule: Any, tool: str) -> tuple[policy_mod.Applied, d
     return applied, staging
 
 
+def _staged_apply_text(raw: str, rule: Any, tool: str) -> tuple[policy_mod.Applied, dict[str, Any]]:
+    """`_staged_apply` for a NON-JSON payload: `raw` is handed to `policy.apply` verbatim
+    rather than re-serialized, since a text payload has no object to dump."""
+    pol = policy_mod.Policy(rules=[rule])
+    staging: dict[str, Any] = {}
+    applied = policy_mod.apply(raw, tool, pol, drop_sink=staging.__setitem__)
+    return applied, staging
+
+
+def _text_questions_and_staging(
+    raw: str, rule: Any, tool: str
+) -> tuple[list[DropQuestion], policy_mod.Applied | None, dict[str, Any] | None]:
+    """The `_questions_and_staging` analogue for a span-addressed text payload.
+
+    The stakes differ from the JSON case and the questions are built to match. A dropped
+    JSON field is one value among many; a dropped fenced code block is a chunk of source
+    the surrounding prose may explicitly tell the model it has "already read" — so the
+    recall question asks for an EXACT line of a dropped block (unanswerable without
+    retrieving, and un-guessable), while the precision question asks how many blocks were
+    omitted (answerable by counting visible markers, so any retrieve call here is a pure
+    over-fetch). Both are computed from `apply()`'s own sink, never guessed.
+    """
+    if not lossy_mod._text_drop_specs(rule):
+        return [], None, None  # no text selector on this rule -> nothing to test
+
+    applied, staging = _staged_apply_text(raw, rule, tool)
+    if applied.text == raw or not staging:
+        return [], None, None  # every span was under the size floor, or the gate failed
+
+    markers = lossy_mod._TEXT_MARKER_RE.findall(applied.text)
+    if not markers:
+        return [], None, None
+
+    # Pick the LARGEST dropped span: the one whose absence a model is most likely to try
+    # to paper over from context instead of retrieving — the hardest honest case.
+    handle = max(markers, key=lambda h: len(staging.get(h, "")))
+    span = staging.get(handle)
+    if not isinstance(span, str):
+        return [], None, None
+    # A line from the middle of the block: the fence lines and the first line of source
+    # are the parts most likely to be echoed elsewhere in the retained prose (a `####
+    # path` heading, an info string), so the midpoint is the least guessable choice.
+    lines = [ln for ln in span.splitlines() if ln.strip()]
+    if len(lines) < 3:
+        return [], None, None  # too small to pose a non-trivial recall question
+    target_i = len(lines) // 2
+    target = lines[target_i]
+
+    recall_q = DropQuestion(
+        qid="drop-text-recall",
+        kind="recall",
+        prompt=(f"The omitted block with handle {handle!r} contains "
+                f"{len(lines)} non-blank lines. What is the exact text of its "
+                f"non-blank line number {target_i + 1} (1-indexed)?"),
+        instruction="Reply with that line's exact text as a JSON string, and nothing else.",
+        expected=target,
+        needs_retrieve=True,
+        expected_handle=handle,
+    )
+    precision_q = DropQuestion(
+        qid="drop-text-precision",
+        kind="precision",
+        prompt="How many blocks were omitted from this payload?",
+        instruction="Reply with a single integer and nothing else.",
+        expected=len(markers),
+        needs_retrieve=False,
+        expected_handle=None,
+    )
+    return [recall_q, precision_q], applied, staging
+
+
+def gen_text_drop_questions(raw: str, rule: Any, tool: str) -> list[DropQuestion]:
+    """One recall + one precision question for a text payload whose rule actually drops
+    spans, else [] (nothing to test — same fail-closed honesty bar as the JSON path)."""
+    return _text_questions_and_staging(raw, rule, tool)[0]
+
+
+def run_drop_text_payload(raw: str, rule: Any, tool: str, answerer: ToolAnswerer,
+                          trials: int = 1) -> list[dict]:
+    """`run_drop_payload` for a non-JSON payload. [] when nothing was dropped."""
+    questions, applied, staging = _text_questions_and_staging(raw, rule, tool)
+    if not questions:
+        return []
+    assert applied is not None and staging is not None
+    return _run_questions_against(questions, applied, staging, answerer, trials=trials)
+
+
 def _questions_and_staging(
     obj: Any, rule: Any, tool: str
 ) -> tuple[list[DropQuestion], policy_mod.Applied | None, dict[str, Any] | None]:
@@ -320,12 +407,24 @@ def run_drop_fluency(envelopes: list[dict], rule_for: Callable[[str], Any],
     avoids M times the redundant parsing/policy.apply() work for M configured models."""
     results: dict[str, list[dict]] = {name: [] for name in answerers}
     for env in envelopes:
+        tool = env["tool"]
+        rule = rule_for(tool)
         try:
             obj = json.loads(env["raw"])
         except (json.JSONDecodeError, TypeError):
+            # Not JSON: the span-addressed text path is the only one that can drop here.
+            # Same envelope-outer/model-inner nesting and the same scored-row shape, so a
+            # text payload's results merge into the report exactly like a JSON one's.
+            questions, applied, staging = _text_questions_and_staging(
+                env.get("raw") or "", rule, tool)
+            if not questions:
+                continue
+            assert applied is not None and staging is not None
+            for name, fn in answerers.items():
+                for row in _run_questions_against(questions, applied, staging, fn,
+                                                  trials=trials):
+                    results[name].append({"tool": tool, "sha": env.get("sha", "?"), **row})
             continue
-        tool = env["tool"]
-        rule = rule_for(tool)
         questions, applied, staging = _questions_and_staging(obj, rule, tool)
         if not questions:
             continue

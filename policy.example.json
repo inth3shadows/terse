@@ -20,9 +20,12 @@
       "tiers": ["minify", "tabularize", "dictionary"]
     },
     {
-      "_comment": "codegraph: search/query JSON measured +33%. explore/node return markdown+source (non-JSON) — terse can't parse those and passes them through untouched, so this rule only ever fires on the JSON-shaped tools.",
+      "_comment": "codegraph: search/query JSON measured +33%. explore/node return markdown+source (non-JSON), which the lossless codec cannot fold — measured 0.0% saved on 60 real payloads, of which 89.2% of the tokens were fenced code blocks. '$text.code_blocks' is the OPT-IN Tier-1 lossy answer: each fenced block over 'min' chars leaves the wire as a retrieve handle while the exploration summary and blast-radius prose stay resident. Measured 87.0% fewer tokens on that same corpus, byte-exact restore verified on every payload. LOSSY — the model must call terse.retrieve to read the source back; delete this field to stay 100% lossless.",
       "match": { "tool": "codegraph.*" },
-      "tiers": ["minify", "tabularize", "dictionary"]
+      "tiers": ["minify", "tabularize", "dictionary"],
+      "fields": {
+        "$text.code_blocks": { "lossy": "drop-to-retrieve", "min": 400 }
+      }
     },
     {
       "_comment": "Already field-projected + high-cardinality content; dictionary added ~nothing (+2.6% total). Keep cheap structural tiers, drop dictionary.",
