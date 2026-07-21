@@ -9,6 +9,8 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-21
+
 ### Fixed
 - **`$`-prefixed JSON keys are drop-eligible again.** Reserving the whole `$` sigil for
   text selectors silently disabled `drop-to-retrieve` on ordinary JSON keys like
@@ -41,6 +43,11 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   and requires byte-for-byte equality. Suppressed on never-lossy servers, by `critical`,
   and by `"tiers": []`, each with an explicit warning rather than silence. The behavioral
   fluency harness (`dropeval`) gained the matching text recall/precision questions.
+
+### Changed
+- Docs: install instructions now lead with `pip install terse-mcp` from PyPI rather than a
+  git clone (#113), and the positioning is corrected — the always-on lossless codec is the
+  core value, with cross-call diffing a bonus tier layered on top (#114).
 
 ## [0.3.1] - 2026-07-18
 
