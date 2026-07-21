@@ -911,6 +911,12 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
                 detail = (f"wraps={r.get('wraps') or '?'}  "
                           f"diff={r.get('diff') or '?'}  stats={stats}")
                 print(f"  {'':<20} {detail}")
+                # A launcher that no longer resolves is fatal to the entry and invisible
+                # everywhere else — the client just fails to spawn it. Print it last so
+                # it reads as the verdict on the two lines above.
+                if r.get("launcher_missing"):
+                    print(f"  {'':<20} launcher={r.get('launcher')} (MISSING) "
+                          f"— this entry cannot start; re-run install-mcp")
     return 0
 
 

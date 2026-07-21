@@ -177,17 +177,30 @@ If your installer provides a stable console script, point wrapped entries at tha
 instead. `$TERSE_MCP_CMD` (whitespace-split) overrides what `install-mcp` bakes in:
 
 ```
-TERSE_MCP_CMD=~/.local/bin/terse uv run terse install-mcp runecho \
+TERSE_MCP_CMD='~/.local/bin/terse' uv run terse install-mcp runecho \
   --policy policy.example.json --print     # confirm the command, then drop --print
 ```
 
 `~/.local/bin/terse` is the console script installed by both `uv tool install
 terse-mcp` and `pipx install terse-mcp`, and it survives upgrades that move the venv.
+A leading `~` is expanded for you (a wrapped entry is spawned without a shell, so a
+literal tilde would never resolve), and a path that does not exist is **rejected at
+install time** rather than written into the config — the same treatment `--policy`
+already gets. A bare name like `terse` is passed through untouched, since it resolves
+against the launcher's `PATH`, which the installer cannot know.
 
-Either way, after **any** terse upgrade run `terse mcp-status` and confirm the
-`wraps=` lines still resolve, then check each server completes an `initialize` +
-`tools/list` handshake once the client restarts. A broken wrapper does not announce
-itself — it only ever looks like a server that has gone quiet.
+After any terse upgrade, `terse mcp-status` flags an entry whose launcher stopped
+resolving:
+
+```
+  runecho              wrapped  policy=/home/you/.config/terse/policy.json
+                       wraps=runecho-mcp  diff=default  stats=on
+                       launcher=/home/you/.local/share/uv/tools/terse-mcp/bin/python (MISSING) — this entry cannot start; re-run install-mcp
+```
+
+Then confirm each server completes an `initialize` + `tools/list` handshake once the
+client restarts. A broken wrapper does not announce itself to the client — it only
+ever looks like a server that has gone quiet.
 
 Claude Code has three MCP scopes, and `--scope` targets any of them (default
 `user`, i.e. today's behavior):

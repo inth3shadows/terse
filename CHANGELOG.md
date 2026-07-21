@@ -9,6 +9,25 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Fixed
+- **`install-mcp` no longer writes a launcher path that can never resolve.** A wrapped
+  entry is spawned from JSON via `execve` with no shell, so a quoted
+  `TERSE_MCP_CMD='~/.local/bin/terse'` wrote a literal tilde and the entry silently
+  failed to start. The override's `argv[0]` is now `expanduser`ed, and a path that does
+  not exist is rejected at install time before the config is touched — the same
+  treatment `--policy` already got. A bare name (`terse`) still passes through, since it
+  resolves against the launcher's `PATH`.
+- **`mcp-status` flags a wrapped entry whose launcher stopped resolving.** This is the
+  failure mode an upgrade causes when a versioned `uv tool`/`pipx` venv moves out from
+  under every wrapped entry at once, and it was invisible everywhere: the client cannot
+  spawn the proxy, so the server just appears with no tools. New `launcher` /
+  `launcher_missing` fields in `mcp-status --json`.
+
+### Added
+- `$TERSE_MCP_CMD` is documented in `USAGE.md` (it previously existed only in a
+  docstring) and now has test coverage, along with the two `install-mcp` footguns that
+  only surface after an upgrade or an uninstall.
+
 ## [0.4.0] - 2026-07-21
 
 ### Fixed
