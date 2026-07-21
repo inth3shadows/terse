@@ -158,6 +158,36 @@ re-wrap rebuilds `command`/`args` from the stashed original but keeps every othe
 live key, and reports what it carried (`kept hand-edited key(s) …`). One edge
 remains: `uninstall-mcp` restores the **pre-terse original**, which does not carry
 such edits — put them on the original entry too if they must survive an uninstall.
+This matters most when the edit is what makes the *downstream* server work at all
+(a Node-version `env.PATH` pin for a server that crashes on the system's default
+runtime, say): kept on the wrapped copy alone, it vanishes the moment you uninstall.
+
+#### After upgrading terse, re-check `mcp-status` (`$TERSE_MCP_CMD`)
+
+A wrapped entry launches terse as `<absolute interpreter> -m terse`, and that
+interpreter path is captured at install time. That's the default because it does not
+depend on `terse` being on the MCP launcher's `PATH` — an MCP client does not
+necessarily start your shell's environment. The cost is that the path is only as
+stable as the install behind it. An isolated-tool install (`uv tool`, `pipx`) puts its
+interpreter in a **versioned** venv, so an upgrade — or a rename of the distribution —
+can move it and leave every wrapped server at once pointing at an interpreter that no
+longer exists. They then fail *silently*: the server just shows up with no tools.
+
+If your installer provides a stable console script, point wrapped entries at that
+instead. `$TERSE_MCP_CMD` (whitespace-split) overrides what `install-mcp` bakes in:
+
+```
+TERSE_MCP_CMD=~/.local/bin/terse uv run terse install-mcp runecho \
+  --policy policy.example.json --print     # confirm the command, then drop --print
+```
+
+`~/.local/bin/terse` is the console script installed by both `uv tool install
+terse-mcp` and `pipx install terse-mcp`, and it survives upgrades that move the venv.
+
+Either way, after **any** terse upgrade run `terse mcp-status` and confirm the
+`wraps=` lines still resolve, then check each server completes an `initialize` +
+`tools/list` handshake once the client restarts. A broken wrapper does not announce
+itself — it only ever looks like a server that has gone quiet.
 
 Claude Code has three MCP scopes, and `--scope` targets any of them (default
 `user`, i.e. today's behavior):
