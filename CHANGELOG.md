@@ -9,6 +9,8 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-21
+
 ### Fixed
 - **`install-mcp` no longer writes a launcher path that can never resolve.** A wrapped
   entry is spawned from JSON via `execve` with no shell, so a quoted
