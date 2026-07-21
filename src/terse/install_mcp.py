@@ -160,11 +160,43 @@ def _servers_root(config: dict, server_path: tuple[str, ...]) -> dict:
 def terse_invocation() -> list[str]:
     """How a wrapped entry should launch terse. Absolute interpreter + `-m terse`
     so it does not depend on `terse` being on the MCP launcher's PATH. Overridable
-    via $TERSE_MCP_CMD (whitespace-split) for unusual installs."""
+    via $TERSE_MCP_CMD (whitespace-split) for unusual installs — e.g. pointing at
+    the `terse` console script, whose path survives upgrades that move a versioned
+    `uv tool`/`pipx` venv out from under the baked interpreter.
+
+    The override's argv[0] is `expanduser`ed: a wrapped entry is spawned from JSON
+    via execve, with no shell to expand `~`, so a quoted `TERSE_MCP_CMD='~/bin/terse'`
+    would otherwise write a literal tilde that can never resolve. Expanding here is
+    what makes the documented override behave the same quoted or bare."""
     override = os.environ.get("TERSE_MCP_CMD")
-    if override:
-        return override.split()
-    return [sys.executable, "-m", "terse"]
+    if not override:
+        # No check needed on this branch: `sys.executable` is the interpreter currently
+        # running, so it exists by construction. Only the override can name something
+        # that doesn't.
+        return [sys.executable, "-m", "terse"]
+    parts = override.split()
+    if parts:
+        parts[0] = os.path.expanduser(parts[0])
+    if (bad := launcher_missing(parts)) is not None:
+        raise FileNotFoundError(
+            f"$TERSE_MCP_CMD launcher not found: {bad}. Wrapped entries are spawned "
+            f"directly (no shell), so this path must exist as written.")
+    return parts
+
+
+def launcher_missing(terse_cmd: list[str]) -> str | None:
+    """The argv[0] of `terse_cmd` if it names a path that does not exist, else None.
+
+    Only a path-like argv[0] (containing a separator) is checkable — a bare name like
+    `terse` is resolved against the launcher's PATH, which we cannot know from here,
+    so it is never flagged. Same restraint as the relative-policy-path rule in
+    `_scan_target`: surface real drift, never manufacture noise."""
+    if not terse_cmd:
+        return None
+    cmd = terse_cmd[0]
+    if os.sep not in cmd and (os.altsep or os.sep) not in cmd:
+        return None
+    return None if os.path.exists(cmd) else cmd
 
 
 # ------------------------------------------------------------------- pure core
@@ -345,6 +377,10 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
     # Resolve to an absolute path so capture works regardless of the proxy's cwd; the
     # proxy/capture_payload creates the dir on first write, so no need to pre-create it.
     capture_abs = str(Path(capture_dir).resolve()) if capture_dir else None
+    # Validated inside terse_invocation when it comes from $TERSE_MCP_CMD — as strictly
+    # as the policy path above. A bad policy path fails loudly the first time the proxy
+    # starts; a bad launcher fails *silently*, because the MCP client cannot spawn the
+    # entry at all, so the server just appears with no tools and nothing says why.
     terse_cmd = terse_invocation()
 
     available = sorted((node.get("mcpServers") or {}).keys())
@@ -432,10 +468,20 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
             state = "unwrapped"
         policy = None
         policy_missing = False
+        launcher = None
+        launcher_gone = False
         wraps = None
         diff = None
         stats_on = None
         if state == "wrapped":
+            # The launcher (`command`) is the entry's most silent failure mode: if it
+            # no longer resolves, the client can't spawn the proxy at all and the server
+            # just shows up with no tools. That is exactly what an upgrade moving a
+            # versioned uv-tool/pipx venv does to every wrapped entry at once, so status
+            # is where it has to be visible.
+            launcher = servers[name].get("command")
+            if isinstance(launcher, str):
+                launcher_gone = launcher_missing([launcher]) is not None
             # A terse-wrapped entry's args are
             #   [-m terse] proxy <proxy-opts> -- <downstream cmd/url + args>
             # so the downstream it actually fronts, and the diff/stats flags baked in,
@@ -460,7 +506,8 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
                                                       else "default")
             stats_on = "--no-stats" not in args
         rows.append({"scope": scope, "server": name, "state": state, "policy": policy,
-                    "policy_missing": policy_missing, "wraps": wraps, "diff": diff,
+                    "policy_missing": policy_missing, "launcher": launcher,
+                    "launcher_missing": launcher_gone, "wraps": wraps, "diff": diff,
                     "stats": stats_on, "config": str(target.cfg)})
     return rows
 
@@ -469,11 +516,12 @@ def scan_scopes(*, cfg: Path | None = None, file: str | None = None,
                 repo_path: str | None = None) -> list[dict]:
     """Enumerate every terse-relevant mcpServers entry across all three scopes,
     read-only — no writes, no directory creation, never raises. One row per
-    (scope, server): {scope, server, state, policy, policy_missing, wraps, diff,
-    stats, config}, state one of "wrapped" (terse-managed and present),
-    "orphaned-stash" (managed but the entry vanished — see `_scan_target`), or
-    "unwrapped" (present, not terse's). The wrapped-only fields (policy_missing,
-    wraps, diff, stats) are None/False for non-wrapped rows. Local scope is
+    (scope, server): {scope, server, state, policy, policy_missing, launcher,
+    launcher_missing, wraps, diff, stats, config}, state one of "wrapped"
+    (terse-managed and present), "orphaned-stash" (managed but the entry vanished —
+    see `_scan_target`), or "unwrapped" (present, not terse's). The wrapped-only
+    fields (policy_missing, launcher, launcher_missing, wraps, diff, stats) are
+    None/False for non-wrapped rows. Local scope is
     silently omitted, not an error, when it doesn't resolve (not in a git repo and
     no --repo-path given) — "no local scope here" is the common case, not a failure."""
     rows: list[dict] = []

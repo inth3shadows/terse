@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -787,3 +788,89 @@ def test_do_install_never_lossy_bakes_into_policy(tmp_path, monkeypatch):
     res2 = im.do_install(["runecho"], str(policy), cfg=cfg, never_lossy=True, dry_run=True)
     assert res2["never_lossy_added"] == ["runecho"]
     assert load_policy(policy).server_never_lossy("runecho") is False
+
+
+# --------------------------------------------------- $TERSE_MCP_CMD (the launcher)
+# The override existed since the installer landed and had no test at all, which is
+# how the tilde bug below survived: a wrapped entry is spawned from JSON via execve
+# with no shell, so an unexpanded `~` writes a command that can never resolve — and
+# the failure is silent (the client just can't start the server).
+def test_terse_invocation_defaults_to_the_running_interpreter(monkeypatch):
+    monkeypatch.delenv("TERSE_MCP_CMD", raising=False)
+    assert im.terse_invocation() == [sys.executable, "-m", "terse"]
+
+
+def test_terse_mcp_cmd_override_is_whitespace_split(tmp_path, monkeypatch):
+    launcher = tmp_path / "terse"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("TERSE_MCP_CMD", f"{launcher} --flag")
+    assert im.terse_invocation() == [str(launcher), "--flag"]
+
+
+def test_terse_mcp_cmd_override_expands_a_leading_tilde(tmp_path, monkeypatch):
+    # Quoting the value (or setting it in a script) means the shell never expands `~`.
+    # Without expanduser here the literal tilde lands in the config verbatim.
+    home = tmp_path / "home"
+    (home / ".local" / "bin").mkdir(parents=True)
+    launcher = home / ".local" / "bin" / "terse"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))  # expanduser's key on Windows
+    monkeypatch.setenv("TERSE_MCP_CMD", "~/.local/bin/terse")
+
+    assert im.terse_invocation() == [str(launcher)]
+
+
+def test_terse_mcp_cmd_override_rejects_a_path_that_does_not_exist(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERSE_MCP_CMD", str(tmp_path / "nope" / "terse"))
+    with pytest.raises(FileNotFoundError, match="TERSE_MCP_CMD"):
+        im.terse_invocation()
+
+
+def test_terse_mcp_cmd_override_allows_a_bare_name(monkeypatch):
+    # A bare `terse` resolves against the launcher's PATH, which we can't know from
+    # here — so it is passed through rather than false-flagged as missing.
+    monkeypatch.setenv("TERSE_MCP_CMD", "terse")
+    assert im.terse_invocation() == ["terse"]
+
+
+def test_do_install_refuses_a_bad_override_before_touching_the_config(tmp_path, monkeypatch):
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})))
+    before = cfg.read_text(encoding="utf-8")
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"version": 1, "policies": []}))
+    monkeypatch.setenv("TERSE_MCP_CMD", str(tmp_path / "gone" / "terse"))
+
+    with pytest.raises(FileNotFoundError):
+        im.do_install(["runecho"], str(policy), cfg=cfg)
+    assert cfg.read_text(encoding="utf-8") == before  # config untouched
+
+
+def test_scan_flags_a_wrapped_entry_whose_launcher_vanished(tmp_path, monkeypatch):
+    # The upgrade case: a versioned uv-tool/pipx venv moves and every wrapped entry is
+    # left pointing at an interpreter that no longer exists.
+    launcher = tmp_path / "python"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})))
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"version": 1, "policies": []}))
+    monkeypatch.setattr(im, "terse_invocation", lambda: [str(launcher), "-m", "terse"])
+    im.do_install(["runecho"], str(policy), cfg=cfg)
+
+    row = next(r for r in im.scan_scopes(cfg=cfg) if r["server"] == "runecho")
+    assert row["state"] == "wrapped" and row["launcher_missing"] is False
+
+    launcher.unlink()  # the upgrade moves the venv out from under the entry
+    row = next(r for r in im.scan_scopes(cfg=cfg) if r["server"] == "runecho")
+    assert row["launcher_missing"] is True and row["launcher"] == str(launcher)
+
+
+def test_scan_never_flags_an_unwrapped_entry_or_a_bare_command(tmp_path):
+    # `uvx` is a bare name on PATH, and the row isn't terse-managed anyway — neither
+    # should acquire a launcher flag.
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(plain={"command": "uvx", "args": ["plain-mcp"]})))
+    row = next(r for r in im.scan_scopes(cfg=cfg) if r["server"] == "plain")
+    assert row["state"] == "unwrapped" and row["launcher_missing"] is False

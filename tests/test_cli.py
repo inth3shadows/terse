@@ -310,6 +310,38 @@ def test_mcp_status_cmd_shows_detail_line_and_json(tmp_path, monkeypatch, capsys
     assert row["policy_missing"] is False
 
 
+def test_mcp_status_cmd_flags_a_launcher_that_no_longer_resolves(tmp_path, monkeypatch, capsys):
+    # The silent failure a wrapped entry can't report itself: if `command` stops
+    # resolving (an upgrade moves a versioned uv-tool/pipx venv), the client cannot spawn
+    # the proxy at all and the server just shows up with no tools. Status has to say so.
+    from terse import install_mcp as im
+
+    launcher = tmp_path / "python"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "plain": {"command": "uvx", "args": ["plain-mcp"]},
+    }}), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(im, "terse_invocation", lambda: [str(launcher), "-m", "terse"])
+    policy = _write(tmp_path, "policy.json", json.dumps({"rules": []}))
+    assert main(["install-mcp", "plain", "--policy", str(policy)]) == 0
+    capsys.readouterr()
+
+    assert main(["mcp-status"]) == 0
+    assert "launcher=" not in capsys.readouterr().out  # resolves -> stays quiet
+
+    launcher.unlink()
+    assert main(["mcp-status"]) == 0
+    out = capsys.readouterr().out
+    assert f"launcher={launcher} (MISSING)" in out and "cannot start" in out
+
+    assert main(["mcp-status", "--json"]) == 0
+    row = next(r for r in json.loads(capsys.readouterr().out) if r["server"] == "plain")
+    assert row["launcher_missing"] is True
+
+
 def test_mcp_status_cmd_flags_a_missing_policy_file(tmp_path, monkeypatch, capsys):
     # A wrapped server whose policy file was deleted/moved after install would fail to
     # start (the proxy raises on load), but the flat status line showed it as normal.
