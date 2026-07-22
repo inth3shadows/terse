@@ -347,7 +347,10 @@ class Interceptor:
         # and the REAL result would then arrive untracked — silently forwarded uncompressed
         # and missing from the ledger. Forward it untouched instead; a server request is not
         # ours to answer or rewrite.
-        if "method" in msg:
+        # Predicate deliberately identical to multiproxy's `from_peer` guard: a message
+        # carrying BOTH `method` and a `result`/`error` is not a server-initiated request
+        # under any reading of JSON-RPC, and must still take the response path.
+        if msg.get("method") is not None and "result" not in msg and "error" not in msg:
             return line
         # Held across the whole body so the init_id/pending/last/since_keyframe state
         # stays consistent against a concurrent note_request on the other thread.

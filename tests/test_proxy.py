@@ -1455,16 +1455,28 @@ def test_server_initiated_request_with_colliding_id_does_not_break_tracking():
     assert reasons                                              # and still recorded
 
 
-def test_server_initiated_notification_is_forwarded_untouched():
-    # Same class: a server notification carrying an id-like field must not be mistaken for
-    # a reply. (A true notification has no id and returns early, but one with both keys
-    # must still be forwarded rather than rewritten.)
+def test_method_bearing_response_still_takes_the_response_path():
+    # The guard must not be "has a method key" alone: a message carrying BOTH `method` and
+    # a `result` is a response (however spec-sloppy), not a server-initiated request. If it
+    # were forwarded as a request, every such result would silently go uncompressed and its
+    # `pending` entry would leak to PENDING_MAX eviction. Same predicate multiproxy uses.
     inter = Interceptor(FULL)
     inter.note_request(_req(2, "gh.api.items"))
-    note = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "notifications/message",
+    payload = _records(30)
+    odd = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                      "result": {"content": [{"type": "text", "text": json.dumps(payload)}]}})
+    out = inter.transform_response(odd)
+    assert transforms.decompress(json.loads(out)["result"]["content"][0]["text"]) == payload
+    assert 2 not in inter.pending          # consumed as the response it is
+
+
+def test_true_notification_returns_before_the_server_request_guard():
+    # A real notification has NO id and returns at the id-is-None check, ahead of the new
+    # guard -- the invariant that keeps the guard from being reached by accident.
+    inter = Interceptor(FULL)
+    note = json.dumps({"jsonrpc": "2.0", "method": "notifications/message",
                        "params": {"level": "info", "data": "hello"}})
     assert inter.transform_response(note) == note
-    assert 2 in inter.pending
 
 
 def test_server_initiated_request_colliding_with_initialize_id_keeps_the_primer():
