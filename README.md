@@ -32,8 +32,12 @@ headroom's stateless per-call compressor, and server-side history-pruning all pa
 full column every call because none of them remember the last result — terse can only do
 it because it lives in the session as a transparent proxy. That makes it the harder half
 to copy. But it is a **bonus tier, not the headline**: it only pays off when a workload
-actually repeats a call with a similar-enough payload, which is rarer than it sounds — in
-terse's own 7-day production traffic the diff tier fired on ~0.4% of results (2 of 464).
+actually repeats a call with a similar-enough payload. That measured ~0.4% of results in
+terse's own 7-day traffic — but most of that was **structural, not workload**: results
+arriving as N content blocks were excluded from diffing outright, which was 71% of tokens.
+The cross-block join (below) removed that exclusion, and across every third-party server
+benchmarked in BENCHMARKS §6 a repeated call now produces a delta. How often *your* loop
+repeats a call is still yours to measure (`terse stats`).
 When your loop *does* re-fetch mostly-unchanged results it compounds hard; when it
 doesn't, it costs nothing (lossless, and emitted only when smaller). Default-on since its
 validation program completed (see Status).
@@ -195,6 +199,8 @@ scripts/
   gen_stress_corpus.py  synthetic stress corpus for the fluency eval
   bench/                terse-vs-TOON token benchmark on a real GitHub-API corpus
                         (fetch_corpus.sh, benchmark.py, diff_demo.py, toon_encode.mjs)
+  bench/mcp_servers/    what terse does, zero-config, to popular third-party MCP servers
+                        (mcp_probe.py harness + pinned repo/web fixtures; BENCHMARKS §6)
 tests/           round-trip, measurement, probe, policy, and fluency tests
 policy.example.json   selective policy encoding the measured per-tool insight
 corpus/          captured tool outputs (gitignored; may contain real data)
@@ -293,8 +299,8 @@ results. (`gh_workflow_runs` is lower here only because its records are large an
 model changed a big nested field; a status/timestamp churn would diff far smaller.) This
 is on top of the single-shot reduction above, and stacks with it. These figures are the
 diff's win *when it fires* on a repeated call; how often that actually happens is a
-separate question — in terse's own production ledger it is ~0.4% of results, so treat
-this as a defensible bonus tier, not the headline lever (that's the codec — see the
+separate question, and workload-dependent — measure yours with `terse stats`. Treat this
+as a defensible bonus tier, not the headline lever (that's the codec — see the
 positioning note at the top and Status).
 
 **Tools not benchmarked head-to-head, and why (no invented numbers):**
@@ -314,7 +320,9 @@ of adoption.
 
 ## Related Documentation
 
-- [Benchmarks](BENCHMARKS.md) — dated, reproducible terse-vs-TOON + competitor numbers
+- [Benchmarks](BENCHMARKS.md) — dated, reproducible numbers: terse-vs-TOON (§1–2), the
+  cross-call diff axis (§3), competitors (§4), the live production ledger (§5), and
+  popular third-party MCP servers + a repo-size sweep (§6)
 - [Verify it yourself](VERIFY.md) — prove losslessness, savings, and no-egress locally
 - [Technical Reference](TECHNICAL.md) — architecture, pipeline, policy schema, limitations
 - [Usage Guide](USAGE.md) — running the CLI day-to-day and reading its output
@@ -334,6 +342,17 @@ that is now **on by default** — its full validation program passed: pair fluen
 (`tests/test_diff_soak.py` — exact reconstruction hundreds of chained hops deep) and
 behaviorally (`fluency --diff-soak` — no depth-correlated accuracy loss up to the
 keyframe bound). Opt out per proxy (`--no-diff`) or per policy (`"diff": false`).
+Cross-block joining (N content blocks
+folded into one record array before compressing) is built and on by default — it removed
+the structural exclusion that kept 71% of real traffic out of the diff tier entirely.
 The Tier 1 lossy modes `truncate` and
 `drop-to-retrieve` are built (opt-in, off by default); `summarize` remains designed but
 not yet built — see TECHNICAL.md "Known Limitations".
+
+Evidence now spans three kinds: a fixed public corpus (BENCHMARKS §1–4), terse's own
+live production ledger (§5), and **popular third-party MCP servers** measured zero-config
+with pinned fixtures (§6) — filesystem, git, memory, fetch, plus serena and
+playwright-mcp. The §6 headline: the codec pays on JSON output (18–58%, depending on
+whether the server pretty-prints) while *every* text-shaped tool is 0% one-shot yet still
+wins on a repeat — so the codec is the JSON-specific lever and the diff is the broad,
+shape-independent one.

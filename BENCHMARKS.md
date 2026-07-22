@@ -1,8 +1,16 @@
 # terse — Benchmarks
 
-**Last updated: 2026-07-17.** All figures below were produced on that date and are
-**reproducible end-to-end** with the commands shown — nothing here is hand-typed or
-estimated. If you re-run and get different numbers, the code changed; open an issue.
+**Last updated: 2026-07-22.** Every figure is dated by section — §1–4 were produced
+2026-07-17, §5–6 on 2026-07-22 — and nothing here is hand-typed or estimated. If you
+re-run and get different numbers, the code changed; open an issue.
+
+Two different kinds of evidence live here, and the difference matters:
+
+- **§1–4, §6 are reproducible by anyone** — fixed corpora, pinned fixtures, credential-free
+  servers, commands shown below.
+- **§5 is one person's live traffic** and is *not* stranger-reproducible by design; it is
+  there to show what an honest production number looks like, and to hand you the one
+  command that gives you your own.
 
 ## What is being measured
 
@@ -23,6 +31,10 @@ cd -
 uv run scripts/bench/benchmark.py        # §1  terse vs TOON on real GitHub API payloads
 uv run scripts/bench/width_sweep.py      # §2  the column-width sweep
 uv run scripts/bench/diff_demo.py        # §3  cross-call diff (terse's own axis)
+
+terse stats                              # §5  YOUR live ledger (your traffic, not ours)
+cat scripts/bench/mcp_servers/README.md  # §6  popular third-party MCP servers + repo-size
+                                         #     sweep (pinned fixtures, credential-free)
 ```
 
 ---
@@ -123,9 +135,9 @@ lossless token axis; the rest measure *different guarantees*, so no head-to-head
 
 ## §5 — In production: the live ledger (not just the curated corpus)
 
-§1–3 are a fixed corpus. This section is **real proxied traffic** — the author's own kb /
+§1–4 and §6 are things anyone can re-run. This section is **real proxied traffic** — the author's own kb /
 secret-broker / runecho / codegraph sessions — read from terse's always-on, **payload-free**
-savings ledger (sizes + decisions only, never content). Unlike §1–3, a stranger can't
+savings ledger (sizes + decisions only, never content). Unlike those, a stranger can't
 reproduce *these* numbers (they're one person's traffic); the point is the opposite — here is
 what an honest production figure looks like, and the one command that gives you *yours*.
 

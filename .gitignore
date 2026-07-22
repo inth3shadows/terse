@@ -36,3 +36,7 @@ src/terse/_version.py
 
 # Benchmark: pinned TOON encoder deps (regenerate with `cd scripts/bench && npm install`)
 scripts/bench/node_modules/
+
+# playwright-mcp writes session artifacts (console logs, page snapshots) into its CWD,
+# so running the §6 benchmark from the repo root drops them here (scripts/bench/mcp_servers).
+.playwright-mcp/
