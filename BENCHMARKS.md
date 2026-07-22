@@ -135,9 +135,9 @@ lossless token axis; the rest measure *different guarantees*, so no head-to-head
 
 ## §5 — In production: the live ledger (not just the curated corpus)
 
-§1–3 are a fixed corpus. This section is **real proxied traffic** — the author's own kb /
+§1–4 and §6 are things anyone can re-run. This section is **real proxied traffic** — the author's own kb /
 secret-broker / runecho / codegraph sessions — read from terse's always-on, **payload-free**
-savings ledger (sizes + decisions only, never content). Unlike §1–3, a stranger can't
+savings ledger (sizes + decisions only, never content). Unlike those, a stranger can't
 reproduce *these* numbers (they're one person's traffic); the point is the opposite — here is
 what an honest production figure looks like, and the one command that gives you *yours*.
 
