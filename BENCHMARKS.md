@@ -121,19 +121,73 @@ lossless token axis; the rest measure *different guarantees*, so no head-to-head
 
 ---
 
-## §5 — Generate your own real-session evidence
+## §5 — In production: the live ledger (not just the curated corpus)
 
-The benchmarks above are a fixed corpus. terse also keeps an always-on, **payload-free**
-savings ledger from your real sessions (sizes + decisions only, never content), so you can
-measure what terse saved *you*, not a synthetic corpus:
+§1–3 are a fixed corpus. This section is **real proxied traffic** — the author's own kb /
+secret-broker / runecho / codegraph sessions — read from terse's always-on, **payload-free**
+savings ledger (sizes + decisions only, never content). Unlike §1–3, a stranger can't
+reproduce *these* numbers (they're one person's traffic); the point is the opposite — here is
+what an honest production figure looks like, and the one command that gives you *yours*.
+
+**Headline (measured 2026-07-22, `terse stats`, ledger spans 7 days):**
+
+```
+1,526 results   470,609 -> 427,378 tok   9.2% blended
+```
+
+That 9.2% is honest and *incomplete*, for two reasons — and both are the point of this section.
+
+**1. This ledger straddles the #116 transition.** Most of its records predate cross-block
+joining (the `multiblock` diff-reason bucket is still 345 of them), so it mostly reflects the
+old per-block path. `terse stats` on post-#116 traffic reads higher for repeat-heavy loops
+(below). The number is *composition*, not a constant — which is why we publish a range.
+
+**2. Savings track payload shape.** Which tools you call sets the mix. Measured on the real
+captured records (production policy, deduplicated to one call's worth per tool):
+
+| shape | example tool | codec: per-block → joined (#116) | an *unchanged* repeat |
+|---|---|--:|--:|
+| wide, low-cardinality | `kb.read.changelog` | 21% → **38%** | ~99% |
+| | `kb.read.recent_rejections` | 17% → **33%** | ~99% |
+| | `kb.read.for_repo` | 15% → **24%** | ~98% |
+| prose-heavy records | `kb.read.list_principles` | 3% → 3% *(hard ceiling)* | **~99.9%** |
+| | `kb.read.get` | 2% → 2% | ~99.9% |
+| already-projected small | `kb.read.query_stats` | 41% → 41% | — |
+| tiny status objects | *(policy `tiers:[]`)* | 0% → 0% *(correct — already minimal)* | — |
+
+The prose ceiling is structural, exactly as predicted: long unique text in
+`principle`/`rationale`/`evidence` has nothing to fold, and no tier combination changes that.
+
+**What #116 actually changed here.** The codec fold (per-block → joined) helps the wide
+low-cardinality tools and does ~nothing for prose. The real lever is the **diff tier**, which
+the per-block path could never reach:
+
+- **76% of ledger tokens** are the multiblock JSON shape #116 targets.
+- **71% of ledger tokens are now diff-eligible** — a join fires *and* a repeat produces a
+  lossless delta — where **before #116 that share was 100% excluded** from diffing.
+- On an *unchanged* repeat, those results collapse **~99%** (the right column above). kb data
+  changes slowly and these tools are re-read many times per session (`list_principles`: 865
+  calls in this 7-day ledger), so in a real agent loop a large fraction of calls after the
+  first are near-empty diffs.
+
+**So the production figure is a range, not a point:**
+
+- **Floor** — every call, no repeats: the joined codec alone, ~9–12%, dominated by prose
+  ceilings.
+- **Ceiling** — repeat-heavy loop with data stable between calls: re-weighting the ledger's
+  own token mix, the diff-eligible 71% collapsing ~99% each puts the aggregate near **~71%**.
+- **Reality sits between**, set by *your* repeat rate and how fast *your* data changes — which
+  no benchmark can tell you. So measure it:
 
 ```bash
-terse stats                 # rollup: results, decisions, tokens saved, per-tool rows
+terse stats                 # rollup: results, decisions, tokens saved, per-tool rows,
+                            #          and the diff-reason breakdown (how often diffs fire)
 terse stats --since 7d      # windowed
 ```
 
-This is terse's "evidence over stars" path: your own numbers, on your own traffic, verifiable
-without trusting this file.
+Wrap your servers (`terse install-mcp …`), use them for a week, read your own ledger. That
+converts "trust our benchmark" into "run it on your traffic" — the honest version of the
+claim, and a better pitch besides.
 
 ---
 
