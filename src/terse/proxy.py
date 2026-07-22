@@ -338,6 +338,17 @@ class Interceptor:
             return line
         if not isinstance(msg, dict) or msg.get("id") is None:
             return line
+        # A server-initiated REQUEST (it carries "method" alongside an id) is NOT a reply to
+        # anything this proxy sent. JSON-RPC gives each direction its OWN id space, and both
+        # sides conventionally number from 1, so a server's `roots/list` /
+        # `sampling/createMessage` / `elicitation/create` id routinely collides with an
+        # in-flight tools/call id. Falling through would pop that call's `pending` entry (the
+        # pop below is deliberately unconditional so an error-shaped reply still frees it),
+        # and the REAL result would then arrive untracked — silently forwarded uncompressed
+        # and missing from the ledger. Forward it untouched instead; a server request is not
+        # ours to answer or rewrite.
+        if "method" in msg:
+            return line
         # Held across the whole body so the init_id/pending/last/since_keyframe state
         # stays consistent against a concurrent note_request on the other thread.
         # ALWAYS this Interceptor's own private lock — never blocks another peer's

@@ -1429,3 +1429,53 @@ def test_join_diff_off_folds_records_but_never_diffs():
     assert len(c1) == 1 and transforms.TABLE_MARKER in c1[0]["text"]   # folded
     assert transforms.DIFF_MARKER not in c2[0]["text"]                # but never a diff
     assert reasons[-1] == "joined"
+
+
+# --- server-initiated requests must not consume a tracked call's pending entry ---
+
+def test_server_initiated_request_with_colliding_id_does_not_break_tracking():
+    # JSON-RPC gives each direction its own id space and both sides conventionally number
+    # from 1, so a server's roots/list (or sampling/createMessage) id routinely collides
+    # with an in-flight tools/call id. Popping `pending` for it left the REAL result
+    # untracked: silently forwarded UNCOMPRESSED and missing from the ledger.
+    reasons, stats = _capture_stats()
+    inter = Interceptor(FULL, stats=stats)
+    inter.note_request(_req(1, "gh.api.items"))
+    assert 1 in inter.pending
+
+    server_req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "roots/list"})
+    assert inter.transform_response(server_req) == server_req   # forwarded byte-for-byte
+    assert 1 in inter.pending                                   # tracking SURVIVES
+
+    payload = _records(30)
+    out = inter.transform_response(_result_msg(1, json.dumps(payload)))
+    text = json.loads(out)["result"]["content"][0]["text"]
+    assert transforms.decompress(text) == payload               # still compressed, lossless
+    assert transforms.TABLE_MARKER in text
+    assert reasons                                              # and still recorded
+
+
+def test_server_initiated_notification_is_forwarded_untouched():
+    # Same class: a server notification carrying an id-like field must not be mistaken for
+    # a reply. (A true notification has no id and returns early, but one with both keys
+    # must still be forwarded rather than rewritten.)
+    inter = Interceptor(FULL)
+    inter.note_request(_req(2, "gh.api.items"))
+    note = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "notifications/message",
+                       "params": {"level": "info", "data": "hello"}})
+    assert inter.transform_response(note) == note
+    assert 2 in inter.pending
+
+
+def test_server_initiated_request_colliding_with_initialize_id_keeps_the_primer():
+    # The init_id branch has the same exposure: a server request colliding with the
+    # initialize id would consume it, and the REAL initialize reply would then never get
+    # the terse primer injected.
+    inter = Interceptor(FULL)
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 5, "method": "initialize"}))
+    server_req = json.dumps({"jsonrpc": "2.0", "id": 5, "method": "roots/list"})
+    assert inter.transform_response(server_req) == server_req
+    reply = json.dumps({"jsonrpc": "2.0", "id": 5,
+                        "result": {"protocolVersion": "2025-06-18", "capabilities": {}}})
+    out = json.loads(inter.transform_response(reply))
+    assert "terse" in (out["result"].get("instructions") or "").lower()   # primer survived
