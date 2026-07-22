@@ -1429,3 +1429,65 @@ def test_join_diff_off_folds_records_but_never_diffs():
     assert len(c1) == 1 and transforms.TABLE_MARKER in c1[0]["text"]   # folded
     assert transforms.DIFF_MARKER not in c2[0]["text"]                # but never a diff
     assert reasons[-1] == "joined"
+
+
+# --- server-initiated requests must not consume a tracked call's pending entry ---
+
+def test_server_initiated_request_with_colliding_id_does_not_break_tracking():
+    # JSON-RPC gives each direction its own id space and both sides conventionally number
+    # from 1, so a server's roots/list (or sampling/createMessage) id routinely collides
+    # with an in-flight tools/call id. Popping `pending` for it left the REAL result
+    # untracked: silently forwarded UNCOMPRESSED and missing from the ledger.
+    reasons, stats = _capture_stats()
+    inter = Interceptor(FULL, stats=stats)
+    inter.note_request(_req(1, "gh.api.items"))
+    assert 1 in inter.pending
+
+    server_req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "roots/list"})
+    assert inter.transform_response(server_req) == server_req   # forwarded byte-for-byte
+    assert 1 in inter.pending                                   # tracking SURVIVES
+
+    payload = _records(30)
+    out = inter.transform_response(_result_msg(1, json.dumps(payload)))
+    text = json.loads(out)["result"]["content"][0]["text"]
+    assert transforms.decompress(text) == payload               # still compressed, lossless
+    assert transforms.TABLE_MARKER in text
+    assert reasons                                              # and still recorded
+
+
+def test_method_bearing_response_still_takes_the_response_path():
+    # The guard must not be "has a method key" alone: a message carrying BOTH `method` and
+    # a `result` is a response (however spec-sloppy), not a server-initiated request. If it
+    # were forwarded as a request, every such result would silently go uncompressed and its
+    # `pending` entry would leak to PENDING_MAX eviction. Same predicate multiproxy uses.
+    inter = Interceptor(FULL)
+    inter.note_request(_req(2, "gh.api.items"))
+    payload = _records(30)
+    odd = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                      "result": {"content": [{"type": "text", "text": json.dumps(payload)}]}})
+    out = inter.transform_response(odd)
+    assert transforms.decompress(json.loads(out)["result"]["content"][0]["text"]) == payload
+    assert 2 not in inter.pending          # consumed as the response it is
+
+
+def test_true_notification_returns_before_the_server_request_guard():
+    # A real notification has NO id and returns at the id-is-None check, ahead of the new
+    # guard -- the invariant that keeps the guard from being reached by accident.
+    inter = Interceptor(FULL)
+    note = json.dumps({"jsonrpc": "2.0", "method": "notifications/message",
+                       "params": {"level": "info", "data": "hello"}})
+    assert inter.transform_response(note) == note
+
+
+def test_server_initiated_request_colliding_with_initialize_id_keeps_the_primer():
+    # The init_id branch has the same exposure: a server request colliding with the
+    # initialize id would consume it, and the REAL initialize reply would then never get
+    # the terse primer injected.
+    inter = Interceptor(FULL)
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 5, "method": "initialize"}))
+    server_req = json.dumps({"jsonrpc": "2.0", "id": 5, "method": "roots/list"})
+    assert inter.transform_response(server_req) == server_req
+    reply = json.dumps({"jsonrpc": "2.0", "id": 5,
+                        "result": {"protocolVersion": "2025-06-18", "capabilities": {}}})
+    out = json.loads(inter.transform_response(reply))
+    assert "terse" in (out["result"].get("instructions") or "").lower()   # primer survived

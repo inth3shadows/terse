@@ -1098,3 +1098,43 @@ def test_resources_read_scatter_gather_all_error_surfaces_first_error():
     assert merged["id"] == 8 and "result" not in merged
     # the first-arriving error is surfaced, not a synthesized one
     assert merged["error"]["message"] == "not found on a"
+
+
+def test_peer_initiated_request_does_not_consume_that_peers_interceptor_pending():
+    # Companion to the _routed_timers test above, one layer down: pins the END-TO-END
+    # invariant that a peer's own request never consumes that peer's Interceptor tracking,
+    # so the real result is still compressed and recorded.
+    #
+    # Note this now holds at TWO layers — `from_peer` recognizes the server request first,
+    # and `transform_response` forwards method-bearing messages untouched. Verified: this
+    # test still passes with `from_peer`'s server-request branch disabled, because the
+    # Interceptor guard catches it. That is defense in depth, not a vacuous test — but it
+    # does mean this test alone will NOT catch a from_peer regression; the _routed_timers
+    # test above is what pins that branch's own behavior.
+    t0 = _FakePeerTransport()
+    inter = Interceptor(PLAIN_POLICY)
+    peers = [Peer("a", t0, inter)]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "a__gh.api.items"}}))
+        assert inter.pending, "the peer's Interceptor is tracking the routed call"
+
+        # the peer emits its own request reusing id=1 (its own id space)
+        router.from_peer(0)(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "roots/list"}))
+        assert inter.pending, "tracking must SURVIVE the peer's own request"
+
+        # ... and the real result still gets compressed
+        payload = {"result": [{"id": i, "status": "active"} for i in range(30)]}
+        line = router.from_peer(0)(json.dumps(
+            {"jsonrpc": "2.0", "id": 1,
+             "result": {"content": [{"type": "text", "text": json.dumps(payload)}]}}))
+        assert line not in (None, SWALLOW)
+        text = json.loads(line)["result"]["content"][0]["text"]
+        assert transforms.decompress(text) == payload
+        assert transforms.TABLE_MARKER in text
+    finally:
+        router.close_senders()

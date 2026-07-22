@@ -9,6 +9,20 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Fixed
+- **A server-initiated request no longer silently disables compression for an in-flight
+  call.** A server→client request (`roots/list`, `sampling/createMessage`,
+  `elicitation/create`) carries a `method` alongside an id, and JSON-RPC gives each
+  direction its own id space — both sides conventionally numbering from 1 — so such an id
+  routinely collides with an in-flight `tools/call` id. `transform_response` popped
+  `pending[id]` unconditionally (deliberately, so an error-shaped reply still frees its
+  entry), which also consumed the entry for a server request; the real tool result then
+  arrived untracked and was forwarded **uncompressed and absent from the savings ledger**,
+  with nothing logged to say so. The `initialize` path had the same exposure — a colliding
+  server request consumed `init_id`, so the real reply never received the terse primer.
+  Method-bearing messages are now forwarded untouched, using the same predicate
+  `multiproxy` already applied one layer up.
+
 ### Added
 - **Cross-block join (`join_blocks`, ON by default) — #116.** When every text content
   block of a tool result is a JSON object, the proxy now joins them into one record array
