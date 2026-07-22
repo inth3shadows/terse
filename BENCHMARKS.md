@@ -191,6 +191,81 @@ claim, and a better pitch besides.
 
 ---
 
+## §6 — Popular third-party MCP servers (measured 2026-07-22)
+
+§5 is one person's traffic. This section is the other half: what terse does **automatically,
+zero-config** to the output of widely-used, **credential-free** MCP servers that anyone can
+run. Reproduce with `scripts/bench/mcp_servers/` (pinned repo fixtures, a static local web
+fixture, one command per server).
+
+Servers: the official reference set (`modelcontextprotocol/servers`, 88.8k★) plus the two
+most-starred credential-free third-party servers — **serena** (26.7k★) and
+**playwright-mcp** (35.4k★).
+
+| server | tool | output shape | codec % (1-shot) | repeated call |
+|---|---|---|--:|---|
+| filesystem | `directory_tree` | JSON, pretty-printed | **50–58%** | diff |
+| filesystem | `read_text_file` | source text | 0% | text-diff |
+| git | `git_log` | long text | 0% | text-diff |
+| memory | `read_graph`, `search_nodes`, `create_entities` | JSON | **40–42%** | — |
+| serena | `get_symbols_overview`, `find_symbol` | JSON, already compact | **18–22%** | diff |
+| playwright | `browser_snapshot` | accessibility tree (text) | 0% | text-diff |
+| fetch | `fetch` | markdown | 0% | text-diff |
+
+### The headline: the codec is narrow, the diff tier is universal
+
+Two things fall out, and they matter more than any single percentage:
+
+1. **The one-shot codec pays only on JSON — and how much depends on whether the server
+   pretty-prints.** filesystem pretty-prints its tree, so minify alone is most of 50–58%.
+   memory returns compact-ish JSON records (40–42%). serena emits *already-compact* JSON, so
+   only the structural fold is left (18–22%) — the hardest honest case, and exactly the
+   "pure structural gain" framing at the top of this file.
+2. **Every text-shaped tool is 0% on the codec — and every one of them still wins on a
+   repeat.** `read_text_file`, `git_log`, `browser_snapshot`, and `fetch` are all
+   uncompressible one-shot, yet all four emit a content-defined-chunking text diff the
+   second time they are called.
+
+So on third-party servers the **cross-call diff is the broad, shape-independent win, and the
+codec is the JSON-specific one.** That is a sharper claim than a blended average, and it
+predicts where terse helps: agent loops that call the same tool repeatedly. Browser
+automation is the clearest case — navigate → snapshot → act → snapshot — where consecutive
+near-identical accessibility trees are precisely the diff's sweet spot.
+
+### Repo size barely moves the codec
+
+`directory_tree` across three pinned fixtures — express v5.2.1 (218 files), fastapi 0.139.2
+(3,131), django 5.2.16 (6,926):
+
+| fixture | raw tok | codec % | repeat |
+|---|--:|--:|---|
+| express | 116 | 54.3% | diff not smaller (payload too small) |
+| fastapi | 1,328 | 50.3% | **diff emitted** |
+| django | 2,696 | 58.0% | **diff emitted** |
+
+The codec sits in a **50–58% band across a 23× payload-size range** — it tracks JSON
+structure, not repo size. What size *does* change is the **diff**: below roughly a thousand
+tokens the delta loses to simply re-sending the compressed form; above it the diff wins and
+keeps winning.
+
+### Zero-config auto-policy holds up
+
+`terse policy generate` was run against each captured corpus and authored a correct,
+conservative, lossless policy every time with no hand-tuning: `directory_tree` →
+`minify,tabularize` (dictionary auto-dropped as below the 5% threshold), `read_text_file` →
+`tiers: []` passthrough (detected as non-JSON), memory's three record tools → all folded.
+That is the "does it just work on a server it has never seen" question, answered yes.
+
+### Honest scope note: #116's cross-block join does *not* apply here
+
+terse's cross-block join folds a result that arrives as *N* content blocks into one record
+array. **Every server measured above returns a single content block per result**, so the
+join never fires — their wins come from the codec and the diff tier. The join targets
+servers that emit one record per block (the kind measured in §5). Worth stating plainly:
+a feature that is decisive on one traffic mix can be inert on another.
+
+---
+
 ## Methodology & honesty notes
 
 - Tokenizer is `cl100k_base`; absolute % shift under a different vocabulary but the ranking is
