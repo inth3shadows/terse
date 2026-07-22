@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Drive a real MCP server through the terse proxy and capture what terse did to it.
 
-Sends `initialize` -> `tools/list` -> each requested `tools/call` **twice** (so the
-cross-call diff tier is exercised), writing every raw payload into a capture corpus and a
-payload-free stats ledger. Feed the corpus to `terse measure` for per-tool codec numbers
-and the ledger to `terse stats` for the diff-reason breakdown.
+Sends `initialize` -> `tools/list` -> each requested `tools/call` **twice**, writing every
+raw payload into a capture corpus and a payload-free stats ledger. Feed the corpus to
+`terse measure` for per-tool codec numbers and the ledger to `terse stats` for the
+diff-reason breakdown.
 
 Usage:
     mcp_probe.py <server_name> <corpus_dir> <stats_log> <calls_json> -- <server argv...>
@@ -13,121 +13,225 @@ Usage:
 
 Env:
     TERSE_BIN         terse executable (default: "terse" from PATH)
-    PROBE_DEADLINE    seconds to wait for all responses (default: 300)
+    PROBE_DEADLINE    seconds to wait for any single response (default: 300)
+    PROBE_STDERR      set to 1 to inherit the proxy's stderr instead of teeing it to
+                      <stats_log>.stderr — terse's launch failures and its once-per-sink
+                      "capture skipped" warnings are written there.
 
-Example:
-    mcp_probe.py filesystem ./corpus ./ledger.jsonl \
-        '[{"name":"directory_tree","arguments":{"path":"/path/to/repo/lib"}}]' \
-        -- npx -y @modelcontextprotocol/server-filesystem /path/to/repo
+Exit status is non-zero if ANY request failed, so a sweep loop can detect a bad run.
 
-IMPORTANT: stdin is held OPEN until every expected response arrives. Closing it as soon as
-the requests are written makes the proxy tear the child down mid-call — fast servers still
-answer, but slow ones (a browser launch, an HTTP fetch) silently return nothing, which
-reads as "that server is broken" when it is only the harness.
+Design notes (each of these exists because getting it wrong produced a *silently wrong
+measurement*, not a crash):
+
+  * **stdin stays open** until every response arrives. Closing it as soon as the requests
+    are written makes the proxy tear the child down mid-call: fast servers still answer,
+    slow ones (browser launch, HTTP fetch) return nothing, which reads as "that server is
+    broken".
+  * **Only `result`/`error` messages count as responses.** Servers legitimately send their
+    own *requests* (`roots/list`, `sampling/createMessage`) and choose their own small
+    integer ids, which collide with this probe's id space. Treating one as a response ends
+    the run early and reports an empty corpus as a clean measurement. Inbound requests are
+    answered `-32601` so a server that blocks on one does not stall to the deadline.
+  * **`result.isError` is a failure.** MCP's normal tool-failure convention is a text block
+    with `isError: true` — a mistyped path or a wrong argument name returns one, and it
+    would otherwise be captured and measured as if it were real tool output.
+  * **The two repeats are serialized**, not pipelined. Servers dispatch concurrently, so
+    batched requests can be answered out of order; the proxy sets its diff base in arrival
+    order, which would make the diff measurement nondeterministic.
 """
 from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
 
 TERSE_BIN = os.environ.get("TERSE_BIN", "terse")
 DEADLINE = float(os.environ.get("PROBE_DEADLINE", "300"))
+INHERIT_STDERR = os.environ.get("PROBE_STDERR") == "1"
+
+
+class Probe:
+    """Owns the proxy subprocess and the request/response correlation."""
+
+    def __init__(self, argv: list[str], stderr_target):
+        self.proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_target,
+            text=True, start_new_session=True)   # own process group -> killable as a tree
+        self._cv = threading.Condition()
+        self._responses: dict[int, dict] = {}
+        self._stdin_lock = threading.Lock()
+        self._eof = False
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+
+    def _write(self, msg: dict) -> None:
+        with self._stdin_lock:
+            if self.proc.stdin is None or self.proc.stdin.closed:
+                return
+            try:
+                self.proc.stdin.write(json.dumps(msg) + "\n")
+                self.proc.stdin.flush()
+            except (BrokenPipeError, ValueError):
+                pass
+
+    def _read_loop(self) -> None:
+        try:
+            if self.proc.stdout is None:
+                return
+            for line in self.proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                # A server-initiated REQUEST (has "method" and an id) — not a response.
+                # Its id may collide with ours, so it must never satisfy a wait.
+                if "method" in msg:
+                    if msg.get("id") is not None:
+                        self._write({"jsonrpc": "2.0", "id": msg["id"],
+                                     "error": {"code": -32601,
+                                               "message": "probe does not implement "
+                                                          f"{msg.get('method')!r}"}})
+                    continue
+                if "result" not in msg and "error" not in msg:
+                    continue
+                with self._cv:
+                    self._responses[msg.get("id")] = msg
+                    self._cv.notify_all()
+        finally:
+            with self._cv:                     # never strand a waiter on reader death
+                self._eof = True
+                self._cv.notify_all()
+
+    def request(self, mid: int, method: str, params: dict | None = None) -> dict | None:
+        """Send one request and wait for ITS response. Returns None on timeout/EOF."""
+        msg = {"jsonrpc": "2.0", "id": mid, "method": method}
+        if params is not None:
+            msg["params"] = params
+        self._write(msg)
+        with self._cv:
+            ok = self._cv.wait_for(lambda: mid in self._responses or self._eof, DEADLINE)
+            if not ok:
+                return None
+            return self._responses.get(mid)
+
+    def notify(self, method: str) -> None:
+        self._write({"jsonrpc": "2.0", "method": method})
+
+    def close(self) -> None:
+        """Shut the tree down gracefully. SIGKILL alone would bypass terse's own
+        `finally: transport.close()`, orphaning grandchildren (a browser, a language
+        server) that outlive the probe."""
+        try:
+            if self.proc.stdin and not self.proc.stdin.closed:
+                self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=10)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            self.proc.kill()
+
+
+def _describe(msg: dict | None) -> tuple[bool, str]:
+    """(ok, description) for one response."""
+    if msg is None:
+        return False, "NO RESPONSE (raise PROBE_DEADLINE?)"
+    if "error" in msg:
+        return False, f"PROTOCOL ERROR {str(msg['error'])[:110]}"
+    result = msg.get("result") or {}
+    content = result.get("content") or []
+    text = content[0].get("text", "") if content and content[0].get("type") == "text" else ""
+    if result.get("isError"):
+        return False, f"TOOL ERROR {text[:110]}"
+    is_diff = False
+    try:
+        env = json.loads(text)
+        is_diff = isinstance(env, dict) and env.get("__terse_diff__") == 1
+    except ValueError:
+        pass
+    return True, f"blocks={len(content)} chars={len(text)}{' DIFF' if is_diff else ''}"
 
 
 def main(argv: list[str]) -> int:
-    try:
-        server_name, corpus, stats_log, calls_json = argv[1:5]
-        assert argv[5] == "--"
-    except (ValueError, IndexError, AssertionError):
+    if len(argv) < 7 or argv[5] != "--":
         print(__doc__)
         return 2
+    server_name, corpus, stats_log, calls_json = argv[1:5]
     server_argv = argv[6:]
-    calls = json.loads(calls_json)
-
-    reqs: list[dict] = [
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-         "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-                    "clientInfo": {"name": "terse-probe", "version": "0"}}},
-        {"jsonrpc": "2.0", "method": "notifications/initialized"},
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-    ]
-    idmap: dict[int, tuple[str, int]] = {}
-    mid = 10
-    for c in calls:
-        for rep in (0, 1):                      # twice: the 2nd call can diff
-            reqs.append({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
-                         "params": {"name": c["name"], "arguments": c.get("arguments", {})}})
-            idmap[mid] = (c["name"], rep)
-            mid += 1
-    expected = set(idmap) | {1, 2}
-
-    proc = subprocess.Popen(
-        [TERSE_BIN, "proxy", "--server-name", server_name, "--capture-dir", corpus,
-         "--stats-log", stats_log, "--"] + server_argv,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-
-    out: dict[int, dict] = {}
-    done = threading.Event()
-
-    def reader() -> None:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            if msg.get("id") in expected:
-                out[msg["id"]] = msg
-                if expected <= set(out):
-                    break
-        done.set()
-
-    threading.Thread(target=reader, daemon=True).start()
-
-    assert proc.stdin is not None
-    for r in reqs:
-        proc.stdin.write(json.dumps(r) + "\n")
-    proc.stdin.flush()
-
-    done.wait(DEADLINE)                          # keep stdin open until answers land
     try:
-        proc.stdin.close()
-    except OSError:
-        pass
-    try:
-        proc.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+        calls = json.loads(calls_json)
+    except ValueError as exc:
+        print(f"calls_json is not valid JSON: {exc}")
+        return 2
 
-    n_tools = len(out.get(2, {}).get("result", {}).get("tools", []))
-    print(f"[{server_name}] init={'result' in out.get(1, {})} tools={n_tools}")
-    for mid_, (name, rep) in idmap.items():
-        msg = out.get(mid_)
-        if msg is None:
-            print(f"  {name} rep{rep}: NO RESPONSE (raise PROBE_DEADLINE?)")
-            continue
-        if "error" in msg:
-            print(f"  {name} rep{rep}: ERROR {str(msg['error'])[:110]}")
-            continue
-        if rep != 1:
-            continue
-        content = msg.get("result", {}).get("content", [])
-        text = content[0]["text"] if content and content[0].get("type") == "text" else ""
-        is_diff = False
-        try:
-            env = json.loads(text)
-            is_diff = isinstance(env, dict) and env.get("__terse_diff__") == 1
-        except ValueError:
-            pass
-        print(f"  {name:24} rep1 blocks={len(content)} chars={len(text)}"
-              f"{' DIFF' if is_diff else ''}")
-    return 0
+    proxy_argv = [TERSE_BIN, "proxy", "--server-name", server_name,
+                  "--capture-dir", corpus, "--stats-log", stats_log, "--"] + server_argv
+
+    err_path = stats_log + ".stderr"
+    err_fh = None if INHERIT_STDERR else open(err_path, "w", encoding="utf-8")
+    probe = Probe(proxy_argv, None if INHERIT_STDERR else err_fh)
+    failed = False
+    try:
+        init = probe.request(1, "initialize", {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "terse-probe", "version": "0"}})
+        ok, desc = _describe(init)
+        if not ok:
+            print(f"[{server_name}] initialize FAILED: {desc}")
+            return 1
+        probe.notify("notifications/initialized")
+
+        listed = probe.request(2, "tools/list")
+        tools = (listed or {}).get("result", {}).get("tools", []) if listed else []
+        print(f"[{server_name}] init=True tools={len(tools)}")
+        if not tools:
+            print("  WARNING: server advertised no tools")
+            failed = True
+
+        mid = 10
+        for call in calls:
+            name = call["name"]
+            # Serialized: rep1 is sent only after rep0's response has landed, so the
+            # proxy's diff base is set in a deterministic order.
+            for rep in (0, 1):
+                resp = probe.request(mid, "tools/call",
+                                     {"name": name, "arguments": call.get("arguments", {})})
+                ok, desc = _describe(resp)
+                if not ok:
+                    print(f"  {name} rep{rep}: {desc}")
+                    failed = True
+                elif rep == 1:
+                    print(f"  {name:24} rep1 {desc}")
+                mid += 1
+    finally:
+        probe.close()
+        if err_fh is not None:
+            err_fh.close()
+            if failed and os.path.getsize(err_path) > 0:
+                print(f"  --- proxy stderr ({err_path}) ---")
+                with open(err_path, encoding="utf-8") as fh:
+                    for line in fh.read().splitlines()[-10:]:
+                        print(f"  {line}")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
