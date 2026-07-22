@@ -41,6 +41,7 @@ measurement*, not a crash):
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
@@ -187,8 +188,14 @@ def main(argv: list[str]) -> int:
                   "--capture-dir", corpus, "--stats-log", stats_log, "--"] + server_argv
 
     err_path = stats_log + ".stderr"
-    err_fh = None if INHERIT_STDERR else open(err_path, "w", encoding="utf-8")
-    probe = Probe(proxy_argv, None if INHERIT_STDERR else err_fh)
+    with contextlib.ExitStack() as stack:
+        err_fh = (None if INHERIT_STDERR
+                  else stack.enter_context(open(err_path, "w", encoding="utf-8")))
+        return _run(proxy_argv, server_name, calls, err_fh, err_path)
+
+
+def _run(proxy_argv, server_name, calls, err_fh, err_path) -> int:
+    probe = Probe(proxy_argv, err_fh)
     failed = False
     try:
         init = probe.request(1, "initialize", {
@@ -225,7 +232,7 @@ def main(argv: list[str]) -> int:
     finally:
         probe.close()
         if err_fh is not None:
-            err_fh.close()
+            err_fh.flush()            # flush, not close: the ExitStack owns closing it
             if failed and os.path.getsize(err_path) > 0:
                 print(f"  --- proxy stderr ({err_path}) ---")
                 with open(err_path, encoding="utf-8") as fh:

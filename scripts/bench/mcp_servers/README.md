@@ -62,6 +62,31 @@ python3 -m http.server 8919 --directory ./webfix   # serves webfix/index.html
 
 Then call `fetch` / `browser_navigate` against `http://127.0.0.1:8919/index.html`.
 
+## Transports beyond stdio
+
+terse also proxies an MCP **Streamable-HTTP** endpoint, and can front several servers from
+one process. Both are covered in §6:
+
+```bash
+# HTTP downstream — a single target containing "://" selects the URL transport
+npx -y @modelcontextprotocol/server-everything streamableHttp     # listens on :3001
+python mcp_probe.py everything-http "$CORPUS" "$LEDGER" \
+  '[{"name":"echo","arguments":{"message":"hi"}}]' -- http://127.0.0.1:3001/mcp
+
+# multi-peer fan-out, mixed transports (2 stdio + 1 HTTP) in one process
+cat > multi.json <<'JSON'
+{"downstreams":[
+  {"name":"fs","command":["npx","-y","@modelcontextprotocol/server-filesystem","/path/to/repo"]},
+  {"name":"mem","command":["npx","-y","@modelcontextprotocol/server-memory"]},
+  {"name":"ev","url":"http://127.0.0.1:3001/mcp"}
+]}
+JSON
+terse proxy --config multi.json --capture-dir "$CORPUS" --stats-log "$LEDGER"
+```
+
+Tools arrive peer-prefixed (`fs__directory_tree`), the terse primer is injected once across
+all peers, and the ledger attributes savings per peer.
+
 ## Gotchas worth knowing
 
 - **Hold stdin open.** `mcp_probe.py` keeps the pipe open until every response arrives.
@@ -69,6 +94,19 @@ Then call `fetch` / `browser_navigate` against `http://127.0.0.1:8919/index.html
   still answer, slow ones (browser launch, HTTP fetch) return *nothing* — which looks like
   "that server is broken" when it is the harness. Raise `PROBE_DEADLINE` (default 300s)
   for slow servers.
+- **A server's own requests use their own ids.** `roots/list` / `sampling/createMessage`
+  are *requests*, and their ids collide with the probe's. The probe only treats
+  `result`/`error` messages as responses and answers inbound requests `-32601`; anything
+  looser ends the run early and reports an **empty corpus as a clean measurement**.
+- **`isError: true` is a failure, not a payload.** A mistyped path or a wrong argument name
+  comes back that way, and capturing it would put an error string into the corpus and
+  measure a codec % over it. The probe reports `TOOL ERROR` and **exits non-zero**, so a
+  sweep loop can tell a bad run from a good one.
+- **Repeats are serialized**, not pipelined — servers dispatch concurrently and the proxy
+  sets its diff base in arrival order, so batched repeats made the diff nondeterministic.
+- **Proxy stderr** is teed to `<stats_log>.stderr` and the tail is printed on failure; it
+  carries terse's launch errors and its once-per-sink "capture skipped" warnings.
+  `PROBE_STDERR=1` inherits it live instead.
 - **playwright** needs `--no-sandbox` where user namespaces are restricted (WSL,
   containers), and its pinned playwright version may want a newer Chromium than you have
   cached — install it with
