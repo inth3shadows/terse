@@ -76,7 +76,7 @@ python mcp_probe.py everything-http "$CORPUS" "$LEDGER" \
 # multi-peer fan-out, mixed transports (2 stdio + 1 HTTP) in one process
 cat > multi.json <<'JSON'
 {"downstreams":[
-  {"name":"fs","command":["npx","-y","@modelcontextprotocol/server-filesystem","/path/to/repo"]},
+  {"name":"fs","command":["npx","-y","@modelcontextprotocol/server-filesystem","/tmp/mcp-fixtures/express"]},
   {"name":"mem","command":["npx","-y","@modelcontextprotocol/server-memory"]},
   {"name":"ev","url":"http://127.0.0.1:3001/mcp"}
 ]}
@@ -99,13 +99,18 @@ all peers, and the ledger attributes savings per peer.
   `result`/`error` messages as responses and answers inbound requests `-32601`; anything
   looser ends the run early and reports an **empty corpus as a clean measurement**.
 - **`isError: true` is a failure, not a payload.** A mistyped path or a wrong argument name
-  comes back that way, and capturing it would put an error string into the corpus and
-  measure a codec % over it. The probe reports `TOOL ERROR` and **exits non-zero**, so a
-  sweep loop can tell a bad run from a good one.
+  comes back that way. terse tees it to the corpus *before* the probe sees it, so the probe
+  cannot prevent the poisoning — it reports `TOOL ERROR` and **exits non-zero**. On a
+  `TOOL ERROR`, discard the corpus dir and the ledger and re-run: those rows otherwise skew
+  both the codec % and the `diff_reason` breakdown.
+- **The probe checks the artifacts, not just the replies.** §6's numbers come from the
+  corpus and the ledger, so a run that answered every request but wrote neither is still a
+  failed measurement — the probe verifies both and exits non-zero. terse swallows
+  capture/stats sink errors unless it runs with `--debug`, so nothing else reports it.
 - **Repeats are serialized**, not pipelined — servers dispatch concurrently and the proxy
   sets its diff base in arrival order, so batched repeats made the diff nondeterministic.
 - **Proxy stderr** is teed to `<stats_log>.stderr` and the tail is printed on failure; it
-  carries terse's launch errors and its once-per-sink "capture skipped" warnings.
+  carries terse's launch errors (the usual cause of an `initialize` failure).
   `PROBE_STDERR=1` inherits it live instead.
 - **playwright** needs `--no-sandbox` where user namespaces are restricted (WSL,
   containers), and its pinned playwright version may want a newer Chromium than you have

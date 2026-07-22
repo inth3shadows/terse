@@ -240,9 +240,10 @@ Two things fall out, and they matter more than any single percentage:
 
 **Read the repeat column as a ceiling, not a typical delta.** Both calls send identical
 arguments against an unchanged fixture, so `prev == curr`: the diff encodes an empty
-changeset and the wire is essentially fixed overhead regardless of payload size. That is
-the *upper bound* of the diff tier — the same discipline §5 applies when it reports ~99%
-on an unchanged repeat and then frames production as a floor/ceiling range. A real agent
+changeset and the wire is near-fixed overhead once the payload clears the small-payload
+floor described below. That is the *upper bound* of the diff tier — the same discipline §5 applies when it reports ~99%
+on an unchanged repeat and then frames production as a floor/ceiling range — note §5's
+column is a *number* and this one is only qualitative (`diff` / `text-diff` / `—`). A real agent
 loop re-fetches results that have **changed**, and how much the delta grows with the change
 is workload-specific and **not measured here**.
 
@@ -287,7 +288,9 @@ That is the "does it just work on a server it has never seen" question, answered
 
 Everything above is a **stdio** downstream. terse also proxies an MCP **Streamable-HTTP**
 endpoint and can front *N* servers from one process, and neither had third-party evidence.
-Both were exercised against the reference `everything` server run in `streamableHttp` mode:
+Both were exercised against the reference `everything` server run in `streamableHttp` mode.
+**Scope: a single run on 2026-07-22, not part of the pinned size sweep** — these establish
+that the transports work end-to-end, not a measured savings result:
 
 - **HTTP downstream** — `terse proxy -- http://127.0.0.1:3001/mcp`. `initialize`,
   `tools/list` (13 tools), `tools/call` and the capture tee all behave as on stdio; the URL
@@ -300,7 +303,7 @@ Both were exercised against the reference `everything` server run in `streamable
   | merged `tools/list` | 36 tools, peer-prefixed (`fs`=14, `mem`=9, `ev`=13) |
   | `initialize` primer | injected **exactly once** across all peers |
   | call routing | each `peer__tool` reached its own peer, including the HTTP one |
-  | per-peer compression | `fs__directory_tree` 54.3%, `mem__read_graph` 42.1% |
+  | per-peer compression | `fs__directory_tree` 54.3% (express v5.2.1 `lib/`), `mem__read_graph` 42.1% |
   | ledger attribution | per-peer, under the peer-qualified tool name |
 
 This round also turned up a real defect, now fixed: a server-initiated request

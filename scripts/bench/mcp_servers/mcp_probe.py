@@ -15,8 +15,10 @@ Env:
     TERSE_BIN         terse executable (default: "terse" from PATH)
     PROBE_DEADLINE    seconds to wait for any single response (default: 300)
     PROBE_STDERR      set to 1 to inherit the proxy's stderr instead of teeing it to
-                      <stats_log>.stderr — terse's launch failures and its once-per-sink
-                      "capture skipped" warnings are written there.
+                      <stats_log>.stderr, where terse's launch failures are written. (Its
+                      capture/stats sink errors are NOT: those are swallowed unless the
+                      proxy runs with --debug, which is why the artifact check below
+                      exists.)
 
 Exit status is non-zero if ANY request failed, so a sweep loop can detect a bad run.
 
@@ -33,8 +35,9 @@ measurement*, not a crash):
     the run early and reports an empty corpus as a clean measurement. Inbound requests are
     answered `-32601` so a server that blocks on one does not stall to the deadline.
   * **`result.isError` is a failure.** MCP's normal tool-failure convention is a text block
-    with `isError: true` — a mistyped path or a wrong argument name returns one, and it
-    would otherwise be captured and measured as if it were real tool output.
+    with `isError: true` — a mistyped path or a wrong argument name returns one. terse tees
+    it to the corpus before the probe ever sees it, so this cannot *prevent* the poisoning;
+    it makes the run exit non-zero so you know to discard the corpus and ledger and re-run.
   * **The two repeats are serialized**, not pipelined. Servers dispatch concurrently, so
     batched requests can be answered out of order; the proxy sets its diff base in arrival
     order, which would make the diff measurement nondeterministic.
@@ -191,10 +194,12 @@ def main(argv: list[str]) -> int:
     with contextlib.ExitStack() as stack:
         err_fh = (None if INHERIT_STDERR
                   else stack.enter_context(open(err_path, "w", encoding="utf-8")))
-        return _run(proxy_argv, server_name, calls, err_fh, err_path)
+        return _run(proxy_argv, server_name, calls, err_fh, err_path,
+                    corpus, stats_log)
 
 
-def _run(proxy_argv, server_name, calls, err_fh, err_path) -> int:
+def _run(proxy_argv: list[str], server_name: str, calls: list[dict], err_fh,
+         err_path: str, corpus: str, stats_log: str) -> int:
     probe = Probe(proxy_argv, err_fh)
     failed = False
     try:
@@ -203,6 +208,10 @@ def _run(proxy_argv, server_name, calls, err_fh, err_path) -> int:
             "clientInfo": {"name": "terse-probe", "version": "0"}})
         ok, desc = _describe(init)
         if not ok:
+            # failed BEFORE returning, or the finally's tail-dump is skipped for the single
+            # most common real failure (downstream cannot launch) and the only thing printed
+            # is misleading "raise PROBE_DEADLINE" advice.
+            failed = True
             print(f"[{server_name}] initialize FAILED: {desc}")
             return 1
         probe.notify("notifications/initialized")
@@ -226,9 +235,35 @@ def _run(proxy_argv, server_name, calls, err_fh, err_path) -> int:
                 if not ok:
                     print(f"  {name} rep{rep}: {desc}")
                     failed = True
+                    if resp is None:
+                        # Abort rather than pay DEADLINE for every remaining request (that
+                        # turned a bounded wait into DEADLINE x 2 x len(calls)). Also stops
+                        # rep1 going out after a rep0 timeout, where a late rep0 could still
+                        # set the proxy's diff base concurrently with rep1.
+                        print("  aborting: no response (a later reply would race the "
+                              "diff base)")
+                        return 1
                 elif rep == 1:
                     print(f"  {name:24} rep1 {desc}")
                 mid += 1
+        # The numbers in BENCHMARKS §6 come from the corpus and the ledger, not from the
+        # JSON-RPC responses -- so a run that answered every request but wrote neither is
+        # still a failed measurement. terse swallows capture/stats sink errors unless
+        # --debug is passed, so nothing else reports this.
+        expected_records = 2 * len(calls)
+        n_payloads = (len([f for f in os.listdir(corpus) if f.endswith(".json")])
+                      if os.path.isdir(corpus) else 0)
+        if n_payloads <= 0:
+            print(f"  ARTIFACT CHECK: corpus {corpus!r} has no captured payloads")
+            failed = True
+        n_records = 0
+        if os.path.isfile(stats_log):
+            with open(stats_log, encoding="utf-8") as fh:
+                n_records = sum(1 for line in fh if line.strip())
+        if n_records < expected_records:
+            print(f"  ARTIFACT CHECK: ledger has {n_records} record(s), expected "
+                  f"{expected_records}")
+            failed = True
     finally:
         probe.close()
         if err_fh is not None:
