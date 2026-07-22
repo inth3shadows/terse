@@ -89,6 +89,17 @@ class Policy:
     # per-policy (`"diff": false`) or with `proxy --no-diff`. The proxy still falls
     # back to the full compressed form whenever a diff doesn't apply or win.
     diff: bool = True
+    # Join every text content block of a multi-block result into ONE record array before
+    # compressing (#116). Several servers return one record per block; independently each
+    # block is a single object, so `tabularize` never sees an array and the cross-call
+    # diff tier — which reasons about one logical payload — is skipped entirely (it was
+    # 71% of real traffic). Joining folds the records together AND makes the result
+    # diff-eligible. ON by default: the per-result verify-before-emit gate proves
+    # losslessness on every join, and a join is a one-shot reshape with none of the
+    # accumulating drift risk that kept `diff` opt-in longer. Opt out per-policy
+    # (`"join_blocks": false`) or with `proxy --no-join-blocks`. Independent of `diff`:
+    # with diffing off, joining still folds records into one compressed block.
+    join_blocks: bool = True
     # Bound dangling-reference drift (#8): force a self-contained full result (a
     # keyframe, like video I-frames) after this many consecutive diffs per tool, so a
     # chained diff can never drift more than K turns from an anchor the model can
@@ -192,7 +203,7 @@ def _coerce_capture(raw: Any, where: str) -> bool:
 # so a typo'd key ("polices", "diff_keyframe_intervall") silently reverting to default
 # behavior is a trap, not a convenience.
 _TOP_KEYS = frozenset({"version", "defaults", "policies", "diff", "diff_keyframe_interval",
-                       "never_lossy_servers"})
+                       "join_blocks", "never_lossy_servers"})
 _DEFAULTS_KEYS = frozenset({"tiers"})
 _RULE_KEYS = frozenset({"match", "tiers", "fields", "capture"})
 _MATCH_KEYS = frozenset({"tool"})
@@ -228,6 +239,7 @@ def load_policy(path: str | Path) -> Policy:
                           fields=r.get("fields", {}),
                           capture=_coerce_capture(r.get("capture", True), f"policies[{i}]")))
     return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", True)),
+                  join_blocks=bool(doc.get("join_blocks", True)),
                   diff_keyframe_interval=int(doc.get("diff_keyframe_interval", 5)),
                   never_lossy_servers=frozenset(doc.get("never_lossy_servers", ())))
 
@@ -294,6 +306,77 @@ def _lossy_warnings(rule: Rule) -> list[str]:
         out.append(f"field '{path}': lossy mode '{mode}' is not span-addressable; a text "
                    "selector supports only 'drop-to-retrieve' (ignored)")
     return out
+
+
+def _lossy_stage(obj: Any, rule: Rule, *, tool: str, never_lossy: bool,
+                 drop_sink: Any, warnings: list[str]) -> Any:
+    """Tier-1 lossy transforms (truncate, then drop-to-retrieve) over one already-parsed
+    JSON object, fail-closed: any unresolved path or failed acceptable/droppable-loss gate
+    keeps the fully-lossless object. Returns the (possibly reduced) object; appends any
+    warnings in place. Extracted so `apply` (one payload) and `apply_joined` (one per
+    block, before the join) run the EXACT same lossy logic — the per-block guarantee that
+    a field path like `$.results[*].body` resolves against a single payload's shape (#116),
+    never against a joined array that would silently change what it selects."""
+    data = obj
+    # Truncate BEFORE drop, both fail-closed.
+    if not never_lossy and lossy_mod._truncate_specs(rule):
+        try:
+            cand = lossy_mod.apply_lossy(obj, rule)
+            if cand is not obj and cand != obj and lossy_mod.acceptable_loss(obj, cand, rule):
+                data = cand
+                warnings.append("lossy: truncated marked field(s) — output is NOT lossless")
+            elif cand != obj:
+                warnings.append("lossy step skipped: acceptable-loss gate failed (kept lossless)")
+        except lossy_mod.PathError as exc:
+            warnings.append(f"lossy step skipped: {exc} (kept lossless)")
+        for bad in lossy_mod.unsupported_truncate_paths(obj, rule):
+            warnings.append(f"lossy: field {bad!r} is marked truncate but is not a "
+                            "string/list; truncate left it unchanged")
+
+    # Drop-to-retrieve (#10): staged writes are committed to the real store only after the
+    # gate proves recoverability, so a gate failure leaves no orphan handles.
+    if not never_lossy and lossy_mod._drop_specs(rule):
+        if drop_sink is None:
+            warnings.append("lossy: drop-to-retrieve needs the proxy store; left lossless")
+        else:
+            staging: dict[str, Any] = {}
+            try:
+                cand = lossy_mod.apply_drops(data, rule, tool, staging.__setitem__)
+                if cand != data and lossy_mod.droppable_loss(data, cand, rule, staging.__getitem__):
+                    for handle, value in staging.items():
+                        drop_sink(handle, value)  # commit only once recoverability is proven
+                    data = cand
+                    warnings.append("lossy: dropped marked field(s) to retrieve handle(s) — "
+                                    "output is NOT lossless")
+                elif cand != data:
+                    warnings.append("lossy step skipped: droppable-loss gate failed (kept lossless)")
+            except lossy_mod.PathError as exc:
+                warnings.append(f"lossy step skipped: {exc} (kept lossless)")
+    return data
+
+
+def _lossless_stage(data: Any, rule: Rule, warnings: list[str]) -> tuple[str, tuple[str, ...]]:
+    """Always-on Tier-0/0.5 codec (minify/tabularize/dictionary) over `data`, with the
+    verify-before-emit self-check: re-parse what we're about to emit and confirm it
+    reconstructs `data`; on any mismatch (or decode error) fall back to the plain minified
+    form, which is lossless by construction, and record why. This is the codec's
+    counterpart to the lossy tiers' acceptable_loss/droppable_loss gates — fail closed to
+    lossless. Returns `(text, tiers)` where `tiers` is `()` when the fallback fired."""
+    text = transforms.compress_with(
+        data,
+        tabularize="tabularize" in rule.tiers,
+        dictionary="dictionary" in rule.tiers,
+    )
+    try:
+        emit_ok = transforms.decompress(text) == data
+    except Exception:  # noqa: BLE001 — any decode failure is a failed self-check
+        emit_ok = False
+    if not emit_ok:
+        text = transforms.minify(data)
+        warnings.append("codec self-check failed (tabularize/dictionary did not "
+                        "round-trip); emitted minified-lossless form instead")
+        return text, ()
+    return text, rule.tiers
 
 
 def apply(raw: str, tool: str, policy: Policy,
@@ -373,67 +456,82 @@ def apply(raw: str, tool: str, policy: Policy,
                        warnings=warnings + ["payload contains a reserved terse marker key; "
                                             "passed through uncompressed to stay lossless"])
 
-    # Tier-1 lossy (truncate) runs BEFORE the lossless tiers and is fail-closed: any
-    # path that doesn't resolve, or a gate failure, keeps the fully-lossless object.
-    data = obj
-    if not never_lossy and lossy_mod._truncate_specs(rule):
-        try:
-            cand = lossy_mod.apply_lossy(obj, rule)
-            if cand is not obj and cand != obj and lossy_mod.acceptable_loss(obj, cand, rule):
-                data = cand
-                warnings.append("lossy: truncated marked field(s) — output is NOT lossless")
-            elif cand != obj:
-                warnings.append("lossy step skipped: acceptable-loss gate failed (kept lossless)")
-        except lossy_mod.PathError as exc:
-            warnings.append(f"lossy step skipped: {exc} (kept lossless)")
-        for bad in lossy_mod.unsupported_truncate_paths(obj, rule):
-            warnings.append(f"lossy: field {bad!r} is marked truncate but is not a "
-                            "string/list; truncate left it unchanged")
-
-    # Tier-1 lossy (drop-to-retrieve, #10): replace a marked field with a handle marker and
-    # persist the original to the session store, so the model can fetch it back on demand.
-    # Same fail-closed contract as truncate, plus: writes are STAGED and committed to the
-    # real store only after the gate passes, so a gate failure leaves no orphan handles.
-    if not never_lossy and lossy_mod._drop_specs(rule):
-        if drop_sink is None:
-            warnings.append("lossy: drop-to-retrieve needs the proxy store; left lossless")
-        else:
-            staging: dict[str, Any] = {}
-            try:
-                cand = lossy_mod.apply_drops(data, rule, tool, staging.__setitem__)
-                if cand != data and lossy_mod.droppable_loss(data, cand, rule, staging.__getitem__):
-                    for handle, value in staging.items():
-                        drop_sink(handle, value)  # commit only once recoverability is proven
-                    data = cand
-                    warnings.append("lossy: dropped marked field(s) to retrieve handle(s) — "
-                                    "output is NOT lossless")
-                elif cand != data:
-                    warnings.append("lossy step skipped: droppable-loss gate failed (kept lossless)")
-            except lossy_mod.PathError as exc:
-                warnings.append(f"lossy step skipped: {exc} (kept lossless)")
-
-    text = transforms.compress_with(
-        data,
-        tabularize="tabularize" in rule.tiers,
-        dictionary="dictionary" in rule.tiers,
-    )
-
-    # Verify-before-emit for the always-on Tier-0/0.5 codec. The diff tier already
-    # self-checks inline (diff_encode only returns a delta that decodes back exactly),
-    # but tabularize/dictionary shipped here WITHOUT the same inline gate — a latent
-    # codec bug would then reach the model silently, defeating the whole lossless-first
-    # premise. Re-parse what we're about to emit and confirm it reconstructs `data`; on
-    # any mismatch (or a decode error) fall back to the plain minified form, which is
-    # lossless by construction, and record why. This is the codec's counterpart to the
-    # lossy tiers' acceptable_loss/droppable_loss gates: fail closed to lossless.
-    try:
-        emit_ok = transforms.decompress(text) == data
-    except Exception:  # noqa: BLE001 — any decode failure is a failed self-check
-        emit_ok = False
-    tiers: tuple[str, ...] = rule.tiers
-    if not emit_ok:
-        text = transforms.minify(data)
-        warnings.append("codec self-check failed (tabularize/dictionary did not "
-                        "round-trip); emitted minified-lossless form instead")
-        tiers = ()
+    # Tier-1 lossy (truncate then drop) is fail-closed; the always-on Tier-0/0.5 codec
+    # then runs with its own verify-before-emit gate. Both stages are extracted so the
+    # multi-block join path (`apply_joined`) reuses the exact same logic (#116).
+    data = _lossy_stage(obj, rule, tool=tool, never_lossy=never_lossy,
+                        drop_sink=drop_sink, warnings=warnings)
+    text, tiers = _lossless_stage(data, rule, warnings)
     return Applied(text=text, tool=tool, tiers=tiers, skipped=False, warnings=warnings)
+
+
+# Reasons `apply_joined` returns when it declines to join, recorded in the ledger (the
+# proxy prefixes them `multiblock_`). Enumerated so the post-#116 measurement can read
+# exactly WHY a multi-block result did or didn't collapse.
+JOIN_REFUSED_OFF = "off"                    # join_blocks disabled by policy/flag
+JOIN_REFUSED_PASSTHROUGH = "passthrough"    # rule is `tiers: []` (explicit hands-off)
+JOIN_REFUSED_NON_JSON = "non_json"          # some block isn't JSON
+JOIN_REFUSED_HETEROGENEOUS = "heterogeneous"  # some block isn't a dict — not a record seq
+JOIN_REFUSED_MARKER = "marker"              # a reserved terse marker key is present
+JOIN_REFUSED_DEPTH = "depth"                # joined array nests past the codec cap
+
+
+def apply_joined(raws: list[str], tool: str, policy: Policy,
+                 drop_sink: Any = None, server: str | None = None,
+                 force_lossless: bool = False) -> tuple[Applied | None, list | None, str]:
+    """Compress a MULTI-block result as ONE record array (#116).
+
+    Parse every block, run the lossy stage per-block (so a field path like
+    `$.results[*].body` keeps its single-payload meaning — the whole reason lossy runs
+    before the join, not after), join the results into an array, then run the always-on
+    lossless codec once over that array so `tabularize`/`dictionary` fold across records.
+
+    Returns `(Applied, raw_array, "")` on success, where `raw_array` is the parsed
+    blocks BEFORE lossy — the value the model reconstructs, hence the correct cross-call
+    diff base (mirroring `apply`, which bases the diff on the raw parse, not the lossy
+    form). Returns `(None, None, reason)` when the join does not apply, so the caller
+    falls back to the per-block path and records `reason` in the ledger.
+
+    `raws` MUST have >=2 entries — the single-block shape is `apply`'s job.
+    """
+    rule = policy.select(tool, server)
+    if not policy.join_blocks:
+        return None, None, JOIN_REFUSED_OFF
+    if not rule.tiers:
+        # `tiers: []` is an explicit hands-off passthrough — that includes block shape, so
+        # the blocks are forwarded byte-for-byte, never reshaped.
+        return None, None, JOIN_REFUSED_PASSTHROUGH
+
+    objs: list[Any] = []
+    for raw in raws:
+        try:
+            objs.append(json.loads(raw))
+        except (json.JSONDecodeError, TypeError, RecursionError):
+            return None, None, JOIN_REFUSED_NON_JSON
+    if not all(isinstance(o, dict) for o in objs):
+        # A mixed bag of dicts / scalars / arrays is not a record sequence; joining would
+        # assert a relationship that isn't there. Equal key sets are NOT required — a
+        # heterogeneous-keyed dict list still unlocks the diff tier, the larger prize.
+        return None, None, JOIN_REFUSED_HETEROGENEOUS
+
+    joined = objs
+    # Same guards `apply` runs, but on the JOINED array (one level deeper than each block):
+    # the codec and diff encoders recurse without a depth argument.
+    if transforms.has_terse_marker(joined):
+        return None, None, JOIN_REFUSED_MARKER
+    if transforms.exceeds_depth(joined):
+        return None, None, JOIN_REFUSED_DEPTH
+
+    warnings = _lossy_warnings(rule)
+    never_lossy = policy.server_never_lossy(server) or force_lossless
+    if never_lossy and rule.lossy_fields():
+        warnings.append(f"lossy fields suppressed: server '{server}' is never-lossy "
+                        "(credential/personal store) — kept fully lossless")
+    if "minify" not in rule.tiers:
+        warnings.append("'minify' implied by serialization; added")
+
+    data = [_lossy_stage(o, rule, tool=tool, never_lossy=never_lossy,
+                         drop_sink=drop_sink, warnings=warnings) for o in objs]
+    text, tiers = _lossless_stage(data, rule, warnings)
+    return (Applied(text=text, tool=tool, tiers=tiers, skipped=False, warnings=warnings),
+            objs, "")

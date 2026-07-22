@@ -587,6 +587,13 @@ nested-record coverage, and the drift soak — has passed; see TECHNICAL.md):
 uv run terse proxy --no-diff -- uvx some-mcp-server
 # or per policy file: {"diff": false, ...}
 
+# multi-block results (one record per content block) are joined into one record array
+# before compressing — folds records across blocks AND makes the result diff-eligible
+# (ON by default, #116). This changes N content blocks to 1. Opt OUT per proxy:
+uv run terse proxy --no-join-blocks -- uvx some-mcp-server
+# or per policy file: {"join_blocks": false, ...}; bake into a wrapped server with
+# install-mcp --no-join-blocks
+
 # re-run the fluency gate against your own consumer/model anytime.
 # needs same-tool PAIRS in the corpus (capture a tool 2+ times) + a configured model:
 TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \

@@ -210,6 +210,21 @@ def test_wrap_no_stats_bakes_opt_out_and_rewrap_drops_it():
     args = config["mcpServers"]["runecho"]["args"]
     assert "--no-stats" not in args                     # default: inherit the proxy's ON
 
+
+def test_wrap_no_join_blocks_bakes_opt_out_and_rewrap_drops_it():
+    # Joining is the proxy default (#116), so only the opt-out is bakeable — and like the
+    # diff/stats flags it reflects the LATEST invocation, never accumulating.
+    config = _cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})
+    stash: dict = {}
+
+    im.wrap(config, stash, "runecho", "/p/policy.json", TERSE_CMD, no_join_blocks=True)
+    args = config["mcpServers"]["runecho"]["args"]
+    assert "--no-join-blocks" in args and args.index("--no-join-blocks") < args.index("--")
+
+    im.wrap(config, stash, "runecho", "/p/policy.json", TERSE_CMD)
+    args = config["mcpServers"]["runecho"]["args"]
+    assert "--no-join-blocks" not in args               # default: inherit the proxy's ON
+
     im.unwrap(config, stash, "runecho")
     assert config["mcpServers"]["runecho"] == {"command": "uvx", "args": ["runecho-mcp"]}
 

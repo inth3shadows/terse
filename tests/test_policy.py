@@ -7,7 +7,7 @@ import json
 import pytest
 
 from terse import transforms
-from terse.policy import Policy, Rule, apply, default_policy, load_policy
+from terse.policy import Policy, Rule, apply, apply_joined, default_policy, load_policy
 
 RECORDS = json.dumps({"result": [{"id": i, "url": "https://x.example/api/items", "ok": True}
                                  for i in range(20)]})
@@ -315,6 +315,98 @@ def test_never_lossy_servers_loads_from_policy_json(tmp_path):
                              "policies": []}), encoding="utf-8")
     pol = load_policy(p)
     assert pol.server_never_lossy("kb") and pol.server_never_lossy("sb-run")
+
+
+# --- #116: multi-block join (apply_joined) ---
+
+def _rec_blocks(n, change=None):
+    rows = [{"id": i, "status": "active", "url": "https://x.example/api/items"}
+            for i in range(n)]
+    if change is not None:
+        rows[change]["status"] = "closed"
+    return [json.dumps(r) for r in rows]
+
+
+def test_join_blocks_defaults_on_and_loader_parses_false(tmp_path):
+    assert Policy(rules=[]).join_blocks is True            # ON by default (#116)
+    p = tmp_path / "policy.json"
+    p.write_text(json.dumps({"version": 1, "join_blocks": False, "policies": []}),
+                 encoding="utf-8")
+    assert load_policy(p).join_blocks is False
+
+
+def test_apply_joined_folds_records_across_blocks_losslessly():
+    pol = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))])
+    raws = _rec_blocks(6)
+    applied, curr, reason = apply_joined(raws, "gh.api.items", pol)
+    assert reason == ""                                   # join applied
+    assert transforms.TABLE_MARKER in applied.text        # records folded into one table
+    assert transforms.decompress(applied.text) == [json.loads(r) for r in raws]  # lossless
+    assert curr == [json.loads(r) for r in raws]          # raw parse is the diff base
+
+
+def test_apply_joined_runs_lossy_per_block_not_over_the_array():
+    # The §2 claim: a field path like `body` is authored against ONE record's shape, so it
+    # must resolve per-block. If lossy ran AFTER the join, `body` would address the array
+    # (which has no `body`) and truncate nothing.
+    rule = Rule("gh.*", ("minify", "tabularize", "dictionary"),
+                fields={"body": {"lossy": "truncate", "max": 5}})
+    pol = Policy(rules=[rule])
+    raws = [json.dumps({"id": 1, "body": "x" * 200}),
+            json.dumps({"id": 2, "body": "y" * 200})]
+    applied, curr, reason = apply_joined(raws, "gh.api.items", pol)
+    assert reason == ""
+    out = transforms.decompress(applied.text)
+    assert [r["id"] for r in out] == [1, 2]
+    assert all(len(r["body"]) < 200 for r in out)         # each record's body was cut
+    assert "x" * 200 not in applied.text and "y" * 200 not in applied.text
+    assert any("truncated" in w for w in applied.warnings)
+    assert curr == [json.loads(r) for r in raws]          # base is the RAW (pre-lossy) parse
+
+
+def test_apply_joined_never_lossy_server_keeps_the_join_fully_lossless():
+    rule = Rule("*", ("minify", "tabularize"),
+                fields={"body": {"lossy": "truncate", "max": 5}})
+    pol = Policy(rules=[rule], never_lossy_servers=frozenset({"kb"}))
+    raws = [json.dumps({"id": 1, "body": "x" * 200}),
+            json.dumps({"id": 2, "body": "y" * 200})]
+    applied, curr, reason = apply_joined(raws, "kb.read.x", pol, server="kb")
+    assert reason == ""
+    assert transforms.decompress(applied.text) == [json.loads(r) for r in raws]  # untouched
+    assert any("never-lossy" in w for w in applied.warnings)
+
+
+def test_apply_joined_refusal_reasons():
+    pol = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))])
+    good = _rec_blocks(2)
+
+    # join_blocks disabled
+    off = Policy(rules=[Rule("gh.*", ("minify", "tabularize"))], join_blocks=False)
+    assert apply_joined(good, "gh.api.items", off) == (None, None, "off")
+
+    # explicit passthrough tier
+    passthru = Policy(rules=[Rule("gh.*", ())])
+    assert apply_joined(good, "gh.api.items", passthru) == (None, None, "passthrough")
+
+    # a non-JSON block
+    _, _, r = apply_joined([good[0], "not json {"], "gh.api.items", pol)
+    assert r == "non_json"
+
+    # a block that isn't a dict (a JSON array) — not a record sequence
+    _, _, r = apply_joined([good[0], json.dumps([1, 2, 3])], "gh.api.items", pol)
+    assert r == "heterogeneous"
+
+    # a reserved terse marker key present
+    _, _, r = apply_joined([json.dumps({transforms.TABLE_MARKER: 1}), good[0]],
+                           "gh.api.items", pol)
+    assert r == "marker"
+
+    # nesting past the codec depth cap
+    deep = {"leaf": 1}
+    for _ in range(transforms.MAX_DEPTH + 5):
+        deep = {"x": deep}
+    _, _, r = apply_joined([json.dumps(deep), json.dumps(deep)], "gh.api.items", pol)
+    assert r == "depth"
 
 
 def test_apply_falls_back_to_lossless_when_codec_self_check_fails(monkeypatch):

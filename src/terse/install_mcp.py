@@ -204,6 +204,7 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
          terse_cmd: list[str], capture_dir: str | None = None,
          diff: bool | None = None,
          diff_keyframe_interval: int | None = None,
+         no_join_blocks: bool = False,
          no_stats: bool = False) -> tuple[dict, dict]:
     """Wrap `server`'s entry with the terse proxy. Idempotent: if already managed
     (present in stash), re-wrap from the stashed original so policy/cmd updates
@@ -246,6 +247,10 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
         proxy_opts += ["--diff"] if diff else ["--no-diff"]
     if diff is not False and diff_keyframe_interval is not None:
         proxy_opts += ["--diff-keyframe-interval", str(diff_keyframe_interval)]
+    if no_join_blocks:
+        # Only the opt-out is bakeable: joining is the proxy DEFAULT (#116), so an entry
+        # needs a flag only to turn it off.
+        proxy_opts += ["--no-join-blocks"]
 
     orig_cmd = original.get("command")
     if orig_cmd:
@@ -360,6 +365,7 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
                diff: bool | None = None, diff_keyframe_interval: int | None = None,
                scope: str = "user", file: str | None = None,
                repo_path: str | None = None, no_stats: bool = False,
+               no_join_blocks: bool = False,
                never_lossy: bool = False) -> dict:
     target = resolve_target(scope, cfg=cfg, file=file, repo_path=repo_path)
     if not target.cfg.exists():
@@ -404,7 +410,7 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
         )
         wrap(node, stash, s, policy_abs, terse_cmd, capture_dir=capture_abs,
              diff=diff, diff_keyframe_interval=diff_keyframe_interval,
-             no_stats=no_stats)
+             no_join_blocks=no_join_blocks, no_stats=no_stats)
         changes.append({"server": s, "before": before,
                         "after": node["mcpServers"][s], "preserved": preserved})
 

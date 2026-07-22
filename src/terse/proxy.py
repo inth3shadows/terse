@@ -163,6 +163,11 @@ class Interceptor:
         self.pending: dict[Any, tuple[str, str, str]] = {}
         self.debug = debug
         self.diff = pol.diff
+        # Join every text block of a multi-block result into one record array before
+        # compressing (#116) — folds records across blocks AND makes the result
+        # diff-eligible. Independent of `diff`: with diffing off it still folds, just
+        # never diffs.
+        self.join_blocks = pol.join_blocks
         # Optional tee of each RAW (pre-compression) tool-result text, keyed by tool name
         # (#32). Keeps the Interceptor I/O-free: the callback owns the disk write. Never
         # affects forwarding — its failures are swallowed at the call site.
@@ -187,6 +192,12 @@ class Interceptor:
         # base); the base itself is still keyed by tool name alone. Cleared everywhere
         # `last` is (skip path, reconnect) so the two never disagree.
         self.last_args: dict[str, str] = {}
+        # tool -> whether the base above came from a JOINED multi-block result (#116). A
+        # result that joins on one call and doesn't on the next flips array<->object, so a
+        # diff across the flip would be unresolvable; when this flag differs from the
+        # current result the base is dropped and the result re-anchors as a full. Kept in
+        # lockstep with `last` (cleared wherever `last` is).
+        self.last_joined: dict[str, bool] = {}
         # tool -> consecutive diffs emitted since the last full (keyframe) result. Bounds
         # how far a chained diff can drift from a self-contained anchor (#8).
         self.keyframe_interval = pol.diff_keyframe_interval
@@ -279,6 +290,7 @@ class Interceptor:
                 # stays opt-in.
                 self.last.clear()
                 self.last_args.clear()
+                self.last_joined.clear()
                 self.since_keyframe.clear()
                 self.last_text.clear()
                 self.since_text_keyframe.clear()
@@ -374,40 +386,53 @@ class Interceptor:
             error_result = bool(result.get("isError")) if isinstance(result, dict) else False
 
             # `"capture": false` on the matching rule — never PERSIST this tool's payloads
-            # (#85). Gates BOTH sinks that write raw content to disk: the corpus tee just
-            # below and the audit/replay log further down (its records embed the raw
-            # payload too, so gating only the tee would be half a guard). The in-memory
-            # compression path is untouched — this is about what survives on disk, and the
-            # client's result is identical either way.
+            # (#85). Gates BOTH sinks that write raw content to disk: the corpus tee below
+            # and the audit/replay log further down (its records embed the raw payload too,
+            # so gating only the tee would be half a guard). The in-memory compression path
+            # is untouched — this is about what survives on disk, and the client's result
+            # is identical either way.
             persist = self.policy.select(tool, self.server_name).capture
 
-            # Tee the RAW payload before any compression touches it (#32). Strictly a side
-            # effect: a capture failure must NEVER affect what the client receives, so it
-            # is swallowed here regardless of what the callback does.
-            if self.capture is not None and persist:
-                for b in text_blocks:
-                    try:
-                        self.capture(capture_tool, b["text"])
-                    except Exception as exc:  # noqa: BLE001 — capture is never load-bearing
-                        self._warn_sink("capture", capture_tool, exc)
-
-            # Snapshot the raw block texts before any transform mutates them in place, so
-            # the audit log can pair each raw payload with what terse actually emitted
-            # (#23) and the stats ledger can size the raw side of each result.
-            # The stats ledger is payload-FREE (sizes + decision only), so it is never
-            # gated by `capture: false` — a credential-returning tool still gets counted,
-            # just never quoted.
-            wants_raw = (self.audit is not None and persist) or self.stats is not None
+            # Snapshot the raw block texts before any transform mutates them in place: the
+            # capture tee, the audit log's raw side (#23), and the stats ledger all read the
+            # ORIGINAL payload. The stats ledger is payload-FREE (sizes + decision only), so
+            # it is never gated by `capture: false` — a credential-returning tool still gets
+            # counted, just never quoted.
+            wants_raw = ((self.capture is not None and persist)
+                         or (self.audit is not None and persist)
+                         or self.stats is not None)
             raw_texts = [b["text"] for b in text_blocks] if wants_raw else None
 
             changed = False
             diff_reason: str | None = None
-            # Diffing reasons about ONE logical payload, so it only engages for a single
-            # text block (the overwhelmingly common tool-result shape); multi-block results
-            # take the plain per-block compression path.
-            if self.diff and len(text_blocks) == 1:
+            joined_block: dict | None = None   # set when the multi-block join fires (#116)
+            joined_curr: list | None = None    # its parsed pre-lossy array, for capture
+
+            # #116: a result with >=2 text blocks is tried as ONE joined record array first
+            # — the per-block path can reach neither cross-record folding nor the diff tier
+            # (71% of real traffic was stuck there). A refusal falls back to per-block and
+            # records WHY (`multiblock_<reason>`); the join itself is gated by
+            # `join_blocks`, independent of `diff`.
+            if len(text_blocks) >= 2:
+                new_text, diff_reason, joined_curr = self._compress_or_diff_joined(
+                    text_blocks, tool, args_key, force_lossless=error_result)
+                if new_text is not None:
+                    joined_block = {"type": "text", "text": new_text}
+
+            if joined_block is not None:
+                # Collapse the N text blocks to the single joined block, in place; non-text
+                # blocks keep their positions. This is the one path that changes the number
+                # of content blocks the client sees — defensible because the MCP spec puts
+                # no meaning on block count (2025-06-18 server/tools).
+                self._collapse_text_blocks(content, text_blocks, joined_block)
+                changed = True
+                emitted_pairs = ([("\n".join(raw_texts), joined_block["text"])]
+                                 if raw_texts is not None else [])
+            elif self.diff and len(text_blocks) == 1:
                 changed, diff_reason = self._compress_or_diff(
                     text_blocks[0], tool, args_key, force_lossless=error_result)
+                emitted_pairs = ([(r, b["text"]) for r, b in zip(raw_texts, text_blocks, strict=True)]
+                                 if raw_texts is not None else [])
             else:
                 for block in text_blocks:
                     new_text = self._compress(block["text"], tool,
@@ -415,17 +440,46 @@ class Interceptor:
                     if new_text != block["text"]:
                         block["text"] = new_text
                         changed = True
-                # No cross-call diff path ran: distinguish "diffing off" from "shape the
-                # diff path skips" so the ledger accounts for every result.
-                diff_reason = "multiblock" if len(text_blocks) != 1 else "diff_off"
+                if len(text_blocks) == 1:
+                    diff_reason = "diff_off"   # diffing disabled for a single-block result
+                # A per-block result the model receives as N blocks has no single JSON value
+                # a later diff could reference (and its actual prior same-tool result was
+                # these N blocks, not the stale base) — drop any base so the next result
+                # re-anchors, the same discipline the skipped path applies (#116).
+                if self.diff:
+                    self.last.pop(tool, None)
+                    self.last_args.pop(tool, None)
+                    self.last_joined.pop(tool, None)
+                    self.since_keyframe.pop(tool, None)
+                emitted_pairs = ([(r, b["text"]) for r, b in zip(raw_texts, text_blocks, strict=True)]
+                                 if raw_texts is not None else [])
+
+            # Tee the RAW payload (#32), AFTER the path is known so a joined result is
+            # captured ONCE as the array terse actually compresses — not N per-block
+            # envelopes that would make the corpus misrepresent multi-block tools (the
+            # corpus feeds measure / fluency / policy-generate). Strictly a side effect:
+            # a capture failure never changes what the client receives.
+            if self.capture is not None and persist and raw_texts is not None:
+                if joined_block is not None:
+                    payloads = [json.dumps(joined_curr, separators=(",", ":"),
+                                           ensure_ascii=False)]
+                else:
+                    payloads = raw_texts
+                for payload in payloads:
+                    try:
+                        self.capture(capture_tool, payload)
+                    except Exception as exc:  # noqa: BLE001 — capture is never load-bearing
+                        self._warn_sink("capture", capture_tool, exc)
 
             # Audit AFTER the transform, regardless of `changed`: a no-op is itself
-            # diagnostic — it confirms terse left a suspect payload untouched.
-            if self.audit is not None and raw_texts is not None and persist:
-                self._emit_audit(tool, msg["id"], raw_texts, text_blocks, changed,
+            # diagnostic — it confirms terse left a suspect payload untouched. On the joined
+            # path both sinks see ONE (raw, emitted) pair — raw = the N originals joined by
+            # newline (the true wire cost the model saw), emitted = the single joined block.
+            if self.audit is not None and persist:
+                self._emit_audit(tool, msg["id"], emitted_pairs, changed,
                                  display_tool=capture_tool)
-            if self.stats is not None and raw_texts is not None:
-                self._emit_stats(tool, raw_texts, text_blocks, display_tool=capture_tool,
+            if self.stats is not None:
+                self._emit_stats(tool, emitted_pairs, display_tool=capture_tool,
                                  diff_reason=diff_reason)
 
             if not changed:
@@ -460,6 +514,7 @@ class Interceptor:
             # result to re-anchor as a full (#8).
             self.last.pop(tool, None)
             self.last_args.pop(tool, None)
+            self.last_joined.pop(tool, None)
             self.since_keyframe.pop(tool, None)
             if applied.text != text:
                 # A text-payload drop-to-retrieve fired (`$text.code_blocks`): the payload
@@ -492,50 +547,121 @@ class Interceptor:
         except (json.JSONDecodeError, ValueError, RecursionError):
             curr = None
         if curr is not None:
-            prev = self.last.get(tool)
-            prev_args = self.last_args.get(tool)
-            emitted_diff = False
-            # A keyframe is due once K diffs have chained off the last full result; force
-            # the full compressed form so the chain re-anchors (#8). interval 0 = never.
-            keyframe_due = (self.keyframe_interval > 0
-                            and self.since_keyframe.get(tool, 0) >= self.keyframe_interval)
-            if prev is None:
-                reason = "no_prior"          # tool not seen this session: nothing to diff
-            elif keyframe_due:
-                reason = "keyframe"          # forced full to re-anchor the chain
-            else:
-                wire = self._diff_wire(prev, curr, tool)
-                if wire is not None and _cost(wire) < _cost(applied.text):
-                    chosen = wire
-                    emitted_diff = True
-                    reason = "emitted"
-                    if self.debug:
-                        sys.stderr.write(
-                            f"[terse-proxy] {tool}: diff {_cost(applied.text)}->{_cost(wire)} "
-                            f"tok vs full compressed\n")
-                else:
-                    # A base existed but the delta didn't win. Split by whether that base
-                    # came from a DIFFERENT-args call (arg-keying could offer a better,
-                    # same-args base — the Phase 2 opportunity) or the SAME args (a genuine
-                    # encoding miss that arg-keying would not fix). This split is the whole
-                    # point of the Phase 1 measurement.
-                    reason = ("not_smaller_diff_args" if prev_args != args_key
-                              else "not_smaller_same_args")
-            if self.debug and keyframe_due:
-                sys.stderr.write(f"[terse-proxy] {tool}: keyframe (full) after "
-                                 f"{self.since_keyframe.get(tool, 0)} diffs\n")
-            # A diff extends the chain; any full result (no prior, diff lost, or keyframe)
-            # is a fresh anchor and resets the counter.
-            self.since_keyframe[tool] = self.since_keyframe.get(tool, 0) + 1 if emitted_diff else 0
-            # Base the NEXT diff on the true current value, whichever form we emit:
-            # the model's reconstructable state after this turn is `curr` either way.
-            self.last[tool] = curr
-            self.last_args[tool] = args_key
+            chosen, reason = self._diff_decision(applied.text, curr, tool, args_key,
+                                                 joined=False)
 
         if chosen != text:
             block["text"] = chosen
             return True, reason
         return False, reason
+
+    def _diff_decision(self, full_text: str, curr: Any, tool: str, args_key: str,
+                       *, joined: bool) -> tuple[str, str]:
+        """Decide diff-vs-full for one reconstructable payload `curr` whose full compressed
+        form is `full_text`; update the per-tool diff base; return `(emitted_text, reason)`.
+        Shared by the single-block path and the multi-block join (#116).
+
+        `joined` records whether this result collapsed N blocks into one. When it differs
+        from the tool's previous result the shapes are incompatible (array vs object), so a
+        diff across the flip would be unresolvable — the base is treated as absent and this
+        result re-anchors as a full (`reason == "reanchor"`)."""
+        prev = self.last.get(tool)
+        prev_args = self.last_args.get(tool)
+        prev_joined = self.last_joined.get(tool)
+        # A shape flip (join<->single) makes the stored base structurally incompatible.
+        shape_flip = prev is not None and prev_joined is not None and prev_joined != joined
+        chosen = full_text
+        emitted_diff = False
+        # A keyframe is due once K diffs have chained off the last full result; force the
+        # full compressed form so the chain re-anchors (#8). interval 0 = never.
+        keyframe_due = (self.keyframe_interval > 0
+                        and self.since_keyframe.get(tool, 0) >= self.keyframe_interval)
+        if prev is None or shape_flip:
+            reason = "reanchor" if shape_flip else "no_prior"
+        elif keyframe_due:
+            reason = "keyframe"              # forced full to re-anchor the chain
+        else:
+            wire = self._diff_wire(prev, curr, tool)
+            if wire is not None and _cost(wire) < _cost(full_text):
+                chosen = wire
+                emitted_diff = True
+                reason = "emitted"
+                if self.debug:
+                    sys.stderr.write(
+                        f"[terse-proxy] {tool}: diff {_cost(full_text)}->{_cost(wire)} "
+                        f"tok vs full compressed\n")
+            else:
+                # A base existed but the delta didn't win. Split by whether that base came
+                # from a DIFFERENT-args call (arg-keying could offer a better, same-args
+                # base) or the SAME args (a genuine encoding miss arg-keying wouldn't fix).
+                reason = ("not_smaller_diff_args" if prev_args != args_key
+                          else "not_smaller_same_args")
+        if self.debug and keyframe_due and not shape_flip:
+            sys.stderr.write(f"[terse-proxy] {tool}: keyframe (full) after "
+                             f"{self.since_keyframe.get(tool, 0)} diffs\n")
+        # A diff extends the chain; any full result (no prior, diff lost, keyframe, flip)
+        # is a fresh anchor and resets the counter.
+        self.since_keyframe[tool] = self.since_keyframe.get(tool, 0) + 1 if emitted_diff else 0
+        # Base the NEXT diff on the true current value, whichever form we emit: the model's
+        # reconstructable state after this turn is `curr` either way.
+        self.last[tool] = curr
+        self.last_args[tool] = args_key
+        self.last_joined[tool] = joined
+        return chosen, reason
+
+    def _compress_or_diff_joined(self, text_blocks: list[dict], tool: str, args_key: str,
+                                 force_lossless: bool = False
+                                 ) -> tuple[str | None, str, list | None]:
+        """#116: compress a multi-block result as ONE joined record array, preferring a
+        cross-call diff when it wins. Returns `(emitted_text, reason, raw_array)`:
+
+          - `emitted_text is None` — the join was declined; the caller falls back to the
+            per-block path. `reason` is `multiblock_<why>` and `raw_array` is None.
+          - otherwise `emitted_text` is the single joined block's text, `reason` is the
+            diff decision (`emitted` | `no_prior` | `keyframe` | `reanchor` |
+            `not_smaller_*`) or `joined` when diffing is off, and `raw_array` is the parsed
+            pre-lossy blocks (the value captured to the corpus).
+
+        Fail-open: any error declines the join, leaving the per-block path and diff state
+        untouched."""
+        raws = [b["text"] for b in text_blocks]
+        try:
+            applied, curr, refuse = policy_mod.apply_joined(
+                raws, tool, self.policy, drop_sink=self._drop_put,
+                server=self.server_name, force_lossless=force_lossless)
+        except Exception as exc:  # noqa: BLE001 — fail-open is the whole point
+            if self.debug:
+                sys.stderr.write(f"[terse-proxy] {tool}: join passthrough on error: {exc}\n")
+            return None, "multiblock_error", None
+        if applied is None:
+            return None, f"multiblock_{refuse}", None
+        if self.diff:
+            chosen, reason = self._diff_decision(applied.text, curr, tool, args_key,
+                                                 joined=True)
+        else:
+            # Diffing off: emit the full joined-and-compressed form, keep no base.
+            chosen, reason = applied.text, "joined"
+        return chosen, reason, curr
+
+    @staticmethod
+    def _collapse_text_blocks(content: list, old_text_blocks: list[dict],
+                              joined_block: dict) -> None:
+        """Replace the N text blocks in `content` (in place) with the single `joined_block`,
+        positioned where the FIRST text block was; every non-text block (image / audio /
+        resource_link / embedded resource) keeps its place and order (#116). Matched by
+        object identity — the blocks in `old_text_blocks` are the very dicts in `content`."""
+        old_ids = {id(b) for b in old_text_blocks}
+        out: list = []
+        placed = False
+        for b in content:
+            if id(b) in old_ids:
+                if not placed:
+                    out.append(joined_block)
+                    placed = True
+                # else: a subsequent text block, now subsumed into joined_block — drop it
+            else:
+                out.append(b)
+        content[:] = out
 
     def _augment_initialize(self, msg: dict) -> str | None:
         """Prepend the terse format primer to the initialize result's `instructions` (#13),
@@ -700,17 +826,19 @@ class Interceptor:
             tail = " (further occurrences silenced unless --debug)" if first else ""
             sys.stderr.write(f"[terse-proxy] {tool}: {kind} skipped: {exc}{tail}\n")
 
-    def _emit_audit(self, tool: str, mid: Any, raw_texts: list[str],
-                    text_blocks: list[dict], changed: bool, *,
-                    display_tool: str | None = None) -> None:
+    def _emit_audit(self, tool: str, mid: Any, pairs: list[tuple[str, str]],
+                    changed: bool, *, display_tool: str | None = None) -> None:
         """Hand the audit callback one replay record per result (#23). Strictly a side
         effect: any error is swallowed so an audit-log write can never change what the
         client receives — same fail-open contract as capture.
 
-        `tool` drives `self.policy.select(tool, self.server_name)` and MUST be the bare/policy-matching
-        name. `display_tool`, if given, overrides only the record's `"tool"` field
-        (e.g. multiproxy's peer-qualified name) without affecting which policy rule's
-        tiers get reported."""
+        `pairs` is one `(raw, emitted)` per emitted block — N pairs on the per-block path,
+        exactly ONE on the joined path (#116), where `raw` is the N originals joined by
+        newline and `emitted` is the single joined block. `tool` drives
+        `self.policy.select(tool, self.server_name)` and MUST be the bare/policy-matching
+        name. `display_tool`, if given, overrides only the record's `"tool"` field (e.g.
+        multiproxy's peer-qualified name) without affecting which policy rule's tiers get
+        reported."""
         shown_tool = display_tool if display_tool is not None else tool
         record = {
             "tool": shown_tool,
@@ -718,8 +846,7 @@ class Interceptor:
             "diff_mode": self.diff,
             "tiers": list(self.policy.select(tool, self.server_name).tiers),
             "changed": changed,
-            "blocks": [{"raw": raw, "emitted": b["text"]}
-                       for raw, b in zip(raw_texts, text_blocks, strict=True)],
+            "blocks": [{"raw": raw, "emitted": emitted} for raw, emitted in pairs],
         }
         audit = self.audit
         if audit is None:
@@ -729,22 +856,22 @@ class Interceptor:
         except Exception as exc:  # noqa: BLE001 — audit is never load-bearing
             self._warn_sink("audit", shown_tool, exc)
 
-    def _emit_stats(self, tool: str, raw_texts: list[str], text_blocks: list[dict], *,
+    def _emit_stats(self, tool: str, pairs: list[tuple[str, str]], *,
                     display_tool: str | None = None, diff_reason: str | None = None) -> None:
         """Hand the stats callback one (tool, raw, emitted, passthrough, diff_reason) per
-        result block, for the payload-free savings ledger (stats.py). Same fail-open
+        emitted block, for the payload-free savings ledger (stats.py). Same fail-open
         contract as capture/audit: the callback owns I/O and a failure can never change
-        what the client receives. `tool`/`display_tool` split as in `_emit_audit`. The
-        diff decision is per-result (one JSON payload), so `diff_reason` is attributed to
-        every block of the result — meaningful for the common single-block shape."""
+        what the client receives. `pairs`/`tool`/`display_tool` as in `_emit_audit`. The
+        diff decision is per-result, so `diff_reason` is attributed to every pair — which
+        is exactly one pair on the joined path and the common single-block shape."""
         stats = self.stats
         if stats is None:
             return
         shown_tool = display_tool if display_tool is not None else tool
         passthrough = not self.policy.select(tool, self.server_name).tiers
-        for raw, b in zip(raw_texts, text_blocks, strict=True):
+        for raw, emitted in pairs:
             try:
-                stats(shown_tool, raw, b["text"], passthrough, diff_reason)
+                stats(shown_tool, raw, emitted, passthrough, diff_reason)
             except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
                 self._warn_sink("stats", shown_tool, exc)
 
