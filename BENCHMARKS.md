@@ -214,7 +214,7 @@ Servers: the official reference set (`modelcontextprotocol/servers`, 88.8k★) p
 most-starred credential-free third-party servers — **serena** (26.7k★) and
 **playwright-mcp** (35.4k★).
 
-| server | tool | output shape | codec % (1-shot) | repeated call |
+| server | tool | output shape | codec % (1-shot) | an *unchanged* repeat |
 |---|---|---|--:|---|
 | filesystem | `directory_tree` | JSON, pretty-printed | **50–58%** | diff |
 | filesystem | `read_text_file` | source text | 0% | text-diff |
@@ -233,16 +233,32 @@ Two things fall out, and they matter more than any single percentage:
    memory returns compact-ish JSON records (40–42%). serena emits *already-compact* JSON, so
    only the structural fold is left (18–22%) — the hardest honest case, and exactly the
    "pure structural gain" framing at the top of this file.
-2. **Every text-shaped tool is 0% on the codec — and every one of them still wins on a
+2. **Every text-shaped tool is 0% on the codec — and every one still wins on an *unchanged*
    repeat.** `read_text_file`, `git_log`, `browser_snapshot`, and `fetch` are all
    uncompressible one-shot, yet all four emit a content-defined-chunking text diff the
    second time they are called.
 
+**Read the repeat column as a ceiling, not a typical delta.** Both calls send identical
+arguments against an unchanged fixture, so `prev == curr`: the diff encodes an empty
+changeset and the wire is near-fixed overhead once the payload clears the small-payload
+floor described below. That is the *upper bound* of the diff tier — the same discipline §5 applies when it reports ~99%
+on an unchanged repeat and then frames production as a floor/ceiling range — note §5's
+column is a *number* and this one is only qualitative (`diff` / `text-diff` / `—`). A real agent
+loop re-fetches results that have **changed**, and how much the delta grows with the change
+is workload-specific and **not measured here**.
+
 So on third-party servers the **cross-call diff is the broad, shape-independent win, and the
 codec is the JSON-specific one.** That is a sharper claim than a blended average, and it
 predicts where terse helps: agent loops that call the same tool repeatedly. Browser
-automation is the clearest case — navigate → snapshot → act → snapshot — where consecutive
-near-identical accessibility trees are precisely the diff's sweet spot.
+automation is the shape it should suit best — navigate → snapshot → act → snapshot produces
+consecutive, largely-overlapping accessibility trees. Stated as a *prediction*, not a
+result: what was measured is an identical repeat; a post-click tree is a different and
+untested experiment.
+
+**Which command produces which column:** codec % comes from `terse measure --corpus`; the
+repeat column comes from `terse stats --log` (its `diff_reason` breakdown). Capture is
+content-addressed, so two identical repeats collapse into one corpus file — the corpus
+alone can never evidence the repeat column, only the ledger can.
 
 ### Repo size barely moves the codec
 
@@ -267,6 +283,34 @@ conservative, lossless policy every time with no hand-tuning: `directory_tree` �
 `minify,tabularize` (dictionary auto-dropped as below the 5% threshold), `read_text_file` →
 `tiers: []` passthrough (detected as non-JSON), memory's three record tools → all folded.
 That is the "does it just work on a server it has never seen" question, answered yes.
+
+### Transports: HTTP downstream and multi-peer fan-out
+
+Everything above is a **stdio** downstream. terse also proxies an MCP **Streamable-HTTP**
+endpoint and can front *N* servers from one process, and neither had third-party evidence.
+Both were exercised against the reference `everything` server run in `streamableHttp` mode.
+**Scope: a single run on 2026-07-22, not part of the pinned size sweep** — these establish
+that the transports work end-to-end, not a measured savings result:
+
+- **HTTP downstream** — `terse proxy -- http://127.0.0.1:3001/mcp`. `initialize`,
+  `tools/list` (13 tools), `tools/call` and the capture tee all behave as on stdio; the URL
+  form is selected automatically (a single target containing `://`).
+- **Multi-peer fan-out with mixed transports** — one process fronting three peers,
+  **two stdio + one HTTP**, via `proxy --config`:
+
+  | check | result |
+  |---|---|
+  | merged `tools/list` | 36 tools, peer-prefixed (`fs`=14, `mem`=9, `ev`=13) |
+  | `initialize` primer | injected **exactly once** across all peers |
+  | call routing | each `peer__tool` reached its own peer, including the HTTP one |
+  | per-peer compression | `fs__directory_tree` 54.3% (express v5.2.1 `lib/`), `mem__read_graph` 42.1% |
+  | ledger attribution | per-peer, under the peer-qualified tool name |
+
+This round also turned up a real defect, now fixed: a server-initiated request
+(`roots/list`, `sampling/createMessage`) uses its **own** id space, so its id can collide
+with an in-flight `tools/call`. terse consumed the call's tracking entry on that collision
+and then forwarded the real result **uncompressed and unrecorded**, silently. See the
+`### Fixed` entry in CHANGELOG.
 
 ### Honest scope note: #116's cross-block join does *not* apply here
 
