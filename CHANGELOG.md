@@ -9,6 +9,28 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Added
+- **Cross-block join (`join_blocks`, ON by default) — #116.** When every text content
+  block of a tool result is a JSON object, the proxy now joins them into one record array
+  before compressing, so `tabularize`/`dictionary` fold across records *and* the whole
+  result becomes eligible for the cross-call diff tier. Several MCP servers return one
+  record per block, a shape that was 71% of terse's own live traffic and could reach
+  neither cross-record folding nor diffing (the diff path only ran for single-block
+  results). Measured on a realistic 80-record `kb.read.list_principles` payload: per-block
+  +9.6% → joined codec +24.9%, and a near-identical repeat call collapses ~6900 tokens to
+  ~100 via a diff. Lossy field rules resolve **per block, before the join**, so a path
+  authored against one record's shape is unaffected. Opt out with `proxy --no-join-blocks`
+  / `install-mcp --no-join-blocks` or a policy-file `"join_blocks": false`.
+
+### Changed
+- **A joined result changes the content-block count the client sees (N → 1).** This is the
+  first time terse changes anything but block *text*. The MCP spec (2025-06-18) puts no
+  meaning on block count — blocks carry no index a payload can reference — and non-text
+  blocks (image/audio/resource) keep their positions. The savings ledger's blanket
+  `multiblock` reason is replaced by reasons that name why a join did or didn't fire
+  (`multiblock_non_json` / `_heterogeneous` / `_marker` / `_depth` / `_passthrough` /
+  `_off`, plus a `reanchor` reason when a join↔single shape flip forces a full).
+
 ## [0.4.1] - 2026-07-21
 
 ### Fixed

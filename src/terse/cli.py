@@ -188,6 +188,10 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
     diff_override = True if args.diff else (False if args.no_diff else None)
     if diff_override is not None:
         pol.diff = diff_override
+    # --no-join-blocks overrides the policy value (join_blocks is ON by default, #116).
+    join_blocks_override = False if args.no_join_blocks else None
+    if join_blocks_override is not None:
+        pol.join_blocks = join_blocks_override
     if args.diff_keyframe_interval is not None:
         pol.diff_keyframe_interval = args.diff_keyframe_interval
     if args.no_stats and args.stats_log:
@@ -219,6 +223,7 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
                                    capture_dir=args.capture_dir, debug_log=args.debug_log,
                                    diff_override=diff_override,
                                    diff_keyframe_override=args.diff_keyframe_interval,
+                                   join_blocks_override=join_blocks_override,
                                    stats_log=stats_log)
         except (OSError, ValueError) as e:
             print(f"proxy --config: {e}", file=sys.stderr)
@@ -808,7 +813,8 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
                          capture_dir=args.capture_dir, diff=diff,
                          diff_keyframe_interval=args.diff_keyframe_interval,
                          scope=args.scope, file=args.file, repo_path=args.repo_path,
-                         no_stats=args.no_stats, never_lossy=args.never_lossy)
+                         no_stats=args.no_stats, no_join_blocks=args.no_join_blocks,
+                         never_lossy=args.never_lossy)
     except (FileNotFoundError, ValueError) as e:
         print(f"install-mcp: {e}", file=sys.stderr)
         return 2
@@ -1097,6 +1103,10 @@ def main(argv: list[str] | None = None) -> int:
     px.add_argument("--no-diff", action="store_true",
                     help="disable cross-call diffing (emit the full compressed form "
                          "every call), overriding the default and any policy value")
+    px.add_argument("--no-join-blocks", action="store_true",
+                    help="disable joining a multi-block result into one record array before "
+                         "compressing (#116; joining is the DEFAULT). Forwards each text "
+                         "block compressed independently, preserving the block count.")
     px.add_argument("--debug", action="store_true", help="log compressions to stderr")
     px.add_argument("--capture-dir", metavar="DIR",
                     help="tee each raw tool-result payload into this corpus dir for later "
@@ -1230,6 +1240,10 @@ def main(argv: list[str] | None = None) -> int:
     im.add_argument("--no-diff", action="store_true",
                     help="bake `--no-diff` into the wrapped entry: this server gets "
                          "full results every call, no cross-call diffing")
+    im.add_argument("--no-join-blocks", action="store_true",
+                    help="bake `--no-join-blocks` into the wrapped entry: this server's "
+                         "multi-block results are compressed per block, not joined into "
+                         "one record array (joining is the proxy DEFAULT, #116)")
     im.add_argument("--diff-keyframe-interval", type=int, default=None, metavar="K",
                     help="force a full result every K consecutive diffs per tool "
                          "(default 5; 0 disables)")

@@ -967,6 +967,7 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                  store: OrderedDict[str, Any], store_lock: Lock,
                  dropped_bytes: list[int], diff_override: bool | None = None,
                  diff_keyframe_override: int | None = None,
+                 join_blocks_override: bool | None = None,
                  stats_log: str | None = None) -> list[Peer]:
     """Build every `Peer`: its own `Transport` (stdio or HTTP, via `build_transport`)
     and its own `Interceptor` (per-peer diff/compress state, but the drop store —
@@ -990,6 +991,8 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                 pol.diff = diff_override
             if diff_keyframe_override is not None:
                 pol.diff_keyframe_interval = diff_keyframe_override
+            if join_blocks_override is not None:
+                pol.join_blocks = join_blocks_override
             # Per-peer stats writer so the ledger's `server` field is the peer's own
             # config name (the tool field is already peer-qualified; this keeps the
             # grouping key meaningful without parsing prefixes back out).
@@ -1020,6 +1023,7 @@ def run_multi_proxy(
     broadcast_timeout: float = BROADCAST_TIMEOUT,
     diff_override: bool | None = None,
     diff_keyframe_override: int | None = None,
+    join_blocks_override: bool | None = None,
     stats_log: str | None = None,
 ) -> int:
     """Load `config_path`, build one `Peer` per downstream (own `Transport` + own
@@ -1058,6 +1062,7 @@ def run_multi_proxy(
                              audit=audit, store=store, store_lock=store_lock,
                              dropped_bytes=dropped_bytes, diff_override=diff_override,
                              diff_keyframe_override=diff_keyframe_override,
+                             join_blocks_override=join_blocks_override,
                              stats_log=stats_log)
     except OSError as exc:
         sys.stderr.write(f"[terse-multiproxy] failed to launch a downstream peer: {exc}\n")

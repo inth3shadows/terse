@@ -74,6 +74,15 @@ then (optionally) serves it through a per-tool policy that decides which tiers r
   chunk boundaries by content, not position, so an edit anywhere only perturbs the
   chunk(s) it overlaps and the rest is sent as references to the prior result. Each
   shape keeps its own diff base per tool.
+- **Cross-block join (ON by default)**: some MCP servers return one record per content
+  block, so each block is a lone object the codec above can barely fold and the diff tier
+  skips entirely (it reasons about one logical payload). When every text block of a result
+  is a JSON object, the proxy joins them into one record array before compressing — so
+  `tabularize`/`dictionary` fold across records *and* the whole result becomes
+  diff-eligible. This changes the number of content blocks the client sees (N → 1), which
+  the MCP spec permits (block count carries no meaning). Opt out with
+  `proxy --no-join-blocks` / `install-mcp --no-join-blocks` or a policy-file
+  `"join_blocks": false`; lossy field rules still resolve per block, before the join.
 - **Tier 1 — lossy (opt-in, per field)**: `truncate` caps and annotates a field marked
   `{"lossy":"truncate","max":N}`, gated by an acceptable-loss check (only marked,
   non-`critical` fields may differ, each only as a valid truncation). `drop-to-retrieve`

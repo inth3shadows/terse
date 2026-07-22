@@ -360,6 +360,32 @@ gitignored because captured tool output may contain real data.
   chain depth, up to the keyframe bound). The residual gap — a context *compaction* with
   no reconnect — is unobservable over stdio; keyframes cap its blast radius at K turns,
   and `--no-diff` remains the escape hatch for a consumer where that residual matters.
+- **Cross-block join is built and ON by default (`proxy --no-join-blocks` / policy
+  `"join_blocks": false` to opt out, #116).** Several MCP servers return one record per
+  content block, so each block is a single object: `tabularize` never sees an array, and
+  the diff tier — which reasons about one logical payload — is skipped for the whole
+  result (`_compress_or_diff` is entered only when `len(text_blocks) == 1`). On terse's
+  own live ledger that shape was **71% of all results** and the single largest token sink
+  (`kb.read.list_principles`, 37% of proxied traffic) was 100% of it. When every text
+  block parses as a JSON object, the proxy joins them into one record array before
+  compressing (`policy.apply_joined`), then runs the same lossless codec and diff decision
+  over the array. Measured on a realistic 80-record `list_principles` payload: per-block
+  +9.6% → joined codec +24.9%, and a near-identical repeat call collapses from ~6900
+  tokens to ~100 (the diff unlock — an order of magnitude the per-block ceiling can't
+  reach). Design points that keep it safe:
+  (1) lossy field rules run **per block, before the join** (`_lossy_stage`), so a path like
+  `$.results[*].body` still resolves against one record's shape rather than the joined
+  array; (2) the join fires only when every block is a JSON **dict** (a mixed bag of dicts,
+  scalars, and arrays is not a record sequence) and none carries a reserved terse marker or
+  nests past the depth cap — otherwise it falls back to the per-block path and records
+  *why* (`multiblock_non_json` / `_heterogeneous` / `_marker` / `_depth` / `_passthrough` /
+  `_off`); (3) the per-result verify-before-emit gate proves the joined payload round-trips
+  before it ships; (4) N → 1 changes the content-block count, which the MCP spec (2025-06-18
+  server/tools) permits — block count carries no meaning, blocks have no index a payload can
+  reference — while non-text blocks (image/audio/resource) keep their positions; (5) the
+  per-tool diff base tracks whether it came from a joined result, and a join↔single **shape
+  flip** re-anchors as a full instead of diffing an array against an object. Independent of
+  `diff`: with diffing off, joining still folds records into one compressed block.
 - **Text diff (Tier 0.7 text, #25) covers non-JSON results, but only the codec side is
   measured so far.** File reads, source excerpts, and log tails get `applicable: False`
   in `measure_payload` — zero Tier-0 compression — and used to get zero cross-call

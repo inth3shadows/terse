@@ -1245,3 +1245,187 @@ def test_text_drop_clears_the_text_diff_base():
 def test_text_payload_untouched_without_a_text_selector():
     inter = Interceptor(FULL)
     assert _emit_text(inter, 1, "codegraph_explore", _MD) == _MD
+
+
+# --- #116: multi-block join (cross-block tabularize + diff unlock) ---
+
+def _rec_blocks(n, change=None):
+    rows = [{"id": i, "status": "active", "url": "https://x.example/api/items"}
+            for i in range(n)]
+    if change is not None:
+        rows[change]["status"] = "closed"
+    return [json.dumps(r) for r in rows]
+
+
+def _msg_content(mid, content):
+    return json.dumps({"jsonrpc": "2.0", "id": mid, "result": {"content": content}})
+
+
+def _emit_multi(inter, mid, tool, texts, extra_blocks=None):
+    """Emit a multi-text-block result; return the emitted content list. `extra_blocks`,
+    if given, is a list of (index, block) to splice in among the text blocks."""
+    content = [{"type": "text", "text": t} for t in texts]
+    if extra_blocks:
+        for idx, block in extra_blocks:
+            content.insert(idx, block)
+    inter.note_request(_req(mid, tool))
+    out = inter.transform_response(_msg_content(mid, content))
+    return json.loads(out)["result"]["content"]
+
+
+def test_join_collapses_n_text_blocks_to_one_record_array():
+    inter = Interceptor(DIFF)
+    raws = _rec_blocks(5)
+    content = _emit_multi(inter, 1, "gh.api.items", raws)
+    assert len(content) == 1 and content[0]["type"] == "text"
+    assert transforms.TABLE_MARKER in content[0]["text"]          # folded across blocks
+    assert transforms.decompress(content[0]["text"]) == [json.loads(r) for r in raws]
+
+
+def test_join_preserves_non_text_blocks_in_position():
+    inter = Interceptor(DIFF)
+    raws = _rec_blocks(2)
+    image = {"type": "image", "data": "abc", "mimeType": "image/png"}
+    link = {"type": "resource_link", "uri": "file:///x"}
+    # order: image, text0, text1, link — the joined block takes the FIRST text slot
+    content = _emit_multi(inter, 1, "gh.api.items", raws,
+                          extra_blocks=[(0, image), (3, link)])
+    assert [b["type"] for b in content] == ["image", "text", "resource_link"]
+    assert content[0] == image and content[2] == link
+    assert transforms.decompress(content[1]["text"]) == [json.loads(r) for r in raws]
+
+
+def test_join_emits_a_diff_on_the_second_same_tool_result():
+    inter = Interceptor(DIFF)
+    prev, curr = _rec_blocks(40), _rec_blocks(40, change=3)
+    _emit_multi(inter, 1, "gh.api.items", prev)
+    content = _emit_multi(inter, 2, "gh.api.items", curr)
+    assert len(content) == 1
+    env = json.loads(content[0]["text"])
+    assert env.get(transforms.DIFF_MARKER) == 1                  # the 71% unlock: a diff!
+    assert transforms.diff_decode([json.loads(r) for r in prev], env) == \
+        [json.loads(r) for r in curr]
+
+
+def test_join_reports_one_stats_record_not_n():
+    reasons, stats = _capture_stats()
+    inter = Interceptor(DIFF, stats=stats)
+    _emit_multi(inter, 1, "gh.api.items", _rec_blocks(5))
+    assert reasons == ["no_prior"]                              # ONE record, first = full
+
+
+def test_join_audit_pairs_the_joined_block_with_newline_joined_raw():
+    records = []
+    inter = Interceptor(DIFF, audit=records.append)
+    raws = _rec_blocks(3)
+    _emit_multi(inter, 1, "gh.api.items", raws)
+    assert len(records) == 1
+    blocks = records[0]["blocks"]
+    assert len(blocks) == 1                                     # single (raw, emitted) pair
+    assert blocks[0]["raw"] == "\n".join(raws)                  # true wire cost the model saw
+
+
+def test_join_captures_the_array_once_not_per_block(tmp_path):
+    captured = []
+    inter = Interceptor(DIFF, capture=lambda tool, text: captured.append(text))
+    raws = _rec_blocks(4)
+    _emit_multi(inter, 1, "gh.api.items", raws)
+    assert len(captured) == 1                                   # one corpus payload, not 4
+    assert json.loads(captured[0]) == [json.loads(r) for r in raws]  # the joined array shape
+
+
+def _reason_of(inter, mid, tool, texts):
+    reasons, stats = _capture_stats()
+    inter.stats = stats
+    _emit_multi(inter, mid, tool, texts)
+    return reasons[-1]
+
+
+def test_join_refusals_fall_back_to_per_block_and_record_why():
+    good = _rec_blocks(2)
+
+    # non-JSON block: 2 blocks stay, reason names the refusal
+    inter = Interceptor(DIFF)
+    reasons, stats = _capture_stats()
+    inter.stats = stats
+    content = _emit_multi(inter, 1, "gh.api.items", [good[0], "not json {"])
+    assert len(content) == 2                                    # NOT collapsed
+    assert reasons[-1] == "multiblock_non_json"
+
+    # heterogeneous (a non-dict block)
+    assert _reason_of(Interceptor(DIFF), 1, "gh.api.items",
+                      [good[0], json.dumps([1, 2, 3])]) == "multiblock_heterogeneous"
+
+    # marker collision
+    assert _reason_of(Interceptor(DIFF), 1, "gh.api.items",
+                      [json.dumps({transforms.TABLE_MARKER: 1}), good[0]]) == \
+        "multiblock_marker"
+
+    # join disabled by policy
+    off = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))],
+                 diff=True, join_blocks=False)
+    assert _reason_of(Interceptor(off), 1, "gh.api.items", good) == "multiblock_off"
+
+    # explicit passthrough tier
+    passthru = Policy(rules=[Rule("gh.*", ())], diff=True)
+    assert _reason_of(Interceptor(passthru), 1, "gh.api.items", good) == \
+        "multiblock_passthrough"
+
+
+def test_join_to_single_shape_flip_re_anchors_instead_of_cross_shape_diff():
+    inter = Interceptor(DIFF)
+    _emit_multi(inter, 1, "gh.api.items", _rec_blocks(5))     # joins -> base is an array
+    assert inter.last_joined.get("gh.api.items") is True
+    # a single-block result for the same tool: the shapes are incompatible (array vs the
+    # {"result": [...]} object), so it must re-anchor as a full, not diff across the flip
+    single = _emit(inter, 2, "gh.api.items", _records(40))
+    assert transforms.DIFF_MARKER not in single
+    assert inter.last_joined.get("gh.api.items") is False
+    # once re-anchored on the single shape, the NEXT single result diffs normally
+    assert transforms.DIFF_MARKER in _emit(inter, 3, "gh.api.items", _records(40, change=2))
+
+
+def test_join_shape_flip_reason_is_reanchor():
+    reasons, stats = _capture_stats()
+    inter = Interceptor(DIFF, stats=stats)
+    _emit_multi(inter, 1, "gh.api.items", _rec_blocks(5))
+    _emit(inter, 2, "gh.api.items", _records(5))
+    assert reasons[-1] == "reanchor"
+
+
+def test_join_off_still_compresses_each_block_and_labels_multiblock_off():
+    off = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))],
+                 diff=True, join_blocks=False)
+    reasons, stats = _capture_stats()
+    inter = Interceptor(off, stats=stats)
+    raws = _rec_blocks(3)
+    content = _emit_multi(inter, 1, "gh.api.items", raws)
+    assert len(content) == 3                                    # each block kept
+    for b, r in zip(content, raws, strict=True):
+        assert transforms.decompress(b["text"]) == json.loads(r)  # still compressed, lossless
+    assert reasons[-1] == "multiblock_off"
+
+
+def test_join_on_iserror_result_stays_fully_lossless():
+    inter = Interceptor(DIFF)
+    raws = _rec_blocks(3)
+    content = [{"type": "text", "text": t} for t in raws]
+    inter.note_request(_req(1, "gh.api.items"))
+    msg = json.dumps({"jsonrpc": "2.0", "id": 1,
+                      "result": {"content": content, "isError": True}})
+    out = json.loads(inter.transform_response(msg))["result"]["content"]
+    assert len(out) == 1                                        # still joined (all JSON dicts)
+    assert transforms.decompress(out[0]["text"]) == [json.loads(r) for r in raws]
+
+
+def test_join_diff_off_folds_records_but_never_diffs():
+    nodiff = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))],
+                    diff=False, join_blocks=True)
+    reasons, stats = _capture_stats()
+    inter = Interceptor(nodiff, stats=stats)
+    raws = _rec_blocks(5)
+    c1 = _emit_multi(inter, 1, "gh.api.items", raws)
+    c2 = _emit_multi(inter, 2, "gh.api.items", raws)
+    assert len(c1) == 1 and transforms.TABLE_MARKER in c1[0]["text"]   # folded
+    assert transforms.DIFF_MARKER not in c2[0]["text"]                # but never a diff
+    assert reasons[-1] == "joined"
