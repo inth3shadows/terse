@@ -381,7 +381,7 @@ def test_http_transport_blocks_link_local_metadata(bad_url):
 def test_http_transport_still_allows_loopback_and_private():
     # The metadata guard must NOT break the first-class local/homelab MCP use case.
     assert HttpTransport("http://127.0.0.1:4000/mcp")
-    assert HttpTransport("http://192.168.9.40:8080/mcp")   # ordinary private LAN host
+    assert HttpTransport("http://192.168.1.50:8080/mcp")   # ordinary private LAN host
 
 
 def test_build_transport_still_allows_http_and_https():
