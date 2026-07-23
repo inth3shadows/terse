@@ -498,14 +498,15 @@ class Interceptor:
             if self.audit is not None and persist:
                 self._emit_audit(tool, msg["id"], emitted_pairs, changed,
                                  display_tool=capture_tool)
+            # `structuredContent` rides alongside the text blocks and is what some clients
+            # actually give the model (#128). Compress it when the rule opts in; either
+            # way its EMITTED size is what the ledger must count, so the reported saving
+            # tracks the whole result rather than the text block alone.
+            structured, rewrote_structured = self._compress_structured(
+                result, tool, force_lossless=error_result)
+            changed = changed or rewrote_structured
+
             if self.stats is not None:
-                # The untouched `structuredContent` duplicate is part of what this result
-                # costs the model, so the ledger must carry it rather than reporting the
-                # text block's reduction as the whole story (#128).
-                structured = None
-                if isinstance(result, dict) and "structuredContent" in result:
-                    structured = json.dumps(result["structuredContent"],
-                                            separators=(",", ":"), ensure_ascii=False)
                 self._emit_stats(tool, emitted_pairs, display_tool=capture_tool,
                                  diff_reason=diff_reason, structured=structured)
 
@@ -764,6 +765,44 @@ class Interceptor:
             if self.debug:
                 sys.stderr.write(f"[terse-proxy] {tool}: passthrough on error: {exc}\n")
             return text
+
+    def _compress_structured(self, result: Any, tool: str, *,
+                             force_lossless: bool = False) -> tuple[str | None, bool]:
+        """Run a result's `structuredContent` through the codec in place, when the matching
+        rule opted in with `"structured": "compress"` (#128). Returns the serialized field
+        as it will go out (compressed or not) for the ledger, or None when absent.
+
+        Why this exists: measured against `claude` 2.1.218, the client forwards the TYPED
+        field to the model and discards the text block terse compresses, so on a tool that
+        emits both, compressing only the block delivers ~0%. Why it is opt-in, and why the
+        default must stay "leave": see `policy.Rule.structured`.
+
+        Codec only — no diff. Diffing the typed field needs its own per-tool base and
+        keyframe accounting; mixing that in here would double the surface with none of the
+        evidence the text-block diff tier earned before it was turned on.
+
+        Fail-open like everything else on this path: a field that does not survive a
+        round-trip through `json.dumps` is left exactly as it was."""
+        if not isinstance(result, dict) or "structuredContent" not in result:
+            return None, False
+        try:
+            original = json.dumps(result["structuredContent"], separators=(",", ":"),
+                                  ensure_ascii=False)
+        except (TypeError, ValueError):
+            return None, False                # unserializable: not ours to touch
+        if self.policy.select(tool, self.server_name).structured != "compress":
+            return original, False            # untouched, but still counted by the ledger
+        emitted = self._compress(original, tool, force_lossless=force_lossless)
+        if emitted == original:
+            return original, False
+        try:
+            result["structuredContent"] = json.loads(emitted)
+        except json.JSONDecodeError:
+            # The codec's output is always JSON, so this cannot normally fire — but the
+            # typed field is the one a client may hand straight to a schema validator, so
+            # an unparseable replacement must never be written. Keep the original.
+            return original, False
+        return emitted, True
 
     def _drop_put(self, handle: str, value: Any) -> None:
         """Store a dropped field's original under `handle` for a later terse.retrieve (#10).

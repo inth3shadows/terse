@@ -74,6 +74,25 @@ class Rule:
     # returns a plaintext value by design) safe to wrap by construction rather than by
     # discipline. Default True = exactly the pre-#85 behavior.
     capture: bool = True
+    # `"structured": "compress"` — also run this tool's `structuredContent` through the
+    # codec, replacing the typed field with a terse envelope (#128).
+    #
+    # Default "leave" = the pre-#128 behavior, and deliberately so despite the measurement
+    # that motivated this. MCP 2025-06-18 lets a tool return `structuredContent` beside a
+    # text block that mirrors it; measured against `claude` 2.1.218, the client forwards
+    # the TYPED field to the model and discards the text block terse compresses — so on
+    # such a tool terse currently delivers ~0% (see `scripts/probe/structured_content/`
+    # and BENCHMARKS §6's scope note). Compressing it recovers ≈61%.
+    #
+    # It stays opt-in because the risk is ASYMMETRIC. Leaving it off means terse keeps
+    # being a no-op for anyone who never reads the docs: bad, but inert. Turning it on by
+    # default means that for any client which validates the typed field against the tool's
+    # `outputSchema` — which the spec says clients SHOULD do — terse starts BREAKING tools
+    # that worked. terse cannot detect which client it sits behind, and a default that
+    # silently violates a declared schema for unknown clients is the exact failure class
+    # #131 and #133 were about. Revisit once more clients are measured: a data question,
+    # not a taste one.
+    structured: str = "leave"
 
     def lossy_fields(self) -> list[str]:
         return [k for k, v in self.fields.items() if v.get("lossy")]
@@ -197,6 +216,21 @@ def _coerce_capture(raw: Any, where: str) -> bool:
     return raw
 
 
+VALID_STRUCTURED = ("leave", "compress")
+
+
+def _coerce_structured(raw: Any, where: str) -> str:
+    """Strict, for the same reason `capture` is: this decides whether terse rewrites a
+    field that carries a declared `outputSchema`. A typo silently reverting to "leave"
+    would be a quiet no-op; a typo silently enabling "compress" would quietly rewrite a
+    typed field for a client that may validate it. Neither is acceptable, so accept only
+    the exact literals and fail at load."""
+    if raw not in VALID_STRUCTURED:
+        raise ValueError(f"{where}: 'structured' must be one of "
+                         f"{list(VALID_STRUCTURED)}, got {raw!r}")
+    return raw
+
+
 # The keys load_policy understands, per level. Anything else (except an "_"-prefixed
 # comment/annotation key, the convention policy_gen's `_comment`/`_suggested_fields*`
 # already use) is rejected loudly: this file governs what gets rewritten on the wire,
@@ -205,7 +239,7 @@ def _coerce_capture(raw: Any, where: str) -> bool:
 _TOP_KEYS = frozenset({"version", "defaults", "policies", "diff", "diff_keyframe_interval",
                        "join_blocks", "never_lossy_servers"})
 _DEFAULTS_KEYS = frozenset({"tiers"})
-_RULE_KEYS = frozenset({"match", "tiers", "fields", "capture"})
+_RULE_KEYS = frozenset({"match", "tiers", "fields", "capture", "structured"})
 _MATCH_KEYS = frozenset({"tool"})
 
 
@@ -237,7 +271,9 @@ def load_policy(path: str | Path) -> Policy:
         glob = match.get("tool", "*")
         rules.append(Rule(tool_glob=glob, tiers=_coerce_tiers(r.get("tiers", []), f"policies[{i}]"),
                           fields=r.get("fields", {}),
-                          capture=_coerce_capture(r.get("capture", True), f"policies[{i}]")))
+                          capture=_coerce_capture(r.get("capture", True), f"policies[{i}]"),
+                          structured=_coerce_structured(r.get("structured", "leave"),
+                                                        f"policies[{i}]")))
     return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", True)),
                   join_blocks=bool(doc.get("join_blocks", True)),
                   diff_keyframe_interval=int(doc.get("diff_keyframe_interval", 5)),

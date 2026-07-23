@@ -9,6 +9,23 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Added
+- **`"structured": "compress"` — compress `structuredContent` too (#128).** New per-rule
+  policy knob. MCP 2025-06-18 lets a tool return a typed `structuredContent` field beside
+  a text block that mirrors it; terse compressed only the block. Measured against `claude`
+  2.1.218 with a read-only proxy, the client forwards the **typed field** to the model and
+  discards the block entirely — so on such a tool terse was delivering ~0% however good
+  the ledger looked. With the knob on, the same fixture measures **61.2%** of the model's
+  real context (2,596 → 1,008 chars), captured end to end rather than inferred.
+  Affected servers are not exotic: filesystem (14/14 tools), memory (9/9) and kb (27/27)
+  all declare an `outputSchema`.
+  **Default is `"leave"` — the previous behavior — and deliberately so.** The risk is
+  asymmetric: off, terse is a no-op for anyone who never reads the docs (bad, but inert);
+  on by default, any client that validates the typed field against `outputSchema` would
+  see terse break tools that worked, and terse cannot detect which client it sits behind.
+  The reference client was measured *not* to validate, which makes the opt-in safe to
+  recommend — not a default safe to flip. Codec only, no diff.
+
 ### Fixed
 - **The savings ledger no longer reports a saving terse did not deliver (#128).** terse
   compresses a result's text block but leaves `structuredContent` untouched, and the

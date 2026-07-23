@@ -399,6 +399,38 @@ terse install-mcp kb --policy policy.json --never-lossy
 enforcement keys off the server's verified identity (the `--server-name` terse bakes into the
 wrap), so it can't be defeated by a mislabeled rule.
 
+### Compressing `structuredContent` (`"structured": "compress"`)
+
+Some MCP servers return a typed `structuredContent` field beside a text block that
+serializes the same data. terse compresses the text block — but **some clients read the
+typed field and throw the text block away**, so on those tools terse can be doing work and
+delivering nothing.
+
+Measured against `claude` 2.1.218 (`scripts/probe/structured_content/`, a read-only proxy
+watching what actually lands in the model's context) that is exactly what happens. Turning
+this on puts the codec where the payload really is:
+
+```json
+{ "match": { "tool": "kb.*" },
+  "tiers": ["minify", "tabularize", "dictionary"],
+  "structured": "compress" }
+```
+
+On the reference fixture: **2,596 → 1,008 chars of the model's real context (61.2%)**,
+against 0% with the default.
+
+**It is off by default, and that is deliberate.** The MCP spec says clients *should*
+validate `structuredContent` against the tool's `outputSchema`, and terse cannot tell
+which client it is sitting behind. Off, terse is merely a no-op on such tools. On by
+default, a validating client would see terse **break tools that worked**. The reference
+client was measured *not* to validate — neither a wrong type nor a terse envelope in place
+of the declared record array draws a complaint — which makes this safe to switch on
+knowingly, not safe to switch on for everyone.
+
+Check whether it applies to you before bothering: a tool that declares an `outputSchema`
+is the one that will emit the field. Among common servers, filesystem (14/14 tools),
+memory (9/9) and kb (27/27) all do; git, fetch, serena and playwright do not.
+
 ### Keeping a tool's output off disk (`"capture": false`)
 
 Some tools return things that should never be written to a file — a credential, a token,

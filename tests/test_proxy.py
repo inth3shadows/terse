@@ -1548,3 +1548,67 @@ def test_server_initiated_request_colliding_with_initialize_id_keeps_the_primer(
                         "result": {"protocolVersion": "2025-06-18", "capabilities": {}}})
     out = json.loads(inter.transform_response(reply))
     assert "terse" in (out["result"].get("instructions") or "").lower()   # primer survived
+
+
+# --- #128: compressing the typed `structuredContent` field (opt-in) ---
+
+def _structured_result_msg(mid, payload):
+    """A spec-shaped pair: the serialized JSON in a text block AND the typed field."""
+    return json.dumps({"jsonrpc": "2.0", "id": mid,
+                       "result": {"content": [{"type": "text", "text": json.dumps(payload)}],
+                                  "structuredContent": payload}})
+
+
+_SC_PAYLOAD = {"rows": [{"id": i, "status": "active", "city": "Berlin"} for i in range(12)]}
+
+
+def _structured_policy(mode):
+    return Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"),
+                              structured=mode)])
+
+
+def test_structured_content_is_left_alone_by_default(tmp_path):
+    # The default must stay the pre-#128 behavior: the typed field carries a declared
+    # outputSchema, and a client may hand it straight to a validator.
+    inter = Interceptor(_structured_policy("leave"))
+    inter.note_request('{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+                       '"params":{"name":"gh.items"}}')
+    out = json.loads(inter.transform_response(_structured_result_msg(1, _SC_PAYLOAD)))
+    assert out["result"]["structuredContent"] == _SC_PAYLOAD          # byte-identical
+    # ...while the text block IS compressed, exactly as before
+    assert "__terse_" in out["result"]["content"][0]["text"]
+
+
+def test_structured_content_is_compressed_when_the_rule_opts_in(tmp_path):
+    inter = Interceptor(_structured_policy("compress"))
+    inter.note_request('{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+                       '"params":{"name":"gh.items"}}')
+    out = json.loads(inter.transform_response(_structured_result_msg(1, _SC_PAYLOAD)))
+    sc = out["result"]["structuredContent"]
+    # the typed field now carries a terse envelope...
+    assert "__terse_table__" in json.dumps(sc) or "__terse_dict__" in json.dumps(sc)
+    # ...that still losslessly decodes to the original, which is the whole contract
+    assert transforms.decompress(json.dumps(sc)) == _SC_PAYLOAD
+    # and it is genuinely smaller than what it replaced
+    assert len(json.dumps(sc)) < len(json.dumps(_SC_PAYLOAD))
+
+
+def test_structured_content_absent_is_not_invented(tmp_path):
+    inter = Interceptor(_structured_policy("compress"))
+    inter.note_request('{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+                       '"params":{"name":"gh.items"}}')
+    out = json.loads(inter.transform_response(_result_msg(1, _records_text())))
+    assert "structuredContent" not in out["result"]
+
+
+def test_structured_content_ledger_counts_the_compressed_size(tmp_path):
+    # The ledger must follow the field: once compressed, the honest saving moves on its
+    # own with no further stats change (#133 made it count the field at all).
+    seen = []
+    inter = Interceptor(_structured_policy("compress"), stats=lambda *a: seen.append(a))
+    inter.note_request('{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+                       '"params":{"name":"gh.items"}}')
+    inter.transform_response(_structured_result_msg(1, _SC_PAYLOAD))
+    structured = seen[0][5]
+    assert structured is not None and "__terse_" in structured
+    assert len(structured) < len(json.dumps(_SC_PAYLOAD, separators=(",", ":")))

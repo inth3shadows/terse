@@ -158,6 +158,7 @@ raw tool output (JSON text)
       "match": { "tool": "gh.*" },    // fnmatch glob on the tool name
       "tiers": ["minify", "tabularize", "dictionary"],   // [] = passthrough (skip)
       "capture": false,               // optional; never PERSIST this tool's payloads
+      "structured": "compress",       // optional; also compress `structuredContent` (default "leave")
       "fields": {                     // optional, per-field
         "result[].id":   { "critical": true },           // denylist: never made lossy
         "result[].body": { "lossy": "drop-to-retrieve" },// evicted to a handle; served by terse.retrieve
@@ -187,6 +188,24 @@ raw tool output (JSON text)
   (`kb.read.search` under server `kb` stays `kb.read.search`, not `kb.kb.read.search`).
 - **Tiers:** any subset of `minify` / `tabularize` / `dictionary`. `minify` is implied
   by serialization (a warning is emitted if omitted). `[]` = passthrough.
+- **`structured` (default `"leave"`, #128):** `"compress"` also runs this tool's
+  `structuredContent` through the codec, replacing the typed field with a terse envelope.
+  MCP 2025-06-18 lets a tool return that field beside a text block mirroring it, and
+  terse historically compressed only the block — but measured against `claude` 2.1.218
+  the client forwards the **typed field** to the model and discards the block entirely
+  (`scripts/probe/structured_content/`; BENCHMARKS §6's scope note). On such a tool terse
+  therefore delivered ~0%; with `"compress"` the same fixture measures **61.2%** of the
+  model's actual context, captured end to end rather than inferred from the ledger.
+  It is **opt-in, and the default must stay `"leave"`**, because the risk is asymmetric:
+  off, terse is a no-op for anyone who never reads this — bad, but inert; on by default,
+  any client that validates the typed field against the tool's `outputSchema` (which the
+  spec says clients SHOULD do) would see terse **break tools that worked**. terse cannot
+  detect which client it sits behind. The reference client was measured NOT to validate —
+  neither a type violation nor a terse envelope in place of the declared record array
+  draws a complaint — which is what makes the opt-in safe to recommend, not what would
+  make a default safe to flip. Revisit when more clients are measured: a data question.
+  Codec only, no diff: diffing the typed field needs its own per-tool base and keyframe
+  accounting, and is deliberately left unbuilt rather than half-built.
 - **`capture` (default `true`, #85):** `false` means *never persist this tool's
   payloads* — the proxy skips both disk sinks that write raw content: the
   `--capture-dir` corpus tee and the `--debug-log` replay trace (whose records embed the
