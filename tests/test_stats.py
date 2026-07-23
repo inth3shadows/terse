@@ -262,3 +262,35 @@ def test_build_stats_writer_propagates_failures(tmp_path, monkeypatch):
     writer = build_stats_writer(tmp_path / "s.jsonl", "s")
     with pytest.raises(OSError, match="disk full"):
         writer("tool", RAW, RAW, False)
+
+
+def test_record_counts_an_untouched_structuredcontent_duplicate(tmp_path):
+    # #128: terse leaves `structuredContent` alone, so it costs full price on BOTH sides.
+    # Measured against a real client, a structuredContent-emitting tool showed a large
+    # text-block reduction and ZERO reduction in what the model received; a ledger that
+    # counted only the text block reported a saving that was never delivered.
+    emitted = '{"__terse_table__":1}'
+    dup = json.dumps({"rows": [{"id": i} for i in range(20)]}, separators=(",", ":"))
+    plain = build_record("s", "records", RAW, emitted, False)
+    withsc = build_record("s", "records", RAW, emitted, False, None, dup)
+    assert plain["structured_chars"] == 0
+    assert withsc["structured_chars"] == len(dup)
+    # the duplicate lands on both sides, so it can never look like a saving
+    assert withsc["raw_chars"] == plain["raw_chars"] + len(dup)
+    assert withsc["out_chars"] == plain["out_chars"] + len(dup)
+    # ...and it shrinks the reported saving toward the truth
+    assert (1 - withsc["out_chars"] / withsc["raw_chars"]) < \
+           (1 - plain["out_chars"] / plain["raw_chars"])
+    # the decision still names what terse DID to the text block
+    assert withsc["decision"] == plain["decision"] == "compressed"
+
+
+def test_structured_duplicate_is_counted_once_per_result_not_per_block(tmp_path):
+    # It is per-RESULT; attributing it to every block of a multi-block result would
+    # inflate the very number this exists to make honest.
+    log = tmp_path / "s.jsonl"
+    writer = build_stats_writer(log, "s")
+    writer("records", RAW, RAW, False, None, '{"a":1}')
+    writer("records", RAW, RAW, False, None, None)
+    recs = load_stats(log)
+    assert [r["structured_chars"] for r in recs] == [len('{"a":1}'), 0]

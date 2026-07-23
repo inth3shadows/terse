@@ -105,8 +105,10 @@ all peers, and the ledger attributes savings per peer.
   both the codec % and the `diff_reason` breakdown.
 - **The probe checks the artifacts, not just the replies.** §6's numbers come from the
   corpus and the ledger, so a run that answered every request but wrote neither is still a
-  failed measurement — the probe verifies both and exits non-zero. terse swallows
-  capture/stats sink errors unless it runs with `--debug`, so nothing else reports it.
+  failed measurement — the probe verifies both and exits non-zero. (Since #131 terse also
+  announces the first failure of each sink kind on stderr without `--debug`; the probe's
+  own artifact check predates that and stays, since it catches a sink that silently wrote
+  the *wrong* thing as well as one that wrote nothing.)
 - **Repeats are serialized**, not pipelined — servers dispatch concurrently and the proxy
   sets its diff base in arrival order, so batched repeats made the diff nondeterministic.
 - **Proxy stderr** is teed to `<stats_log>.stderr` and the tail is printed on failure; it

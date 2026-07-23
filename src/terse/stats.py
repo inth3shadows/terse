@@ -80,25 +80,52 @@ def classify_decision(raw: str, emitted: str, passthrough: bool) -> str:
 
 
 def build_record(server: str, tool: str, raw: str, emitted: str,
-                 passthrough: bool, diff_reason: str | None = None) -> dict[str, Any]:
+                 passthrough: bool, diff_reason: str | None = None,
+                 structured: str | None = None) -> dict[str, Any]:
     """One ledger line. Sizes and labels only — never payload content (the property
     that makes always-on safe). Token counts are None without tiktoken.
 
     `diff_reason` (Phase 1 instrumentation) records WHY the cross-call diff did or
     did not fire for this result — the datum that decides whether arg-keying the diff base
     is worth building. See proxy `_compress_or_diff` for the value set. None on older
-    records (the field post-dates them) and on writers that don't supply it."""
+    records (the field post-dates them) and on writers that don't supply it.
+
+    `structured` is the serialized `structuredContent` riding alongside this result, when
+    the server sent one (#128). terse does not touch that field, so it is counted at FULL
+    size on BOTH sides of the ledger: `raw_chars`/`out_chars` are the whole result's cost,
+    not the text block's alone. Without this the ledger reported a saving terse did not
+    deliver — measured against a real client, a `structuredContent`-emitting tool showed a
+    64% text-block reduction and 0% actual reduction in what the model received, because
+    the client reads the typed field and discards the block terse compressed
+    (`scripts/probe/structured_content/`). `structured_chars` keeps the split recoverable;
+    records predating the field simply had no duplicate, so treating a missing value as 0
+    is correct rather than merely convenient.
+
+    `decision` stays keyed on the TEXT BLOCK alone — it names what terse did, and terse
+    genuinely did compress it. The size fields say what that was worth."""
+    extra = structured or ""
     return {
         "ts": int(time.time()),
         "server": server,
         "tool": tool,
         "decision": classify_decision(raw, emitted, passthrough),
         "diff_reason": diff_reason,
-        "raw_chars": len(raw),
-        "out_chars": len(emitted),
-        "raw_tokens": count_cl100k(raw),
-        "out_tokens": count_cl100k(emitted),
+        "raw_chars": len(raw) + len(extra),
+        "out_chars": len(emitted) + len(extra),
+        "raw_tokens": _sum_tokens(count_cl100k(raw), count_cl100k(extra)),
+        "out_tokens": _sum_tokens(count_cl100k(emitted), count_cl100k(extra)),
+        "structured_chars": len(extra),
+        "structured_tokens": count_cl100k(extra) if extra else 0,
     }
+
+
+def _sum_tokens(a: int | None, b: int | None) -> int | None:
+    """None means "not tokenized" and must stay None — `aggregate` reports those rows
+    separately as `untokenized` rather than blending them into a total, so silently
+    coercing a None to 0 here would move an unknown into the known column."""
+    if a is None or b is None:
+        return None
+    return a + b
 
 
 def append_stats(record: dict[str, Any], log_path: str | Path,
@@ -291,8 +318,9 @@ def build_stats_writer(stats_log: str | Path, server: str):
     `proxy.Interceptor._warn_sink` — catching here too made its unconditional
     first-failure warning dead code, so a dead ledger stayed silent (#131)."""
     def stats(tool: str, raw: str, emitted: str, passthrough: bool,
-              diff_reason: str | None = None) -> None:
-        append_stats(build_record(server, tool, raw, emitted, passthrough, diff_reason),
+              diff_reason: str | None = None, structured: str | None = None) -> None:
+        append_stats(build_record(server, tool, raw, emitted, passthrough, diff_reason,
+                                  structured),
                      stats_log)
 
     return stats
