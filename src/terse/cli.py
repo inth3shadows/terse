@@ -305,8 +305,13 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
     from .policy_gen import generate_policy, merge_policy
 
     existing_path = Path(args.policy)
-    existing = _json.loads(existing_path.read_text(encoding="utf-8"))
-    load_policy(existing_path)  # refuse to diff against a policy we can't even load
+    try:
+        existing = _json.loads(existing_path.read_text(encoding="utf-8"))
+        load_policy(existing_path)   # refuse to DIFF against a policy we can't even load
+    except (OSError, ValueError) as exc:
+        # A refusal, per the line above — not a traceback. Same convention as `stats`.
+        print(f"policy autotune: cannot read {existing_path}: {exc}", file=sys.stderr)
+        return 2
 
     envelopes = load_corpus(args.corpus)
     if not envelopes:
@@ -314,11 +319,15 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
               f"(`terse capture` or `proxy --capture-dir`).", file=sys.stderr)
         return 1
 
-    generated, _rows = generate_policy(envelopes, threshold=args.threshold)
+    # A policy that opted out of the #116 join must not be tuned on cross-block folding
+    # it will never perform.
+    generated, _rows = generate_policy(envelopes, threshold=args.threshold,
+                                       join_blocks=bool(existing.get("join_blocks", True)))
     merged, changes = merge_policy(existing, generated)
 
     kinds = {k: [c for c in changes if c["kind"] == k]
-             for k in ("added", "tiers", "suggestions", "unchanged", "preserved")}
+             for k in ("added", "tiers", "suggestions", "unchanged", "preserved",
+                       "inherited")}
     print(f"# terse policy autotune — {len(envelopes)} payload(s), {existing_path}")
     for c in kinds["tiers"]:
         before = ",".join(c["before"]) or "(passthrough)"
@@ -326,6 +335,8 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
         print(f"  ~ {c['tool']:<28} {before}  ->  {after}")
     for c in kinds["added"]:
         print(f"  + {c['tool']:<28} {','.join(c['after']) or '(passthrough)'}  (new rule)")
+    for c in kinds["inherited"]:
+        print(f"  = {c['tool']:<28} inherited {','.join(c['keys'])} from {c['from']}")
     for c in kinds["suggestions"]:
         print(f"  ~ {c['tool']:<28} drop-to-retrieve suggestions changed (still INACTIVE)")
     # Say what was deliberately NOT regenerated. An operator who can't see this can't tell
@@ -348,7 +359,11 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
     # it holds each payload's first sighting rather than every call, and it holds nothing at
     # all for a tool gated by `capture: false`. Adding a tier on thin evidence costs a
     # little transform time; removing one silently gives back measured savings.
-    downgrades = [c for c in kinds["tiers"] if len(c["after"]) < len(c["before"])]
+    # Includes `added`: a NEW rule inserted ahead of a broader one takes that tool from the
+    # broader rule's tiers to its own, so a rule can lose tiers without any existing rule
+    # being re-decided. Comparing only same-rule changes misses it entirely.
+    downgrades = [c for c in kinds["tiers"] + kinds["added"]
+                  if len(c["after"]) < len(c.get("before") or [])]
     if downgrades:
         print(f"\n[warn] {len(downgrades)} rule(s) would LOSE a tier "
               f"({', '.join(c['tool'] for c in downgrades)}). The corpus is a sample; cross-"

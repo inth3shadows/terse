@@ -356,3 +356,55 @@ def test_a_roundtrip_failure_still_disqualifies_the_tool():
     row = _tool_decision("t", [_blocks(5), [marker]], 5.0)
     assert row["tiers"] == []
     assert "round-trip" in row["reason"]
+
+
+# --- #146 review findings ---
+
+def test_a_new_rule_inherits_the_operator_keys_of_the_rule_it_displaces():
+    # Without this the anti-shadowing insertion is a SAFETY HOLE: the new rule sits ahead
+    # of the operator's, so that tool would run with capture ON and structured "auto".
+    existing = {"version": 1, "policies": [
+        {"match": {"tool": "kb.*"}, "tiers": [], "capture": False, "structured": "leave"}]}
+    merged, changes = merge_policy(existing, _gen(("kb.read.search", ("minify", "tabularize"))))
+    new = merged["policies"][0]
+    assert new["match"]["tool"] == "kb.read.search"       # inserted ahead, as intended
+    assert new["capture"] is False                         # ...but not at the cost of these
+    assert new["structured"] == "leave"
+    assert any(c["kind"] == "inherited" and c["tool"] == "kb.read.search" for c in changes)
+
+
+def test_autotune_will_not_activate_a_lossy_selector_by_turning_tiers_on():
+    # `policy.apply` suppresses the text-drop path entirely under `tiers: []`, so the
+    # selector is inert today. Flipping tiers on would put a LOSSY transform live — which a
+    # merge documented as lossless and operator-preserving must never do.
+    existing = {"version": 1, "policies": [
+        {"match": {"tool": "docs.fetch"}, "tiers": [],
+         "fields": {"$text.code_blocks": {"lossy": "drop-to-retrieve"}}}]}
+    merged, _ = merge_policy(existing, _gen(("docs.fetch", ("minify", "tabularize"))))
+    rule = merged["policies"][0]
+    assert rule["tiers"] == []
+    assert "ACTIVATE the lossy" in rule["_comment"]
+    assert rule["fields"] == {"$text.code_blocks": {"lossy": "drop-to-retrieve"}}
+
+
+def test_join_blocks_false_is_honoured_when_scoring():
+    # apply_joined's first check is `if not policy.join_blocks`. Tuning a tool on
+    # cross-block folding it will never perform proposes savings the operator can't observe.
+    envs = [{"tool": "t", "captured_at": 1_000_000_000 + i,
+             "raw": json.dumps({"id": i, "status": "active", "city": "Berlin"})}
+            for i in range(20)]
+    _, on = generate_policy(envs, join_blocks=True)
+    _, off = generate_policy(envs, join_blocks=False)
+    # Asserting on the measured saving, not the tier list: a single small object still
+    # minifies past the threshold, so the tiers can agree while the NUMBER the operator is
+    # shown — and the dictionary decision that hangs off it — is scored on folding that
+    # will never happen.
+    assert on[0]["saved_pct"] > off[0]["saved_pct"] * 1.5
+
+
+def test_reason_ratios_count_results_not_blocks():
+    # `n` counts BLOCKS and a joined result is one row, so a blocks denominator would
+    # understate by the join factor and argue against the decision it justifies.
+    groups = [_blocks(20), ["Error executing tool t: boom"]]
+    row = _tool_decision("t", groups, 5.0)
+    assert "1/2 non-JSON" in row["reason"], row["reason"]
