@@ -99,6 +99,28 @@ class Rule:
     # client, including any that never identifies itself. That removes the premise the
     # #134 default rested on ("terse cannot detect which client it sits behind"), which
     # was simply wrong. Explicit "leave"/"compress" always override the resolution.
+    #
+    # `"replace"` goes one step further: compress the typed field AND drop the text block
+    # that mirrors it. Read the measurement before enabling it, because it is NOT a
+    # context saving for the client this was all measured against:
+    #
+    #   raw 2,596 chars in context -> "compress" 1,008 -> "replace" 1,008.
+    #
+    # No change. `claude` 2.1.218 had *already* discarded the block, so removing it takes
+    # 2,596 chars off the stdio pipe and nothing at all off the model's context. Its real
+    # beneficiary is a client that forwards BOTH fields — for which it roughly halves the
+    # result — and no such client has been measured. Two things it does deliver today: it
+    # ends the shape contradiction (under "compress" the block can be a cross-call DIFF
+    # while the typed field is a full envelope, so a both-forwarding client would receive
+    # two disagreeing renderings), and it makes the wire match what the model receives.
+    #
+    # It is NOT what "auto" resolves to, and deliberately so. Every mode up to "compress"
+    # is invisible to a client that ignores `structuredContent` — the block is still there,
+    # still complete. "replace" is the first mode that removes information from the wire,
+    # so a client that changes its mind about which field it reads gets an empty result
+    # rather than a suboptimal one. That is a loud failure, and recoverable with a one-line
+    # `"structured": "leave"`, but it is not a failure worth defaulting anyone into — least
+    # of all for a measured benefit of zero.
     structured: str = "auto"
 
     def lossy_fields(self) -> list[str]:
@@ -223,7 +245,12 @@ def _coerce_capture(raw: Any, where: str) -> bool:
     return raw
 
 
-VALID_STRUCTURED = ("auto", "leave", "compress")
+VALID_STRUCTURED = ("auto", "leave", "compress", "replace")
+
+# The modes under which `structuredContent` is run through the codec. `replace` does that
+# AND drops the text mirror; ordering the literals by invasiveness (leave < compress <
+# replace) keeps "is the typed field being rewritten" a single membership test.
+STRUCTURED_REWRITING = frozenset({"compress", "replace"})
 
 # Clients measured NOT to validate `structuredContent` against a tool's `outputSchema`,
 # and therefore safe to hand a terse envelope in that field under `"structured": "auto"`.
