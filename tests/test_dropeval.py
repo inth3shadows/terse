@@ -11,10 +11,12 @@ mirroring fluency.py's own precedent.
 from __future__ import annotations
 
 import json
+import re
+import urllib.request
 
 from terse import dropeval, lossy
 from terse.policy import Policy, Rule
-from terse.proxy import Interceptor
+from terse.proxy import RETRIEVE_TOOL_DEF, Interceptor
 from terse.report import build_dropeval_report
 
 TOOL = "demo.get"
@@ -270,11 +272,6 @@ def test_run_drop_fluency_computes_questions_once_per_envelope_not_per_model(mon
 # is a legal MCP tool name and an ILLEGAL OpenAI function name, so every drop-eval run
 # against a real endpoint 400'd and scored a confident 0% retrieve-recall.
 # --------------------------------------------------------------------------- #
-import re
-import urllib.request
-
-from terse.proxy import RETRIEVE_TOOL_DEF
-
 _OPENAI_FN_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
