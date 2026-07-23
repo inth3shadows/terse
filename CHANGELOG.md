@@ -10,6 +10,22 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Added
+- **`terse policy autotune` — re-tune an EXISTING policy instead of overwriting it (#136).**
+  `policy generate` authors from nothing and is *total*: run it on a deployed policy and it
+  silently drops every decision the corpus cannot see. It already warned about that for
+  `capture: false`; the same was true of `never_lossy_servers`, any `structured` override,
+  hand-written active `fields`, any rule for a tool the corpus never saw, and rule ORDER
+  (first match wins). `autotune` merges instead, split by what a corpus can possibly know:
+  **the corpus decides `tiers`** (including removing one — the motivating case is a stale
+  tier decision that predates a codec change), **the operator owns everything else**. It
+  prints a per-rule diff, names what it deliberately did not regenerate, and writes
+  **nothing** without `--apply`. New rules are inserted before any existing glob that would
+  shadow them, since a `kb.read.search` rule appended after `kb.*` is dead on arrival.
+  Warns before applying a tier *downgrade*: the generator scores payloads individually,
+  while the proxy compresses a multi-block result as one joined array (#116), so a
+  one-record-per-block server scores far lower in the generator than it does in production.
+
+### Added
 - **`"structured": "compress"` — compress `structuredContent` too (#128).** New per-rule
   policy knob. MCP 2025-06-18 lets a tool return a typed `structuredContent` field beside
   a text block that mirrors it; terse compressed only the block. Measured against `claude`

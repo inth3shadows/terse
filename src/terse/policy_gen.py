@@ -36,6 +36,7 @@ transform. The CLI surfaces that pointer; it is not a hard gate here.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 from typing import Any
@@ -108,6 +109,110 @@ def activate_suggestions(doc: dict) -> dict:
         if sug:
             entry["fields"] = {**entry.get("fields", {}), **sug}
     return out
+
+
+# Rule keys the CORPUS is allowed to decide. Everything else on an existing rule is the
+# operator's and survives a merge verbatim — see `merge_policy`.
+CORPUS_OWNED_KEYS = ("tiers", "_comment", "_suggested_fields", "_suggested_fields_note")
+
+
+def merge_policy(existing: dict, generated: dict) -> tuple[dict, list[dict[str, Any]]]:
+    """Merge a freshly `generate_policy`'d doc INTO an existing policy (#136). Returns
+    `(merged_doc, changes)`; pure, like everything else here.
+
+    `generate_policy` is *total* — it authors a whole fresh doc from the corpus and knows
+    nothing about what is already deployed. Writing that over a live policy silently drops
+    every decision the corpus cannot see, which `_cmd_policy_generate` already warns about
+    for `capture: false` alone. The same is true of `never_lossy_servers`, a `structured`
+    override, hand-written active `fields`, any rule for a tool this corpus never saw, and
+    rule ORDER (first match wins).
+
+    So the merge is split by what a corpus can possibly know:
+
+      * The corpus decides `tiers` — INCLUDING removing one. That is the whole point: a
+        tier decision goes stale the moment a codec change lands (the motivating case is a
+        `dictionary` rule disabled by a measurement predating the multi-block join, #116),
+        and an additive-only merge could never correct it. Removals are proposed, surfaced
+        in `changes`, and — by contract with the CLI — never written without an explicit
+        `--apply`.
+      * The corpus decides its own `_suggested_fields` block, which stays INACTIVE either
+        way (the loader reads `fields`, not `_suggested_fields`).
+      * The operator owns EVERYTHING else. `capture`, `structured` and `never_lossy_servers`
+        are safety decisions a corpus is structurally incapable of making — a payload
+        cannot show that a tool returns a plaintext credential, or that a client validates
+        `outputSchema`. terse treats all three as fail-safe elsewhere (#85, #135); a
+        regeneration path that quietly reverses them would be the one hole in that.
+
+    Ordering is preserved because it is load-bearing: rules are first-match-wins, so a
+    reordered policy is a different policy. Existing rules keep their positions; a rule for
+    a tool the corpus didn't see is untouched; new rules are inserted BEFORE the first
+    catch-all (`*`) rule, since appending after one would make them dead.
+
+    A duplicate tool glob in the existing doc is merged into the FIRST occurrence only —
+    the later ones are already unreachable, and rewriting them would imply otherwise."""
+    import copy
+
+    gen_by_tool: dict[str, dict] = {}
+    for entry in generated.get("policies", []):
+        tool = (entry.get("match") or {}).get("tool", "*")
+        gen_by_tool.setdefault(tool, entry)
+
+    merged: list[dict] = []
+    changes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for old in existing.get("policies", []):
+        tool = (old.get("match") or {}).get("tool", "*")
+        gen = gen_by_tool.get(tool)
+        if gen is None or tool in seen:
+            merged.append(copy.deepcopy(old))
+            changes.append({"tool": tool, "kind": "preserved",
+                            "why": "unreachable duplicate" if tool in seen
+                                   else "not in corpus"})
+            seen.add(tool)
+            continue
+        seen.add(tool)
+        new = copy.deepcopy(old)
+        for key in CORPUS_OWNED_KEYS:
+            new.pop(key, None)
+            if key in gen:
+                new[key] = copy.deepcopy(gen[key])
+        kept = sorted(k for k in old if k not in CORPUS_OWNED_KEYS and k != "match")
+        before, after = old.get("tiers", []), new.get("tiers", [])
+        if list(before) != list(after):
+            changes.append({"tool": tool, "kind": "tiers", "before": list(before),
+                            "after": list(after), "preserved": kept})
+        elif old.get("_suggested_fields") != new.get("_suggested_fields"):
+            changes.append({"tool": tool, "kind": "suggestions", "preserved": kept})
+        else:
+            changes.append({"tool": tool, "kind": "unchanged", "preserved": kept})
+        merged.append(new)
+
+    # Each new rule goes BEFORE the first existing rule that would already match its tool.
+    # Appending is wrong and silently so: rules are first-match-wins, so a fresh
+    # `kb.read.search` rule placed after an existing `kb.*` is dead on arrival — the policy
+    # would look re-tuned and change nothing. The guard is any matching glob, not just a
+    # literal `*`: `kb.*` is a catch-all for every kb tool.
+    added = [(t, copy.deepcopy(e)) for t, e in gen_by_tool.items() if t not in seen]
+
+    def _insert_at(tool: str) -> int:
+        for i, e in enumerate(merged):
+            if fnmatch.fnmatchcase(tool, (e.get("match") or {}).get("tool", "*")):
+                return i
+        return len(merged)
+
+    # Group by insertion point and splice from the back, so earlier indices stay valid and
+    # the generator's own order (highest savings first) survives within each group.
+    buckets: dict[int, list[dict]] = {}
+    for tool, entry in added:
+        buckets.setdefault(_insert_at(tool), []).append(entry)
+        changes.append({"tool": tool, "kind": "added", "after": list(entry.get("tiers", []))})
+    for at in sorted(buckets, reverse=True):
+        merged[at:at] = buckets[at]
+
+    out = copy.deepcopy(existing)
+    out["policies"] = merged
+    return out, changes
 
 
 def _drop_candidates(

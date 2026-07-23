@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 
 from terse.policy import load_policy
-from terse.policy_gen import generate_policy
+from terse.policy_gen import generate_policy, merge_policy
 
 
 def _env(tool: str, obj_or_text):
@@ -198,3 +198,82 @@ def test_activate_suggestions_promotes_inactive_to_fields():
     assert "_suggested_fields" not in p0 and "_suggested_fields_note" not in p0
     assert "fields" not in out["policies"][1]                                  # untouched
     assert "_suggested_fields" in doc["policies"][0]                           # original intact (deep copy)
+
+
+# --- #136: merge_policy — re-tuning an EXISTING policy without destroying it ---
+
+def _gen(*rules):
+    return {"version": 1, "policies": [{"match": {"tool": t}, "tiers": list(ti),
+                                        "_comment": "generated"} for t, ti in rules]}
+
+
+def test_merge_preserves_every_key_the_corpus_cannot_decide():
+    # capture / structured / active fields are safety decisions a payload cannot inform.
+    # A regeneration path that reverses them would be the one hole in terse's fail-safe
+    # posture (#85, #135).
+    existing = {"version": 1, "never_lossy_servers": ["secret-broker"],
+                "policies": [{"match": {"tool": "kb.*"}, "tiers": ["minify"],
+                              "capture": False, "structured": "leave",
+                              "fields": {"result[].id": {"critical": True}}}]}
+    merged, changes = merge_policy(existing, _gen(("kb.*", ("minify", "tabularize"))))
+    rule = merged["policies"][0]
+    assert rule["capture"] is False
+    assert rule["structured"] == "leave"
+    assert rule["fields"] == {"result[].id": {"critical": True}}
+    assert merged["never_lossy_servers"] == ["secret-broker"]
+    assert rule["tiers"] == ["minify", "tabularize"]          # the corpus DID decide this
+    assert changes[0]["kind"] == "tiers"
+
+
+def test_merge_proposes_tier_removal():
+    # The motivating case: a tier decision that went stale. Additive-only could never fix it.
+    existing = {"version": 1, "policies": [
+        {"match": {"tool": "kb.*"}, "tiers": ["minify", "tabularize", "dictionary"]}]}
+    merged, changes = merge_policy(existing, _gen(("kb.*", ("minify", "tabularize"))))
+    assert merged["policies"][0]["tiers"] == ["minify", "tabularize"]
+    assert changes[0] == {"tool": "kb.*", "kind": "tiers",
+                          "before": ["minify", "tabularize", "dictionary"],
+                          "after": ["minify", "tabularize"], "preserved": []}
+
+
+def test_merge_keeps_rules_absent_from_the_corpus_in_position():
+    existing = {"version": 1, "policies": [
+        {"match": {"tool": "gh.*"}, "tiers": ["minify"]},
+        {"match": {"tool": "runecho.*"}, "tiers": []}]}
+    merged, changes = merge_policy(existing, _gen(("runecho.*", ("minify", "tabularize"))))
+    assert [p["match"]["tool"] for p in merged["policies"]] == ["gh.*", "runecho.*"]
+    assert merged["policies"][0]["tiers"] == ["minify"]        # untouched
+    assert {c["tool"]: c["kind"] for c in changes}["gh.*"] == "preserved"
+
+
+def test_merge_inserts_a_new_rule_before_any_glob_that_would_shadow_it():
+    # first-match-wins: appending `kb.read.search` after `kb.*` makes it DEAD, and the
+    # policy would look re-tuned while changing nothing.
+    existing = {"version": 1, "policies": [{"match": {"tool": "kb.*"}, "tiers": ["minify"]}]}
+    merged, _ = merge_policy(existing, _gen(("kb.read.search", ("minify", "tabularize"))))
+    order = [p["match"]["tool"] for p in merged["policies"]]
+    assert order.index("kb.read.search") < order.index("kb.*")
+
+
+def test_merge_appends_when_nothing_shadows_the_new_rule():
+    existing = {"version": 1, "policies": [{"match": {"tool": "gh.*"}, "tiers": ["minify"]}]}
+    merged, _ = merge_policy(existing, _gen(("runecho.structure", ("minify",))))
+    assert [p["match"]["tool"] for p in merged["policies"]] == ["gh.*", "runecho.structure"]
+
+
+def test_merge_leaves_an_unreachable_duplicate_alone():
+    existing = {"version": 1, "policies": [
+        {"match": {"tool": "kb.*"}, "tiers": ["minify"]},
+        {"match": {"tool": "kb.*"}, "tiers": []}]}
+    merged, changes = merge_policy(existing, _gen(("kb.*", ("minify", "tabularize"))))
+    assert merged["policies"][0]["tiers"] == ["minify", "tabularize"]
+    assert merged["policies"][1]["tiers"] == []               # already unreachable
+    assert changes[1]["why"] == "unreachable duplicate"
+
+
+def test_merge_does_not_mutate_its_inputs():
+    existing = {"version": 1, "policies": [{"match": {"tool": "kb.*"}, "tiers": ["minify"],
+                                            "capture": False}]}
+    snapshot = json.dumps(existing, sort_keys=True)
+    merge_policy(existing, _gen(("kb.*", ("minify", "tabularize"))))
+    assert json.dumps(existing, sort_keys=True) == snapshot
