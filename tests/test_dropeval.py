@@ -275,6 +275,12 @@ def test_run_drop_fluency_computes_questions_once_per_envelope_not_per_model(mon
 _OPENAI_FN_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
+def dropeval_text_rule():
+    from terse.lossy import TEXT_SELECTOR_CODE_BLOCKS
+    return Rule("codegraph_explore", ("minify",),
+                fields={TEXT_SELECTOR_CODE_BLOCKS: {"lossy": "drop-to-retrieve"}})
+
+
 def test_openai_tool_name_matches_openai_alphabet():
     # The MCP name is dotted; the wire name must not be, or the request is rejected
     # outright (400) before the model ever sees the question.
@@ -359,3 +365,36 @@ def test_the_terminal_chart_refuses_the_same_run_the_markdown_does():
     results = {"model-a": rows}
     assert "INCONCLUSIVE" in build_dropeval_report(results)
     assert "INCONCLUSIVE" in build_terminal_dropeval_report(results, color=False)
+
+
+def test_sole_number_scoring_rejects_a_block_echo():
+    """The numbered recall answer is scored `sole_number`, not `count`. The retrieved block
+    is injected into the conversation carrying every one of its line numbers, so a reply
+    that echoes the block contains the target number — `count`'s present-anywhere rule would
+    pass it without the model having located the right line."""
+    from terse.fluency.scoring import score
+    assert score("sole_number", 61, "61")
+    assert score("sole_number", 61, '"61"')
+    assert score("sole_number", 61, "The line number is 61.")
+    # A block echo: many line numbers, including the right one -> must NOT pass.
+    assert not score("sole_number", 61, "40\tfoo 41\tbar 61\tbaz 79\tqux")
+    # `count` DOES pass that echo — the reason we switched.
+    assert score("count", 61, "40\tfoo 41\tbar 61\tbaz 79\tqux")
+
+
+def test_the_recall_question_uses_sole_number_not_count():
+    numbered = "\n".join(f"{i}\tcode call{i}(ctx, payload) // widening the covered region"
+                         for i in range(40, 90))
+    doc = f"## E\n\n### Source Code\n\n```go\n{numbered}\n```\n\nProse.\n"
+    recall, _ = dropeval.gen_text_drop_questions(doc, dropeval_text_rule(), "codegraph_explore")
+    assert recall.qtype == "sole_number"
+
+
+def test_oai_name_collision_fails_loud_not_silent():
+    """A future multi-tool eval whose names sanitize to one wire name must not silently
+    map returned calls to the wrong tool — the very failure class this module fixes."""
+    import pytest
+    colliding = [dict(RETRIEVE_TOOL_DEF),
+                 {**RETRIEVE_TOOL_DEF, "name": "terse_retrieve"}]  # sanitizes identically
+    with pytest.raises(ValueError, match="collide"):
+        dropeval.openai_tool_answerer("http://x/v1", "k", "m", tools=colliding)

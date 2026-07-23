@@ -358,7 +358,7 @@ def test_line_numbered_block_is_asked_for_the_number_not_the_text():
     anchor = _anchor_of(recall.prompt, span_lines)
     following = span_lines[span_lines.index(anchor) + 1]
     assert recall.expected == int(following.split("\t")[0])
-    assert recall.qtype == "count"       # graded like the precision question, not as text
+    assert recall.qtype == "sole_number"  # a lone integer; a block echo must not pass
     # A line blank apart from its gutter still has a number, so there is no degenerate
     # target to filter out.
     assert isinstance(recall.expected, int)

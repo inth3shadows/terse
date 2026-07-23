@@ -156,7 +156,11 @@ def _line_recall_question(handle: str, anchor: str, target: str) -> DropQuestion
             expected=int(m.group(1)),
             needs_retrieve=True,
             expected_handle=handle,
-            qtype="count",
+            # NOT `count`: the retrieved block is injected into the conversation and carries
+            # every one of its line numbers, so `_matches_number`'s present-anywhere rule
+            # would pass a reply that merely echoes the block. `sole_number` requires the
+            # answer to stand alone, which a block echo cannot satisfy.
+            qtype="sole_number",
         )
     return DropQuestion(
         qid="drop-text-recall",
@@ -584,6 +588,13 @@ def openai_tool_answerer(base_url: str, api_key: str, model: str, tools: list[di
     # Reverse of the `_oai_name` rewrite, so a returned tool_call is scored against the MCP
     # name the questions and `_run_question` are written in terms of.
     mcp_name = {_oai_name(t["name"]): t["name"] for t in tools}
+    # A silent last-wins collapse here would reintroduce the exact bug this module fixes:
+    # two MCP names that sanitize to one wire name would map a returned call back to the
+    # wrong one, and `_run_question`'s `c.name == RETRIEVE_TOOL` filter would score a real
+    # retrieval as "didn't retrieve". Single-tool today, but fail loud if that ever changes.
+    if len(mcp_name) != len(tools):
+        raise ValueError(f"tool names collide after OpenAI-name sanitization: "
+                         f"{sorted(t['name'] for t in tools)}")
 
     def ask(messages: list[dict]) -> Turn:
         body = json.dumps({

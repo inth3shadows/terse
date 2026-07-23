@@ -49,6 +49,18 @@ def _matches_number(reply: str, expected: Any) -> bool:
     return any(abs(float(tok) - float(expected)) < 1e-9 for tok in _NUM.findall(reply))
 
 
+def _is_sole_number(reply: str, expected: Any) -> bool:
+    """True iff the reply IS the expected number and essentially nothing else — the strict
+    counterpart to `_matches_number`'s present-anywhere rule. Needed where the correct value
+    also appears in the surrounding context the model was shown, so 'contains it' proves
+    nothing: the drop-eval's numbered recall injects the retrieved code block (every one of
+    its line numbers) into the conversation, and a reply that merely echoes that block would
+    contain the target line number without demonstrating the model located the right line.
+    Requires a lone number after stripping quotes, whitespace and one trailing period."""
+    toks = _NUM.findall(reply.strip().strip("\"'").strip())
+    return len(toks) == 1 and abs(float(toks[0]) - float(expected)) < 1e-9
+
+
 def _extract_json(reply: str) -> Any:
     """Pull the first JSON object/array out of a reply (tolerating surrounding prose).
     Returns a sentinel-free value or raises ValueError if none parses."""
@@ -68,6 +80,8 @@ def score(qtype: str, expected: Any, reply: str) -> bool:
     empty-reply reject — an empty reply only matches an empty expected scalar, which
     each branch already decides correctly."""
     reply = reply.strip()
+    if qtype == "sole_number":
+        return _is_sole_number(reply, expected)
     if qtype == "count" or (qtype == "aggregate" and _is_number(expected)):
         return _matches_number(reply, expected)
     if qtype == "enumerate":
