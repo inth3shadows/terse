@@ -8,9 +8,12 @@ turns that measurement into a policy directly.
 The tier decision is deliberately CONSERVATIVE and 100% lossless (it only ever enables the
 round-trip-gated Tier-0/0.5 tiers, never a lossy mode):
 
-  For each tool, aggregate its payloads' per-tier cl100k savings, then:
-    1. any non-JSON payload OR any round-trip failure  -> passthrough  (never compress
-       a tool we can't losslessly handle)
+  For each tool, score its RESULTS the way the proxy compresses them — a multi-block
+  result as one joined record array (#116/#147), not block by block — then:
+    1. any round-trip failure                          -> passthrough  (never compress
+       a tool we can't losslessly handle). A non-JSON payload does NOT disqualify the
+       tool: the runtime passes it through untouched, and its raw tokens stay in the
+       denominator, so a mostly-text tool falls below the threshold on its own.
     2. total savings %  < threshold                    -> passthrough  (transform cost
        not worth a marginal gain)
     3. otherwise  ["minify","tabularize"] (+ "dictionary" iff its MARGINAL saving clears
@@ -43,7 +46,7 @@ from typing import Any
 
 from . import probes
 from .capture import find_record_list_with_path
-from .measure import measure_payload
+from .measure import measure_joined, measure_payload
 
 # Tiers are cumulative in the codec (minify ⊂ tabularize ⊂ dictionary). minify is implied
 # by re-serialization, so it never ships alone — tabularize always carries it.
@@ -288,11 +291,66 @@ def _pct(saved: int, raw: int) -> float:
     return (saved / raw * 100.0) if raw else 0.0
 
 
-def _tool_decision(tool: str, raws: list[str], threshold: float) -> dict[str, Any]:
-    """Aggregate one tool's payloads and decide its tiers. Returns a summary row with
-    the chosen `tiers`, the measured savings, and a human-readable `reason`."""
-    rows = [measure_payload(r) for r in raws]
-    n = len(rows)
+# Two captured blocks of ONE result are teed back-to-back — a file write apart — so
+# consecutive envelopes closer than this belong to the same tool call (#147). Compared
+# CONSECUTIVELY, not first-to-last, so a 200-block result groups correctly however long it
+# takes overall. Over-grouping is possible in one case — genuinely parallel calls to the
+# same tool interleave in time and no window separates them — and is mild: it scores that
+# tool as if one larger result arrived, which is still representative of its shape. The
+# exact fix would be a result id written into the capture envelope; it is not worth a
+# format change until over-grouping is shown to move a decision.
+_RESULT_WINDOW_NS = 50_000_000  # 50 ms
+
+
+def group_results(envelopes: list[dict[str, Any]]) -> dict[str, list[list[str]]]:
+    """Reconstruct `tool -> [[block, ...], ...]` from a flat corpus, so a tool's payloads
+    can be scored as the RESULTS they arrived as (#147). Envelopes without a `captured_at`
+    (predating the field) each become their own single-block group — the pre-#147 behavior,
+    which is the safe direction: it under-measures rather than inventing a join.
+
+    Note the corpus is idempotent by sha and preserves a payload's FIRST `captured_at`, so
+    this reconstructs first-sightings, not every call. That is the same sample the tier
+    decision was always made from; it just stops pretending each block arrived alone."""
+    out: dict[str, list[list[str]]] = {}
+    by_tool: dict[str, list[dict[str, Any]]] = {}
+    for env in envelopes:
+        by_tool.setdefault(env.get("tool", "?"), []).append(env)
+    for tool, envs in by_tool.items():
+        timed = sorted((e for e in envs if isinstance(e.get("captured_at"), int)),
+                       key=lambda e: e["captured_at"])
+        groups: list[list[str]] = [[e["raw"]] for e in envs
+                                   if not isinstance(e.get("captured_at"), int)]
+        prev_ts: int | None = None
+        for env in timed:
+            if prev_ts is not None and env["captured_at"] - prev_ts < _RESULT_WINDOW_NS:
+                groups[-1].append(env["raw"])
+            else:
+                groups.append([env["raw"]])
+            prev_ts = env["captured_at"]
+        out[tool] = groups
+    return out
+
+
+def _tool_decision(tool: str, groups: list[list[str]], threshold: float) -> dict[str, Any]:
+    """Aggregate one tool's RESULTS and decide its tiers. Returns a summary row with
+    the chosen `tiers`, the measured savings, and a human-readable `reason`.
+
+    Each result is scored the way the proxy would compress it: a multi-block result as one
+    joined array, falling back to per-block exactly where `apply_joined` would refuse
+    (#147). Scoring blocks individually — which this did until then — under-measures every
+    server that returns one record per content block, and produced `passthrough` for tools
+    that measurably compress in production."""
+    raws = [r for g in groups for r in g]
+    rows = []
+    joined_results = 0
+    for group in groups:
+        joined = measure_joined(group)
+        if joined is not None:
+            rows.append(joined)
+            joined_results += 1
+        else:
+            rows.extend(measure_payload(r) for r in group)
+    n = len(raws)
 
     # A single non-JSON payload or round-trip failure disqualifies the whole tool: the
     # policy matches on tool name, so we can't enable a tier for "most" of its results.
@@ -314,30 +372,43 @@ def _tool_decision(tool: str, raws: list[str], threshold: float) -> dict[str, An
     drop_suggestion, drop_rows = _drop_candidates(raws)
 
     base = {
-        "tool": tool, "n": n, "raw_tok": raw_tok,
+        "tool": tool, "n": n, "n_results": len(groups), "joined_results": joined_results,
+        "raw_tok": raw_tok,
         "saved_pct": round(total_pct, 1), "dict_pct": round(dict_pct, 1),
         "minify": minify, "tabularize": tabularize, "dictionary": dictionary,
         "drop_suggestion": drop_suggestion, "drop_rows": drop_rows,
     }
 
-    if non_json or gate_fail:
-        why = []
-        if non_json:
-            why.append(f"{non_json}/{n} non-JSON")
-        if gate_fail:
-            why.append(f"{gate_fail}/{n} failed round-trip")
-        return {**base, "tiers": [], "reason": f"passthrough — {', '.join(why)}"}
+    # A round-trip FAILURE still disqualifies the whole tool: it says the codec cannot
+    # losslessly handle this tool's shape, and the policy matches on tool name, so there is
+    # no way to enable a tier for only the payloads that survive.
+    if gate_fail:
+        return {**base, "tiers": [],
+                "reason": f"passthrough — {gate_fail}/{n} failed round-trip"}
+
+    # A non-JSON payload does NOT (#147). It used to, and that quietly zeroed the
+    # highest-volume tool in a real fleet: `kb.read.search` measured 16.7% saved and was
+    # marked passthrough because 4 of its 436 captured payloads were the server's
+    # `Error executing tool …` text. The premise was wrong — `policy.apply` passes a
+    # non-JSON payload through untouched at runtime, so enabling a tier for a tool that
+    # occasionally returns prose costs exactly nothing on those results. Meanwhile a tool
+    # that is MOSTLY text is still suppressed, and for the right reason: non-JSON payloads
+    # contribute 0 saved while their raw tokens stay in the denominator, so the percentage
+    # falls below the threshold on its own (`codegraph_explore`, 61/61 non-JSON, scores
+    # 0.0%). The measurement handles it; the disqualifier only ever discarded real savings.
+    mixed = f" ({non_json}/{n} non-JSON, passed through)" if non_json else ""
 
     if total_pct < threshold:
         return {**base, "tiers": [],
-                "reason": f"passthrough — {total_pct:.1f}% < {threshold:.1f}% threshold"}
+                "reason": f"passthrough — {total_pct:.1f}% < {threshold:.1f}% threshold{mixed}"}
 
     tiers = list(_BASE_TIERS)
     if dict_pct >= threshold:
         tiers.append("dictionary")
-        reason = f"{total_pct:.1f}% saved (dictionary +{dict_pct:.1f}%)"
+        reason = f"{total_pct:.1f}% saved (dictionary +{dict_pct:.1f}%){mixed}"
     else:
-        reason = f"{total_pct:.1f}% saved (dictionary +{dict_pct:.1f}% below threshold — dropped)"
+        reason = (f"{total_pct:.1f}% saved (dictionary +{dict_pct:.1f}% below threshold "
+                  f"— dropped){mixed}")
     return {**base, "tiers": tiers, "reason": reason}
 
 
@@ -351,18 +422,17 @@ def generate_policy(
     minify+tabularize. Returns `(policy_doc, rows)` — `policy_doc` is loadable by
     `policy.load_policy`; `rows` is one decision summary per tool (sorted by savings desc)
     for a report. Tools are emitted in the same order so the JSON is deterministic."""
-    by_tool: dict[str, list[str]] = {}
-    for env in envelopes:
-        by_tool.setdefault(env.get("tool", "?"), []).append(env["raw"])
-
-    rows = [_tool_decision(tool, raws, threshold) for tool, raws in by_tool.items()]
+    rows = [_tool_decision(tool, groups, threshold)
+            for tool, groups in group_results(envelopes).items()]
     # Highest-savings tools first: makes the policy and the report read top-down by value,
     # and keeps output stable regardless of corpus file ordering.
     rows.sort(key=lambda r: (-r["saved_pct"], r["tool"]))
 
     policies = []
     for r in rows:
-        comment = f"{r['n']} payload(s), {r['reason']}"
+        comment = (f"{r['n']} payload(s) in {r['n_results']} result(s)"
+                   + (f", {r['joined_results']} scored joined" if r.get("joined_results") else "")
+                   + f", {r['reason']}")
         entry: dict[str, Any] = {"_comment": comment, "match": {"tool": r["tool"]},
                                  "tiers": r["tiers"]}
         # Drop-to-retrieve suggestions ride along INACTIVE: the loader reads `fields`, not

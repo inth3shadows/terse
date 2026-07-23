@@ -9,6 +9,24 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Fixed
+- **`policy generate` scored payloads per-BLOCK, so every multi-block tool was
+  under-measured (#147).** The proxy compresses a multi-block result as one joined record
+  array (#116); the generator scored each captured block alone. For a server that returns
+  one record per content block — common — those are wildly different numbers: measured on
+  real kb traffic, `changelog` is 23.3% per-block and **48.4% joined**. Payloads are now
+  grouped back into results (by capture-time proximity) and each result is scored the way
+  the proxy would, falling back to per-block exactly where `apply_joined` would refuse.
+- **One non-JSON payload no longer disqualifies a whole tool (#147).** A single
+  `Error executing tool …` text block among a tool's records forced `passthrough` for all
+  of it. The premise was wrong — `policy.apply` passes a non-JSON payload through untouched
+  at runtime, so the tier costs nothing on those results. On a real corpus this alone was
+  zeroing the highest-volume tool in the fleet: `kb.read.search` measured **16.7% saved**
+  and was written as passthrough because 4 of its 436 payloads were error text. A
+  mostly-text tool is still suppressed, now for the right reason — non-JSON contributes 0
+  saved while its raw tokens stay in the denominator, so it falls below the threshold on
+  its own (`codegraph_explore`, 61/61 non-JSON, scores 0.0%).
+
 ### Added
 - **`terse policy autotune` — re-tune an EXISTING policy instead of overwriting it (#136).**
   `policy generate` authors from nothing and is *total*: run it on a deployed policy and it

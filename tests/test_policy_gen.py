@@ -3,8 +3,14 @@ from __future__ import annotations
 
 import json
 
+from terse.measure import measure_joined, measure_payload
 from terse.policy import load_policy
-from terse.policy_gen import generate_policy, merge_policy
+from terse.policy_gen import (
+    _tool_decision,
+    generate_policy,
+    group_results,
+    merge_policy,
+)
 
 
 def _env(tool: str, obj_or_text):
@@ -98,13 +104,18 @@ def test_no_suggestion_when_no_field_qualifies():
     assert "_suggested_fields" not in rule                        # small, foldable fields only
 
 
-def test_non_json_payload_disqualifies_the_tool():
-    # even one non-JSON result among a tool's payloads forces passthrough — the policy
-    # matches by tool name, so we can't compress only "most" of its results.
+def test_non_json_payload_no_longer_disqualifies_the_tool():
+    # REVERSED in #147, deliberately. This used to assert passthrough on the grounds that
+    # the policy matches by tool name so we can't compress only "most" of its results. The
+    # premise was wrong: `policy.apply` passes a non-JSON payload through untouched at
+    # runtime, so the tier costs nothing on those results — and the old rule silently
+    # zeroed real savings whenever a server returned an error string among its records
+    # (measured: 4 of 436 `kb.read.search` payloads).
     doc, _ = generate_policy([_env("logs.tail", _records()),
                               _env("logs.tail", "2026-06-30 12:00:00 INFO started\n...")])
     rule = next(p for p in doc["policies"] if p["match"]["tool"] == "logs.tail")
-    assert rule["tiers"] == []
+    assert rule["tiers"]
+    assert "non-JSON, passed through" in rule["_comment"]
 
 
 def test_dictionary_dropped_when_marginal_below_threshold():
@@ -277,3 +288,71 @@ def test_merge_does_not_mutate_its_inputs():
     snapshot = json.dumps(existing, sort_keys=True)
     merge_policy(existing, _gen(("kb.*", ("minify", "tabularize"))))
     assert json.dumps(existing, sort_keys=True) == snapshot
+
+
+# --- #147: score RESULTS the way the proxy compresses them, not block by block ---
+
+def _blocks(n):
+    return [json.dumps({"id": i, "status": "active", "city": "Berlin",
+                        "url": "https://example/api/items"}) for i in range(n)]
+
+
+def test_measure_joined_beats_per_block_on_one_record_per_block():
+    # The whole reason #147 exists: a server returning one record per content block has
+    # nothing to fold within a block, and everything to fold across them.
+    raws = _blocks(20)
+    per_block = sum(measure_payload(r)["saved_cl100k"]["tier_total"] for r in raws)
+    joined = measure_joined(raws)
+    assert joined["saved_cl100k"]["tier_total"] > per_block
+    assert joined["roundtrip_ok"] and joined["blocks"] == 20
+
+
+def test_measure_joined_refuses_exactly_where_apply_joined_would():
+    assert measure_joined(_blocks(1)) is None                      # nothing to join
+    assert measure_joined([*_blocks(2), "Error executing tool"]) is None   # non-JSON block
+    assert measure_joined([*_blocks(2), json.dumps([1, 2])]) is None       # not a record
+    assert measure_joined([*_blocks(2),
+                           json.dumps({"__terse_table__": 1})]) is None    # reserved marker
+
+
+def test_group_results_splits_on_a_gap_and_keeps_a_burst_together():
+    def env(ts, i):
+        return {"tool": "t", "raw": json.dumps({"id": i}), "captured_at": ts}
+    # three blocks a millisecond apart, then a gap, then two more
+    envs = [env(1_000_000_000, 0), env(1_001_000_000, 1), env(1_002_000_000, 2),
+            env(9_000_000_000, 3), env(9_001_000_000, 4)]
+    groups = group_results(envs)["t"]
+    assert [len(g) for g in groups] == [3, 2]
+
+
+def test_group_results_treats_an_untimed_envelope_as_its_own_result():
+    # Envelopes predating `captured_at` must not be silently joined with anything.
+    envs = [{"tool": "t", "raw": json.dumps({"id": 0})},
+            {"tool": "t", "raw": json.dumps({"id": 1})}]
+    assert [len(g) for g in group_results(envs)["t"]] == [1, 1]
+
+
+def test_one_non_json_payload_no_longer_disqualifies_a_whole_tool():
+    # The live case: kb.read.search measured 16.7% saved and was marked passthrough
+    # because 4 of 436 payloads were the server's `Error executing tool …` text. The
+    # runtime passes a non-JSON payload through untouched, so the tier costs nothing there.
+    groups = [_blocks(20), ["Error executing tool t: boom"]]
+    row = _tool_decision("t", groups, 5.0)
+    assert row["tiers"], row["reason"]
+    assert "non-JSON, passed through" in row["reason"]
+
+
+def test_a_mostly_text_tool_is_still_passthrough_on_the_threshold():
+    # Suppressed for the right reason: non-JSON contributes 0 saved while its raw tokens
+    # stay in the denominator, so the percentage falls below the threshold by itself.
+    groups = [["some long prose answer " * 200] for _ in range(10)] + [_blocks(3)]
+    row = _tool_decision("t", groups, 5.0)
+    assert row["tiers"] == []
+    assert "threshold" in row["reason"]
+
+
+def test_a_roundtrip_failure_still_disqualifies_the_tool():
+    marker = json.dumps({"__terse_table__": 1, "n": 1, "cols": ["a"], "rows": [[1]]})
+    row = _tool_decision("t", [_blocks(5), [marker]], 5.0)
+    assert row["tiers"] == []
+    assert "round-trip" in row["reason"]
