@@ -20,6 +20,7 @@ import json
 import json as _json
 import re
 import sys
+import tempfile
 import time
 from datetime import UTC
 from pathlib import Path
@@ -329,35 +330,52 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
         print(f"  ~ {c['tool']:<28} drop-to-retrieve suggestions changed (still INACTIVE)")
     # Say what was deliberately NOT regenerated. An operator who can't see this can't tell
     # a preserved safety key from one the merge forgot.
-    kept = sorted({k for c in changes for k in c.get("preserved", []) if k != "tiers"})
+    kept = sorted({k for c in changes for k in c.get("preserved", [])})
     if kept:
         print(f"  = preserved on existing rules, not regenerated: {', '.join(kept)}")
     if kinds["preserved"]:
         print(f"  = {len(kinds['preserved'])} rule(s) untouched "
               f"(not in this corpus): {', '.join(c['tool'] for c in kinds['preserved'])}")
-    if top := sorted(k for k in existing if k not in ("version", "defaults", "policies")):
+    # `defaults` is listed explicitly rather than filtered out: it governs every tool with
+    # no matching rule, so "was it regenerated?" is a real question about it.
+    if top := sorted(k for k in existing if k not in ("version", "policies")):
         print(f"  = top-level preserved: {', '.join(top)}")
     if not (kinds["tiers"] or kinds["added"] or kinds["suggestions"]):
         print("  (no change — the deployed policy already matches this corpus)")
 
-    # A proposed DOWNGRADE deserves a second look, because the generator measures each
-    # captured payload on its own while the proxy compresses a multi-block result as one
-    # joined array (#116). A tool whose server emits one record per block therefore looks
-    # uncompressible to the generator and compressible in production — so "this tool should
-    # be passthrough" can be an artifact of how it was measured, not a finding.
+    # A proposed DOWNGRADE deserves a second look. It removes a tier from a rule that is
+    # working today, on the evidence of a corpus that is a SAMPLE — idempotent by sha, so
+    # it holds each payload's first sighting rather than every call, and it holds nothing at
+    # all for a tool gated by `capture: false`. Adding a tier on thin evidence costs a
+    # little transform time; removing one silently gives back measured savings.
     downgrades = [c for c in kinds["tiers"] if len(c["after"]) < len(c["before"])]
     if downgrades:
         print(f"\n[warn] {len(downgrades)} rule(s) would LOSE a tier "
-              f"({', '.join(c['tool'] for c in downgrades)}). The generator scores payloads "
-              "individually; a tool whose server returns one record per content block scores "
-              "far lower that way than it compresses in production, where the blocks are "
-              "joined. Confirm against `terse stats` before applying a downgrade.")
+              f"({', '.join(c['tool'] for c in downgrades)}). The corpus is a sample; cross-"
+              "check those tools in `terse stats` — which counts every call, including ones "
+              "whose payloads were never captured — before applying a downgrade.")
     if not args.apply:
         print("\nnothing written. Re-run with --apply to write the merged policy.")
         return 0
+
     text = _json.dumps(merged, ensure_ascii=False, indent=2)
+    # Validate BEFORE writing, not after. `policy generate --out` can validate afterwards
+    # because it is usually authoring a new file; autotune overwrites a policy that is
+    # deployed and working, so a merged doc our own loader rejects must never reach it —
+    # "fail loud" would otherwise mean "loudly, on top of the file you needed".
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                     encoding="utf-8") as tf:
+        tf.write(text)
+        probe = tf.name
+    try:
+        load_policy(probe)
+    except (OSError, ValueError) as exc:
+        print(f"\nrefusing to write: the merged policy does not load ({exc}). "
+              f"{existing_path} is unchanged.", file=sys.stderr)
+        return 1
+    finally:
+        Path(probe).unlink(missing_ok=True)
     write_restricted(existing_path, text + "\n", mode=0o644)
-    load_policy(existing_path)  # fail loud rather than leaving a policy we reject
     print(f"\n[policy written to {existing_path}]")
     return 0
 
