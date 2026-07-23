@@ -19,12 +19,8 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   real context (2,596 → 1,008 chars), captured end to end rather than inferred.
   Affected servers are not exotic: filesystem (14/14 tools), memory (9/9) and kb (27/27)
   all declare an `outputSchema`.
-  **Default is `"leave"` — the previous behavior — and deliberately so.** The risk is
-  asymmetric: off, terse is a no-op for anyone who never reads the docs (bad, but inert);
-  on by default, any client that validates the typed field against `outputSchema` would
-  see terse break tools that worked, and terse cannot detect which client it sits behind.
-  The reference client was measured *not* to validate, which makes the opt-in safe to
-  recommend — not a default safe to flip. Codec only, no diff.
+  Codec only, no diff. See the `structured: "auto"` entry under **Changed** for how the
+  default now decides this per connected client.
 
 ### Fixed
 - **The savings ledger no longer reports a saving terse did not deliver (#128).** terse
@@ -79,6 +75,22 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   / `install-mcp --no-join-blocks` or a policy-file `"join_blocks": false`.
 
 ### Changed
+- **`structured` now defaults to `"auto"`, which decides per connected client (#128).**
+  This **changes default wire behavior for Claude Code users**: `structuredContent` will
+  carry a terse envelope where it previously carried the server's own object. That is the
+  intended effect — with the previous `"leave"` default terse was a measured no-op on
+  filesystem, memory and kb — but it is a real behavior change, stated here rather than
+  buried under Added.
+  The `"leave"` default shipped alongside the knob rested on "terse cannot detect which
+  client it sits behind." That was wrong: the MCP `initialize` request carries
+  `params.clientInfo`, a name the client *declares*, and the proxy proxies that request.
+  `"auto"` compresses the typed field only for clients measured not to validate it
+  (`policy.STRUCTURED_SAFE_CLIENTS`, currently `claude-code`, evidenced by the `badtype`
+  and `enveloped` probes) and **fails closed** for an unlisted client, a client that omits
+  `clientInfo`, and a library caller that never handshakes. Explicit `"compress"`/`"leave"`
+  still win. Measured with a stock policy — no `structured` key anywhere — the fixture's
+  context cost drops 2,596 → 1,008 chars (61.2%) against `claude-code`, and is untouched
+  against anything else.
 - **A joined result changes the content-block count the client sees (N → 1).** This is the
   first time terse changes anything but block *text*. The MCP spec (2025-06-18) puts no
   meaning on block count — blocks carry no index a payload can reference — and non-text
