@@ -462,10 +462,17 @@ class Interceptor:
                 # be the replay log lying about the one decision it exists to record.
                 changed = True
                 if self.diff:
+                    # ALL SIX state maps, not just the JSON four. The client's actual
+                    # previous result for this tool is an empty content array, so a later
+                    # CDC text diff whose `=` ops reference the dropped block's text would
+                    # be unrecoverable — the model never received the text being referenced.
+                    # Same discipline as the per-block path below and the reconnect reset.
                     self.last.pop(tool, None)
                     self.last_args.pop(tool, None)
                     self.last_joined.pop(tool, None)
                     self.since_keyframe.pop(tool, None)
+                    self.last_text.pop(tool, None)
+                    self.since_text_keyframe.pop(tool, None)
                 # Emitted side is the empty string, which is the literal wire truth: the
                 # ledger must show this block costing zero, not show it "unchanged".
                 emitted_pairs = ([(r, "") for r in raw_texts]
@@ -582,8 +589,16 @@ class Interceptor:
         where `reason` is the Phase 1 instrumentation datum — a short label for WHY the
         diff did/didn't fire (no_prior | keyframe | emitted | not_smaller_same_args |
         not_smaller_diff_args | text_emitted | text_dropped | non_json | passthrough |
-        error), for the
-        ledger. Fail-open: any error leaves the block untouched and state intact."""
+        error), for the ledger.
+
+        Two labels the ledger carries do NOT originate here, so the enumeration above is
+        not the whole value set: `diff_off` and `mirror_dropped` are both set by
+        `transform_response`. `mirror_dropped` means the text block was deleted as a
+        redundant `structuredContent` mirror (#128) and no diff decision was reached at
+        all — which is why it displaces the `diff_off` a single-block result would
+        otherwise carry.
+
+        Fail-open: any error leaves the block untouched and state intact."""
         text = block["text"]
         try:
             applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put,
@@ -887,8 +902,17 @@ class Interceptor:
         if not isinstance(result, dict) or "structuredContent" not in result:
             return None
         try:
-            mirrored = json.loads(text_blocks[0]["text"])
-            match = mirrored == result["structuredContent"]
+            # Compare CANONICAL SERIALIZATIONS, not the parsed values. Python `==` treats
+            # True == 1 and 1 == 1.0, so a block reading `{"ok":true,"n":1.0}` would count
+            # as a faithful mirror of `{"ok":1,"n":1}` and be deleted — handing the model
+            # `1` where the block said `true`. The guard's whole claim is that a block
+            # carrying anything the typed field does not is never dropped; value-level
+            # equality is a hole in it.
+            mirrored = json.dumps(json.loads(text_blocks[0]["text"]),
+                                  sort_keys=True, separators=(",", ":"))
+            typed = json.dumps(result["structuredContent"],
+                               sort_keys=True, separators=(",", ":"))
+            match = mirrored == typed
         except (ValueError, TypeError, RecursionError):
             # `RecursionError` covers BOTH statements, and both can raise it: nesting deep
             # enough blows the C parser's stack on the way in, and a deep `==` recurses on

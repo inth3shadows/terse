@@ -121,8 +121,16 @@ ARMS="${ARMS:-raw terse}"
 for arm in $ARMS; do run_arm "$arm"; done
 
 echo
-if [ "$ARMS" = "raw terse" ]; then
+# Decide by the ARTIFACTS, not by string-matching $ARMS: `ARMS="terse raw"` and
+# `ARMS="raw  terse"` both run two arms, and an equality test on the variable would
+# silently downgrade either to two presence checks — losing the raw-vs-terse delta that is
+# the whole point of the harness.
+if [ -s "$OUTDIR/raw.jsonl" ] && [ -s "$OUTDIR/terse.jsonl" ]; then
   "$HERE/report.py" "$OUTDIR/raw.jsonl" "$OUTDIR/terse.jsonl"
 else
-  for arm in $ARMS; do "$HERE/report.py" "$OUTDIR/$arm.jsonl"; done
+  # `|| rc=1` so a FAIL on the first arm doesn't let `set -e` kill the loop before the
+  # remaining arms report — the second artifact often explains the first one's failure.
+  rc=0
+  for arm in $ARMS; do "$HERE/report.py" "$OUTDIR/$arm.jsonl" || rc=1; done
+  exit "$rc"
 fi

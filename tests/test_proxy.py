@@ -1808,3 +1808,35 @@ def test_structured_replace_survives_a_payload_too_deep_to_parse():
               "structuredContent": {"rows": []}}
     out = _replace_run(result)
     assert out["content"][0]["text"] == deep_text          # passed through, not dropped
+
+
+def test_structured_replace_resets_the_TEXT_diff_base_too():
+    # The client's actual previous result for this tool is an empty content array, so a
+    # later CDC text diff whose `=` ops reference the dropped block is unrecoverable — the
+    # model never received the text being referenced. All six state maps must reset.
+    inter = Interceptor(Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"),
+                                           structured="replace")]))
+    def call(mid, result):
+        inter.note_request(f'{{"jsonrpc":"2.0","id":{mid},"method":"tools/call",'
+                           '"params":{"name":"gh.items"}}')
+        return json.loads(inter.transform_response(
+            json.dumps({"jsonrpc": "2.0", "id": mid, "result": result})))["result"]
+
+    prose = "a long prose payload that is not JSON at all. " * 200
+    call(1, {"content": [{"type": "text", "text": prose}]})       # establishes a text base
+    assert inter.last_text.get("gh.items")
+    call(2, _pair(_SC_PAYLOAD))                                    # mirror dropped
+    assert "gh.items" not in inter.last_text
+    assert "gh.items" not in inter.since_text_keyframe
+    out = call(3, {"content": [{"type": "text", "text": prose + "and one more line."}]})
+    assert "__terse_textdiff__" not in out["content"][0]["text"]   # re-anchored, not diffed
+
+
+def test_structured_replace_will_not_drop_a_block_that_only_LOOKS_equal():
+    # Python `==` treats True == 1 and 1 == 1.0, so value-level equality would delete a
+    # block saying `true` in favour of a typed field saying `1`.
+    result = {"content": [{"type": "text", "text": '{"ok":true,"n":1.0}'}],
+              "structuredContent": {"ok": 1, "n": 1}}
+    out = _replace_run(result)
+    assert len(out["content"]) == 1
+    assert out["content"][0]["text"] == '{"ok":true,"n":1.0}'

@@ -71,11 +71,18 @@ def single_arm(path: str) -> int:
         print("VERDICT: inconclusive — captured nothing. An empty artifact is a failed "
               "measurement, not evidence.")
         return 1
-    if not arm["chars"]:
-        print("VERDICT: FAIL — the tool_result reached the model EMPTY. Whatever the")
-        print("  server put in `structuredContent` did not survive the client.")
+    # EVERY record, not `describe`'s max. A run where the tool was called twice and one
+    # result arrived empty is the exact failure this gates against, and a max() over
+    # [0, 2596] reports it as a clean PASS. This arm is the sole safety evidence cited for
+    # dropping the mirror, so a false PASS here green-lights the feature on wrong evidence.
+    empty = [r for r in recs if not r["chars"]]
+    if empty:
+        print(f"VERDICT: FAIL — {len(empty)}/{arm['n']} tool_result(s) reached the model")
+        print("  EMPTY. Whatever the server put in `structuredContent` did not survive the")
+        print("  client on those calls.")
         return 1
-    print(f"VERDICT: PASS — {arm['chars']} chars of payload reached the model's context.")
+    print(f"VERDICT: PASS — all {arm['n']} tool_result(s) carried payload "
+          f"(max {arm['chars']} chars) into the model's context.")
     print("  Compare the verbatim block against the fixture's two renderings to say")
     print("  WHICH field it came from; presence alone is what this arm gates on.")
     return 0
