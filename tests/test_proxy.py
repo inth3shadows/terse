@@ -233,7 +233,7 @@ def _emit_args(inter, mid, tool, payload, args=None):
 def _capture_stats():
     reasons: list = []
 
-    def stats(tool, raw, emitted, passthrough, diff_reason=None):
+    def stats(tool, raw, emitted, passthrough, diff_reason=None, structured=None):
         reasons.append(diff_reason)
 
     return reasons, stats
@@ -904,7 +904,7 @@ def test_capture_false_still_counts_in_the_payload_free_stats_ledger():
     _note_call(inter, 1, "secret.reveal")
     inter.transform_response(_result_msg(1, SECRET))
     assert len(seen) == 1
-    tool, raw, emitted, passthrough, reason = seen[0]
+    tool, raw, emitted, passthrough, reason, structured = seen[0]
     assert tool == "secret.reveal" and passthrough is True and reason == "passthrough"
     assert raw == SECRET and emitted == SECRET             # passthrough: untouched
 
@@ -946,7 +946,7 @@ def test_stats_callback_sees_raw_and_emitted_per_result():
     _note_call(inter, 1, "gh.api.items")
     out = inter.transform_response(_result_msg(1, _records_text()))
     assert len(seen) == 1
-    tool, raw, emitted, passthrough, reason = seen[0]
+    tool, raw, emitted, passthrough, reason, structured = seen[0]
     assert tool == "gh.api.items" and passthrough is False and reason == "no_prior"
     assert raw == _records_text()                       # true pre-transform snapshot
     assert emitted == json.loads(out)["result"]["content"][0]["text"]
@@ -967,7 +967,7 @@ def test_stats_callback_works_without_audit_and_labels_a_diff():
     inter.transform_response(_result_msg(1, json.dumps(first)))
     _note_call(inter, 2, "gh.api.items")
     inter.transform_response(_result_msg(2, json.dumps(second)))
-    assert [classify_decision(r, e, p) for (_t, r, e, p, _rsn) in seen] == ["compressed", "diff"]
+    assert [classify_decision(r, e, p) for (_t, r, e, p, _rsn, _sc) in seen] == ["compressed", "diff"]
     assert [s[4] for s in seen] == ["no_prior", "emitted"]   # the diff_reason datum agrees
 
 
@@ -977,7 +977,7 @@ def test_stats_passthrough_tool_is_labeled_passthrough():
     inter = Interceptor(Policy(rules=[Rule("gh.*", ())]), stats=lambda *a: seen.append(a))
     _note_call(inter, 5, "gh.api.items")
     inter.transform_response(_result_msg(5, _records_text()))
-    (tool, raw, emitted, passthrough, reason), = seen
+    (tool, raw, emitted, passthrough, reason, structured), = seen
     assert passthrough is True and raw == emitted and reason == "passthrough"
     assert classify_decision(raw, emitted, passthrough) == "passthrough"
 

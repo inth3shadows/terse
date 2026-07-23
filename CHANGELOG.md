@@ -10,6 +10,18 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Fixed
+- **The savings ledger no longer reports a saving terse did not deliver (#128).** terse
+  compresses a result's text block but leaves `structuredContent` untouched, and the
+  ledger counted only the block — so a tool emitting both was credited with the block's
+  full reduction while the untouched duplicate rode along at full size. `build_record`
+  now counts that duplicate on *both* sides, making `raw_chars`/`out_chars` the whole
+  result's cost, and records the split as `structured_chars`/`structured_tokens`. On the
+  reference fixture the same call now reports **33.9%** where it previously reported
+  58.7%. `decision` is unchanged — it names what terse did to the block, and terse did
+  compress it. Records predating the field had no duplicate, so a missing value reads
+  as 0. Measured against a live client, the honest figure may be lower still: see
+  `scripts/probe/structured_content/`, which found that `claude` 2.1.218 reads
+  `structuredContent` and discards the compressed block entirely.
 - **A broken capture/stats/audit sink now says so, instead of failing silently.** The
   callbacks handed to the `Interceptor` caught their own exceptions behind a `--debug`
   gate, so the `try/except → _warn_sink` around them never saw one and `_warn_sink`'s

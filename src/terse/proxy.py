@@ -143,7 +143,7 @@ class Interceptor:
     def __init__(self, pol: policy_mod.Policy, debug: bool = False,
                  capture: Callable[[str, str], None] | None = None,
                  audit: Callable[[dict], None] | None = None,
-                 stats: Callable[[str, str, str, bool, str | None], None] | None = None,
+                 stats: Callable[[str, str, str, bool, str | None, str | None], None] | None = None,
                  server_name: str | None = None,
                  store: OrderedDict[str, Any] | None = None,
                  store_lock: Lock | None = None,
@@ -499,8 +499,15 @@ class Interceptor:
                 self._emit_audit(tool, msg["id"], emitted_pairs, changed,
                                  display_tool=capture_tool)
             if self.stats is not None:
+                # The untouched `structuredContent` duplicate is part of what this result
+                # costs the model, so the ledger must carry it rather than reporting the
+                # text block's reduction as the whole story (#128).
+                structured = None
+                if isinstance(result, dict) and "structuredContent" in result:
+                    structured = json.dumps(result["structuredContent"],
+                                            separators=(",", ":"), ensure_ascii=False)
                 self._emit_stats(tool, emitted_pairs, display_tool=capture_tool,
-                                 diff_reason=diff_reason)
+                                 diff_reason=diff_reason, structured=structured)
 
             if not changed:
                 return line
@@ -877,21 +884,28 @@ class Interceptor:
             self._warn_sink("audit", shown_tool, exc)
 
     def _emit_stats(self, tool: str, pairs: list[tuple[str, str]], *,
-                    display_tool: str | None = None, diff_reason: str | None = None) -> None:
+                    display_tool: str | None = None, diff_reason: str | None = None,
+                    structured: str | None = None) -> None:
         """Hand the stats callback one (tool, raw, emitted, passthrough, diff_reason) per
         emitted block, for the payload-free savings ledger (stats.py). Same fail-open
         contract as capture/audit: the callback owns I/O and a failure can never change
         what the client receives. `pairs`/`tool`/`display_tool` as in `_emit_audit`. The
         diff decision is per-result, so `diff_reason` is attributed to every pair — which
-        is exactly one pair on the joined path and the common single-block shape."""
+        is exactly one pair on the joined path and the common single-block shape.
+
+        `structured` is the serialized `structuredContent` this result carried, if any. It
+        is per-RESULT, not per-block, so on a multi-block result it is attributed to the
+        first pair only — counting it once per block would inflate the very number this is
+        meant to make honest (#128)."""
         stats = self.stats
         if stats is None:
             return
         shown_tool = display_tool if display_tool is not None else tool
         passthrough = not self.policy.select(tool, self.server_name).tiers
-        for raw, emitted in pairs:
+        for index, (raw, emitted) in enumerate(pairs):
             try:
-                stats(shown_tool, raw, emitted, passthrough, diff_reason)
+                stats(shown_tool, raw, emitted, passthrough, diff_reason,
+                      structured if index == 0 else None)
             except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
                 self._warn_sink("stats", shown_tool, exc)
 
