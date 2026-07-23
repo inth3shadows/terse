@@ -334,7 +334,13 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
         after = ",".join(c["after"]) or "(passthrough)"
         print(f"  ~ {c['tool']:<28} {before}  ->  {after}")
     for c in kinds["added"]:
-        print(f"  + {c['tool']:<28} {','.join(c['after']) or '(passthrough)'}  (new rule)")
+        # A drop suggestion on a NEW rule is the whole reason some rules exist (a
+        # passthrough long-text tool carrying `$text.code_blocks`, #139); name it here or the
+        # diff hides it behind "(new rule)".
+        suggests = c.get("suggests") or []
+        tail = (f"  + suggests {', '.join(suggests)} (INACTIVE, drop-to-retrieve)"
+                if suggests else "")
+        print(f"  + {c['tool']:<28} {','.join(c['after']) or '(passthrough)'}  (new rule){tail}")
     for c in kinds["inherited"]:
         print(f"  = {c['tool']:<28} inherited {','.join(c['keys'])} from {c['from']}")
     for c in kinds["suggestions"]:
