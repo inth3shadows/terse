@@ -90,9 +90,16 @@ class Rule:
     # `outputSchema` — which the spec says clients SHOULD do — terse starts BREAKING tools
     # that worked. terse cannot detect which client it sits behind, and a default that
     # silently violates a declared schema for unknown clients is the exact failure class
-    # #131 and #133 were about. Revisit once more clients are measured: a data question,
-    # not a taste one.
-    structured: str = "leave"
+    # #131 and #133 were about.
+    #
+    # "auto" (the default) resolves that per CONNECTED CLIENT instead of per guess. The
+    # MCP `initialize` request carries `params.clientInfo` — a field the client declares —
+    # and the proxy sees it, so terse compresses the typed field for clients measured not
+    # to validate it (`STRUCTURED_SAFE_CLIENTS`) and leaves it alone for every other
+    # client, including any that never identifies itself. That removes the premise the
+    # #134 default rested on ("terse cannot detect which client it sits behind"), which
+    # was simply wrong. Explicit "leave"/"compress" always override the resolution.
+    structured: str = "auto"
 
     def lossy_fields(self) -> list[str]:
         return [k for k, v in self.fields.items() if v.get("lossy")]
@@ -216,7 +223,34 @@ def _coerce_capture(raw: Any, where: str) -> bool:
     return raw
 
 
-VALID_STRUCTURED = ("leave", "compress")
+VALID_STRUCTURED = ("auto", "leave", "compress")
+
+# Clients measured NOT to validate `structuredContent` against a tool's `outputSchema`,
+# and therefore safe to hand a terse envelope in that field under `"structured": "auto"`.
+# Matched on `initialize`'s `clientInfo.name`, exactly as declared.
+#
+# `claude-code`: measured 2026-07-23 against 2.1.218 with the `badtype` and `enveloped`
+# probes in `scripts/probe/structured_content/` — neither a wrong-typed payload nor a
+# terse table envelope in place of the declared record array drew any complaint; both were
+# forwarded to the model verbatim.
+#
+# Deliberately keyed on NAME, not name+version. A version ceiling would block every future
+# release on the strength of one measurement; and if a listed client ever starts
+# validating, the failure is LOUD — tool calls error visibly — not silent, and
+# `"structured": "leave"` is a one-line override. The client version is logged under
+# --debug so such a regression is diagnosable from a log rather than a bisect.
+STRUCTURED_SAFE_CLIENTS = frozenset({"claude-code"})
+
+
+def structured_mode_for_client(mode: str, client_name: str | None) -> str:
+    """Resolve a rule's `structured` setting against the connected client's declared name.
+
+    Fail-closed: an unknown client, or none at all (no handshake seen, a client that omits
+    `clientInfo`, or a library caller driving `Interceptor` directly), resolves to "leave"
+    — the conservative behavior, never the rewriting one."""
+    if mode != "auto":
+        return mode
+    return "compress" if client_name in STRUCTURED_SAFE_CLIENTS else "leave"
 
 
 def _coerce_structured(raw: Any, where: str) -> str:
@@ -272,7 +306,7 @@ def load_policy(path: str | Path) -> Policy:
         rules.append(Rule(tool_glob=glob, tiers=_coerce_tiers(r.get("tiers", []), f"policies[{i}]"),
                           fields=r.get("fields", {}),
                           capture=_coerce_capture(r.get("capture", True), f"policies[{i}]"),
-                          structured=_coerce_structured(r.get("structured", "leave"),
+                          structured=_coerce_structured(r.get("structured", "auto"),
                                                         f"policies[{i}]")))
     return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", True)),
                   join_blocks=bool(doc.get("join_blocks", True)),

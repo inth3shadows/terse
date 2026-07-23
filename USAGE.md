@@ -419,13 +419,18 @@ this on puts the codec where the payload really is:
 On the reference fixture: **2,596 → 1,008 chars of the model's real context (61.2%)**,
 against 0% with the default.
 
-**It is off by default, and that is deliberate.** The MCP spec says clients *should*
-validate `structuredContent` against the tool's `outputSchema`, and terse cannot tell
-which client it is sitting behind. Off, terse is merely a no-op on such tools. On by
-default, a validating client would see terse **break tools that worked**. The reference
-client was measured *not* to validate — neither a wrong type nor a terse envelope in place
-of the declared record array draws a complaint — which makes this safe to switch on
-knowingly, not safe to switch on for everyone.
+**You usually do not need to set this.** The default is `"auto"`, which decides per
+connected client: the MCP handshake carries a `clientInfo` name the client *declares*, and
+terse compresses the typed field only for clients measured not to validate it — currently
+Claude Code. Every other client, a client that omits `clientInfo`, and a library caller
+that never handshakes all keep the server's own object untouched. Set `"compress"` or
+`"leave"` explicitly only to override that.
+
+Why it is gated at all: the MCP spec says clients *should* validate `structuredContent`
+against the tool's `outputSchema`. Leaving it alone merely makes terse a no-op; rewriting
+it for a validating client would **break tools that worked**. The allowlist is measured,
+not assumed — neither a wrong type nor a terse envelope in place of the declared record
+array draws a complaint from the reference client.
 
 Check whether it applies to you before bothering: a tool that declares an `outputSchema`
 is the one that will emit the field. Among common servers, filesystem (14/14 tools),

@@ -423,7 +423,7 @@ def test_apply_falls_back_to_lossless_when_codec_self_check_fails(monkeypatch):
     assert any("self-check failed" in w for w in result.warnings)
 
 
-def test_structured_defaults_to_leave_and_accepts_only_known_literals(tmp_path):
+def test_structured_defaults_to_auto_and_accepts_only_known_literals(tmp_path):
     # Strict for the same reason `capture` is: this decides whether terse rewrites a field
     # carrying a declared outputSchema. A typo reverting to "leave" is a quiet no-op; a
     # typo enabling "compress" quietly rewrites a typed field. Both must fail at load.
@@ -432,12 +432,26 @@ def test_structured_defaults_to_leave_and_accepts_only_known_literals(tmp_path):
         p.write_text(json.dumps({"version": 1, "policies": [rule]}))
         return p
     assert load_policy(write({"match": {"tool": "*"}, "tiers": []})).rules[0].structured \
-        == "leave"
+        == "auto"
     assert load_policy(write({"match": {"tool": "*"}, "tiers": [],
                               "structured": "compress"})).rules[0].structured == "compress"
-    for bad in ("Compress", "true", True, 1, None, "drop"):
+    for bad in ("Compress", "Auto", "true", True, 1, None, "drop"):
         try:
             load_policy(write({"match": {"tool": "*"}, "tiers": [], "structured": bad}))
         except ValueError:
             continue
         raise AssertionError(f"load_policy accepted structured={bad!r}")
+
+
+def test_structured_mode_resolves_against_the_declared_client(tmp_path):
+    # "auto" is decided by the client's own `clientInfo.name`, and fails CLOSED: an
+    # unknown client, or none at all, must never get the rewriting behavior (#128).
+    from terse.policy import structured_mode_for_client as resolve
+    assert resolve("auto", "claude-code") == "compress"      # measured not to validate
+    assert resolve("auto", "some-other-client") == "leave"
+    assert resolve("auto", None) == "leave"                  # no handshake seen
+    assert resolve("auto", "Claude-Code") == "leave"          # exact match only
+    # explicit settings always win over the resolution
+    for client in ("claude-code", "some-other-client", None):
+        assert resolve("leave", client) == "leave"
+        assert resolve("compress", client) == "compress"

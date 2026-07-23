@@ -1612,3 +1612,55 @@ def test_structured_content_ledger_counts_the_compressed_size(tmp_path):
     structured = seen[0][5]
     assert structured is not None and "__terse_" in structured
     assert len(structured) < len(json.dumps(_SC_PAYLOAD, separators=(",", ":")))
+
+
+def _init_req_for(client: str | None):
+    params: dict = {"protocolVersion": "2025-06-18", "capabilities": {}}
+    if client is not None:
+        params["clientInfo"] = {"name": client, "version": "9.9.9"}
+    return json.dumps({"jsonrpc": "2.0", "id": 99, "method": "initialize",
+                       "params": params})
+
+
+def _auto_run(client: str | None):
+    """Handshake as `client`, then call a tool returning a structuredContent pair."""
+    inter = Interceptor(Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))]))
+    inter.note_request(_init_req_for(client))
+    inter.note_request('{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+                       '"params":{"name":"gh.items"}}')
+    out = json.loads(inter.transform_response(_structured_result_msg(1, _SC_PAYLOAD)))
+    return out["result"]["structuredContent"]
+
+
+def test_structured_auto_compresses_for_a_measured_safe_client():
+    # The default is "auto": with no `structured` key in the policy at all, a client
+    # measured not to validate the typed field gets it compressed (#128).
+    sc = _auto_run("claude-code")
+    assert transforms.decompress(json.dumps(sc)) == _SC_PAYLOAD      # still lossless
+    assert len(json.dumps(sc)) < len(json.dumps(_SC_PAYLOAD))
+
+
+def test_structured_auto_fails_closed_for_unknown_and_absent_clients():
+    # An unlisted client, and a handshake with no clientInfo at all, must both keep the
+    # server's own object byte-identical — the conservative branch is the default one.
+    assert _auto_run("some-other-client") == _SC_PAYLOAD
+    assert _auto_run(None) == _SC_PAYLOAD
+
+
+def test_structured_auto_fails_closed_with_no_handshake_at_all():
+    # A library caller driving Interceptor directly never feeds it an initialize.
+    inter = Interceptor(Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))]))
+    inter.note_request('{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+                       '"params":{"name":"gh.items"}}')
+    out = json.loads(inter.transform_response(_structured_result_msg(1, _SC_PAYLOAD)))
+    assert out["result"]["structuredContent"] == _SC_PAYLOAD
+
+
+def test_explicit_leave_overrides_a_safe_client():
+    # The operator's explicit setting outranks the client-based resolution, both ways.
+    inter = Interceptor(_structured_policy("leave"))
+    inter.note_request(_init_req_for("claude-code"))
+    inter.note_request('{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+                       '"params":{"name":"gh.items"}}')
+    out = json.loads(inter.transform_response(_structured_result_msg(1, _SC_PAYLOAD)))
+    assert out["result"]["structuredContent"] == _SC_PAYLOAD

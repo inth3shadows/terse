@@ -239,6 +239,9 @@ class Interceptor:
         # box, exactly equivalent to a private int.
         self._dropped_bytes_box: list[int] = dropped_bytes if dropped_bytes is not None else [0]
         self.init_id: Any = None        # id of the initialize request, to prime its reply
+        # `clientInfo.name` from the handshake, when the client declared one (#128). Drives
+        # `"structured": "auto"`; None until an initialize is seen, and None means "leave".
+        self.client_name: str | None = None
         # The two proxy pump threads call note_request (client->server) and
         # transform_response (server->client) concurrently, both mutating pending/last/
         # since_keyframe/init_id state. `_local_lock` serializes each method against the
@@ -308,6 +311,19 @@ class Interceptor:
                 with self._store_lock:
                     self.dropped.clear()
                     self._dropped_bytes_box[0] = 0
+                # The client's DECLARED identity, straight off the handshake. This is
+                # what lets `"structured": "auto"` compress the typed `structuredContent`
+                # field only for clients measured not to validate it (#128) — an observed
+                # name, not a heuristic. Absent/malformed leaves it None, which the
+                # resolver treats as "unknown" and therefore "leave".
+                info = (msg.get("params") or {}).get("clientInfo")
+                if isinstance(info, dict) and isinstance(info.get("name"), str):
+                    self.client_name = info["name"]
+                    if self.debug:
+                        sys.stderr.write(
+                            f"{self.log_prefix} client: {info['name']} "
+                            f"{info.get('version', '?')} -> structured=auto resolves to "
+                            f"{policy_mod.structured_mode_for_client('auto', info['name'])}\n")
                 if mid is not None:
                     self.init_id = mid
                 return
@@ -777,9 +793,18 @@ class Interceptor:
         emits both, compressing only the block delivers ~0%. Why it is opt-in, and why the
         default must stay "leave": see `policy.Rule.structured`.
 
-        Codec only — no diff. Diffing the typed field needs its own per-tool base and
-        keyframe accounting; mixing that in here would double the surface with none of the
-        evidence the text-block diff tier earned before it was turned on.
+        No diff. Diffing the typed field needs its own per-tool base and keyframe
+        accounting; mixing that in here would double the surface with none of the evidence
+        the text-block diff tier earned before it was turned on.
+
+        It is otherwise the SAME path the text block takes — `policy.apply` — so a rule
+        that declares `drop-to-retrieve` fields sees them applied here too, and the typed
+        field can come out carrying a `__terse_dropped__` marker. That is deliberate (the
+        mirrored payload has the mirrored shape, so the same field paths match) and it
+        inherits the same guards: the never-lossy SERVER floor is enforced inside `apply`
+        on the verified server identity, and `force_lossless` suppresses it on an error
+        result. Handles are content-derived, so the same value dropped from both the block
+        and the field resolves to one store entry, not two.
 
         Fail-open like everything else on this path: a field that does not survive a
         round-trip through `json.dumps` is left exactly as it was."""
@@ -790,7 +815,9 @@ class Interceptor:
                                   ensure_ascii=False)
         except (TypeError, ValueError):
             return None, False                # unserializable: not ours to touch
-        if self.policy.select(tool, self.server_name).structured != "compress":
+        mode = policy_mod.structured_mode_for_client(
+            self.policy.select(tool, self.server_name).structured, self.client_name)
+        if mode != "compress":
             return original, False            # untouched, but still counted by the ledger
         emitted = self._compress(original, tool, force_lossless=force_lossless)
         if emitted == original:
