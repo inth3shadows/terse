@@ -1664,3 +1664,179 @@ def test_explicit_leave_overrides_a_safe_client():
                        '"params":{"name":"gh.items"}}')
     out = json.loads(inter.transform_response(_structured_result_msg(1, _SC_PAYLOAD)))
     assert out["result"]["structuredContent"] == _SC_PAYLOAD
+
+
+# --- #128 option 2: `"structured": "replace"` drops the redundant text mirror ---
+
+def _replace_run(result: dict, *, mode="replace", tiers=("minify", "tabularize", "dictionary"),
+                 stats=None):
+    """Drive one tools/call whose result is `result`, under `structured=mode`."""
+    inter = Interceptor(Policy(rules=[Rule("gh.*", tiers, structured=mode)]), stats=stats)
+    inter.note_request('{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+                       '"params":{"name":"gh.items"}}')
+    line = json.dumps({"jsonrpc": "2.0", "id": 1, "result": result})
+    return json.loads(inter.transform_response(line))["result"]
+
+
+def _pair(payload, **extra):
+    return {"content": [{"type": "text", "text": json.dumps(payload)}],
+            "structuredContent": payload, **extra}
+
+
+def test_structured_replace_drops_the_mirror():
+    out = _replace_run(_pair(_SC_PAYLOAD))
+    # The mirror is gone entirely — an empty `content` is the shape measured to reach the
+    # model intact (`scripts/probe/structured_content/`, the `nomirror` probe).
+    assert out["content"] == []
+    # ...and everything the model needs is in the typed field, still losslessly.
+    assert transforms.decompress(json.dumps(out["structuredContent"])) == _SC_PAYLOAD
+
+
+def test_structured_replace_keeps_a_block_that_is_not_a_faithful_mirror():
+    # The guard that makes this safe rather than merely measured: a block carrying
+    # something the typed field does not is not a mirror, whatever the spec calls it.
+    result = _pair(_SC_PAYLOAD)
+    result["content"][0]["text"] = json.dumps({"note": "half the story", "rows": []})
+    out = _replace_run(result)
+    assert len(out["content"]) == 1
+    assert out["content"][0]["text"]                       # still there, still non-empty
+
+
+def test_structured_replace_keeps_the_mirror_on_an_error_result():
+    # A model recovering from a failure has to be able to READ the failure.
+    out = _replace_run(_pair(_SC_PAYLOAD, isError=True))
+    assert len(out["content"]) == 1
+
+
+def test_structured_replace_does_nothing_without_a_typed_field():
+    # Nothing to fall back on: dropping the block here would blank the result.
+    out = _replace_run({"content": [{"type": "text", "text": json.dumps(_SC_PAYLOAD)}]})
+    assert len(out["content"]) == 1
+    assert "structuredContent" not in out
+
+
+def test_structured_replace_is_inert_when_the_rule_has_no_tiers():
+    # `tiers: []` is the "hands off this tool" switch; removing a block is the most
+    # hands-on thing terse does.
+    out = _replace_run(_pair(_SC_PAYLOAD), tiers=())
+    assert len(out["content"]) == 1
+    assert out["structuredContent"] == _SC_PAYLOAD
+
+
+def test_structured_replace_keeps_a_non_json_block():
+    result = _pair(_SC_PAYLOAD)
+    result["content"][0]["text"] = "Fetched 12 rows."      # prose, not a serialization
+    out = _replace_run(result)
+    assert out["content"][0]["text"] == "Fetched 12 rows."
+
+
+def test_structured_replace_keeps_multiple_text_blocks():
+    # Two blocks means at most one of them mirrors the field; terse cannot tell which
+    # without guessing, so it drops neither.
+    result = _pair(_SC_PAYLOAD)
+    result["content"].append({"type": "text", "text": json.dumps({"page": 2})})
+    out = _replace_run(result)
+    # BOTH survive — either as two blocks or collapsed into the #116 joined one. Asserting
+    # on the decoded payload rather than the block count is what makes this catch a drop
+    # of the first block while the second one covers for it.
+    decoded = json.dumps([transforms.decompress(b["text"])
+                          for b in out["content"] if b.get("type") == "text"])
+    assert "page" in decoded and "Berlin" in decoded
+
+
+def test_structured_replace_preserves_non_text_blocks():
+    # Only the mirror goes. An image block is not a duplicate of anything.
+    image = {"type": "image", "data": "AAAA", "mimeType": "image/png"}
+    result = _pair(_SC_PAYLOAD)
+    result["content"].append(image)
+    out = _replace_run(result)
+    assert out["content"] == [image]
+
+
+def test_structured_replace_reports_the_dropped_block_as_zero_to_the_ledger():
+    # The wire truth, per #133: the block cost nothing because it was not sent. Reporting
+    # it as "unchanged" would credit terse with a saving on the typed field alone while
+    # still charging for a block nobody received.
+    seen = []
+    _replace_run(_pair(_SC_PAYLOAD), stats=lambda *a: seen.append(a))
+    tool, raw, emitted, passthrough, reason, structured = seen[0]
+    assert emitted == ""
+    assert raw == json.dumps(_SC_PAYLOAD)                  # the sink still sees the original
+    assert reason == "mirror_dropped"
+    assert structured is not None and "__terse_" in structured
+
+
+def test_structured_replace_tells_the_audit_trace_it_changed_the_result():
+    # The replay trace exists to record the decision. A record saying `changed: false`
+    # beside an emitted "" would be it lying about the only thing it is for.
+    seen = []
+    inter = Interceptor(Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"),
+                                           structured="replace")]),
+                        audit=lambda rec: seen.append(rec))
+    inter.note_request('{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+                       '"params":{"name":"gh.items"}}')
+    inter.transform_response(json.dumps({"jsonrpc": "2.0", "id": 1,
+                                         "result": _pair(_SC_PAYLOAD)}))
+    assert seen[0]["changed"] is True
+    assert seen[0]["blocks"][0]["emitted"] == ""
+    assert seen[0]["blocks"][0]["raw"] == json.dumps(_SC_PAYLOAD)
+
+
+def test_structured_auto_never_resolves_to_replace():
+    # "auto" tops out at "compress". Dropping a block is the first mode that removes
+    # information from the wire, and no client is defaulted into it.
+    inter = Interceptor(Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))]))
+    inter.note_request(_init_req_for("claude-code"))
+    inter.note_request('{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+                       '"params":{"name":"gh.items"}}')
+    out = json.loads(inter.transform_response(_structured_result_msg(1, _SC_PAYLOAD)))
+    assert len(out["result"]["content"]) == 1              # mirror survives
+    assert "__terse_" in json.dumps(out["result"]["structuredContent"])   # but compressed
+
+
+def test_structured_replace_survives_a_payload_too_deep_to_parse():
+    # `_mirror_to_drop` runs OUTSIDE `_compress`'s fail-open wrapper, so an escaping
+    # exception takes down the whole tool call. Nesting deep enough raises RecursionError
+    # from the C parser (the depth cap in #79 exists for this), and a deep `==` recurses
+    # too. Neither may reach the caller.
+    # Depth chosen by measurement, not by `recursionlimit * k`: CPython's C scanner
+    # swallows 20k nested arrays fine and only blows up near 100k, so a smaller number
+    # would make this test pass whether the guard is there or not.
+    depth = 100_000
+    deep_text = "[" * depth + "]" * depth
+    result = {"content": [{"type": "text", "text": deep_text}],
+              "structuredContent": {"rows": []}}
+    out = _replace_run(result)
+    assert out["content"][0]["text"] == deep_text          # passed through, not dropped
+
+
+def test_structured_replace_resets_the_TEXT_diff_base_too():
+    # The client's actual previous result for this tool is an empty content array, so a
+    # later CDC text diff whose `=` ops reference the dropped block is unrecoverable — the
+    # model never received the text being referenced. All six state maps must reset.
+    inter = Interceptor(Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"),
+                                           structured="replace")]))
+    def call(mid, result):
+        inter.note_request(f'{{"jsonrpc":"2.0","id":{mid},"method":"tools/call",'
+                           '"params":{"name":"gh.items"}}')
+        return json.loads(inter.transform_response(
+            json.dumps({"jsonrpc": "2.0", "id": mid, "result": result})))["result"]
+
+    prose = "a long prose payload that is not JSON at all. " * 200
+    call(1, {"content": [{"type": "text", "text": prose}]})       # establishes a text base
+    assert inter.last_text.get("gh.items")
+    call(2, _pair(_SC_PAYLOAD))                                    # mirror dropped
+    assert "gh.items" not in inter.last_text
+    assert "gh.items" not in inter.since_text_keyframe
+    out = call(3, {"content": [{"type": "text", "text": prose + "and one more line."}]})
+    assert "__terse_textdiff__" not in out["content"][0]["text"]   # re-anchored, not diffed
+
+
+def test_structured_replace_will_not_drop_a_block_that_only_LOOKS_equal():
+    # Python `==` treats True == 1 and 1 == 1.0, so value-level equality would delete a
+    # block saying `true` in favour of a typed field saying `1`.
+    result = {"content": [{"type": "text", "text": '{"ok":true,"n":1.0}'}],
+              "structuredContent": {"ok": 1, "n": 1}}
+    out = _replace_run(result)
+    assert len(out["content"]) == 1
+    assert out["content"][0]["text"] == '{"ok":true,"n":1.0}'

@@ -444,18 +444,53 @@ class Interceptor:
             joined_block: dict | None = None   # set when the multi-block join fires (#116)
             joined_curr: list | None = None    # its parsed pre-lossy array, for capture
 
+            # `"structured": "replace"` (#128) — is this result's text block a dead mirror
+            # of `structuredContent`? Decided HERE, against the RAW block, because every
+            # branch below rewrites that text in place and the comparison is only
+            # meaningful before they do.
+            mirror = self._mirror_to_drop(result, text_blocks, tool,
+                                          error_result=error_result)
+
+            if mirror is not None:
+                # Do not compress a block that is about to be deleted: it is wasted work,
+                # and it would leave a diff base the client never received — the next
+                # result would then diff against text nobody has seen.
+                diff_reason = "mirror_dropped"
+                # Set here, not at the drop below, so the audit record — emitted further
+                # down, and deliberately before the block is removed — reports `changed`
+                # truthfully. A trace saying "changed: false" next to an emitted "" would
+                # be the replay log lying about the one decision it exists to record.
+                changed = True
+                if self.diff:
+                    # ALL SIX state maps, not just the JSON four. The client's actual
+                    # previous result for this tool is an empty content array, so a later
+                    # CDC text diff whose `=` ops reference the dropped block's text would
+                    # be unrecoverable — the model never received the text being referenced.
+                    # Same discipline as the per-block path below and the reconnect reset.
+                    self.last.pop(tool, None)
+                    self.last_args.pop(tool, None)
+                    self.last_joined.pop(tool, None)
+                    self.since_keyframe.pop(tool, None)
+                    self.last_text.pop(tool, None)
+                    self.since_text_keyframe.pop(tool, None)
+                # Emitted side is the empty string, which is the literal wire truth: the
+                # ledger must show this block costing zero, not show it "unchanged".
+                emitted_pairs = ([(r, "") for r in raw_texts]
+                                 if raw_texts is not None else [])
             # #116: a result with >=2 text blocks is tried as ONE joined record array first
             # — the per-block path can reach neither cross-record folding nor the diff tier
             # (71% of real traffic was stuck there). A refusal falls back to per-block and
             # records WHY (`multiblock_<reason>`); the join itself is gated by
             # `join_blocks`, independent of `diff`.
-            if len(text_blocks) >= 2:
+            elif len(text_blocks) >= 2:
                 new_text, diff_reason, joined_curr = self._compress_or_diff_joined(
                     text_blocks, tool, args_key, force_lossless=error_result)
                 if new_text is not None:
                     joined_block = {"type": "text", "text": new_text}
 
-            if joined_block is not None:
+            if mirror is not None:
+                pass                       # handled above; the drop itself happens below
+            elif joined_block is not None:
                 # Collapse the N text blocks to the single joined block, in place; non-text
                 # blocks keep their positions. This is the one path that changes the number
                 # of content blocks the client sees — defensible because the MCP spec puts
@@ -522,6 +557,22 @@ class Interceptor:
                 result, tool, force_lossless=error_result)
             changed = changed or rewrote_structured
 
+            # The mirror drop happens LAST, after the typed field is final and after both
+            # sinks have seen the raw block: capture feeds the corpus and audit is the
+            # record of what the server sent, and neither may be told the block never
+            # existed. Removal is by identity — an `==`-based remove could take a
+            # different block that happens to compare equal.
+            if mirror is not None:
+                # Slice-assign the list `result["content"]` already points at rather than
+                # rebinding the key: same effect, and it works off `content`, which the
+                # isinstance check above narrowed to a list (`result` is still `Any | None`
+                # to a type checker at this point).
+                content[:] = [b for b in content if b is not mirror]
+                if self.debug:
+                    sys.stderr.write(
+                        f"[terse-proxy] {tool}: dropped {len(mirror['text'])}-char text "
+                        f"mirror of structuredContent (structured=replace)\n")
+
             if self.stats is not None:
                 self._emit_stats(tool, emitted_pairs, display_tool=capture_tool,
                                  diff_reason=diff_reason, structured=structured)
@@ -538,8 +589,16 @@ class Interceptor:
         where `reason` is the Phase 1 instrumentation datum — a short label for WHY the
         diff did/didn't fire (no_prior | keyframe | emitted | not_smaller_same_args |
         not_smaller_diff_args | text_emitted | text_dropped | non_json | passthrough |
-        error), for the
-        ledger. Fail-open: any error leaves the block untouched and state intact."""
+        error), for the ledger.
+
+        Two labels the ledger carries do NOT originate here, so the enumeration above is
+        not the whole value set: `diff_off` and `mirror_dropped` are both set by
+        `transform_response`. `mirror_dropped` means the text block was deleted as a
+        redundant `structuredContent` mirror (#128) and no diff decision was reached at
+        all — which is why it displaces the `diff_off` a single-block result would
+        otherwise carry.
+
+        Fail-open: any error leaves the block untouched and state intact."""
         text = block["text"]
         try:
             applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put,
@@ -782,6 +841,88 @@ class Interceptor:
                 sys.stderr.write(f"[terse-proxy] {tool}: passthrough on error: {exc}\n")
             return text
 
+    def _structured_mode(self, tool: str) -> str:
+        """This tool's `structured` setting, resolved against the connected client. One
+        place, so the mirror-drop guard and the codec can never disagree about the mode."""
+        return policy_mod.structured_mode_for_client(
+            self.policy.select(tool, self.server_name).structured, self.client_name)
+
+    def _mirror_to_drop(self, result: Any, text_blocks: list[dict], tool: str, *,
+                        error_result: bool) -> dict | None:
+        """The text block to delete under `"structured": "replace"` (#128 option 2), or
+        None to leave the result's blocks alone.
+
+        MCP 2025-06-18 has a structured tool return the serialized JSON in a text block
+        *for backwards compatibility*. Measured against `claude` 2.1.218, that client reads
+        `structuredContent` and discards the block — so once the typed field is compressed
+        (#134/#135) the block is the entire remaining wire cost and nobody's input. Dropping
+        it is measured-safe for that client: a result with `content: []` and a populated
+        typed field reaches the model complete and without error
+        (`scripts/probe/structured_content/`, the `nomirror` probe).
+
+        Measured-safe, and for that client measured-worthless: context cost went
+        2,596 -> 1,008 chars under "compress" and 1,008 -> 1,008 under "replace", because
+        the block it removes was already being thrown away. The mode exists for a client
+        that forwards both fields (unmeasured — see `policy.Rule.structured`), which is
+        also the only client that would otherwise see a diffed block contradicting a
+        full-envelope typed field.
+
+        Every condition below must hold; any failure returns None and the result takes the
+        ordinary compress path, exactly as `"compress"` would have produced it:
+
+        * mode resolves to "replace" — never on "auto"/"leave"/"compress"
+        * the rule actually has tiers. `tiers: []` is the "hands off this tool" switch, and
+          removing a block is the most hands-on thing terse does. It also keeps the ledger
+          honest: a passthrough-labelled row whose out_chars fell would be the #133 error
+          again.
+        * not an error result — error text is usually the only thing there, and a model
+          recovering from a failure has to be able to read it
+        * exactly one text block, and it is a FAITHFUL mirror: its parsed JSON equals
+          `structuredContent`. A block that merely accompanies the typed field carries
+          information the typed field does not, and dropping it would lose data. This is
+          the guard that makes the whole thing safe rather than merely measured, since it
+          is checked per result rather than assumed from the spec's SHOULD.
+
+        Deliberately NOT a guard: whether the tool declared an `outputSchema`. That was the
+        expected gate — a client should only prefer the typed field when a schema says it
+        exists — and it was measured false: the `noschema` probe's mirror-less-equivalent
+        tool declares no `outputSchema` and the client forwarded `structuredContent`
+        anyway. Keeping a guard whose premise had just been disproved would be superstition,
+        and it would have cost per-tool `tools/list` state to enforce.
+
+        Also NOT a guard: whether the codec managed to shrink the typed field. If it did
+        not, the field is still there, still complete, still the field the client reads —
+        and the mirror is still dead weight."""
+        if self._structured_mode(tool) != "replace" or error_result:
+            return None
+        if not self.policy.select(tool, self.server_name).tiers:
+            return None
+        if len(text_blocks) != 1:
+            return None
+        if not isinstance(result, dict) or "structuredContent" not in result:
+            return None
+        try:
+            # Compare CANONICAL SERIALIZATIONS, not the parsed values. Python `==` treats
+            # True == 1 and 1 == 1.0, so a block reading `{"ok":true,"n":1.0}` would count
+            # as a faithful mirror of `{"ok":1,"n":1}` and be deleted — handing the model
+            # `1` where the block said `true`. The guard's whole claim is that a block
+            # carrying anything the typed field does not is never dropped; value-level
+            # equality is a hole in it.
+            mirrored = json.dumps(json.loads(text_blocks[0]["text"]),
+                                  sort_keys=True, separators=(",", ":"))
+            typed = json.dumps(result["structuredContent"],
+                               sort_keys=True, separators=(",", ":"))
+            match = mirrored == typed
+        except (ValueError, TypeError, RecursionError):
+            # `RecursionError` covers BOTH statements, and both can raise it: nesting deep
+            # enough blows the C parser's stack on the way in, and a deep `==` recurses on
+            # the way out. This method runs outside `_compress`'s fail-open wrapper, so an
+            # escaping exception would take down a tool call rather than pass it through —
+            # the one failure mode the proxy exists to never have. (json.JSONDecodeError is
+            # a ValueError; the depth cap that motivates this is #79.)
+            return None
+        return text_blocks[0] if match else None
+
     def _compress_structured(self, result: Any, tool: str, *,
                              force_lossless: bool = False) -> tuple[str | None, bool]:
         """Run a result's `structuredContent` through the codec in place, when the matching
@@ -815,9 +956,7 @@ class Interceptor:
                                   ensure_ascii=False)
         except (TypeError, ValueError):
             return None, False                # unserializable: not ours to touch
-        mode = policy_mod.structured_mode_for_client(
-            self.policy.select(tool, self.server_name).structured, self.client_name)
-        if mode != "compress":
+        if self._structured_mode(tool) not in policy_mod.STRUCTURED_REWRITING:
             return original, False            # untouched, but still counted by the ledger
         emitted = self._compress(original, tool, force_lossless=force_lossless)
         if emitted == original:

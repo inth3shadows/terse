@@ -113,8 +113,24 @@ run_arm() {
   echo "  captured $(wc -l < "$out") tool_result block(s) -> $out"
 }
 
-run_arm raw
-run_arm terse
+# ARMS=raw runs the fixture-only arm. That is the whole measurement for the mirror-drop
+# probes (`TOOL=nomirror`, `TOOL=noschema`): they test what the CLIENT does with a wire
+# shape the fixture emits directly, so putting terse in the path would only add a second
+# suspect to any failure.
+ARMS="${ARMS:-raw terse}"
+for arm in $ARMS; do run_arm "$arm"; done
 
 echo
-"$HERE/report.py" "$OUTDIR/raw.jsonl" "$OUTDIR/terse.jsonl"
+# Decide by the ARTIFACTS, not by string-matching $ARMS: `ARMS="terse raw"` and
+# `ARMS="raw  terse"` both run two arms, and an equality test on the variable would
+# silently downgrade either to two presence checks — losing the raw-vs-terse delta that is
+# the whole point of the harness.
+if [ -s "$OUTDIR/raw.jsonl" ] && [ -s "$OUTDIR/terse.jsonl" ]; then
+  "$HERE/report.py" "$OUTDIR/raw.jsonl" "$OUTDIR/terse.jsonl"
+else
+  # `|| rc=1` so a FAIL on the first arm doesn't let `set -e` kill the loop before the
+  # remaining arms report — the second artifact often explains the first one's failure.
+  rc=0
+  for arm in $ARMS; do "$HERE/report.py" "$OUTDIR/$arm.jsonl" || rc=1; done
+  exit "$rc"
+fi

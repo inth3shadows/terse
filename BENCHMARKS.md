@@ -276,6 +276,16 @@ Tracked in #128. The ledger was corrected first (it had the same flaw one level 
 now counts the untouched duplicate on both sides); re-running these numbers per-server is
 the remaining work.
 
+**Recovering it: `"structured": "compress"`, and the mirror drop that adds nothing.**
+Putting the codec on the field the client actually reads takes the reference fixture from
+2,596 to **1,008 chars of the model's real context (61.2%)**, measured end to end by the
+same probe rather than inferred from the ledger. Going one step further and deleting the
+now-redundant text block (`"structured": "replace"`) measures **1,008 → 1,008**: no
+change, because the client had already discarded that block. Worth recording as a negative
+result — the duplicate is a *wire* cost on this client, not a context one, so the
+2,596-char mirror shows up in the ledger's `raw_chars` and never in a token bill. A client
+that forwarded both fields would be the one that benefits, and none has been measured.
+
 ### The headline: the codec is narrow, the diff tier is universal
 
 Two things fall out, and they matter more than any single percentage:

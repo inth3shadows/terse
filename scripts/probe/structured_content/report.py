@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Turn the two capture arms into the verdict issue #128 needs.
 
-Usage: report.py raw.jsonl terse.jsonl
+Usage: report.py raw.jsonl terse.jsonl   # two-arm comparison, the original question
+       report.py one.jsonl               # single-arm: did the payload reach the model?
 
 Reports, per arm, what the client actually put in the model's context, then names which
 of #128's four options the evidence selects. Deliberately refuses to guess when the
 arms disagree in a way the harness didn't anticipate — a confidently-wrong verdict here
 would be worse than no verdict, since the whole point is to stop arguing from priors.
+
+The single-arm mode answers a narrower question, for the mirror-drop probes (#128
+option 2): the fixture emits a wire shape directly, with no terse in the path, and the
+only thing being measured is whether the CLIENT still delivers the payload to the model.
+There is no second arm to compare against, so it reports presence, not a percentage.
 """
 from __future__ import annotations
 
@@ -15,11 +21,22 @@ import sys
 
 
 def load(path: str) -> list[dict]:
+    """Only the tool_result records. The capture also writes a `kind: tool_use` line per
+    call so a result can be attributed to a tool name (see `names_by_id`); those are not
+    measurements and must never enter a token count."""
     with open(path, encoding="utf-8") as fh:
-        return [json.loads(ln) for ln in fh if ln.strip()]
+        recs = [json.loads(ln) for ln in fh if ln.strip()]
+    return [r for r in recs if r.get("kind") != "tool_use"]
 
 
-def describe(name: str, recs: list[dict]) -> dict:
+def names_by_id(path: str) -> dict[str, str]:
+    with open(path, encoding="utf-8") as fh:
+        recs = [json.loads(ln) for ln in fh if ln.strip()]
+    return {r["tool_use_id"]: r.get("name", "?") for r in recs
+            if r.get("kind") == "tool_use" and r.get("tool_use_id")}
+
+
+def describe(name: str, recs: list[dict], names: dict[str, str] | None = None) -> dict:
     tokens = [r["tokens"] for r in recs if r.get("tokens") is not None]
     chars = [r["chars"] for r in recs]
     keys = sorted({k for r in recs for k in r.get("block_keys", [])})
@@ -30,12 +47,50 @@ def describe(name: str, recs: list[dict]) -> dict:
     print(f"  terse envelope     : {enveloped}/{len(recs)}")
     print(f"  chars  (max)       : {max(chars) if chars else 0}")
     print(f"  tokens (max)       : {max(tokens) if tokens else 'n/a (no tiktoken)'}")
+    if names:
+        # Per-result attribution. A run where the model called two different tools is a
+        # different measurement from one where it called the same tool twice, and the
+        # aggregate above cannot tell them apart.
+        for r in recs:
+            print(f"    {names.get(r.get('tool_use_id'), '?'):<12} "
+                  f"{r['chars']:>6} chars  is_error={r.get('is_error')}")
     return {"tokens": max(tokens) if tokens else None,
             "chars": max(chars) if chars else 0,
             "keys": keys, "enveloped": enveloped, "n": len(recs)}
 
 
+def single_arm(path: str) -> int:
+    """Presence check for a one-armed probe. The pass condition is deliberately blunt —
+    a non-empty tool_result carrying the payload — because a mirror-less result that the
+    client silently turns into an empty block is the exact failure this gates against,
+    and that failure is indistinguishable from success in any percentage-based summary."""
+    recs = load(path)
+    arm = describe(path.rsplit("/", 1)[-1].removesuffix(".jsonl"), recs, names_by_id(path))
+    print()
+    if not arm["n"]:
+        print("VERDICT: inconclusive — captured nothing. An empty artifact is a failed "
+              "measurement, not evidence.")
+        return 1
+    # EVERY record, not `describe`'s max. A run where the tool was called twice and one
+    # result arrived empty is the exact failure this gates against, and a max() over
+    # [0, 2596] reports it as a clean PASS. This arm is the sole safety evidence cited for
+    # dropping the mirror, so a false PASS here green-lights the feature on wrong evidence.
+    empty = [r for r in recs if not r["chars"]]
+    if empty:
+        print(f"VERDICT: FAIL — {len(empty)}/{arm['n']} tool_result(s) reached the model")
+        print("  EMPTY. Whatever the server put in `structuredContent` did not survive the")
+        print("  client on those calls.")
+        return 1
+    print(f"VERDICT: PASS — all {arm['n']} tool_result(s) carried payload "
+          f"(max {arm['chars']} chars) into the model's context.")
+    print("  Compare the verbatim block against the fixture's two renderings to say")
+    print("  WHICH field it came from; presence alone is what this arm gates on.")
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) == 2:
+        return single_arm(sys.argv[1])
     if len(sys.argv) != 3:
         print(__doc__, file=sys.stderr)
         return 2
@@ -44,7 +99,8 @@ def main() -> int:
     # the two reads disagree, and the verdict would describe a record set the reader never
     # saw.
     raw_recs, terse_recs = load(sys.argv[1]), load(sys.argv[2])
-    raw, terse = describe("raw", raw_recs), describe("terse", terse_recs)
+    raw = describe("raw", raw_recs, names_by_id(sys.argv[1]))
+    terse = describe("terse", terse_recs, names_by_id(sys.argv[2]))
     print()
 
     if not raw["n"] or not terse["n"]:
