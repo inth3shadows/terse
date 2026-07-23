@@ -339,14 +339,17 @@ payloads, 5 models over an OpenAI-compatible gateway:
 
 | model | called retrieve when needed | asked for the right block | left it alone when not needed | answered correctly |
 |---|--:|--:|--:|--:|
-| `claude-sonnet-5` | 100% | 100% | 100% | 100% |
+| `claude-sonnet-5` | 100% | 100% | 100% | 97% |
 | `deepseek-v4-pro` | 100% | 100% | 100% | 100% |
-| `qwen3.7-max` | 100% | 100% | 100% | 100% |
-| `glm-5.2` | 100% | 100% | 100% | 97% |
+| `qwen3.7-max` | 100% | 100% | 87% | 100% |
+| `glm-5.2` | 100% | 100% | 100% | 83% |
 | `minimax-m3` | 100% | 100% | 100% | 97% |
 
-No model answered from the retained prose as if it had read the source, and none fetched a
-block it did not need. Reproduce with
+No model answered from the retained prose as if it had read the source, and (bar one
+qwen over-fetch) none fetched a block it did not need. The "answered correctly" column is
+a comprehension check on the *retrieved* content and is deliberately un-guessable — it is
+lower than the retrieve columns because the model has to read the fetched source, not
+because it failed to fetch it. Reproduce with
 `terse fluency --drop-eval --corpus <dir> --policy <file> --base-url ... --models ...`.
 
 **State the downside too.** 87% is a *gross* number: a retrieve returns the span in full,
