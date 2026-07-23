@@ -556,7 +556,11 @@ class Interceptor:
             # existed. Removal is by identity — an `==`-based remove could take a
             # different block that happens to compare equal.
             if mirror is not None:
-                result["content"] = [b for b in content if b is not mirror]
+                # Slice-assign the list `result["content"]` already points at rather than
+                # rebinding the key: same effect, and it works off `content`, which the
+                # isinstance check above narrowed to a list (`result` is still `Any | None`
+                # to a type checker at this point).
+                content[:] = [b for b in content if b is not mirror]
                 if self.debug:
                     sys.stderr.write(
                         f"[terse-proxy] {tool}: dropped {len(mirror['text'])}-char text "
