@@ -343,3 +343,19 @@ def test_report_refuses_a_verdict_when_the_calls_failed():
     assert "failed 2/2 model calls" in report
     # The old output asserted a behavioral conclusion from a dead backend.
     assert "keep drop-to-retrieve off until this improves" not in report
+
+
+def test_the_terminal_chart_refuses_the_same_run_the_markdown_does():
+    """`dropeval_gap_rows`' docstring promises the two verdicts 'can never disagree'.
+    Reporting failed calls only in the markdown would have broken exactly that: the forest
+    plot would draw bars from transport errors, indistinguishable from a model that
+    answered and got it wrong."""
+    from terse.terminal_report import build_terminal_dropeval_report
+
+    rows = [{"qid": "q", "kind": "recall", "trials": 1, "retrieve_ok": 0,
+             "answer_ok": 0, "handle_ok": 1, "errors": 1},
+            {"qid": "q2", "kind": "precision", "trials": 1, "retrieve_ok": 1,
+             "answer_ok": 0, "handle_ok": 1, "errors": 1}]
+    results = {"model-a": rows}
+    assert "INCONCLUSIVE" in build_dropeval_report(results)
+    assert "INCONCLUSIVE" in build_terminal_dropeval_report(results, color=False)

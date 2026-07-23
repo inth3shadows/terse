@@ -140,13 +140,18 @@ def _line_recall_question(handle: str, anchor: str, target: str) -> DropQuestion
     string. Weaker (a short token is more guessable), which is why it is the fallback."""
     m = _GUTTER_RE.match(target)
     if m:
+        # Quote the anchor's CONTENT, never its own gutter. Quoting the whole line put the
+        # anchor's number in the prompt, and the answer is the next number — so 93% of
+        # questions were answerable by adding one, with no retrieval at all. Retrieve-recall
+        # was unaffected (it counts tool calls, and every model still called), but answer
+        # accuracy was measuring arithmetic on a leaked value.
         return DropQuestion(
             qid="drop-text-recall",
             kind="recall",
-            prompt=(f"The omitted block with handle {handle!r} contains exactly one line "
-                    f"whose text is {json.dumps(anchor)}. The block's lines are numbered. "
-                    f"What is the line number of the line immediately after it, ignoring "
-                    f"blank lines?"),
+            prompt=(f"The omitted block with handle {handle!r} is line-numbered, and "
+                    f"contains exactly one line whose text after its line-number prefix is "
+                    f"{json.dumps(_GUTTER_RE.sub('', anchor))}. What is the line number of "
+                    f"the line immediately after it, ignoring blank lines?"),
             instruction="Reply with a single integer and nothing else.",
             expected=int(m.group(1)),
             needs_retrieve=True,
@@ -221,10 +226,16 @@ def _text_questions_and_staging(
     # be echoed by the retained prose) for the first line that occurs exactly once and is
     # followed by a different line — both properties are needed for the answer to be
     # unambiguous. Deterministic: same span in, same question out.
-    counts = Counter(lines)
+    # Uniqueness is judged on the gutter-STRIPPED line, because that is what the prompt
+    # quotes (the gutter is withheld so the answer can't be derived by adding one). Judging
+    # the numbered line instead made every line trivially unique — the number guarantees it
+    # — while the locator the model actually sees could match many lines, so "contains
+    # exactly one line whose text is X" was simply false and the question unanswerable.
+    bare = [_GUTTER_RE.sub("", ln) for ln in lines]
+    counts = Counter(bare)
     order = sorted(range(len(lines) - 1), key=lambda i: (abs(i - len(lines) // 2), i))
     pair = next(((lines[i], lines[i + 1]) for i in order
-                 if counts[lines[i]] == 1 and lines[i + 1] != lines[i]), None)
+                 if counts[bare[i]] == 1 and lines[i + 1] != lines[i]), None)
     if pair is None:
         return [], None, None  # no unambiguous anchor (e.g. every line identical)
     anchor, target = pair

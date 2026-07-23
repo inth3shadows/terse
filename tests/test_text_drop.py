@@ -314,8 +314,12 @@ def test_run_drop_text_payload_is_the_single_payload_entry_point():
 
 
 def _anchor_of(prompt, span_lines):
-    """The one line of the span the prompt quotes verbatim as its locator."""
-    return next(ln for ln in span_lines if json.dumps(ln) in prompt)
+    """The one line of the span the prompt quotes as its locator. A line-numbered block is
+    quoted WITHOUT its gutter — see test_the_anchor_never_leaks_its_own_line_number."""
+    import re
+    gut = re.compile(r"^\s*\d+\t")
+    return next(ln for ln in span_lines
+                if json.dumps(ln) in prompt or json.dumps(gut.sub("", ln)) in prompt)
 
 
 def test_text_recall_question_is_anchored_not_counted():
@@ -390,5 +394,40 @@ def test_gutter_only_lines_count_as_blank():
     recall, _ = dropeval.gen_text_drop_questions(doc, rule, "codegraph_explore")
     # Neither the anchor nor the answer may be one of the gutter-only lines.
     assert isinstance(recall.expected, int) and recall.expected < 1000, recall.expected
-    anchor = recall.prompt.split("whose text is ")[1].split(".")[0]
-    assert "\\t\"" not in anchor, anchor
+    quoted = recall.prompt.split(" prefix is ")[1]
+    assert not quoted.startswith('""'), quoted   # a gutter-only line has empty content
+
+
+def test_the_anchor_never_leaks_its_own_line_number():
+    """Quoting the anchor line whole put its line number in the prompt — and the answer is
+    the next number, so 93% of generated questions were answerable by adding one, with no
+    retrieval at all. Measured on 30 live payloads. Retrieve-recall was unaffected (it
+    counts tool calls), but answer accuracy was scoring arithmetic on a leaked value."""
+    import re
+    numbered = "\n".join(f"{i}\tresolve(ctx, payload, opts) // widening the covered region"
+                         for i in range(40, 90))
+    doc = f"## E\n\n### Source Code\n\n```go\n{numbered}\n```\n\nProse.\n"
+    recall, _ = dropeval.gen_text_drop_questions(doc, _drop_rule(), "codegraph_explore")
+    quoted = re.search(r'prefix is (".*?")\. What is', recall.prompt).group(1)
+    assert not re.match(r'^"\s*\d+\\t', quoted), quoted
+    assert str(recall.expected) not in quoted
+    assert str(recall.expected - 1) not in quoted
+
+
+def test_the_quoted_locator_is_unique_on_what_the_model_actually_sees():
+    """Uniqueness must be judged on the gutter-STRIPPED line, since that is what the prompt
+    quotes. Judging the numbered line made every line trivially unique — the number
+    guarantees it — while the locator the model sees could match many, so "contains exactly
+    one line whose text is X" was false and the question unanswerable."""
+    import re
+    same = "resolve(ctx, payload, opts) // identical on every line"
+    body = "\n".join(f"{i}\t{same}" if i % 3 else f"{i}\tdistinct call number {i // 3}"
+                     for i in range(40, 90))
+    doc = f"## E\n\n### Source Code\n\n```go\n{body}\n```\n\nProse.\n"
+    recall, _ = dropeval.gen_text_drop_questions(doc, _drop_rule(), "codegraph_explore")
+    quoted = json.loads(re.search(r'prefix is (".*?")\. What is', recall.prompt).group(1))
+    assert quoted != same, "the locator matches 33 lines — it locates nothing"
+    _, store = _apply(doc, _drop_rule())
+    bare = [re.sub(r"^\s*\d+\t", "", ln)
+            for ln in store[recall.expected_handle].splitlines() if ln.strip()]
+    assert bare.count(quoted) == 1

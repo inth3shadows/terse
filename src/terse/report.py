@@ -126,6 +126,22 @@ def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float
     return out, broken
 
 
+def inconclusive_models(results: dict) -> dict[str, tuple[int, int]]:
+    """{model: (failed_calls, attempts)} for models whose calls mostly did not reach the
+    backend. A failed call scores identically to a model that declined to retrieve, so past
+    this threshold the accuracy columns are counting transport errors and no verdict may be
+    rendered from them. Lives beside `dropeval_gap_rows` and for the same reason: the
+    markdown verdict and the terminal chart must never disagree about whether a run counts.
+    """
+    out: dict[str, tuple[int, int]] = {}
+    for model, rows in results.items():
+        errs = sum(r.get("errors", 0) for r in rows)
+        attempts = sum(r.get("trials", 1) for r in rows)
+        if errs and attempts and errs * 2 >= attempts:
+            out[model] = (errs, attempts)
+    return out
+
+
 def dropeval_gap_rows(results: dict) -> dict[str, dict[str, tuple[float, float, float, float]]]:
     """Per-model (recall, precision, accuracy) gap-row tuples for build_dropeval_report
     and its terminal-bar companion. Control is always a fixed 100% ideal (se=0) — there's
@@ -887,7 +903,7 @@ def build_dropeval_report(results: dict) -> str:
     out += ["## Verdict", ""]
     # Half of a model's calls failing means its accuracy columns are mostly counting
     # transport errors. Refuse to render a pass/fail rather than let the run be cited.
-    inconclusive = {m: (e, a) for m, (e, a) in err_by_model.items() if a and e * 2 >= a}
+    inconclusive = inconclusive_models(results)
     if inconclusive:
         out += ["- **INCONCLUSIVE** — "
                 + ", ".join(f"`{m}` failed {e}/{a} model calls" for m, (e, a) in
