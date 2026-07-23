@@ -421,3 +421,23 @@ def test_apply_falls_back_to_lossless_when_codec_self_check_fails(monkeypatch):
     assert json.loads(result.text) == json.loads(RECORDS)  # lossless despite the "bug"
     assert result.tiers == ()
     assert any("self-check failed" in w for w in result.warnings)
+
+
+def test_structured_defaults_to_leave_and_accepts_only_known_literals(tmp_path):
+    # Strict for the same reason `capture` is: this decides whether terse rewrites a field
+    # carrying a declared outputSchema. A typo reverting to "leave" is a quiet no-op; a
+    # typo enabling "compress" quietly rewrites a typed field. Both must fail at load.
+    def write(rule):
+        p = tmp_path / "p.json"
+        p.write_text(json.dumps({"version": 1, "policies": [rule]}))
+        return p
+    assert load_policy(write({"match": {"tool": "*"}, "tiers": []})).rules[0].structured \
+        == "leave"
+    assert load_policy(write({"match": {"tool": "*"}, "tiers": [],
+                              "structured": "compress"})).rules[0].structured == "compress"
+    for bad in ("Compress", "true", True, 1, None, "drop"):
+        try:
+            load_policy(write({"match": {"tool": "*"}, "tiers": [], "structured": bad}))
+        except ValueError:
+            continue
+        raise AssertionError(f"load_policy accepted structured={bad!r}")

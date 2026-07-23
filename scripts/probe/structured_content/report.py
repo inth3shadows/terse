@@ -83,11 +83,24 @@ def main() -> int:
         print("     the typed field clients validate against `outputSchema`.")
         return 0
 
-    if not terse["enveloped"]:
-        print("VERDICT: terse did not compress this result at all (no envelope in the "
-              "model's context), and the arms differ. Fix the wiring before reading "
-              "anything into the numbers above.")
-        return 1
+    # A terse envelope IN THE MODEL'S CONTEXT settles it without any threshold reasoning:
+    # whatever field the client reads, terse reached it. The percentage above is then the
+    # real saving, not a proxy for one. This is what `"structured": "compress"` (#128)
+    # produces, and it must be checked BEFORE the threshold branches below — those were
+    # calibrated for the default build, where the envelope never arrives, and would
+    # misread a genuine 61% as the "duplicate halved it" signature.
+    if terse["enveloped"]:
+        print("VERDICT: terse's output REACHES the model — a terse envelope is in the")
+        print(f"  context, so the {saved:.1f}% above is the real saving, not an estimate.")
+        print("  If this run had `structured: compress` set, that is the #128 fix")
+        print("  working: the codec is now landing on the field the client actually")
+        print("  reads. Confirm the policy in use before quoting the number.")
+        return 0
+
+    print("VERDICT: terse did not compress this result at all (no envelope in the "
+          "model's context), and the arms differ. Fix the wiring before reading "
+          "anything into the numbers above.")
+    return 1
 
     # The measured saving on the text block alone was 70.5%; with an untouched duplicate
     # riding along it was 56.2% (issue #128's table). Those are far enough apart to

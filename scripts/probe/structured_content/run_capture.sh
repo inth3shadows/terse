@@ -38,8 +38,15 @@ mkdir -p "$OUTDIR"; chmod 700 "$OUTDIR"
 cat > "$OUTDIR/mcp-raw.json" <<JSON
 {"mcpServers":{"sfix":{"command":"python3","args":["$HERE/structured_server.py"]}}}
 JSON
+# POLICY=<file> threads a policy through to the terse arm — the way to measure what
+# `"structured": "compress"` (#128) actually does to the model's context, which is the
+# only number that counts here: the ledger and the benchmark can both disagree with it.
+POLICY_ARGS=""
+if [ -n "${POLICY:-}" ]; then
+  POLICY_ARGS="\"--policy\",\"$POLICY\","
+fi
 cat > "$OUTDIR/mcp-terse.json" <<JSON
-{"mcpServers":{"sfix":{"command":"$TERSE_BIN","args":["proxy","--no-stats","--server-name","sfix","--","python3","$HERE/structured_server.py"]}}}
+{"mcpServers":{"sfix":{"command":"$TERSE_BIN","args":["proxy",$POLICY_ARGS"--no-stats","--server-name","sfix","--","python3","$HERE/structured_server.py"]}}}
 JSON
 
 MITM_PID=""
