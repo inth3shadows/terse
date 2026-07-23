@@ -793,9 +793,18 @@ class Interceptor:
         emits both, compressing only the block delivers ~0%. Why it is opt-in, and why the
         default must stay "leave": see `policy.Rule.structured`.
 
-        Codec only — no diff. Diffing the typed field needs its own per-tool base and
-        keyframe accounting; mixing that in here would double the surface with none of the
-        evidence the text-block diff tier earned before it was turned on.
+        No diff. Diffing the typed field needs its own per-tool base and keyframe
+        accounting; mixing that in here would double the surface with none of the evidence
+        the text-block diff tier earned before it was turned on.
+
+        It is otherwise the SAME path the text block takes — `policy.apply` — so a rule
+        that declares `drop-to-retrieve` fields sees them applied here too, and the typed
+        field can come out carrying a `__terse_dropped__` marker. That is deliberate (the
+        mirrored payload has the mirrored shape, so the same field paths match) and it
+        inherits the same guards: the never-lossy SERVER floor is enforced inside `apply`
+        on the verified server identity, and `force_lossless` suppresses it on an error
+        result. Handles are content-derived, so the same value dropped from both the block
+        and the field resolves to one store entry, not two.
 
         Fail-open like everything else on this path: a field that does not survive a
         round-trip through `json.dumps` is left exactly as it was."""
