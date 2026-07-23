@@ -1792,3 +1792,19 @@ def test_structured_auto_never_resolves_to_replace():
     out = json.loads(inter.transform_response(_structured_result_msg(1, _SC_PAYLOAD)))
     assert len(out["result"]["content"]) == 1              # mirror survives
     assert "__terse_" in json.dumps(out["result"]["structuredContent"])   # but compressed
+
+
+def test_structured_replace_survives_a_payload_too_deep_to_parse():
+    # `_mirror_to_drop` runs OUTSIDE `_compress`'s fail-open wrapper, so an escaping
+    # exception takes down the whole tool call. Nesting deep enough raises RecursionError
+    # from the C parser (the depth cap in #79 exists for this), and a deep `==` recurses
+    # too. Neither may reach the caller.
+    # Depth chosen by measurement, not by `recursionlimit * k`: CPython's C scanner
+    # swallows 20k nested arrays fine and only blows up near 100k, so a smaller number
+    # would make this test pass whether the guard is there or not.
+    depth = 100_000
+    deep_text = "[" * depth + "]" * depth
+    result = {"content": [{"type": "text", "text": deep_text}],
+              "structuredContent": {"rows": []}}
+    out = _replace_run(result)
+    assert out["content"][0]["text"] == deep_text          # passed through, not dropped

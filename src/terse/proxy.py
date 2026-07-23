@@ -888,9 +888,16 @@ class Interceptor:
             return None
         try:
             mirrored = json.loads(text_blocks[0]["text"])
-        except (json.JSONDecodeError, ValueError):
-            return None                       # not JSON: not a mirror of anything
-        return text_blocks[0] if mirrored == result["structuredContent"] else None
+            match = mirrored == result["structuredContent"]
+        except (ValueError, TypeError, RecursionError):
+            # `RecursionError` covers BOTH statements, and both can raise it: nesting deep
+            # enough blows the C parser's stack on the way in, and a deep `==` recurses on
+            # the way out. This method runs outside `_compress`'s fail-open wrapper, so an
+            # escaping exception would take down a tool call rather than pass it through —
+            # the one failure mode the proxy exists to never have. (json.JSONDecodeError is
+            # a ValueError; the depth cap that motivates this is #79.)
+            return None
+        return text_blocks[0] if match else None
 
     def _compress_structured(self, result: Any, tool: str, *,
                              force_lossless: bool = False) -> tuple[str | None, bool]:
