@@ -29,7 +29,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 from urllib.parse import urlparse
 
 from ._secure_io import append_restricted
@@ -283,23 +283,16 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
     return "\n".join(lines) + "\n"
 
 
-def build_stats_writer(stats_log: str | Path, server: str, debug: bool,
-                       log_prefix: str, stderr: TextIO | None = None):
+def build_stats_writer(stats_log: str | Path, server: str):
     """The proxy-side callback: (tool, raw, emitted, passthrough) -> appended record.
-    Owns all I/O and swallows every failure (debug-gated stderr only) — the same
-    never-load-bearing contract as capture/audit, kept here so both run_proxy and
-    run_multi_proxy wire it identically."""
-    import sys
-
-    err = stderr if stderr is not None else sys.stderr
-
+    Owns all I/O and NOTHING else, kept here so both run_proxy and run_multi_proxy wire
+    it identically. A write failure propagates: stats is still never load-bearing, but
+    the swallow-and-announce lives in the one caller with the bookkeeping for it,
+    `proxy.Interceptor._warn_sink` — catching here too made its unconditional
+    first-failure warning dead code, so a dead ledger stayed silent (#131)."""
     def stats(tool: str, raw: str, emitted: str, passthrough: bool,
               diff_reason: str | None = None) -> None:
-        try:
-            append_stats(build_record(server, tool, raw, emitted, passthrough, diff_reason),
-                         stats_log)
-        except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
-            if debug:
-                err.write(f"{log_prefix} append_stats failed: {exc}\n")
+        append_stats(build_record(server, tool, raw, emitted, passthrough, diff_reason),
+                     stats_log)
 
     return stats

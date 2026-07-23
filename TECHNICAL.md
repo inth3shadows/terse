@@ -89,8 +89,13 @@ raw tool output (JSON text)
   own name — truthful, and what `install-mcp` bakes in), else `server_label`'s guess from
   the command basename, which misreads a launcher-wrapped server (kb behind secret-broker
   labels itself `sb-run`) — #83. Default path `$XDG_STATE_HOME/terse/stats.jsonl`; the
-  proxy wires it via `build_stats_writer` (same never-load-bearing, failures-swallowed contract
-  as capture/audit). ON by default in `cli.py` (`--no-stats` / `--stats-log FILE`);
+  proxy wires it via `build_stats_writer` (same never-load-bearing contract as
+  capture/audit: the writer owns I/O only and lets failures out, and `Interceptor`
+  swallows them — announcing the first of each kind unconditionally, further ones only
+  under `--debug`, so a dead sink can't go silent *or* flood stderr; #131. The
+  bookkeeping lives on the `Interceptor`, which multiproxy builds per peer, so there
+  the guard is once per (peer, kind) — attribution over a single line). ON by
+  default in `cli.py` (`--no-stats` / `--stats-log FILE`);
   the `run_proxy`/`run_multi_proxy` API default stays None (disabled) so library
   callers opt in explicitly.
 - **`capture.py`** — `classify_shape` (pretty/compact JSON, array-of-records,

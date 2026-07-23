@@ -10,6 +10,19 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Fixed
+- **A broken capture/stats/audit sink now says so, instead of failing silently.** The
+  callbacks handed to the `Interceptor` caught their own exceptions behind a `--debug`
+  gate, so the `try/except → _warn_sink` around them never saw one and `_warn_sink`'s
+  unconditional first-failure warning was dead code. A `--capture-dir` pointing at a
+  regular file, or a `--stats-log` pointing at a directory, produced a completely
+  normal-looking run — every tool call answered, exit 0 — with zero payloads captured,
+  no ledger written, and nothing on stderr; a later `terse measure --corpus` then
+  reported a percentage over whatever subset happened to land. The callbacks now own
+  I/O only and let failures propagate to the single caller that has the per-sink
+  bookkeeping. The fail-open contract is unchanged: a sink failure still never changes
+  what the client receives — it is now merely *audible*: once per sink kind, and under
+  `multiproxy` (where the `Interceptor` and its bookkeeping are per-peer) once per
+  peer, so a dead shared sink is attributed to each downstream that hit it.
 - **A server-initiated request no longer silently disables compression for an in-flight
   call.** A server→client request (`roots/list`, `sampling/createMessage`,
   `elicitation/create`) carries a `method` alongside an id, and JSON-RPC gives each

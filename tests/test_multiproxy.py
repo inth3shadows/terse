@@ -195,6 +195,31 @@ def test_stats_ledger_records_peer_name_and_qualified_tool(tmp_path):
     assert "active" not in log.read_text(encoding="utf-8")   # payload-free
 
 
+def test_broken_stats_sink_warns_once_per_peer_under_the_multiproxy_prefix(tmp_path,
+                                                                          capsys):
+    # #131: sink-failure reporting moved into the Interceptor, so the line must still say
+    # [terse-multiproxy], not the single-proxy default. The Interceptor — and with it the
+    # warn-once bookkeeping — is PER PEER here, so the guard is once-per-(peer, kind), not
+    # once per kind: two peers hitting the same dead sink say so twice, each attributed to
+    # itself. That attribution is the point; the flood guard still holds within a peer.
+    cfg = _write_config(tmp_path, [{"name": "gh", "command": [sys.executable, str(FAKE)]},
+                                   {"name": "gh2", "command": [sys.executable, str(FAKE)]}])
+    cin = io.StringIO("\n".join(
+        json.dumps({"jsonrpc": "2.0", "id": i, "method": "tools/call",
+                    "params": {"name": f"{peer}__gh.api.items"}})
+        # two calls per peer: the SECOND must be silenced, the first must not
+        for i, peer in enumerate(["gh", "gh", "gh2", "gh2"], start=2)) + "\n")
+    cout = io.StringIO()
+    rc = run_multi_proxy(str(cfg), PLAIN_POLICY, stdin=cin, stdout=cout,
+                         stats_log=str(tmp_path))     # a DIRECTORY — every append fails
+    assert rc == 0
+    warnings = [ln for ln in capsys.readouterr().err.splitlines() if "stats skipped" in ln]
+    assert sorted(ln.split(":")[0] for ln in warnings) == [
+        "[terse-multiproxy] gh2__gh.api.items", "[terse-multiproxy] gh__gh.api.items"]
+    # all four calls still answered — a dead ledger is never load-bearing
+    assert len([ln for ln in cout.getvalue().splitlines() if ln.strip()]) == 4
+
+
 def test_tools_call_routes_by_prefix_and_strips_it(tmp_path):
     with _fake_http() as srv:
         cfg = _write_config(tmp_path, [

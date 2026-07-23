@@ -615,6 +615,63 @@ def test_run_proxy_capture_dir_failure_does_not_break_traffic(tmp_path):
         {"id": i, "status": "active", "url": "https://x.example/api/items"} for i in range(20)]}
 
 
+def _two_tool_calls() -> str:
+    return "\n".join(json.dumps({"jsonrpc": "2.0", "id": i, "method": "tools/call",
+                                 "params": {"name": "gh.api.items"}})
+                     for i in (1, 2)) + "\n"
+
+
+def test_run_proxy_broken_capture_warns_once_without_debug(tmp_path, capsys):
+    # #131: the sink callbacks used to swallow their own failures behind --debug, so
+    # Interceptor._warn_sink's unconditional first-failure line could never fire and a
+    # --capture-dir that captures NOTHING looked like a perfectly normal run.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    cin, cout = io.StringIO(_two_tool_calls()), io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout,
+                   capture_dir=str(blocker))
+    assert rc == 0
+    warnings = [ln for ln in capsys.readouterr().err.splitlines()
+                if "capture skipped" in ln]
+    # exactly ONE line despite two failing calls, and it names the sink + the tool
+    assert len(warnings) == 1
+    assert warnings[0].startswith("[terse-proxy] gh.api.items: capture skipped: ")
+    assert "silenced unless --debug" in warnings[0]
+    # and the client still got both results (a dead sink stays fail-open); the first is
+    # the full compressed payload, the second a diff against it, exactly as with a
+    # healthy capture dir
+    lines = [ln for ln in cout.getvalue().splitlines() if ln.strip()]
+    assert [json.loads(ln)["id"] for ln in lines] == [1, 2]
+    assert transforms.decompress(
+        json.loads(lines[0])["result"]["content"][0]["text"]) == {
+            "result": [{"id": i, "status": "active",
+                        "url": "https://x.example/api/items"} for i in range(20)]}
+
+
+def test_run_proxy_broken_audit_log_warns_without_debug(tmp_path, capsys):
+    # --debug-log at a DIRECTORY: append_audit's open() fails on every call (#131).
+    cin, cout = io.StringIO(_two_tool_calls()), io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout,
+                   debug_log=str(tmp_path))
+    assert rc == 0
+    warnings = [ln for ln in capsys.readouterr().err.splitlines() if "audit skipped" in ln]
+    assert len(warnings) == 1 and warnings[0].startswith("[terse-proxy] gh.api.items: ")
+    assert len([ln for ln in cout.getvalue().splitlines() if ln.strip()]) == 2
+
+
+def test_run_proxy_broken_stats_log_warns_without_debug(tmp_path, capsys):
+    # --stats-log at a DIRECTORY. Stats is the on-by-default sink, so a silently dead
+    # ledger is the one most likely to go unnoticed — and it is what makes a later
+    # `terse measure --corpus` report a percentage over whatever subset survived (#131).
+    cin, cout = io.StringIO(_two_tool_calls()), io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout,
+                   stats_log=str(tmp_path))
+    assert rc == 0
+    warnings = [ln for ln in capsys.readouterr().err.splitlines() if "stats skipped" in ln]
+    assert len(warnings) == 1 and warnings[0].startswith("[terse-proxy] gh.api.items: ")
+    assert len([ln for ln in cout.getvalue().splitlines() if ln.strip()]) == 2
+
+
 def test_run_proxy_debug_log_writes_replay_trace(tmp_path):
     requests = "\n".join([
         json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
