@@ -39,9 +39,13 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   prints a per-rule diff, names what it deliberately did not regenerate, and writes
   **nothing** without `--apply`. New rules are inserted before any existing glob that would
   shadow them, since a `kb.read.search` rule appended after `kb.*` is dead on arrival.
-  Warns before applying a tier *downgrade*: the generator scores payloads individually,
-  while the proxy compresses a multi-block result as one joined array (#116), so a
-  one-record-per-block server scores far lower in the generator than it does in production.
+  A new rule **inherits the operator-owned keys of whatever rule it displaces** — inserting
+  it ahead of a broader rule must not quietly hand that tool `capture: true` or
+  `structured: "auto"` — and a rule whose `tiers: []` is suppressing a lossy `$text.*`
+  selector keeps `tiers: []`, because turning them on would ACTIVATE that selector and this
+  merge is documented as lossless. Warns before applying a tier *downgrade*: the corpus is
+  a sample (idempotent by sha, and empty for a `capture: false` tool), so a removal should
+  be cross-checked against `terse stats`, which counts every call.
 
 ### Added
 - **`"structured": "compress"` — compress `structuredContent` too (#128).** New per-rule
