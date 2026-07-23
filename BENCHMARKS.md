@@ -214,15 +214,67 @@ Servers: the official reference set (`modelcontextprotocol/servers`, 88.8k★) p
 most-starred credential-free third-party servers — **serena** (26.7k★) and
 **playwright-mcp** (35.4k★).
 
-| server | tool | output shape | codec % (1-shot) | an *unchanged* repeat |
-|---|---|---|--:|---|
-| filesystem | `directory_tree` | JSON, pretty-printed | **50–58%** | diff |
-| filesystem | `read_text_file` | source text | 0% | text-diff |
-| git | `git_log` | long text | 0% | text-diff |
-| memory | `read_graph`, `search_nodes`, `create_entities` | JSON | **40–42%** | — |
-| serena | `get_symbols_overview`, `find_symbol` | JSON, already compact | **18–22%** | diff |
-| playwright | `browser_snapshot` | accessibility tree (text) | 0% | text-diff |
-| fetch | `fetch` | markdown | 0% | text-diff |
+| server | tool | output shape | codec % (1-shot) | an *unchanged* repeat | reaches the model? |
+|---|---|---|--:|---|---|
+| filesystem | `directory_tree` | JSON, pretty-printed | **50–58%** | diff | ⚠️ no — see below |
+| filesystem | `read_text_file` | source text | 0% | text-diff | ⚠️ no — see below |
+| git | `git_log` | long text | 0% | text-diff | yes |
+| memory | `read_graph`, `search_nodes`, `create_entities` | JSON | **40–42%** | — | ⚠️ no — see below |
+| serena | `get_symbols_overview`, `find_symbol` | JSON, already compact | **18–22%** | diff | yes |
+| playwright | `browser_snapshot` | accessibility tree (text) | 0% | text-diff | yes |
+| fetch | `fetch` | markdown | 0% | text-diff | yes |
+
+### Honest scope note: on two of these servers the codec % never reaches the model
+
+Added 2026-07-23, after measuring it. **These percentages describe the text content block,
+which on some servers the client discards.**
+
+MCP 2025-06-18 lets a tool return `structuredContent` alongside a text block that
+serializes the same data for backwards compatibility. terse compresses the text block and
+leaves `structuredContent` alone (#128). Measured with a read-only proxy on the real
+client (`claude` 2.1.218, `scripts/probe/structured_content/`), the client forwards
+**`structuredContent`** to the model and discards the text block entirely — so wherever a
+server emits it, the codec % above is a reduction of a payload the model never sees.
+
+Which servers do, measured by `outputSchema` declarations and confirmed on the wire:
+
+| server | tools declaring `outputSchema` |
+|---|--:|
+| filesystem | **14 / 14** |
+| memory | **9 / 9** |
+| serena | 0 / 21 |
+| playwright | 0 / 24 |
+| git | 0 / 12 |
+| fetch | 0 / 1 |
+
+It splits along SDK generation, not by accident: the newer TypeScript servers declare
+schemas on every tool. Expect this to grow.
+
+`filesystem`/`directory_tree`, re-measured end to end:
+
+| quantity | tokens |
+|---|--:|
+| text block, raw | 1,658 |
+| text block, terse | 816 |
+| — the 50.8% this table reports | |
+| `structuredContent` (untouched) | 2,047 |
+| **what the model actually receives** | **2,047** |
+| **saving in the model's context** | **0%** |
+| honest whole-result wire saving | 22.7% |
+
+Note the structured form is *larger* than the text block it mirrors — the JSON wrapper
+re-encodes newlines as `\n` escapes — so on this tool the client's choice costs more than
+the text block would have, before terse enters the picture at all.
+
+**What survives this correction:** serena's 18–22% is the only non-zero one-shot codec
+number in the table that reaches the model, and the diff tier still lands on `git`,
+`serena`, `playwright` and `fetch`. The claim below — codec narrow, diff broad — holds;
+it is narrower than first published, and the two rows carrying the biggest codec numbers
+are the two that don't count.
+
+Tracked in #128. The ledger was corrected first (it had the same flaw one level down, and
+now counts the untouched duplicate on both sides); re-running these numbers per-server is
+the remaining work.
 
 ### The headline: the codec is narrow, the diff tier is universal
 
@@ -248,7 +300,9 @@ loop re-fetches results that have **changed**, and how much the delta grows with
 is workload-specific and **not measured here**.
 
 So on third-party servers the **cross-call diff is the broad, shape-independent win, and the
-codec is the JSON-specific one.** That is a sharper claim than a blended average, and it
+codec is the JSON-specific one** — narrowed further by the `structuredContent` note above,
+which removes both of the codec's biggest rows from what the model actually receives, and
+leaves the diff tier landing on four of the six servers. That is a sharper claim than a blended average, and it
 predicts where terse helps: agent loops that call the same tool repeatedly. Browser
 automation is the shape it should suit best — navigate → snapshot → act → snapshot produces
 consecutive, largely-overlapping accessibility trees. Stated as a *prediction*, not a

@@ -62,6 +62,27 @@ Worse than the issue's framing. #128 measured the duplicate as *halving* the sav
   truth — what terse can measure without knowing the client — and remains an upper bound
   on what a `structuredContent`-reading client actually saves, which is 0%.
 
+### Follow-up: does the client validate `structuredContent` against `outputSchema`?
+
+**No** — measured, not assumed. #128 rejects option 1 on the grounds that clients validate
+the typed field, so the fixture carries two probes that test it:
+
+| probe | `structuredContent` it sends | client's response |
+|---|---|---|
+| `badtype` | right keys, wrong types (schema says `number`, sends `"hot"`) | forwarded verbatim, `is_error=False` |
+| `enveloped` | a terse table envelope where the schema declares an array of records — **exactly what option 1 would put on the wire** | forwarded verbatim, `is_error=False` |
+
+`enveloped` is the one that matters: structurally incompatible with the declared schema,
+and passed straight through to the model without complaint.
+
+That makes option 1 safe *for this client* — the spec still says clients SHOULD validate,
+so it is not safe in general. Which is precisely the argument for a policy-gated opt-in
+rather than unconditional behavior.
+
+For scale: the same data compressed by terse was **1,008 chars** against the 2,596 the
+model currently receives — roughly **61%** recoverable on a `structuredContent`-emitting
+tool, against the 0% recovered today.
+
 ### Scope — read before generalizing
 
 - One client, one version: `claude` **2.1.218**. The MCP spec makes the text block a

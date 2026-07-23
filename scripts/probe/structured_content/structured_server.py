@@ -76,9 +76,31 @@ TOOLS = [
      "description": "Thirty uniform records plus their text mirror (the tabularize case).",
      "inputSchema": {"type": "object", "properties": {}},
      "outputSchema": RECORDS_SCHEMA},
+    # The two schema-violation probes. #128's option 1 (compress `structuredContent`
+    # itself) is rejected on the grounds that clients validate the typed field against
+    # `outputSchema` — an assumption nobody had tested. These make it testable.
+    {"name": "badtype",
+     "description": "Structured content violating its own outputSchema by TYPE.",
+     "inputSchema": {"type": "object", "properties": {}},
+     "outputSchema": WEATHER_SCHEMA},
+    {"name": "enveloped",
+     "description": "Structured content replaced by a terse envelope (option 1's shape).",
+     "inputSchema": {"type": "object", "properties": {}},
+     "outputSchema": RECORDS_SCHEMA},
 ]
 
-PAYLOADS = {"weather": WEATHER, "records": RECORDS}
+# `badtype` is the mild violation: right keys, wrong types (schema says number, sends
+# string). `enveloped` is the one that actually matters — it is exactly what option 1
+# would put on the wire: a terse table envelope where the schema declares an array of
+# records. If a client rejects anything, it should reject this.
+BADTYPE = {"temperature": "hot", "conditions": 42, "humidity": "very"}
+ENVELOPED = {"__terse_table__": 1, "n": 30,
+             "cols": ["id", "status", "city", "url"],
+             "rows": [[r["id"], r["status"], r["city"], r["url"]]
+                      for r in RECORDS["rows"]]}
+
+PAYLOADS = {"weather": WEATHER, "records": RECORDS,
+            "badtype": BADTYPE, "enveloped": ENVELOPED}
 
 
 def _result(payload: dict) -> dict:
