@@ -442,6 +442,11 @@ def test_a_long_text_tool_is_proposed_the_code_block_selector():
     row = next(r for r in rows[0]["drop_rows"] if r["path"] == "$text.code_blocks")
     assert row["role"] == "unknown"
     assert row["tok_share"] > 0.4
+    # Measured, not asserted: three identical payloads means every block repeats, and
+    # identical blocks are content-addressed to one handle. Printing a fabricated
+    # "100% uniq" beside honestly-measured JSON rows would misreport the drop's cost.
+    assert row["n"] == 9 and row["distinct"] == 3
+    assert row["uniq_ratio"] == round(3 / 9, 4)
 
     # INACTIVE: the loader reads `fields`, so the generated policy is still fully lossless.
     assert "fields" not in rule

@@ -308,6 +308,8 @@ def _text_drop_candidate(raws: list[str]) -> tuple[dict[str, dict], list[dict[st
     """
     n = spans_tok = total_tok = 0
     max_tok = 0
+    n_spans = 0
+    distinct: set[str] = set()
     for raw in raws:
         if not isinstance(raw, str) or classify_shape(raw) != LONG_TEXT:
             continue
@@ -316,9 +318,12 @@ def _text_drop_candidate(raws: list[str]) -> tuple[dict[str, dict], list[dict[st
         for start, end in fenced_spans(raw):
             if end - start < DEFAULT_TEXT_DROP_MIN:
                 continue  # under the floor: the runtime leaves it in place, so don't count it
-            t = _tok(raw[start:end])
+            span = raw[start:end]
+            t = _tok(span)
             spans_tok += t
             max_tok = max(max_tok, t)
+            n_spans += 1
+            distinct.add(span)
     if n < _TEXT_DROP_MIN_PAYLOADS or not total_tok:
         return {}, []
     share = spans_tok / total_tok
@@ -328,8 +333,13 @@ def _text_drop_candidate(raws: list[str]) -> tuple[dict[str, dict], list[dict[st
                                               "min": DEFAULT_TEXT_DROP_MIN}}
     # role stays `unknown`, never `prose`: a fenced block is source, and source is exactly
     # the load-bearing case the role split exists to flag for review.
-    row = {"path": TEXT_SELECTOR_CODE_BLOCKS, "role": "unknown", "n": n, "distinct": n,
-           "uniq_ratio": 1.0, "mean_tok": round(spans_tok / n, 1), "max_tok": max_tok,
+    # `uniq_ratio` is MEASURED, not assumed to be 1.0. Identical blocks are content-
+    # addressed to one handle, so a tool that repeats the same source across payloads is
+    # cheaper to drop than a unique-every-time one, and the report should say so rather
+    # than print a fabricated "100% uniq" beside honestly-measured JSON rows.
+    row = {"path": TEXT_SELECTOR_CODE_BLOCKS, "role": "unknown", "n": n_spans,
+           "distinct": len(distinct), "uniq_ratio": round(len(distinct) / n_spans, 4),
+           "mean_tok": round(spans_tok / n_spans, 1), "max_tok": max_tok,
            "tok_share": round(share, 4)}
     return suggestion, [row]
 
