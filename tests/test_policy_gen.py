@@ -218,6 +218,32 @@ def _gen(*rules):
                                         "_comment": "generated"} for t, ti in rules]}
 
 
+def _gen_with_suggestion(tool, tiers, suggested_field):
+    doc = _gen((tool, tiers))
+    doc["policies"][0]["_suggested_fields"] = {suggested_field: {"lossy": "drop-to-retrieve"}}
+    return doc
+
+
+def test_an_added_rule_surfaces_its_drop_suggestion_in_the_diff():
+    """A new passthrough rule whose only value is its `_suggested_fields` (the #139
+    codegraph_explore case) must not render as a bare '(new rule)' — the suggestion is the
+    whole reason it exists. The `added` change record carries `suggests` so the diff can
+    name it; the `suggestions` change kind never fired for a NEW rule, only a changed one."""
+    existing = {"version": 1, "policies": [{"match": {"tool": "gh.*"}, "tiers": ["minify"]}]}
+    _, changes = merge_policy(existing,
+                              _gen_with_suggestion("codegraph_explore", (), "$text.code_blocks"))
+    added = next(c for c in changes if c["kind"] == "added"
+                 and c["tool"] == "codegraph_explore")
+    assert added["suggests"] == ["$text.code_blocks"]
+
+
+def test_an_added_rule_without_a_suggestion_has_an_empty_suggests():
+    existing = {"version": 1, "policies": [{"match": {"tool": "gh.*"}, "tiers": ["minify"]}]}
+    _, changes = merge_policy(existing, _gen(("codegraph_search", ("minify", "tabularize"))))
+    added = next(c for c in changes if c["kind"] == "added")
+    assert added["suggests"] == []
+
+
 def test_merge_preserves_every_key_the_corpus_cannot_decide():
     # capture / structured / active fields are safety decisions a payload cannot inform.
     # A regeneration path that reverses them would be the one hole in terse's fail-safe

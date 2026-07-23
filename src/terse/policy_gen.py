@@ -265,8 +265,14 @@ def merge_policy(existing: dict, generated: dict) -> tuple[dict, list[dict[str, 
                                 "keys": sorted(inherited)})
         entry = _keep_lossy_inert(entry, prior_tiers)
         buckets.setdefault(at, []).append(entry)
+        # Surface a drop suggestion carried by a NEW rule. Without this, an added
+        # passthrough rule whose only value is its `_suggested_fields` (the codegraph_explore
+        # / long-text case #139) rendered as a bare "(new rule)" with the suggestion — the
+        # entire reason the rule exists — invisible in the diff. The `suggestions` change
+        # kind only fired for an EXISTING rule whose suggestions changed, never a new one.
         changes.append({"tool": tool, "kind": "added", "before": prior_tiers,
-                        "after": list(entry.get("tiers", []))})
+                        "after": list(entry.get("tiers", [])),
+                        "suggests": sorted(entry.get("_suggested_fields") or {})})
     for at in sorted(buckets, reverse=True):
         merged[at:at] = buckets[at]
 
