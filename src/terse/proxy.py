@@ -147,7 +147,8 @@ class Interceptor:
                  server_name: str | None = None,
                  store: OrderedDict[str, Any] | None = None,
                  store_lock: Lock | None = None,
-                 dropped_bytes: list[int] | None = None):
+                 dropped_bytes: list[int] | None = None,
+                 log_prefix: str = "[terse-proxy]"):
         self.policy = pol
         # The downstream server's name, when the caller knows it (`proxy --server-name`,
         # or a multiproxy peer's config name). Passed to every `policy.select`/`apply` so
@@ -185,7 +186,12 @@ class Interceptor:
         # but a sink that fails on EVERY call — a full disk, a bad path — would then stop
         # writing forever with the failure only visible under --debug. Warn ONCE per sink,
         # unconditionally, the first time it fails, so a silently-dead ledger is noticed.
+        # This is the ONLY place a sink failure is reported, so the callbacks must let
+        # their exceptions out (#131) — see `_build_capture_and_audit`.
         self._sink_warned: set[str] = set()
+        # Prefix on this Interceptor's stderr lines, so a multiproxy peer's sink failure
+        # is attributed to `[terse-multiproxy]` rather than the single-proxy default.
+        self.log_prefix = log_prefix
         self.last: dict[str, Any] = {}  # tool -> previous result object (the diff base)
         # tool -> args-key of the call that produced the base above (Phase 1). Recorded
         # only, to classify WHY a diff did/didn't fire (same-args miss vs different-args
@@ -838,7 +844,7 @@ class Interceptor:
         if first or self.debug:
             self._sink_warned.add(kind)
             tail = " (further occurrences silenced unless --debug)" if first else ""
-            sys.stderr.write(f"[terse-proxy] {tool}: {kind} skipped: {exc}{tail}\n")
+            sys.stderr.write(f"{self.log_prefix} {tool}: {kind} skipped: {exc}{tail}\n")
 
     def _emit_audit(self, tool: str, mid: Any, pairs: list[tuple[str, str]],
                     changed: bool, *, display_tool: str | None = None) -> None:
@@ -999,35 +1005,31 @@ def _restore_sigterm(token: Any) -> None:
 
 
 def _build_capture_and_audit(
-    capture_dir: str | None, debug_log: str | None, debug: bool, log_prefix: str
+    capture_dir: str | None, debug_log: str | None
 ) -> tuple[Callable[[str, str], None] | None, Callable[[dict], None] | None]:
     """Build the (capture, audit) callback pair from --capture-dir/--debug-log, shared
     by `run_proxy` and `multiproxy.run_multi_proxy` (identical logic, differing only in
-    which process's downstream target they're wired to). Both callbacks are strictly
-    side effects — a read-only or full disk must never break the proxy — so a failure
-    is swallowed with only a --debug-gated stderr line, tagged with `log_prefix` (e.g.
-    `"[terse-proxy]"` vs `"[terse-multiproxy]"`) so the failure's origin stays legible."""
+    which process's downstream target they're wired to).
+
+    These callbacks own I/O and NOTHING else: a failure propagates to the caller. Both
+    sinks are still strictly side effects — a read-only or full disk must never break
+    the proxy — but that fail-open guarantee is enforced by the one caller that has the
+    bookkeeping for it, `Interceptor` (see `_warn_sink`), which swallows the failure AND
+    announces the first one of each kind. Catching here as well made that unconditional
+    first warning dead code, so a dead sink stayed invisible without --debug (#131)."""
     capture: Callable[[str, str], None] | None = None
     if capture_dir is not None:
         from .capture import capture_payload
 
         def capture(tool: str, raw: str) -> None:
-            try:
-                capture_payload(tool, raw, capture_dir)
-            except Exception as exc:  # noqa: BLE001 — capture is never load-bearing
-                if debug:
-                    sys.stderr.write(f"{log_prefix} capture_payload failed: {exc}\n")
+            capture_payload(tool, raw, capture_dir)
 
     audit: Callable[[dict], None] | None = None
     if debug_log is not None:
         from .capture import append_audit
 
         def audit(record: dict) -> None:
-            try:
-                append_audit(record, debug_log)
-            except Exception as exc:  # noqa: BLE001 — audit is never load-bearing
-                if debug:
-                    sys.stderr.write(f"{log_prefix} append_audit failed: {exc}\n")
+            append_audit(record, debug_log)
 
     return capture, audit
 
@@ -1089,7 +1091,7 @@ def run_proxy(
         sys.stderr.write(f"[terse-proxy] {transport_err}\n")
         return 2
 
-    capture, audit = _build_capture_and_audit(capture_dir, debug_log, debug, "[terse-proxy]")
+    capture, audit = _build_capture_and_audit(capture_dir, debug_log)
 
     stats = None
     if stats_log is not None:
@@ -1100,7 +1102,7 @@ def run_proxy(
         # from the command basename, which misreads a launcher-wrapped server (kb behind
         # secret-broker's `sb-run` labels itself "sb-run") — #83.
         label = server_name or server_label(cmd)
-        stats = build_stats_writer(stats_log, label, debug, "[terse-proxy]")
+        stats = build_stats_writer(stats_log, label)
 
     inter = Interceptor(pol, debug=debug, capture=capture, audit=audit, stats=stats,
                         server_name=server_name)

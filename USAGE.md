@@ -444,6 +444,23 @@ no-op (`changed:false`) is logged, so you can confirm terse left a suspect paylo
 Replay any line through `terse compress --tool <tool>` on its `raw` to reproduce. Opt-in
 and side-effect-only: a log-write failure never affects what the client receives.
 
+If a sink is dead — `--capture-dir` pointing at a regular file, `--stats-log` at a
+directory, a full disk — the proxy says so on stderr the **first** time each one fails,
+without needing `--debug`, then goes quiet so it can't flood the hot path:
+
+```
+[terse-proxy] gh.api.items: capture skipped: [Errno 17] File exists: '/tmp/not-a-dir' (further occurrences silenced unless --debug)
+```
+
+The run itself is unaffected — that is the point of the sinks being fail-open — but an
+empty corpus makes a later `terse measure --corpus` report a percentage over whatever
+subset happened to land, so this one is worth reading.
+
+Under `terse multiproxy` the bookkeeping is per **peer**, so a dead shared sink prints
+one line per downstream that hit it — each naming its own peer-qualified tool — rather
+than one for the whole run. That is deliberate: it tells you *which* downstreams were
+actually affected, and the flood guard still holds within each peer.
+
 Because those records embed the raw payload, a tool with `"capture": false` in the policy
 (above) is skipped here too — one declaration covers both disk sinks.
 

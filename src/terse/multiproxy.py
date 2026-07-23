@@ -996,12 +996,12 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
             # Per-peer stats writer so the ledger's `server` field is the peer's own
             # config name (the tool field is already peer-qualified; this keeps the
             # grouping key meaningful without parsing prefixes back out).
-            stats = (build_stats_writer(stats_log, spec.name, debug,
-                                        "[terse-multiproxy]")
+            stats = (build_stats_writer(stats_log, spec.name)
                      if stats_log is not None else None)
             inter = Interceptor(pol, debug=debug, capture=capture, audit=audit,
                                 stats=stats, server_name=spec.name, store=store,
-                                store_lock=store_lock, dropped_bytes=dropped_bytes)
+                                store_lock=store_lock, dropped_bytes=dropped_bytes,
+                                log_prefix="[terse-multiproxy]")
             transport = build_transport(spec.target, headers=spec.headers or None)
             peers.append(Peer(name=spec.name, transport=transport, inter=inter))
     except Exception:
@@ -1051,7 +1051,7 @@ def run_multi_proxy(
         sys.stderr.write(f"[terse-multiproxy] {exc}\n")
         return 2
 
-    capture, audit = _build_capture_and_audit(capture_dir, debug_log, debug, "[terse-multiproxy]")
+    capture, audit = _build_capture_and_audit(capture_dir, debug_log)
 
     store: OrderedDict[str, Any] = OrderedDict()
     store_lock = Lock()

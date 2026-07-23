@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import io
 import json
+
+import pytest
 
 from terse import stats as stats_mod
 from terse.stats import (
@@ -242,23 +243,22 @@ def test_report_shows_diff_hit_rate_per_tool():
 
 def test_build_stats_writer_appends_a_record(tmp_path):
     log = tmp_path / "stats.jsonl"
-    writer = build_stats_writer(log, "runecho-mcp", debug=False, log_prefix="[t]")
+    writer = build_stats_writer(log, "runecho-mcp")
     writer("structure", RAW, '{"__terse_table__":1}', False)
     recs = load_stats(log)
     assert len(recs) == 1
     assert recs[0]["server"] == "runecho-mcp" and recs[0]["decision"] == "compressed"
 
 
-def test_build_stats_writer_swallows_failures(tmp_path, monkeypatch):
+def test_build_stats_writer_propagates_failures(tmp_path, monkeypatch):
+    # The writer owns I/O and nothing else: it must NOT swallow. Stats stays never
+    # load-bearing, but the swallow-and-warn-once belongs to the single caller that has
+    # the per-sink bookkeeping, proxy.Interceptor._warn_sink — catching here too made
+    # that unconditional first-failure warning dead code (#131). Pinned end-to-end by
+    # test_proxy.py::test_run_proxy_broken_stats_log_warns_without_debug.
     def boom(*_a, **_kw):
         raise OSError("disk full")
     monkeypatch.setattr(stats_mod, "append_stats", boom)
-    err = io.StringIO()
-    quiet = build_stats_writer(tmp_path / "s.jsonl", "s", debug=False,
-                               log_prefix="[t]", stderr=err)
-    quiet("tool", RAW, RAW, False)                  # must not raise
-    assert err.getvalue() == ""                     # silent without --debug
-    loud = build_stats_writer(tmp_path / "s.jsonl", "s", debug=True,
-                              log_prefix="[t]", stderr=err)
-    loud("tool", RAW, RAW, False)                   # must not raise either
-    assert "append_stats failed" in err.getvalue()  # but --debug says why
+    writer = build_stats_writer(tmp_path / "s.jsonl", "s")
+    with pytest.raises(OSError, match="disk full"):
+        writer("tool", RAW, RAW, False)
