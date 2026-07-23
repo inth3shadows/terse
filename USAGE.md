@@ -330,9 +330,39 @@ This is **lossy and opt-in** — the same bar as any drop:
 - It is suppressed — with a warning, never silently — on a `--never-lossy` server, on a
   selector marked `{"critical": true}`, and on a rule with `"tiers": []`.
 - A misspelled selector (`$text.codeblocks`) warns rather than quietly compressing nothing.
-- Confirm the behavior, not just the token count, with `terse fluency --drop` (below): the
-  question that matters for this shape is whether the model *retrieves* the source instead
-  of answering from the surrounding prose.
+- Confirm the behavior, not just the token count, with `terse fluency --drop-eval` (below):
+  the question that matters for this shape is whether the model *retrieves* the source
+  instead of answering from the surrounding prose.
+
+**That behavioral question is now measured, not assumed.** 30 captured `codegraph_explore`
+payloads, 5 models over an OpenAI-compatible gateway:
+
+| model | called retrieve when needed | asked for the right block | left it alone when not needed | answered correctly |
+|---|--:|--:|--:|--:|
+| `claude-sonnet-5` | 100% | 100% | 100% | 97% |
+| `deepseek-v4-pro` | 100% | 100% | 100% | 100% |
+| `qwen3.7-max` | 100% | 100% | 87% | 100% |
+| `glm-5.2` | 100% | 100% | 100% | 83% |
+| `minimax-m3` | 100% | 100% | 100% | 97% |
+
+No model answered from the retained prose as if it had read the source, and (bar one
+qwen over-fetch) none fetched a block it did not need. The "answered correctly" column is
+a comprehension check on the *retrieved* content and is deliberately un-guessable — it is
+lower than the retrieve columns because the model has to read the fetched source, not
+because it failed to fetch it. Reproduce with
+`terse fluency --drop-eval --corpus <dir> --policy <file> --base-url ... --models ...`.
+
+**State the downside too.** 87% is a *gross* number: a retrieve returns the span in full,
+so the conversation then holds both the stub and the original. Best case, the model never
+retrieves and you keep the full saving; worst case it retrieves every block and you are
+~13% *worse* off than not compressing, plus the extra round-trips. The measured retrieve
+behavior above is what makes that asymmetry a good bet — not the token count.
+
+**It does not generalize to all long text.** The selector reaches markdown *scaffolding
+around* code, not raw source. On the third-party `filesystem/read_text_file` corpus —
+long-text, 34k tokens — the only fences are docstring examples and it saves **1%**. That is
+why `policy generate` proposes the selector only when droppable blocks are ≥40% of a tool's
+tokens across ≥2 payloads; a tool like `read_text_file` is correctly left alone.
 
 ### One-command lossy tuning (`terse tune`)
 
@@ -347,8 +377,16 @@ terse tune --corpus corpus/ --out policy.json
 #   → enabling all 1 here: ≈12,400 tok, ~18% of corpus (gross, before the per-record retrieve-handle cost)
 # REVIEW candidates — role unknown, may be LOAD-BEARING; verify carefully:
 #   kb.read.list_principles  result[].principle  ~36% tok, 100% uniq  [unknown]
+#   codegraph_explore        $text.code_blocks   ~89% tok, 100% uniq  [unknown]
 #   → enabling all 1 here: ≈9,800 tok, ~14% of corpus (gross, before the per-record retrieve-handle cost)
 ```
+
+Text tools are included in that scan. A tool whose payloads never parse as JSON has no
+fields to profile, so it used to produce no candidates at all — which is exactly how a
+0.0%-saved, 89%-droppable tool stayed invisible to the generator. `$text.code_blocks` is
+proposed when droppable fenced blocks are >=40% of the tool's tokens over >=2 payloads, and
+always as `[unknown]`: a fenced block is source, and source is load-bearing until a
+`--drop-eval` pass says otherwise.
 
 Each bucket ends with a **rollup** — the estimated gross tokens dropping that whole
 bucket would evict (`mean field tokens × record count`, summed) and its share of the

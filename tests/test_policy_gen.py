@@ -408,3 +408,76 @@ def test_reason_ratios_count_results_not_blocks():
     groups = [_blocks(20), ["Error executing tool t: boom"]]
     row = _tool_decision("t", groups, 5.0)
     assert "1/2 non-JSON" in row["reason"], row["reason"]
+
+
+# --------------------------------------------------------------------------- #
+# text-payload drop candidates (#139): the shape `_drop_candidates` cannot see
+# --------------------------------------------------------------------------- #
+def _explore_doc(n_files=3, code_lines=60):
+    """A `codegraph_explore`-shaped answer: markdown intelligence wrapping fenced source."""
+    out = ["## Exploration: symbols", "", f"Found {n_files * 4} symbols.", "",
+           "### Blast radius", ""]
+    for f in range(n_files):
+        out += [f"- `sym{f}` (src/f{f}.go:10) — 2 callers; no covering tests found"]
+    out += ["", "### Source Code", ""]
+    for f in range(n_files):
+        body = "\n".join(f"{i}\t\tcall{f}_{i}(ctx, payload, opts) // widening the region"
+                         for i in range(code_lines))
+        out += [f"**`src/f{f}.go`**", "", "```go", body, "```", ""]
+    return "\n".join(out) + "\n"
+
+
+def test_a_long_text_tool_is_proposed_the_code_block_selector():
+    """`_drop_candidates` opens with `json.loads` and skips on failure, so a 100%-text
+    tool yielded ZERO candidates by construction — not a threshold missed, a shape unseen.
+    That is why autotune never surfaced `codegraph_explore` (0.0% saved, 86.6% of its
+    tokens inside droppable blocks)."""
+    envs = [_env("codegraph_explore", _explore_doc()) for _ in range(3)]
+    doc, rows = generate_policy(envs, threshold=5.0)
+    rule = next(p for p in doc["policies"] if p["match"]["tool"] == "codegraph_explore")
+
+    assert rule["_suggested_fields"] == {
+        "$text.code_blocks": {"lossy": "drop-to-retrieve", "min": 400}}
+    # Source is the load-bearing case the role split exists to flag — never tagged safe.
+    row = next(r for r in rows[0]["drop_rows"] if r["path"] == "$text.code_blocks")
+    assert row["role"] == "unknown"
+    assert row["tok_share"] > 0.4
+    # Measured, not asserted: three identical payloads means every block repeats, and
+    # identical blocks are content-addressed to one handle. Printing a fabricated
+    # "100% uniq" beside honestly-measured JSON rows would misreport the drop's cost.
+    assert row["n"] == 9 and row["distinct"] == 3
+    assert row["uniq_ratio"] == round(3 / 9, 4)
+
+    # INACTIVE: the loader reads `fields`, so the generated policy is still fully lossless.
+    assert "fields" not in rule
+    assert not load_policy_from(doc).has_drop()
+
+
+def test_a_text_tool_whose_bulk_is_not_fenced_is_not_proposed():
+    """The guard against proposing it everywhere long text appears. `read_text_file`
+    returns raw source: the only fences are docstring examples, ~1-5% of tokens, so the
+    selector would evict almost nothing and still cost a retrieve round-trip."""
+    prose = "\n".join(f"line {i} of a plain source file with no markdown fencing at all"
+                      for i in range(400))
+    doc, rows = generate_policy([_env("read_text_file", prose) for _ in range(3)],
+                                threshold=5.0)
+    rule = next(p for p in doc["policies"] if p["match"]["tool"] == "read_text_file")
+    assert "_suggested_fields" not in rule
+
+
+def test_one_text_payload_is_an_anecdote_not_a_shape():
+    doc, _ = generate_policy([_env("codegraph_explore", _explore_doc())], threshold=5.0)
+    rule = next(p for p in doc["policies"] if p["match"]["tool"] == "codegraph_explore")
+    assert "_suggested_fields" not in rule
+
+
+def load_policy_from(doc):
+    import tempfile
+    from pathlib import Path
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+        tf.write(json.dumps(doc))
+        name = tf.name
+    try:
+        return load_policy(name)
+    finally:
+        Path(name).unlink(missing_ok=True)

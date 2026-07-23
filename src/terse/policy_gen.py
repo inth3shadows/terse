@@ -46,8 +46,10 @@ from typing import Any
 
 from . import policy as policy_mod
 from . import probes
-from .capture import find_record_list_with_path
+from .capture import LONG_TEXT, classify_shape, find_record_list_with_path
+from .lossy import DEFAULT_TEXT_DROP_MIN, TEXT_SELECTOR_CODE_BLOCKS, fenced_spans
 from .measure import measure_joined, measure_payload
+from .tokenize import count_cl100k
 
 # Tiers are cumulative in the codec (minify ⊂ tabularize ⊂ dictionary). minify is implied
 # by re-serialization, so it never ships alone — tabularize always carries it.
@@ -273,6 +275,75 @@ def merge_policy(existing: dict, generated: dict) -> tuple[dict, list[dict[str, 
     return out, changes
 
 
+# A text tool's drop candidate is judged on the one thing that decides whether the selector
+# pays: what share of its tokens sits inside droppable fenced blocks. Deliberately higher
+# than the JSON `min_share`— a text drop evicts a contiguous region a reader can see is
+# missing, so it should only be proposed where it is the dominant cost, not a trim.
+_TEXT_DROP_MIN_SHARE = 0.40
+_TEXT_DROP_MIN_PAYLOADS = 2   # one payload is an anecdote; the shape must repeat
+
+
+def _tok(text: str) -> int:
+    """Token count, degrading to the codec-wide length heuristic when tiktoken is absent —
+    the ratio this feeds is scale-free, so an approximate count still ranks correctly."""
+    n = count_cl100k(text)
+    return n if n is not None else len(text) // 4
+
+
+def _text_drop_candidate(raws: list[str]) -> tuple[dict[str, dict], list[dict[str, Any]]]:
+    """Suggest `$text.code_blocks` for a tool whose payloads are long TEXT dominated by
+    fenced code — the span-addressed analogue of `_drop_candidates`, and the reason a
+    0.0%-saved text tool could never be surfaced by autotune (#136/#139).
+
+    `_drop_candidates` opens with `json.loads(raw)` and `continue`s on failure, so a tool
+    that is 100% prose produces zero candidates BY CONSTRUCTION. That is not a threshold
+    being missed, it is a shape the generator cannot see: `codegraph_explore` measured
+    0.0% across 61 captured payloads and was never proposed anything, while 86.6% of its
+    tokens sat in droppable blocks.
+
+    Judged on the aggregate token share of blocks that clear the drop floor — the same
+    quantity the runtime would actually evict, so the estimate cannot flatter itself with
+    spans the transform would skip. Returns the INACTIVE `_suggested_fields` entry plus a
+    report row, never an active rule: drop is lossy and the operator opts in.
+    """
+    n = spans_tok = total_tok = 0
+    max_tok = 0
+    n_spans = 0
+    distinct: set[str] = set()
+    for raw in raws:
+        if not isinstance(raw, str) or classify_shape(raw) != LONG_TEXT:
+            continue
+        n += 1
+        total_tok += _tok(raw)
+        for start, end in fenced_spans(raw):
+            if end - start < DEFAULT_TEXT_DROP_MIN:
+                continue  # under the floor: the runtime leaves it in place, so don't count it
+            span = raw[start:end]
+            t = _tok(span)
+            spans_tok += t
+            max_tok = max(max_tok, t)
+            n_spans += 1
+            distinct.add(span)
+    if n < _TEXT_DROP_MIN_PAYLOADS or not total_tok:
+        return {}, []
+    share = spans_tok / total_tok
+    if share < _TEXT_DROP_MIN_SHARE:
+        return {}, []
+    suggestion = {TEXT_SELECTOR_CODE_BLOCKS: {"lossy": "drop-to-retrieve",
+                                              "min": DEFAULT_TEXT_DROP_MIN}}
+    # role stays `unknown`, never `prose`: a fenced block is source, and source is exactly
+    # the load-bearing case the role split exists to flag for review.
+    # `uniq_ratio` is MEASURED, not assumed to be 1.0. Identical blocks are content-
+    # addressed to one handle, so a tool that repeats the same source across payloads is
+    # cheaper to drop than a unique-every-time one, and the report should say so rather
+    # than print a fabricated "100% uniq" beside honestly-measured JSON rows.
+    row = {"path": TEXT_SELECTOR_CODE_BLOCKS, "role": "unknown", "n": n_spans,
+           "distinct": len(distinct), "uniq_ratio": round(len(distinct) / n_spans, 4),
+           "mean_tok": round(spans_tok / n_spans, 1), "max_tok": max_tok,
+           "tok_share": round(share, 4)}
+    return suggestion, [row]
+
+
 def _drop_candidates(
     raws: list[str],
     min_mean_tok: float = _DROP_MIN_MEAN_TOK,
@@ -429,6 +500,12 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
     # threshold — passthrough for tiers — yet is dominated by a huge unique field only drop
     # can shrink. So compute it here and carry it through every return path.
     drop_suggestion, drop_rows = _drop_candidates(raws)
+    # The text analogue runs unconditionally alongside it, not as a fallback: the two
+    # address disjoint payload shapes (fields of a parsed object vs spans of prose), so a
+    # tool that returns both JSON and markdown can legitimately earn one candidate of each.
+    text_suggestion, text_rows = _text_drop_candidate(raws)
+    drop_suggestion = {**drop_suggestion, **text_suggestion}
+    drop_rows = drop_rows + text_rows
 
     base = {
         "tool": tool, "n": n, "n_results": len(groups), "joined_results": joined_results,
