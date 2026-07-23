@@ -23,6 +23,7 @@ from .report import (
     diff_gap_rows,
     dropeval_gap_rows,
     fluency_gap_rows,
+    inconclusive_models,
 )
 
 _BAR_WIDTH = 24
@@ -236,6 +237,13 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None) -> 
     forest plots (retrieve-recall, no-overfetch, final-accuracy), each vs a fixed
     100%-ideal control, gated on the worst model per metric. Fed by report.py's
     dropeval_gap_rows so the gap a chart shows can never diverge from the markdown."""
+    dead = inconclusive_models(results)
+    if dead:
+        # Never draw a forest plot from transport errors: the bars would be indistinguishable
+        # from a model that answered and got it wrong. Same refusal build_dropeval_report
+        # renders, from the same helper, so chart and markdown cannot disagree.
+        return "  INCONCLUSIVE — " + ", ".join(
+            f"{m} failed {e}/{a} model calls" for m, (e, a) in sorted(dead.items()))
     gaps = dropeval_gap_rows(results)
     if not gaps:
         return "  (no data)"

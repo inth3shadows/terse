@@ -311,3 +311,123 @@ def test_run_drop_text_payload_is_the_single_payload_entry_point():
     rows = dropeval.run_drop_text_payload(
         DOC, rule, "codegraph_explore", lambda _m: dropeval.Turn(text="nope"))
     assert [r["kind"] for r in rows] == ["recall", "precision"]
+
+
+def _anchor_of(prompt, span_lines):
+    """The one line of the span the prompt quotes as its locator. A line-numbered block is
+    quoted WITHOUT its gutter — see test_the_anchor_never_leaks_its_own_line_number."""
+    import re
+    gut = re.compile(r"^\s*\d+\t")
+    return next(ln for ln in span_lines
+                if json.dumps(ln) in prompt or json.dumps(gut.sub("", ln)) in prompt)
+
+
+def test_text_recall_question_is_anchored_not_counted():
+    """The recall question must be answerable by READING the retrieved span, not by
+    counting lines in it. Measured on 4 models x 49 questions, the old ordinal form
+    ("non-blank line number 81 of 160") scored 100% retrieve-recall and 100% handle
+    accuracy while answering 0% correct — every model fetched the right block and then
+    miscounted. Because final-accuracy gates the verdict, that made the text drop-eval
+    impossible to pass and so unable to authorize any policy."""
+    rule = _drop_rule()
+    recall, _ = dropeval.gen_text_drop_questions(DOC, rule, "codegraph_explore")
+    _, store = _apply(DOC, rule)
+    span_lines = [ln for ln in store[recall.expected_handle].splitlines() if ln.strip()]
+
+    anchor = _anchor_of(recall.prompt, span_lines)
+    assert span_lines.count(anchor) == 1, "an ambiguous anchor has no single right answer"
+    # No ordinal is asked for — the anchor locates the line, so nothing has to be counted.
+    assert "line number of" in recall.prompt or "first whitespace-delimited" in recall.prompt
+    assert "non-blank line number" not in recall.prompt
+
+
+def test_line_numbered_block_is_asked_for_the_number_not_the_text():
+    """`codegraph_explore` blocks carry a `NN\\t` gutter. Asking for the line's TEXT made
+    the answer's written form ambiguous — models returned the right line with the gutter
+    and indentation stripped, scoring 0-33%. A line number has one canonical form, so
+    exact scoring is correct rather than merely strict, and no whitespace-tolerant
+    comparator (which would also pass whitespace-wrong answers) is needed."""
+    numbered = "\n".join(f"{i}\tcode line {i} with enough text to clear the drop floor"
+                         for i in range(40, 80))
+    doc = f"## Exploration\n\n### Source Code\n\n```go\n{numbered}\n```\n\nProse.\n"
+    rule = _drop_rule()
+    recall, _ = dropeval.gen_text_drop_questions(doc, rule, "codegraph_explore")
+    _, store = _apply(doc, rule)
+    span_lines = [ln for ln in store[recall.expected_handle].splitlines() if ln.strip()]
+
+    anchor = _anchor_of(recall.prompt, span_lines)
+    following = span_lines[span_lines.index(anchor) + 1]
+    assert recall.expected == int(following.split("\t")[0])
+    assert recall.qtype == "sole_number"  # a lone integer; a block echo must not pass
+    # A line blank apart from its gutter still has a number, so there is no degenerate
+    # target to filter out.
+    assert isinstance(recall.expected, int)
+
+
+def test_unnumbered_block_falls_back_to_the_first_token():
+    """One `if`, not a subsystem: a block with no gutter is asked for the following
+    line's first whitespace-delimited token — still free of leading indentation, still a
+    single canonical string."""
+    rule = _drop_rule()
+    recall, _ = dropeval.gen_text_drop_questions(DOC, rule, "codegraph_explore")  # CODE has no gutter
+    _, store = _apply(DOC, rule)
+    span_lines = [ln for ln in store[recall.expected_handle].splitlines() if ln.strip()]
+
+    anchor = _anchor_of(recall.prompt, span_lines)
+    assert recall.expected == span_lines[span_lines.index(anchor) + 1].split()[0]
+    assert recall.qtype is None          # the kind's default (deref) grades a string
+
+
+def test_gutter_only_lines_count_as_blank():
+    """A line-numbered source line that is empty after its gutter (`81\\t`) renders as a
+    blank line, and every model skips it when told to ignore blank lines — while
+    `str.strip` sees "81" and calls it non-blank. That mismatch produced a unanimous
+    off-by-one against the ground truth (expected 81, all four models answered 82): the
+    truth was wrong, not the answers."""
+    lines = []
+    for i in range(40, 80):
+        lines.append(f"{i}\tcode line {i} with enough text to clear the drop floor")
+        if i % 2:
+            lines.append(f"{i + 1000}\t")          # renders blank; must not be selectable
+    doc = "## E\n\n### Source Code\n\n```go\n" + "\n".join(lines) + "\n```\n\nProse.\n"
+    rule = _drop_rule()
+    recall, _ = dropeval.gen_text_drop_questions(doc, rule, "codegraph_explore")
+    # Neither the anchor nor the answer may be one of the gutter-only lines.
+    assert isinstance(recall.expected, int) and recall.expected < 1000, recall.expected
+    quoted = recall.prompt.split(" prefix is ")[1]
+    assert not quoted.startswith('""'), quoted   # a gutter-only line has empty content
+
+
+def test_the_anchor_never_leaks_its_own_line_number():
+    """Quoting the anchor line whole put its line number in the prompt — and the answer is
+    the next number, so 93% of generated questions were answerable by adding one, with no
+    retrieval at all. Measured on 30 live payloads. Retrieve-recall was unaffected (it
+    counts tool calls), but answer accuracy was scoring arithmetic on a leaked value."""
+    import re
+    numbered = "\n".join(f"{i}\tresolve(ctx, payload, opts) // widening the covered region"
+                         for i in range(40, 90))
+    doc = f"## E\n\n### Source Code\n\n```go\n{numbered}\n```\n\nProse.\n"
+    recall, _ = dropeval.gen_text_drop_questions(doc, _drop_rule(), "codegraph_explore")
+    quoted = re.search(r'prefix is (".*?")\. What is', recall.prompt).group(1)
+    assert not re.match(r'^"\s*\d+\\t', quoted), quoted
+    assert str(recall.expected) not in quoted
+    assert str(recall.expected - 1) not in quoted
+
+
+def test_the_quoted_locator_is_unique_on_what_the_model_actually_sees():
+    """Uniqueness must be judged on the gutter-STRIPPED line, since that is what the prompt
+    quotes. Judging the numbered line made every line trivially unique — the number
+    guarantees it — while the locator the model sees could match many, so "contains exactly
+    one line whose text is X" was false and the question unanswerable."""
+    import re
+    same = "resolve(ctx, payload, opts) // identical on every line"
+    body = "\n".join(f"{i}\t{same}" if i % 3 else f"{i}\tdistinct call number {i // 3}"
+                     for i in range(40, 90))
+    doc = f"## E\n\n### Source Code\n\n```go\n{body}\n```\n\nProse.\n"
+    recall, _ = dropeval.gen_text_drop_questions(doc, _drop_rule(), "codegraph_explore")
+    quoted = json.loads(re.search(r'prefix is (".*?")\. What is', recall.prompt).group(1))
+    assert quoted != same, "the locator matches 33 lines — it locates nothing"
+    _, store = _apply(doc, _drop_rule())
+    bare = [re.sub(r"^\s*\d+\t", "", ln)
+            for ln in store[recall.expected_handle].splitlines() if ln.strip()]
+    assert bare.count(quoted) == 1
