@@ -87,7 +87,17 @@ def request(flow) -> None:
         if not isinstance(content, list):
             continue
         for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
+            if not isinstance(block, dict):
+                continue
+            # Name-and-id only, never `input`: a tool_result on its own cannot say WHICH
+            # tool produced it, which makes a multi-call run unreadable (two results, two
+            # ids, no way to attribute either). The argument object is deliberately not
+            # recorded — it is model-authored content and outside this addon's remit.
+            if block.get("type") == "tool_use":
+                _write({"kind": "tool_use", "tool_use_id": block.get("id"),
+                        "name": block.get("name")})
+                continue
+            if block.get("type") != "tool_result":
                 continue
             text = _text_of(block)
             record = {

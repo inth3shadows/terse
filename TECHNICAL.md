@@ -158,7 +158,7 @@ raw tool output (JSON text)
       "match": { "tool": "gh.*" },    // fnmatch glob on the tool name
       "tiers": ["minify", "tabularize", "dictionary"],   // [] = passthrough (skip)
       "capture": false,               // optional; never PERSIST this tool's payloads
-      "structured": "compress",       // optional; "auto" (default) | "compress" | "leave"
+      "structured": "compress",       // optional; "auto" (default) | "compress" | "leave" | "replace"
       "fields": {                     // optional, per-field
         "result[].id":   { "critical": true },           // denylist: never made lossy
         "result[].body": { "lossy": "drop-to-retrieve" },// evicted to a handle; served by terse.retrieve
@@ -211,6 +211,24 @@ raw tool output (JSON text)
   version is logged under `--debug` so such a regression is diagnosable from a log.
   Codec only, no diff: diffing the typed field needs its own per-tool base and keyframe
   accounting, and is deliberately left unbuilt rather than half-built.
+- **`structured: "replace"` (#128 option 2)** compresses the typed field *and deletes the
+  text block that mirrors it*. **Measured benefit against the reference client: zero.**
+  Context cost goes 2,596 → 1,008 chars under `"compress"` and 1,008 → 1,008 under
+  `"replace"`, because `claude` 2.1.218 had already discarded the block — what it removes
+  is stdio bytes, not context. It is documented rather than deleted because it is the
+  correct behavior for a client that forwards *both* fields (which would otherwise halve
+  its saving, and which under `"compress"` can receive a cross-call **diff** in the block
+  contradicting a full envelope in the typed field). No such client has been measured.
+  `"auto"` never resolves to it: every mode up to `"compress"` is invisible to a client
+  that ignores `structuredContent`, and this is the first that removes information from
+  the wire. Five guards, each independently tested, must all hold or the block stays —
+  the mode resolves to `replace`, the rule has non-empty `tiers` (`[]` is the hands-off
+  switch), the result is not an `isError`, there is exactly one text block, and that
+  block's parsed JSON **equals** `structuredContent`. That last one is what makes it safe
+  rather than merely measured: a block carrying anything the typed field does not is not
+  a mirror and is never dropped. Deliberately *not* a guard: whether the tool declared an
+  `outputSchema` — the expected gate, measured false (the `noschema` probe's tool declares
+  none and the client read the typed field anyway).
 - **`capture` (default `true`, #85):** `false` means *never persist this tool's
   payloads* — the proxy skips both disk sinks that write raw content: the
   `--capture-dir` corpus tee and the `--debug-log` replay trace (whose records embed the

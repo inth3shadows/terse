@@ -16,6 +16,10 @@ block for backwards compatibility):
   weather  -> one flat object      (benign: minify only, shapes stay identical)
   records  -> N records, N=30      (tabularize fires: shapes diverge, duplicate is big)
 
+plus four probe tools that deliberately break one property each — `badtype` and
+`enveloped` (does the client validate against `outputSchema`?), `nomirror` and
+`noschema` (is a mirror-less result readable, and does a declared schema matter?).
+
 No dependencies, no network, no clock, no randomness — same request always produces the
 same bytes, so a token count measured today is comparable to one measured next month.
 """
@@ -87,6 +91,20 @@ TOOLS = [
      "description": "Structured content replaced by a terse envelope (option 1's shape).",
      "inputSchema": {"type": "object", "properties": {}},
      "outputSchema": RECORDS_SCHEMA},
+    # The two mirror-drop probes (#128 option 2). Dropping the text block is only sound
+    # if a client that reads `structuredContent` still reads it when the mirror is GONE,
+    # and only for a tool whose `outputSchema` is what made the client prefer that field
+    # in the first place. Neither had been measured; these make both testable.
+    {"name": "nomirror",
+     "description": "Structured content with NO text mirror (option 2's shape).",
+     "inputSchema": {"type": "object", "properties": {}},
+     "outputSchema": RECORDS_SCHEMA},
+    # No `outputSchema` on purpose: the guard candidate. If the client ignores
+    # `structuredContent` absent a declared schema, dropping this tool's mirror would
+    # blank the result, and the guard earns its place.
+    {"name": "noschema",
+     "description": "Structured content plus its text mirror, but no declared outputSchema.",
+     "inputSchema": {"type": "object", "properties": {}}},
 ]
 
 # `badtype` is the mild violation: right keys, wrong types (schema says number, sends
@@ -100,15 +118,25 @@ ENVELOPED = {"__terse_table__": 1, "n": 30,
                       for r in RECORDS["rows"]]}
 
 PAYLOADS = {"weather": WEATHER, "records": RECORDS,
-            "badtype": BADTYPE, "enveloped": ENVELOPED}
+            "badtype": BADTYPE, "enveloped": ENVELOPED,
+            "nomirror": RECORDS, "noschema": RECORDS}
+
+# Tools whose result carries `structuredContent` and an EMPTY `content` array — the exact
+# wire shape `"structured": "replace"` would produce. Kept as a fixture tool rather than
+# measured through terse so the gate tests the CLIENT's tolerance of the shape, with no
+# terse in the path to confuse a failure for a proxy bug.
+NO_MIRROR = frozenset({"nomirror"})
 
 
-def _result(payload: dict) -> dict:
+def _result(payload: dict, *, mirror: bool = True) -> dict:
     """The spec's backwards-compatibility pair: the serialized JSON in a text block AND
     the typed field. Kept in ONE place so the two provably start out identical — any
-    divergence the capture observes is then terse's doing, not the fixture's."""
-    return {"content": [{"type": "text", "text": json.dumps(payload)}],
-            "structuredContent": payload}
+    divergence the capture observes is then terse's doing, not the fixture's.
+
+    `mirror=False` omits the text block entirely (`content: []`). MCP requires the field,
+    not a non-empty one."""
+    blocks = [{"type": "text", "text": json.dumps(payload)}] if mirror else []
+    return {"content": blocks, "structuredContent": payload}
 
 
 def _reply(mid, result) -> None:
@@ -148,7 +176,7 @@ def main() -> int:
             if payload is None:
                 _error(mid, -32602, f"unknown tool: {name!r}")
             else:
-                _reply(mid, _result(payload))
+                _reply(mid, _result(payload, mirror=name not in NO_MIRROR))
         else:
             _error(mid, -32601, f"method not found: {method!r}")
     return 0

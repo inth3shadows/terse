@@ -83,6 +83,40 @@ For scale: the same data compressed by terse was **1,008 chars** against the 2,5
 model currently receives — roughly **61%** recoverable on a `structuredContent`-emitting
 tool, against the 0% recovered today.
 
+### Follow-up: can the text mirror simply be dropped? (option 2)
+
+Two more probes, run 2026-07-23 against the same client. Both use `ARMS=raw` — the fixture
+emits the wire shape directly, so a failure can't be blamed on terse being in the path.
+
+| probe | what the fixture sends | what reached the model |
+|---|---|---|
+| `nomirror` | `structuredContent` with **`content: []`** — exactly option 2's shape | 2,596 chars, `is_error=False`, client rendered it normally |
+| `noschema` | the mirrored pair, but the tool declares **no `outputSchema`** | 2,596 chars — the *compact* rendering, i.e. `structuredContent` again |
+
+`nomirror` says the drop is safe: a mirror-less result reaches the model complete.
+
+`noschema` killed a guard before it was written. The obvious precondition for dropping the
+block was "only for tools that declare an `outputSchema`", on the theory that a declared
+schema is what makes a client prefer the typed field. It isn't — the client read
+`structuredContent` from a tool with no schema at all, discarding a 2,836-char text block
+in favour of a 2,596-char one it had to re-serialize. So the guard would have been
+superstition, and it would have cost per-tool `tools/list` state to enforce.
+
+**And then the measurement that matters: dropping the mirror saves nothing.**
+
+| policy | context cost of the result |
+|---|--:|
+| none | 2,596 chars |
+| `"structured": "compress"` | **1,008 chars** |
+| `"structured": "replace"` | 1,008 chars — *unchanged* |
+
+The block being removed was already being thrown away by the client, so `replace` takes
+2,596 chars off the stdio pipe and zero off the model's context. It shipped anyway, as an
+explicit opt-in that `"auto"` never selects, because it is the right behavior for a client
+that forwards *both* fields — the case #128 originally hypothesized, and the one no probe
+here has been able to find a client for. Anyone on Claude Code should stop at
+`"compress"`.
+
 ### Scope — read before generalizing
 
 - One client, one version: `claude` **2.1.218**. The MCP spec makes the text block a
@@ -98,8 +132,10 @@ tool, against the 0% recovered today.
 ## Run it
 
 ```bash
-./run_capture.sh                  # both arms + verdict
-TOOL=weather ./run_capture.sh     # the flat-object case (minify only)
+./run_capture.sh                              # both arms + verdict
+TOOL=weather ./run_capture.sh                 # the flat-object case (minify only)
+POLICY=/path/to/policy.json ./run_capture.sh  # measure what a policy does to the context
+ARMS=raw TOOL=nomirror ./run_capture.sh       # single-arm: is a mirror-less result readable?
 OUTDIR=/path/to/scratch ./run_capture.sh
 ```
 

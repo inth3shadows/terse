@@ -436,6 +436,30 @@ Check whether it applies to you before bothering: a tool that declares an `outpu
 is the one that will emit the field. Among common servers, filesystem (14/14 tools),
 memory (9/9) and kb (27/27) all do; git, fetch, serena and playwright do not.
 
+#### `"structured": "replace"` — and why you almost certainly don't want it
+
+`"replace"` compresses the typed field **and deletes the text block that mirrors it**.
+Measured against the same client, it saves nothing:
+
+| mode | what reaches the model |
+|---|--:|
+| default (`auto` → `leave` for an unlisted client) | 2,596 chars |
+| `"compress"` | **1,008 chars** |
+| `"replace"` | 1,008 chars — *no further change* |
+
+Claude Code had already thrown the block away, so removing it takes ~2,596 chars off a
+local stdio pipe and nothing off the model's context. It ships for the client that
+forwards *both* fields — for which it roughly halves the result, and which under
+`"compress"` can receive a cross-call diff in the block that contradicts the full envelope
+in the typed field. No such client has been measured. If you are on Claude Code,
+`"compress"` is the end of the line.
+
+It is never what `"auto"` resolves to, and it drops nothing unless all five guards hold:
+the mode is explicitly `"replace"`, the rule has non-empty `tiers`, the result is not an
+error, there is exactly one text block, and that block's parsed JSON is **equal** to
+`structuredContent`. A block that says anything the typed field doesn't is not a mirror
+and is kept.
+
 ### Keeping a tool's output off disk (`"capture": false`)
 
 Some tools return things that should never be written to a file — a credential, a token,

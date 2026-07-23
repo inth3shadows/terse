@@ -113,8 +113,16 @@ run_arm() {
   echo "  captured $(wc -l < "$out") tool_result block(s) -> $out"
 }
 
-run_arm raw
-run_arm terse
+# ARMS=raw runs the fixture-only arm. That is the whole measurement for the mirror-drop
+# probes (`TOOL=nomirror`, `TOOL=noschema`): they test what the CLIENT does with a wire
+# shape the fixture emits directly, so putting terse in the path would only add a second
+# suspect to any failure.
+ARMS="${ARMS:-raw terse}"
+for arm in $ARMS; do run_arm "$arm"; done
 
 echo
-"$HERE/report.py" "$OUTDIR/raw.jsonl" "$OUTDIR/terse.jsonl"
+if [ "$ARMS" = "raw terse" ]; then
+  "$HERE/report.py" "$OUTDIR/raw.jsonl" "$OUTDIR/terse.jsonl"
+else
+  for arm in $ARMS; do "$HERE/report.py" "$OUTDIR/$arm.jsonl"; done
+fi

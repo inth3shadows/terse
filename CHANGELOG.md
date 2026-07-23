@@ -21,6 +21,19 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   all declare an `outputSchema`.
   Codec only, no diff. See the `structured: "auto"` entry under **Changed** for how the
   default now decides this per connected client.
+- **`"structured": "replace"` — drop the redundant text mirror (#128), and the measurement
+  saying you probably shouldn't.** Compresses the typed field *and* deletes the text block
+  that duplicates it. Measured on the reference fixture: context cost goes 2,596 → 1,008
+  chars under `"compress"` and **1,008 → 1,008** under `"replace"` — no change, because
+  Claude Code had already discarded the block. What it removes is stdio bytes, not context.
+  Shipped as an explicit opt-in that `"auto"` never selects, because it is correct for a
+  client that forwards *both* fields (which `"compress"` can leave holding a cross-call
+  diff in the block contradicting a full envelope in the typed field); no such client has
+  been measured. Five independently-tested guards must all hold before a block is dropped
+  — explicit `"replace"`, non-empty `tiers`, not an `isError`, exactly one text block, and
+  that block's parsed JSON **equal** to `structuredContent`. Whether the tool declared an
+  `outputSchema` is deliberately *not* a guard: the new `noschema` probe shows the client
+  reads the typed field from a tool that declares none.
 
 ### Fixed
 - **The savings ledger no longer reports a saving terse did not deliver (#128).** terse

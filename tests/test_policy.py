@@ -435,6 +435,8 @@ def test_structured_defaults_to_auto_and_accepts_only_known_literals(tmp_path):
         == "auto"
     assert load_policy(write({"match": {"tool": "*"}, "tiers": [],
                               "structured": "compress"})).rules[0].structured == "compress"
+    assert load_policy(write({"match": {"tool": "*"}, "tiers": [],
+                              "structured": "replace"})).rules[0].structured == "replace"
     for bad in ("Compress", "Auto", "true", True, 1, None, "drop"):
         try:
             load_policy(write({"match": {"tool": "*"}, "tiers": [], "structured": bad}))
@@ -451,7 +453,12 @@ def test_structured_mode_resolves_against_the_declared_client(tmp_path):
     assert resolve("auto", "some-other-client") == "leave"
     assert resolve("auto", None) == "leave"                  # no handshake seen
     assert resolve("auto", "Claude-Code") == "leave"          # exact match only
+    # "auto" tops out at "compress" and never escalates to "replace": every mode up to
+    # "compress" is invisible to a client that ignores the typed field, and "replace" is
+    # the first one that removes information from the wire.
+    assert resolve("auto", "claude-code") != "replace"
     # explicit settings always win over the resolution
     for client in ("claude-code", "some-other-client", None):
         assert resolve("leave", client) == "leave"
         assert resolve("compress", client) == "compress"
+        assert resolve("replace", client) == "replace"
