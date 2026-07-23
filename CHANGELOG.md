@@ -9,6 +9,44 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Fixed
+- **`policy generate` scored payloads per-BLOCK, so every multi-block tool was
+  under-measured (#147).** The proxy compresses a multi-block result as one joined record
+  array (#116); the generator scored each captured block alone. For a server that returns
+  one record per content block — common — those are wildly different numbers: measured on
+  real kb traffic, `changelog` is 23.3% per-block and **48.4% joined**. Payloads are now
+  grouped back into results (by capture-time proximity) and each result is scored the way
+  the proxy would, falling back to per-block exactly where `apply_joined` would refuse.
+- **One non-JSON payload no longer disqualifies a whole tool (#147).** A single
+  `Error executing tool …` text block among a tool's records forced `passthrough` for all
+  of it. The premise was wrong — `policy.apply` passes a non-JSON payload through untouched
+  at runtime, so the tier costs nothing on those results. On a real corpus this alone was
+  zeroing the highest-volume tool in the fleet: `kb.read.search` measured **16.7% saved**
+  and was written as passthrough because 4 of its 436 payloads were error text. A
+  mostly-text tool is still suppressed, now for the right reason — non-JSON contributes 0
+  saved while its raw tokens stay in the denominator, so it falls below the threshold on
+  its own (`codegraph_explore`, 61/61 non-JSON, scores 0.0%).
+
+### Added
+- **`terse policy autotune` — re-tune an EXISTING policy instead of overwriting it (#136).**
+  `policy generate` authors from nothing and is *total*: run it on a deployed policy and it
+  silently drops every decision the corpus cannot see. It already warned about that for
+  `capture: false`; the same was true of `never_lossy_servers`, any `structured` override,
+  hand-written active `fields`, any rule for a tool the corpus never saw, and rule ORDER
+  (first match wins). `autotune` merges instead, split by what a corpus can possibly know:
+  **the corpus decides `tiers`** (including removing one — the motivating case is a stale
+  tier decision that predates a codec change), **the operator owns everything else**. It
+  prints a per-rule diff, names what it deliberately did not regenerate, and writes
+  **nothing** without `--apply`. New rules are inserted before any existing glob that would
+  shadow them, since a `kb.read.search` rule appended after `kb.*` is dead on arrival.
+  A new rule **inherits the operator-owned keys of whatever rule it displaces** — inserting
+  it ahead of a broader rule must not quietly hand that tool `capture: true` or
+  `structured: "auto"` — and a rule whose `tiers: []` is suppressing a lossy `$text.*`
+  selector keeps `tiers: []`, because turning them on would ACTIVATE that selector and this
+  merge is documented as lossless. Warns before applying a tier *downgrade*: the corpus is
+  a sample (idempotent by sha, and empty for a `capture: false` tool), so a removal should
+  be cross-checked against `terse stats`, which counts every call.
+
 ### Added
 - **`"structured": "compress"` — compress `structuredContent` too (#128).** New per-rule
   policy knob. MCP 2025-06-18 lets a tool return a typed `structuredContent` field beside

@@ -90,6 +90,68 @@ def measure_payload(raw: str) -> dict[str, Any]:
     }
 
 
+def measure_joined(raws: list[str]) -> dict[str, Any] | None:
+    """Measure N blocks of ONE result the way the proxy compresses them — as a single
+    joined record array (#116) — or None if the join would refuse (#147).
+
+    `measure_payload` scores each captured payload on its own. The proxy does not: a
+    multi-block result is folded into one array first, so `tabularize`/`dictionary` can
+    fold ACROSS the blocks. For a server that returns one record per content block — which
+    is common — those two numbers are wildly different, and the per-block one is the wrong
+    input to a policy decision. Measured on real kb traffic: `changelog` 23.3% per-block,
+    48.4% joined.
+
+    The raw baseline is the newline-join of the original block texts, not a re-serialization
+    of the parsed array — that is exactly what the proxy attributes as the raw side
+    (`"\\n".join(raw_texts)` in `transform_response`), and it keeps the whitespace win that
+    a re-serialized baseline would silently discard.
+
+    Returns None — meaning "the caller must fall back to per-block" — under the same
+    conditions `policy.apply_joined` refuses, so the measurement models what would actually
+    happen rather than a best case: a block that isn't JSON, a block that isn't an object,
+    a reserved terse marker already present, or a joined array past the depth cap."""
+    if len(raws) < 2:
+        return None
+    objs: list[Any] = []
+    for raw in raws:
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, RecursionError):
+            return None                      # non-JSON block: apply_joined refuses
+        if not isinstance(obj, dict):
+            return None                      # not a record sequence: apply_joined refuses
+        objs.append(obj)
+    if transforms.has_terse_marker(objs) or transforms.exceeds_depth(objs):
+        return None
+
+    raw_tok = count_cl100k("\n".join(raws))
+    min_tok = count_cl100k(transforms.minify(objs))
+    tab_tok = count_cl100k(transforms.compress_tabular(objs))
+    cmp_tok = count_cl100k(transforms.compress(objs))
+    gate = transforms.roundtrip_ok(objs)
+
+    def _saved(a: int | None, b: int | None) -> int | None:
+        return None if a is None or b is None else a - b
+
+    saved = {
+        "minify": _saved(raw_tok, min_tok),
+        "tabularize": _saved(min_tok, tab_tok),
+        "dictionary": _saved(tab_tok, cmp_tok),
+        "tier_total": _saved(raw_tok, cmp_tok),
+    }
+    if not gate:
+        saved = dict.fromkeys(saved, 0)       # same rule as measure_payload: no banking a loss
+    return {
+        "shape": "joined-records",
+        "applicable": True,
+        "roundtrip_ok": gate,
+        "blocks": len(raws),
+        "cl100k": {"raw": raw_tok, "minified": min_tok, "tabular": tab_tok,
+                   "compressed": cmp_tok},
+        "saved_cl100k": saved,
+    }
+
+
 def cross_tokenizer_savings(envelopes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Per-tool Tier-0 savings under two different BPE vocabularies (cl100k, o200k).
 

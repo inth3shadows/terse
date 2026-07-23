@@ -20,6 +20,7 @@ import json
 import json as _json
 import re
 import sys
+import tempfile
 import time
 from datetime import UTC
 from pathlib import Path
@@ -290,6 +291,108 @@ def _warn_if_dropping_capture_rules(out: Path) -> None:
         print(f"[warn] {out} already sets \"capture\": false for {len(guarded)} rule(s) "
               f"({', '.join(guarded)}); regeneration does NOT preserve them — re-add any "
               "you still want before relying on this file", file=sys.stderr)
+
+
+def _cmd_policy_autotune(args: argparse.Namespace) -> int:
+    """Re-tune an EXISTING policy against a corpus (#136).
+
+    `policy generate` authors from nothing and overwrites; running it on a deployed policy
+    silently drops every decision the corpus cannot see (it says so itself, for
+    `capture: false` alone). This merges instead — the corpus owns `tiers`, the operator
+    owns everything else — and writes NOTHING without `--apply`, so the diff is the default
+    output rather than an after-the-fact warning."""
+    from .policy import load_policy
+    from .policy_gen import generate_policy, merge_policy
+
+    existing_path = Path(args.policy)
+    try:
+        existing = _json.loads(existing_path.read_text(encoding="utf-8"))
+        load_policy(existing_path)   # refuse to DIFF against a policy we can't even load
+    except (OSError, ValueError) as exc:
+        # A refusal, per the line above — not a traceback. Same convention as `stats`.
+        print(f"policy autotune: cannot read {existing_path}: {exc}", file=sys.stderr)
+        return 2
+
+    envelopes = load_corpus(args.corpus)
+    if not envelopes:
+        print(f"no payloads in {args.corpus}/ — capture some first "
+              f"(`terse capture` or `proxy --capture-dir`).", file=sys.stderr)
+        return 1
+
+    # A policy that opted out of the #116 join must not be tuned on cross-block folding
+    # it will never perform.
+    generated, _rows = generate_policy(envelopes, threshold=args.threshold,
+                                       join_blocks=bool(existing.get("join_blocks", True)))
+    merged, changes = merge_policy(existing, generated)
+
+    kinds = {k: [c for c in changes if c["kind"] == k]
+             for k in ("added", "tiers", "suggestions", "unchanged", "preserved",
+                       "inherited")}
+    print(f"# terse policy autotune — {len(envelopes)} payload(s), {existing_path}")
+    for c in kinds["tiers"]:
+        before = ",".join(c["before"]) or "(passthrough)"
+        after = ",".join(c["after"]) or "(passthrough)"
+        print(f"  ~ {c['tool']:<28} {before}  ->  {after}")
+    for c in kinds["added"]:
+        print(f"  + {c['tool']:<28} {','.join(c['after']) or '(passthrough)'}  (new rule)")
+    for c in kinds["inherited"]:
+        print(f"  = {c['tool']:<28} inherited {','.join(c['keys'])} from {c['from']}")
+    for c in kinds["suggestions"]:
+        print(f"  ~ {c['tool']:<28} drop-to-retrieve suggestions changed (still INACTIVE)")
+    # Say what was deliberately NOT regenerated. An operator who can't see this can't tell
+    # a preserved safety key from one the merge forgot.
+    kept = sorted({k for c in changes for k in c.get("preserved", [])})
+    if kept:
+        print(f"  = preserved on existing rules, not regenerated: {', '.join(kept)}")
+    if kinds["preserved"]:
+        print(f"  = {len(kinds['preserved'])} rule(s) untouched "
+              f"(not in this corpus): {', '.join(c['tool'] for c in kinds['preserved'])}")
+    # `defaults` is listed explicitly rather than filtered out: it governs every tool with
+    # no matching rule, so "was it regenerated?" is a real question about it.
+    if top := sorted(k for k in existing if k not in ("version", "policies")):
+        print(f"  = top-level preserved: {', '.join(top)}")
+    if not (kinds["tiers"] or kinds["added"] or kinds["suggestions"]):
+        print("  (no change — the deployed policy already matches this corpus)")
+
+    # A proposed DOWNGRADE deserves a second look. It removes a tier from a rule that is
+    # working today, on the evidence of a corpus that is a SAMPLE — idempotent by sha, so
+    # it holds each payload's first sighting rather than every call, and it holds nothing at
+    # all for a tool gated by `capture: false`. Adding a tier on thin evidence costs a
+    # little transform time; removing one silently gives back measured savings.
+    # Includes `added`: a NEW rule inserted ahead of a broader one takes that tool from the
+    # broader rule's tiers to its own, so a rule can lose tiers without any existing rule
+    # being re-decided. Comparing only same-rule changes misses it entirely.
+    downgrades = [c for c in kinds["tiers"] + kinds["added"]
+                  if len(c["after"]) < len(c.get("before") or [])]
+    if downgrades:
+        print(f"\n[warn] {len(downgrades)} rule(s) would LOSE a tier "
+              f"({', '.join(c['tool'] for c in downgrades)}). The corpus is a sample; cross-"
+              "check those tools in `terse stats` — which counts every call, including ones "
+              "whose payloads were never captured — before applying a downgrade.")
+    if not args.apply:
+        print("\nnothing written. Re-run with --apply to write the merged policy.")
+        return 0
+
+    text = _json.dumps(merged, ensure_ascii=False, indent=2)
+    # Validate BEFORE writing, not after. `policy generate --out` can validate afterwards
+    # because it is usually authoring a new file; autotune overwrites a policy that is
+    # deployed and working, so a merged doc our own loader rejects must never reach it —
+    # "fail loud" would otherwise mean "loudly, on top of the file you needed".
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                     encoding="utf-8") as tf:
+        tf.write(text)
+        probe = tf.name
+    try:
+        load_policy(probe)
+    except (OSError, ValueError) as exc:
+        print(f"\nrefusing to write: the merged policy does not load ({exc}). "
+              f"{existing_path} is unchanged.", file=sys.stderr)
+        return 1
+    finally:
+        Path(probe).unlink(missing_ok=True)
+    write_restricted(existing_path, text + "\n", mode=0o644)
+    print(f"\n[policy written to {existing_path}]")
+    return 0
 
 
 def _cmd_policy_generate(args: argparse.Namespace) -> int:
@@ -1050,6 +1153,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="min total savings %% to compress a tool, and min marginal %% to add "
                          "the dictionary tier (default 5.0; conservative)")
     pg.set_defaults(func=_cmd_policy_generate)
+    pa = pol_sub.add_parser("autotune", help="re-tune an EXISTING policy from a corpus — "
+                                             "merge, don't overwrite; prints a diff")
+    pa.add_argument("--policy", required=True, help="the existing policy to re-tune")
+    pa.add_argument("--corpus", default=DEFAULT_CORPUS)
+    pa.add_argument("--threshold", type=float, default=5.0, metavar="PCT",
+                    help="as `policy generate` (default 5.0)")
+    pa.add_argument("--apply", action="store_true",
+                    help="write the merged policy. Without it, nothing is written.")
+    pa.set_defaults(func=_cmd_policy_autotune)
 
     c2 = sub.add_parser("compress", help="compress a tool output per policy (the shell)")
     c2.add_argument("file", help="path to the raw tool output, or - for stdin")

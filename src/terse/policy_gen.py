@@ -8,9 +8,12 @@ turns that measurement into a policy directly.
 The tier decision is deliberately CONSERVATIVE and 100% lossless (it only ever enables the
 round-trip-gated Tier-0/0.5 tiers, never a lossy mode):
 
-  For each tool, aggregate its payloads' per-tier cl100k savings, then:
-    1. any non-JSON payload OR any round-trip failure  -> passthrough  (never compress
-       a tool we can't losslessly handle)
+  For each tool, score its RESULTS the way the proxy compresses them — a multi-block
+  result as one joined record array (#116/#147), not block by block — then:
+    1. any round-trip failure                          -> passthrough  (never compress
+       a tool we can't losslessly handle). A non-JSON payload does NOT disqualify the
+       tool: the runtime passes it through untouched, and its raw tokens stay in the
+       denominator, so a mostly-text tool falls below the threshold on its own.
     2. total savings %  < threshold                    -> passthrough  (transform cost
        not worth a marginal gain)
     3. otherwise  ["minify","tabularize"] (+ "dictionary" iff its MARGINAL saving clears
@@ -36,13 +39,15 @@ transform. The CLI surfaces that pointer; it is not a hard gate here.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 from typing import Any
 
+from . import policy as policy_mod
 from . import probes
 from .capture import find_record_list_with_path
-from .measure import measure_payload
+from .measure import measure_joined, measure_payload
 
 # Tiers are cumulative in the codec (minify ⊂ tabularize ⊂ dictionary). minify is implied
 # by re-serialization, so it never ships alone — tabularize always carries it.
@@ -108,6 +113,164 @@ def activate_suggestions(doc: dict) -> dict:
         if sug:
             entry["fields"] = {**entry.get("fields", {}), **sug}
     return out
+
+
+# Rule keys the CORPUS is allowed to decide. Everything else on an existing rule is the
+# operator's and survives a merge verbatim — see `merge_policy`.
+CORPUS_OWNED_KEYS = ("tiers", "_comment", "_suggested_fields", "_suggested_fields_note")
+
+
+def _keep_lossy_inert(entry: dict, before: list[str]) -> dict:
+    """Refuse to turn `tiers: []` into a compressing stack when the rule carries a LOSSY
+    field selector. `policy.apply` treats `tiers: []` as an explicit hands-off passthrough
+    that suppresses the text-drop path entirely (it even warns that a rule carrying both is
+    a contradiction), so such a selector is inert today — and flipping tiers on would ACTIVATE
+    it. A merge documented as lossless and operator-preserving must not be the thing that
+    puts a lossy transform live; the operator opts into that by editing `fields`, gated by
+    `terse fluency --drop-eval`. Returns the entry unchanged when the situation doesn't
+    arise."""
+    if before or not entry.get("tiers"):
+        return entry                        # not a []-to-compressing transition
+    lossy = [k for k, v in (entry.get("fields") or {}).items()
+             if isinstance(v, dict) and v.get("lossy")]
+    if not lossy:
+        return entry
+    note = (f"tiers left at [] by autotune: enabling them would ACTIVATE the lossy "
+            f"selector(s) {sorted(lossy)} that 'tiers: []' currently suppresses. "
+            f"Enable deliberately, then verify with `terse fluency --drop-eval`.")
+    return {**entry, "tiers": [], "_comment": f"{entry.get('_comment', '')} — {note}".strip(" —")}
+
+
+def merge_policy(existing: dict, generated: dict) -> tuple[dict, list[dict[str, Any]]]:
+    """Merge a freshly `generate_policy`'d doc INTO an existing policy (#136). Returns
+    `(merged_doc, changes)`; pure, like everything else here.
+
+    `generate_policy` is *total* — it authors a whole fresh doc from the corpus and knows
+    nothing about what is already deployed. Writing that over a live policy silently drops
+    every decision the corpus cannot see, which `_cmd_policy_generate` already warns about
+    for `capture: false` alone. The same is true of `never_lossy_servers`, a `structured`
+    override, hand-written active `fields`, any rule for a tool this corpus never saw, and
+    rule ORDER (first match wins).
+
+    So the merge is split by what a corpus can possibly know:
+
+      * The corpus decides `tiers` — INCLUDING removing one. That is the whole point: a
+        tier decision goes stale the moment a codec change lands (the motivating case is a
+        `dictionary` rule disabled by a measurement predating the multi-block join, #116),
+        and an additive-only merge could never correct it. Removals are proposed, surfaced
+        in `changes`, and — by contract with the CLI — never written without an explicit
+        `--apply`.
+      * The corpus decides its own `_suggested_fields` block, which stays INACTIVE either
+        way (the loader reads `fields`, not `_suggested_fields`).
+      * The operator owns EVERYTHING else. `capture`, `structured` and `never_lossy_servers`
+        are safety decisions a corpus is structurally incapable of making — a payload
+        cannot show that a tool returns a plaintext credential, or that a client validates
+        `outputSchema`. terse treats all three as fail-safe elsewhere (#85, #135); a
+        regeneration path that quietly reverses them would be the one hole in that.
+
+    Ordering is preserved because it is load-bearing: rules are first-match-wins, so a
+    reordered policy is a different policy. Existing rules keep their positions; a rule for
+    a tool the corpus didn't see is untouched; new rules are inserted BEFORE the first
+    catch-all (`*`) rule, since appending after one would make them dead.
+
+    A duplicate tool glob in the existing doc is merged into the FIRST occurrence only —
+    the later ones are already unreachable, and rewriting them would imply otherwise."""
+    import copy
+
+    gen_by_tool: dict[str, dict] = {}
+    for entry in generated.get("policies", []):
+        tool = (entry.get("match") or {}).get("tool", "*")
+        gen_by_tool.setdefault(tool, entry)
+
+    merged: list[dict] = []
+    changes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for old in existing.get("policies", []):
+        tool = (old.get("match") or {}).get("tool", "*")
+        gen = gen_by_tool.get(tool)
+        if gen is None or tool in seen:
+            merged.append(copy.deepcopy(old))
+            changes.append({"tool": tool, "kind": "preserved",
+                            "why": "unreachable duplicate" if tool in seen
+                                   else "not in corpus"})
+            seen.add(tool)
+            continue
+        seen.add(tool)
+        new = copy.deepcopy(old)
+        for key in CORPUS_OWNED_KEYS:
+            new.pop(key, None)
+            if key in gen:
+                new[key] = copy.deepcopy(gen[key])
+        new = _keep_lossy_inert(new, list(old.get("tiers", [])))
+        kept = sorted(k for k in old if k not in CORPUS_OWNED_KEYS and k != "match")
+        before, after = old.get("tiers", []), new.get("tiers", [])
+        if list(before) != list(after):
+            changes.append({"tool": tool, "kind": "tiers", "before": list(before),
+                            "after": list(after), "preserved": kept})
+        elif old.get("_suggested_fields") != new.get("_suggested_fields"):
+            changes.append({"tool": tool, "kind": "suggestions", "preserved": kept})
+        else:
+            changes.append({"tool": tool, "kind": "unchanged", "preserved": kept})
+        merged.append(new)
+
+    # Each new rule goes BEFORE the first existing rule that would already match its tool.
+    # Appending is wrong and silently so: rules are first-match-wins, so a fresh
+    # `kb.read.search` rule placed after an existing `kb.*` is dead on arrival — the policy
+    # would look re-tuned and change nothing. The guard is any matching glob, not just a
+    # literal `*`: `kb.*` is a catch-all for every kb tool.
+    added = [(t, copy.deepcopy(e)) for t, e in gen_by_tool.items() if t not in seen]
+
+    def _shadowing(tool: str) -> tuple[int, dict | None]:
+        """Index of the first existing rule that currently governs `tool`, and that rule.
+
+        Uses `Policy`'s own candidate list rather than a bare fnmatch, so a multiproxy
+        peer-qualified name resolves the way the loader would. Best-effort on ONE axis:
+        the server-qualified candidate needs a server name, and the corpus does not record
+        which server a payload came from — so a server-scoped rule (`runecho.*`) against a
+        tool captured under its bare name (`structure`) is not detected here. Tracked
+        separately; erring this way inserts a rule that the loader may then shadow, which
+        is inert, rather than one that silently overrides an operator rule."""
+        for i, e in enumerate(merged):
+            glob = (e.get("match") or {}).get("tool", "*")
+            if any(fnmatch.fnmatch(c, glob)
+                   for c in policy_mod.Policy._match_candidates(tool)):
+                return i, e
+        return len(merged), None
+
+    # Group by insertion point and splice from the back, so earlier indices stay valid and
+    # the generator's own order (highest savings first) survives within each group.
+    buckets: dict[int, list[dict]] = {}
+    for tool, entry in added:
+        at, shadowed = _shadowing(tool)
+        prior_tiers: list[str] = []
+        if shadowed is not None:
+            # INHERIT the operator-owned keys of the rule this one displaces. Without this
+            # the anti-shadowing insertion above becomes a safety hole: a new
+            # `kb.read.search` rule placed ahead of an operator's
+            # `kb.* {capture: false, structured: "leave"}` would leave that tool running
+            # with capture ON (payloads to disk, reversing the #85 decision) and
+            # `structured: "auto"` (rewriting a typed field the operator opted out of).
+            # A new rule refines `tiers` for a tool; it must not quietly re-decide
+            # anything else about it.
+            inherited = {k: copy.deepcopy(v) for k, v in shadowed.items()
+                         if k not in CORPUS_OWNED_KEYS and k != "match"}
+            entry = {**entry, **inherited}
+            prior_tiers = list(shadowed.get("tiers", []))
+            if inherited:
+                changes.append({"tool": tool, "kind": "inherited",
+                                "from": (shadowed.get("match") or {}).get("tool", "*"),
+                                "keys": sorted(inherited)})
+        entry = _keep_lossy_inert(entry, prior_tiers)
+        buckets.setdefault(at, []).append(entry)
+        changes.append({"tool": tool, "kind": "added", "before": prior_tiers,
+                        "after": list(entry.get("tiers", []))})
+    for at in sorted(buckets, reverse=True):
+        merged[at:at] = buckets[at]
+
+    out = copy.deepcopy(existing)
+    out["policies"] = merged
+    return out, changes
 
 
 def _drop_candidates(
@@ -183,14 +346,73 @@ def _pct(saved: int, raw: int) -> float:
     return (saved / raw * 100.0) if raw else 0.0
 
 
-def _tool_decision(tool: str, raws: list[str], threshold: float) -> dict[str, Any]:
-    """Aggregate one tool's payloads and decide its tiers. Returns a summary row with
-    the chosen `tiers`, the measured savings, and a human-readable `reason`."""
-    rows = [measure_payload(r) for r in raws]
-    n = len(rows)
+# Two captured blocks of ONE result are teed back-to-back — a file write apart — so
+# consecutive envelopes closer than this belong to the same tool call (#147). Compared
+# CONSECUTIVELY, not first-to-last, so a 200-block result groups correctly however long it
+# takes overall. Over-grouping is possible in one case — genuinely parallel calls to the
+# same tool interleave in time and no window separates them — and is mild: it scores that
+# tool as if one larger result arrived, which is still representative of its shape. The
+# exact fix would be a result id written into the capture envelope; it is not worth a
+# format change until over-grouping is shown to move a decision.
+_RESULT_WINDOW_NS = 50_000_000  # 50 ms
 
-    # A single non-JSON payload or round-trip failure disqualifies the whole tool: the
-    # policy matches on tool name, so we can't enable a tier for "most" of its results.
+
+def group_results(envelopes: list[dict[str, Any]]) -> dict[str, list[list[str]]]:
+    """Reconstruct `tool -> [[block, ...], ...]` from a flat corpus, so a tool's payloads
+    can be scored as the RESULTS they arrived as (#147). Envelopes without a `captured_at`
+    (predating the field) each become their own single-block group — the pre-#147 behavior,
+    which is the safe direction: it under-measures rather than inventing a join.
+
+    Note the corpus is idempotent by sha and preserves a payload's FIRST `captured_at`, so
+    this reconstructs first-sightings, not every call. That is the same sample the tier
+    decision was always made from; it just stops pretending each block arrived alone."""
+    out: dict[str, list[list[str]]] = {}
+    by_tool: dict[str, list[dict[str, Any]]] = {}
+    for env in envelopes:
+        by_tool.setdefault(env.get("tool", "?"), []).append(env)
+    for tool, envs in by_tool.items():
+        timed = sorted((e for e in envs if isinstance(e.get("captured_at"), int)),
+                       key=lambda e: e["captured_at"])
+        groups: list[list[str]] = [[e["raw"]] for e in envs
+                                   if not isinstance(e.get("captured_at"), int)]
+        prev_ts: int | None = None
+        for env in timed:
+            if prev_ts is not None and env["captured_at"] - prev_ts < _RESULT_WINDOW_NS:
+                groups[-1].append(env["raw"])
+            else:
+                groups.append([env["raw"]])
+            prev_ts = env["captured_at"]
+        out[tool] = groups
+    return out
+
+
+def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
+                   join_blocks: bool = True) -> dict[str, Any]:
+    """Aggregate one tool's RESULTS and decide its tiers. Returns a summary row with
+    the chosen `tiers`, the measured savings, and a human-readable `reason`.
+
+    Each result is scored the way the proxy would compress it: a multi-block result as one
+    joined array, falling back to per-block exactly where `apply_joined` would refuse
+    (#147). Scoring blocks individually — which this did until then — under-measures every
+    server that returns one record per content block, and produced `passthrough` for tools
+    that measurably compress in production."""
+    raws = [r for g in groups for r in g]
+    rows = []
+    joined_results = 0
+    for group in groups:
+        # `apply_joined`'s FIRST check is `if not policy.join_blocks` — a policy that opted
+        # out of #116 must not be tuned on cross-block folding it will never perform.
+        joined = measure_joined(group) if join_blocks else None
+        if joined is not None:
+            rows.append(joined)
+            joined_results += 1
+        else:
+            rows.extend(measure_payload(r) for r in group)
+    n = len(raws)
+
+    # Counted over ROWS, so a joined result contributes 1 whatever its block count — see
+    # the ratio note where these are rendered. Only `gate_fail` disqualifies the tool;
+    # `non_json` is reported, not acted on (#147, and the reasoning at the branch below).
     non_json = sum(1 for r in rows if not r["applicable"])
     gate_fail = sum(1 for r in rows if not r["roundtrip_ok"])
 
@@ -209,35 +431,52 @@ def _tool_decision(tool: str, raws: list[str], threshold: float) -> dict[str, An
     drop_suggestion, drop_rows = _drop_candidates(raws)
 
     base = {
-        "tool": tool, "n": n, "raw_tok": raw_tok,
+        "tool": tool, "n": n, "n_results": len(groups), "joined_results": joined_results,
+        "raw_tok": raw_tok,
         "saved_pct": round(total_pct, 1), "dict_pct": round(dict_pct, 1),
         "minify": minify, "tabularize": tabularize, "dictionary": dictionary,
         "drop_suggestion": drop_suggestion, "drop_rows": drop_rows,
     }
 
-    if non_json or gate_fail:
-        why = []
-        if non_json:
-            why.append(f"{non_json}/{n} non-JSON")
-        if gate_fail:
-            why.append(f"{gate_fail}/{n} failed round-trip")
-        return {**base, "tiers": [], "reason": f"passthrough — {', '.join(why)}"}
+    # A round-trip FAILURE still disqualifies the whole tool: it says the codec cannot
+    # losslessly handle this tool's shape, and the policy matches on tool name, so there is
+    # no way to enable a tier for only the payloads that survive.
+    if gate_fail:
+        return {**base, "tiers": [],
+                "reason": f"passthrough — {gate_fail}/{len(rows)} result(s) failed "
+                          f"round-trip"}
+
+    # A non-JSON payload does NOT (#147). It used to, and that quietly zeroed the
+    # highest-volume tool in a real fleet: `kb.read.search` measured 16.7% saved and was
+    # marked passthrough because 4 of its 436 captured payloads were the server's
+    # `Error executing tool …` text. The premise was wrong — `policy.apply` passes a
+    # non-JSON payload through untouched at runtime, so enabling a tier for a tool that
+    # occasionally returns prose costs exactly nothing on those results. Meanwhile a tool
+    # that is MOSTLY text is still suppressed, and for the right reason: non-JSON payloads
+    # contribute 0 saved while their raw tokens stay in the denominator, so the percentage
+    # falls below the threshold on its own (`codegraph_explore`, 61/61 non-JSON, scores
+    # 0.0%). The measurement handles it; the disqualifier only ever discarded real savings.
+    # Denominator is rows, not `n`: `n` counts BLOCKS and a joined result is one row,
+    # so "4/436" would understate by the join factor and argue against the decision
+    # it is justifying.
+    mixed = f" ({non_json}/{len(rows)} non-JSON, passed through)" if non_json else ""
 
     if total_pct < threshold:
         return {**base, "tiers": [],
-                "reason": f"passthrough — {total_pct:.1f}% < {threshold:.1f}% threshold"}
+                "reason": f"passthrough — {total_pct:.1f}% < {threshold:.1f}% threshold{mixed}"}
 
     tiers = list(_BASE_TIERS)
     if dict_pct >= threshold:
         tiers.append("dictionary")
-        reason = f"{total_pct:.1f}% saved (dictionary +{dict_pct:.1f}%)"
+        reason = f"{total_pct:.1f}% saved (dictionary +{dict_pct:.1f}%){mixed}"
     else:
-        reason = f"{total_pct:.1f}% saved (dictionary +{dict_pct:.1f}% below threshold — dropped)"
+        reason = (f"{total_pct:.1f}% saved (dictionary +{dict_pct:.1f}% below threshold "
+                  f"— dropped){mixed}")
     return {**base, "tiers": tiers, "reason": reason}
 
 
 def generate_policy(
-    envelopes: list[dict[str, Any]], threshold: float = 5.0
+    envelopes: list[dict[str, Any]], threshold: float = 5.0, join_blocks: bool = True
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Author a conservative lossless policy from captured payloads.
 
@@ -246,18 +485,17 @@ def generate_policy(
     minify+tabularize. Returns `(policy_doc, rows)` — `policy_doc` is loadable by
     `policy.load_policy`; `rows` is one decision summary per tool (sorted by savings desc)
     for a report. Tools are emitted in the same order so the JSON is deterministic."""
-    by_tool: dict[str, list[str]] = {}
-    for env in envelopes:
-        by_tool.setdefault(env.get("tool", "?"), []).append(env["raw"])
-
-    rows = [_tool_decision(tool, raws, threshold) for tool, raws in by_tool.items()]
+    rows = [_tool_decision(tool, groups, threshold, join_blocks)
+            for tool, groups in group_results(envelopes).items()]
     # Highest-savings tools first: makes the policy and the report read top-down by value,
     # and keeps output stable regardless of corpus file ordering.
     rows.sort(key=lambda r: (-r["saved_pct"], r["tool"]))
 
     policies = []
     for r in rows:
-        comment = f"{r['n']} payload(s), {r['reason']}"
+        comment = (f"{r['n']} payload(s) in {r['n_results']} result(s)"
+                   + (f", {r['joined_results']} scored joined" if r.get("joined_results") else "")
+                   + f", {r['reason']}")
         entry: dict[str, Any] = {"_comment": comment, "match": {"tool": r["tool"]},
                                  "tiers": r["tiers"]}
         # Drop-to-retrieve suggestions ride along INACTIVE: the loader reads `fields`, not

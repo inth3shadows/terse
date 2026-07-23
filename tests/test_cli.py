@@ -695,3 +695,65 @@ def test_tune_cmd_reports_no_candidates(tmp_path, capsys):
     assert main(["capture", str(f), "--tool", "x.y", "--corpus", str(corpus)]) == 0
     assert main(["tune", "--corpus", str(corpus)]) == 0
     assert "no drop-to-retrieve candidates" in capsys.readouterr().out
+
+
+# --- #136: `policy autotune` writes nothing without --apply, and never a broken policy ---
+
+def _autotune_setup(tmp_path):
+    """A deployed policy carrying operator-only decisions, plus a corpus that would
+    otherwise regenerate the rule from scratch."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for i in range(6):
+        rec = {"tool": "gh.items", "captured_at": 1_000_000_000 + i,
+               "raw": json.dumps({"result": [{"id": j, "status": "active",
+                                              "url": "https://x.example/api/items"}
+                                             for j in range(20)]})}
+        (corpus / f"gh.items__{i}.json").write_text(json.dumps(rec), encoding="utf-8")
+    pol = tmp_path / "policy.json"
+    pol.write_text(json.dumps({
+        "version": 1,
+        "never_lossy_servers": ["secret-broker"],
+        "policies": [{"match": {"tool": "gh.items"}, "tiers": [], "capture": False,
+                      "structured": "leave"}],
+    }), encoding="utf-8")
+    return pol, corpus
+
+
+def test_policy_autotune_writes_nothing_without_apply(tmp_path, capsys):
+    pol, corpus = _autotune_setup(tmp_path)
+    before = pol.read_bytes()
+    rc = main(["policy", "autotune", "--policy", str(pol), "--corpus", str(corpus)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert pol.read_bytes() == before                      # byte-for-byte untouched
+    assert "nothing written" in out
+    assert "gh.items" in out                               # the change WAS proposed
+
+
+def test_policy_autotune_apply_preserves_operator_keys(tmp_path):
+    pol, corpus = _autotune_setup(tmp_path)
+    rc = main(["policy", "autotune", "--policy", str(pol), "--corpus", str(corpus),
+               "--apply"])
+    assert rc == 0
+    doc = json.loads(pol.read_text(encoding="utf-8"))
+    rule = doc["policies"][0]
+    assert rule["capture"] is False                        # operator's, not the corpus's
+    assert rule["structured"] == "leave"
+    assert doc["never_lossy_servers"] == ["secret-broker"]
+    assert rule["tiers"]                                   # the corpus DID re-decide this
+
+
+def test_policy_autotune_refuses_to_write_a_policy_it_cannot_load(tmp_path, capsys, monkeypatch):
+    # The live policy is deployed and working; a merged doc our own loader rejects must
+    # never land on top of it.
+    pol, corpus = _autotune_setup(tmp_path)
+    before = pol.read_bytes()
+    import terse.policy_gen as pg
+    monkeypatch.setattr(pg, "merge_policy",
+                        lambda existing, generated: ({"version": 99}, []))
+    rc = main(["policy", "autotune", "--policy", str(pol), "--corpus", str(corpus),
+               "--apply"])
+    assert rc == 1
+    assert pol.read_bytes() == before                      # unchanged
+    assert "refusing to write" in capsys.readouterr().err
