@@ -844,9 +844,15 @@ def build_dropeval_report(results: dict) -> str:
         "binomial bound.",
         "",
         "| Model | recall q | retrieve-recall | precision (no-overfetch) | final-accuracy "
-        "| handle-accuracy |",
-        "|---|---|---|---|---|---|",
+        "| handle-accuracy | failed calls |",
+        "|---|---|---|---|---|---|---|",
     ]
+    # A call that never reached the model scores identically to a model that declined to
+    # retrieve, so the error count is reported next to the accuracy it can counterfeit and
+    # suppresses the verdict outright past a threshold — a broken harness must not be
+    # readable as a behavioral result (this is exactly how the `terse.retrieve` tool-name
+    # 400 produced a clean 0%-recall FAIL for every model, see dropeval._oai_name).
+    err_by_model: dict[str, tuple[int, int]] = {}
     recall_gate: dict[str, tuple[float, float, float, float]] = {}
     precision_gate: dict[str, tuple[float, float, float, float]] = {}
     accuracy_gate: dict[str, tuple[float, float, float, float]] = {}
@@ -864,12 +870,31 @@ def build_dropeval_report(results: dict) -> str:
         recall_gate[model] = (racc, rse, 1.0, 0.0)
         precision_gate[model] = (pacc, pse, 1.0, 0.0)
         accuracy_gate[model] = (aacc, ase, 1.0, 0.0)
+        errs = sum(r.get("errors", 0) for r in rows)
+        attempts = sum(r.get("trials", 1) for r in rows)
+        err_by_model[model] = (errs, attempts)
         out.append(f"| `{model}` | {len(recall_rows)} | {racc:.0%} ±{_ci(rse) * 100:.0f} "
                    f"| {pacc:.0%} ±{_ci(pse) * 100:.0f} | {aacc:.0%} ±{_ci(ase) * 100:.0f} "
-                   f"| {hacc:.0%} ±{_ci(hse) * 100:.0f} |")
+                   f"| {hacc:.0%} ±{_ci(hse) * 100:.0f} "
+                   f"| {errs}/{attempts} |")
     out.append("")
+    broken = {m: (e, a) for m, (e, a) in err_by_model.items() if e}
+    if broken:
+        out += ["> **Model calls failed** — these rows measure the harness, not the model: "
+                + ", ".join(f"`{m}` {e}/{a}" for m, (e, a) in sorted(broken.items())) + ".",
+                ""]
 
     out += ["## Verdict", ""]
+    # Half of a model's calls failing means its accuracy columns are mostly counting
+    # transport errors. Refuse to render a pass/fail rather than let the run be cited.
+    inconclusive = {m: (e, a) for m, (e, a) in err_by_model.items() if a and e * 2 >= a}
+    if inconclusive:
+        out += ["- **INCONCLUSIVE** — "
+                + ", ".join(f"`{m}` failed {e}/{a} model calls" for m, (e, a) in
+                            sorted(inconclusive.items()))
+                + ". Fix the backend and re-run; no behavioral claim can be made from this.",
+                ""]
+        return "\n".join(out)
     recall_worst = _worst_case_gap(recall_gate)
     precision_worst = _worst_case_gap(precision_gate)
     accuracy_worst = _worst_case_gap(accuracy_gate)

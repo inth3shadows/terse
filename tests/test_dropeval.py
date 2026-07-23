@@ -262,3 +262,87 @@ def test_run_drop_fluency_computes_questions_once_per_envelope_not_per_model(mon
     assert set(results) == {"model-a", "model-b", "model-c"}
     assert all(results[m] for m in results)  # each model still got real rows
     assert calls["n"] == 1  # one envelope -> one derivation, reused across all 3 models
+
+
+# --------------------------------------------------------------------------- #
+# The live OpenAI-compatible bridge. Previously untested "because it's a thin urllib
+# adapter" — and that is precisely where the feature-killing bug lived: `terse.retrieve`
+# is a legal MCP tool name and an ILLEGAL OpenAI function name, so every drop-eval run
+# against a real endpoint 400'd and scored a confident 0% retrieve-recall.
+# --------------------------------------------------------------------------- #
+import re
+import urllib.request
+
+from terse.proxy import RETRIEVE_TOOL_DEF
+
+_OPENAI_FN_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def test_openai_tool_name_matches_openai_alphabet():
+    # The MCP name is dotted; the wire name must not be, or the request is rejected
+    # outright (400) before the model ever sees the question.
+    assert not _OPENAI_FN_NAME.match(RETRIEVE_TOOL_DEF["name"])
+    wire = dropeval._to_openai_tool(RETRIEVE_TOOL_DEF)["function"]["name"]
+    assert _OPENAI_FN_NAME.match(wire), wire
+    assert wire == "terse_retrieve"
+
+
+def _fake_urlopen(captured: dict, tool_name_in_reply: str):
+    """Stand in for the endpoint: record the request body, reply with one tool call."""
+    class _Resp:
+        def __init__(self, payload): self._payload = payload
+        def read(self): return json.dumps(self._payload).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake(req, timeout=None):
+        captured["body"] = json.loads(req.data.decode())
+        return _Resp({"choices": [{"message": {
+            "content": "",
+            "tool_calls": [{"id": "c1", "type": "function", "function": {
+                "name": tool_name_in_reply, "arguments": json.dumps({"handle": "h1"})}}],
+        }}]})
+    return fake
+
+
+def test_openai_tool_answerer_sends_sanitized_name_and_maps_the_reply_back(monkeypatch):
+    captured: dict = {}
+    # A real endpoint echoes back the SANITIZED name it was given, so the adapter must
+    # map it home — otherwise `_run_question`'s `c.name == RETRIEVE_TOOL` filter never
+    # matches and every retrieve call is scored as "didn't retrieve".
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        _fake_urlopen(captured, "terse_retrieve"))
+    ask = dropeval.openai_tool_answerer("http://x/v1", "k", "m", tools=[RETRIEVE_TOOL_DEF])
+    turn = ask([{"role": "user", "content": "hi"}])
+
+    sent = captured["body"]["tools"][0]["function"]["name"]
+    assert _OPENAI_FN_NAME.match(sent)
+    assert [c.name for c in turn.tool_calls] == [lossy.RETRIEVE_TOOL]
+    assert turn.tool_calls[0].arguments == {"handle": "h1"}
+    assert not turn.error
+
+
+def test_safe_call_records_the_failure_instead_of_scoring_it_as_a_refusal():
+    def unreachable(messages):
+        raise urllib.error.URLError("connection refused")
+
+    turn = dropeval._safe_call(unreachable, [])
+    assert turn.error and not turn.tool_calls
+
+    rows = dropeval.run_drop_payload(PAYLOAD, json.dumps(PAYLOAD), DROP_RULE, TOOL,
+                                     unreachable, trials=2)
+    assert rows, "the payload has a drop-marked field, so questions were generated"
+    # Every attempt failed: the row must say so, not just show 0 retrieve_ok.
+    assert all(r["errors"] == r["trials"] for r in rows)
+
+
+def test_report_refuses_a_verdict_when_the_calls_failed():
+    rows = [{"qid": "q", "kind": "recall", "trials": 1, "retrieve_ok": 0,
+             "answer_ok": 0, "handle_ok": 1, "errors": 1},
+            {"qid": "q2", "kind": "precision", "trials": 1, "retrieve_ok": 1,
+             "answer_ok": 0, "handle_ok": 1, "errors": 1}]
+    report = build_dropeval_report({"model-a": rows})
+    assert "INCONCLUSIVE" in report
+    assert "failed 2/2 model calls" in report
+    # The old output asserted a behavioral conclusion from a dead backend.
+    assert "keep drop-to-retrieve off until this improves" not in report
