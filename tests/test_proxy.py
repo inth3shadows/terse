@@ -844,6 +844,50 @@ def test_audit_failure_never_breaks_forwarding():
     assert transforms.decompress(text) == json.loads(_records_text())
 
 
+def test_blocking_sink_does_not_stall_a_concurrent_note_request():
+    """A sink that BLOCKS (not raises) must not hold `_local_lock`.
+
+    The fail-open `try/except` around each sink only ever caught a sink that raised.
+    A sink that hangs — full disk mid-retry, stalled network mount, slow fsync — used
+    to hold `_local_lock` for the whole of `transform_response`, and `note_request`
+    takes that same lock, so every subsequent tools/call on the connection wedged
+    behind it. Sinks now run after the lock is released.
+    """
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hangs(_tool, _payload, **_kw):
+        entered.set()
+        release.wait(timeout=10)   # blocks; never raises
+
+    inter = Interceptor(FULL, capture=hangs)
+    _note_call(inter, 11, "gh.api.items")
+
+    done = threading.Event()
+    t = threading.Thread(
+        target=lambda: (inter.transform_response(_result_msg(11, _records_text())),
+                        done.set()),
+        daemon=True)
+    t.start()
+    assert entered.wait(timeout=5), "capture sink was never reached"
+
+    # The sink is mid-hang. A concurrent note_request must still complete — this is the
+    # assertion that fails (times out) if the sink is invoked under `_local_lock`.
+    noted = threading.Event()
+    threading.Thread(
+        target=lambda: (inter.note_request(json.dumps(
+            {"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+             "params": {"name": "gh.api.items"}})), noted.set()),
+        daemon=True).start()
+    assert noted.wait(timeout=5), "note_request blocked behind a hanging sink"
+
+    release.set()
+    assert done.wait(timeout=5)
+    t.join(timeout=5)
+
+
 def test_no_audit_callback_is_byte_identical():
     plain = Interceptor(FULL)
     audited = Interceptor(FULL, audit=lambda _r: None)

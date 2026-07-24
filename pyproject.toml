@@ -46,7 +46,7 @@ terse = "terse.cli:main"
 [dependency-groups]
 # hypothesis: property-based fuzzing of the lossless guarantee (M3 — tests/test_fuzz.py).
 # Dev-only, no runtime dependency. Unpinned like the others; uv.lock carries the exact pin.
-dev = ["pytest", "ruff", "mypy", "hypothesis"]
+dev = ["pytest", "pytest-cov", "ruff", "mypy", "hypothesis"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
@@ -100,3 +100,16 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "terse._version"
 ignore_missing_imports = true
+
+# Coverage is REPORTED, not gated. 908 tests with no coverage number meant nobody knew
+# which lines they reached; a threshold picked before seeing the first measurement would
+# just be an arbitrary gate. `--cov` is opt-in per run (not in addopts) so the default
+# `pytest` stays fast.
+[tool.coverage.run]
+source = ["src/terse"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]

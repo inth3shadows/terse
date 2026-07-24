@@ -30,6 +30,7 @@ import sys
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
+from functools import partial
 from threading import Lock, Thread
 from typing import Any, TextIO
 
@@ -394,6 +395,14 @@ class Interceptor:
         # under any reading of JSON-RPC, and must still take the response path.
         if msg.get("method") is not None and "result" not in msg and "error" not in msg:
             return line
+        # Sink calls (capture/audit/stats) are QUEUED here and invoked after the lock is
+        # released. A `try/except` around a sink catches one that RAISES; it cannot catch
+        # one that BLOCKS — a full disk mid-retry, a stalled network mount, a slow fsync
+        # would hold `_local_lock` indefinitely, freeze `note_request` (which takes the
+        # same lock), and with it every later tools/call on this connection. Deferring the
+        # I/O is what makes the fail-open contract — "a sink failure or slowness never
+        # affects forwarding" — true for slowness and not merely for failure.
+        deferred: list[tuple[str, str, Callable[[], None]]] = []
         # Held across the whole body so the init_id/pending/last/since_keyframe state
         # stays consistent against a concurrent note_request on the other thread.
         # ALWAYS this Interceptor's own private lock — never blocks another peer's
@@ -556,26 +565,32 @@ class Interceptor:
                                            ensure_ascii=False)]
                 else:
                     payloads = raw_texts
+                # The JSON-RPC id identifies the RESULT these blocks came from, so the
+                # corpus no longer has to infer "same call" from write timing (#148).
+                # Scoped twice, because the bare id is unique only within one connection:
+                # by handshake generation here, and by process in the callback — many
+                # connections, and many processes, write into one corpus dir. Resolved
+                # under the lock (`_result_gen` is reset by note_request on re-handshake)
+                # so the deferred write carries the generation this result was read in,
+                # not whatever a reconnect may have moved it to meanwhile.
+                result_id = f"{self._result_gen}.{msg['id']}"
                 for payload in payloads:
-                    try:
-                        # The JSON-RPC id identifies the RESULT these blocks came from, so
-                        # the corpus no longer has to infer "same call" from write timing
-                        # (#148). Scoped twice, because the bare id is unique only within
-                        # one connection: by handshake generation here, and by process in
-                        # the callback — many connections, and many processes, write into
-                        # one corpus dir.
-                        self.capture(capture_tool, payload, server=self.server_name,
-                                     result_id=f"{self._result_gen}.{msg['id']}")
-                    except Exception as exc:  # noqa: BLE001 — capture is never load-bearing
-                        self._warn_sink("capture", capture_tool, exc)
+                    deferred.append((
+                        "capture", capture_tool,
+                        partial(self.capture, capture_tool, payload,
+                                server=self.server_name, result_id=result_id),
+                    ))
 
             # Audit AFTER the transform, regardless of `changed`: a no-op is itself
             # diagnostic — it confirms terse left a suspect payload untouched. On the joined
             # path both sinks see ONE (raw, emitted) pair — raw = the N originals joined by
             # newline (the true wire cost the model saw), emitted = the single joined block.
             if self.audit is not None and persist:
-                self._emit_audit(tool, msg["id"], emitted_pairs, changed,
-                                 display_tool=capture_tool)
+                deferred.append((
+                    "audit", capture_tool,
+                    partial(self._emit_audit, tool, msg["id"], emitted_pairs, changed,
+                            display_tool=capture_tool),
+                ))
             # `structuredContent` rides alongside the text blocks and is what some clients
             # actually give the model (#128). Compress it when the rule opts in; either
             # way its EMITTED size is what the ledger must count, so the reported saving
@@ -601,13 +616,30 @@ class Interceptor:
                         f"mirror of structuredContent (structured=replace)\n")
 
             if self.stats is not None:
-                self._emit_stats(tool, emitted_pairs, display_tool=capture_tool,
-                                 diff_reason=diff_reason, structured=structured)
+                deferred.append((
+                    "stats", capture_tool,
+                    partial(self._emit_stats, tool, emitted_pairs,
+                            display_tool=capture_tool, diff_reason=diff_reason,
+                            structured=structured),
+                ))
 
             if not changed:
-                return line
-            # Re-serialize compactly. JSON-RPC is semantics, not formatting; no newlines.
-            return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+                out = line
+            else:
+                # Re-serialize compactly. JSON-RPC is semantics, not formatting; no
+                # newlines.
+                out = json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+
+        # Lock RELEASED. The reply is already decided, so a sink that blocks here delays
+        # only this response's own return — it can no longer wedge `note_request` or any
+        # later call. `_emit_audit`/`_emit_stats` swallow their own errors (their fail-open
+        # contract); the capture callback does not, so it is guarded here.
+        for label, sink_tool, run_sink in deferred:
+            try:
+                run_sink()
+            except Exception as exc:  # noqa: BLE001 — sinks are never load-bearing
+                self._warn_sink(label, sink_tool, exc)
+        return out
 
     def _compress_or_diff(self, block: dict, tool: str, args_key: str = "",
                           force_lossless: bool = False) -> tuple[bool, str]:

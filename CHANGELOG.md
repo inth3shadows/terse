@@ -10,6 +10,36 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Fixed
+- **A capture/audit/stats sink that HUNG — rather than raised — froze every later tool
+  call on the connection.** The sinks were invoked inside `transform_response`'s
+  `_local_lock`, and the fail-open `try/except` around them only ever caught a sink that
+  raised. A sink that blocks (full disk mid-retry, stalled network mount, slow fsync) held
+  the lock indefinitely; `note_request` takes that same lock, so the next `tools/call`
+  wedged behind it and never recovered. Sink calls are now queued under the lock and
+  invoked after it is released — the reply is already decided by then, so a slow sink
+  delays only its own response instead of the whole connection. This makes the documented
+  contract ("a sink failure or slowness never affects forwarding") true for *slowness*,
+  which it previously was not. Pinned by
+  `test_blocking_sink_does_not_stall_a_concurrent_note_request`, which times out against
+  the old code.
+
+### Added
+- **The corpus is bounded per tool (`MAX_SAMPLES_PER_TOOL`, default 200).** `capture.py`
+  was the only disk sink with no retention — `stats.py` rotates at 10 MB and `history.py`
+  at 5 MB, but envelopes accumulated forever. Since envelopes hold *raw* tool payloads
+  (credentials, PII, private source), unbounded retention widened the blast radius of any
+  later disk compromise as much as it risked disk exhaustion. The cap is per tool, not
+  global: every consumer (measure, probes, `policy generate`/`autotune`) reasons per tool,
+  so a global byte cap would let one chatty tool evict the only samples a quiet one ever
+  produced and silently narrow what a generated policy can see. Eviction is oldest-first
+  by mtime. `capture_payload(..., max_per_tool=None)` restores unlimited retention for a
+  deliberate one-shot corpus build.
+- **Coverage instrumentation** (`pytest-cov`, `[tool.coverage.*]`). The suite had no
+  coverage number at all; the first measured run is **89% branch coverage** over
+  `src/terse`. Reported, not gated — `--cov` is opt-in per run so the default `pytest`
+  stays fast, and no threshold is set until the baseline has been looked at.
+
+### Fixed
 - **The capture envelope recorded neither which result nor which server a payload came
   from, so autotune had to guess both (#148, #152).** Two defects, one absent pair of
   fields, now written by the proxy (`server`, `result_id`) and read at tune time:

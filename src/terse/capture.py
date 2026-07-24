@@ -147,14 +147,48 @@ def _sha8(raw: str) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
 
 
+# Retention cap, PER TOOL rather than over the whole corpus. Every consumer of this
+# corpus — measure, probes, policy generate/autotune — reasons per tool, so a global
+# byte cap (the shape stats.py and history.py use) would let one chatty tool evict the
+# only samples another tool ever produced and silently narrow what a generated policy
+# can even see. A per-tool cap bounds disk while preserving breadth.
+#
+# This matters more here than for the other two sinks: envelopes hold RAW tool payloads
+# (credentials, PII, private source), so unbounded retention is a widening blast radius,
+# not just a disk-space question. Eviction is oldest-first by mtime — cheap, and the
+# right axis, since the newest samples are the ones that reflect a tool's current shape.
+MAX_SAMPLES_PER_TOOL = 200
+
+
+def _prune_tool_samples(corpus: Path, safe_tool: str, keep: int) -> None:
+    """Drop the oldest envelopes for one tool past `keep`. Best-effort by design: a
+    prune failure must never fail the capture that triggered it."""
+    try:
+        existing = sorted(corpus.glob(f"{safe_tool}__*.json"),
+                          key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    for stale in existing[:max(0, len(existing) - keep)]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass  # a concurrent proxy already pruned it, or it is not ours to remove
+
+
 def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
-                    server: str | None = None, result_id: str | None = None) -> Path:
+                    server: str | None = None, result_id: str | None = None,
+                    max_per_tool: int | None = MAX_SAMPLES_PER_TOOL) -> Path:
     """Persist one captured payload as a shape-tagged envelope. Idempotent by sha.
 
     `server` is the downstream's name in the MCP config and `result_id` identifies the
     tool RESULT this payload was one content block of. Both are optional because the
     format is additive — a corpus captured before they existed stays loadable, and every
     consumer treats their absence as "unknown", never as a value (#148, #152).
+
+    `max_per_tool` bounds how many envelopes this tool keeps; the oldest are evicted past
+    it. Pass `None` to retain everything (the pre-cap behavior) — appropriate for a
+    deliberate one-shot `terse capture` run building a fixed corpus, not for a proxy
+    capturing a live session indefinitely.
     """
     corpus = Path(corpus_dir)
     mkdir_restricted(corpus)
@@ -202,6 +236,10 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
     # Captured payloads are real MCP tool traffic (README/TECHNICAL: "may contain real
     # data") — restrict permissions the same as terse-managed config/secrets (#42).
     write_restricted(path, json.dumps(envelope, ensure_ascii=False, indent=2))
+    # AFTER the write, so `keep` counts this payload and a re-capture of an existing sha
+    # (which rewrote in place, adding no file) cannot evict anything.
+    if max_per_tool is not None and max_per_tool > 0:
+        _prune_tool_samples(corpus, safe_tool, max_per_tool)
     return path
 
 
