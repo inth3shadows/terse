@@ -69,22 +69,35 @@ jobs:
             exit 0
           fi
 
-          last="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
-          [ -n "$last" ] || last="v0.0.0"
-          echo "last release tag: ${last}"
+          # `|| true` so a SIGPIPE from `head` closing the pipe early can't abort under
+          # pipefail. No `v*` tag yet (first ever release) -> scan all of history, not the
+          # nonexistent `v0.0.0..HEAD` range (which would `fatal: unknown revision` and abort).
+          last="$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)"
+          if [ -n "$last" ]; then
+            range="${last}..HEAD"
+          else
+            last="v0.0.0"; range="HEAD"
+          fi
+          echo "last release tag: ${last} (scanning ${range})"
 
-          subjects="$(git log --format='%s%n%b' "${last}..HEAD")"
+          subjects="$(git log --format='%s%n%b' "${range}")"
 
           # Derive the bump from Conventional-Commit types across every commit since the tag.
-          # Precedence major > minor > patch. `type!:` or a `BREAKING CHANGE:` body line is
-          # breaking. While 0.x, a breaking change bumps MINOR (semver's 0.x carve-out), not
-          # major — an intentional 1.0 is the one release you cut by hand.
+          # Precedence major > minor > patch. `type!:` (subject) or a `BREAKING CHANGE:` line
+          # is breaking. While 0.x, a breaking change bumps MINOR (semver's 0.x carve-out),
+          # not major — an intentional 1.0 is the one release you cut by hand.
+          #
+          # Case-SENSITIVE and line-anchored on purpose: Conventional-Commit types are
+          # lowercase and `BREAKING CHANGE:` is uppercase with a colon, so prose like
+          # "not a breaking change" in a body cannot trip a bump. Herestrings, not pipes,
+          # so grep's exit status is never masked by a SIGPIPE under pipefail.
           bump=none
-          if printf '%s\n' "$subjects" | grep -qiE '^[a-z]+(\([^)]*\))?!:|BREAKING[ -]CHANGE'; then
+          if grep -qE '^[a-z]+(\([^)]*\))?!:' <<<"$subjects" \
+             || grep -qE '^BREAKING[ -]CHANGE:' <<<"$subjects"; then
             bump=breaking
-          elif printf '%s\n' "$subjects" | grep -qiE '^feat(\([^)]*\))?:'; then
+          elif grep -qE '^feat(\([^)]*\))?:' <<<"$subjects"; then
             bump=minor
-          elif printf '%s\n' "$subjects" | grep -qiE '^(fix|perf)(\([^)]*\))?:'; then
+          elif grep -qE '^(fix|perf)(\([^)]*\))?:' <<<"$subjects"; then
             bump=patch
           fi
 
