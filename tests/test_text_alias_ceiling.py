@@ -26,6 +26,7 @@ import json
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -163,9 +164,48 @@ def test_a_payload_containing_every_sigil_falls_back_and_is_counted() -> None:
 
 
 def test_repetition_is_actually_found() -> None:
-    """A guard against the tests above passing because the encoders do nothing."""
-    assert tac.score(BLOCKY, "phrase") > 5.0
+    """A guard against the tests above passing because the encoders do nothing.
+
+    Pinned near the real value, not at a floor a crippled encoder clears. The verdict this
+    script feeds is "the number is small", so a silent weakening of the encoder is the one
+    mutation that must never pass — and `> 5.0` did not catch it: with `max_aliases`
+    lowered from 300 to 1, BLOCKY still scored 34%.
+    """
+    assert tac.score(BLOCKY, "phrase") == pytest.approx(43.0, abs=1.5)
     assert tac.best(BLOCKY)[1] in {"line", "phrase", "both"}
+
+
+@pytest.mark.parametrize("knob,value", [("max_aliases", 1), ("budget", 3)])
+def test_weakening_an_encoder_knob_is_visible(knob: str, value: int) -> None:
+    """Every strength knob was mutable without failing a test. Each one moves the number
+    the verdict is quoted in, so each needs to move a test."""
+    weakened = tac.encode_phrases(BLOCKY, **{knob: value})[1]
+    assert len(weakened) < len(tac.encode_phrases(BLOCKY)[1])
+
+
+def test_the_reported_saving_literally_includes_the_legend() -> None:
+    """The accounting, checked against the arithmetic rather than a proxy for it."""
+    for name, _ in tac.ENCODERS:
+        body, legend = dict(tac.ENCODERS)[name](BLOCKY)
+        raw = tac.TOK(BLOCKY)
+        expected = 100.0 * (raw - (tac.legend_cost(legend) + tac.TOK(body))) / raw
+        assert tac.score(BLOCKY, name) == pytest.approx(expected)
+        assert tac.legend_cost(legend) > 0
+
+
+def test_legend_overhead_is_load_bearing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`LEGEND_ENTRY_OVERHEAD = 0` shipped green — the accept test could be neutered with
+    no test noticing.
+
+    The direction is worth recording, because it is not the obvious one: zeroing it makes
+    the reported saving go DOWN (43.1% -> 42.5% on BLOCKY), because the greedy then accepts
+    marginal candidates that consume spans a better later candidate would have used. So it
+    is not simply a "ceiling comes out too high" knob — it changes what the greedy picks,
+    which is exactly why it needs pinning rather than reasoning about.
+    """
+    charged = tac.score(BLOCKY, "phrase")
+    monkeypatch.setattr(tac, "LEGEND_ENTRY_OVERHEAD", 0)
+    assert tac.score(BLOCKY, "phrase") != pytest.approx(charged)
 
 
 def test_declines_when_there_is_nothing_to_gain() -> None:
@@ -194,7 +234,6 @@ def test_a_lossy_encoder_cannot_report_a_saving(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(tac, "ENCODERS", (("phrase", lossy),))
     with pytest.raises(tac.NotLossless):
         tac.score(BLOCKY, "phrase")
-    assert not isinstance(tac.NotLossless("x"), type(None))
     assert issubclass(tac.NotLossless, AssertionError)
 
 
@@ -234,6 +273,59 @@ def test_baseline_leaves_non_json_alone() -> None:
     assert base(text, "codegraph_explore") == text
 
 
+def _drop_policy(tmp_path: Path) -> Any:
+    doc = tmp_path / "drop.json"
+    doc.write_text(json.dumps({
+        "version": 1,
+        "defaults": {"tiers": ["minify", "tabularize", "dictionary"]},
+        "policies": [{
+            "match": {"tool": "*explore"},
+            "tiers": ["minify", "tabularize", "dictionary"],
+            "fields": {"$text.code_blocks": {"lossy": "drop-to-retrieve", "min": 100}},
+        }],
+    }))
+    return tac.policy_mod.load_policy(doc)
+
+
+LONG_TEXT_WITH_FENCE = (
+    "## Exploration\n\nFound 3 symbols.\n\n### Source Code\n\n```go\n"
+    + "".join(f"{i}\tfunc handler{i}(w http.ResponseWriter, r *http.Request) {{}}\n"
+             for i in range(40))
+    + "```\n\n### Blast radius\n\n- handler0 (a.go:1) — 4 callers\n")
+
+
+def test_baseline_drop_sink_is_load_bearing(tmp_path: Path) -> None:
+    """Deleting `drop_sink=` from `make_baseline` failed NO test, and silently turned the
+    whole `--policy` table into the default-policy table (live long-text 86.6% -> 0.0%,
+    fleet 25.1% -> 3.0%). The single number the verdict is quoted in rode on one keyword
+    argument that nothing verified."""
+    base = tac.make_baseline(_drop_policy(tmp_path))
+    out = base(LONG_TEXT_WITH_FENCE, "codegraph_explore")
+    assert tac.TOK(out) < tac.TOK(LONG_TEXT_WITH_FENCE) * 0.6, \
+        "the drop rule did not fire — is the drop-sink still wired?"
+    assert "__terse_dropped__" in out
+    assert "### Blast radius" in out          # the prose survives; only the fence leaves
+
+
+def test_authored_rule_counter_distinguishes_a_real_rule_from_the_default(
+        tmp_path: Path) -> None:
+    """The previous counter incremented on "the codec ran", which is true for the
+    synthesized `*` default too — identical under a policy with zero authored rules and
+    one with eight, and blind to every drop-path payload (`tiers == ()`)."""
+    raw = json.dumps({"rows": [{"a": i} for i in range(30)]})
+    tac.LIMITS.clear()
+    tac.make_baseline(tac.policy_mod.default_policy())(raw, "anything")
+    assert tac.LIMITS["authored_rule"] == 0
+
+    tac.LIMITS.clear()
+    base = tac.make_baseline(_drop_policy(tmp_path))
+    base(LONG_TEXT_WITH_FENCE, "codegraph_explore")     # drop path: tiers == ()
+    assert tac.LIMITS["authored_rule"] == 1, "the drop path must still count as a match"
+    base(raw, "unmatched.tool")
+    assert tac.LIMITS["authored_rule"] == 1
+    tac.LIMITS.clear()
+
+
 # ---------------------------------------------------------------- reporting math
 
 
@@ -264,5 +356,44 @@ def test_row_gzip_is_byte_weighted_not_token_weighted() -> None:
 def test_combined_equals_terse_when_the_aliaser_finds_nothing() -> None:
     c = Counter({"n": 1, "raw": 1000, "prod": 700, "alias_raw": 0, "alias_post": 0,
                  "gzip_bytes": 0, "bytes": 1000})
-    terse, _, _, combined, _ = _cells(tac._row("x", c))
-    assert terse == pytest.approx(combined)
+    cells = _cells(tac._row("x", c))
+    assert cells[0] == pytest.approx(cells[3])      # terse == combined
+
+
+def test_marginal_column_is_fleet_points_not_a_percent_of_terses_output() -> None:
+    """The verdict is quoted in fleet POINTS. `alias:post` is a percent of terse's OUTPUT;
+    the two only coincide when terse's own saving is near zero, which it is not under the
+    live policy. Printing the wrong one would misstate the headline by ~4x."""
+    c = Counter({"n": 1, "raw": 1000, "prod": 200, "alias_raw": 0, "alias_post": 40,
+                 "gzip_bytes": 0, "bytes": 1000})
+    row = tac._row("x", c)
+    assert _cells(row)[2] == pytest.approx(20.0)   # alias:post — 40/200, a % of terse's out
+    marginal = float(next(p for p in row.split() if p.endswith("p")).rstrip("p"))
+    assert marginal == pytest.approx(4.0)          # MARGINAL — 40/1000, fleet points
+
+
+# ---------------------------------------------------------------- corpus population
+
+
+def test_inflation_is_counted_over_every_payload_not_just_scored_ones(
+        tmp_path: Path) -> None:
+    """The two-population split, which had NO coverage — re-applying the scoring floor to
+    the inflation counter (i.e. reinstating the bug it fixed) shipped green.
+
+    Inflation happens BELOW the token floor, on payloads too small to amortize a table
+    header, so a counter that only sees scored payloads is structurally blind to it.
+    """
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    # Two records: too small to pay for the table header, and far below the scoring floor.
+    tiny = json.dumps({"rows": [{"a": 1, "b": "x"}, {"a": 2, "b": "x"}]})
+    (corpus / "tiny__aaaa.json").write_text(json.dumps(
+        {"tool": "t.list", "shape": "pretty-json", "raw": tiny, "sha": "aaaa"}))
+
+    res = tac.run_corpus(corpus, tac.policy_mod.default_policy())
+    infl = res["inflation"]
+    assert infl["n"] == 1
+    assert infl["below_floor"] == 1, "fixture must sit below the scoring floor"
+    assert infl["inflated_n"] == 1, "…and must still be counted as inflated"
+    assert infl["inflated_tok"] > 0
+    assert res["by_shape"] == {}, "nothing was scored, yet inflation was still reported"

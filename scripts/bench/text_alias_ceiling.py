@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import json
 import os
 import random
@@ -319,23 +320,38 @@ def make_baseline(pol: policy_mod.Policy):
     `policy.apply` rather than `transforms.compress`: the passthrough rule (`tiers: []`),
     the reserved-marker guard, the depth guard and the codec's minify-on-gate-failure
     fallback are all shipped behavior, and re-implementing any of them here would make the
-    marginal column measure a terse that does not exist. A dict drop-sink is supplied so a
-    `drop-to-retrieve` rule actually fires instead of warning and staying lossless.
+    marginal column measure a terse that does not exist.
 
-    Caveat worth stating: capture envelopes record the tool name UNPREFIXED (#152), so a
-    server-scoped rule (`secret-broker.*`) will not match here even though it matches at
-    runtime. `--policy` runs are therefore a close model of a deployment, not a replay of
-    one; `rules_hit` in the output says how many payloads selected a non-default rule.
+    The **drop-sink is load-bearing, not incidental**. Without it `_apply_text_drops` warns
+    and stays lossless, and a `--policy` run silently collapses to the default-policy run:
+    on the live policy that is long-text 86.6% -> 0.0% and the fleet 25.1% -> 3.0%, with no
+    error and no diagnostic. `test_baseline_drop_sink_is_load_bearing` pins it.
+
+    Two ways this is a close model of a deployment rather than a replay of one, both
+    measured on the live corpus rather than asserted:
+
+    * Capture envelopes record the tool name UNPREFIXED (#152), so a server-scoped rule
+      could in principle miss here while matching at runtime. On this corpus it is
+      immaterial — **0 of 1,671 payloads** select a different rule when the server is
+      supplied, because every server-scoped rule in the live policy restates the defaults.
+      `authored_rule` in the output counts payloads that matched a rule the policy actually
+      declares, as opposed to the synthesized `*` default.
+    * `policy.apply` is the single-result path: the proxy's cross-call **diff** and
+      **multi-block join** stages (both default-ON) are not modelled. Both would make the
+      `terse` column larger, so this **understates terse and overstates** what is left for
+      an aliaser — the bias runs against the conclusion drawn from it, not toward it.
     """
+    authored = {id(rule) for rule in pol.rules}
+
     def baseline(raw: str, tool: str) -> str:
         sink: dict[str, object] = {}
+        if id(pol.select(tool)) in authored:
+            LIMITS["authored_rule"] += 1
         try:
             applied = policy_mod.apply(raw, tool, pol, drop_sink=sink.__setitem__)
         except Exception:  # noqa: BLE001 — the proxy is fail-open; so is the measurement
             LIMITS["baseline_error"] += 1
             return raw
-        if applied.tiers:
-            LIMITS["rules_hit"] += 1
         return applied.text
     return baseline
 
@@ -404,6 +420,17 @@ def run_corpus(corpus: Path, pol: policy_mod.Policy) -> dict:
 def iter_source(root: Path, cap: int) -> list[Path]:
     """Candidate source files under `root`, capped at `cap`.
 
+    SORTED, and that is not cosmetic. `os.walk` order is filesystem order, and the sample
+    is `shuffle(pool)[:sample]` — so on an unsorted pool a single unrelated file appearing
+    anywhere under the root re-shuffles the ENTIRE sample rather than perturbing it by one.
+    Measured before this was fixed: the same command with the same seed returned 4.5%, 5.5%
+    and 6.5% on three runs of a clean tree as files came and went, against an effect size
+    of 0.2-0.5 points. `--seed` fixes the RNG; only sorting fixes the population.
+
+    Even sorted, this is a sample of a moving tree. `print_files` emits a fingerprint of
+    the exact file list so a future run can tell "the code changed" from "the tree changed"
+    — which is the whole reason this script exists.
+
     The cap stops the walk rather than sampling it, so a cap that actually bites biases the
     pool toward directories `os.walk` reaches first. The default (`--sample` x 40) is set
     well above the trees this is run on; `pool=` in the output is what tells you whether it
@@ -424,16 +451,20 @@ def iter_source(root: Path, cap: int) -> list[Path]:
                     pass
         if len(out) > cap:
             LIMITS["walk_cap_bound"] += 1
+            out.sort()
             return out
+    out.sort()
     return out
 
 
 def run_files(root: Path, sample: int, seed: int) -> dict:
+    before = Counter(LIMITS)          # so a --corpus run's counters cannot bleed in here
     pool = iter_source(root, sample * 40)
     random.Random(seed).shuffle(pool)
+    chosen = pool[:sample]
     rows = []
     skipped = 0
-    for p in pool[:sample]:
+    for p in chosen:
         try:
             text = p.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -443,7 +474,12 @@ def run_files(root: Path, sample: int, seed: int) -> dict:
         rows.append({"file": str(p), "tok": _tok(text), "saved": pct, "encoder": how,
                      "gzip_bytes": gzip_floor(text)})
     rows.sort(key=lambda r: -r["saved"])
-    return {"pool": len(pool), "skipped": skipped, "rows": rows, "limits": dict(LIMITS)}
+    # A fingerprint of the exact population, so a future run can tell a code change from a
+    # tree change. Without it a moved number is uninterpretable.
+    digest = hashlib.sha256("\n".join(sorted(str(p) for p in chosen)).encode()).hexdigest()
+    return {"pool": len(pool), "skipped": skipped, "rows": rows,
+            "sample_sha256": digest[:16],
+            "limits": dict(Counter(LIMITS) - before)}
 
 
 # ---------------------------------------------------------------- reporting
@@ -453,13 +489,18 @@ def print_corpus(res: dict, policy_label: str) -> None:
     by_shape, tot = res["by_shape"], Counter()
     print(f"baseline: {policy_label}\n")
     print(f"{'shape':18} {'n':>5} {'raw tok':>10} {'terse':>8} {'alias:raw':>10} "
-          f"{'alias:post':>11} {'combined':>9} {'gzip(bytes)*':>13}")
+          f"{'alias:post':>11} {'combined':>9} {'MARGINAL':>9} {'gzip(bytes)*':>13}")
     for shape, c in sorted(by_shape.items(), key=lambda x: -x[1]["raw"]):
         for k, v in c.items():
             tot[k] += v
         print(_row(shape, c))
     if tot["raw"]:
         print(_row("TOTAL", tot))
+        # The number the verdict is quoted in. Printed rather than left to be re-derived:
+        # `combined` and `terse` are each rounded independently, so subtracting the
+        # displayed columns gives a different answer than subtracting the real ones.
+        print(f"\nMARGINAL = fleet points the aliaser adds ON TOP of terse "
+              f"(combined - terse): {100 * tot['alias_post'] / tot['raw']:+.2f} points")
     print("\n* gzip is a BYTE ratio, byte-weighted — a different domain from every token "
           "column beside it,\n  and an unreachable floor besides (the model must still "
           "read the output). Scale only; not comparable.")
@@ -475,19 +516,31 @@ def print_corpus(res: dict, policy_label: str) -> None:
     _print_limits(res.get("limits", {}))
 
 
+# Counters that describe the run rather than bound it. Printed apart from the caps, so
+# "a cap silently truncated this measurement" stays a distinct signal from "here is how
+# many payloads matched a rule you wrote".
+_DIAGNOSTIC_KEYS = frozenset({"authored_rule"})
+
+
 def _print_limits(limits: dict) -> None:
-    if limits:
-        print("\nlimits that bound this run:", limits)
+    diag = {k: v for k, v in limits.items() if k in _DIAGNOSTIC_KEYS}
+    caps = {k: v for k, v in limits.items() if k not in _DIAGNOSTIC_KEYS}
+    if diag:
+        print("\npayloads matching a rule the policy actually declares "
+              "(vs the synthesized '*' default):", diag["authored_rule"])
+    if caps:
+        print("\nlimits that BOUND this run — a truncated measurement, not a ceiling:", caps)
 
 
 def _row(label: str, c: Counter | dict) -> str:
     raw, prod = c["raw"], c["prod"]
     prod_pct = 100 * (raw - prod) / raw
     combined = 100 * (raw - (prod - c["alias_post"])) / raw
+    marginal = 100 * c["alias_post"] / raw     # fleet POINTS, not a % of terse's output
     gz = 100 * c["gzip_bytes"] / c["bytes"] if c.get("bytes") else 0.0
     return (f"{label:18} {int(c['n']):>5} {int(raw):>10,} {prod_pct:>7.1f}% "
             f"{100 * c['alias_raw'] / raw:>9.1f}% {100 * c['alias_post'] / prod:>10.1f}% "
-            f"{combined:>8.1f}% {gz:>12.1f}%")
+            f"{combined:>8.1f}% {marginal:>+8.2f}p {gz:>12.1f}%")
 
 
 BANDS = ((30, 1e9), (20, 30), (10, 20), (5, 10), (2, 5), (-1e9, 2))
@@ -502,6 +555,9 @@ def print_files(res: dict) -> None:
     wsum = sum(r["tok"] * r["saved"] / 100 for r in rows)
     print(f"pool={res['pool']} scored={len(rows)} skipped={res['skipped']} "
           f"total={tot:,} tok  token-weighted saving={100 * wsum / tot:.1f}%")
+    print(f"sample sha256={res['sample_sha256']} — a DIFFERENT fingerprint means the tree "
+          "moved, not the code.\nThe pool is sorted and the seed fixed, so an identical "
+          "fingerprint must reproduce the number exactly.")
     print(f"size window: {MIN_FILE_BYTES:,}-{MAX_FILE_BYTES:,} bytes — BOTH tails of the "
           "file-size\ndistribution are excluded, so this is a saving over the middle of "
           "it, not over all of it.")
