@@ -27,14 +27,22 @@ from .tokenize import count_cl100k, encode_cl100k
 from .transforms import minify
 
 # Reverse-map a captured tool name to its origin server. The capture envelope stores
-# only `tool` (#64 Phase 0): the corpus was captured by separate per-server proxies
-# sharing one --capture-dir, so server identity must be inferred. kb/codegraph carry a
-# delimiter prefix; runecho's tools are bare verbs, so they need an explicit set.
+# Legacy fallback only (#158): a pre-#156 corpus records no `server`, so identity has to
+# be inferred from the tool name — the corpus was captured by separate per-server proxies
+# sharing one --capture-dir. kb/codegraph carry a delimiter prefix; runecho's tools are
+# bare verbs, so they need an explicit set. This list silently goes stale every time
+# runecho gains a tool, which is exactly why an envelope that STATES its server no longer
+# consults it — see `server_of_tool`.
 _RUNECHO_TOOLS = {"locate", "structure", "status", "health", "hash", "diff"}
 
 
-def server_of_tool(tool: str) -> str:
-    """Best-effort origin server for a captured tool name (see _RUNECHO_TOOLS note)."""
+def server_of_tool(tool: str, server: str | None = None) -> str:
+    """Origin server for a captured tool. Since #156 the envelope records `server`
+    straight from the wrap, so pass it and it is returned verbatim — the truth, not a
+    guess. The name-based heuristic below is the fallback for legacy envelopes that record
+    no server (an empty string is treated as none, so "unknown" has one spelling)."""
+    if isinstance(server, str) and server:
+        return server
     if tool.startswith("kb."):
         return "kb"
     if tool.startswith("codegraph"):

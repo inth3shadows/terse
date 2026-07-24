@@ -88,6 +88,20 @@ def test_server_of_tool_maps_the_three_known_servers():
     assert server_of_tool("weather.forecast") == "weather"
 
 
+def test_server_of_tool_prefers_the_stated_server_over_the_heuristic():
+    # #158: since the envelope records `server`, the stated value is returned verbatim —
+    # even when the name-based heuristic would guess otherwise. `structure` on a server
+    # that ISN'T runecho must attribute to that server, not to the stale hardcoded set.
+    assert server_of_tool("structure", "my-fork") == "my-fork"
+    assert server_of_tool("kb.read.search", "kb-mirror") == "kb-mirror"
+
+
+def test_server_of_tool_falls_back_to_the_heuristic_for_legacy_envelopes():
+    # No server (pre-#156 corpus), or an empty-string server, still resolves by name.
+    assert server_of_tool("structure", None) == "runecho"
+    assert server_of_tool("structure", "") == "runecho"
+
+
 def test_cross_server_redundancy_positive_when_value_shared_across_peers():
     # "us-east-1" appears in BOTH servers -> a shared legend folds it once; two
     # per-peer legends each keep their own copy. So pooled > per-peer.
