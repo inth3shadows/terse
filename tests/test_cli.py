@@ -751,9 +751,38 @@ def test_policy_autotune_refuses_to_write_a_policy_it_cannot_load(tmp_path, caps
     before = pol.read_bytes()
     import terse.policy_gen as pg
     monkeypatch.setattr(pg, "merge_policy",
-                        lambda existing, generated: ({"version": 99}, []))
+                        lambda existing, generated, identities=None: ({"version": 99}, []))
     rc = main(["policy", "autotune", "--policy", str(pol), "--corpus", str(corpus),
                "--apply"])
     assert rc == 1
     assert pol.read_bytes() == before                      # unchanged
     assert "refusing to write" in capsys.readouterr().err
+
+
+def test_autotune_names_what_it_guessed_about_an_old_corpus(tmp_path, capsys):
+    # A pre-#148 corpus can't be made exact retroactively, so the two inputs that were
+    # inferred rather than read are stated. Silently presenting a guessed grouping as a
+    # measurement is the failure this exists to prevent.
+    from terse.cli import _print_corpus_identity_note
+
+    _print_corpus_identity_note([{"tool": "structure", "raw": "{}", "captured_at": 1}])
+    out = capsys.readouterr().out
+    assert "1/1 payload(s) predate result ids" in out
+    assert "1/1 payload(s) record no server" in out
+
+
+def test_an_untimed_payload_is_not_reported_as_grouped_by_timing(capsys):
+    # It became its own single-block group; the timing heuristic never ran on it. Saying
+    # otherwise is a false alarm about the one number the note exists to qualify.
+    from terse.cli import _print_corpus_identity_note
+
+    _print_corpus_identity_note([{"tool": "structure", "raw": "{}", "server": "runecho"}])
+    assert "predate result ids" not in capsys.readouterr().out
+
+
+def test_no_note_on_a_fully_identified_corpus(capsys):
+    from terse.cli import _print_corpus_identity_note
+
+    _print_corpus_identity_note([{"tool": "structure", "raw": "{}",
+                                  "server": "runecho", "result_id": "s:1"}])
+    assert capsys.readouterr().out == ""

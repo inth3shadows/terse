@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -262,7 +264,7 @@ def test_run_drop_fluency_computes_questions_once_per_envelope_not_per_model(mon
     envelopes = [{"tool": TOOL, "sha": "abc", "raw": json.dumps(PAYLOAD)}]
     answerers = {"model-a": never_retrieves, "model-b": never_retrieves,
                 "model-c": never_retrieves}
-    results = dropeval.run_drop_fluency(envelopes, lambda t: DROP_RULE, answerers, trials=1)
+    results = dropeval.run_drop_fluency(envelopes, lambda t, s=None: DROP_RULE, answerers, trials=1)
     assert set(results) == {"model-a", "model-b", "model-c"}
     assert all(results[m] for m in results)  # each model still got real rows
     assert calls["n"] == 1  # one envelope -> one derivation, reused across all 3 models
@@ -420,3 +422,57 @@ def test_openai_tool_answerer_allows_loopback_https_and_keyless_http():
                                                   "m", tools=[RETRIEVE_TOOL_DEF]))
     assert callable(dropeval.openai_tool_answerer("http://api.example.com/v1", "",
                                                   "m", tools=[RETRIEVE_TOOL_DEF]))
+
+
+def test_drop_eval_looks_the_rule_up_the_way_the_proxy_does():
+    # Review finding: a policy generated from a server-tagged corpus carries QUALIFIED rule
+    # names, but the drop-eval looked its rule up by the bare tool name alone. That falls
+    # through to the defaults, which have no `fields`, so the eval scored ZERO drop
+    # questions while still reporting that it had verified the suggested drops — the #149
+    # failure mode with one lookup removed.
+    seen: list[tuple] = []
+
+    def rule_for(tool, server=None):
+        seen.append((tool, server))
+        return DROP_RULE
+
+    envelopes = [{"tool": TOOL, "server": "kb", "sha": "abc", "raw": json.dumps(PAYLOAD)}]
+    rows = dropeval.run_drop_fluency(
+        envelopes, rule_for,
+        {"m": lambda messages: dropeval.Turn(text="I don't know", tool_calls=[])}, trials=1)
+
+    assert seen == [(TOOL, "kb")]      # the pair `Policy.select` needs, not the name alone
+    assert rows["m"], "precondition: this fixture does produce drop questions"
+
+
+def test_a_qualified_rule_is_unreachable_by_a_bare_lookup():
+    # Why the pair matters, stated as the policy fact it rests on: the generated rule for a
+    # server that does not self-prefix its tools is `kb.search`, and `select("search")`
+    # never reaches it — it lands on the defaults, which carry no `fields` at all.
+    import json as _json
+
+    from terse.policy import load_policy
+    from terse.policy_gen import activate_suggestions, generate_policy
+
+    def blob_records(n, seed):
+        return {"result": [{"id": i, "status": "active",
+                            "embedding": _json.dumps([round((seed + i * 100 + j) * 0.001, 3)
+                                                      for j in range(200)])}
+                           for i in range(n)]}
+
+    envs = [{"tool": "search", "server": "kb", "raw": _json.dumps(blob_records(20, seed)),
+             "captured_at": 1_000_000_000 + seed, "result_id": f"s:{seed}"}
+            for seed in range(3)]
+    doc, _rows = generate_policy(envs, threshold=0.1)
+    assert [p["match"]["tool"] for p in doc["policies"]] == ["kb.search"]
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+        tf.write(_json.dumps(activate_suggestions(doc)))
+        name = tf.name
+    try:
+        pol = load_policy(name)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+    assert pol.select("search").fields == {}          # what a bare lookup saw
+    assert pol.select("search", "kb").fields          # what the proxy actually applies

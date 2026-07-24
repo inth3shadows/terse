@@ -80,7 +80,9 @@ def _cmd_gate(args: argparse.Namespace) -> int:
 
 def _cmd_capture(args: argparse.Namespace) -> int:
     raw = _read(args.file)
-    path = capture_payload(args.tool, raw, args.corpus)
+    # No `result_id`: a hand-captured payload has no result to belong to. Left absent
+    # rather than invented, which keeps it a single-block result — the honest reading.
+    path = capture_payload(args.tool, raw, args.corpus, server=args.server)
     print(f"captured {args.tool} ({classify_shape(raw)}, {len(raw)} bytes) -> {path}")
     return 0
 
@@ -293,6 +295,36 @@ def _warn_if_dropping_capture_rules(out: Path) -> None:
               "you still want before relying on this file", file=sys.stderr)
 
 
+def _print_corpus_identity_note(envelopes: list, out=None) -> None:
+    """Say which of this run's inputs were GUESSED rather than read (#148, #152).
+
+    Both notes describe the same absence — a corpus captured before the envelope recorded
+    `result_id`/`server` — and both change how the output should be read, so neither is
+    left for the operator to infer:
+
+    * results grouped by timing can merge parallel calls into one, which has been shown to
+      flip a `dictionary` decision;
+    * without a server, a rule is authored under the bare tool name, and a bare rule sits
+      dead behind any deployed server-scoped glob.
+
+    Silent on a fully-identified corpus, which is the steady state after a re-capture — the
+    remedy in both cases, since neither field can be recovered after the fact.
+    """
+    from .policy_gen import heuristic_share
+
+    guessed, total = heuristic_share(envelopes)
+    if guessed:
+        print(f"  [note] {guessed}/{total} payload(s) predate result ids; their results were "
+              f"grouped by capture timing, which can merge parallel calls into one. "
+              f"Re-capture to make this exact.", file=out)
+    unnamed = sum(1 for e in envelopes if not isinstance(e.get("server"), str) or not e["server"])
+    if unnamed:
+        print(f"  [note] {unnamed}/{total} payload(s) record no server, so their rules are "
+              f"authored under the bare tool name — which a deployed server-scoped rule "
+              f"(`runecho.*`) shadows at runtime whatever its position. Re-capture, or wrap "
+              f"with `proxy --server-name`, to author reachable rules.", file=out)
+
+
 def _cmd_policy_autotune(args: argparse.Namespace) -> int:
     """Re-tune an EXISTING policy against a corpus (#136).
 
@@ -302,7 +334,7 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
     owns everything else — and writes NOTHING without `--apply`, so the diff is the default
     output rather than an after-the-fact warning."""
     from .policy import load_policy
-    from .policy_gen import generate_policy, merge_policy
+    from .policy_gen import generate_policy, merge_policy, resolve_identities
 
     existing_path = Path(args.policy)
     try:
@@ -323,12 +355,15 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
     # it will never perform.
     generated, _rows = generate_policy(envelopes, threshold=args.threshold,
                                        join_blocks=bool(existing.get("join_blocks", True)))
-    merged, changes = merge_policy(existing, generated)
+    # Identities, not just names: the shadow check has to resolve a generated rule the way
+    # the LOADER will, and a rule's server is not recoverable from its name alone.
+    merged, changes = merge_policy(existing, generated, resolve_identities(envelopes))
 
     kinds = {k: [c for c in changes if c["kind"] == k]
              for k in ("added", "tiers", "suggestions", "unchanged", "preserved",
                        "inherited")}
     print(f"# terse policy autotune — {len(envelopes)} payload(s), {existing_path}")
+    _print_corpus_identity_note(envelopes)
     for c in kinds["tiers"]:
         before = ",".join(c["before"]) or "(passthrough)"
         after = ",".join(c["after"]) or "(passthrough)"
@@ -417,6 +452,7 @@ def _cmd_policy_generate(args: argparse.Namespace) -> int:
     # Per-tool decision summary to stderr so stdout stays a clean policy when piped.
     print(f"# terse policy generate — {len(rows)} tool(s), threshold {args.threshold:.1f}%",
           file=sys.stderr)
+    _print_corpus_identity_note(envelopes, out=sys.stderr)
     for r in rows:
         tiers = ",".join(r["tiers"]) or "(passthrough)"
         print(f"  {r['tool']:<28} {tiers:<28} {r['reason']}", file=sys.stderr)
@@ -1179,6 +1215,9 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("file", help="path to the raw tool output, or - for stdin")
     c.add_argument("--tool", required=True, help="source tool name (for coverage tracking)")
     c.add_argument("--corpus", default=DEFAULT_CORPUS)
+    c.add_argument("--server", default=None,
+                   help="downstream server name, so a generated rule is authored under the "
+                        "same qualified name the proxy looks it up by (#152)")
     c.set_defaults(func=_cmd_capture)
 
     m = sub.add_parser("measure", help="token delta per tier per shape bucket over the corpus")

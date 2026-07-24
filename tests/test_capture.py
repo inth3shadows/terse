@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import stat
+from pathlib import Path
 
 from terse.capture import (
     append_audit,
@@ -70,3 +71,66 @@ def test_find_record_list_with_path_none_when_no_simple_path():
     assert find_record_list_with_path([1, 2, 3]) == (None, None)           # list of scalars
     # a record list nested inside another list has no simple field path -> not returned
     assert find_record_list_with_path([[{"a": 1}, {"a": 2}]]) == (None, None)
+
+
+def test_envelope_records_server_and_result_id(tmp_path):
+    p = capture_payload("structure", '{"a":1}', tmp_path / "c",
+                        server="runecho", result_id="ab12cd34:7")
+    env = json.loads(p.read_text())
+    assert env["server"] == "runecho"
+    assert env["result_id"] == "ab12cd34:7"
+
+
+def test_unknown_server_and_result_are_omitted_not_nulled(tmp_path):
+    # One spelling of "nothing": consumers check for absence, never for a null that means
+    # the same thing.
+    env = json.loads(capture_payload("t", '{"a":1}', tmp_path / "c").read_text())
+    assert "server" not in env and "result_id" not in env
+
+
+def test_recapture_preserves_the_first_result_id_with_its_timestamp(tmp_path):
+    # The corpus is idempotent by sha and an envelope describes a payload's FIRST sighting.
+    # Keeping a later result id while keeping the earlier timestamp would leave the grouping
+    # key and the clock disagreeing about which call this envelope stands for.
+    corpus = tmp_path / "c"
+    first = json.loads(capture_payload("t", '{"a":1}', corpus, result_id="s:1").read_text())
+    again = json.loads(capture_payload("t", '{"a":1}', corpus, result_id="s:9").read_text())
+    assert again["result_id"] == "s:1" == first["result_id"]
+    assert again["captured_at"] == first["captured_at"]
+
+
+def test_qualified_tool_mirrors_the_runtime_lookup():
+    from terse.capture import bare_and_server, qualified_tool
+    from terse.policy import Policy
+
+    # The name must equal the FIRST candidate `select` tries FOR THAT PAYLOAD, or a rule
+    # authored under it is unreachable. `select` receives the bare downstream name — only
+    # capture ever sees a multiproxy peer prefix — so the pair is what the comparison is
+    # anchored to, not the stored `tool` string.
+    for env in [
+        {"tool": "structure", "server": "runecho"},
+        {"tool": "kb.read.search", "server": "kb"},
+        {"tool": "peer__structure", "server": "peer"},
+        {"tool": "peer__kb.read.search", "server": "kb"},
+        {"tool": "structure", "server": "run.echo"},        # a dot in the server name
+    ]:
+        bare, server = bare_and_server(env)
+        assert qualified_tool(env) == Policy._match_candidates(bare, server)[0]
+
+    assert qualified_tool({"tool": "structure"}) == "structure"          # no server recorded
+    assert qualified_tool({"tool": "structure", "server": ""}) == "structure"
+
+
+def test_a_legacy_envelope_does_not_adopt_a_new_result_id():
+    # Review finding: keeping the FIRST `captured_at` while adopting a LATER `result_id` is
+    # the exact disagreement the preservation rule exists to prevent — the block would join
+    # the new result's group but sort by the old result's timestamp within it. A payload
+    # first seen before the field stays legacy until a different payload replaces it.
+    import tempfile
+
+    corpus = Path(tempfile.mkdtemp())
+    first = json.loads(capture_payload("t", '{"a":1}', corpus).read_text())
+    assert "result_id" not in first
+    again = json.loads(capture_payload("t", '{"a":1}', corpus, result_id="s:9").read_text())
+    assert "result_id" not in again
+    assert again["captured_at"] == first["captured_at"]

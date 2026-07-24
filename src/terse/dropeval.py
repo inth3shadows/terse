@@ -505,7 +505,7 @@ def run_drop_payload(obj: Any, raw: str, rule: Any, tool: str, answerer: ToolAns
     return _run_questions_against(questions, applied, staging, answerer, trials=trials)
 
 
-def run_drop_fluency(envelopes: list[dict], rule_for: Callable[[str], Any],
+def run_drop_fluency(envelopes: list[dict], rule_for: Callable[..., Any],
                      answerers: dict[str, ToolAnswerer], trials: int = 1) -> dict:
     """Run the drop-eval for each named tool-capable answerer over every record-shaped,
     drop-marked payload in the corpus. Mirrors `fluency.run_diff_fluency`'s shape.
@@ -519,7 +519,12 @@ def run_drop_fluency(envelopes: list[dict], rule_for: Callable[[str], Any],
     results: dict[str, list[dict]] = {name: [] for name in answerers}
     for env in envelopes:
         tool = env["tool"]
-        rule = rule_for(tool)
+        # Look the rule up the way the PROXY does — bare tool plus the recorded server. A
+        # policy generated from a server-tagged corpus carries qualified rule names, so a
+        # bare-name lookup falls through to the defaults, finds no `fields`, and the whole
+        # eval silently scores nothing while still printing that it verified the drops
+        # (the #149 failure mode, one lookup removed).
+        rule = rule_for(tool, env.get("server"))
         try:
             obj = json.loads(env["raw"])
         except (json.JSONDecodeError, TypeError):

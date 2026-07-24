@@ -299,6 +299,36 @@ turns a +2.6% tool into a +77% one.
 terse measures *tokens*, not comprehension — before relying on a generated policy, confirm
 the model still reads the compressed form with `terse fluency --corpus <dir>` (see below).
 
+#### Rule names carry the server
+
+A generated rule is named the way the proxy will **look it up**, which is `{server}.{tool}`
+whenever the corpus recorded a server — so a corpus captured from a `--server-name runecho`
+wrap authors `runecho.structure`, not `structure`.
+
+That is not cosmetic. `Policy.select` tries the qualified name against *every* rule before
+it tries the bare one against any, so with a `runecho.*` rule deployed, a bare `structure`
+rule never matches — no matter where in the file it sits. Authoring the qualified name is
+the only thing that reaches it.
+
+The corollary is that a corpus which records **no** server can only produce bare rules. If
+`policy generate` or `autotune` prints:
+
+```
+  [note] 1674/1674 payload(s) record no server, so their rules are authored under the bare
+         tool name — which a deployed server-scoped rule (`runecho.*`) shadows at runtime
+         whatever its position. Re-capture, or wrap with `proxy --server-name`, to author
+         reachable rules.
+```
+
+…the rules in that diff for a server-scoped tool are inert. Fix it at the source: make sure
+every wrap passes `--server-name` (`install-mcp` does), then capture again. For a
+hand-captured payload, `terse capture --server <name>` records it directly.
+
+A second note reports how many payloads predate `result_id` and therefore had their
+*results* reconstructed from capture timing rather than read. Neither field can be recovered
+after the fact, which is why both are reported rather than quietly assumed away — see
+[TECHNICAL.md](TECHNICAL.md) for what the timing heuristic can get wrong.
+
 ### Reaching a long-text tool (`$text.code_blocks`)
 
 Some tools don't return JSON at all — they return markdown whose bulk is verbatim source
@@ -770,6 +800,11 @@ To measure your own tools, capture their outputs first:
 ```
 your-tool | uv run terse capture --tool your.tool.name -
 ```
+
+Add `--server <name>` if that tool comes from a named MCP server, so the rule generated for
+it is authored under the same qualified name the proxy looks it up by (see *Rule names carry
+the server* above). A payload captured this way records no result id — it has no result to
+belong to — so it is scored as a single-block result, which is the honest reading.
 
 Each capture is saved locally. **Only capture output you're comfortable storing** —
 captured files can contain whatever the tool returned. Do not capture anything with

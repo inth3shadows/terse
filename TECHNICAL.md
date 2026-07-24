@@ -100,7 +100,19 @@ raw tool output (JSON text)
   callers opt in explicitly.
 - **`capture.py`** — `classify_shape` (pretty/compact JSON, array-of-records,
   long-text), `capture_payload` (writes a sha-idempotent envelope to `corpus/`),
-  `load_corpus`, `coverage`, `extract_records`.
+  `load_corpus`, `coverage`, `extract_records`, `bare_and_server` / `qualify` /
+  `qualified_tool`.
+  The envelope records `server` and `result_id` when the proxy knows them, so a tune-time
+  reader can tell *which downstream* sent a payload and *which result* its blocks arrived
+  in, rather than inferring both. Both are optional and omitted when unknown — the format
+  is additive, so a corpus captured before them stays loadable, and both are preserved
+  together on an idempotent rewrite (a first sighting's timestamp beside a later
+  sighting's result id would place the same block in two different calls at once).
+  `qualify(bare, server)` reproduces `Policy._match_candidates`' first candidate and is
+  the single definition of what a tool is called, shared by the corpus and the generator
+  so they cannot drift. That name is not a preference: `select` tries the qualified
+  candidate against *every* rule before the bare one against any, so a bare `structure`
+  rule is dead behind a deployed `runecho.*` wherever in the file it sits (#152).
 - **`measure.py`** — `measure_payload` (per-tier cl100k decomposition: `minify +
   tabularize + dictionary == tier_total`, re-runs the gate), `measure_corpus`, and
   `cross_tokenizer_savings` (cl100k vs o200k invariance).

@@ -46,7 +46,13 @@ from typing import Any
 
 from . import policy as policy_mod
 from . import probes
-from .capture import LONG_TEXT, classify_shape, find_record_list_with_path
+from .capture import (
+    LONG_TEXT,
+    bare_and_server,
+    classify_shape,
+    find_record_list_with_path,
+    qualify,
+)
 from .lossy import DEFAULT_TEXT_DROP_MIN, TEXT_SELECTOR_CODE_BLOCKS, fenced_spans
 from .measure import measure_joined, measure_payload
 from .tokenize import count_cl100k
@@ -143,9 +149,20 @@ def _keep_lossy_inert(entry: dict, before: list[str]) -> dict:
     return {**entry, "tiers": [], "_comment": f"{entry.get('_comment', '')} — {note}".strip(" —")}
 
 
-def merge_policy(existing: dict, generated: dict) -> tuple[dict, list[dict[str, Any]]]:
+def merge_policy(existing: dict, generated: dict,
+                 identities: dict[str, tuple[str, str | None]] | None = None,
+                 ) -> tuple[dict, list[dict[str, Any]]]:
     """Merge a freshly `generate_policy`'d doc INTO an existing policy (#136). Returns
     `(merged_doc, changes)`; pure, like everything else here.
+
+    `identities` is `resolve_identities(envelopes)` — the `(bare tool, server)` pair behind
+    each generated rule name. It is what lets the shadow check resolve a rule the way the
+    LOADER will: a generated `runecho.structure` is governed at runtime by a deployed bare
+    `structure` rule just as much as by a `runecho.*` one, and inheriting that rule's
+    operator-owned keys is the difference between refining a tool's tiers and silently
+    re-deciding its `capture`. Omitting it falls back to treating each rule name as a
+    server-less tool, which is the pre-#152 behavior and safe only for a corpus that
+    records no servers.
 
     `generate_policy` is *total* — it authors a whole fresh doc from the corpus and knows
     nothing about what is already deployed. Writing that over a live policy silently drops
@@ -224,20 +241,27 @@ def merge_policy(existing: dict, generated: dict) -> tuple[dict, list[dict[str, 
     added = [(t, copy.deepcopy(e)) for t, e in gen_by_tool.items() if t not in seen]
 
     def _shadowing(tool: str) -> tuple[int, dict | None]:
-        """Index of the first existing rule that currently governs `tool`, and that rule.
+        """Index of the existing rule that currently governs `tool`, and that rule.
 
-        Uses `Policy`'s own candidate list rather than a bare fnmatch, so a multiproxy
-        peer-qualified name resolves the way the loader would. Best-effort on ONE axis:
-        the server-qualified candidate needs a server name, and the corpus does not record
-        which server a payload came from — so a server-scoped rule (`runecho.*`) against a
-        tool captured under its bare name (`structure`) is not detected here. Tracked
-        separately; erring this way inserts a rule that the loader may then shadow, which
-        is inert, rather than one that silently overrides an operator rule."""
-        for i, e in enumerate(merged):
-            glob = (e.get("match") or {}).get("tool", "*")
-            if any(fnmatch.fnmatch(c, glob)
-                   for c in policy_mod.Policy._match_candidates(tool)):
-                return i, e
+        Resolves exactly as `Policy.select` does — same candidate list, and CANDIDATE-major
+        rather than rule-major. The iteration order is not a detail: `select` tries the
+        qualified candidate against every rule before the bare one against any, so with
+        rules `[structure, runecho.*]` deployed, a rule-major scan answers `structure` while
+        the loader answers `runecho.*`. Inheriting the wrong rule's operator keys is worse
+        than inheriting none.
+
+        Both axes the corpus used to be blind to are closed by taking the `(bare, server)`
+        pair from `identities`: a deployed `runecho.*` is detected for a tool captured from
+        runecho (#148), and so is a deployed bare `structure`, which the qualified name
+        alone would have missed. What remains unresolvable is a legacy envelope for a tool
+        no server was ever observed for — nothing can recover which downstream sent it, so
+        it checks bare. Erring that way inserts a rule the loader may then shadow, which is
+        inert, rather than one that silently overrides an operator rule."""
+        bare, server = (identities or {}).get(tool, (tool, None))
+        for cand in policy_mod.Policy._match_candidates(bare, server):
+            for i, e in enumerate(merged):
+                if fnmatch.fnmatch(cand, (e.get("match") or {}).get("tool", "*")):
+                    return i, e
         return len(merged), None
 
     # Group by insertion point and splice from the back, so earlier indices stay valid and
@@ -423,44 +447,153 @@ def _pct(saved: int, raw: int) -> float:
     return (saved / raw * 100.0) if raw else 0.0
 
 
-# Two captured blocks of ONE result are teed back-to-back — a file write apart — so
-# consecutive envelopes closer than this belong to the same tool call (#147). Compared
-# CONSECUTIVELY, not first-to-last, so a 200-block result groups correctly however long it
-# takes overall. Over-grouping is possible in one case — genuinely parallel calls to the
-# same tool interleave in time and no window separates them — and is mild: it scores that
-# tool as if one larger result arrived, which is still representative of its shape. The
-# exact fix would be a result id written into the capture envelope; it is not worth a
-# format change until over-grouping is shown to move a decision.
+# LEGACY PATH ONLY — envelopes captured before `result_id` existed (#148). Two blocks of one
+# result are teed back-to-back, a file write apart, so consecutive envelopes closer than this
+# were taken to belong to the same call (#147). It is a guess, and a guess that moves
+# decisions: 200 independent single-block results arriving 1 ms apart chain into ONE
+# 200-block group, which scores 63.4% saved with `dictionary` enabled where the truth — each
+# scored alone, which is what the proxy does — is 25.0% and no dictionary. An earlier comment
+# here called that over-grouping "mild" and unproven; it was neither, and the fix it named
+# (a result id in the envelope) now ships.
 _RESULT_WINDOW_NS = 50_000_000  # 50 ms
+
+# ...bounded from the group's FIRST member as well, so an unbroken run of 1 ms-apart
+# envelopes can no longer chain without limit. A real multi-block result is written in one
+# tight loop; a stream of calls that stays inside the consecutive window for longer than this
+# is a burst of separate calls, not one enormous result. Only bounds the legacy damage — it
+# cannot make an old corpus exact, because the information was never written down.
+_RESULT_SPAN_CAP_NS = 250_000_000  # 250 ms
 
 
 def group_results(envelopes: list[dict[str, Any]]) -> dict[str, list[list[str]]]:
     """Reconstruct `tool -> [[block, ...], ...]` from a flat corpus, so a tool's payloads
-    can be scored as the RESULTS they arrived as (#147). Envelopes without a `captured_at`
-    (predating the field) each become their own single-block group — the pre-#147 behavior,
-    which is the safe direction: it under-measures rather than inventing a join.
+    can be scored as the RESULTS they arrived as (#147).
 
-    Note the corpus is idempotent by sha and preserves a payload's FIRST `captured_at`, so
-    this reconstructs first-sightings, not every call. That is the same sample the tier
-    decision was always made from; it just stops pretending each block arrived alone."""
+    Two regimes, and which one applies is a property of the corpus, not a setting:
+
+    * `result_id` present — grouped by EXACT equality. No timing, no window, no guess.
+    * `result_id` absent (captured before #148) — the consecutive-timing heuristic above,
+      now also capped in total span. `captured_at` absent too: each envelope is its own
+      single-block group, the pre-#147 behavior, which under-measures rather than
+      inventing a join.
+
+    Tools are keyed by `resolve_identities`, i.e. the name the RUNTIME looks a rule up
+    under, so a rule authored from this grouping is reachable by `Policy.select` instead of
+    sitting dead behind a server-scoped glob (#152).
+
+    Note the corpus is idempotent by sha and preserves a payload's FIRST `captured_at` (and
+    its first `result_id` with it), so this reconstructs first-sightings, not every call.
+    That is the same sample the tier decision was always made from; it just stops pretending
+    each block arrived alone."""
     out: dict[str, list[list[str]]] = {}
     by_tool: dict[str, list[dict[str, Any]]] = {}
+    keys = _corpus_keys(envelopes)
     for env in envelopes:
-        by_tool.setdefault(env.get("tool", "?"), []).append(env)
+        by_tool.setdefault(keys[id(env)], []).append(env)
     for tool, envs in by_tool.items():
-        timed = sorted((e for e in envs if isinstance(e.get("captured_at"), int)),
+        identified = [e for e in envs if isinstance(e.get("result_id"), str)]
+        rest = [e for e in envs if not isinstance(e.get("result_id"), str)]
+
+        # Exact: one group per distinct result id, ordered by when that result was first
+        # seen so the emitted order still tracks the session's.
+        exact: dict[str, list[dict[str, Any]]] = {}
+        for env in sorted(identified, key=_seq):
+            exact.setdefault(env["result_id"], []).append(env)
+        groups: list[list[str]] = [[e["raw"] for e in g] for g in exact.values()]
+
+        groups.extend([e["raw"]] for e in rest
+                      if not isinstance(e.get("captured_at"), int))
+        timed = sorted((e for e in rest if isinstance(e.get("captured_at"), int)),
                        key=lambda e: e["captured_at"])
-        groups: list[list[str]] = [[e["raw"]] for e in envs
-                                   if not isinstance(e.get("captured_at"), int)]
         prev_ts: int | None = None
+        start_ts: int | None = None
         for env in timed:
-            if prev_ts is not None and env["captured_at"] - prev_ts < _RESULT_WINDOW_NS:
+            ts = env["captured_at"]
+            same_result = (prev_ts is not None and start_ts is not None
+                           and ts - prev_ts < _RESULT_WINDOW_NS
+                           and ts - start_ts < _RESULT_SPAN_CAP_NS)
+            if same_result:
                 groups[-1].append(env["raw"])
             else:
                 groups.append([env["raw"]])
-            prev_ts = env["captured_at"]
+                start_ts = ts
+            prev_ts = ts
         out[tool] = groups
     return out
+
+
+def _seq(env: dict[str, Any]) -> int:
+    """Capture order, with an untimed envelope sorting first (as 0) — same convention as
+    `capture.load_corpus`, so the two agree on what "corpus order" means."""
+    return env["captured_at"] if isinstance(env.get("captured_at"), int) else 0
+
+
+def resolve_identities(
+    envelopes: list[dict[str, Any]]
+) -> dict[str, tuple[str, str | None]]:
+    """`qualified rule name -> (bare tool, server)` for every tool in the corpus.
+
+    The bare/server pair is what `Policy.select` is actually called with at runtime, so
+    anything that has to reason about a generated rule the way the loader will — the merge's
+    shadow check, a drop-eval looking up a tool's `fields` — needs the pair, not just the
+    name. Returning both from one place keeps them from drifting.
+
+    **Legacy attribution.** An envelope captured before `server` existed records no server,
+    which would split one tool into two rules the moment a corpus spans the upgrade — the
+    old half measured on half the sample, and dead at runtime besides, since the qualified
+    candidate is always tried first. So an unattributed payload is folded into the server
+    observed for that same bare tool, *when exactly one server was observed*. More than one
+    (a shared corpus dir where two peers both expose `search`) is genuinely ambiguous and
+    stays unattributed rather than being assigned by guess."""
+    return {qualify(bare, server): (bare, server)
+            for _env, bare, server in _attribute(envelopes)}
+
+
+def _corpus_keys(envelopes: list[dict[str, Any]]) -> dict[int, str]:
+    """`id(envelope) -> qualified rule name`. Keyed by object identity because two envelopes
+    can be equal in every field a dict key could be built from and still be distinct
+    payloads."""
+    return {id(env): qualify(bare, server)
+            for env, bare, server in _attribute(envelopes)}
+
+
+def _attribute(
+    envelopes: list[dict[str, Any]]
+) -> list[tuple[dict[str, Any], str, str | None]]:
+    """Each envelope with the `(bare tool, server)` pair it should be judged under, after
+    folding server-less legacy payloads into the one server observed for that bare tool.
+    The single place the attribution rule lives — see `resolve_identities`."""
+    observed: dict[str, set[str]] = {}
+    pairs = []
+    for env in envelopes:
+        bare, server = bare_and_server(env)
+        observed.setdefault(bare, set())
+        if server is not None:
+            observed[bare].add(server)
+        pairs.append((env, bare, server))
+    return [(env, bare,
+             next(iter(observed[bare])) if server is None and len(observed[bare]) == 1
+             else server)
+            for env, bare, server in pairs]
+
+
+def heuristic_share(envelopes: list[dict[str, Any]]) -> tuple[int, int]:
+    """`(payloads grouped by timing, total payloads)` — how much of a corpus had its results
+    GUESSED rather than read (#148).
+
+    Counts only the payloads the timing heuristic actually ran on. An envelope with no
+    `captured_at` at all becomes its own single-block group and is not guessed at, and
+    neither is a hand-written `terse capture` payload, which has no result to belong to —
+    reporting either as "grouped by timing" would be a false alarm.
+
+    Surfaced rather than smoothed over: an old corpus cannot be made exact retroactively,
+    and quietly re-measuring one downward would be a worse answer than saying which part of
+    the number rests on a heuristic."""
+    total = len(envelopes)
+    guessed = sum(1 for e in envelopes
+                  if not isinstance(e.get("result_id"), str)
+                  and isinstance(e.get("captured_at"), int))
+    return guessed, total
 
 
 def _tool_decision(tool: str, groups: list[list[str]], threshold: float,

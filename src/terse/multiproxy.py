@@ -72,6 +72,7 @@ from .proxy import (
     _build_capture_and_audit,
     _ignore_sigterm,
     _install_sigterm_to_exit,
+    _new_session_id,
     _restore_sigterm,
     pump,
 )
@@ -1051,7 +1052,10 @@ def run_multi_proxy(
         sys.stderr.write(f"[terse-multiproxy] {exc}\n")
         return 2
 
-    capture, audit = _build_capture_and_audit(capture_dir, debug_log)
+    # ONE session id across every peer: the peers share a corpus dir, and each peer's
+    # `server` already disambiguates them — a per-peer id would only make the same run look
+    # like N runs to a tune-time reader.
+    capture, audit = _build_capture_and_audit(capture_dir, debug_log, _new_session_id())
 
     store: OrderedDict[str, Any] = OrderedDict()
     store_lock = Lock()

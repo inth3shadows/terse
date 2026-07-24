@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import policy as policy_mod
 from ._secure_io import append_restricted, mkdir_restricted, write_restricted
 from .transforms import (
     MAX_DEPTH,
@@ -146,8 +147,15 @@ def _sha8(raw: str) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
 
 
-def capture_payload(tool: str, raw: str, corpus_dir: str | Path) -> Path:
-    """Persist one captured payload as a shape-tagged envelope. Idempotent by sha."""
+def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
+                    server: str | None = None, result_id: str | None = None) -> Path:
+    """Persist one captured payload as a shape-tagged envelope. Idempotent by sha.
+
+    `server` is the downstream's name in the MCP config and `result_id` identifies the
+    tool RESULT this payload was one content block of. Both are optional because the
+    format is additive — a corpus captured before they existed stays loadable, and every
+    consumer treats their absence as "unknown", never as a value (#148, #152).
+    """
     corpus = Path(corpus_dir)
     mkdir_restricted(corpus)
     sha = _sha8(raw)
@@ -163,16 +171,34 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path) -> Path:
             prior = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(prior, dict) and isinstance(prior.get("captured_at"), int):
                 captured_at = prior["captured_at"]
+                # `result_id` travels WITH `captured_at`, never independently: an envelope
+                # describes a payload's FIRST sighting, and a later sighting's result id
+                # beside an earlier sighting's timestamp would put the grouping key and the
+                # clock in disagreement about which call this envelope stands for — the
+                # block would join the new result's group but sort by the old result's
+                # position in it. So when the prior envelope predates the field, the
+                # incoming id is DROPPED rather than adopted: that payload stays legacy
+                # (grouped by timing, and reported as such) until a new payload replaces it.
+                result_id = prior.get("result_id")
+                if not isinstance(result_id, str):
+                    result_id = None
         except (json.JSONDecodeError, OSError):
             pass
-    envelope = {
+    envelope: dict[str, Any] = {
         "tool": tool,
         "shape": classify_shape(raw),
         "bytes": len(raw),
         "sha": sha,
         "captured_at": captured_at,
-        "raw": raw,
     }
+    # Omitted rather than written as null when unknown, so "the field is absent" is the
+    # one signal a consumer has to check — an explicit null would make every reader
+    # handle two spellings of the same nothing.
+    if server is not None:
+        envelope["server"] = server
+    if result_id is not None:
+        envelope["result_id"] = result_id
+    envelope["raw"] = raw   # last: keeps the big field at the end of the file
     # Captured payloads are real MCP tool traffic (README/TECHNICAL: "may contain real
     # data") — restrict permissions the same as terse-managed config/secrets (#42).
     write_restricted(path, json.dumps(envelope, ensure_ascii=False, indent=2))
@@ -224,6 +250,44 @@ def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
             f"{corpus} (corrupt JSON)\n")
     loaded.sort(key=lambda t: (t[0], t[1]))
     return [env for _, _, env in loaded]
+
+
+def bare_and_server(env: dict[str, Any]) -> tuple[str, str | None]:
+    """The pair `Policy.select` is called with for this payload.
+
+    The bare name is the DOWNSTREAM tool's own name, with multiproxy's peer prefix stripped:
+    the proxy selects on that name and only capture sees the peer-qualified one, so a rule
+    has to be authored against the former. The server is whatever the envelope recorded, or
+    None — an empty string is None, so "unknown" has exactly one spelling."""
+    tool = env.get("tool", "?")
+    bare = tool.partition(policy_mod.PREFIX_SEP)[2] if policy_mod.PREFIX_SEP in tool else tool
+    server = env.get("server")
+    return bare, (server if isinstance(server, str) and server else None)
+
+
+def qualify(bare: str, server: str | None) -> str:
+    """`Policy._match_candidates(bare, server)[0]` — the first name `select` looks up, and
+    therefore the only name a generated rule can carry and still be reachable.
+
+    `select` iterates CANDIDATE-major: the qualified candidate is tried against every rule
+    before the bare one is tried against any. So a bare `structure` rule sits dead behind a
+    deployed `runecho.*` no matter where in the file it is placed, and authoring
+    `runecho.structure` is what reaches it (#152). Qualification is skipped when the tool
+    already carries the server as its own prefix — kb names its tools `kb.read.*`, and
+    `kb.kb.read.search` would match nothing (mirrors the same skip in `_match_candidates`).
+
+    Kept here, beside the envelope that feeds it, so the corpus and the runtime cannot drift
+    on what a tool is called — the failure behind #4, where three hand-rolled copies of one
+    rule disagreed."""
+    if server is None or bare.startswith(f"{server}."):
+        return bare
+    return f"{server}.{bare}"
+
+
+def qualified_tool(env: dict[str, Any]) -> str:
+    """The name a corpus entry's tool is looked up under AT RUNTIME — `qualify` applied to
+    this envelope's `bare_and_server` pair."""
+    return qualify(*bare_and_server(env))
 
 
 def coverage(envelopes: list[dict[str, Any]]) -> dict[str, Any]:
