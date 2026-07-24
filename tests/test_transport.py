@@ -412,3 +412,233 @@ def test_http_transport_refuses_credential_headers_over_remote_cleartext():
     assert HttpTransport("http://localhost:4000/mcp", headers={"X-Api-Key": "v"})
     assert HttpTransport("http://api.example.com/mcp", headers={"X-Trace-Id": "v"})
     assert HttpTransport("http://api.example.com/mcp")
+
+
+# --- redirect guards (security audit 2026-07-23) --------------------------------------
+# Every guard in HttpTransport.__init__ ran ONCE, against the configured URL — but
+# `urlopen` follows up to 10 redirects, and none of them were re-checked. All four tests
+# below fail against the pre-fix code (verified): the redirect was followed, and CPython's
+# HTTPRedirectHandler carried every request header onto the new request.
+
+class _RedirectHandler(http.server.BaseHTTPRequestHandler):
+    """A hostile downstream: answers every POST with a 302 to `self.server.target`.
+
+    Also serves the SAME-ORIGIN hop (a relative `Location`, which arrives here as a GET),
+    recording its headers into `server.seen_final` — that is what lets a test distinguish
+    "credential scoped correctly" from "credential stripped unconditionally"."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_a):
+        pass
+
+    def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler's naming convention
+        self.send_response(302)
+        self.send_header("Location", self.server.target)  # type: ignore[attr-defined]
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self) -> None:  # noqa: N802 — the 302 turns the POST into a GET
+        self.server.seen_final.append(dict(self.headers))  # type: ignore[attr-defined]
+        payload = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"same_origin": True}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+class _SinkHandler(http.server.BaseHTTPRequestHandler):
+    """The redirect target — records the headers it was handed, so a leaked credential
+    is observable rather than inferred."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_a):
+        pass
+
+    def do_GET(self) -> None:  # noqa: N802 — a 302 turns the POST into a GET
+        self.server.seen.append(dict(self.headers))  # type: ignore[attr-defined]
+        payload = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"leaked": True}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Mcp-Session-Id", "ATTACKER-CHOSEN")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+@contextlib.contextmanager
+def _redirect_pair(target: str | None = None):
+    """(redirector, sink) — the redirector 302s to the sink unless `target` overrides."""
+    sink = http.server.HTTPServer(("127.0.0.1", 0), _SinkHandler)
+    sink.seen = []  # type: ignore[attr-defined]
+    red = http.server.HTTPServer(("127.0.0.1", 0), _RedirectHandler)
+    red.target = target or f"http://127.0.0.1:{sink.server_address[1]}/steal"  # type: ignore[attr-defined]
+    red.seen_final = []  # type: ignore[attr-defined]
+    threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (sink, red)]
+    for t in threads:
+        t.start()
+    try:
+        yield red, sink
+    finally:
+        for s in (sink, red):
+            s.shutdown()
+        for t in threads:
+            t.join(timeout=2)
+        for s in (sink, red):
+            s.server_close()
+
+
+def _post_one(transport: HttpTransport, mid: int = 1) -> str:
+    transport._post(json.dumps({"jsonrpc": "2.0", "id": mid, "method": "tools/list"}))
+    return transport._q.get(timeout=10)
+
+
+def test_redirect_strips_credential_headers_cross_origin():
+    # The confirmed leak: `Authorization: Bearer <secret>` was re-sent verbatim to the
+    # redirect target, which is a DIFFERENT host:port than the one the operator scoped
+    # the credential to.
+    with _redirect_pair() as (red, sink):
+        t = HttpTransport(_url(red), headers={"Authorization": "Bearer SUPERSECRET"})
+        _post_one(t)
+        assert sink.seen, "redirect target was never reached — test is not exercising the hop"
+        leaked = [h for h in sink.seen if "Authorization" in h]
+        assert not leaked, f"credential survived a cross-origin redirect: {leaked}"
+
+
+def test_redirect_keeps_non_credential_headers():
+    # Stripping must be surgical: a legitimate redirect (CDN, renamed path) still works,
+    # and headers that carry no secret are not collateral damage.
+    with _redirect_pair() as (red, sink):
+        t = HttpTransport(_url(red), headers={"X-Trace-Id": "abc123"})
+        reply = _post_one(t)
+        assert json.loads(reply)["result"] == {"leaked": True}   # the hop still succeeded
+        assert sink.seen[0].get("X-Trace-Id") == "abc123"
+
+
+def test_redirect_to_metadata_address_is_refused():
+    # The construction-time metadata guard, re-applied per hop. Refused BEFORE any
+    # connection is attempted, so this needs no network and cannot hang on a timeout.
+    with _redirect_pair(target="http://169.254.169.254/latest/meta-data/") as (red, _sink):
+        t = HttpTransport(_url(red), timeout=5)
+        err = json.loads(_post_one(t))["error"]["message"]
+        assert "metadata" in err and "169.254.169.254" in err
+
+
+def test_redirect_to_disallowed_scheme_is_refused():
+    # urllib's own redirect handler permits http/https/FTP, which sidesteps
+    # _ALLOWED_URL_SCHEMES entirely. Re-checking the scheme per hop closes that.
+    with _redirect_pair(target="ftp://ftp.example.com/pub/x") as (red, _sink):
+        t = HttpTransport(_url(red), timeout=5)
+        err = json.loads(_post_one(t))["error"]["message"]
+        assert "scheme" in err and "ftp" in err
+
+
+# --- _post's "never raises" contract ---------------------------------------------------
+
+@pytest.mark.parametrize("bad", [
+    "http://exa mple.com/mcp",     # http.client.InvalidURL (a ValueError) — passes urlsplit
+    "https://ex ample.com/mcp",
+])
+def test_post_converts_malformed_url_to_jsonrpc_error(bad):
+    # `_post` documents "Never raises", but only caught HTTPError/URLError/OSError.
+    # `http.client.InvalidURL` derives from `HTTPException`, NOT from `ValueError` (the
+    # audit got this backwards and this test is what caught it), so a downstream url from a
+    # repo-committed .mcp.json escaped through _HttpSendWriter.flush() into pump(),
+    # killed the client->server thread, and made the proxy exit 0 with the call
+    # unanswered. It must become a legible JSON-RPC error like every other failure.
+    t = HttpTransport(bad, timeout=3)
+    err = json.loads(_post_one(t))["error"]
+    assert err["code"] == -32000
+    assert "downstream HTTP request failed" in err["message"]
+
+
+def test_post_converts_invalid_header_value_to_jsonrpc_error():
+    # Same escape, different trigger: http.client rejects a CRLF-bearing header value
+    # with a bare ValueError — this one really IS a ValueError, unlike InvalidURL above,
+    # which is why the except clause needs both types. (The injection itself is blocked by the stdlib — this
+    # pins that the refusal is reported rather than raised.)
+    t = HttpTransport("https://example.invalid/mcp",
+                      headers={"X-Evil": "a\r\nX-Injected: yes"}, timeout=3)
+    err = json.loads(_post_one(t))["error"]
+    assert err["code"] == -32000
+
+
+# --- adversarial-review follow-ups (2026-07-23) ---------------------------------------
+# Six defects the first cut of the redirect fix still had. Each test below fails against
+# that first cut, not merely against the pre-audit code.
+
+@pytest.mark.parametrize("encoded", [
+    "2852039166",              # decimal
+    "0251.0376.0251.0376",     # octal
+    "0xa9.0xfe.0xa9.0xfe",     # hex
+    "169.254.43518",           # short form (a.b.c)
+    "169.254.169.254.",        # fully-qualified, trailing dot
+])
+def test_metadata_guard_catches_alternate_ipv4_encodings(encoded):
+    # `ipaddress.ip_address` parses ONLY dotted-quad, but glibc's resolver — the thing
+    # that actually dials — accepts all of these, and every one is 169.254.169.254. The
+    # guard classified them "not an IP, therefore allowed", which is a complete bypass of
+    # the exact address it exists to refuse.
+    with pytest.raises(ValueError, match="metadata"):
+        HttpTransport(f"http://{encoded}/latest/meta-data/")
+
+
+def test_metadata_guard_still_allows_ordinary_hosts():
+    # The canonicalizer must not start refusing real servers: a DNS name is unparseable
+    # as an IP and stays allowed, as do loopback and private LAN literals.
+    assert HttpTransport("https://mcp.example.com/mcp")
+    assert HttpTransport("http://127.0.0.1:4000/mcp")
+    assert HttpTransport("http://192.168.1.50:8080/mcp")
+    assert HttpTransport("http://3232235826/mcp")   # decimal 192.168.1.50 — private, fine
+
+
+def test_redirect_keeps_credential_on_same_origin_hop():
+    # THE MUTATION TEST. Replacing `if _origin(...) != self._origin:` with `if True:`
+    # passed the whole suite: the only "control" used a header that is never stripped at
+    # any origin, so an unconditional strip was undetectable. A same-origin redirect (a
+    # renamed path) must KEEP the credential — that is what makes the strip a scoping
+    # rule rather than a blanket removal.
+    with _redirect_pair(target="/final") as (red, _sink):
+        t = HttpTransport(_url(red), headers={"Authorization": "Bearer KEEPME"})
+        _post_one(t)
+        assert red.seen_final, "the same-origin hop was never taken"
+        assert red.seen_final[0].get("Authorization") == "Bearer KEEPME"
+
+
+@pytest.mark.parametrize("url_a,url_b", [
+    ("https://h.example.com/mcp", "https://h.example.com:443/mcp"),
+    ("http://h.example.com/mcp", "http://h.example.com:80/mcp"),
+    ("http://[::1]:9/mcp", "http://[0:0:0:0:0:0:0:1]:9/mcp"),
+    ("http://127.0.0.1:9/mcp", "http://2130706433:9/mcp"),
+])
+def test_origin_normalizes_default_ports_and_ip_spellings(url_a, url_b):
+    # Two spellings of one origin compared UNEQUAL, so a legitimate same-host redirect
+    # silently lost its credential and the downstream answered 401 with no explanation.
+    from terse.transport import _origin
+
+    assert _origin(url_a) == _origin(url_b)
+
+
+@pytest.mark.parametrize("name", ["X-Auth", "Authentication", "Mcp-Session-Id",
+                                  "X-Bearer", "Api-Credential", "X-Signature"])
+def test_credential_headers_beyond_authorization_are_stripped(name):
+    # `_SENSITIVE_HEADER_TOKENS` held "authorization", which matched `Authorization` and
+    # nothing else — `X-Auth` and `Authentication` were observed reaching a cross-origin
+    # sink intact.
+    with _redirect_pair() as (red, sink):
+        t = HttpTransport(_url(red), headers={name: "s3cret"})
+        _post_one(t)
+        assert sink.seen and name not in sink.seen[0], f"{name} survived a cross-origin hop"
+
+
+def test_redirect_target_cannot_fixate_the_mcp_session():
+    # A hostile downstream 302s to a host it controls, which returns its own
+    # Mcp-Session-Id. Storing that meant terse presented an ATTACKER-CHOSEN session on
+    # every subsequent POST to the legitimate downstream.
+    with _redirect_pair() as (red, _sink):
+        t = HttpTransport(_url(red))
+        _post_one(t)
+        assert t.session != "ATTACKER-CHOSEN"
+        assert t.session is None

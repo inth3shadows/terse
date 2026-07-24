@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ._secure_io import append_restricted
+from ._secure_io import append_restricted, mkdir_restricted
 from .report import _sum
 
 # One JSONL line per real `measure --history` run — tiny, but unbounded over a project's
@@ -53,7 +53,7 @@ def append_run(path: Path, run: dict[str, Any]) -> None:
     dir) on first use. Written via append_restricted (0600) for perms parity with the
     corpus/ledger — a run row can embed an operator-supplied `label`. Rotates one
     generation once the file passes MAX_HISTORY_BYTES so it can't grow without bound."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_restricted(path.parent)
     try:
         if path.stat().st_size >= MAX_HISTORY_BYTES:
             path.replace(path.with_name(path.name + ".1"))

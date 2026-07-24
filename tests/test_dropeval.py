@@ -14,6 +14,8 @@ import json
 import re
 import urllib.request
 
+import pytest
+
 from terse import dropeval, lossy
 from terse.policy import Policy, Rule
 from terse.proxy import RETRIEVE_TOOL_DEF, Interceptor
@@ -315,7 +317,7 @@ def test_openai_tool_answerer_sends_sanitized_name_and_maps_the_reply_back(monke
     # matches and every retrieve call is scored as "didn't retrieve".
     monkeypatch.setattr(urllib.request, "urlopen",
                         _fake_urlopen(captured, "terse_retrieve"))
-    ask = dropeval.openai_tool_answerer("http://x/v1", "k", "m", tools=[RETRIEVE_TOOL_DEF])
+    ask = dropeval.openai_tool_answerer("http://127.0.0.1:1/v1", "k", "m", tools=[RETRIEVE_TOOL_DEF])
     turn = ask([{"role": "user", "content": "hi"}])
 
     sent = captured["body"]["tools"][0]["function"]["name"]
@@ -397,4 +399,24 @@ def test_oai_name_collision_fails_loud_not_silent():
     colliding = [dict(RETRIEVE_TOOL_DEF),
                  {**RETRIEVE_TOOL_DEF, "name": "terse_retrieve"}]  # sanitizes identically
     with pytest.raises(ValueError, match="collide"):
-        dropeval.openai_tool_answerer("http://x/v1", "k", "m", tools=colliding)
+        dropeval.openai_tool_answerer("http://127.0.0.1:1/v1", "k", "m", tools=colliding)
+
+
+# --- cleartext-credential guard parity with fluency.openai_answerer (audit 2026-07-23) ---
+# This constructor sends the same `Authorization: Bearer <key>` fluency's does, but had
+# NO guard at all — so `--base-url http://remote/v1` put the key on the wire in the clear.
+
+def test_openai_tool_answerer_refuses_cleartext_key_to_remote_host():
+    with pytest.raises(ValueError, match="cleartext http"):
+        dropeval.openai_tool_answerer("http://api.example.com/v1", "sk-secret", "m",
+                                      tools=[RETRIEVE_TOOL_DEF])
+
+
+def test_openai_tool_answerer_allows_loopback_https_and_keyless_http():
+    # The three shapes that carry no wire exposure — same allowances fluency makes.
+    assert callable(dropeval.openai_tool_answerer("http://127.0.0.1:3456/v1", "sk-secret",
+                                                  "m", tools=[RETRIEVE_TOOL_DEF]))
+    assert callable(dropeval.openai_tool_answerer("https://api.example.com/v1", "sk-secret",
+                                                  "m", tools=[RETRIEVE_TOOL_DEF]))
+    assert callable(dropeval.openai_tool_answerer("http://api.example.com/v1", "",
+                                                  "m", tools=[RETRIEVE_TOOL_DEF]))

@@ -27,7 +27,12 @@ dependencies = [
     # tiktoken: cl100k_base token counts for headroom-eval parity. uv.lock pins the exact
     # version for this repo; the floor here gives a lockfile-less `pip install terse-mcp` a
     # sane lower bound instead of resolving to an arbitrarily old release.
-    "tiktoken>=0.7",
+    # The floor is raised (was >=0.7, a 2023 release) and capped at the next MAJOR: a
+    # lockfile-less `pip install terse-mcp` ignores uv.lock entirely, so the range here is
+    # the ONLY thing constraining what a downstream user actually gets. An unbounded floor
+    # that old widened the supply-chain surface for no benefit — nothing in terse uses an
+    # API older than 0.8, and every version in range is verified by the same round-trip gate.
+    "tiktoken>=0.8,<1",
 ]
 
 [project.urls]

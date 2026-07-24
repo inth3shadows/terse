@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ._secure_io import append_restricted, write_restricted
+from ._secure_io import append_restricted, mkdir_restricted, write_restricted
 from .transforms import (
     MAX_DEPTH,
     _uniform_dict_list,  # the one canonical "what tabularize folds" rule
@@ -149,7 +149,7 @@ def _sha8(raw: str) -> str:
 def capture_payload(tool: str, raw: str, corpus_dir: str | Path) -> Path:
     """Persist one captured payload as a shape-tagged envelope. Idempotent by sha."""
     corpus = Path(corpus_dir)
-    corpus.mkdir(parents=True, exist_ok=True)
+    mkdir_restricted(corpus)
     sha = _sha8(raw)
     safe_tool = _SANITIZE.sub("_", tool).strip("_") or "unknown"
     path = corpus / f"{safe_tool}__{sha}.json"
@@ -188,7 +188,7 @@ def append_audit(record: dict[str, Any], log_path: str | Path) -> None:
     threads; tool results are low-frequency enough that the syscall cost is irrelevant.
     """
     p = Path(log_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_restricted(p.parent)
     # Replay records embed raw tool traffic too — same secrets exposure as capture_payload.
     append_restricted(p, json.dumps(record, ensure_ascii=False) + "\n")
 
