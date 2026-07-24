@@ -1475,6 +1475,99 @@ def test_join_refusals_fall_back_to_per_block_and_record_why():
         "multiblock_passthrough"
 
 
+# --- #140: partial join — fold the record run, leave the non-records per-block ---
+
+def test_partial_join_folds_record_run_beside_a_trailing_error_string():
+    # kb.read.list_principles in the wild: many object blocks + one bare error string.
+    # The FULL join refuses (non_json), but the records must still fold.
+    inter = Interceptor(DIFF)
+    raws = _rec_blocks(5)
+    err = "Error executing tool gh.api.items: upstream 503"
+    content = _emit_multi(inter, 1, "gh.api.items", raws + [err])
+    assert len(content) == 2                                      # folded block + the error
+    assert transforms.TABLE_MARKER in content[0]["text"]         # records folded across blocks
+    assert transforms.decompress(content[0]["text"]) == [json.loads(r) for r in raws]
+    assert content[1]["text"] == err                             # error left byte-for-byte
+
+
+def test_partial_join_folds_around_an_interspersed_non_record_block():
+    # A JSON array between two record runs breaks the run: each contiguous run of >=2
+    # objects folds on its own, the array passes through in place.
+    inter = Interceptor(DIFF)
+    a, b = _rec_blocks(3), _rec_blocks(2)
+    arr = json.dumps([1, 2, 3])
+    content = _emit_multi(inter, 1, "gh.api.items", a + [arr] + b)
+    assert len(content) == 3
+    assert transforms.decompress(content[0]["text"]) == [json.loads(r) for r in a]
+    assert json.loads(content[1]["text"]) == [1, 2, 3]           # the array, per-block (minified)
+    assert transforms.decompress(content[2]["text"]) == [json.loads(r) for r in b]
+
+
+def test_partial_join_records_multiblock_partial_reason():
+    reasons, stats = _capture_stats()
+    inter = Interceptor(DIFF, stats=stats)
+    _emit_multi(inter, 1, "gh.api.items", _rec_blocks(4) + ["bare error"])
+    assert reasons and all(r == "multiblock_partial" for r in reasons)
+
+
+def test_partial_join_does_not_fold_a_lone_record_beside_a_non_record():
+    # One object + one error string: no run of >=2 objects, so nothing folds and the
+    # result stays on the plain per-block path.
+    reasons, stats = _capture_stats()
+    inter = Interceptor(DIFF, stats=stats)
+    content = _emit_multi(inter, 1, "gh.api.items", [_rec_blocks(1)[0], "bare error"])
+    assert len(content) == 2
+    assert reasons[-1] == "multiblock_non_json"                  # fell back, did not partial-fold
+
+
+def test_partial_join_captures_folded_array_and_leftover_separately(tmp_path):
+    captured = []
+    inter = Interceptor(DIFF, capture=lambda tool, text, **kw: captured.append(text))
+    raws = _rec_blocks(3)
+    err = "boom"
+    _emit_multi(inter, 1, "gh.api.items", raws + [err])
+    assert len(captured) == 2                                    # the array + the leftover
+    assert json.loads(captured[0]) == [json.loads(r) for r in raws]
+    assert captured[1] == err
+
+
+def test_partial_join_audit_pairs_the_run_and_the_leftover():
+    records = []
+    inter = Interceptor(DIFF, audit=records.append)
+    raws = _rec_blocks(3)
+    err = "boom"
+    _emit_multi(inter, 1, "gh.api.items", raws + [err])
+    blocks = records[0]["blocks"]
+    assert len(blocks) == 2
+    assert blocks[0]["raw"] == "\n".join(raws)                   # folded run's true wire cost
+    assert blocks[1]["raw"] == err
+
+
+def test_partial_join_establishes_no_diff_base():
+    # A partial fold must NOT leave a diff base: the next same-tool result re-anchors as a
+    # full rather than diffing against a folded subset whose boundaries may have moved.
+    inter = Interceptor(DIFF)
+    _emit_multi(inter, 1, "gh.api.items", _rec_blocks(5) + ["err"])
+    assert "gh.api.items" not in inter.last                      # no base parked
+    assert "gh.api.items" not in inter.last_joined
+    # a subsequent all-record result for the same tool sends a full, not a diff
+    content = _emit_multi(inter, 2, "gh.api.items", _rec_blocks(5))
+    assert transforms.DIFF_MARKER not in content[0]["text"]
+
+
+def test_partial_join_stays_lossless_reconstructs_every_block():
+    inter = Interceptor(DIFF)
+    a = _rec_blocks(4)
+    arr, err = json.dumps({"nested": [1, 2]}), "plain error text"
+    # object-run, a lone object (arr is a dict here -> counts as a record but lone), error
+    content = _emit_multi(inter, 1, "gh.api.items", a + [arr, err])
+    # a[0..3] fold; arr is a dict adjacent to the run? No — it IS a record, so it extends
+    # the run to 5. Reconstruct the whole folded array + the error.
+    assert transforms.decompress(content[0]["text"]) == \
+        [json.loads(r) for r in a] + [json.loads(arr)]
+    assert content[1]["text"] == err
+
+
 def test_join_to_single_shape_flip_re_anchors_instead_of_cross_shape_diff():
     inter = Interceptor(DIFF)
     _emit_multi(inter, 1, "gh.api.items", _rec_blocks(5))     # joins -> base is an array
