@@ -214,7 +214,11 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     would silently blend tokenizers-with-chars); `untokenized` counts the rest so the
     report can show the gap instead of hiding it. Char totals always cover everything.
     """
-    total = {"results": 0, "raw_chars": 0, "out_chars": 0,
+    # `blocks`, not `results`: one ledger record is emitted per tool-result text BLOCK
+    # (the proxy tees `_emit_stats` per emitted pair), so a multi-block result contributes
+    # N and a joined/partial one contributes 1 per folded unit. Naming it `blocks` keeps
+    # the count honest — it moves with join behaviour by design, not by call volume (#141).
+    total = {"blocks": 0, "raw_chars": 0, "out_chars": 0,
              "raw_tokens": 0, "out_tokens": 0, "untokenized": 0}
     decisions: dict[str, int] = {}
     # Phase 1: why the cross-call diff did/didn't fire (only present on newer records).
@@ -224,7 +228,7 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         raw_c, out_c = rec.get("raw_chars"), rec.get("out_chars")
         if not (isinstance(raw_c, int) and isinstance(out_c, int)):
             continue  # not a ledger record
-        total["results"] += 1
+        total["blocks"] += 1
         total["raw_chars"] += raw_c
         total["out_chars"] += out_c
         decision = str(rec.get("decision", "unknown"))
@@ -233,9 +237,9 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(reason, str):
             diff_reasons[reason] = diff_reasons.get(reason, 0) + 1
         key = (str(rec.get("server", "unknown")), str(rec.get("tool", "unknown")))
-        row = tools.setdefault(key, {"results": 0, "raw_tokens": 0, "out_tokens": 0,
+        row = tools.setdefault(key, {"blocks": 0, "raw_tokens": 0, "out_tokens": 0,
                                      "raw_chars": 0, "out_chars": 0, "diffs": 0})
-        row["results"] += 1
+        row["blocks"] += 1
         row["raw_chars"] += raw_c
         row["out_chars"] += out_c
         if decision == DIFF:
@@ -260,11 +264,11 @@ def _pct_saved(raw: int, out: int) -> str:
     return f"{(raw - out) / raw * 100:5.1f}%" if raw else "    –"
 
 
-def _hit_rate(diffs: int, results: int) -> str:
-    """diffs / results as a percent — the cross-call diff hit rate this ledger exists
+def _hit_rate(diffs: int, blocks: int) -> str:
+    """diffs / blocks as a percent — the cross-call diff hit rate this ledger exists
     to measure (a raw count alone is meaningless without its denominator). Blank on a
     zero denominator, which can't happen per-row but keeps the helper total."""
-    return f"{diffs / results * 100:4.0f}%" if results else "    –"
+    return f"{diffs / blocks * 100:4.0f}%" if blocks else "    –"
 
 
 def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
@@ -274,7 +278,7 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
     total, decisions, tools = agg["total"], agg["decisions"], agg["tools"]
     scope = f"last {window}" if window else "all time"
     lines = [f"terse stats — {scope}  (ledger: {log_path})", ""]
-    if total["results"] == 0:
+    if total["blocks"] == 0:
         if window:
             # The ledger isn't necessarily empty — the window filtered everything out.
             # Point at the window, not at "nothing ever recorded" (the wrong cause).
@@ -285,7 +289,7 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
                          "tool call since stats shipped?")
         return "\n".join(lines) + "\n"
     tok_raw, tok_out = total["raw_tokens"], total["out_tokens"]
-    lines.append(f"results: {total['results']}   "
+    lines.append(f"blocks: {total['blocks']}   "
                  f"decisions: " + ", ".join(f"{k}={v}" for k, v in sorted(decisions.items())))
     diff_reasons = agg.get("diff_reasons") or {}
     if diff_reasons:
@@ -313,14 +317,14 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
     # table as a wall of zeros while the header above honestly shows char savings.
     use_tokens = bool(tok_raw or tok_out)
     raw_col, out_col = ("tok raw", "tok out") if use_tokens else ("chr raw", "chr out")
-    lines.append(f"{'server':<18} {'tool':<34} {'results':>7} {'diffs':>5} "
+    lines.append(f"{'server':<18} {'tool':<34} {'blocks':>7} {'diffs':>5} "
                  f"{'diff%':>5} {raw_col:>10} {out_col:>10} {'saved':>6}")
     for row in tools:
         raw_n = row["raw_tokens"] if use_tokens else row["raw_chars"]
         out_n = row["out_tokens"] if use_tokens else row["out_chars"]
         lines.append(f"{row['server'][:18]:<18} {row['tool'][:34]:<34} "
-                     f"{row['results']:>7} {row['diffs']:>5} "
-                     f"{_hit_rate(row['diffs'], row['results']):>5} "
+                     f"{row['blocks']:>7} {row['diffs']:>5} "
+                     f"{_hit_rate(row['diffs'], row['blocks']):>5} "
                      f"{raw_n:>10,} {out_n:>10,} "
                      f"{_pct_saved(raw_n, out_n):>6}")
     return "\n".join(lines) + "\n"

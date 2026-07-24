@@ -129,12 +129,12 @@ def test_aggregate_totals_decisions_and_per_tool_rows():
         _rec(tool="a", decision="compressed", raw_t=100, out_t=50),
         _rec(tool="b", decision="unchanged", raw_t=10, out_t=10),
     ])
-    assert agg["total"]["results"] == 3
+    assert agg["total"]["blocks"] == 3              # one ledger record per result BLOCK (#141)
     assert agg["total"]["raw_tokens"] == 210 and agg["total"]["out_tokens"] == 70
     assert agg["decisions"] == {"diff": 1, "compressed": 1, "unchanged": 1}
     rows = agg["tools"]
     assert rows[0]["tool"] == "a"                   # sorted by tokens saved, desc
-    assert rows[0]["results"] == 2 and rows[0]["diffs"] == 1
+    assert rows[0]["blocks"] == 2 and rows[0]["diffs"] == 1
 
 
 def test_aggregate_keeps_untokenized_records_out_of_token_totals():
@@ -148,7 +148,7 @@ def test_aggregate_keeps_untokenized_records_out_of_token_totals():
 
 
 def test_aggregate_ignores_non_ledger_records():
-    assert aggregate([{"ts": 1, "something": "else"}])["total"]["results"] == 0
+    assert aggregate([{"ts": 1, "something": "else"}])["total"]["blocks"] == 0
 
 
 def test_aggregate_tallies_diff_reasons_and_tolerates_their_absence():
@@ -192,6 +192,18 @@ def test_report_omits_diff_reason_line_for_legacy_ledger():
     assert "diff reasons:" not in out
 
 
+def test_report_headline_and_table_count_blocks_not_results():
+    # #141 pt2: one ledger record is emitted per result BLOCK, so the count is a block
+    # count — label it `blocks`, not `results`, which read as call volume and moved with
+    # join behaviour (a joined result -> 1, its per-block fallback -> N).
+    agg = aggregate([_rec(tool="a"), _rec(tool="a")])
+    out = build_stats_report(agg, log_path="/x")
+    assert "blocks: 2" in out                       # honest headline
+    assert "results:" not in out                    # the misleading label is gone
+    header = next(line for line in out.splitlines() if "diff%" in line)
+    assert "blocks" in header and "results" not in header
+
+
 def test_report_empty_ledger_says_so():
     out = build_stats_report(aggregate([]), log_path="/x/stats.jsonl")
     assert "no results recorded" in out
@@ -227,7 +239,7 @@ def test_report_per_tool_table_uses_chars_when_untokenized_not_all_zeros():
 
 
 def test_report_shows_diff_hit_rate_per_tool():
-    # The diff hit rate (diffs / results) is the metric the ledger exists for; a bare
+    # The diff hit rate (diffs / blocks) is the metric the ledger exists for; a bare
     # count is meaningless without its denominator.
     agg = aggregate([_rec(tool="a", decision="diff"),
                      _rec(tool="a", decision="diff"),
@@ -236,7 +248,7 @@ def test_report_shows_diff_hit_rate_per_tool():
     out = build_stats_report(agg, log_path="/x")
     assert "diff%" in out
     table = out.splitlines()[-1]
-    assert table.split()[2] == "4" and table.split()[3] == "2"  # results, diffs
+    assert table.split()[2] == "4" and table.split()[3] == "2"  # blocks, diffs
     assert "50%" in table                                       # 2 / 4 hit rate
 
 
