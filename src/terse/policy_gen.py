@@ -46,7 +46,12 @@ from typing import Any
 
 from . import policy as policy_mod
 from . import probes
-from .capture import LONG_TEXT, classify_shape, find_record_list_with_path
+from .capture import (
+    LONG_TEXT,
+    classify_shape,
+    find_record_list_with_path,
+    qualified_tool,
+)
 from .lossy import DEFAULT_TEXT_DROP_MIN, TEXT_SELECTOR_CODE_BLOCKS, fenced_spans
 from .measure import measure_joined, measure_payload
 from .tokenize import count_cl100k
@@ -227,12 +232,16 @@ def merge_policy(existing: dict, generated: dict) -> tuple[dict, list[dict[str, 
         """Index of the first existing rule that currently governs `tool`, and that rule.
 
         Uses `Policy`'s own candidate list rather than a bare fnmatch, so a multiproxy
-        peer-qualified name resolves the way the loader would. Best-effort on ONE axis:
-        the server-qualified candidate needs a server name, and the corpus does not record
-        which server a payload came from — so a server-scoped rule (`runecho.*`) against a
-        tool captured under its bare name (`structure`) is not detected here. Tracked
-        separately; erring this way inserts a rule that the loader may then shadow, which
-        is inert, rather than one that silently overrides an operator rule."""
+        peer-qualified name resolves the way the loader would.
+
+        `tool` arrives already server-qualified when the corpus recorded one
+        (`capture.qualified_tool`), which is what closes the axis this used to miss (#148):
+        a deployed `runecho.*` is now DETECTED against a tool captured from runecho, where
+        before the bare corpus name `structure` matched nothing and a dead rule was appended.
+        The gap that remains is a legacy envelope with no `server` at all — nothing can
+        recover which downstream sent it, so it still checks bare. Erring that way inserts a
+        rule the loader may then shadow, which is inert, rather than one that silently
+        overrides an operator rule."""
         for i, e in enumerate(merged):
             glob = (e.get("match") or {}).get("tool", "*")
             if any(fnmatch.fnmatch(c, glob)
@@ -423,44 +432,96 @@ def _pct(saved: int, raw: int) -> float:
     return (saved / raw * 100.0) if raw else 0.0
 
 
-# Two captured blocks of ONE result are teed back-to-back — a file write apart — so
-# consecutive envelopes closer than this belong to the same tool call (#147). Compared
-# CONSECUTIVELY, not first-to-last, so a 200-block result groups correctly however long it
-# takes overall. Over-grouping is possible in one case — genuinely parallel calls to the
-# same tool interleave in time and no window separates them — and is mild: it scores that
-# tool as if one larger result arrived, which is still representative of its shape. The
-# exact fix would be a result id written into the capture envelope; it is not worth a
-# format change until over-grouping is shown to move a decision.
+# LEGACY PATH ONLY — envelopes captured before `result_id` existed (#148). Two blocks of one
+# result are teed back-to-back, a file write apart, so consecutive envelopes closer than this
+# were taken to belong to the same call (#147). It is a guess, and a guess that moves
+# decisions: 200 independent single-block results arriving 1 ms apart chain into ONE
+# 200-block group, which scores 63.4% saved with `dictionary` enabled where the truth — each
+# scored alone, which is what the proxy does — is 25.0% and no dictionary. An earlier comment
+# here called that over-grouping "mild" and unproven; it was neither, and the fix it named
+# (a result id in the envelope) now ships.
 _RESULT_WINDOW_NS = 50_000_000  # 50 ms
+
+# ...bounded from the group's FIRST member as well, so an unbroken run of 1 ms-apart
+# envelopes can no longer chain without limit. A real multi-block result is written in one
+# tight loop; a stream of calls that stays inside the consecutive window for longer than this
+# is a burst of separate calls, not one enormous result. Only bounds the legacy damage — it
+# cannot make an old corpus exact, because the information was never written down.
+_RESULT_SPAN_CAP_NS = 250_000_000  # 250 ms
 
 
 def group_results(envelopes: list[dict[str, Any]]) -> dict[str, list[list[str]]]:
     """Reconstruct `tool -> [[block, ...], ...]` from a flat corpus, so a tool's payloads
-    can be scored as the RESULTS they arrived as (#147). Envelopes without a `captured_at`
-    (predating the field) each become their own single-block group — the pre-#147 behavior,
-    which is the safe direction: it under-measures rather than inventing a join.
+    can be scored as the RESULTS they arrived as (#147).
 
-    Note the corpus is idempotent by sha and preserves a payload's FIRST `captured_at`, so
-    this reconstructs first-sightings, not every call. That is the same sample the tier
-    decision was always made from; it just stops pretending each block arrived alone."""
+    Two regimes, and which one applies is a property of the corpus, not a setting:
+
+    * `result_id` present — grouped by EXACT equality. No timing, no window, no guess.
+    * `result_id` absent (captured before #148) — the consecutive-timing heuristic above,
+      now also capped in total span. `captured_at` absent too: each envelope is its own
+      single-block group, the pre-#147 behavior, which under-measures rather than
+      inventing a join.
+
+    Tools are keyed by `capture.qualified_tool`, i.e. the name the RUNTIME looks a rule up
+    under, so a rule authored from this grouping is reachable by `Policy.select` instead of
+    sitting dead behind a server-scoped glob (#152).
+
+    Note the corpus is idempotent by sha and preserves a payload's FIRST `captured_at` (and
+    its first `result_id` with it), so this reconstructs first-sightings, not every call.
+    That is the same sample the tier decision was always made from; it just stops pretending
+    each block arrived alone."""
     out: dict[str, list[list[str]]] = {}
     by_tool: dict[str, list[dict[str, Any]]] = {}
     for env in envelopes:
-        by_tool.setdefault(env.get("tool", "?"), []).append(env)
+        by_tool.setdefault(qualified_tool(env), []).append(env)
     for tool, envs in by_tool.items():
-        timed = sorted((e for e in envs if isinstance(e.get("captured_at"), int)),
+        identified = [e for e in envs if isinstance(e.get("result_id"), str)]
+        rest = [e for e in envs if not isinstance(e.get("result_id"), str)]
+
+        # Exact: one group per distinct result id, ordered by when that result was first
+        # seen so the emitted order still tracks the session's.
+        exact: dict[str, list[dict[str, Any]]] = {}
+        for env in sorted(identified, key=_seq):
+            exact.setdefault(env["result_id"], []).append(env)
+        groups: list[list[str]] = [[e["raw"] for e in g] for g in exact.values()]
+
+        groups.extend([e["raw"]] for e in rest
+                      if not isinstance(e.get("captured_at"), int))
+        timed = sorted((e for e in rest if isinstance(e.get("captured_at"), int)),
                        key=lambda e: e["captured_at"])
-        groups: list[list[str]] = [[e["raw"]] for e in envs
-                                   if not isinstance(e.get("captured_at"), int)]
         prev_ts: int | None = None
+        start_ts: int | None = None
         for env in timed:
-            if prev_ts is not None and env["captured_at"] - prev_ts < _RESULT_WINDOW_NS:
+            ts = env["captured_at"]
+            same_result = (prev_ts is not None and start_ts is not None
+                           and ts - prev_ts < _RESULT_WINDOW_NS
+                           and ts - start_ts < _RESULT_SPAN_CAP_NS)
+            if same_result:
                 groups[-1].append(env["raw"])
             else:
                 groups.append([env["raw"]])
-            prev_ts = env["captured_at"]
+                start_ts = ts
+            prev_ts = ts
         out[tool] = groups
     return out
+
+
+def _seq(env: dict[str, Any]) -> int:
+    """Capture order, with an untimed envelope sorting first (as 0) — same convention as
+    `capture.load_corpus`, so the two agree on what "corpus order" means."""
+    return env["captured_at"] if isinstance(env.get("captured_at"), int) else 0
+
+
+def heuristic_share(envelopes: list[dict[str, Any]]) -> tuple[int, int]:
+    """`(payloads grouped by timing, total payloads)` — how much of a corpus predates
+    `result_id` and therefore had its results GUESSED rather than read (#148).
+
+    Surfaced rather than smoothed over: an old corpus cannot be made exact retroactively,
+    and quietly re-measuring one downward would be a worse answer than saying which part of
+    the number rests on a heuristic."""
+    total = len(envelopes)
+    guessed = sum(1 for e in envelopes if not isinstance(e.get("result_id"), str))
+    return guessed, total
 
 
 def _tool_decision(tool: str, groups: list[list[str]], threshold: float,

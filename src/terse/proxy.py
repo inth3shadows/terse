@@ -27,6 +27,7 @@ import json
 import signal
 import subprocess
 import sys
+import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from threading import Lock, Thread
@@ -44,6 +45,12 @@ from .transport import HttpTransport, build_transport
 # client stopped reading our stdout) instead of the old 2s cap that could truncate a large
 # final reply outright.
 _STDIO_DRAIN_TIMEOUT = 30.0
+
+# The corpus tee: (tool, raw, server, result_id). `server` and `result_id` are what let a
+# tune-time reader reconstruct which downstream sent a payload and which result's blocks
+# arrived together, instead of inferring both from capture timing (#148, #152). Keyword-only
+# past `raw` so the pre-#148 two-positional-arg call shape still reads correctly.
+CaptureFn = Callable[..., None]
 
 # The synthetic tool terse advertises in tools/list when a policy enables drop-to-retrieve
 # (#10). The proxy answers its calls itself from the drop store — the downstream server
@@ -141,7 +148,7 @@ class Interceptor:
     DROPPED_MAX_BYTES = 8 << 20  # 8 MiB
 
     def __init__(self, pol: policy_mod.Policy, debug: bool = False,
-                 capture: Callable[[str, str], None] | None = None,
+                 capture: CaptureFn | None = None,
                  audit: Callable[[dict], None] | None = None,
                  stats: Callable[[str, str, str, bool, str | None, str | None], None] | None = None,
                  server_name: str | None = None,
@@ -171,7 +178,10 @@ class Interceptor:
         self.join_blocks = pol.join_blocks
         # Optional tee of each RAW (pre-compression) tool-result text, keyed by tool name
         # (#32). Keeps the Interceptor I/O-free: the callback owns the disk write. Never
-        # affects forwarding — its failures are swallowed at the call site.
+        # affects forwarding — its failures are swallowed at the call site. Also handed
+        # this peer's `server` and the `result_id` the block belonged to, so the corpus can
+        # answer "which server" and "which call" instead of leaving both to be guessed at
+        # tune time (#148, #152).
         self.capture = capture
         # Optional structured replay log of the raw->decision->emitted triple per result
         # (#23). Like capture, the callback owns I/O and its failures are swallowed: an
@@ -538,7 +548,13 @@ class Interceptor:
                     payloads = raw_texts
                 for payload in payloads:
                     try:
-                        self.capture(capture_tool, payload)
+                        # The JSON-RPC id identifies the RESULT these blocks came from, so
+                        # the corpus no longer has to infer "same call" from write timing
+                        # (#148). It is scoped to this process by the callback, since the id
+                        # is only unique within one session and many sessions write into one
+                        # corpus dir.
+                        self.capture(capture_tool, payload, server=self.server_name,
+                                     result_id=msg["id"])
                     except Exception as exc:  # noqa: BLE001 — capture is never load-bearing
                         self._warn_sink("capture", capture_tool, exc)
 
@@ -1223,9 +1239,18 @@ def _restore_sigterm(token: Any) -> None:
         pass
 
 
+def _new_session_id() -> str:
+    """A fresh id for one proxy process's run, used to scope captured result ids.
+
+    The single point of nondeterminism on the capture path, minted at the EDGE
+    (`run_proxy` / `run_multi_proxy`) so `Interceptor` and `capture_payload` stay pure —
+    the same reason `captured_at` is stamped in one place (principle #31)."""
+    return uuid.uuid4().hex[:8]
+
+
 def _build_capture_and_audit(
-    capture_dir: str | None, debug_log: str | None
-) -> tuple[Callable[[str, str], None] | None, Callable[[dict], None] | None]:
+    capture_dir: str | None, debug_log: str | None, session: str | None = None
+) -> tuple[CaptureFn | None, Callable[[dict], None] | None]:
     """Build the (capture, audit) callback pair from --capture-dir/--debug-log, shared
     by `run_proxy` and `multiproxy.run_multi_proxy` (identical logic, differing only in
     which process's downstream target they're wired to).
@@ -1236,12 +1261,19 @@ def _build_capture_and_audit(
     bookkeeping for it, `Interceptor` (see `_warn_sink`), which swallows the failure AND
     announces the first one of each kind. Catching here as well made that unconditional
     first warning dead code, so a dead sink stayed invisible without --debug (#131)."""
-    capture: Callable[[str, str], None] | None = None
+    capture: CaptureFn | None = None
     if capture_dir is not None:
         from .capture import capture_payload
 
-        def capture(tool: str, raw: str) -> None:
-            capture_payload(tool, raw, capture_dir)
+        def capture(tool: str, raw: str, server: str | None = None,
+                    result_id: Any = None) -> None:
+            # A JSON-RPC id repeats across sessions (every client starts counting again),
+            # and one corpus dir accumulates many sessions — so the id alone would collide
+            # and fuse unrelated calls into one "result". `session` is minted per proxy
+            # process by the caller; without it the id is dropped rather than stored
+            # ambiguously.
+            key = None if result_id is None or session is None else f"{session}:{result_id}"
+            capture_payload(tool, raw, capture_dir, server=server, result_id=key)
 
     audit: Callable[[dict], None] | None = None
     if debug_log is not None:
@@ -1310,7 +1342,7 @@ def run_proxy(
         sys.stderr.write(f"[terse-proxy] {transport_err}\n")
         return 2
 
-    capture, audit = _build_capture_and_audit(capture_dir, debug_log)
+    capture, audit = _build_capture_and_audit(capture_dir, debug_log, _new_session_id())
 
     stats = None
     if stats_log is not None:

@@ -507,3 +507,124 @@ def load_policy_from(doc):
         return load_policy(name)
     finally:
         Path(name).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# #148 / #152 — the corpus records which RESULT and which SERVER a payload came from,
+# so neither has to be inferred from capture timing or left unknowable.
+# ---------------------------------------------------------------------------
+
+
+def _idenv(tool, i, ts, result_id, server=None):
+    env = {"tool": tool, "raw": json.dumps({"id": i, "status": "active"}),
+           "captured_at": ts, "result_id": result_id}
+    if server is not None:
+        env["server"] = server
+    return env
+
+
+def test_result_ids_beat_the_timing_heuristic_on_the_parallel_call_burst():
+    # The #148 repro: 200 INDEPENDENT single-block results, each a millisecond after the
+    # last. Consecutive-window grouping chains all 200 into one result and scores the tool
+    # as if that array had arrived together. With result ids there is nothing to infer.
+    envs = [_idenv("t", i, 1_000_000_000 + i * 1_000_000, f"s:{i}") for i in range(200)]
+    groups = group_results(envs)["t"]
+    assert len(groups) == 200
+    assert {len(g) for g in groups} == {1}
+
+
+def test_result_ids_keep_a_genuine_multi_block_result_together():
+    # Same tight timing, but the blocks really do share a result — the case the window was
+    # right about. Exact ids must not over-split it either.
+    envs = [_idenv("t", i, 1_000_000_000 + i * 1_000_000, "s:7") for i in range(4)]
+    assert [len(g) for g in group_results(envs)["t"]] == [4]
+
+
+def test_result_ids_group_across_a_gap_the_window_would_have_split():
+    # Timing says "two results" (an 8-second gap); the ids say one. A slow server that
+    # streams its blocks is exactly where the heuristic under-groups, and the ids win.
+    envs = [_idenv("t", 0, 1_000_000_000, "s:1"), _idenv("t", 1, 9_000_000_000, "s:1")]
+    assert [len(g) for g in group_results(envs)["t"]] == [2]
+
+
+def test_a_mixed_corpus_groups_each_half_by_what_it_knows():
+    # Re-capturing after an upgrade leaves both generations in one dir. Identified
+    # envelopes group exactly; the rest still fall back to timing.
+    envs = [_idenv("t", 0, 1_000_000_000, "s:1"), _idenv("t", 1, 1_000_500_000, "s:1"),
+            {"tool": "t", "raw": json.dumps({"id": 2}), "captured_at": 5_000_000_000},
+            {"tool": "t", "raw": json.dumps({"id": 3}), "captured_at": 5_001_000_000}]
+    assert sorted(len(g) for g in group_results(envs)["t"]) == [2, 2]
+
+
+def test_legacy_span_cap_bounds_an_unbroken_burst():
+    # No ids to read, so the guess stands — but it is no longer unbounded. 600 envelopes a
+    # millisecond apart stay inside the 50 ms consecutive window forever; the total-span cap
+    # is what stops them chaining into one 600-block "result".
+    envs = [{"tool": "t", "raw": json.dumps({"id": i}),
+             "captured_at": 1_000_000_000 + i * 1_000_000} for i in range(600)]
+    groups = group_results(envs)["t"]
+    assert len(groups) > 1
+    assert max(len(g) for g in groups) <= 260        # ~250 ms of 1 ms-apart writes
+
+
+def test_heuristic_share_reports_what_was_guessed():
+    from terse.policy_gen import heuristic_share
+    envs = [_idenv("t", 0, 1, "s:1"), {"tool": "t", "raw": "{}"}]
+    assert heuristic_share(envs) == (1, 2)
+    assert heuristic_share([_idenv("t", 0, 1, "s:1")]) == (0, 1)
+
+
+def test_a_rule_generated_from_a_server_tagged_corpus_is_reachable_by_select():
+    # The property #152 says is silently false today. runecho does NOT self-prefix its tool
+    # names, so the corpus holds a bare `structure`; `select` looks up `runecho.structure`
+    # FIRST. A rule authored under the bare name is therefore unreachable — not merely
+    # lower-priority — and the generated policy has to carry the qualified name.
+    envs = [{"tool": "structure", "server": "runecho", "raw": json.dumps(_records()),
+             "captured_at": 1_000_000_000 + i, "result_id": f"s:{i}"} for i in range(3)]
+    doc, _rows = generate_policy(envs, threshold=5.0)
+    names = [p["match"]["tool"] for p in doc["policies"]]
+    assert names == ["runecho.structure"]
+    rule = load_policy_from(doc).select("structure", server="runecho")
+    assert rule.tool_glob == "runecho.structure"
+    assert "tabularize" in rule.tiers
+
+
+def test_a_self_prefixing_server_is_not_double_qualified():
+    # kb names its own tools `kb.read.*`; qualifying again would author `kb.kb.read.search`
+    # and miss the operator's `kb.*` rule. Mirrors Policy._match_candidates' own skip.
+    envs = [{"tool": "kb.read.search", "server": "kb", "raw": json.dumps(_records()),
+             "captured_at": 1_000_000_000 + i, "result_id": f"s:{i}"} for i in range(3)]
+    doc, _rows = generate_policy(envs, threshold=5.0)
+    assert [p["match"]["tool"] for p in doc["policies"]] == ["kb.read.search"]
+
+
+def test_a_corpus_with_no_server_keeps_the_bare_name():
+    envs = [{"tool": "structure", "raw": json.dumps(_records()),
+             "captured_at": 1_000_000_000 + i} for i in range(3)]
+    doc, _rows = generate_policy(envs, threshold=5.0)
+    assert [p["match"]["tool"] for p in doc["policies"]] == ["structure"]
+
+
+def test_a_deployed_server_glob_is_visible_to_the_shadow_check():
+    # #148.2: with `runecho.* {tiers: []}` deployed and the corpus holding runecho's tool,
+    # the merge must SEE that rule — inheriting its operator-owned keys and reporting the
+    # tier change against it — rather than appending a rule the loader will never reach.
+    existing = {"version": 1, "policies": [
+        {"match": {"tool": "runecho.*"}, "tiers": [], "capture": False},
+    ]}
+    envs = [{"tool": "structure", "server": "runecho", "raw": json.dumps(_records()),
+             "captured_at": 1_000_000_000 + i, "result_id": f"s:{i}"} for i in range(3)]
+    generated, _ = generate_policy(envs, threshold=5.0)
+    merged, changes = merge_policy(existing, generated)
+
+    added = [c for c in changes if c["kind"] == "added"]
+    assert [c["tool"] for c in added] == ["runecho.structure"]
+    assert added[0]["before"] == []           # it displaces the deployed passthrough
+    inherited = [c for c in changes if c["kind"] == "inherited"]
+    assert inherited and inherited[0]["from"] == "runecho.*"
+    assert "capture" in inherited[0]["keys"]  # the operator's #85 decision survives
+
+    # And the merged doc actually re-decides the tool at runtime, which is the whole point.
+    new_rule = load_policy_from(merged).select("structure", server="runecho")
+    assert new_rule.tool_glob == "runecho.structure"
+    assert new_rule.tiers and new_rule.capture is False

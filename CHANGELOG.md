@@ -10,6 +10,28 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Fixed
+- **The capture envelope recorded neither which result nor which server a payload came
+  from, so autotune had to guess both (#148, #152).** Two defects, one absent pair of
+  fields, now written by the proxy (`server`, `result_id`) and read at tune time:
+  - *Results were reconstructed from capture timing.* Consecutive envelopes within 50 ms
+    were taken to be one result. A burst of independent parallel calls has no gap between
+    it, so 200 separate single-block results chained into ONE 200-block group and scored
+    **63.4% saved with `dictionary` enabled** where the truth — each scored alone, which is
+    what the proxy does — is **25.0% and no dictionary**. Grouping is now exact wherever
+    result ids are present. Corpora captured before them keep the heuristic, which also
+    gained a total-span cap so an unbroken run can no longer chain without bound, and
+    `policy generate`/`autotune` now say how many payloads were grouped that way rather
+    than presenting a guessed number as a measured one.
+  - *A generated rule could be unreachable.* `select` tries the `{server}.{tool}`
+    candidate against **every** rule before the bare name, so with `runecho.*` deployed a
+    corpus-derived `structure` rule is dead on arrival — position cannot save it, only the
+    qualified name can. Generated rules are now authored under the same name the runtime
+    looks them up by, which also makes a deployed server-scoped rule visible to the merge's
+    shadow check (it inherits that rule's operator-owned keys instead of appending a rule
+    the loader never reaches). On the live 1663-payload corpus this was ~35 shadow rules in
+    the autotune diff, all of which a human had to hand-filter.
+  Both fields are optional and omitted when unknown, so an existing corpus stays loadable
+  and needs no migration. `terse capture` gained `--server` for the hand-captured case.
 - **`policy generate` scored payloads per-BLOCK, so every multi-block tool was
   under-measured (#147).** The proxy compresses a multi-block result as one joined record
   array (#116); the generator scored each captured block alone. For a server that returns

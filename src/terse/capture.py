@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import policy as policy_mod
 from ._secure_io import append_restricted, mkdir_restricted, write_restricted
 from .transforms import (
     MAX_DEPTH,
@@ -146,8 +147,15 @@ def _sha8(raw: str) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
 
 
-def capture_payload(tool: str, raw: str, corpus_dir: str | Path) -> Path:
-    """Persist one captured payload as a shape-tagged envelope. Idempotent by sha."""
+def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
+                    server: str | None = None, result_id: str | None = None) -> Path:
+    """Persist one captured payload as a shape-tagged envelope. Idempotent by sha.
+
+    `server` is the downstream's name in the MCP config and `result_id` identifies the
+    tool RESULT this payload was one content block of. Both are optional because the
+    format is additive — a corpus captured before they existed stays loadable, and every
+    consumer treats their absence as "unknown", never as a value (#148, #152).
+    """
     corpus = Path(corpus_dir)
     mkdir_restricted(corpus)
     sha = _sha8(raw)
@@ -163,16 +171,29 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path) -> Path:
             prior = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(prior, dict) and isinstance(prior.get("captured_at"), int):
                 captured_at = prior["captured_at"]
+                # `result_id` is preserved WITH `captured_at`, never independently: an
+                # envelope describes a payload's FIRST sighting, and keeping a later
+                # sighting's result id would put the grouping key and the timestamp in
+                # disagreement about which call this envelope stands for.
+                if isinstance(prior.get("result_id"), str):
+                    result_id = prior["result_id"]
         except (json.JSONDecodeError, OSError):
             pass
-    envelope = {
+    envelope: dict[str, Any] = {
         "tool": tool,
         "shape": classify_shape(raw),
         "bytes": len(raw),
         "sha": sha,
         "captured_at": captured_at,
-        "raw": raw,
     }
+    # Omitted rather than written as null when unknown, so "the field is absent" is the
+    # one signal a consumer has to check — an explicit null would make every reader
+    # handle two spellings of the same nothing.
+    if server is not None:
+        envelope["server"] = server
+    if result_id is not None:
+        envelope["result_id"] = result_id
+    envelope["raw"] = raw   # last: keeps the big field at the end of the file
     # Captured payloads are real MCP tool traffic (README/TECHNICAL: "may contain real
     # data") — restrict permissions the same as terse-managed config/secrets (#42).
     write_restricted(path, json.dumps(envelope, ensure_ascii=False, indent=2))
@@ -224,6 +245,29 @@ def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
             f"{corpus} (corrupt JSON)\n")
     loaded.sort(key=lambda t: (t[0], t[1]))
     return [env for _, _, env in loaded]
+
+
+def qualified_tool(env: dict[str, Any]) -> str:
+    """The name a corpus entry's tool is looked up under AT RUNTIME.
+
+    Mirrors `Policy._match_candidates`' first candidate exactly: `{server}.{bare}` when the
+    envelope records a server, skipped when the tool already carries that server as its own
+    prefix (kb names its tools `kb.read.*`; runecho calls its tool plain `structure`).
+    Falls back to the stored name when no server was recorded.
+
+    This is what makes a corpus-derived rule reachable. `select` iterates CANDIDATE-major —
+    the qualified candidate is tried against every rule before the bare one is tried against
+    any — so a bare `structure` rule sits dead behind a deployed `runecho.*` no matter where
+    in the file it is placed. Authoring `runecho.structure` is the only name that reaches it
+    (#152), and it is also what lets the shadow check see the rule at all (#148)."""
+    server = env.get("server")
+    tool = env.get("tool", "?")
+    if not isinstance(server, str) or not server:
+        return tool
+    bare = tool.partition(policy_mod.PREFIX_SEP)[2] if policy_mod.PREFIX_SEP in tool else tool
+    if bare.startswith(f"{server}."):
+        return bare
+    return f"{server}.{bare}"
 
 
 def coverage(envelopes: list[dict[str, Any]]) -> dict[str, Any]:

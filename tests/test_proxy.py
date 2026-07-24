@@ -529,7 +529,7 @@ def test_primer_injected_once_not_per_message():
 
 def test_capture_tees_raw_text_before_compression():
     captured: list[tuple[str, str]] = []
-    inter = Interceptor(FULL, capture=lambda tool, raw: captured.append((tool, raw)))
+    inter = Interceptor(FULL, capture=lambda tool, raw, **kw: captured.append((tool, raw)))
     inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
                                    "params": {"name": "gh.api.items"}}))
     raw = _records_text()
@@ -548,7 +548,7 @@ def test_note_request_tool_name_qualifies_capture_but_not_policy_selection():
     # a custom policy_path.
     captured: list[tuple[str, str]] = []
     audited = []
-    inter = Interceptor(FULL, capture=lambda tool, raw: captured.append((tool, raw)),
+    inter = Interceptor(FULL, capture=lambda tool, raw, **kw: captured.append((tool, raw)),
                         audit=audited.append)
     inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
                                    "params": {"name": "gh.api.items"}}),
@@ -874,7 +874,7 @@ CAPTURE_GATED = Policy(rules=[Rule("secret.*", (), capture=False),
 
 def test_capture_false_blocks_the_corpus_tee_but_a_sibling_tool_still_captures():
     captured = []
-    inter = Interceptor(CAPTURE_GATED, capture=lambda tool, raw: captured.append((tool, raw)))
+    inter = Interceptor(CAPTURE_GATED, capture=lambda tool, raw, **kw: captured.append((tool, raw)))
     _note_call(inter, 1, "secret.reveal")
     inter.transform_response(_result_msg(1, SECRET))
     assert captured == []                                  # nothing persisted at all
@@ -1156,7 +1156,7 @@ def test_shared_store_lock_does_not_serialize_unrelated_peers_transform_response
     started_a = threading.Event()
     release_a = threading.Event()
 
-    def slow_capture(tool, raw):
+    def slow_capture(tool, raw, **kw):
         started_a.set()
         release_a.wait(timeout=5)  # blocks peer A's transform_response indefinitely
 
@@ -1384,7 +1384,7 @@ def test_join_audit_pairs_the_joined_block_with_newline_joined_raw():
 
 def test_join_captures_the_array_once_not_per_block(tmp_path):
     captured = []
-    inter = Interceptor(DIFF, capture=lambda tool, text: captured.append(text))
+    inter = Interceptor(DIFF, capture=lambda tool, text, **kw: captured.append(text))
     raws = _rec_blocks(4)
     _emit_multi(inter, 1, "gh.api.items", raws)
     assert len(captured) == 1                                   # one corpus payload, not 4
@@ -1840,3 +1840,53 @@ def test_structured_replace_will_not_drop_a_block_that_only_LOOKS_equal():
     out = _replace_run(result)
     assert len(out["content"]) == 1
     assert out["content"][0]["text"] == '{"ok":true,"n":1.0}'
+
+
+# --- capture identity: which server, which result (#148, #152) ---
+
+def test_capture_is_told_the_server_and_the_result_the_block_belonged_to():
+    calls: list[dict] = []
+    inter = Interceptor(FULL, server_name="runecho",
+                        capture=lambda tool, raw, **kw: calls.append(kw))
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                                   "params": {"name": "gh.api.items"}}))
+    inter.transform_response(_result_msg(7, _records_text()))
+    assert calls == [{"server": "runecho", "result_id": 7}]
+
+
+def test_every_block_of_one_result_carries_the_same_result_id():
+    # The property the corpus needs: "these blocks arrived together" is READ, not inferred
+    # from how close their file writes landed (#148).
+    calls: list[dict] = []
+    inter = Interceptor(FULL, capture=lambda tool, raw, **kw: calls.append(kw))
+    raws = [json.dumps({"id": i, "note": "x"}) for i in range(3)]
+    _emit_multi(inter, 4, "gh.api.blocks", raws)
+    assert len(calls) >= 1
+    assert {c["result_id"] for c in calls} == {4}
+
+
+def test_result_ids_are_scoped_to_the_proxy_run_not_bare_jsonrpc_ids():
+    # A JSON-RPC id restarts at 1 every session while one corpus dir accumulates many
+    # sessions, so two runs' `id: 1` would fuse into one "result" if stored bare.
+    from terse.proxy import _build_capture_and_audit
+
+    seen: list[str | None] = []
+
+    def fake(tool, raw, corpus_dir, *, server=None, result_id=None):
+        seen.append(result_id)
+
+    import terse.capture as capture_mod
+    real, capture_mod.capture_payload = capture_mod.capture_payload, fake
+    try:
+        cap_a, _ = _build_capture_and_audit("/tmp/nope", None, "aaaa1111")
+        cap_b, _ = _build_capture_and_audit("/tmp/nope", None, "bbbb2222")
+        cap_a("t", "{}", server=None, result_id=1)
+        cap_b("t", "{}", server=None, result_id=1)
+        # ...and with no session to scope it, the id is dropped rather than stored ambiguously
+        cap_c, _ = _build_capture_and_audit("/tmp/nope", None, None)
+        cap_c("t", "{}", server=None, result_id=1)
+    finally:
+        capture_mod.capture_payload = real
+
+    assert seen == ["aaaa1111:1", "bbbb2222:1", None]
+    assert len(set(seen[:2])) == 2
