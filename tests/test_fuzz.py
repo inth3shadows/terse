@@ -166,6 +166,15 @@ def test_fuzz_text_drop_is_recoverable_or_untouched(lines, min_len):
     from terse.policy import Policy, Rule, apply
 
     raw = "\n".join(lines)
+    try:
+        json.loads(raw)
+    except (json.JSONDecodeError, RecursionError):
+        pass                         # genuine non-JSON text: the code-block drop tier's domain
+    else:
+        return                       # wholesale valid JSON (e.g. a bare "0", or "\n0") is the
+                                     # minify path, not a text drop — it canonicalizes JSON
+                                     # whitespace losslessly BY VALUE (roundtrip tests own that),
+                                     # so a byte-identity assertion does not apply here.
     rule = Rule(tool_glob="*", tiers=("minify", "tabularize", "dictionary"),
                 fields={lossy.TEXT_SELECTOR_CODE_BLOCKS:
                         {"lossy": "drop-to-retrieve", "min": min_len}})
