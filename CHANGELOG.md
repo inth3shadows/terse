@@ -10,6 +10,21 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Fixed
+- **The savings ledger charged `structuredContent` at its COMPRESSED size on the raw side,
+  understating the real wire saving by ~15 points (#141, part 1).** Since #134 the typed
+  field can itself be compressed (`"structured": "compress"/"replace"`), but `_emit_stats`
+  passed only the emitted serialization, and `build_record` added that one value to *both*
+  `raw_chars` and `out_chars` — so the raw side was charged the compressed size and the
+  saving looked smaller than it was. On the reference fixture the ledger reported 47.6%
+  where the wire truth is 62.9% (`compress`) and 73.8% vs 81.4% (`replace`). The two sides
+  are now tracked separately end to end: `_compress_structured` returns `(raw, out)`, and
+  `build_record` charges each side its own size (`structured_chars` raw, new
+  `structured_out_chars` emitted). A caller passing one value — an untouched field, and
+  every record written before the split — still lands the same size on both sides, so older
+  records need no migration. This matters beyond tidiness: the ledger feeds
+  `policy generate` and the #136 autotune loop, so a skewed per-tool saving produced a
+  skewed policy. *(#141 part 2 — `terse stats` counts BLOCKS but labels them "results" — is
+  tracked separately; it's a wider naming change.)*
 - **A capture/audit/stats sink that HUNG — rather than raised — froze every later tool
   call on the connection.** The sinks were invoked inside `transform_response`'s
   `_local_lock`, and the fail-open `try/except` around them only ever caught a sink that

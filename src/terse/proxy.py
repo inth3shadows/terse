@@ -151,7 +151,7 @@ class Interceptor:
     def __init__(self, pol: policy_mod.Policy, debug: bool = False,
                  capture: CaptureFn | None = None,
                  audit: Callable[[dict], None] | None = None,
-                 stats: Callable[[str, str, str, bool, str | None, str | None], None] | None = None,
+                 stats: Callable[..., None] | None = None,
                  server_name: str | None = None,
                  store: OrderedDict[str, Any] | None = None,
                  store_lock: Lock | None = None,
@@ -595,7 +595,7 @@ class Interceptor:
             # actually give the model (#128). Compress it when the rule opts in; either
             # way its EMITTED size is what the ledger must count, so the reported saving
             # tracks the whole result rather than the text block alone.
-            structured, rewrote_structured = self._compress_structured(
+            structured_raw, structured_out, rewrote_structured = self._compress_structured(
                 result, tool, force_lossless=error_result)
             changed = changed or rewrote_structured
 
@@ -620,7 +620,7 @@ class Interceptor:
                     "stats", capture_tool,
                     partial(self._emit_stats, tool, emitted_pairs,
                             display_tool=capture_tool, diff_reason=diff_reason,
-                            structured=structured),
+                            structured=structured_raw, structured_out=structured_out),
                 ))
 
             if not changed:
@@ -983,10 +983,14 @@ class Interceptor:
         return text_blocks[0] if match else None
 
     def _compress_structured(self, result: Any, tool: str, *,
-                             force_lossless: bool = False) -> tuple[str | None, bool]:
+                             force_lossless: bool = False
+                             ) -> tuple[str | None, str | None, bool]:
         """Run a result's `structuredContent` through the codec in place, when the matching
-        rule opted in with `"structured": "compress"` (#128). Returns the serialized field
-        as it will go out (compressed or not) for the ledger, or None when absent.
+        rule opted in with `"structured": "compress"` (#128). Returns
+        `(raw_serialization, out_serialization, rewrote)` — the field's size on the RAW and
+        EMITTED sides of the ledger, which DIFFER only when it was actually compressed
+        (#141), and `(None, None, False)` when absent. Equal on both sides when the field is
+        left untouched.
 
         Why this exists: measured against `claude` 2.1.218, the client forwards the TYPED
         field to the model and discards the text block terse compresses, so on a tool that
@@ -1009,25 +1013,25 @@ class Interceptor:
         Fail-open like everything else on this path: a field that does not survive a
         round-trip through `json.dumps` is left exactly as it was."""
         if not isinstance(result, dict) or "structuredContent" not in result:
-            return None, False
+            return None, None, False
         try:
             original = json.dumps(result["structuredContent"], separators=(",", ":"),
                                   ensure_ascii=False)
         except (TypeError, ValueError):
-            return None, False                # unserializable: not ours to touch
+            return None, None, False          # unserializable: not ours to touch
         if self._structured_mode(tool) not in policy_mod.STRUCTURED_REWRITING:
-            return original, False            # untouched, but still counted by the ledger
+            return original, original, False  # untouched, but still counted by the ledger
         emitted = self._compress(original, tool, force_lossless=force_lossless)
         if emitted == original:
-            return original, False
+            return original, original, False
         try:
             result["structuredContent"] = json.loads(emitted)
         except json.JSONDecodeError:
             # The codec's output is always JSON, so this cannot normally fire — but the
             # typed field is the one a client may hand straight to a schema validator, so
             # an unparseable replacement must never be written. Keep the original.
-            return original, False
-        return emitted, True
+            return original, original, False
+        return original, emitted, True
 
     def _drop_put(self, handle: str, value: Any) -> None:
         """Store a dropped field's original under `handle` for a later terse.retrieve (#10).
@@ -1149,7 +1153,8 @@ class Interceptor:
 
     def _emit_stats(self, tool: str, pairs: list[tuple[str, str]], *,
                     display_tool: str | None = None, diff_reason: str | None = None,
-                    structured: str | None = None) -> None:
+                    structured: str | None = None,
+                    structured_out: str | None = None) -> None:
         """Hand the stats callback one (tool, raw, emitted, passthrough, diff_reason) per
         emitted block, for the payload-free savings ledger (stats.py). Same fail-open
         contract as capture/audit: the callback owns I/O and a failure can never change
@@ -1157,10 +1162,11 @@ class Interceptor:
         diff decision is per-result, so `diff_reason` is attributed to every pair — which
         is exactly one pair on the joined path and the common single-block shape.
 
-        `structured` is the serialized `structuredContent` this result carried, if any. It
-        is per-RESULT, not per-block, so on a multi-block result it is attributed to the
-        first pair only — counting it once per block would inflate the very number this is
-        meant to make honest (#128)."""
+        `structured`/`structured_out` are the serialized `structuredContent` this result
+        carried, if any, on the raw and emitted sides (they differ only when the typed field
+        was itself compressed, #141). Per-RESULT, not per-block, so both are attributed to
+        the first pair only — counting them once per block would inflate the very number
+        this is meant to make honest (#128)."""
         stats = self.stats
         if stats is None:
             return
@@ -1169,7 +1175,8 @@ class Interceptor:
         for index, (raw, emitted) in enumerate(pairs):
             try:
                 stats(shown_tool, raw, emitted, passthrough, diff_reason,
-                      structured if index == 0 else None)
+                      structured if index == 0 else None,
+                      structured_out if index == 0 else None)
             except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
                 self._warn_sink("stats", shown_tool, exc)
 

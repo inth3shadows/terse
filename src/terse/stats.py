@@ -81,7 +81,8 @@ def classify_decision(raw: str, emitted: str, passthrough: bool) -> str:
 
 def build_record(server: str, tool: str, raw: str, emitted: str,
                  passthrough: bool, diff_reason: str | None = None,
-                 structured: str | None = None) -> dict[str, Any]:
+                 structured: str | None = None,
+                 structured_out: str | None = None) -> dict[str, Any]:
     """One ledger line. Sizes and labels only — never payload content (the property
     that makes always-on safe). Token counts are None without tiktoken.
 
@@ -90,32 +91,40 @@ def build_record(server: str, tool: str, raw: str, emitted: str,
     is worth building. See proxy `_compress_or_diff` for the value set. None on older
     records (the field post-dates them) and on writers that don't supply it.
 
-    `structured` is the serialized `structuredContent` riding alongside this result, when
-    the server sent one (#128). terse does not touch that field, so it is counted at FULL
-    size on BOTH sides of the ledger: `raw_chars`/`out_chars` are the whole result's cost,
-    not the text block's alone. Without this the ledger reported a saving terse did not
-    deliver — measured against a real client, a `structuredContent`-emitting tool showed a
-    64% text-block reduction and 0% actual reduction in what the model received, because
-    the client reads the typed field and discards the block terse compressed
-    (`scripts/probe/structured_content/`). `structured_chars` keeps the split recoverable;
-    records predating the field simply had no duplicate, so treating a missing value as 0
-    is correct rather than merely convenient.
+    `structured` / `structured_out` are the serialized `structuredContent` riding alongside
+    this result (#128), on the RAW and EMITTED sides respectively. They are usually equal —
+    terse leaves the typed field alone by default, so it costs full price on both sides, and
+    `raw_chars`/`out_chars` are the whole result's cost, not the text block's alone. Without
+    that a `structuredContent`-emitting tool reported a text-block reduction the model never
+    received, because the client reads the typed field and discards the block terse
+    compressed (`scripts/probe/structured_content/`).
+
+    Since #134 the field can ITSELF be compressed (`"structured": "compress"/"replace"`), and
+    then the two sides DIFFER — the raw side must carry the original size, the out side the
+    compressed one. Charging the compressed size to both (the pre-#141 bug) understated the
+    real wire saving by ~15 points whenever the typed field was compressed. `structured_out`
+    defaults to `structured` so a caller that passes one value — an untouched field, and
+    every record written before the split — still lands the same size on both sides, which
+    is exactly right for that case. `structured_chars` (raw side) and `structured_out_chars`
+    (emitted side) keep the split recoverable.
 
     `decision` stays keyed on the TEXT BLOCK alone — it names what terse did, and terse
     genuinely did compress it. The size fields say what that was worth."""
-    extra = structured or ""
+    extra_raw = structured or ""
+    extra_out = structured_out if structured_out is not None else extra_raw
     return {
         "ts": int(time.time()),
         "server": server,
         "tool": tool,
         "decision": classify_decision(raw, emitted, passthrough),
         "diff_reason": diff_reason,
-        "raw_chars": len(raw) + len(extra),
-        "out_chars": len(emitted) + len(extra),
-        "raw_tokens": _sum_tokens(count_cl100k(raw), count_cl100k(extra)),
-        "out_tokens": _sum_tokens(count_cl100k(emitted), count_cl100k(extra)),
-        "structured_chars": len(extra),
-        "structured_tokens": count_cl100k(extra) if extra else 0,
+        "raw_chars": len(raw) + len(extra_raw),
+        "out_chars": len(emitted) + len(extra_out),
+        "raw_tokens": _sum_tokens(count_cl100k(raw), count_cl100k(extra_raw)),
+        "out_tokens": _sum_tokens(count_cl100k(emitted), count_cl100k(extra_out)),
+        "structured_chars": len(extra_raw),
+        "structured_out_chars": len(extra_out),
+        "structured_tokens": count_cl100k(extra_raw) if extra_raw else 0,
     }
 
 
@@ -318,9 +327,10 @@ def build_stats_writer(stats_log: str | Path, server: str):
     `proxy.Interceptor._warn_sink` — catching here too made its unconditional
     first-failure warning dead code, so a dead ledger stayed silent (#131)."""
     def stats(tool: str, raw: str, emitted: str, passthrough: bool,
-              diff_reason: str | None = None, structured: str | None = None) -> None:
+              diff_reason: str | None = None, structured: str | None = None,
+              structured_out: str | None = None) -> None:
         append_stats(build_record(server, tool, raw, emitted, passthrough, diff_reason,
-                                  structured),
+                                  structured, structured_out),
                      stats_log)
 
     return stats
