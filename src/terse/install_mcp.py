@@ -303,18 +303,18 @@ def is_managed(stash: dict, server: str) -> bool:
 
 
 def _looks_like_terse_launcher(entry: dict) -> bool:
-    """True if `entry` launches via terse — the console script `terse`, or `python -m
-    terse`. Distinguishes a terse-wrapped entry from an unrelated server that merely
-    happens to carry a `proxy` arg, so `parse_proxy_opts` never misreads a stranger."""
+    """True if `entry` launches via terse. Covers every form `terse_invocation` /
+    `$TERSE_MCP_CMD` can emit: the console script `terse` as `command`, `python -m terse`,
+    and `uvx terse` / `uv tool run terse` (where `terse` is a bare token in `args`). A
+    launcher this misses would drop that server's baked `--policy` from the ambiguity set —
+    which could make a genuinely multi-policy wire look unambiguous — so it errs toward
+    detection; a false positive is caught anyway by `parse_proxy_opts` requiring a `proxy`
+    subcommand."""
     cmd = entry.get("command")
     if isinstance(cmd, str) and Path(cmd).name == "terse":
         return True
     args = entry.get("args")
-    if isinstance(args, list):
-        for i in range(len(args) - 1):
-            if args[i] == "-m" and args[i + 1] == "terse":
-                return True
-    return False
+    return isinstance(args, list) and "terse" in args
 
 
 def parse_proxy_opts(entry: dict) -> dict[str, str] | None:

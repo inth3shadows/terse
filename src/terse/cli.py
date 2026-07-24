@@ -329,33 +329,37 @@ def _print_corpus_identity_note(envelopes: list, out=None) -> None:
               f"with `proxy --server-name`, to author reachable rules.", file=out)
 
 
-def _installed_autotune_defaults() -> tuple[str | None, str | None, str | None]:
-    """`(policy, corpus, note)` for a bare `terse policy autotune`, resolved from the
-    user-scope `install-mcp` wiring in the Claude config (#136). `policy`/`corpus` are set
-    only when the wrapped servers agree on exactly ONE value; `note` explains any ambiguity
-    or absence. Never raises — a resolution failure just leaves the flags to the operator,
-    so the convenience can never break the explicit path."""
+def _installed_autotune_defaults() -> tuple[str | None, str | None, str | None, set[str]]:
+    """`(policy, corpus, note, ambiguous)` for a bare `terse policy autotune`, resolved from
+    the user-scope `install-mcp` wiring in the Claude config (#136). `policy`/`corpus` are
+    set only when the wrapped servers agree on exactly ONE value; `note` explains any
+    ambiguity or absence; `ambiguous` names which of `{"policy","corpus"}` had MORE than one
+    distinct value wired (so the caller can refuse rather than fall back on a NEEDED one).
+    Never raises — a resolution failure just leaves the flags to the operator, so the
+    convenience can never break the explicit path."""
     from .install_mcp import config_path, discover_wrapped_opts
     try:
         cfg = config_path()
         config = _json.loads(cfg.read_text(encoding="utf-8")) if cfg.exists() else {}
     except (OSError, ValueError):
-        return None, None, "could not read the Claude config to resolve defaults"
+        return None, None, "could not read the Claude config to resolve defaults", set()
     wrapped = discover_wrapped_opts(config)
     if not wrapped:
-        return None, None, "no terse-wrapped servers found in the Claude config"
+        return None, None, "no terse-wrapped servers found in the Claude config", set()
     policies = sorted({w["policy"] for w in wrapped if w.get("policy")})
     corpora = sorted({w["capture_dir"] for w in wrapped if w.get("capture_dir")})
-    notes = []
+    notes, ambiguous = [], set()
     if len(policies) > 1:
+        ambiguous.add("policy")
         notes.append(f"{len(policies)} distinct policies across wrapped servers "
                      f"({', '.join(policies)}) — pass --policy to choose")
     if len(corpora) > 1:
+        ambiguous.add("corpus")
         notes.append(f"{len(corpora)} distinct capture dirs "
                      f"({', '.join(corpora)}) — pass --corpus to choose")
     return (policies[0] if len(policies) == 1 else None,
             corpora[0] if len(corpora) == 1 else None,
-            "; ".join(notes) or None)
+            "; ".join(notes) or None, ambiguous)
 
 
 def _cmd_policy_autotune(args: argparse.Namespace) -> int:
@@ -377,27 +381,37 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
 
     policy_arg, corpus_arg = args.policy, args.corpus
     if policy_arg is None or corpus_arg is None:
-        resolved_policy, resolved_corpus, note = _installed_autotune_defaults()
+        resolved_policy, resolved_corpus, note, ambiguous = _installed_autotune_defaults()
         if policy_arg is None:
             policy_arg = resolved_policy
         if corpus_arg is None:
             corpus_arg = resolved_corpus
         if note:
-            # A resolution NOTE is only surfaced when it actually left a needed value
-            # unresolved (ambiguity) — a clean single-policy install resolves silently
-            # except for the "[resolved ...]" line printed once both are pinned below.
             print(f"policy autotune: {note}", file=sys.stderr)
+        # Refuse rather than fall back when a NEEDED input is AMBIGUOUS across wrapped
+        # servers — symmetrically for policy and corpus. Guessing which corpus the wire
+        # captured to is the same class of error as guessing the policy; only the absence
+        # of any wired corpus (not a disagreement) is allowed to fall through to the
+        # DEFAULT_CORPUS below.
+        if (policy_arg is None and "policy" in ambiguous) or \
+           (corpus_arg is None and "corpus" in ambiguous):
+            print("policy autotune: the installed wiring is ambiguous — pass the "
+                  "flag(s) above explicitly.", file=sys.stderr)
+            return 2
     if policy_arg is None:
         print("policy autotune: no --policy given and it could not be resolved from the "
               "installed wiring — pass --policy <path> (and --corpus <dir>).",
               file=sys.stderr)
         return 2
-    if args.policy is None or args.corpus is None:
-        # Announce what a bare invocation resolved to: the operator is about to see a diff
-        # against a policy they did not name, so which policy/corpus it is must be explicit.
-        print(f"# resolved from install-mcp wiring: --policy {policy_arg}"
-              + (f" --corpus {corpus_arg}" if corpus_arg else ""))
-    corpus_arg = corpus_arg or DEFAULT_CORPUS
+    # Announce ONLY the value(s) actually resolved from wiring — naming an explicitly
+    # passed flag as "resolved" would misattribute the operator's own choice.
+    resolved_bits = ([f"--policy {policy_arg}"] if args.policy is None else []) + \
+                    ([f"--corpus {corpus_arg}"] if args.corpus is None and corpus_arg else [])
+    if resolved_bits:
+        # The operator is about to see a diff against inputs they did not name, so which
+        # policy/corpus it is must be explicit.
+        print(f"# resolved from install-mcp wiring: {' '.join(resolved_bits)}")
+    corpus_arg = str(Path(corpus_arg).expanduser()) if corpus_arg else DEFAULT_CORPUS
 
     existing_path = Path(policy_arg).expanduser()
     try:

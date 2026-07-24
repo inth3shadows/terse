@@ -852,3 +852,38 @@ def test_no_note_on_a_fully_identified_corpus(capsys):
     _print_corpus_identity_note([{"tool": "structure", "raw": "{}",
                                   "server": "runecho", "result_id": "s:1"}])
     assert capsys.readouterr().out == ""
+
+
+def test_autotune_refuses_ambiguous_corpora_even_when_policy_agrees(tmp_path, monkeypatch, capsys):
+    # #136 review Finding 2: a single agreed policy but TWO distinct wired corpora must
+    # refuse, not silently fall back to the relative DEFAULT_CORPUS.
+    pol = _write(tmp_path, "p.json", json.dumps({"version": 1, "policies": []}))
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "a": {"command": "/usr/bin/python",
+              "args": ["-m", "terse", "proxy", "--policy", str(pol),
+                       "--capture-dir", str(tmp_path / "ca"), "--", "a-mcp"]},
+        "b": {"command": "/usr/bin/python",
+              "args": ["-m", "terse", "proxy", "--policy", str(pol),
+                       "--capture-dir", str(tmp_path / "cb"), "--", "b-mcp"]},
+    }}), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    rc = main(["policy", "autotune"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "2 distinct capture dirs" in err
+    assert "the installed wiring is ambiguous" in err
+
+
+def test_autotune_explicit_policy_resolves_only_corpus_and_announces_only_it(tmp_path, monkeypatch, capsys):
+    # An explicit --policy with --corpus omitted resolves the corpus from wiring, and the
+    # announce line names ONLY the corpus — the operator's explicit policy is not
+    # misattributed as "resolved from wiring" (#136 review minor obs).
+    pol, corpus = _autotune_setup(tmp_path)
+    _wire_one_terse_server(tmp_path, monkeypatch, pol, corpus)
+    explicit = _write(tmp_path, "explicit.json", json.dumps({"version": 1, "policies": []}))
+    rc = main(["policy", "autotune", "--policy", str(explicit)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    line = next(ln for ln in out.splitlines() if "resolved from install-mcp wiring" in ln)
+    assert f"--corpus {corpus}" in line and "--policy" not in line

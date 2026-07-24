@@ -943,3 +943,15 @@ def test_discover_wrapped_opts_collects_only_wrapped_in_order():
 def test_discover_wrapped_opts_empty_without_mcpservers():
     assert im.discover_wrapped_opts({}) == []
     assert im.discover_wrapped_opts({"mcpServers": "not-a-dict"}) == []
+
+
+def test_parse_proxy_opts_detects_uvx_and_uv_tool_run_launchers():
+    # $TERSE_MCP_CMD='uvx terse' / 'uv tool run terse' bake `terse` as a bare arg token,
+    # not `-m terse` — these must still be recognized or their policy silently drops out
+    # of the ambiguity set (#136 review Finding 1).
+    uvx = {"command": "uvx",
+           "args": ["terse", "proxy", "--policy", "/p.json", "--", "gh-mcp"]}
+    assert im.parse_proxy_opts(uvx) == {"policy": "/p.json"}
+    uv_run = {"command": "uv",
+              "args": ["tool", "run", "terse", "proxy", "--policy", "/q.json", "--", "kb"]}
+    assert im.parse_proxy_opts(uv_run) == {"policy": "/q.json"}
