@@ -1,11 +1,19 @@
 """Guards for the #137 ceiling measurement (`scripts/bench/text_alias_ceiling.py`).
 
-The script's whole value is that a reported saving is a saving on a LOSSLESS encoding.
-That property is easy to break silently — the block-then-phrase encoder originally aliased
-spans that CONTAINED an earlier alias, nesting aliases inside legend values and making
-decoding order-dependent. It corrupted 10 of 296 real files while still reporting cheerful
-percentages, because the round-trip check ran per payload and nothing pinned the encoders
-themselves. These tests pin them.
+The script's value is that a reported saving is a saving on a LOSSLESS encoding, and that
+nothing silently biases the number toward the conclusion being drawn. Both properties broke
+once already:
+
+* the block-then-phrase encoder aliased spans that CONTAINED an earlier alias, nesting
+  aliases inside legend values and making decoding order-dependent — 10 of 296 real files
+  corrupted while still reporting cheerful percentages;
+* the alias namespace was hard-coded to `~K`, which is the SAME namespace `transforms`
+  mints from, so on any payload terse's dictionary tier had touched the collision guard
+  scored 0.0% — silently zeroing 84 of 626 live payloads, all of them the one tool #137 is
+  about, in the direction of "no headroom".
+
+Neither was catchable by reading the output. These tests pin the encoders, the sigil
+choice, and the reporting arithmetic that turns them into a headline.
 
 The script is loaded by path: `scripts/` is not an importable package, and putting the
 research encoders in `src/terse` would ship measurement code in the wheel.
@@ -16,6 +24,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -53,6 +62,7 @@ def other(request):
 
 """ * 4)
 
+
 def _b36(n: int) -> str:
     digits = "0123456789abcdefghijklmnopqrstuvwxyz"
     out = ""
@@ -76,6 +86,11 @@ CASES = {
                                for i in range(60)),
     "empty-lines-only": "\n" * 50,
     "single-line": "a" * 5000,
+    # Already carries terse's OWN alias namespace, on top of real redundancy — the
+    # regression case. A terse-compressed payload looks exactly like this: a legend using
+    # `~K`, then content. The aliaser must still be able to work on the content.
+    "terse-aliased": ('{"__terse_dict__":1,"legend":{"~0":"src/resolution/frameworks/'
+                      'cargo-workspace.ts","~1":"no covering tests found"}}\n' + BLOCKY),
 }
 
 
@@ -93,18 +108,58 @@ def test_no_alias_nests_inside_a_legend_value(name: str) -> None:
     """The regression that made decoding order-dependent.
 
     Fails without the `blocked` guard in `_alias_ngrams`: the phrase pass aliases a span
-    covering an alias emitted by the block pass, so a legend value contains `~K` and
+    covering an alias emitted by the block pass, so a legend value contains an alias and
     decode order decides the result.
     """
     _, legend = tac.encode_blocks_then_phrases(CASES[name])
     for alias, value in legend.items():
         others = set(legend) - {alias}
-        assert not (others & set(_aliases_in(value, others))), \
+        assert not (others & {a for a in others if a in value}), \
             f"legend[{alias!r}] contains a nested alias: {value!r}"
 
 
-def _aliases_in(value: str, candidates: set[str]) -> set[str]:
-    return {a for a in candidates if a in value}
+# ---------------------------------------------------------------- sigil choice
+
+
+@pytest.mark.parametrize("name", sorted(CASES))
+def test_the_chosen_sigil_is_absent_from_the_payload(name: str) -> None:
+    """Absence of the sigil is absence of collisions, for the whole legend at once."""
+    assert tac.pick_sigil(CASES[name]) not in CASES[name]
+
+
+@pytest.mark.parametrize("name", sorted(CASES))
+def test_no_alias_collides_with_real_content(name: str) -> None:
+    text = CASES[name]
+    for encoder, _ in tac.ENCODERS:
+        _, legend = dict(tac.ENCODERS)[encoder](text)
+        assert not [a for a in legend if a in text], f"{encoder} minted a colliding alias"
+
+
+def test_a_payload_carrying_terse_aliases_is_still_scored() -> None:
+    """THE bias regression.
+
+    `transforms` mints `~0, ~1, ...` from `ALIAS_SIGIL`, the same namespace this script
+    used to hard-code. Any payload the dictionary tier had touched therefore tripped the
+    collision guard and was scored 0.0% — 84 of 626 live payloads, all `codegraph_explore`,
+    every one of them in the direction of the conclusion. A payload that already contains
+    `~0` must still get a real, non-zero, round-tripping score.
+    """
+    text = CASES["terse-aliased"]
+    assert "~0" in text and "~1" in text
+    pct = tac.score(text, "phrase")
+    assert pct > 1.0, "a terse-aliased payload scored as if it had no redundancy"
+    body, legend = tac.encode_phrases(text)
+    assert tac.decode(body, legend) == text
+
+
+def test_a_payload_containing_every_sigil_falls_back_and_is_counted() -> None:
+    text = "".join(tac.SIGILS) + "\n" + BLOCKY
+    sigil = tac.pick_sigil(text)
+    assert sigil not in text
+    assert tac.LIMITS["no_free_sigil"] >= 1
+
+
+# ---------------------------------------------------------------- encoder behavior
 
 
 def test_repetition_is_actually_found() -> None:
@@ -131,14 +186,16 @@ def test_saving_is_charged_the_legend_cost() -> None:
 
 
 def test_a_lossy_encoder_cannot_report_a_saving(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`score` asserts the round-trip itself — the property the whole script rests on."""
+    """`score` re-checks the round-trip itself — and raises, so `python -O` cannot strip it."""
 
-    def lossy(text: str) -> tuple[str, dict[str, str]]:
-        return "totally different", {"~0": "unrelated"}
+    def lossy(text: str, sigil: str | None = None) -> tuple[str, dict[str, str]]:
+        return "totally different", {"@0": "unrelated"}
 
     monkeypatch.setattr(tac, "ENCODERS", (("phrase", lossy),))
-    with pytest.raises(AssertionError, match="not lossless"):
+    with pytest.raises(tac.NotLossless):
         tac.score(BLOCKY, "phrase")
+    assert not isinstance(tac.NotLossless("x"), type(None))
+    assert issubclass(tac.NotLossless, AssertionError)
 
 
 def test_decode_handles_two_digit_aliases() -> None:
@@ -147,21 +204,65 @@ def test_decode_handles_two_digit_aliases() -> None:
     assert tac.decode("~10|~1", legend) == "TEN|ONE"
 
 
-def test_production_falls_back_to_raw_for_non_json() -> None:
-    """The marginal column models what the proxy sends, which for text is the payload."""
+# ---------------------------------------------------------------- baseline
+
+
+def test_baseline_is_the_shipped_policy_path_not_a_reimplementation(tmp_path: Path) -> None:
+    """`policy.apply`, so passthrough / marker / depth / minify-fallback are shipped
+    behavior rather than re-derived here. A `tiers: []` rule must yield the payload
+    untouched — the case a direct `transforms.compress` call gets wrong, and the reason
+    "what terse actually emits" has to go through the real entry point."""
+    raw = json.dumps({"rows": [{"alpha": i, "beta": "constant"} for i in range(40)]},
+                     indent=2)
+    default = tac.make_baseline(tac.policy_mod.default_policy())
+    assert tac.TOK(default(raw, "any.tool")) < tac.TOK(raw)
+
+    doc = tmp_path / "p.json"
+    doc.write_text(json.dumps({
+        "version": 1,
+        "defaults": {"tiers": ["minify", "tabularize", "dictionary"]},
+        "policies": [{"match": {"tool": "quiet.*"}, "tiers": []}],
+    }))
+    passthrough = tac.make_baseline(tac.policy_mod.load_policy(doc))
+    assert passthrough(raw, "quiet.thing") == raw
+    assert tac.TOK(passthrough(raw, "loud.thing")) < tac.TOK(raw)
+
+
+def test_baseline_leaves_non_json_alone() -> None:
     text = "## Blast radius\n\nnot json at all\n"
-    assert tac.production(text) == text
+    base = tac.make_baseline(tac.policy_mod.default_policy())
+    assert base(text, "codegraph_explore") == text
 
 
-def test_production_is_the_shipped_tier_path_for_json() -> None:
-    """Enough records that tabularize clears its own header cost.
+# ---------------------------------------------------------------- reporting math
 
-    A 2-record payload comes out LARGER — terse has no emit-only-if-smaller guard on the
-    lossless stage — and `production` deliberately reproduces that rather than papering
-    over it, because the marginal column must model what the proxy really sends.
-    """
-    raw = json.dumps({"rows": [{"alpha": i, "beta": "constant", "gamma": i * 3}
-                               for i in range(40)]}, indent=2)
-    out = tac.production(raw)
-    assert out != raw
-    assert tac.TOK(out) < tac.TOK(raw)
+
+def _cells(row: str) -> list[float]:
+    return [float(p.rstrip("%")) for p in row.split() if p.endswith("%")]
+
+
+def test_row_arithmetic() -> None:
+    """The formulas that produce the headline. A sign flip or a wrong denominator here
+    ships green otherwise — nothing else covers `_row`."""
+    c = Counter({"n": 10, "raw": 1000, "prod": 800, "alias_raw": 100,
+                 "alias_post": 80, "gzip_bytes": 600, "bytes": 1000})
+    terse, alias_raw, alias_post, combined, gz = _cells(tac._row("x", c))
+    assert terse == pytest.approx(20.0)          # 1000 -> 800
+    assert alias_raw == pytest.approx(10.0)      # 100/1000, measured on RAW
+    assert alias_post == pytest.approx(10.0)     # 80/800, measured on terse's OUTPUT
+    assert combined == pytest.approx(28.0)       # 1000 -> (800 - 80)
+    assert gz == pytest.approx(60.0)             # byte-weighted, byte domain
+
+
+def test_row_gzip_is_byte_weighted_not_token_weighted() -> None:
+    """gzip is a byte ratio; dividing it by a token count would silently mix domains."""
+    c = Counter({"n": 1, "raw": 100, "prod": 100, "alias_raw": 0, "alias_post": 0,
+                 "gzip_bytes": 500, "bytes": 1000})
+    assert _cells(tac._row("x", c))[-1] == pytest.approx(50.0)
+
+
+def test_combined_equals_terse_when_the_aliaser_finds_nothing() -> None:
+    c = Counter({"n": 1, "raw": 1000, "prod": 700, "alias_raw": 0, "alias_post": 0,
+                 "gzip_bytes": 0, "bytes": 1000})
+    terse, _, _, combined, _ = _cells(tac._row("x", c))
+    assert terse == pytest.approx(combined)
