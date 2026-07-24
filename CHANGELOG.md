@@ -9,6 +9,20 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Changed
+- **`terse report` coverage and `measure` rows now name a tool the way the policy does
+  (#158).** `capture.coverage` keyed `by_tool` on the bare `env["tool"]`, so a server-tagged
+  corpus reported `structure` while `policy generate` on the same corpus authored
+  `runecho.structure` — an operator cross-checking a rule against its coverage count had to
+  know the two named one tool. Both `coverage` and `measure`'s per-row labels now use
+  `qualified_tool(env)` (`qualify(bare, server)`), the runtime lookup name. A legacy
+  envelope with no server qualifies to its bare name, unchanged.
+- **`probes.server_of_tool` reads the envelope's `server` instead of guessing it (#158).**
+  Since #156 the envelope records `server` straight from the wrap, so it is now returned
+  verbatim; the hand-maintained `_RUNECHO_TOOLS` name heuristic is the fallback for legacy
+  envelopes only. The point is that the hardcoded list — which silently went stale every
+  time runecho gained a tool — is off the primary path.
+
 ### Fixed
 - **The savings ledger charged `structuredContent` at its COMPRESSED size on the raw side,
   understating the real wire saving by ~15 points (#141, part 1).** Since #134 the typed

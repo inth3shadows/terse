@@ -22,7 +22,7 @@ import json
 from typing import Any
 
 from . import transforms
-from .capture import classify_shape
+from .capture import classify_shape, qualified_tool
 from .tokenize import CL100K, O200K, count, count_cl100k
 
 
@@ -166,7 +166,9 @@ def cross_tokenizer_savings(envelopes: list[dict[str, Any]]) -> list[dict[str, A
             comp = transforms.compress(json.loads(raw))
         except (json.JSONDecodeError, TypeError):
             comp = raw
-        row: dict[str, Any] = {"tool": env.get("tool", "?")}
+        # Qualified name — the same one coverage/policy use, so a report's measure rows and
+        # coverage counts name one tool the same way (#158).
+        row: dict[str, Any] = {"tool": qualified_tool(env)}
         for enc in (CL100K, O200K):
             r, c = count(raw, enc), count(comp, enc)
             pct = ((r - c) / r * 100) if (r and c is not None) else None
@@ -180,7 +182,7 @@ def measure_corpus(envelopes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = []
     for env in envelopes:
         row = measure_payload(env["raw"])
-        row["tool"] = env.get("tool", "?")
+        row["tool"] = qualified_tool(env)   # #158: match coverage/policy naming
         row["sha"] = env.get("sha", "?")
         row["bytes"] = env.get("bytes", len(env["raw"]))
         rows.append(row)

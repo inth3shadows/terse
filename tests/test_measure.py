@@ -98,6 +98,21 @@ def test_capture_load_coverage_roundtrip(tmp_path):
     assert cov["by_tool"]["gh.issues"] == 1
 
 
+def test_coverage_keys_on_the_qualified_name_the_policy_uses(tmp_path):
+    # #158: a server-tagged corpus must report the tool under the SAME name
+    # `policy generate` authors and the proxy looks up (`qualify(bare, server)`), so an
+    # operator can cross-check a rule against its coverage count without a mental map.
+    capture.capture_payload("structure", json.dumps([{"n": 1}]), tmp_path, server="runecho")
+    cov = capture.coverage(capture.load_corpus(tmp_path))
+    assert cov["by_tool"] == {"runecho.structure": 1}      # qualified, not bare `structure`
+
+
+def test_coverage_leaves_a_serverless_legacy_tool_bare(tmp_path):
+    capture.capture_payload("gh.issues", json.dumps([{"n": 1}]), tmp_path)   # no server
+    cov = capture.coverage(capture.load_corpus(tmp_path))
+    assert cov["by_tool"] == {"gh.issues": 1}
+
+
 def test_capture_is_idempotent_by_sha(tmp_path):
     raw = json.dumps({"a": 1})
     p1 = capture.capture_payload("t", raw, tmp_path)

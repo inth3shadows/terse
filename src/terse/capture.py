@@ -329,10 +329,18 @@ def qualified_tool(env: dict[str, Any]) -> str:
 
 
 def coverage(envelopes: list[dict[str, Any]]) -> dict[str, Any]:
-    """Per-tool and per-shape counts — surfaced in the report so thin samples show."""
+    """Per-tool and per-shape counts — surfaced in the report so thin samples show.
+
+    Keyed on `qualified_tool` — the SAME name `policy generate` authors and the proxy
+    looks a rule up by (`qualify(bare, server)`), not the bare `env["tool"]` (#158). On a
+    server-tagged corpus the bare name reported `structure` while the generated policy said
+    `runecho.structure`, so an operator cross-checking a rule against its coverage count had
+    to know the two named one tool. Legacy envelopes with no server qualify to their bare
+    name, unchanged."""
     by_tool: dict[str, int] = {}
     by_shape: dict[str, int] = {}
     for env in envelopes:
-        by_tool[env["tool"]] = by_tool.get(env["tool"], 0) + 1
+        name = qualified_tool(env)
+        by_tool[name] = by_tool.get(name, 0) + 1
         by_shape[env.get("shape", "?")] = by_shape.get(env.get("shape", "?"), 0) + 1
     return {"total": len(envelopes), "by_tool": by_tool, "by_shape": by_shape}

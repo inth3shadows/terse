@@ -559,7 +559,7 @@ def _cmd_probe_cross_server(args: argparse.Namespace, envelopes: list[dict]) -> 
     records_by_server: dict[str, list[dict]] = {}
     raws_by_server: dict[str, list[tuple[str, str]]] = {}
     for env in envelopes:
-        srv = server_of_tool(env["tool"])
+        srv = server_of_tool(env["tool"], env.get("server"))
         raws_by_server.setdefault(srv, []).append((env.get("sha", ""), env["raw"]))
         try:
             records = extract_records(_json.loads(env["raw"]))
