@@ -759,6 +759,72 @@ def test_policy_autotune_refuses_to_write_a_policy_it_cannot_load(tmp_path, caps
     assert "refusing to write" in capsys.readouterr().err
 
 
+# --- #136: a bare `terse policy autotune` resolves --policy/--corpus from the wiring ---
+
+def _wire_one_terse_server(tmp_path, monkeypatch, pol, corpus):
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {"gh": {
+        "command": "/usr/bin/python",
+        "args": ["-m", "terse", "proxy", "--policy", str(pol),
+                 "--capture-dir", str(corpus), "--", "gh-mcp"]}}}), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    return cfg
+
+
+def test_autotune_resolves_policy_and_corpus_from_install_wiring(tmp_path, monkeypatch, capsys):
+    pol, corpus = _autotune_setup(tmp_path)
+    _wire_one_terse_server(tmp_path, monkeypatch, pol, corpus)
+    before = pol.read_bytes()
+    rc = main(["policy", "autotune"])                       # bare — no flags at all
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"resolved from install-mcp wiring: --policy {pol}" in out
+    assert str(corpus) in out                              # the corpus was resolved too
+    assert "gh.items" in out and "nothing written" in out  # reached the real diff, wrote nothing
+    assert pol.read_bytes() == before
+
+
+def test_autotune_refuses_when_wiring_has_no_terse_servers(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {"plain": {"command": "node", "args": ["s.js"]}}}),
+                   encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    rc = main(["policy", "autotune"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "could not be resolved from the installed wiring" in err
+
+
+def test_autotune_refuses_ambiguous_policies_and_lists_them(tmp_path, monkeypatch, capsys):
+    pol_a = _write(tmp_path, "a.json", json.dumps({"version": 1, "policies": []}))
+    pol_b = _write(tmp_path, "b.json", json.dumps({"version": 1, "policies": []}))
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "a": {"command": "/usr/bin/python",
+              "args": ["-m", "terse", "proxy", "--policy", str(pol_a), "--", "a-mcp"]},
+        "b": {"command": "/usr/bin/python",
+              "args": ["-m", "terse", "proxy", "--policy", str(pol_b), "--", "b-mcp"]},
+    }}), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    rc = main(["policy", "autotune"])                       # ambiguous — must not guess
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "2 distinct policies" in err
+    assert str(pol_a) in err and str(pol_b) in err
+
+
+def test_autotune_explicit_flags_do_not_announce_wiring(tmp_path, monkeypatch, capsys):
+    # An unrelated wiring must not leak into an explicit invocation, and no resolution
+    # line is printed when the operator named both paths.
+    pol, corpus = _autotune_setup(tmp_path)
+    _wire_one_terse_server(tmp_path, monkeypatch, _write(tmp_path, "other.json", "{}"), corpus)
+    rc = main(["policy", "autotune", "--policy", str(pol), "--corpus", str(corpus)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "resolved from install-mcp wiring" not in out    # explicit path is silent
+    assert "nothing written" in out
+
+
 def test_autotune_names_what_it_guessed_about_an_old_corpus(tmp_path, capsys):
     # A pre-#148 corpus can't be made exact retroactively, so the two inputs that were
     # inferred rather than read are stated. Silently presenting a guessed grouping as a

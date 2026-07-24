@@ -889,3 +889,57 @@ def test_scan_never_flags_an_unwrapped_entry_or_a_bare_command(tmp_path):
     cfg.write_text(json.dumps(_cfg(plain={"command": "uvx", "args": ["plain-mcp"]})))
     row = next(r for r in im.scan_scopes(cfg=cfg) if r["server"] == "plain")
     assert row["state"] == "unwrapped" and row["launcher_missing"] is False
+
+
+# --- reading the baked proxy opts back out of a wrapped entry (#136) ---
+
+def test_parse_proxy_opts_reads_policy_capture_and_server_between_proxy_and_sep():
+    entry = {"command": "/usr/bin/python",
+             "args": ["-m", "terse", "proxy", "--policy", "/p/pol.json",
+                      "--server-name", "runecho", "--capture-dir", "/c/corpus",
+                      "--", "runecho-mcp"]}
+    assert im.parse_proxy_opts(entry) == {
+        "policy": "/p/pol.json", "server_name": "runecho", "capture_dir": "/c/corpus"}
+
+
+def test_parse_proxy_opts_recognizes_console_script_launcher():
+    entry = {"command": "/home/u/.local/bin/terse",
+             "args": ["proxy", "--policy", "/p.json", "--server-name", "kb", "--", "sb-run"]}
+    assert im.parse_proxy_opts(entry) == {"policy": "/p.json", "server_name": "kb"}
+
+
+def test_parse_proxy_opts_ignores_a_downstream_policy_flag():
+    # A wrapped server whose OWN downstream args carry --policy must not have that value
+    # misread as terse's — only the segment before `--` is terse's.
+    entry = {"command": "/usr/bin/python",
+             "args": ["-m", "terse", "proxy", "--policy", "/terse/pol.json",
+                      "--", "weird-server", "--policy", "/downstream/other.json"]}
+    assert im.parse_proxy_opts(entry) == {"policy": "/terse/pol.json"}
+
+
+def test_parse_proxy_opts_returns_none_for_non_terse_entries():
+    assert im.parse_proxy_opts(
+        {"command": "node", "args": ["s.js", "proxy", "--policy", "x"]}) is None  # not terse
+    assert im.parse_proxy_opts({"command": "/bin/foo"}) is None                    # no args
+    assert im.parse_proxy_opts(
+        {"command": "/usr/bin/python", "args": ["-m", "terse", "capture"]}) is None  # no proxy
+
+
+def test_discover_wrapped_opts_collects_only_wrapped_in_order():
+    config = {"mcpServers": {
+        "a": {"command": "/usr/bin/python",
+              "args": ["-m", "terse", "proxy", "--policy", "/p.json",
+                       "--capture-dir", "/c", "--", "srv-a"]},
+        "b": {"command": "node", "args": ["b.js"]},                 # unrelated server
+        "c": {"command": "/home/u/.local/bin/terse",
+              "args": ["proxy", "--policy", "/p.json", "--", "srv-c"]},
+    }}
+    assert im.discover_wrapped_opts(config) == [
+        {"server": "a", "policy": "/p.json", "capture_dir": "/c"},
+        {"server": "c", "policy": "/p.json"},
+    ]
+
+
+def test_discover_wrapped_opts_empty_without_mcpservers():
+    assert im.discover_wrapped_opts({}) == []
+    assert im.discover_wrapped_opts({"mcpServers": "not-a-dict"}) == []

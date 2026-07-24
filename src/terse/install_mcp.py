@@ -302,6 +302,75 @@ def is_managed(stash: dict, server: str) -> bool:
     return server in stash
 
 
+def _looks_like_terse_launcher(entry: dict) -> bool:
+    """True if `entry` launches via terse — the console script `terse`, or `python -m
+    terse`. Distinguishes a terse-wrapped entry from an unrelated server that merely
+    happens to carry a `proxy` arg, so `parse_proxy_opts` never misreads a stranger."""
+    cmd = entry.get("command")
+    if isinstance(cmd, str) and Path(cmd).name == "terse":
+        return True
+    args = entry.get("args")
+    if isinstance(args, list):
+        for i in range(len(args) - 1):
+            if args[i] == "-m" and args[i + 1] == "terse":
+                return True
+    return False
+
+
+def parse_proxy_opts(entry: dict) -> dict[str, str] | None:
+    """The terse proxy options baked into a wrapped MCP server `entry`'s args —
+    `{'policy','capture_dir','server_name'}` for whichever keys are present — or None
+    when `entry` is not a terse-wrapped entry.
+
+    Only the segment BETWEEN the `proxy` subcommand and the first `--` (the downstream
+    boundary `wrap` writes) is scanned, so a value on the DOWNSTREAM side that happens to
+    equal `--policy` (e.g. the wrapped server's own flag) is never misread as terse's."""
+    if not _looks_like_terse_launcher(entry):
+        return None
+    args = entry.get("args")
+    if not isinstance(args, list):
+        return None
+    try:
+        start = args.index("proxy")
+    except ValueError:
+        return None
+    try:
+        end = args.index("--", start + 1)
+    except ValueError:
+        end = len(args)   # no downstream separator (unusual) — scan to the end
+    seg = args[start + 1:end]
+    flag_map = {"--policy": "policy", "--capture-dir": "capture_dir",
+                "--server-name": "server_name"}
+    opts: dict[str, str] = {}
+    i = 0
+    while i < len(seg):
+        key = flag_map.get(seg[i]) if isinstance(seg[i], str) else None
+        if key is not None and i + 1 < len(seg) and isinstance(seg[i + 1], str):
+            opts[key] = seg[i + 1]
+            i += 2
+        else:
+            i += 1
+    return opts
+
+
+def discover_wrapped_opts(config: dict) -> list[dict[str, str]]:
+    """Every terse-wrapped server in `config`'s top-level `mcpServers`, each as its baked
+    proxy opts plus `{'server': name}`. Order-preserving; empty when none are wrapped.
+    Read-only and scope-agnostic (user/project shape); the caller decides what to do with
+    multiple distinct policies/corpora."""
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict):
+        return []
+    out: list[dict[str, str]] = []
+    for name, entry in servers.items():
+        if not isinstance(entry, dict):
+            continue
+        opts = parse_proxy_opts(entry)
+        if opts is not None:
+            out.append({"server": name, **opts})
+    return out
+
+
 # ------------------------------------------------------------------ IO helpers
 def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
