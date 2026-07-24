@@ -473,6 +473,9 @@ class Interceptor:
             diff_reason: str | None = None
             joined_block: dict | None = None   # set when the multi-block join fires (#116)
             joined_curr: list | None = None    # its parsed pre-lossy array, for capture
+            partial_done = False               # set when a PARTIAL multi-block join fires (#140)
+            partial_pairs: list[tuple[str, str]] = []
+            partial_payloads: list[str] = []
 
             # `"structured": "replace"` (#128) — is this result's text block a dead mirror
             # of `structuredContent`? Decided HERE, against the RAW block, because every
@@ -517,9 +520,28 @@ class Interceptor:
                     text_blocks, tool, args_key, force_lossless=error_result)
                 if new_text is not None:
                     joined_block = {"type": "text", "text": new_text}
+                elif diff_reason in ("multiblock_non_json", "multiblock_heterogeneous"):
+                    # #140: the FULL join refused because at least one block is not a
+                    # record (a bare error string, a JSON array). Rather than drop the
+                    # whole result to the per-block path — losing cross-record folding on
+                    # the records that ARE there — fold each contiguous run of >=2 object
+                    # blocks and leave the rest per-block. A server emitting an error block
+                    # beside good records is ordinary MCP, not an edge case (the single
+                    # most common diff reason in the live ledger).
+                    partial_result = self._partial_join(content, tool,
+                                                        force_lossless=error_result)
+                    if partial_result is not None:
+                        partial_pairs, partial_payloads, partial_changed = partial_result
+                        partial_done = True
+                        changed = partial_changed
+                        diff_reason = "multiblock_partial"
 
             if mirror is not None:
                 pass                       # handled above; the drop itself happens below
+            elif partial_done:
+                # #140: `_partial_join` already rebuilt `content` in place and dropped any
+                # diff base; just carry its (raw, emitted) pairs to the sinks below.
+                emitted_pairs = partial_pairs
             elif joined_block is not None:
                 # Collapse the N text blocks to the single joined block, in place; non-text
                 # blocks keep their positions. This is the one path that changes the number
@@ -564,6 +586,10 @@ class Interceptor:
                 if joined_block is not None:
                     payloads = [json.dumps(joined_curr, separators=(",", ":"),
                                            ensure_ascii=False)]
+                elif partial_done:
+                    # Each folded run captured as its own array, each leftover block as
+                    # itself — the corpus mirrors exactly what terse compressed (#140).
+                    payloads = partial_payloads
                 else:
                     payloads = raw_texts
                 # The JSON-RPC id identifies the RESULT these blocks came from, so the
@@ -805,6 +831,118 @@ class Interceptor:
             # Diffing off: emit the full joined-and-compressed form, keep no base.
             chosen, reason = applied.text, "joined"
         return chosen, reason, curr
+
+    def _partial_join(self, content: list, tool: str,
+                      force_lossless: bool = False
+                      ) -> tuple[list[tuple[str, str]], list[str], bool] | None:
+        """#140: fold each maximal run of >=2 ADJACENT JSON-object text blocks into one
+        joined record array, leaving every other block (non-text, a JSON array, a
+        non-JSON error string, or a lone object) in place and per-block compressed.
+
+        Rebuilds `content` in place and returns `(emitted_pairs, capture_payloads,
+        changed)`, or None when nothing folds (no run of >=2 object blocks clears the
+        codec) — in which case `content` is left untouched and the caller keeps the plain
+        per-block path.
+
+        Establishes NO cross-call diff base. A partial layout's block boundaries can shift
+        call to call (an error block appears, records move), so anchoring a diff on the
+        folded subset needs its own keyframe accounting — deferred (#140). All diff state
+        for the tool is dropped instead, the same discipline the mirror-drop and per-block
+        paths use, so no stale base is diffed against and no partial base misleads the next
+        result.
+
+        Adjacency is measured over `content`, not over the text blocks alone: a non-text
+        block (image / resource_link) breaks a run, because folding across it would reorder
+        content the client may rely on."""
+        def _is_record(b: Any) -> bool:
+            if not (isinstance(b, dict) and b.get("type") == "text"
+                    and isinstance(b.get("text"), str)):
+                return False
+            try:
+                return isinstance(json.loads(b["text"]), dict)
+            except (json.JSONDecodeError, TypeError, RecursionError):
+                return False
+
+        # Partition `content` into maximal runs of adjacent object-text blocks vs
+        # everything else, preserving order. A run has len>=1; a non-record is its own
+        # singleton segment.
+        segments: list[list] = []
+        run: list = []
+        for b in content:
+            if _is_record(b):
+                run.append(b)
+            else:
+                if run:
+                    segments.append(run)
+                    run = []
+                segments.append([b])
+        if run:
+            segments.append(run)
+
+        # Decide each segment WITHOUT mutating content, so a run that only refuses
+        # (a reserved marker or over-depth on its sub-array) leaves nothing half-applied.
+        # A len>=2 segment is a record run by construction (singletons are the non-records).
+        plan: list[tuple[str, Any]] = []
+        folded_any = False
+        for seg in segments:
+            if len(seg) >= 2:
+                raws = [b["text"] for b in seg]
+                try:
+                    applied, curr, _refuse = policy_mod.apply_joined(
+                        raws, tool, self.policy, drop_sink=self._drop_put,
+                        server=self.server_name, force_lossless=force_lossless)
+                except Exception as exc:  # noqa: BLE001 — fail-open per run
+                    if self.debug:
+                        sys.stderr.write(f"[terse-proxy] {tool}: partial-join run "
+                                         f"passthrough on error: {exc}\n")
+                    applied, curr = None, None
+                if applied is not None:
+                    plan.append(("fold", (applied.text, curr, raws)))
+                    folded_any = True
+                    continue
+            plan.append(("pass", seg))
+
+        if not folded_any:
+            return None
+
+        # Apply the plan. This mutates leftover blocks in place (`b["text"] = new`) BEFORE
+        # the atomic `content[:] = out` below, so its all-or-nothing property rests on
+        # `_compress` being hard fail-open (it returns the original text on any error and
+        # never raises) — a raise mid-loop would leave `content` half-compressed.
+        out: list = []
+        emitted_pairs: list[tuple[str, str]] = []
+        capture_payloads: list[str] = []
+        changed = False
+        for kind, item in plan:
+            if kind == "fold":
+                text, curr, raws = item
+                out.append({"type": "text", "text": text})
+                emitted_pairs.append(("\n".join(raws), text))
+                capture_payloads.append(json.dumps(curr, separators=(",", ":"),
+                                                   ensure_ascii=False))
+                changed = True
+            else:
+                for b in item:
+                    if (isinstance(b, dict) and b.get("type") == "text"
+                            and isinstance(b.get("text"), str)):
+                        raw = b["text"]
+                        new = self._compress(raw, tool, force_lossless=force_lossless)
+                        if new != raw:
+                            b["text"] = new
+                            changed = True
+                        emitted_pairs.append((raw, b["text"]))
+                        capture_payloads.append(raw)
+                    out.append(b)
+        content[:] = out
+
+        if self.diff:
+            self.last.pop(tool, None)
+            self.last_args.pop(tool, None)
+            self.last_joined.pop(tool, None)
+            self.since_keyframe.pop(tool, None)
+            self.last_text.pop(tool, None)
+            self.since_text_keyframe.pop(tool, None)
+        return emitted_pairs, capture_payloads, changed
 
     @staticmethod
     def _collapse_text_blocks(content: list, old_text_blocks: list[dict],
