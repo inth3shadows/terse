@@ -151,7 +151,8 @@ class Interceptor:
     def __init__(self, pol: policy_mod.Policy, debug: bool = False,
                  capture: CaptureFn | None = None,
                  audit: Callable[[dict], None] | None = None,
-                 stats: Callable[..., None] | None = None,
+                 stats: Callable[[str, str, str, bool, str | None, str | None,
+                                  str | None], None] | None = None,
                  server_name: str | None = None,
                  store: OrderedDict[str, Any] | None = None,
                  store_lock: Lock | None = None,
@@ -1155,7 +1156,8 @@ class Interceptor:
                     display_tool: str | None = None, diff_reason: str | None = None,
                     structured: str | None = None,
                     structured_out: str | None = None) -> None:
-        """Hand the stats callback one (tool, raw, emitted, passthrough, diff_reason) per
+        """Hand the stats callback one
+        (tool, raw, emitted, passthrough, diff_reason, structured, structured_out) per
         emitted block, for the payload-free savings ledger (stats.py). Same fail-open
         contract as capture/audit: the callback owns I/O and a failure can never change
         what the client receives. `pairs`/`tool`/`display_tool` as in `_emit_audit`. The

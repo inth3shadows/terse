@@ -112,6 +112,10 @@ def build_record(server: str, tool: str, raw: str, emitted: str,
     genuinely did compress it. The size fields say what that was worth."""
     extra_raw = structured or ""
     extra_out = structured_out if structured_out is not None else extra_raw
+    # Tokenize each side once and reuse — the same value feeds both the folded *_tokens
+    # total and the recoverable structured_*_tokens split.
+    extra_raw_tok = count_cl100k(extra_raw)
+    extra_out_tok = count_cl100k(extra_out)
     return {
         "ts": int(time.time()),
         "server": server,
@@ -120,11 +124,14 @@ def build_record(server: str, tool: str, raw: str, emitted: str,
         "diff_reason": diff_reason,
         "raw_chars": len(raw) + len(extra_raw),
         "out_chars": len(emitted) + len(extra_out),
-        "raw_tokens": _sum_tokens(count_cl100k(raw), count_cl100k(extra_raw)),
-        "out_tokens": _sum_tokens(count_cl100k(emitted), count_cl100k(extra_out)),
+        "raw_tokens": _sum_tokens(count_cl100k(raw), extra_raw_tok),
+        "out_tokens": _sum_tokens(count_cl100k(emitted), extra_out_tok),
         "structured_chars": len(extra_raw),
         "structured_out_chars": len(extra_out),
-        "structured_tokens": count_cl100k(extra_raw) if extra_raw else 0,
+        # Both token sides recorded, mirroring the char split above — the emitted side is
+        # what a downstream needs to recover the structured field's own token saving.
+        "structured_tokens": extra_raw_tok if extra_raw else 0,
+        "structured_out_tokens": extra_out_tok if extra_out else 0,
     }
 
 
