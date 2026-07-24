@@ -2,15 +2,19 @@
 
 Subcommands:
   gate <file|->            run the lossless round-trip gate on a JSON payload
+  policy generate/autotune author/re-tune a per-tool policy from a captured corpus
+  compress --tool N        compress one tool output through a policy (the shell)
   capture --tool N <file|-> persist a tool output to corpus/ + bucket by shape
   measure                  token delta per tier per shape bucket over the corpus
   probe                    value-redundancy + cross-call-overlap ceiling probes
   validate                 cross-tokenizer invariance (cl100k vs o200k)
-  compress --tool N        compress one tool output through a policy (the shell)
   proxy -- <cmd>           MCP stdio proxy: compress a downstream server's results
   stats                    live savings report from the proxy's payload-free ledger
   fluency                  does a model read the compressed form as well as raw JSON?
   tune                     analyze a corpus -> safe-first drop candidates (+ optional verify)
+  install-mcp / uninstall-mcp  wrap/restore Claude Code MCP server(s) with the terse proxy
+  mcp-status               list terse-wrapped MCP servers across all Claude Code configs
+  verify                   self-contained verification report: lossless gate + fluency + stats
 """
 
 from __future__ import annotations

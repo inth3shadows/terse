@@ -585,7 +585,7 @@ The run itself is unaffected — that is the point of the sinks being fail-open 
 empty corpus makes a later `terse measure --corpus` report a percentage over whatever
 subset happened to land, so this one is worth reading.
 
-Under `terse multiproxy` the bookkeeping is per **peer**, so a dead shared sink prints
+Under `proxy --config` (multi-server mode) the bookkeeping is per **peer**, so a dead shared sink prints
 one line per downstream that hit it — each naming its own peer-qualified tool — rather
 than one for the whole run. That is deliberate: it tells you *which* downstreams were
 actually affected, and the flood guard still holds within each peer.
@@ -860,9 +860,11 @@ For anything else, see the [Technical Reference](TECHNICAL.md) or [README](READM
 ## FAQ
 
 **Does terse delete any of my data?**
-No. Today it is fully lossless — the compressed output always reconstructs the exact
-original. A future opt-in mode could drop detail you explicitly mark, but it isn't
-built, and even the policy slots for it are ignored for now.
+By default, no — the compressed output always reconstructs the exact original. Two
+opt-in lossy modes exist for fields you explicitly mark in the policy: `truncate`
+(caps a field's length) and `drop-to-retrieve` (replaces a field with a handle you
+can fetch back via the injected `terse.retrieve` tool). Nothing is dropped unless you
+mark it, and `{"critical":true}` fields are never touched by either mode.
 
 **Why didn't my payload get smaller?**
 Because there was nothing safe to remove. terse shrinks repetition (repeated field
@@ -882,3 +884,10 @@ effort, so the policy turns it off there. You control this in the policy file.
 No. Everything runs locally. A key is only needed for the optional live fluency eval
 (`fluency --diff`/`--drop-eval`), which calls any OpenAI-compatible endpoint you point
 it at (broker pool or a loopback gateway). You never need it for normal use.
+
+<!-- docvet:anchors
+drop-to-retrieve -> src/terse/transforms.py
+proxy --config -> src/terse/cli.py
+truncate -> src/terse/transforms.py
+-->
+

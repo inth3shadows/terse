@@ -194,7 +194,8 @@ src/terse/
   tokenize.py    cl100k / o200k token counting
   report.py      markdown reports (savings, per-tool, probes, tokenizer, fluency)
   html_report.py charted HTML companion (inline SVG, no JS/CDN) for measure/verify
-  cli.py         entrypoint: gate / capture / measure / probe / validate / compress / proxy / stats / fluency
+  cli.py         entrypoint: gate / policy / compress / capture / measure / probe / validate /
+                 proxy / stats / fluency / tune / install-mcp / uninstall-mcp / mcp-status / verify
 scripts/
   gen_stress_corpus.py  synthetic stress corpus for the fluency eval
   bench/                terse-vs-TOON token benchmark on a real GitHub-API corpus
@@ -356,3 +357,13 @@ playwright-mcp. The §6 headline: the codec pays on JSON output (18–58%, depen
 whether the server pretty-prints) while *every* text-shaped tool is 0% one-shot yet still
 wins on a repeat — so the codec is the JSON-specific lever and the diff is the broad,
 shape-independent one.
+
+<!-- docvet:anchors
+install-mcp -> src/terse/cli.py
+mcp-status -> src/terse/cli.py
+policy -> src/terse/cli.py
+tune -> src/terse/cli.py
+uninstall-mcp -> src/terse/cli.py
+verify -> src/terse/cli.py
+-->
+
