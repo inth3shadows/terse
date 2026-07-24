@@ -491,7 +491,7 @@ def test_stats_cmd_json_output(tmp_path, capsys):
     rc = main(["stats", "--log", str(log), "--json"])
     assert rc == 0
     agg = json.loads(capsys.readouterr().out)
-    assert agg["total"]["results"] == 1 and agg["total"]["raw_tokens"] == 100
+    assert agg["total"]["blocks"] == 1 and agg["total"]["raw_tokens"] == 100
 
 
 def test_stats_cmd_missing_ledger_is_a_clean_error(tmp_path, capsys):
