@@ -321,6 +321,27 @@ uv run terse stats --since 7d # live savings from real proxy sessions (payload-f
 Reports are written under `reports/` (gitignored). The corpus under `corpus/` is
 gitignored because captured tool output may contain real data.
 
+## Releasing (automatic)
+
+Releases are **zero-touch** — there is no manual tag, version bump, or changelog step.
+`.github/workflows/release.yml` runs on every push to `main` and:
+
+1. Derives the next version from the Conventional-Commit types since the last tag —
+   `feat:` → minor, `fix:`/`perf:` → patch, a breaking `type!:`/`BREAKING CHANGE` → minor
+   while 0.x. A push whose commits are only `docs:`/`chore:`/`test:`/`ci:`/etc. releases
+   nothing.
+2. Creates and pushes the `vX.Y.Z` tag (hatch-vcs makes that tag the version).
+3. Builds the sdist+wheel, cuts a GitHub Release with auto-generated notes, and publishes
+   `terse-mcp` to PyPI via Trusted Publishing (OIDC — no stored token), after re-running
+   the full test suite against the tagged tree as a publish gate.
+
+Two manual overrides remain: push a `vX.Y.Z` tag by hand (released verbatim), or use the
+Actions **Run workflow** button with a forced bump level. To require a human click before
+each PyPI upload, add a required reviewer to the `pypi` environment in
+Settings → Environments; leaving it unprotected keeps releases fully automatic. There is
+no remote infrastructure and nothing to roll back at runtime; a bad release is superseded
+by the next patch (PyPI versions cannot be re-uploaded).
+
 ## Known Limitations
 
 - **Tier 1 (lossy) — `truncate` and `drop-to-retrieve` built; `summarize` deferred.**

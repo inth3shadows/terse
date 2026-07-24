@@ -10,6 +10,14 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Changed
+- **Releases are now zero-touch.** `release.yml` runs on every push to `main`, derives the
+  next version from the Conventional-Commit types since the last tag (`feat` → minor,
+  `fix`/`perf` → patch, breaking → minor while 0.x; docs/chore/test/ci release nothing),
+  creates the tag, and builds → GitHub Release → PyPI (Trusted Publishing) in one run after
+  re-running the suite against the tagged tree. No manual tag, version bump, or changelog
+  graduation. Manual overrides stay: push a `vX.Y.Z` tag, or the Actions Run-workflow button
+  with a forced bump. Reuses the one `release.yml` publisher identity, so PyPI needs no
+  reconfiguration. See TECHNICAL.md → Releasing.
 - **`terse report` coverage and `measure` rows now name a tool the way the policy does
   (#158).** `capture.coverage` keyed `by_tool` on the bare `env["tool"]`, so a server-tagged
   corpus reported `structure` while `policy generate` on the same corpus authored
