@@ -1,0 +1,23 @@
+{
+  "baseline_commit": "660aee5cc7506c11bb05a3622f5199801c690695",
+  "known_dead": [
+    ".terse-mcp-stash.json",
+    "_heterogeneous",
+    "_marker",
+    "_off",
+    "_passthrough",
+    "drop-policy.json",
+    "gh-policy.json",
+    "gh__search_issues",
+    "gh_commits_flat",
+    "kb-policy.json",
+    "kb.read.list_principles",
+    "kb__read",
+    "list_principles",
+    "mcp.json",
+    "peers.json",
+    "policy.json",
+    "some-output.json",
+    "terse-policy.json"
+  ]
+}
