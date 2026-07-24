@@ -19,6 +19,7 @@ from terse.stats import (
     parse_window,
     server_label,
 )
+from terse.tokenize import count_cl100k
 
 RAW = json.dumps({"result": [{"id": i, "status": "active"} for i in range(20)]}, indent=2)
 
@@ -294,3 +295,33 @@ def test_structured_duplicate_is_counted_once_per_result_not_per_block(tmp_path)
     writer("records", RAW, RAW, False, None, None)
     recs = load_stats(log)
     assert [r["structured_chars"] for r in recs] == [len('{"a":1}'), 0]
+
+
+def test_compressed_structured_charges_each_side_its_own_size():
+    # #141: once the typed field is compressed the two sides DIFFER — the raw side must
+    # carry the original, the emitted side the compressed form. The pre-#141 code charged
+    # the compressed size to BOTH, understating the wire saving. Passing distinct raw/out
+    # values is what a compressing proxy now does.
+    original = json.dumps({"rows": [{"id": i} for i in range(20)]}, separators=(",", ":"))
+    compressed = '{"__terse_table__":1,"n":20,"cols":["id"],"rows":[[0]]}'  # smaller, illustrative
+    rec = build_record("s", "records", RAW, RAW, False, None, original, compressed)
+    assert rec["structured_chars"] == len(original)          # raw side: full price
+    assert rec["structured_out_chars"] == len(compressed)    # emitted side: compressed
+    assert rec["raw_chars"] == len(RAW) + len(original)
+    assert rec["out_chars"] == len(RAW) + len(compressed)
+    # The token split mirrors the char split, so the structured field's own saving stays
+    # recoverable on both axes.
+    assert rec["structured_tokens"] == count_cl100k(original)
+    assert rec["structured_out_tokens"] == count_cl100k(compressed)
+    # The saving is real, not the wash the pre-fix double-charge produced.
+    assert rec["out_chars"] < rec["raw_chars"]
+
+
+def test_one_structured_value_still_lands_on_both_sides():
+    # Backward-compat: a caller (or an older record) that passes a single `structured`
+    # value — an UNTOUCHED typed field — must charge it identically to both sides, which
+    # is exactly right when terse left the field alone.
+    dup = '{"a":1}'
+    rec = build_record("s", "records", RAW, RAW, False, None, dup)   # no structured_out
+    assert rec["structured_chars"] == rec["structured_out_chars"] == len(dup)
+    assert rec["raw_chars"] == rec["out_chars"]

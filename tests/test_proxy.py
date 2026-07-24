@@ -233,7 +233,8 @@ def _emit_args(inter, mid, tool, payload, args=None):
 def _capture_stats():
     reasons: list = []
 
-    def stats(tool, raw, emitted, passthrough, diff_reason=None, structured=None):
+    def stats(tool, raw, emitted, passthrough, diff_reason=None, structured=None,
+              structured_out=None):
         reasons.append(diff_reason)
 
     return reasons, stats
@@ -948,7 +949,7 @@ def test_capture_false_still_counts_in_the_payload_free_stats_ledger():
     _note_call(inter, 1, "secret.reveal")
     inter.transform_response(_result_msg(1, SECRET))
     assert len(seen) == 1
-    tool, raw, emitted, passthrough, reason, structured = seen[0]
+    tool, raw, emitted, passthrough, reason, structured, structured_out = seen[0]
     assert tool == "secret.reveal" and passthrough is True and reason == "passthrough"
     assert raw == SECRET and emitted == SECRET             # passthrough: untouched
 
@@ -990,7 +991,7 @@ def test_stats_callback_sees_raw_and_emitted_per_result():
     _note_call(inter, 1, "gh.api.items")
     out = inter.transform_response(_result_msg(1, _records_text()))
     assert len(seen) == 1
-    tool, raw, emitted, passthrough, reason, structured = seen[0]
+    tool, raw, emitted, passthrough, reason, structured, structured_out = seen[0]
     assert tool == "gh.api.items" and passthrough is False and reason == "no_prior"
     assert raw == _records_text()                       # true pre-transform snapshot
     assert emitted == json.loads(out)["result"]["content"][0]["text"]
@@ -1011,7 +1012,8 @@ def test_stats_callback_works_without_audit_and_labels_a_diff():
     inter.transform_response(_result_msg(1, json.dumps(first)))
     _note_call(inter, 2, "gh.api.items")
     inter.transform_response(_result_msg(2, json.dumps(second)))
-    assert [classify_decision(r, e, p) for (_t, r, e, p, _rsn, _sc) in seen] == ["compressed", "diff"]
+    assert [classify_decision(r, e, p)
+            for (_t, r, e, p, _rsn, _sc, _so) in seen] == ["compressed", "diff"]
     assert [s[4] for s in seen] == ["no_prior", "emitted"]   # the diff_reason datum agrees
 
 
@@ -1021,7 +1023,7 @@ def test_stats_passthrough_tool_is_labeled_passthrough():
     inter = Interceptor(Policy(rules=[Rule("gh.*", ())]), stats=lambda *a: seen.append(a))
     _note_call(inter, 5, "gh.api.items")
     inter.transform_response(_result_msg(5, _records_text()))
-    (tool, raw, emitted, passthrough, reason, structured), = seen
+    (tool, raw, emitted, passthrough, reason, structured, structured_out), = seen
     assert passthrough is True and raw == emitted and reason == "passthrough"
     assert classify_decision(raw, emitted, passthrough) == "passthrough"
 
@@ -1646,16 +1648,29 @@ def test_structured_content_absent_is_not_invented(tmp_path):
 
 
 def test_structured_content_ledger_counts_the_compressed_size(tmp_path):
-    # The ledger must follow the field: once compressed, the honest saving moves on its
-    # own with no further stats change (#133 made it count the field at all).
+    # The ledger must follow the field, and the two SIDES must not agree once it is
+    # compressed (#141): the raw side carries the ORIGINAL typed field, the emitted side
+    # the compressed one. Charging the compressed size to both (the pre-#141 bug)
+    # understated the real wire saving.
     seen = []
     inter = Interceptor(_structured_policy("compress"), stats=lambda *a: seen.append(a))
     inter.note_request('{"jsonrpc":"2.0","id":1,"method":"tools/call",'
                        '"params":{"name":"gh.items"}}')
     inter.transform_response(_structured_result_msg(1, _SC_PAYLOAD))
-    structured = seen[0][5]
-    assert structured is not None and "__terse_" in structured
-    assert len(structured) < len(json.dumps(_SC_PAYLOAD, separators=(",", ":")))
+    structured_raw, structured_out = seen[0][5], seen[0][6]
+    original = json.dumps(_SC_PAYLOAD, separators=(",", ":"))
+    # Raw side: the original, uncompressed — NOT the compressed form (that was the bug).
+    assert structured_raw == original
+    assert "__terse_" not in structured_raw
+    # Emitted side: the compressed form, genuinely smaller.
+    assert structured_out is not None and "__terse_" in structured_out
+    assert len(structured_out) < len(original)
+    # And the record built from them charges each side its own size, so the saving is honest.
+    from terse.stats import build_record
+    rec = build_record("s", "gh.items", "", "", False, None, structured_raw, structured_out)
+    assert rec["structured_chars"] == len(original)          # raw side = full price
+    assert rec["structured_out_chars"] == len(structured_out)  # emitted side = compressed
+    assert rec["raw_chars"] > rec["out_chars"]               # a real, non-understated saving
 
 
 def _init_req_for(client: str | None):
@@ -1803,11 +1818,15 @@ def test_structured_replace_reports_the_dropped_block_as_zero_to_the_ledger():
     # still charging for a block nobody received.
     seen = []
     _replace_run(_pair(_SC_PAYLOAD), stats=lambda *a: seen.append(a))
-    tool, raw, emitted, passthrough, reason, structured = seen[0]
+    tool, raw, emitted, passthrough, reason, structured, structured_out = seen[0]
     assert emitted == ""
     assert raw == json.dumps(_SC_PAYLOAD)                  # the sink still sees the original
     assert reason == "mirror_dropped"
-    assert structured is not None and "__terse_" in structured
+    # replace = compress the typed field AND drop the mirror block, so the two ledger sides
+    # differ (#141): raw side is the original, emitted side the compressed field.
+    assert structured is not None and "__terse_" not in structured        # raw side
+    assert structured_out is not None and "__terse_" in structured_out    # emitted side
+    assert len(structured_out) < len(structured)
 
 
 def test_structured_replace_tells_the_audit_trace_it_changed_the_result():
