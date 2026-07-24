@@ -40,6 +40,7 @@ transform. The CLI surfaces that pointer; it is not a hard gate here.
 from __future__ import annotations
 
 import fnmatch
+import glob
 import json
 import re
 from typing import Any
@@ -712,7 +713,21 @@ def generate_policy(
         comment = (f"{r['n']} payload(s) in {r['n_results']} result(s)"
                    + (f", {r['joined_results']} scored joined" if r.get("joined_results") else "")
                    + f", {r['reason']}")
-        entry: dict[str, Any] = {"_comment": comment, "match": {"tool": r["tool"]},
+        # A generated rule names ONE exact tool, but `match.tool` is an fnmatch glob
+        # (hand-authored rules use `gh.*`, `*.rate_limit`). A tool or server name carrying
+        # a glob metacharacter — `*` `?` `[` — would otherwise author a rule that governs
+        # more than the tool it was measured on: `qualify("*", "runecho")` -> `runecho.*`,
+        # one tool's tiers (and `capture: false`) silently landing on every tool of that
+        # server (#157). `glob.escape` wraps each metacharacter in a one-char class
+        # (`search*` -> `search[*]`), which fnmatch reads as the literal — so the rule
+        # matches exactly its own name and nothing else. Names without metacharacters (the
+        # overwhelming common case) are returned unchanged, so this is a no-op there and
+        # the stored form stays readable. Escaping at the single serialization point keeps
+        # it self-consistent: `select`, `_shadowing`, and `merge_policy`'s equality key all
+        # read this same stored string, so the escaped literal is simultaneously a
+        # correct fnmatch pattern and a stable merge key.
+        entry: dict[str, Any] = {"_comment": comment,
+                                 "match": {"tool": glob.escape(r["tool"])},
                                  "tiers": r["tiers"]}
         # Drop-to-retrieve suggestions ride along INACTIVE: the loader reads `fields`, not
         # `_suggested_fields`, so this is a no-op until the operator renames it. Drop is

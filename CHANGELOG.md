@@ -10,6 +10,18 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Fixed
+- **A generated rule name carrying a glob metacharacter governed more than its own tool
+  (#157).** `policy generate`/`autotune` author `"match": {"tool": name}`, and
+  `Policy.select` reads `match.tool` as an fnmatch glob (hand-authored rules use `gh.*`,
+  `*.rate_limit`). A tool or server name containing `*`, `?`, or `[` therefore authored a
+  rule that silently over-matched: `qualify("*", "runecho")` → `runecho.*`, one tool's
+  tiers — and its `capture: false` — landing on every tool of that server. The generated
+  name is now `glob.escape`d at the single serialization point, so it matches its own
+  literal name and nothing else. Names without metacharacters (the common case) are
+  unchanged, so the stored policy stays readable, and `select`/`_shadowing`/`merge_policy`
+  all keep reading the one stored string, so the escaped form is both a correct pattern
+  and a stable merge key. Neither name is attacker-controlled in any supported deployment,
+  so this was a robustness gap, not a vulnerability.
 - **A capture/audit/stats sink that HUNG — rather than raised — froze every later tool
   call on the connection.** The sinks were invoked inside `transform_response`'s
   `_local_lock`, and the fail-open `try/except` around them only ever caught a sink that
