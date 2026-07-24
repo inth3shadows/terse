@@ -36,7 +36,13 @@ def mkdir_restricted(path: str | Path, *, mode: int = 0o700) -> None:
     try:
         p.mkdir(mode=mode)
     except FileExistsError:
-        pass  # operator's directory, operator's mode
+        # An existing DIRECTORY is the normal case: operator's directory, operator's mode.
+        # An existing regular FILE at this path is not — `Path.mkdir(exist_ok=True)`
+        # deliberately re-raises for a non-directory, and swallowing it here turned a
+        # clear "File exists" into a baffling `NotADirectoryError` thrown later from
+        # inside `tempfile.mkstemp` on the first write.
+        if not p.is_dir():
+            raise
 
 
 def write_restricted(path: str | Path, text: str, *, mode: int = 0o600) -> None:

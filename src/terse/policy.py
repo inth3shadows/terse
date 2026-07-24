@@ -60,7 +60,18 @@ SENSITIVE_SERVER_RE = re.compile(
     # Personal-data servers. Not credentials, but the `never_lossy` floor exists to stop a
     # lossy transform silently eating content the operator cannot afford to lose, and a
     # mailbox or contact list is exactly that.
-    r"|gmail|mail\b|inbox|contacts|calendar|drive|photos", re.I
+    #
+    # `mail` is UNBOUNDED on the right so it also catches `mailbox`/`mailstore` — a
+    # trailing `\b` looked tighter but put the boundary between `l` and `b`, where there
+    # isn't one, so `mailbox` sailed past the very floor this line adds. Erring toward
+    # over-match here is correct: the cost is one server needlessly lossless.
+    #
+    # `drive` is BOUNDED, for the opposite reason: unbounded it matched `webdriver`,
+    # `chromedriver` and `selenium-driver` — browser-automation servers, whose verbose
+    # output is precisely what lossy exists for. Bounded plus the real product spellings
+    # keeps Google Drive covered without disabling lossy on Playwright-shaped servers.
+    r"|gmail|mail|inbox|contacts|calendar|photos|\bdrive\b|gdrive|onedrive|google-?drive",
+    re.I
 )
 
 

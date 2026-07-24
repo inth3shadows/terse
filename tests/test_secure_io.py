@@ -227,3 +227,13 @@ def test_capture_corpus_dir_is_created_owner_only(tmp_path):
     capture_payload("some.tool", '{"a": 1}', corpus)
     assert _mode(corpus) == 0o700
     assert all(_mode(f) == 0o600 for f in corpus.glob("*.json"))
+
+
+def test_mkdir_restricted_still_raises_when_the_path_is_a_file(tmp_path):
+    # `Path.mkdir(exist_ok=True)` deliberately re-raises for a NON-directory. Swallowing
+    # every FileExistsError dropped that, turning a clear "File exists" into a baffling
+    # NotADirectoryError thrown much later from inside tempfile.mkstemp on the first write.
+    clash = tmp_path / "corpus"
+    clash.write_text("i am a file", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        sio.mkdir_restricted(clash)

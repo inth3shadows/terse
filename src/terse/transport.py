@@ -18,6 +18,7 @@ import http.client
 import ipaddress
 import json
 import queue
+import socket
 import subprocess
 import urllib.error
 import urllib.request
@@ -46,7 +47,19 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 # Header names that carry credentials. A downstream with one of these over cleartext
 # http to a REMOTE host would put the secret on the wire unencrypted — refuse at
 # construction, mirroring fluency's answerer guard (parity noted in the 07-14 audit).
-_SENSITIVE_HEADER_TOKENS = ("authorization", "token", "secret", "key", "cookie")
+# The same list decides what `_GuardedRedirectHandler` STRIPS on a cross-origin hop, so a
+# name missing here is a credential that leaves the machine.
+#
+# `auth`, not `authorization`: the narrower token matched `Authorization` but sailed past
+# `X-Auth` and `Authentication`, both of which were observed reaching a cross-origin sink
+# intact. `session` is here because MCP's `Mcp-Session-Id` is bearer-equivalent — a server
+# that pins state to it treats presenting it as proof of identity. Deliberately
+# over-inclusive: a false positive costs one header on a redirect (or an http:// config
+# refusal the operator resolves with https), a false negative costs the secret.
+_SENSITIVE_HEADER_TOKENS = (
+    "auth", "token", "secret", "key", "cookie", "session", "bearer",
+    "credential", "passwd", "password", "signature",
+)
 
 
 def _has_sensitive_header(headers: dict[str, str]) -> bool:
@@ -75,14 +88,26 @@ def guard_cleartext_credential(base_url: str, has_credential: bool, *, what: str
         f"({'/'.join(sorted(_LOOPBACK_HOSTS))}) for a local gateway")
 
 
+# A scheme's implicit port, so `https://h` and `https://h:443` are ONE origin. Without
+# this they compared unequal and a legitimate same-host redirect silently lost its
+# credential, producing an unexplained 401 the operator has no way to diagnose.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
 def _origin(url: str) -> tuple[str, str, int | None]:
-    """(scheme, host, port) — the identity a credential header is scoped to."""
+    """(scheme, host, port) — the identity a credential header is scoped to.
+
+    Normalized so two spellings of the same origin compare EQUAL: the default port is
+    made explicit, and an IP-literal host is canonicalized through `ipaddress` (`::1` and
+    `0:0:0:0:0:0:0:1` are the same host; so are `127.0.0.1` and its decimal form)."""
     parts = urlsplit(url)
+    scheme = parts.scheme.lower()
     try:
         port = parts.port
     except ValueError:
         port = None  # malformed port; treat as its own origin rather than crashing here
-    return (parts.scheme.lower(), (parts.hostname or "").lower(), port)
+    host = _canonical_host(parts.hostname)
+    return (scheme, host, port if port is not None else _DEFAULT_PORTS.get(scheme))
 
 
 class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -134,6 +159,44 @@ class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
         return new
 
 
+def _as_ip(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """`hostname` as an IP address if it is a literal in ANY encoding the resolver
+    accepts, else None.
+
+    `ipaddress.ip_address` alone is not enough, and the gap is a live SSRF bypass rather
+    than a nicety: it parses only dotted-quad, while glibc's `getaddrinfo` — the thing
+    that actually dials — also accepts decimal (`2852039166`), octal
+    (`0251.0376.0251.0376`), hex (`0xa9.0xfe.0xa9.0xfe`) and short (`169.254.43518`)
+    forms. Every one of those resolves to 169.254.169.254 and every one of them was
+    classified "not an IP, therefore allowed" by the guard whose whole job is refusing
+    that address. `socket.inet_aton` accepts exactly the same set, so canonicalizing
+    through it closes the encodings without resolving DNS (rebinding stays out of scope,
+    as documented on `_is_metadata_host`).
+
+    The trailing dot — `169.254.169.254.` — is the fully-qualified form; the resolver
+    accepts it and `inet_aton` does not, so strip it first."""
+    host = hostname.strip("[]").rstrip(".")
+    if not host:
+        return None
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(host))
+    except (OSError, ValueError):
+        return None  # a real DNS name, not classifiable without resolving
+
+
+def _canonical_host(hostname: str | None) -> str:
+    """A host's one canonical spelling, for origin comparison. IP literals go through
+    `_as_ip` so alternate encodings of one address collapse to a single string."""
+    if not hostname:
+        return ""
+    ip = _as_ip(hostname)
+    return str(ip) if ip is not None else hostname.lower().rstrip(".")
+
+
 def _is_metadata_host(hostname: str | None) -> bool:
     """True for a link-local target — the cloud instance-metadata SSRF endpoint
     (169.254.169.254 across AWS/Azure/GCP/DO, fe80::/10, and GCP's
@@ -145,11 +208,8 @@ def _is_metadata_host(hostname: str | None) -> bool:
         return False
     if hostname.lower().rstrip(".") == "metadata.google.internal":
         return True
-    try:
-        ip = ipaddress.ip_address(hostname.strip("[]"))
-    except ValueError:
-        return False  # a DNS name / non-literal — not classifiable without resolving
-    return ip.is_link_local
+    ip = _as_ip(hostname)   # every encoding the resolver accepts, not just dotted-quad
+    return ip is not None and ip.is_link_local
 
 
 class Transport(Protocol):
@@ -356,6 +416,7 @@ class HttpTransport:
         # handler that re-applies these same guards to every hop (see
         # `_GuardedRedirectHandler`). Built per-transport because the handler is bound to
         # THIS downstream's origin, which is what decides a cross-origin credential strip.
+        self._own_origin = _origin(url)
         self._opener = urllib.request.build_opener(_GuardedRedirectHandler(url))
         self._q: queue.Queue[Any] = queue.Queue()
         # MCP Streamable HTTP session affinity: some servers pin a client to
@@ -403,9 +464,17 @@ class HttpTransport:
                                      headers=req_headers, method="POST")
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:  # noqa: S310
-                sid = resp.headers.get("Mcp-Session-Id")
-                if sid:
-                    self.session = sid
+                # Only the CONFIGURED downstream may set our session id. After a redirect
+                # `resp` is the final hop's response, so without this check a hostile
+                # server could 302 to a host of its choosing and have that host's
+                # `Mcp-Session-Id` stored — which terse then presented on every subsequent
+                # POST to the legitimate downstream. That is session fixation: an attacker
+                # picks the session the real server sees. (`geturl()` is the post-redirect
+                # url; on a non-redirected response it equals `self.url`.)
+                if _origin(resp.geturl()) == self._own_origin:
+                    sid = resp.headers.get("Mcp-Session-Id")
+                    if sid:
+                        self.session = sid
                 ctype = resp.headers.get("Content-Type", "")
                 # Bounded read: one byte past the cap tells us it overflowed without
                 # trusting a (possibly absent/lying) Content-Length. An over-limit body

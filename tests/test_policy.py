@@ -479,6 +479,9 @@ def test_never_lossy_floor_catches_password_managers(server):
 
 @pytest.mark.parametrize("server", [
     "gmail", "mail", "inbox", "google-contacts", "calendar", "gdrive", "photos",
+    # `mailbox` needs `mail` unbounded on the right: a trailing `\b` put the boundary
+    # between `l` and `b`, where there is none, so it missed.
+    "mailbox", "mailstore", "onedrive", "google-drive", "drive",
 ])
 def test_never_lossy_floor_catches_personal_data_servers(server):
     # Not credentials, but the floor exists to stop a lossy transform silently eating
@@ -490,6 +493,9 @@ def test_never_lossy_floor_catches_personal_data_servers(server):
 @pytest.mark.parametrize("server", [
     "runecho", "codegraph", "lodestone", "shot-mcp", "filesystem", "openapi-tools",
     "operator-console", "playwright",
+    # Browser-automation servers: an unbounded `drive` matched every one of these, which
+    # would disable lossy on exactly the verbose output lossy exists for.
+    "webdriver", "chromedriver", "selenium-driver", "driver",
 ])
 def test_never_lossy_floor_does_not_overmatch_ordinary_servers(server):
     # The floor must stay a floor. `\bop\b` in particular is word-bounded on purpose:
