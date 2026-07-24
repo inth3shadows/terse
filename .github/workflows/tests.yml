@@ -39,4 +39,8 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --dev          # no anthropic extra: keeps CI keyless, matches design
-      - run: uv run pytest -q
+      # Coverage is REPORTED, never gated: no --cov-fail-under. The suite had no coverage
+      # number at all before this, and a threshold picked before anyone had looked at the
+      # baseline would be an arbitrary gate that fails on unrelated PRs. Printing it every
+      # run is what makes the number visible enough to set an honest floor later.
+      - run: uv run pytest -q --cov --cov-report=term-missing

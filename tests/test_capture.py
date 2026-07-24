@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -134,3 +135,43 @@ def test_a_legacy_envelope_does_not_adopt_a_new_result_id():
     again = json.loads(capture_payload("t", '{"a":1}', corpus, result_id="s:9").read_text())
     assert "result_id" not in again
     assert again["captured_at"] == first["captured_at"]
+
+
+def test_corpus_is_capped_per_tool_evicting_oldest(tmp_path):
+    """Unbounded corpus growth was the one sink with no retention (stats.py and
+    history.py both rotate). Envelopes hold raw payloads, so this bounds a real
+    data-hoarding surface, not just disk."""
+    for i in range(8):
+        p = capture_payload("gh.api.items", json.dumps({"n": i}), tmp_path,
+                                    max_per_tool=3)
+        os.utime(p, (i, i))   # deterministic mtime ordering — eviction is oldest-first
+    kept = sorted(tmp_path.glob("gh.api.items__*.json"))
+    assert len(kept) == 3
+    survivors = {json.loads(p.read_text())["raw"] for p in kept}
+    assert survivors == {json.dumps({"n": i}) for i in (5, 6, 7)}
+
+
+def test_cap_is_per_tool_so_a_chatty_tool_cannot_evict_a_quiet_one(tmp_path):
+    capture_payload("quiet.tool", json.dumps({"keep": "me"}), tmp_path,
+                            max_per_tool=2)
+    for i in range(6):
+        capture_payload("chatty.tool", json.dumps({"n": i}), tmp_path,
+                                max_per_tool=2)
+    assert len(list(tmp_path.glob("quiet.tool__*.json"))) == 1
+    assert len(list(tmp_path.glob("chatty.tool__*.json"))) == 2
+
+
+def test_max_per_tool_none_retains_everything(tmp_path):
+    for i in range(5):
+        capture_payload("gh.api.items", json.dumps({"n": i}), tmp_path,
+                                max_per_tool=None)
+    assert len(list(tmp_path.glob("gh.api.items__*.json"))) == 5
+
+
+def test_recapturing_an_existing_sha_evicts_nothing(tmp_path):
+    for i in range(3):
+        capture_payload("gh.api.items", json.dumps({"n": i}), tmp_path,
+                                max_per_tool=3)
+    capture_payload("gh.api.items", json.dumps({"n": 0}), tmp_path,
+                            max_per_tool=3)
+    assert len(list(tmp_path.glob("gh.api.items__*.json"))) == 3

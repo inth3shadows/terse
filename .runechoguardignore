@@ -119,3 +119,7 @@ resolve
 # outside the appended hunk, so it reads as unresolved. The original hunk-split class
 # documented at the top of this file; a missing import fails collection immediately.
 given
+# proxy.py transform_response: `for label, sink_tool, run_sink in deferred:` — a local
+# holding the deferred sink CALLABLE, invoked bare as run_sink(). Same local-variable
+# false-positive class as real/orig_send/real_minify above; pytest confirms it resolves.
+run_sink
