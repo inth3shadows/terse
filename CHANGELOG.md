@@ -10,6 +10,17 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Fixed
+- **The lossless codec could emit MORE tokens than the server sent, silently (#154).** On a
+  record set too small to amortize the `__terse_table__` header — a 2-row `list_*`, a
+  filtered query, a shrunk result — `tabularize` produced a form larger than the raw
+  payload, and nothing compared the two, so terse shipped the inflated version. The
+  reported saving is an average, so a long tail of inflated small payloads hid behind a
+  positive headline. `compress_with` now holds the same emit-only-if-smaller contract the
+  diff tier already does and the dictionary tier held per-alias: the tiered form is emitted
+  only when it tokenizes strictly smaller than plain minify, else the plain lossless form
+  ships. Compared on the tokenizer, since a shorter byte string can tokenize longer. Zero
+  occurrences on the live corpus (0 of 624) — a latent hole closed before it bit, and the
+  `text_alias_ceiling` tripwire now reads zero by construction rather than by luck.
 - **A generated rule name carrying a glob metacharacter governed more than its own tool
   (#157).** `policy generate`/`autotune` author `"match": {"tool": name}`, and
   `Policy.select` reads `match.tool` as an fnmatch glob (hand-authored rules use `gh.*`,

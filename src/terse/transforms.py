@@ -589,21 +589,39 @@ def compress_with(obj: Any, tabularize: bool = True, dictionary: bool = True) ->
 
     `decompress` auto-detects the markers, so any combination round-trips. minify is
     always applied (it is the serialization). Pass both False for minify-only.
+
+    Emit-only-if-smaller (#154): the tiered form is NEVER returned when it tokenizes no
+    smaller than plain minify. `tabularize`'s `__terse_table__` header and envelope cost a
+    fixed number of tokens that a small record set (a 2-row `list_*`, a filtered query, a
+    shrunk result) cannot amortize, so the codec could otherwise emit MORE tokens than the
+    server sent — silently, since the reported saving is an average that hides a per-payload
+    regression. `dict_encode` already guards its own legend per-alias; this is the same
+    contract one level up, covering the table header the per-alias guard cannot see. The
+    diff tier holds the identical "emit the delta only when it's smaller" contract.
     """
+    plain = minify(obj)  # the lossless floor: never larger than a well-formed raw payload
+    if not tabularize and not dictionary:
+        return plain
     structure = compress_structure(obj) if tabularize else obj
-    if not dictionary:
-        return minify(structure)
-    base, memo = _build_canon_memo(structure)  # root canon doubles as the minified base
-    data, legend = dict_encode(structure, memo)
-    if legend:
-        coded = minify({DICT_MARKER: 1, "legend": legend, "data": data})
-        # Net-token guard: with whole-subtree aliasing the per-candidate estimate
-        # can mis-rank under nesting overlap, so commit the dict block only when it
-        # is actually smaller. Losslessness is independent (the round-trip gate);
-        # this guards SIZE — the dict tier can never regress the payload.
-        if _tok_text(coded) < _tok_text(base):
-            return coded
-    return base
+    candidate = minify(structure)
+    if dictionary:
+        base, memo = _build_canon_memo(structure)  # root canon doubles as the minified base
+        data, legend = dict_encode(structure, memo)
+        if legend:
+            coded = minify({DICT_MARKER: 1, "legend": legend, "data": data})
+            # Net-token guard: with whole-subtree aliasing the per-candidate estimate
+            # can mis-rank under nesting overlap, so commit the dict block only when it
+            # is actually smaller. Losslessness is independent (the round-trip gate);
+            # this guards SIZE — the dict tier can never regress the payload.
+            if _tok_text(coded) < _tok_text(base):
+                candidate = coded
+            else:
+                candidate = base
+        else:
+            candidate = base
+    # Compared on the tokenizer, not bytes: a shorter byte string can tokenize longer.
+    # Ties go to `plain` — no reason to ship the more complex form for zero saving.
+    return candidate if _tok_text(candidate) < _tok_text(plain) else plain
 
 
 def compress(obj: Any) -> str:

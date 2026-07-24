@@ -139,3 +139,40 @@ def test_proxy_forwards_too_deep_payload_unchanged():
     out = inter.transform_response(reply)
     assert json.loads(out) == json.loads(reply)  # payload untouched
     assert inter.last == {}                       # and never stored as a diff base
+
+
+# --- #154: emit-only-if-smaller — the codec must never emit a tiered form larger than
+#     plain minify. A small record set can't amortize the __terse_table__ header/envelope.
+
+def test_small_record_array_is_not_inflated_by_tabularize():
+    """The issue's own example: 2 rows x 2 cols. The table header costs more than it folds,
+    so the codec must fall back to plain minify (byte-identical to the compact raw), not
+    ship a larger `__terse_table__` envelope."""
+    obj = {"rows": [{"a": 1, "b": "x"}, {"a": 2, "b": "x"}]}
+    plain = transforms.minify(obj)
+    out = transforms.compress_with(obj, tabularize=True, dictionary=True)
+    assert transforms.decompress(out) == obj                     # still lossless
+    assert transforms._tok_text(out) <= transforms._tok_text(plain)
+    assert "__terse_table__" not in out                          # the tiered form was rejected
+    assert out == plain                                          # byte-identical to compact raw
+
+
+def test_guard_does_not_over_fire_when_tabularize_wins():
+    """A 20-row array clears the header cost — the guard must let the table through, or it
+    would defeat the codec's best shape."""
+    big = {"rows": [{"a": i, "status": "active",
+                     "url": "https://x.example/api/items"} for i in range(20)]}
+    out = transforms.compress_with(big)
+    assert "__terse_table__" in out
+    assert transforms._tok_text(out) < transforms._tok_text(transforms.minify(big))
+
+
+def test_compress_never_exceeds_minify_across_small_arrays():
+    """Property: for record arrays of length 1..6, the emitted form is never more tokens
+    than plain minify — the guarantee #154 asks for, swept across the small end where the
+    header is hardest to amortize."""
+    for n in range(1, 7):
+        obj = {"rows": [{"a": i, "b": "x"} for i in range(n)]}
+        out = transforms.compress_with(obj)
+        assert transforms._tok_text(out) <= transforms._tok_text(transforms.minify(obj)), n
+        assert transforms.decompress(out) == obj

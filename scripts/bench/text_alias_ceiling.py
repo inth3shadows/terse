@@ -386,7 +386,10 @@ def run_corpus(corpus: Path, pol: policy_mod.Policy) -> dict:
     baseline = make_baseline(pol)
     agg: dict[str, Counter] = defaultdict(Counter)
     winners: Counter = Counter()
-    infl = Counter()
+    # Seed the reported keys so a clean run (no inflation — the #154 guard holds) still
+    # produces a full `inflation` dict, rather than one missing `inflated_n`/`inflated_tok`
+    # that a consumer must `.get(...)` defensively.
+    infl: Counter = Counter({"n": 0, "below_floor": 0, "inflated_n": 0, "inflated_tok": 0})
     for env in capture.load_corpus(corpus):
         raw, tool = env.get("raw"), env.get("tool", "?")
         if not isinstance(raw, str) or not raw:
@@ -511,8 +514,9 @@ def print_corpus(res: dict, policy_label: str) -> None:
           f"({inf.get('below_floor', 0)} of them below the {MIN_SCORED_TOKENS}-token "
           f"scoring floor):")
     print(f"  terse emits LARGER than raw on {inf.get('inflated_n', 0)} "
-          f"(+{inf.get('inflated_tok', 0):,} tok) — no emit-only-if-smaller guard on the "
-          "lossless stage")
+          f"(+{inf.get('inflated_tok', 0):,} tok) — expected 0: the emit-only-if-smaller "
+          "guard on the lossless stage (#154) never ships a tiered form above plain minify. "
+          "A non-zero count is a regression in that guard.")
     _print_limits(res.get("limits", {}))
 
 
