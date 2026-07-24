@@ -17,6 +17,28 @@ from pathlib import Path
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
+def mkdir_restricted(path: str | Path, *, mode: int = 0o700) -> None:
+    """`mkdir -p` for a directory terse will fill with restricted files, created owner-only
+    instead of at the process umask (0755 in practice).
+
+    The files inside are already 0600, so contents were never exposed — but the NAMES were:
+    a corpus entry is `{tool}__{sha8}.json`, so a world-readable directory leaks the tool
+    inventory and payload content hashes to any local user.
+
+    Only the mode of directories terse CREATES is pinned; a pre-existing directory is left
+    exactly as the operator set it. `--capture-dir` can point anywhere, and silently
+    chmod'ing a directory the operator made for their own reasons is a side effect a
+    logging call has no business having. `parents=True` intentionally creates missing
+    ANCESTORS at the default umask: they are ordinary path components (`~/.local/state`),
+    not terse-managed payload directories."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        p.mkdir(mode=mode)
+    except FileExistsError:
+        pass  # operator's directory, operator's mode
+
+
 def write_restricted(path: str | Path, text: str, *, mode: int = 0o600) -> None:
     # Atomic full-file write: stage into a sibling temp file, fsync, then os.replace()
     # onto the target. A crash/SIGKILL mid-write can now only leave the temp behind —

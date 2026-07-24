@@ -36,6 +36,7 @@ from . import capture, fluency
 from . import lossy as lossy_mod
 from . import policy as policy_mod
 from .proxy import TERSE_PRIMER
+from .transport import guard_cleartext_credential
 
 
 # --------------------------------------------------------------------------- #
@@ -583,6 +584,10 @@ def openai_tool_answerer(base_url: str, api_key: str, model: str, tools: list[di
     urllib (no SDK dependency, matching fluency.openai_answerer). `tools` (RETRIEVE_TOOL_DEF
     shape) is bound at construction time — every call to the returned answerer offers the
     same tool set, as a real client would."""
+    # Same cleartext-credential refusal fluency.openai_answerer makes. This constructor
+    # sends the identical `Authorization: Bearer <key>` and had NO such guard, so a
+    # `--base-url http://remote/v1` put the key on the wire in the clear.
+    guard_cleartext_credential(base_url, bool(api_key), what="terse drop-eval")
     url = base_url.rstrip("/") + "/chat/completions"
     oai_tools = [_to_openai_tool(t) for t in tools]
     # Reverse of the `_oai_name` rewrite, so a returned tool_call is scored against the MCP

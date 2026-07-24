@@ -184,3 +184,46 @@ def test_append_restricted_refuses_to_follow_a_symlink(tmp_path):
     with pytest.raises(OSError):
         sio.append_restricted(link, "pwned")
     assert target.read_text(encoding="utf-8") == "original"
+
+
+# --- mkdir_restricted (security audit 2026-07-23) --------------------------------------
+# Files terse writes were already 0600, but the directories holding them were created at
+# the process umask (0755 in practice). Contents were never exposed — the NAMES were: a
+# corpus entry is `{tool}__{sha8}.json`, so any local user could read off the tool
+# inventory and payload content hashes.
+
+def test_mkdir_restricted_creates_dir_owner_only(tmp_path):
+    d = tmp_path / "corpus"
+    sio.mkdir_restricted(d)
+    assert d.is_dir()
+    assert _mode(d) == 0o700
+
+
+def test_mkdir_restricted_leaves_an_existing_dir_alone(tmp_path):
+    # `--capture-dir` can point anywhere. Silently chmod'ing a directory the operator
+    # created for their own reasons is a side effect a logging call has no business
+    # having, so a pre-existing dir keeps whatever mode it had.
+    d = tmp_path / "preexisting"
+    d.mkdir(mode=0o755)
+    sio.mkdir_restricted(d)
+    assert _mode(d) == 0o755
+
+
+def test_mkdir_restricted_is_idempotent_and_creates_parents(tmp_path):
+    d = tmp_path / "a" / "b" / "corpus"
+    sio.mkdir_restricted(d)
+    sio.mkdir_restricted(d)          # second call must not raise
+    assert _mode(d) == 0o700
+    # Ancestors are ordinary path components (`~/.local/state`), not payload dirs —
+    # deliberately left at the default umask rather than tightened.
+    assert (tmp_path / "a").is_dir()
+
+
+def test_capture_corpus_dir_is_created_owner_only(tmp_path):
+    # End-to-end through the real caller: the corpus dir, not just the helper.
+    from terse.capture import capture_payload
+
+    corpus = tmp_path / "session-corpus"
+    capture_payload("some.tool", '{"a": 1}', corpus)
+    assert _mode(corpus) == 0o700
+    assert all(_mode(f) == 0o600 for f in corpus.glob("*.json"))

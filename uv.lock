@@ -590,7 +590,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "tiktoken", specifier = ">=0.7" }]
+requires-dist = [{ name = "tiktoken", specifier = ">=0.8,<1" }]
 
 [package.metadata.requires-dev]
 dev = [

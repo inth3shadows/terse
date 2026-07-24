@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from ._secure_io import append_restricted
+from ._secure_io import append_restricted, mkdir_restricted
 from .tokenize import count_cl100k
 
 MAX_LEDGER_BYTES = 10 * 1024 * 1024  # rotate the live file past this size
@@ -134,7 +134,7 @@ def append_stats(record: dict[str, Any], log_path: str | Path,
     Restricted perms for consistency with every other terse-managed file, even though
     records are payload-free."""
     p = Path(log_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
+    mkdir_restricted(p.parent)
     try:
         if p.stat().st_size >= max_bytes:
             p.replace(p.with_name(p.name + ".1"))

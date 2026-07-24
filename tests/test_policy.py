@@ -462,3 +462,38 @@ def test_structured_mode_resolves_against_the_declared_client(tmp_path):
         assert resolve("leave", client) == "leave"
         assert resolve("compress", client) == "compress"
         assert resolve("replace", client) == "replace"
+
+
+# --- never-lossy floor coverage (security audit 2026-07-23) ---------------------------
+# The floor's pattern matched credential-shaped WORDS only, so the two categories most
+# likely to be catastrophic to lossily compress — password managers, whose names contain
+# none of those words, and personal-data servers — sailed straight past it.
+
+@pytest.mark.parametrize("server", [
+    "1password", "onepassword", "op", "bitwarden", "lastpass", "dashlane", "keepass",
+])
+def test_never_lossy_floor_catches_password_managers(server):
+    pol = Policy(rules=[], never_lossy_servers=frozenset())
+    assert pol.server_never_lossy(server), f"{server} is a password manager"
+
+
+@pytest.mark.parametrize("server", [
+    "gmail", "mail", "inbox", "google-contacts", "calendar", "gdrive", "photos",
+])
+def test_never_lossy_floor_catches_personal_data_servers(server):
+    # Not credentials, but the floor exists to stop a lossy transform silently eating
+    # content the operator cannot afford to lose — a mailbox qualifies.
+    pol = Policy(rules=[], never_lossy_servers=frozenset())
+    assert pol.server_never_lossy(server)
+
+
+@pytest.mark.parametrize("server", [
+    "runecho", "codegraph", "lodestone", "shot-mcp", "filesystem", "openapi-tools",
+    "operator-console", "playwright",
+])
+def test_never_lossy_floor_does_not_overmatch_ordinary_servers(server):
+    # The floor must stay a floor. `\bop\b` in particular is word-bounded on purpose:
+    # unbounded it swallows the "op" inside "openapi" and "operator-console", which would
+    # silently disable lossy on servers that were never sensitive.
+    pol = Policy(rules=[], never_lossy_servers=frozenset())
+    assert not pol.server_never_lossy(server)
