@@ -14,6 +14,17 @@ from terse.policy_gen import (
 )
 
 
+def load_policy_from_doc(doc):
+    """Round-trip a generated doc through the real loader — the only path that turns
+    `match.tool` into the fnmatch pattern `Policy.select` actually uses."""
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(doc, f)
+        f.flush()
+        name = f.name
+    return load_policy(name)
+
+
 def _env(tool: str, obj_or_text):
     raw = obj_or_text if isinstance(obj_or_text, str) else json.dumps(obj_or_text)
     return {"tool": tool, "raw": raw}
@@ -710,3 +721,59 @@ def test_resolve_identities_returns_the_pair_select_is_called_with():
         "peer.search": ("search", "peer"),
         "lone": ("lone", None),
     }
+
+
+# --- #157: a glob metacharacter in a tool/server name must not author an over-matching rule ---
+
+def _env_srv(tool: str, server: str, obj_or_text):
+    e = _env(tool, obj_or_text)
+    e["server"] = server
+    return e
+
+
+# Assertions are on rule OBJECT IDENTITY, not `.tiers`: `_records()` earns exactly the
+# default tier set, so a `.tiers == default_tiers` check would pass even when the wrong
+# rule matched (the coincidence that let the first cut of these tests pass pre-fix). The
+# single generated rule is `pol.rules[0]`; `select` returns that same object on a match
+# and a fresh `Rule("*", default_tiers)` on a miss, so `is` / `is not` is exact.
+
+def test_metachar_tool_name_authors_an_exact_rule_not_a_wildcard():
+    """A tool literally named `search*` must govern only itself, never `searchX`.
+
+    Before #157 the raw name went into `match.tool`, which `Policy.select` reads as an
+    fnmatch glob — so `search*` matched every tool starting `search`. The name is now
+    escaped at authoring (`search[*]`), which fnmatch reads as the literal `*`.
+    """
+    doc, _ = generate_policy([_env("search*", _records()) for _ in range(3)])
+    pol = load_policy_from_doc(doc)
+    (gen_rule,) = pol.rules
+    assert pol.select("search*") is gen_rule                     # the measured tool is governed
+    # A sibling that merely shares the prefix must NOT resolve to the generated rule.
+    assert pol.select("searchX") is not gen_rule
+    assert pol.select("search_users") is not gen_rule
+
+
+def test_server_glob_metachar_does_not_govern_the_whole_server():
+    """The issue's own example: `qualify("*", "runecho")` -> `runecho.*` must not become a
+    catch-all for every runecho tool."""
+    doc, _ = generate_policy([_env_srv("*", "runecho", _records()) for _ in range(3)])
+    pol = load_policy_from_doc(doc)
+    (gen_rule,) = pol.rules
+    assert pol.select("*", server="runecho") is gen_rule         # the exact captured tool
+    assert pol.select("structure", server="runecho") is not gen_rule  # not every runecho tool
+
+
+def test_bracket_metachar_tool_name_is_escaped():
+    """`data[1]` is an fnmatch character class matching the single char `1`; escaped it
+    matches the literal name and nothing else."""
+    doc, _ = generate_policy([_env("data[1]", _records()) for _ in range(3)])
+    pol = load_policy_from_doc(doc)
+    (gen_rule,) = pol.rules
+    assert pol.select("data[1]") is gen_rule                     # the literal name resolves
+    assert pol.select("data1") is not gen_rule                   # the class char does not
+
+
+def test_plain_tool_names_are_stored_unchanged():
+    """Escaping is a no-op on the common case, so the stored policy stays readable."""
+    doc, _ = generate_policy([_env("gh.items", _records()) for _ in range(3)])
+    assert any(p["match"]["tool"] == "gh.items" for p in doc["policies"])
