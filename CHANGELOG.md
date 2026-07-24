@@ -25,6 +25,29 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   `policy generate` and the #136 autotune loop, so a skewed per-tool saving produced a
   skewed policy. *(#141 part 2 — `terse stats` counts BLOCKS but labels them "results" — is
   tracked separately; it's a wider naming change.)*
+- **The lossless codec could emit MORE tokens than the server sent, silently (#154).** On a
+  record set too small to amortize the `__terse_table__` header — a 2-row `list_*`, a
+  filtered query, a shrunk result — `tabularize` produced a form larger than the raw
+  payload, and nothing compared the two, so terse shipped the inflated version. The
+  reported saving is an average, so a long tail of inflated small payloads hid behind a
+  positive headline. `compress_with` now holds the same emit-only-if-smaller contract the
+  diff tier already does and the dictionary tier held per-alias: the tiered form is emitted
+  only when it tokenizes strictly smaller than plain minify, else the plain lossless form
+  ships. Compared on the tokenizer, since a shorter byte string can tokenize longer. Zero
+  occurrences on the live corpus (0 of 624) — a latent hole closed before it bit, and the
+  `text_alias_ceiling` tripwire now reads zero by construction rather than by luck.
+- **A generated rule name carrying a glob metacharacter governed more than its own tool
+  (#157).** `policy generate`/`autotune` author `"match": {"tool": name}`, and
+  `Policy.select` reads `match.tool` as an fnmatch glob (hand-authored rules use `gh.*`,
+  `*.rate_limit`). A tool or server name containing `*`, `?`, or `[` therefore authored a
+  rule that silently over-matched: `qualify("*", "runecho")` → `runecho.*`, one tool's
+  tiers — and its `capture: false` — landing on every tool of that server. The generated
+  name is now `glob.escape`d at the single serialization point, so it matches its own
+  literal name and nothing else. Names without metacharacters (the common case) are
+  unchanged, so the stored policy stays readable, and `select`/`_shadowing`/`merge_policy`
+  all keep reading the one stored string, so the escaped form is both a correct pattern
+  and a stable merge key. Neither name is attacker-controlled in any supported deployment,
+  so this was a robustness gap, not a vulnerability.
 - **A capture/audit/stats sink that HUNG — rather than raised — froze every later tool
   call on the connection.** The sinks were invoked inside `transform_response`'s
   `_local_lock`, and the fail-open `try/except` around them only ever caught a sink that

@@ -375,13 +375,17 @@ def test_marginal_column_is_fleet_points_not_a_percent_of_terses_output() -> Non
 # ---------------------------------------------------------------- corpus population
 
 
-def test_inflation_is_counted_over_every_payload_not_just_scored_ones(
+def test_inflation_counter_sees_below_floor_payloads_but_the_guard_prevents_inflation(
         tmp_path: Path) -> None:
-    """The two-population split, which had NO coverage — re-applying the scoring floor to
-    the inflation counter (i.e. reinstating the bug it fixed) shipped green.
+    """Two properties in one fixture, both about the below-floor population:
 
-    Inflation happens BELOW the token floor, on payloads too small to amortize a table
-    header, so a counter that only sees scored payloads is structurally blind to it.
+    1. The inflation counter's denominator includes payloads under the scoring floor —
+       the two-population split, which a counter reusing the scoring filter would be blind
+       to (the bug PR #153's counter fixed).
+    2. Post-#154, the emit-only-if-smaller guard means such a payload — the classic
+       can't-amortize-the-table-header case — is emitted at plain-minify size, so it is
+       NOT counted as inflated. Before #154 this same fixture inflated; the guard is what
+       makes the tripwire read zero on the live corpus.
     """
     corpus = tmp_path / "corpus"
     corpus.mkdir()
@@ -392,8 +396,8 @@ def test_inflation_is_counted_over_every_payload_not_just_scored_ones(
 
     res = tac.run_corpus(corpus, tac.policy_mod.default_policy())
     infl = res["inflation"]
-    assert infl["n"] == 1
+    assert infl["n"] == 1                                  # the counter SAW it...
     assert infl["below_floor"] == 1, "fixture must sit below the scoring floor"
-    assert infl["inflated_n"] == 1, "…and must still be counted as inflated"
-    assert infl["inflated_tok"] > 0
-    assert res["by_shape"] == {}, "nothing was scored, yet inflation was still reported"
+    assert infl["inflated_n"] == 0, "the #154 guard emits plain minify, so nothing inflates"
+    assert infl["inflated_tok"] == 0
+    assert res["by_shape"] == {}, "nothing was scored (below floor), yet it was still counted"
