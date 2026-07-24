@@ -299,7 +299,7 @@ def test_run_drop_fluency_scores_a_text_payload():
             call_id="c1", name=lossy.RETRIEVE_TOOL,
             arguments={"handle": recall.expected_handle})])
 
-    rows = dropeval.run_drop_fluency(envelopes, lambda _t: rule, {"m": answerer})["m"]
+    rows = dropeval.run_drop_fluency(envelopes, lambda _t, _s=None: rule, {"m": answerer})["m"]
     recall_row = next(r for r in rows if r["kind"] == "recall")
     assert recall_row["retrieve_ok"] == 1 and recall_row["handle_ok"] == 1
     assert recall_row["answer_ok"] == 1

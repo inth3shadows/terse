@@ -26,12 +26,31 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
     candidate against **every** rule before the bare name, so with `runecho.*` deployed a
     corpus-derived `structure` rule is dead on arrival — position cannot save it, only the
     qualified name can. Generated rules are now authored under the same name the runtime
-    looks them up by, which also makes a deployed server-scoped rule visible to the merge's
-    shadow check (it inherits that rule's operator-owned keys instead of appending a rule
-    the loader never reaches). On the live 1663-payload corpus this was ~35 shadow rules in
-    the autotune diff, all of which a human had to hand-filter.
+    looks them up by. On the live 1663-payload corpus this was ~35 shadow rules in the
+    autotune diff, all of which a human had to hand-filter.
+  - *The merge's shadow check resolves on the `(bare tool, server)` pair, candidate-major.*
+    Naming the rule is only half of it: the check has to find the rule the LOADER would.
+    Both a deployed `runecho.*` and a deployed bare `structure` govern a tool captured from
+    runecho, and either one's operator-owned keys must be inherited — otherwise autotune
+    hands a tool from a `capture: false` rule to a fresh one with capture ON, silently
+    reversing the #85 decision and reporting it as a benign "(new rule)". Candidate-major
+    also matters when both are deployed: rule-major picks `structure`, the loader picks
+    `runecho.*`, and inheriting the wrong rule's keys is worse than inheriting none.
+  - *A corpus spanning the upgrade no longer splits one tool in two.* A payload with no
+    server is folded into the single server observed for that same bare tool; two servers
+    for one bare name is genuinely ambiguous and stays unattributed rather than guessed.
+    Without this, the half captured before the upgrade is measured on half the sample —
+    and is dead at runtime besides.
+  - *`tune --drop-eval` looks its rule up the way the proxy does.* It resolved by bare tool
+    name, which on a server-tagged corpus falls through to the defaults, finds no `fields`,
+    and scores **nothing** while still reporting that it verified the suggested drops — the
+    #149 failure mode with one lookup removed.
   Both fields are optional and omitted when unknown, so an existing corpus stays loadable
-  and needs no migration. `terse capture` gained `--server` for the hand-captured case.
+  and needs no migration; they are preserved together on an idempotent rewrite, since a
+  first sighting's timestamp beside a later sighting's result id would place one block in
+  two calls at once. Result ids are scoped by proxy process *and* by handshake generation,
+  because a reconnecting client restarts its JSON-RPC ids at 1. `terse capture` gained
+  `--server` for the hand-captured case.
 - **`policy generate` scored payloads per-BLOCK, so every multi-block tool was
   under-measured (#147).** The proxy compresses a multi-block result as one joined record
   array (#116); the generator scored each captured block alone. For a server that returns

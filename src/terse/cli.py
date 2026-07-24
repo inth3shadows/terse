@@ -334,7 +334,7 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
     owns everything else — and writes NOTHING without `--apply`, so the diff is the default
     output rather than an after-the-fact warning."""
     from .policy import load_policy
-    from .policy_gen import generate_policy, merge_policy
+    from .policy_gen import generate_policy, merge_policy, resolve_identities
 
     existing_path = Path(args.policy)
     try:
@@ -355,7 +355,9 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
     # it will never perform.
     generated, _rows = generate_policy(envelopes, threshold=args.threshold,
                                        join_blocks=bool(existing.get("join_blocks", True)))
-    merged, changes = merge_policy(existing, generated)
+    # Identities, not just names: the shadow check has to resolve a generated rule the way
+    # the LOADER will, and a rule's server is not recoverable from its name alone.
+    merged, changes = merge_policy(existing, generated, resolve_identities(envelopes))
 
     kinds = {k: [c for c in changes if c["kind"] == k]
              for k in ("added", "tiers", "suggestions", "unchanged", "preserved",

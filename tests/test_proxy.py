@@ -1851,7 +1851,7 @@ def test_capture_is_told_the_server_and_the_result_the_block_belonged_to():
     inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
                                    "params": {"name": "gh.api.items"}}))
     inter.transform_response(_result_msg(7, _records_text()))
-    assert calls == [{"server": "runecho", "result_id": 7}]
+    assert calls == [{"server": "runecho", "result_id": "0.7"}]
 
 
 def test_every_block_of_one_result_carries_the_same_result_id():
@@ -1862,7 +1862,7 @@ def test_every_block_of_one_result_carries_the_same_result_id():
     raws = [json.dumps({"id": i, "note": "x"}) for i in range(3)]
     _emit_multi(inter, 4, "gh.api.blocks", raws)
     assert len(calls) >= 1
-    assert {c["result_id"] for c in calls} == {4}
+    assert {c["result_id"] for c in calls} == {"0.4"}
 
 
 def test_result_ids_are_scoped_to_the_proxy_run_not_bare_jsonrpc_ids():
@@ -1890,3 +1890,24 @@ def test_result_ids_are_scoped_to_the_proxy_run_not_bare_jsonrpc_ids():
 
     assert seen == ["aaaa1111:1", "bbbb2222:1", None]
     assert len(set(seen[:2])) == 2
+
+
+def test_a_reconnect_makes_a_reused_jsonrpc_id_a_different_result():
+    # Review finding: the session id is minted once per PROCESS, but a client that
+    # re-initializes restarts its ids at 1. Without a per-handshake generation, `sess:1`
+    # from before and after the reconnect name the same result and the corpus fuses two
+    # unrelated calls — the #148 defect arriving by the one door left open. `note_request`
+    # already resets `pending` on this exact event for the mirror-image reason.
+    calls: list[dict] = []
+    inter = Interceptor(FULL, capture=lambda tool, raw, **kw: calls.append(kw))
+    call = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": "gh.api.items"}})
+
+    inter.note_request(call)
+    inter.transform_response(_result_msg(1, _records_text()))
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                                   "params": {}}))
+    inter.note_request(call)
+    inter.transform_response(_result_msg(1, _records_text()))
+
+    assert len({c["result_id"] for c in calls}) == 2

@@ -10,6 +10,7 @@ from terse.policy_gen import (
     generate_policy,
     group_results,
     merge_policy,
+    resolve_identities,
 )
 
 
@@ -567,10 +568,12 @@ def test_legacy_span_cap_bounds_an_unbroken_burst():
     assert max(len(g) for g in groups) <= 260        # ~250 ms of 1 ms-apart writes
 
 
-def test_heuristic_share_reports_what_was_guessed():
+def test_heuristic_share_counts_only_what_the_timing_heuristic_ran_on():
     from terse.policy_gen import heuristic_share
-    envs = [_idenv("t", 0, 1, "s:1"), {"tool": "t", "raw": "{}"}]
-    assert heuristic_share(envs) == (1, 2)
+    timed_no_id = {"tool": "t", "raw": "{}", "captured_at": 1}
+    untimed = {"tool": "t", "raw": "{}"}                  # its own group; nothing guessed
+    assert heuristic_share([_idenv("t", 0, 1, "s:1"), timed_no_id]) == (1, 2)
+    assert heuristic_share([_idenv("t", 0, 1, "s:1"), untimed]) == (0, 2)
     assert heuristic_share([_idenv("t", 0, 1, "s:1")]) == (0, 1)
 
 
@@ -628,3 +631,82 @@ def test_a_deployed_server_glob_is_visible_to_the_shadow_check():
     new_rule = load_policy_from(merged).select("structure", server="runecho")
     assert new_rule.tool_glob == "runecho.structure"
     assert new_rule.tiers and new_rule.capture is False
+
+
+def test_a_deployed_BARE_rule_is_visible_to_the_shadow_check():
+    # Review finding on the first cut of #152: qualifying the generated name closed the
+    # `runecho.*` axis and OPENED a worse one. `structure` is what the operator deployed;
+    # the generated rule is `runecho.structure`; nothing matches by name, so the new rule
+    # was appended with no inheritance — and it still WINS at runtime, because the
+    # qualified candidate is tried first. Result: `capture: false` silently reversed, i.e.
+    # a credential-returning tool's payloads start landing on disk, reported as a benign
+    # "(new rule)". The shadow check has to resolve on the (bare, server) PAIR.
+    existing = {"version": 1, "policies": [
+        {"match": {"tool": "structure"}, "tiers": [], "capture": False,
+         "structured": "leave"},
+    ]}
+    envs = [{"tool": "structure", "server": "runecho", "raw": json.dumps(_records()),
+             "captured_at": 1_000_000_000 + i, "result_id": f"s:{i}"} for i in range(3)]
+    generated, _ = generate_policy(envs, threshold=5.0)
+    merged, changes = merge_policy(existing, generated, resolve_identities(envs))
+
+    inherited = [c for c in changes if c["kind"] == "inherited"]
+    assert inherited and inherited[0]["from"] == "structure"
+    rule = load_policy_from(merged).select("structure", server="runecho")
+    assert rule.tool_glob == "runecho.structure"
+    assert rule.capture is False            # the #85 decision survives
+    assert rule.structured == "leave"       # and the #135 one
+
+
+def test_shadowing_resolves_candidate_major_like_select():
+    # `select` tries the qualified candidate against EVERY rule before the bare one against
+    # any, so with both deployed the loader answers `runecho.*`. A rule-major scan answers
+    # `structure` and inherits the wrong rule's operator keys.
+    existing = {"version": 1, "policies": [
+        {"match": {"tool": "structure"}, "tiers": [], "capture": False},
+        {"match": {"tool": "runecho.*"}, "tiers": [], "structured": "leave"},
+    ]}
+    envs = [{"tool": "structure", "server": "runecho", "raw": json.dumps(_records()),
+             "captured_at": 1_000_000_000 + i, "result_id": f"s:{i}"} for i in range(3)]
+    generated, _ = generate_policy(envs, threshold=5.0)
+    _merged, changes = merge_policy(existing, generated, resolve_identities(envs))
+    inherited = [c for c in changes if c["kind"] == "inherited"]
+    assert inherited and inherited[0]["from"] == "runecho.*"
+
+
+def test_one_tool_does_not_split_across_the_capture_format_upgrade():
+    # A corpus spanning the upgrade holds the same tool with and without a server. Keyed
+    # naively that is two rules, each measured on HALF the sample — and the bare one is
+    # dead at runtime besides. An unattributed payload is folded into the single server
+    # observed for that bare tool.
+    legacy = [{"tool": "structure", "raw": json.dumps(_records()),
+               "captured_at": 900_000_000 + i * 100_000_000} for i in range(3)]
+    tagged = [{"tool": "structure", "server": "runecho", "raw": json.dumps(_unique_value_records(n)),
+               "captured_at": 1_000_000_000 + i, "result_id": f"s:{i}"}
+              for i, n in enumerate((21, 22, 23))]
+    groups = group_results(legacy + tagged)
+    assert list(groups) == ["runecho.structure"]
+    assert sum(len(g) for g in groups["runecho.structure"]) == 6
+
+
+def test_two_servers_for_one_bare_tool_is_left_unattributed():
+    # A shared corpus dir where two peers both expose `search`: which one an untagged
+    # payload came from is genuinely unrecoverable, so it stays unattributed rather than
+    # being assigned to whichever server happened to be seen.
+    envs = [{"tool": "search", "server": "kb", "raw": json.dumps(_records()),
+             "captured_at": 1, "result_id": "s:1"},
+            {"tool": "search", "server": "docs", "raw": json.dumps(_unique_value_records()),
+             "captured_at": 2, "result_id": "s:2"},
+            {"tool": "search", "raw": json.dumps(_records(21)), "captured_at": 3}]
+    assert set(group_results(envs)) == {"kb.search", "docs.search", "search"}
+
+
+def test_resolve_identities_returns_the_pair_select_is_called_with():
+    envs = [{"tool": "structure", "server": "runecho", "raw": "{}"},
+            {"tool": "peer__search", "server": "peer", "raw": "{}"},
+            {"tool": "lone", "raw": "{}"}]
+    assert resolve_identities(envs) == {
+        "runecho.structure": ("structure", "runecho"),
+        "peer.search": ("search", "peer"),
+        "lone": ("lone", None),
+    }

@@ -169,6 +169,9 @@ class Interceptor:
         # overrides it to a peer-qualified name (see note_request's tool_name) so two
         # peers' same-named tools don't collide into one capture-corpus bucket.
         self.pending: dict[Any, tuple[str, str, str]] = {}
+        # Bumped on every `initialize`, and folded into the result id handed to `capture`
+        # so a reconnecting client's restarted JSON-RPC ids stay distinguishable (#148).
+        self._result_gen = 0
         self.debug = debug
         self.diff = pol.diff
         # Join every text block of a multi-block result into one record array before
@@ -314,6 +317,13 @@ class Interceptor:
                 self.last_text.clear()
                 self.since_text_keyframe.clear()
                 self.pending.clear()
+                # A reconnecting client restarts its JSON-RPC ids at 1 while this process
+                # keeps one session id, so `sess:1` from before and after the reconnect
+                # would name two unrelated results the same and the corpus would fuse them
+                # — the #148 defect, arriving by the one door the process-scoped id leaves
+                # open. Same reasoning as the `pending` reset directly above, applied to
+                # the identity the corpus stores rather than the one this class routes by.
+                self._result_gen += 1
                 # self.dropped is the (possibly cross-peer-shared) drop store — its own
                 # lock guards this reset, consistent with _drop_put/answer_retrieve.
                 # Lock order is always _local_lock then _store_lock, never reversed
@@ -550,11 +560,12 @@ class Interceptor:
                     try:
                         # The JSON-RPC id identifies the RESULT these blocks came from, so
                         # the corpus no longer has to infer "same call" from write timing
-                        # (#148). It is scoped to this process by the callback, since the id
-                        # is only unique within one session and many sessions write into one
-                        # corpus dir.
+                        # (#148). Scoped twice, because the bare id is unique only within
+                        # one connection: by handshake generation here, and by process in
+                        # the callback — many connections, and many processes, write into
+                        # one corpus dir.
                         self.capture(capture_tool, payload, server=self.server_name,
-                                     result_id=msg["id"])
+                                     result_id=f"{self._result_gen}.{msg['id']}")
                     except Exception as exc:  # noqa: BLE001 — capture is never load-bearing
                         self._warn_sink("capture", capture_tool, exc)
 

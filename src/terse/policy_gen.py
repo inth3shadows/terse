@@ -48,9 +48,10 @@ from . import policy as policy_mod
 from . import probes
 from .capture import (
     LONG_TEXT,
+    bare_and_server,
     classify_shape,
     find_record_list_with_path,
-    qualified_tool,
+    qualify,
 )
 from .lossy import DEFAULT_TEXT_DROP_MIN, TEXT_SELECTOR_CODE_BLOCKS, fenced_spans
 from .measure import measure_joined, measure_payload
@@ -148,9 +149,20 @@ def _keep_lossy_inert(entry: dict, before: list[str]) -> dict:
     return {**entry, "tiers": [], "_comment": f"{entry.get('_comment', '')} — {note}".strip(" —")}
 
 
-def merge_policy(existing: dict, generated: dict) -> tuple[dict, list[dict[str, Any]]]:
+def merge_policy(existing: dict, generated: dict,
+                 identities: dict[str, tuple[str, str | None]] | None = None,
+                 ) -> tuple[dict, list[dict[str, Any]]]:
     """Merge a freshly `generate_policy`'d doc INTO an existing policy (#136). Returns
     `(merged_doc, changes)`; pure, like everything else here.
+
+    `identities` is `resolve_identities(envelopes)` — the `(bare tool, server)` pair behind
+    each generated rule name. It is what lets the shadow check resolve a rule the way the
+    LOADER will: a generated `runecho.structure` is governed at runtime by a deployed bare
+    `structure` rule just as much as by a `runecho.*` one, and inheriting that rule's
+    operator-owned keys is the difference between refining a tool's tiers and silently
+    re-deciding its `capture`. Omitting it falls back to treating each rule name as a
+    server-less tool, which is the pre-#152 behavior and safe only for a corpus that
+    records no servers.
 
     `generate_policy` is *total* — it authors a whole fresh doc from the corpus and knows
     nothing about what is already deployed. Writing that over a live policy silently drops
@@ -229,24 +241,27 @@ def merge_policy(existing: dict, generated: dict) -> tuple[dict, list[dict[str, 
     added = [(t, copy.deepcopy(e)) for t, e in gen_by_tool.items() if t not in seen]
 
     def _shadowing(tool: str) -> tuple[int, dict | None]:
-        """Index of the first existing rule that currently governs `tool`, and that rule.
+        """Index of the existing rule that currently governs `tool`, and that rule.
 
-        Uses `Policy`'s own candidate list rather than a bare fnmatch, so a multiproxy
-        peer-qualified name resolves the way the loader would.
+        Resolves exactly as `Policy.select` does — same candidate list, and CANDIDATE-major
+        rather than rule-major. The iteration order is not a detail: `select` tries the
+        qualified candidate against every rule before the bare one against any, so with
+        rules `[structure, runecho.*]` deployed, a rule-major scan answers `structure` while
+        the loader answers `runecho.*`. Inheriting the wrong rule's operator keys is worse
+        than inheriting none.
 
-        `tool` arrives already server-qualified when the corpus recorded one
-        (`capture.qualified_tool`), which is what closes the axis this used to miss (#148):
-        a deployed `runecho.*` is now DETECTED against a tool captured from runecho, where
-        before the bare corpus name `structure` matched nothing and a dead rule was appended.
-        The gap that remains is a legacy envelope with no `server` at all — nothing can
-        recover which downstream sent it, so it still checks bare. Erring that way inserts a
-        rule the loader may then shadow, which is inert, rather than one that silently
-        overrides an operator rule."""
-        for i, e in enumerate(merged):
-            glob = (e.get("match") or {}).get("tool", "*")
-            if any(fnmatch.fnmatch(c, glob)
-                   for c in policy_mod.Policy._match_candidates(tool)):
-                return i, e
+        Both axes the corpus used to be blind to are closed by taking the `(bare, server)`
+        pair from `identities`: a deployed `runecho.*` is detected for a tool captured from
+        runecho (#148), and so is a deployed bare `structure`, which the qualified name
+        alone would have missed. What remains unresolvable is a legacy envelope for a tool
+        no server was ever observed for — nothing can recover which downstream sent it, so
+        it checks bare. Erring that way inserts a rule the loader may then shadow, which is
+        inert, rather than one that silently overrides an operator rule."""
+        bare, server = (identities or {}).get(tool, (tool, None))
+        for cand in policy_mod.Policy._match_candidates(bare, server):
+            for i, e in enumerate(merged):
+                if fnmatch.fnmatch(cand, (e.get("match") or {}).get("tool", "*")):
+                    return i, e
         return len(merged), None
 
     # Group by insertion point and splice from the back, so earlier indices stay valid and
@@ -462,7 +477,7 @@ def group_results(envelopes: list[dict[str, Any]]) -> dict[str, list[list[str]]]
       single-block group, the pre-#147 behavior, which under-measures rather than
       inventing a join.
 
-    Tools are keyed by `capture.qualified_tool`, i.e. the name the RUNTIME looks a rule up
+    Tools are keyed by `resolve_identities`, i.e. the name the RUNTIME looks a rule up
     under, so a rule authored from this grouping is reachable by `Policy.select` instead of
     sitting dead behind a server-scoped glob (#152).
 
@@ -472,8 +487,9 @@ def group_results(envelopes: list[dict[str, Any]]) -> dict[str, list[list[str]]]
     each block arrived alone."""
     out: dict[str, list[list[str]]] = {}
     by_tool: dict[str, list[dict[str, Any]]] = {}
+    keys = _corpus_keys(envelopes)
     for env in envelopes:
-        by_tool.setdefault(qualified_tool(env), []).append(env)
+        by_tool.setdefault(keys[id(env)], []).append(env)
     for tool, envs in by_tool.items():
         identified = [e for e in envs if isinstance(e.get("result_id"), str)]
         rest = [e for e in envs if not isinstance(e.get("result_id"), str)]
@@ -512,15 +528,71 @@ def _seq(env: dict[str, Any]) -> int:
     return env["captured_at"] if isinstance(env.get("captured_at"), int) else 0
 
 
+def resolve_identities(
+    envelopes: list[dict[str, Any]]
+) -> dict[str, tuple[str, str | None]]:
+    """`qualified rule name -> (bare tool, server)` for every tool in the corpus.
+
+    The bare/server pair is what `Policy.select` is actually called with at runtime, so
+    anything that has to reason about a generated rule the way the loader will — the merge's
+    shadow check, a drop-eval looking up a tool's `fields` — needs the pair, not just the
+    name. Returning both from one place keeps them from drifting.
+
+    **Legacy attribution.** An envelope captured before `server` existed records no server,
+    which would split one tool into two rules the moment a corpus spans the upgrade — the
+    old half measured on half the sample, and dead at runtime besides, since the qualified
+    candidate is always tried first. So an unattributed payload is folded into the server
+    observed for that same bare tool, *when exactly one server was observed*. More than one
+    (a shared corpus dir where two peers both expose `search`) is genuinely ambiguous and
+    stays unattributed rather than being assigned by guess."""
+    return {qualify(bare, server): (bare, server)
+            for _env, bare, server in _attribute(envelopes)}
+
+
+def _corpus_keys(envelopes: list[dict[str, Any]]) -> dict[int, str]:
+    """`id(envelope) -> qualified rule name`. Keyed by object identity because two envelopes
+    can be equal in every field a dict key could be built from and still be distinct
+    payloads."""
+    return {id(env): qualify(bare, server)
+            for env, bare, server in _attribute(envelopes)}
+
+
+def _attribute(
+    envelopes: list[dict[str, Any]]
+) -> list[tuple[dict[str, Any], str, str | None]]:
+    """Each envelope with the `(bare tool, server)` pair it should be judged under, after
+    folding server-less legacy payloads into the one server observed for that bare tool.
+    The single place the attribution rule lives — see `resolve_identities`."""
+    observed: dict[str, set[str]] = {}
+    pairs = []
+    for env in envelopes:
+        bare, server = bare_and_server(env)
+        observed.setdefault(bare, set())
+        if server is not None:
+            observed[bare].add(server)
+        pairs.append((env, bare, server))
+    return [(env, bare,
+             next(iter(observed[bare])) if server is None and len(observed[bare]) == 1
+             else server)
+            for env, bare, server in pairs]
+
+
 def heuristic_share(envelopes: list[dict[str, Any]]) -> tuple[int, int]:
-    """`(payloads grouped by timing, total payloads)` — how much of a corpus predates
-    `result_id` and therefore had its results GUESSED rather than read (#148).
+    """`(payloads grouped by timing, total payloads)` — how much of a corpus had its results
+    GUESSED rather than read (#148).
+
+    Counts only the payloads the timing heuristic actually ran on. An envelope with no
+    `captured_at` at all becomes its own single-block group and is not guessed at, and
+    neither is a hand-written `terse capture` payload, which has no result to belong to —
+    reporting either as "grouped by timing" would be a false alarm.
 
     Surfaced rather than smoothed over: an old corpus cannot be made exact retroactively,
     and quietly re-measuring one downward would be a worse answer than saying which part of
     the number rests on a heuristic."""
     total = len(envelopes)
-    guessed = sum(1 for e in envelopes if not isinstance(e.get("result_id"), str))
+    guessed = sum(1 for e in envelopes
+                  if not isinstance(e.get("result_id"), str)
+                  and isinstance(e.get("captured_at"), int))
     return guessed, total
 
 

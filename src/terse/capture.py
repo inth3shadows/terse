@@ -171,12 +171,17 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
             prior = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(prior, dict) and isinstance(prior.get("captured_at"), int):
                 captured_at = prior["captured_at"]
-                # `result_id` is preserved WITH `captured_at`, never independently: an
-                # envelope describes a payload's FIRST sighting, and keeping a later
-                # sighting's result id would put the grouping key and the timestamp in
-                # disagreement about which call this envelope stands for.
-                if isinstance(prior.get("result_id"), str):
-                    result_id = prior["result_id"]
+                # `result_id` travels WITH `captured_at`, never independently: an envelope
+                # describes a payload's FIRST sighting, and a later sighting's result id
+                # beside an earlier sighting's timestamp would put the grouping key and the
+                # clock in disagreement about which call this envelope stands for — the
+                # block would join the new result's group but sort by the old result's
+                # position in it. So when the prior envelope predates the field, the
+                # incoming id is DROPPED rather than adopted: that payload stays legacy
+                # (grouped by timing, and reported as such) until a new payload replaces it.
+                result_id = prior.get("result_id")
+                if not isinstance(result_id, str):
+                    result_id = None
         except (json.JSONDecodeError, OSError):
             pass
     envelope: dict[str, Any] = {
@@ -247,27 +252,42 @@ def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
     return [env for _, _, env in loaded]
 
 
-def qualified_tool(env: dict[str, Any]) -> str:
-    """The name a corpus entry's tool is looked up under AT RUNTIME.
+def bare_and_server(env: dict[str, Any]) -> tuple[str, str | None]:
+    """The pair `Policy.select` is called with for this payload.
 
-    Mirrors `Policy._match_candidates`' first candidate exactly: `{server}.{bare}` when the
-    envelope records a server, skipped when the tool already carries that server as its own
-    prefix (kb names its tools `kb.read.*`; runecho calls its tool plain `structure`).
-    Falls back to the stored name when no server was recorded.
-
-    This is what makes a corpus-derived rule reachable. `select` iterates CANDIDATE-major —
-    the qualified candidate is tried against every rule before the bare one is tried against
-    any — so a bare `structure` rule sits dead behind a deployed `runecho.*` no matter where
-    in the file it is placed. Authoring `runecho.structure` is the only name that reaches it
-    (#152), and it is also what lets the shadow check see the rule at all (#148)."""
-    server = env.get("server")
+    The bare name is the DOWNSTREAM tool's own name, with multiproxy's peer prefix stripped:
+    the proxy selects on that name and only capture sees the peer-qualified one, so a rule
+    has to be authored against the former. The server is whatever the envelope recorded, or
+    None — an empty string is None, so "unknown" has exactly one spelling."""
     tool = env.get("tool", "?")
-    if not isinstance(server, str) or not server:
-        return tool
     bare = tool.partition(policy_mod.PREFIX_SEP)[2] if policy_mod.PREFIX_SEP in tool else tool
-    if bare.startswith(f"{server}."):
+    server = env.get("server")
+    return bare, (server if isinstance(server, str) and server else None)
+
+
+def qualify(bare: str, server: str | None) -> str:
+    """`Policy._match_candidates(bare, server)[0]` — the first name `select` looks up, and
+    therefore the only name a generated rule can carry and still be reachable.
+
+    `select` iterates CANDIDATE-major: the qualified candidate is tried against every rule
+    before the bare one is tried against any. So a bare `structure` rule sits dead behind a
+    deployed `runecho.*` no matter where in the file it is placed, and authoring
+    `runecho.structure` is what reaches it (#152). Qualification is skipped when the tool
+    already carries the server as its own prefix — kb names its tools `kb.read.*`, and
+    `kb.kb.read.search` would match nothing (mirrors the same skip in `_match_candidates`).
+
+    Kept here, beside the envelope that feeds it, so the corpus and the runtime cannot drift
+    on what a tool is called — the failure behind #4, where three hand-rolled copies of one
+    rule disagreed."""
+    if server is None or bare.startswith(f"{server}."):
         return bare
     return f"{server}.{bare}"
+
+
+def qualified_tool(env: dict[str, Any]) -> str:
+    """The name a corpus entry's tool is looked up under AT RUNTIME — `qualify` applied to
+    this envelope's `bare_and_server` pair."""
+    return qualify(*bare_and_server(env))
 
 
 def coverage(envelopes: list[dict[str, Any]]) -> dict[str, Any]:
