@@ -955,3 +955,80 @@ def test_parse_proxy_opts_detects_uvx_and_uv_tool_run_launchers():
     uv_run = {"command": "uv",
               "args": ["tool", "run", "terse", "proxy", "--policy", "/q.json", "--", "kb"]}
     assert im.parse_proxy_opts(uv_run) == {"policy": "/q.json"}
+
+
+# ---------------------------------------------------------------------------
+# #172: classify from the config, not from stash membership. A wrapped entry whose
+# stash record is missing used to read "unwrapped" AND be skipped by uninstall --all,
+# leaving it terse-wrapped forever and invisible to terse's own tooling.
+# ---------------------------------------------------------------------------
+
+def _wrapped_entry(downstream, *, extra_args=()):
+    return {"type": "stdio", "command": "/home/u/.local/bin/terse",
+            "args": ["proxy", "--policy", "/home/u/.config/terse/policy.json",
+                     "--", downstream, *extra_args]}
+
+
+def _cfg_with(tmp_path, servers, stash):
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps({"mcpServers": servers}))
+    (tmp_path / im.STASH_NAME).write_text(json.dumps({"user": stash}))
+    return cfg
+
+
+def test_wrapped_but_unstashed_entry_is_not_reported_as_unwrapped(tmp_path):
+    """The live repro: two servers wrapped identically, only one in the stash."""
+    cfg = _cfg_with(
+        tmp_path,
+        {"runecho": _wrapped_entry("/home/u/.local/bin/runecho-mcp"),
+         "codegraph": _wrapped_entry("/opt/homebrew/bin/codegraph",
+                                     extra_args=("serve", "--mcp"))},
+        {"runecho": {"type": "stdio", "command": "/home/u/.local/bin/runecho-mcp",
+                     "args": [], "env": {}}})
+    rows = {r["server"]: r for r in im.scan_scopes(cfg=cfg)}
+    assert rows["runecho"]["state"] == "wrapped"
+    assert rows["codegraph"]["state"] == "wrapped-unstashed"
+    # the wrapped-only detail fields must be populated for BOTH, or status hides the
+    # downstream of exactly the entry the operator most needs to fix by hand
+    assert rows["codegraph"]["wraps"] == "/opt/homebrew/bin/codegraph serve --mcp"
+    assert rows["codegraph"]["policy"] == "/home/u/.config/terse/policy.json"
+
+
+def test_a_genuinely_unwrapped_entry_is_still_unwrapped(tmp_path):
+    cfg = _cfg_with(tmp_path, {"plain": {"type": "stdio", "command": "/usr/bin/plain",
+                                         "args": []}}, {})
+    rows = {r["server"]: r for r in im.scan_scopes(cfg=cfg)}
+    assert rows["plain"]["state"] == "unwrapped"
+    assert rows["plain"]["wraps"] is None
+
+
+def test_orphaned_stash_still_detected(tmp_path):
+    """The opposite drift (#58) must keep working — stash entry, no config entry."""
+    cfg = _cfg_with(tmp_path, {}, {"gone": {"type": "stdio", "command": "/usr/bin/gone"}})
+    rows = {r["server"]: r for r in im.scan_scopes(cfg=cfg)}
+    assert rows["gone"]["state"] == "orphaned-stash"
+
+
+def test_uninstall_all_refuses_an_unstashed_entry_with_a_reason(tmp_path):
+    """It must NOT silently skip: `do_uninstall` used to iterate stash keys only, so this
+    server could never be unwrapped by terse at all."""
+    cfg = _cfg_with(
+        tmp_path,
+        {"codegraph": _wrapped_entry("/opt/homebrew/bin/codegraph",
+                                     extra_args=("serve", "--mcp"))},
+        {})
+    out = im.do_uninstall(None, all_=True, cfg=cfg, dry_run=True)
+    (change,) = out["changes"]
+    assert change["server"] == "codegraph" and change["restored"] is False
+    assert "stash entry is missing" in change["reason"]
+    assert "not managed by terse" not in change["reason"]
+
+
+def test_uninstall_all_still_restores_a_properly_stashed_entry(tmp_path):
+    original = {"type": "stdio", "command": "/home/u/.local/bin/runecho-mcp",
+                "args": [], "env": {}}
+    cfg = _cfg_with(tmp_path, {"runecho": _wrapped_entry("/home/u/.local/bin/runecho-mcp")},
+                    {"runecho": original})
+    out = im.do_uninstall(None, all_=True, cfg=cfg)
+    assert out["changes"] == [{"server": "runecho", "restored": True}]
+    assert json.loads(cfg.read_text())["mcpServers"]["runecho"] == original

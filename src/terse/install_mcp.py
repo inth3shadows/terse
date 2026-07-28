@@ -530,11 +530,23 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
 
     rows = []
     for name in sorted(set(servers) | set(stash)):
-        managed = name in stash
+        stashed = name in stash
         present = name in servers
-        if managed and present:
-            state = "wrapped"
-        elif managed and not present:
+        # Classify from the CONFIG, with the stash as recovery data rather than as the
+        # source of truth (#172). Keying purely on stash membership misfiled an entry
+        # that plainly launches via terse as "unwrapped" whenever its stash entry was
+        # missing — and since `do_uninstall` iterates the stash, that server could not be
+        # unwrapped by terse at all: wrapped in the live config, absent from status,
+        # skipped by `uninstall-mcp --all`. That is the exact inverse of the drift #58
+        # surfaced as `orphaned-stash`; only one direction had been considered.
+        launches_via_terse = present and _looks_like_terse_launcher(servers[name])
+        if present and (stashed or launches_via_terse):
+            # `wrapped-unstashed` is deliberately its own state, not a flag: the original
+            # command is UNRECOVERABLE, so `uninstall-mcp` cannot restore this entry and
+            # `install-mcp`'s idempotence (re-wrap from the stash) does not hold either.
+            # Reporting it as plain `wrapped` would hide a real, actionable loss.
+            state = "wrapped" if stashed else "wrapped-unstashed"
+        elif stashed and not present:
             # A stash entry with no matching mcpServers entry — the entry was removed
             # or edited by hand after terse wrapped it. Surfacing this is the whole
             # point of #58: this exact kind of scope/state drift is what prompted it.
@@ -548,7 +560,7 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
         wraps = None
         diff = None
         stats_on = None
-        if state == "wrapped":
+        if state in ("wrapped", "wrapped-unstashed"):
             # The launcher (`command`) is the entry's most silent failure mode: if it
             # no longer resolves, the client can't spawn the proxy at all and the server
             # just shows up with no tools. That is exactly what an upgrade moving a
@@ -593,8 +605,9 @@ def scan_scopes(*, cfg: Path | None = None, file: str | None = None,
     read-only — no writes, no directory creation, never raises. One row per
     (scope, server): {scope, server, state, policy, policy_missing, launcher,
     launcher_missing, wraps, diff, stats, config}, state one of "wrapped"
-    (terse-managed and present), "orphaned-stash" (managed but the entry vanished —
-    see `_scan_target`), or "unwrapped" (present, not terse's). The wrapped-only
+    (stashed and present), "wrapped-unstashed" (the entry launches via terse but has no
+    stash, so its original command cannot be restored — #172), "orphaned-stash" (stashed
+    but the entry vanished — see `_scan_target`), or "unwrapped" (present, not terse's). The wrapped-only
     fields (policy_missing, launcher, launcher_missing, wraps, diff, stats) are
     None/False for non-wrapped rows. Local scope is
     silently omitted, not an error, when it doesn't resolve (not in a git repo and
@@ -622,11 +635,32 @@ def do_uninstall(servers: list[str] | None, *, all_: bool = False,
     full_stash = _load_stash(stash_path(target.cfg))
     stash = full_stash.setdefault(target.stash_prefix, {})
     node = _servers_root(config, target.server_path)
-    targets = sorted(stash.keys()) if all_ else (servers or [])
+    # `--all` walks the stash UNION anything the config shows as terse-launched, so a
+    # wrapped-but-unstashed entry is reported (and refused with a reason) rather than
+    # silently omitted from the run — see #172.
+    if all_:
+        detected = {n for n, e in (node.get("mcpServers") or {}).items()
+                    if isinstance(e, dict) and _looks_like_terse_launcher(e)}
+        targets = sorted(set(stash) | detected)
+    else:
+        targets = servers or []
 
     changes = []
     for s in targets:
         if not is_managed(stash, s):
+            # Distinguish "not ours" from "ours but unrecoverable" (#172). An entry that
+            # launches via terse with no stash CANNOT be restored — the original command
+            # is gone — and silently reporting it as "not managed by terse" is how such a
+            # server stays wrapped forever, invisible to both status and uninstall.
+            entry = node.get("mcpServers", {}).get(s)
+            if isinstance(entry, dict) and _looks_like_terse_launcher(entry):
+                changes.append({
+                    "server": s, "restored": False,
+                    "reason": "wrapped by terse but its stash entry is missing, so the "
+                              "original command cannot be restored — edit the config by "
+                              "hand, using the downstream shown after `--` in its args",
+                })
+                continue
             changes.append({"server": s, "restored": False, "reason": "not managed by terse"})
             continue
         unwrap(node, stash, s)
