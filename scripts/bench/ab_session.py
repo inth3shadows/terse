@@ -34,31 +34,41 @@ number, weighted is the honest money number.
 
 First results (2026-07-28)
 --------------------------
-Identical workload in every arm: four `runecho structure` calls on the same four files,
-model pinned to sonnet, same prompt. Every arm returned the same answer (377) with zero
-`terse.retrieve` round-trips, so the deltas are cost, not behavior.
+Identical workload in every arm; model pinned to sonnet; same prompt. Every arm returned
+the same answer with zero `terse.retrieve` round-trips, so the deltas are cost, not
+behavior.
 
-    wrapped servers            RAW input      WEIGHTED    n
-    1 (runecho only)             -14.0%         -9.2%     1
-    3 (codegraph, kb, runecho)    +2.1%         +4.9%     3   <- signal, spread +/-332
-    6, one proxy each            +23.1%        +17.4%     1
-    6, behind one multiproxy      +0.0%         +4.5%     4   <- within spread
+    wrapped servers                calls   RAW input   n   note
+    1 (runecho only)                   4     -14.0%    1
+    2 (runecho, kb)                    4      +1.9%    3   inside spread
+    3 (codegraph, kb, runecho)         4      +2.1%    3   pre diff-flip
+    3, after the #170 diff flip        4      +1.4%    3
+    3, after the #170 diff flip       16      +0.8%    6   modal-turn filtered
+    6, one proxy each                  4     +23.1%    1
+    6, behind one multiproxy           4      +0.0%    4   inside spread
 
-terse WINS at one wrapped server and LOSES at three. The variable is not server count per
-se: each standalone `terse proxy` injects its own copy of TERSE_PRIMER (402 cl100k tokens)
-into that server's MCP `instructions`, and the client re-reads all of them every turn as
-cache_read. Cost therefore scales with (servers x turns) while savings scale with
-(compressible tool calls). At four calls, three primers are already too many to amortize.
+terse WINS at one wrapped server and LOSES from two upward, and MORE CALLS DID NOT SAVE
+IT: 4 calls and 16 calls both land net-negative at three servers. Each standalone
+`terse proxy` injects its own TERSE_PRIMER into that server's MCP `instructions`, and the
+client re-reads all of them every turn as cache_read, so cost scales with
+(servers x turns). #170 cut the primer 402 -> 212 tokens and moved 3 servers from +2.1%
+to +1.4% — real, but not enough to change the sign.
 
 `multiproxy` collapses N primers to one and erased the six-server penalty (+23.1% ->
 +0.0% RAW), which is the cleanest evidence that the primer, not the codec, is the
 regression. See terse#168 for the amortization fix.
+
+A caution on the 16-call row: turn counts there are BIMODAL (a ~3-turn batched path and a
+~18-turn sequential one), not unimodal-with-outliers. The modal filter selects the larger
+cluster, so it is choosing a behavioral mode rather than discarding noise. Both clusters
+agree on the sign (+0.4% at 3 turns, +0.8% at 18), which is why the conclusion stands.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import statistics as st
 import sys
 from collections import Counter
 from pathlib import Path
@@ -165,76 +175,162 @@ class SessionStats:
         return sum(self.mcp_calls.values())
 
 
+# --------------------------------------------------------------------------- arms
+
+# A run whose assistant-turn count deviates from the modal value across both arms is
+# DROPPED, not reported. `cache_read` scales with turns and dominates RAW input, so a
+# single extra round-trip moves the total by more than the entire treatment effect.
+# Measured: a 16-call pair where one run per arm took 18 turns instead of 3 reported
+# RAW -3.0%, while the modal-turn runs showed +0.4% — the aggregate was reporting
+# round-trip luck, not compression.
+#
+# This is a deliberate reversal. An earlier revision argued a turn delta was a measured
+# EFFECT of the treatment (fewer round-trips to the same answer) as long as MCP call
+# counts matched, and so refused to flag it. That holds for a 6-vs-7 difference; it does
+# not survive 18-vs-3, where the variance swamps the signal it was supposed to preserve.
+
+
+class Arm:
+    """One side of the comparison: N runs of the same task under the same condition."""
+
+    def __init__(self, paths: list[Path], label: str):
+        self.label = label
+        self.runs = [SessionStats(p) for p in paths]
+        self.kept: list[SessionStats] = list(self.runs)
+        self.dropped: list[SessionStats] = []
+
+    def restrict_to_turns(self, turns: int) -> None:
+        self.kept = [r for r in self.runs if r.turns == turns]
+        self.dropped = [r for r in self.runs if r.turns != turns]
+
+    def stat(self, field: str) -> tuple[float, float]:
+        """(mean, sample stdev) of `field` over the kept runs. sd is 0.0 for n<2 —
+        reported as such rather than hidden, since n=1 has no spread to speak of."""
+        vals = [getattr(r, field) for r in self.kept]
+        if not vals:
+            return (0.0, 0.0)
+        return (st.mean(vals), st.stdev(vals) if len(vals) > 1 else 0.0)
+
+    def union(self, field: str) -> set:
+        out: set = set()
+        for r in self.kept or self.runs:
+            out |= set(getattr(r, field))
+        return out
+
+
+def modal_turns(a: Arm, b: Arm) -> int:
+    """The most common turn count across BOTH arms, so the filter is applied
+    symmetrically and cannot be tuned to favor one side. Ties resolve to the lower
+    count (statistics.mode is order-dependent on ties; sorting makes it deterministic)."""
+    counts = Counter(r.turns for r in a.runs + b.runs)
+    top = max(counts.values())
+    return min(t for t, c in counts.items() if c == top)
+
+
 def _fmt(n: float) -> str:
     return f"{n:,.0f}"
 
 
-def _delta_line(label: str, a: float, b: float, unit: str = "") -> str:
-    d = b - a
-    pct = (d / a * 100) if a else float("nan")
-    sign = "+" if d > 0 else ""
-    verdict = "worse" if d > 0 else ("better" if d < 0 else "same")
-    pct_s = "   n/a" if a == 0 else f"{sign}{pct:6.1f}%"
-    return (f"  {label:<22} {_fmt(a):>12} {_fmt(b):>12} "
-            f"{sign}{_fmt(d):>12}{unit} {pct_s}  {verdict}")
+def _row(label: str, a: Arm, b: Arm, field: str) -> tuple[str, bool]:
+    """One metric line, plus whether the delta clears the noise floor."""
+    ma, sa = a.stat(field)
+    mb, sb = b.stat(field)
+    d = mb - ma
+    pct = (d / ma * 100) if ma else 0.0
+    pooled = (sa + sb) / 2
+    # A delta smaller than twice the pooled spread is not distinguishable from run-to-run
+    # variance at these sample sizes. Crude on purpose: with n<=6 a real significance test
+    # would imply a precision this harness does not have.
+    #
+    # BOTH arms need n>=2 or there is no spread to compare against. A one-run arm reports
+    # sd=0, which halves `pooled` and makes almost any delta look like SIGNAL — the exact
+    # false confidence this outlier control exists to remove. Say "n<2" instead.
+    enough = len(a.kept) > 1 and len(b.kept) > 1
+    clears = enough and pooled > 0 and abs(d) > 2 * pooled
+    if not enough:
+        flag = "  n<2"
+    elif pooled == 0:
+        flag = ""
+    else:
+        flag = "  SIGNAL" if clears else "  noise"
+    return (f"  {label:<18} {ma:>11,.0f} +/-{sa:>9,.0f} {mb:>11,.0f} +/-{sb:>9,.0f} "
+            f"{d:>+11,.0f} {pct:>+7.1f}%{flag}", clears)
 
 
-def _skew_warnings(a: SessionStats, b: SessionStats) -> list[str]:
+def _skew_warnings(a: Arm, b: Arm) -> list[str]:
     warns = []
-    for name, va, vb in (("model", set(a.models), set(b.models)),
-                         ("cli version", set(a.versions), set(b.versions)),
-                         ("git branch", set(a.branches), set(b.branches))):
+    for name, field in (("model", "models"), ("cli version", "versions"),
+                        ("git branch", "branches")):
+        va, vb = a.union(field), b.union(field)
         if va and vb and va != vb:
             warns.append(f"{name} differs: A={sorted(va)} B={sorted(vb)}")
-    if a.total_mcp != b.total_mcp:
+    mcp_a = {r.total_mcp for r in a.kept}
+    mcp_b = {r.total_mcp for r in b.kept}
+    if mcp_a and mcp_b and mcp_a != mcp_b:
         warns.append(
-            f"MCP call count differs: A={a.total_mcp} B={b.total_mcp} — the two runs did "
+            f"MCP call count differs: A={sorted(mcp_a)} B={sorted(mcp_b)} — the runs did "
             f"not do the same work, so the token delta is not attributable to terse")
-    # Turn count is deliberately NOT a skew warning. With MCP call counts equal, a turn
-    # delta is a measured effect of the treatment (fewer/more round-trips to reach the
-    # same answer), not an uncontrolled variable. It only invalidates the comparison when
-    # the call counts already disagree, which is caught above.
     return warns
 
 
-def report(a: SessionStats, b: SessionStats, *, label_a: str, label_b: str) -> int:
-    print(f"\nA (control): {a.path}")
-    print(f"B (terse)  : {b.path}\n")
-    print(f"  {'metric':<22} {label_a:>12} {label_b:>12} {'delta':>13} {'pct':>7}")
-    print(f"  {'-' * 22} {'-' * 12} {'-' * 12} {'-' * 13} {'-' * 7}")
-    print(_delta_line("input (uncached)", a.input, b.input))
-    print(_delta_line("cache write", a.cache_write, b.cache_write))
-    print(_delta_line("cache read", a.cache_read, b.cache_read))
-    print(_delta_line("output", a.output, b.output))
-    print(f"  {'-' * 22} {'-' * 12} {'-' * 12} {'-' * 13} {'-' * 7}")
-    print(_delta_line("RAW input total", a.raw_input, b.raw_input))
-    print(_delta_line("WEIGHTED (spend)", a.weighted, b.weighted))
-    print()
-    print(f"  assistant turns        {a.turns:>12} {b.turns:>12}")
-    print(f"  MCP tool calls         {a.total_mcp:>12} {b.total_mcp:>12}")
-    print(f"  terse.retrieve calls   {a.retrieve_calls:>12} {b.retrieve_calls:>12}")
-    warns = _skew_warnings(a, b)
-    # Per-call amortization is only meaningful when both runs did the same work. On a
-    # skewed pair it produces a large, confident, meaningless number — so don't print it.
-    if b.total_mcp and not warns:
-        per_call = (b.weighted - a.weighted) / b.total_mcp
-        print(f"\n  weighted delta per MCP call: {per_call:+,.0f}")
-        if per_call < 0:
-            # Fixed primer overhead is paid once; savings accrue per call.
-            print("  (negative = terse pays for itself at this call volume)")
+def report(a: Arm, b: Arm, *, drop_outliers: bool = True) -> int:
+    turns = modal_turns(a, b)
+    if drop_outliers:
+        a.restrict_to_turns(turns)
+        b.restrict_to_turns(turns)
 
+    print(f"\nA ({a.label}): {len(a.kept)}/{len(a.runs)} runs")
+    print(f"B ({b.label}): {len(b.kept)}/{len(b.runs)} runs")
+    if drop_outliers:
+        print(f"modal assistant turns: {turns}"
+              + (f"  (dropped {len(a.dropped) + len(b.dropped)} outlier run(s))"
+                 if a.dropped or b.dropped else ""))
+        for arm in (a, b):
+            for r in arm.dropped:
+                print(f"  ! dropped {arm.label} {r.path.name[:8]}: {r.turns} turns "
+                      f"(RAW {r.raw_input:,})")
+    if not a.kept or not b.kept:
+        print("\n  NO COMPARABLE RUNS — every run in one arm deviated from the modal "
+              "turn count. Re-run, or pass --keep-outliers to see the raw spread.\n")
+        return 2
+
+    print(f"\n  {'metric':<18} {'A control':>23} {'B terse':>23} {'delta':>11} {'pct':>8}")
+    print(f"  {'-'*18} {'-'*23} {'-'*23} {'-'*11} {'-'*8}")
+    for label, fld in (("cache write", "cache_write"), ("cache read", "cache_read"),
+                       ("output", "output")):
+        line, _ = _row(label, a, b, fld)
+        print(line)
+    print(f"  {'-'*18} {'-'*23} {'-'*23} {'-'*11} {'-'*8}")
+    raw_line, raw_clears = _row("RAW input", a, b, "raw_input")
+    w_line, w_clears = _row("WEIGHTED", a, b, "weighted")
+    print(raw_line)
+    print(w_line)
+    print()
+    print(f"  MCP calls          {a.kept[0].total_mcp:>11} {b.kept[0].total_mcp:>23}")
+    print(f"  terse.retrieve     {a.kept[0].retrieve_calls:>11} "
+          f"{b.kept[0].retrieve_calls:>23}")
+
+    warns = _skew_warnings(a, b)
     if warns:
-        print("\n  UNCONTROLLED SKEW — the delta below is not clean:")
+        print("\n  UNCONTROLLED SKEW — the delta above is not clean:")
         for w in warns:
             print(f"    ! {w}")
 
-    d = b.weighted - a.weighted
-    if d == 0:
-        print("\n  verdict (weighted): NO DIFFERENCE\n")
+    mw, _ = b.stat("weighted")
+    ma, _ = a.stat("weighted")
+    d = mw - ma
+    if len(a.kept) < 2 or len(b.kept) < 2:
+        print(f"\n  verdict (weighted): INSUFFICIENT DATA — delta {d:+,.0f}, but an arm "
+              f"has fewer than 2 surviving runs so there is no spread to judge it "
+              f"against\n")
+        return 2
+    if not w_clears:
+        print(f"\n  verdict (weighted): INCONCLUSIVE — delta {d:+,.0f} is inside the "
+              f"run-to-run spread\n")
     else:
-        verdict = "TERSE WINS" if d < 0 else "TERSE LOSES"
-        print(f"\n  verdict (weighted): {verdict} by {abs(d):,.0f} weighted tokens\n")
-    return 0 if not warns else 2
+        print(f"\n  verdict (weighted): {'TERSE WINS' if d < 0 else 'TERSE LOSES'} "
+              f"by {abs(d):,.0f} weighted tokens\n")
+    return 2 if warns else 0
 
 
 def _resolve(p: str) -> Path:
@@ -252,33 +348,44 @@ def _resolve(p: str) -> Path:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--a", required=True, metavar="PATH",
-                    help="control transcript (terse NOT installed): a .jsonl file, or a "
-                         "session dir whose newest .jsonl is used")
-    ap.add_argument("--b", required=True, metavar="PATH",
-                    help="treatment transcript (terse installed)")
+    ap.add_argument("--a", required=True, nargs="+", metavar="PATH",
+                    help="control transcript(s) (terse NOT installed). Repeatable — pass "
+                         "every replicate; a .jsonl file, or a session dir whose newest "
+                         ".jsonl is used")
+    ap.add_argument("--b", required=True, nargs="+", metavar="PATH",
+                    help="treatment transcript(s) (terse installed)")
+    ap.add_argument("--keep-outliers", action="store_true",
+                    help="do NOT drop runs whose turn count deviates from the modal "
+                         "value. Shows the raw spread; the aggregate is then dominated "
+                         "by round-trip luck rather than by compression")
     ap.add_argument("--json", action="store_true",
-                    help="emit the raw numbers as JSON instead of the table")
+                    help="emit the per-run numbers as JSON instead of the table")
     args = ap.parse_args(argv)
 
-    a = SessionStats(_resolve(args.a))
-    b = SessionStats(_resolve(args.b))
+    a = Arm([_resolve(p) for p in args.a], "no-terse")
+    b = Arm([_resolve(p) for p in args.b], "terse")
 
     if args.json:
-        def dump(s: SessionStats) -> dict:
-            return {"path": str(s.path), "input": s.input, "cache_write": s.cache_write,
-                    "cache_read": s.cache_read, "output": s.output,
-                    "raw_input": s.raw_input, "weighted": round(s.weighted, 1),
-                    "turns": s.turns, "mcp_calls": s.total_mcp,
-                    "retrieve_calls": s.retrieve_calls,
-                    "models": sorted(s.models), "versions": sorted(s.versions)}
-        print(json.dumps({"a": dump(a), "b": dump(b),
-                          "delta_raw_input": b.raw_input - a.raw_input,
-                          "delta_weighted": round(b.weighted - a.weighted, 1),
-                          "skew": _skew_warnings(a, b)}, indent=2))
+        turns = modal_turns(a, b)
+        if not args.keep_outliers:
+            a.restrict_to_turns(turns)
+            b.restrict_to_turns(turns)
+
+        def dump(arm: Arm) -> dict:
+            return {"label": arm.label, "modal_turns": turns,
+                    "kept": [{"path": str(r.path), "turns": r.turns,
+                              "raw_input": r.raw_input, "weighted": round(r.weighted, 1),
+                              "mcp_calls": r.total_mcp} for r in arm.kept],
+                    "dropped": [{"path": str(r.path), "turns": r.turns} for r in arm.dropped],
+                    "mean_raw_input": arm.stat("raw_input")[0],
+                    "sd_raw_input": arm.stat("raw_input")[1],
+                    "mean_weighted": arm.stat("weighted")[0],
+                    "sd_weighted": arm.stat("weighted")[1]}
+        print(json.dumps({"a": dump(a), "b": dump(b), "skew": _skew_warnings(a, b)},
+                         indent=2))
         return 0
 
-    return report(a, b, label_a="A no-terse", label_b="B terse")
+    return report(a, b, drop_outliers=not args.keep_outliers)
 
 
 if __name__ == "__main__":
