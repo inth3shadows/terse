@@ -151,12 +151,27 @@ class Rule:
 class Policy:
     rules: list[Rule]
     default_tiers: tuple[str, ...] = ("minify", "tabularize", "dictionary")
-    # Cross-call diffing is ON by default since its validation program completed —
-    # pair fluency (`fluency --diff`), nested-record coverage (#72), and the drift
-    # soak (#75: mechanical zero-drift, depth-1..5 behavioral PASS). Opt out
-    # per-policy (`"diff": false`) or with `proxy --no-diff`. The proxy still falls
-    # back to the full compressed form whenever a diff doesn't apply or win.
-    diff: bool = True
+    # Cross-call diffing is OFF by default (#170). Opt IN per-policy (`"diff": true`) or
+    # with `proxy --diff`; the tier itself is unchanged and still falls back to the full
+    # compressed form whenever a diff doesn't apply or win.
+    #
+    # It was default-ON from PR #76, on the strength of a validation program that measured
+    # CORRECTNESS — pair fluency (`fluency --diff`), nested-record coverage (#72), drift
+    # soak (#75: mechanical zero-drift, depth-1..5 behavioral PASS). All of that still
+    # holds. What it did not measure is net token value, because the primer was not yet
+    # known to be the dominant cost term.
+    #
+    # It is: the primer paragraph explaining the diff envelopes is 190 of 402 cl100k
+    # tokens (47%, the largest section) and is re-read every turn per wrapped server. The
+    # live all-time ledger over 13.3 days: 7 diff emissions in 1,828 blocks (0.38%),
+    # saving 5,052 tokens, against 24,252 assistant turns in the same window — 912x the
+    # saving at one wrapped server, 2,736x at three. Even discounting for cache reads
+    # (~0.1x) and for turns without terse attached, no correction closes that gap.
+    #
+    # The dominant refusal is `multiblock` (444 vs 7 emissions): most real results arrive
+    # as several content blocks. If #140's partial multi-block join converts those into
+    # emissions, re-measure and flip back — the tier is not the problem, its hit rate is.
+    diff: bool = False
     # Join every text content block of a multi-block result into ONE record array before
     # compressing (#116). Several servers return one record per block; independently each
     # block is a single object, so `tabularize` never sees an array and the cross-call
@@ -426,7 +441,7 @@ def load_policy(path: str | Path) -> Policy:
                           capture=_coerce_capture(r.get("capture", True), f"policies[{i}]"),
                           structured=_coerce_structured(r.get("structured", "auto"),
                                                         f"policies[{i}]")))
-    return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", True)),
+    return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", False)),
                   join_blocks=bool(doc.get("join_blocks", True)),
                   diff_keyframe_interval=int(doc.get("diff_keyframe_interval", 5)),
                   never_lossy_servers=frozenset(doc.get("never_lossy_servers", ())))

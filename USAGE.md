@@ -145,9 +145,9 @@ uv run terse uninstall-mcp --all          # every terse-managed server
 the entry's `env`/`cwd`/etc. The original is saved verbatim in a sidecar stash
 (`.terse-mcp-stash.json` next to the config), so `uninstall-mcp` restores it
 byte-for-byte. It's **idempotent** (re-running re-wraps from the stashed original
-instead of nesting proxies). Cross-call diffing is the proxy default, so a plain
-wrap inherits it; pass `install-mcp --no-diff` to bake an opt-out into a server's
-entry (or `--diff` to override a policy-file `"diff": false`), and
+instead of nesting proxies). Cross-call diffing is OPT-IN since #170, so a plain
+wrap does NOT diff; pass `install-mcp --diff` to bake an opt-in into a server's
+entry (or `--no-diff` to override a policy-file `"diff": true`), and
 `--diff-keyframe-interval K` to tune re-anchoring. Flags always reflect the latest
 install invocation. It honors `$CLAUDE_CONFIG` if your config isn't at
 `~/.claude.json`. Start with one high-win, read-only server (e.g. `runecho`) and
@@ -789,9 +789,9 @@ TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \
 It asks whether a model reconstructs the current text as accurately from (previous text
 + text-diff) as from the full current text, and PASS/FAILs on the worst model — re-run
 it for a new consumer of text-heavy tools. There's no separate switch: the same
-default-on diffing emits a text diff instead of a JSON diff whenever the payload isn't
-JSON (and `--no-diff` turns both off together), so this eval is a risk-item check on
-existing behavior.
+diff tier emits a text diff instead of a JSON diff whenever the payload isn't JSON
+(and `--diff` turns both on together), so this eval is a risk-item check on the
+opt-in path.
 
 ### Building a sample set
 

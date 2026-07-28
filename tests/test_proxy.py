@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import pathlib
@@ -263,10 +264,11 @@ def test_diff_reason_splits_same_vs_different_args_when_delta_loses():
     assert reasons[-1] == "not_smaller_same_args"          # base now the page=2 call
 
 
-def test_diff_on_by_default_and_policy_false_disables():
-    # Since #75 completed the validation program, Policy.diff defaults ON: a plain
-    # policy diffs the second same-tool result with no flag at all …
-    inter = Interceptor(FULL)
+def test_diff_off_by_default_and_policy_true_enables():
+    # Policy.diff defaults OFF since #170: the tier is correct (its #72/#75 validation
+    # still holds) but its 190-token primer paragraph cost ~900-5,500x what the tier
+    # saved at a 0.38% production hit rate. A plain policy therefore does NOT diff …
+    inter = Interceptor(DIFF)
     prev, curr = _records(40), _records(40, change=5)
     _emit(inter, 1, "gh.api.items", prev)
     t2 = _emit(inter, 2, "gh.api.items", curr)
@@ -389,9 +391,9 @@ def test_second_non_json_result_emits_smaller_lossless_text_diff():
     assert raw_first == prev  # sanity: first call was untouched
 
 
-def test_text_diff_on_by_default_and_policy_false_disables():
-    # Same default flip for the CDC text path: on by default, off via "diff": false.
-    inter = Interceptor(FULL)
+def test_text_diff_off_by_default_and_policy_true_enables():
+    # Same default for the CDC text path: off by default (#170), on via "diff": true.
+    inter = Interceptor(DIFF)
     prev, curr = _log_text(80), _log_text(80, changed_line=40)
     _emit_text(inter, 1, "fs.read", prev)
     t2 = _emit_text(inter, 2, "fs.read", curr)
@@ -471,7 +473,7 @@ def _init_resp(mid=1, instructions=None):
 
 
 def test_initialize_reply_gets_format_primer():
-    inter = Interceptor(FULL)
+    inter = Interceptor(DIFF)      # diff opt-in, so the primer covers every form
     inter.note_request(_init_req(1))
     out = json.loads(inter.transform_response(_init_resp(1)))
     instr = out["result"]["instructions"]
@@ -950,7 +952,7 @@ def test_capture_false_still_counts_in_the_payload_free_stats_ledger():
     inter.transform_response(_result_msg(1, SECRET))
     assert len(seen) == 1
     tool, raw, emitted, passthrough, reason, structured, structured_out = seen[0]
-    assert tool == "secret.reveal" and passthrough is True and reason == "passthrough"
+    assert tool == "secret.reveal" and passthrough is True and reason == "diff_off"
     assert raw == SECRET and emitted == SECRET             # passthrough: untouched
 
 
@@ -992,7 +994,7 @@ def test_stats_callback_sees_raw_and_emitted_per_result():
     out = inter.transform_response(_result_msg(1, _records_text()))
     assert len(seen) == 1
     tool, raw, emitted, passthrough, reason, structured, structured_out = seen[0]
-    assert tool == "gh.api.items" and passthrough is False and reason == "no_prior"
+    assert tool == "gh.api.items" and passthrough is False and reason == "diff_off"
     assert raw == _records_text()                       # true pre-transform snapshot
     assert emitted == json.loads(out)["result"]["content"][0]["text"]
     assert classify_decision(raw, emitted, passthrough) == "compressed"
@@ -1003,7 +1005,7 @@ def test_stats_callback_works_without_audit_and_labels_a_diff():
     # second same-tool call that ships a cross-call delta classifies as "diff".
     from terse.stats import classify_decision
     seen = []
-    inter = Interceptor(FULL, stats=lambda *a: seen.append(a))
+    inter = Interceptor(DIFF, stats=lambda *a: seen.append(a))
     first = {"result": [{"id": i, "status": "active", "url": "https://x.example/api/items"}
                         for i in range(20)]}
     second = json.loads(json.dumps(first))
@@ -1024,7 +1026,7 @@ def test_stats_passthrough_tool_is_labeled_passthrough():
     _note_call(inter, 5, "gh.api.items")
     inter.transform_response(_result_msg(5, _records_text()))
     (tool, raw, emitted, passthrough, reason, structured, structured_out), = seen
-    assert passthrough is True and raw == emitted and reason == "passthrough"
+    assert passthrough is True and raw == emitted and reason == "diff_off"
     assert classify_decision(raw, emitted, passthrough) == "passthrough"
 
 
@@ -1337,7 +1339,7 @@ def test_text_drop_emits_marker_stores_original_and_retrieve_serves_it_back():
 
 
 def test_text_drop_clears_the_text_diff_base():
-    inter = Interceptor(TEXT_DROP)
+    inter = Interceptor(dataclasses.replace(TEXT_DROP, diff=True))
     _emit_text(inter, 1, "codegraph_explore", "plain text result with no fences at all")
     assert inter.last_text.get("codegraph_explore") is not None   # normal CDC base stored
     _emit_text(inter, 2, "codegraph_explore", _MD)
@@ -1971,7 +1973,7 @@ def test_structured_replace_resets_the_TEXT_diff_base_too():
     # later CDC text diff whose `=` ops reference the dropped block is unrecoverable — the
     # model never received the text being referenced. All six state maps must reset.
     inter = Interceptor(Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"),
-                                           structured="replace")]))
+                                           structured="replace")], diff=True))
     def call(mid, result):
         inter.note_request(f'{{"jsonrpc":"2.0","id":{mid},"method":"tools/call",'
                            '"params":{"name":"gh.items"}}')

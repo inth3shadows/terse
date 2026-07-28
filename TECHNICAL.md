@@ -421,8 +421,10 @@ by the next patch (PyPI versions cannot be re-uploaded).
   merging, and any client method outside `initialize`/`tools/list`/`tools/call` falls back
   to peer 0 (debug-logged). Each is a documented v1 limitation, not a silent gap — revisit
   if a real workload needs it.
-- **Cross-call diffing is built and ON by default (`proxy --no-diff` / policy
-  `"diff": false` to opt out).** The probe shows 91% overlap between successive
+- **Cross-call diffing is built and OPT-IN (`proxy --diff` / policy
+  `"diff": true`).** Default-off since #170: the tier is correct, but its primer
+  paragraph is 47% of the primer and the live ledger shows a 0.38% hit rate.
+ The probe shows 91% overlap between successive
   same-tool calls; the proxy emits a lossless delta against the prior result (keyed row
   diff for record arrays, shallow key diff for objects) instead of the full payload. It
   is stateful (per-tool last result), self-verifying (a diff is sent only when it
