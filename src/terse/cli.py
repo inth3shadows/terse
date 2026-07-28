@@ -1134,7 +1134,7 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
             # For a wrapped entry, a second indented line surfaces what it actually
             # fronts and the tiers baked into the entry — the diagnostic the flat
             # "wrapped policy=…" line couldn't answer when a server misbehaves.
-            if r["state"] == "wrapped":
+            if r["state"] in ("wrapped", "wrapped-unstashed"):
                 stats = "on" if r.get("stats") else "off"
                 detail = (f"wraps={r.get('wraps') or '?'}  "
                           f"diff={r.get('diff') or '?'}  stats={stats}")
