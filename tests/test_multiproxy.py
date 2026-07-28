@@ -1163,3 +1163,14 @@ def test_peer_initiated_request_does_not_consume_that_peers_interceptor_pending(
         assert transforms.TABLE_MARKER in text
     finally:
         router.close_senders()
+
+
+def test_merge_initialize_omits_instructions_when_nothing_to_say():
+    """`"instructions": ""` and an absent key are different to a client that renders an
+    instructions block. When no peer can emit a terse form and none supplied its own,
+    omit the key — matching what the single-proxy `_augment_initialize` does (#168)."""
+    from terse import policy as P
+    from terse.proxy import union_primer
+    quiet = P.Policy(rules=[], default_tiers=(), diff=False)
+    assert union_primer([(quiet, "a")]) == ""
+    assert union_primer([(quiet, "a"), (quiet, "b")]) == ""

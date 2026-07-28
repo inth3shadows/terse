@@ -100,14 +100,31 @@ def _args_key(arguments: Any) -> str:
 # can't set a system prompt); `instructions` is the channel clients add to that context.
 # Covers the always-on table/dict forms AND the opt-in diff form, so it helps base
 # comprehension too — paid once per session, not per result.
-TERSE_PRIMER = (
+# The primer is assembled per-server from these sections, not shipped whole (#168). Each
+# section documents ONE wire form, and the form is gated by policy the proxy already knows
+# at initialize time — so a server explains only what it can actually put on the wire.
+#
+# Measured cost of the whole primer, cl100k: header 41, table 55, dict 44, diff 190,
+# dropped 64, tail 8 = 402. Paid per wrapped server, re-read every turn as cache_read.
+# That is why terse measured a 14.0% win at one wrapped server and a loss at three.
+#
+# PRIMER_HEAD is the idempotency sentinel: it appears in every non-empty assembly, so
+# `_augment_initialize` can detect its own prior injection without knowing which sections
+# were selected.
+PRIMER_HEAD = (
     "Some tool results are 'terse'-compressed (a lossless, denser JSON encoding); some "
     "are sent as diffs against the previous result of the same tool. Read each as the "
     "equivalent full JSON:\n"
+)
+PRIMER_TABLE = (
     '- Table {"__terse_table__":1,"n":N,"cols":[...],"rows":[[...]]}: N records, each row '
     'POSITIONAL — its i-th value belongs to the i-th name in "cols". "n" is the exact count.\n'
+)
+PRIMER_DICT = (
     '- Dict {"__terse_dict__":1,"legend":{"~0":value,...},"data":...}: every "~K" token '
     'inside "data" stands for legend["~K"] — substitute it back.\n'
+)
+PRIMER_DIFF = (
     '- Diff {"__terse_diff__":1,"shape":"rows","by":COL,"set":[...],"new":[...],"del":[...],'
     '"n":N}: update the PREVIOUS same-tool result — from its records drop ids in "del", '
     'overwrite/insert each record in "set" matched by its "by" field, append ids in "new"; '
@@ -117,11 +134,64 @@ TERSE_PRIMER = (
     "PREVIOUS same-tool plain-text result: process ops in order, copying chunks a..b of "
     "that prior text for a `=` op or inserting its literal string for a `+` op, then "
     "concatenating everything.\n"
+)
+PRIMER_DROPPED = (
     '- Dropped field {"__terse_dropped__":"H","bytes":N,"retrieve":"terse.retrieve"}: a '
     "large field value was omitted to save context. It is NOT lost — when you actually need "
     'it, call the terse.retrieve tool with {"handle":"H"} to get the exact original back.\n'
-    "Always reason about the fully reconstructed result."
 )
+PRIMER_TAIL = "Always reason about the fully reconstructed result."
+
+# The full assembly, for tests and for callers that want every section regardless of
+# policy. `build_primer(default_policy())` reproduces this exactly.
+TERSE_PRIMER = (PRIMER_HEAD + PRIMER_TABLE + PRIMER_DICT + PRIMER_DIFF + PRIMER_DROPPED
+                + PRIMER_TAIL)
+
+
+def build_primer(pol: policy_mod.Policy, server: str | None = None) -> str:
+    """The primer for a server governed by `pol` — only the wire forms it can emit (#168).
+
+    Returns "" when the policy can emit no compressed form at all (every reachable rule is
+    `tiers: ()` with diffing therefore dead and no field drop). secret-broker's
+    default-deny policy is exactly that case, and today it pays 402 tokens per turn to
+    explain forms it is structurally forbidden from producing.
+
+    `minify` alone is deliberately NOT a reason to emit a primer: minified JSON is just
+    JSON, carries no terse marker, and needs no explanation.
+    """
+    return _assemble_primer(
+        table=pol.emits_table(server), dictionary=pol.emits_dict(server),
+        diff=pol.emits_diff(server), dropped=pol.has_drop(),
+    )
+
+
+def _assemble_primer(*, table: bool, dictionary: bool, diff: bool, dropped: bool) -> str:
+    """Join the selected sections, or "" when none are selected."""
+    body = "".join(s for gate, s in (
+        (table, PRIMER_TABLE),
+        (dictionary, PRIMER_DICT),
+        (diff, PRIMER_DIFF),
+        (dropped, PRIMER_DROPPED),
+    ) if gate)
+    return PRIMER_HEAD + body + PRIMER_TAIL if body else ""
+
+
+def union_primer(pairs: list[tuple[policy_mod.Policy, str | None]]) -> str:
+    """One primer covering every form ANY of `policies` can emit (#168).
+
+    `pairs` is [(policy, server_name)] — each peer is gated against its OWN name, since a
+    rule like `kb.*` totally covers the kb peer and is irrelevant to the runecho one.
+
+    For a router fronting several peers with independent policies: a form no peer can emit
+    is a form the client will never see, but a form any single peer can emit must still be
+    documented once. Erring toward inclusion — a surplus paragraph costs tokens, a missing
+    one costs comprehension."""
+    return _assemble_primer(
+        table=any(p.emits_table(s) for p, s in pairs),
+        dictionary=any(p.emits_dict(s) for p, s in pairs),
+        diff=any(p.emits_diff(s) for p, s in pairs),
+        dropped=any(p.has_drop() for p, _ in pairs),
+    )
 
 
 class Interceptor:
@@ -967,18 +1037,29 @@ class Interceptor:
     def _augment_initialize(self, msg: dict) -> str | None:
         """Prepend the terse format primer to the initialize result's `instructions` (#13),
         preserving any the downstream server set. Idempotent. Returns the reserialized
-        line, or None to forward unchanged."""
+        line, or None to forward unchanged.
+
+        The primer is assembled from this server's policy (#168), so it documents only the
+        wire forms this server can emit — and is empty, injecting nothing, for a policy
+        that can emit none. Idempotency keys on PRIMER_HEAD rather than the whole string,
+        since the assembly varies per policy."""
         result = msg.get("result")
         if not isinstance(result, dict):
             return None
+        primer = build_primer(self.policy, self.server_name)
+        if not primer:
+            if self.debug:
+                sys.stderr.write("[terse-proxy] policy emits no terse wire form; "
+                                 "no primer injected\n")
+            return None
         existing = result.get("instructions")
         existing = existing if isinstance(existing, str) else ""
-        if TERSE_PRIMER in existing:
+        if PRIMER_HEAD in existing:
             return None
-        result["instructions"] = TERSE_PRIMER + (f"\n\n{existing}" if existing else "")
+        result["instructions"] = primer + (f"\n\n{existing}" if existing else "")
         if self.debug:
-            sys.stderr.write("[terse-proxy] injected terse format primer into "
-                             "initialize.instructions\n")
+            sys.stderr.write(f"[terse-proxy] injected terse format primer "
+                             f"({len(primer)} chars) into initialize.instructions\n")
         return json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
 
     def _diff_wire(self, prev: Any, curr: Any, tool: str) -> str | None:
