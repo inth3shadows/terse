@@ -2067,3 +2067,173 @@ def test_a_reconnect_makes_a_reused_jsonrpc_id_a_different_result():
     inter.transform_response(_result_msg(1, _records_text()))
 
     assert len({c["result_id"] for c in calls}) == 2
+
+
+# ---------------------------------------------------------------------------
+# #168: the primer is assembled per-policy, so a server documents only the wire
+# forms it can actually emit.
+# ---------------------------------------------------------------------------
+
+def _pol(tiers=("minify", "tabularize", "dictionary"), *, diff=True, drop=False, rules=None):
+    from terse import policy as P
+    rs = list(rules or [])
+    if drop:
+        rs.append(P.Rule(tool_glob="*", tiers=tuple(tiers),
+                         fields={"$text": {"lossy": "drop-to-retrieve"}}))
+    return P.Policy(rules=rs, default_tiers=tuple(tiers), diff=diff)
+
+
+def test_every_section_selected_reproduces_the_whole_primer_verbatim():
+    """A policy reaching every form must be byte-identical to the shipped constant, so the
+    decomposition cannot silently reword text that readers (and dropeval) depend on.
+
+    Note `default_policy()` alone does NOT reproduce it: it has no field drop, so the
+    dropped-field paragraph is correctly absent."""
+    from terse.proxy import TERSE_PRIMER, build_primer
+    assert build_primer(_pol(drop=True)) == TERSE_PRIMER
+
+
+def test_minify_only_policy_emits_no_primer_at_all():
+    """`tiers: ["minify"]` puts no terse marker on the wire — minified JSON is just JSON.
+    With diffing dead alongside it, there is nothing to explain."""
+    from terse.proxy import build_primer
+    assert build_primer(_pol(("minify",), diff=False)) == ""
+
+
+def test_deny_everything_policy_emits_no_primer():
+    """secret-broker's default-deny shape: no tiers, no diff, no drop. Today it pays the
+    full 402-token primer to describe forms it is structurally forbidden from producing."""
+    from terse.proxy import build_primer
+    assert build_primer(_pol((), diff=False)) == ""
+
+
+def test_diff_flag_alone_cannot_resurrect_the_primer_when_no_tier_is_reachable():
+    """`diff: true` with `tiers: ()` keeps no diff base (the interceptor skips those
+    tools), so the diff section must not be emitted on its strength alone."""
+    from terse.proxy import build_primer
+    assert build_primer(_pol((), diff=True)) == ""
+
+
+def test_tabularize_without_dictionary_documents_the_table_but_not_the_legend():
+    from terse.proxy import PRIMER_DICT, PRIMER_TABLE, build_primer
+    out = build_primer(_pol(("minify", "tabularize"), diff=False))
+    assert PRIMER_TABLE in out
+    assert PRIMER_DICT not in out
+
+
+def test_diff_section_is_omitted_when_diffing_is_off():
+    """The diff paragraph is 190 of the primer's 402 cl100k tokens — the single largest
+    section — for a tier measured at a ~0.4% hit rate in production."""
+    from terse.proxy import PRIMER_DIFF, build_primer
+    assert PRIMER_DIFF not in build_primer(_pol(diff=False))
+    assert PRIMER_DIFF in build_primer(_pol(diff=True))
+
+
+def test_dropped_section_tracks_has_drop():
+    from terse.proxy import PRIMER_DROPPED, build_primer
+    assert PRIMER_DROPPED not in build_primer(_pol())
+    assert PRIMER_DROPPED in build_primer(_pol(drop=True))
+
+
+def test_a_rule_reaching_a_tier_the_default_does_not_still_documents_it():
+    """The primer is injected before any tool is named, so the gate is the UNION over
+    every reachable rule — not just the default."""
+    from terse import policy as P
+    from terse.proxy import PRIMER_TABLE, build_primer
+    pol = P.Policy(rules=[P.Rule(tool_glob="wide.*", tiers=("minify", "tabularize"))],
+                   default_tiers=("minify",), diff=False)
+    assert PRIMER_TABLE in build_primer(pol)
+
+
+def test_union_primer_documents_a_form_any_single_peer_can_emit():
+    from terse.proxy import PRIMER_DROPPED, PRIMER_TABLE, union_primer
+    quiet = _pol(("minify",), diff=False)
+    dropper = _pol(("minify",), diff=False, drop=True)
+    out = union_primer([(quiet, "a"), (dropper, "b")])
+    assert PRIMER_DROPPED in out
+    assert PRIMER_TABLE not in out          # no peer reaches tabularize
+    assert union_primer([(quiet, "a"), (quiet, "b")]) == ""
+
+
+def test_initialize_injects_nothing_when_the_policy_emits_no_form():
+    """End-to-end: a deny-everything server's initialize reply is forwarded untouched."""
+    from terse.proxy import Interceptor
+    inter = Interceptor(_pol((), diff=False))
+    inter.note_request(_init_req(1))
+    out = json.loads(inter.transform_response(_init_resp(1)))
+    assert "instructions" not in out["result"]
+    assert out["result"]["serverInfo"]["name"] == "s"      # rest untouched
+
+
+def test_initialize_primer_injection_is_idempotent_across_varying_assemblies():
+    """Idempotency keys on PRIMER_HEAD, not the whole string, because the assembly now
+    varies per policy — a full-primer check would re-inject onto a shortened one."""
+    from terse.proxy import PRIMER_HEAD, Interceptor
+    inter = Interceptor(_pol(("minify", "tabularize"), diff=False))
+    inter.note_request(_init_req(1))
+    out = json.loads(inter.transform_response(_init_resp(1, PRIMER_HEAD + "already here")))
+    assert out["result"]["instructions"].count(PRIMER_HEAD) == 1
+
+
+def test_a_total_cover_rule_makes_default_tiers_unreachable_for_that_server():
+    """The live policy sets `default_tiers` to all three tiers, so without terminating the
+    walk at a total-cover rule every server would appear to reach every tier and the
+    primer could never shrink. `kb.*` covers every kb tool, so kb's ceiling is that rule's
+    tiers — not the default's."""
+    from terse import policy as P
+    from terse.proxy import PRIMER_DICT, PRIMER_TABLE, build_primer
+    pol = P.Policy(rules=[P.Rule(tool_glob="kb.*", tiers=("minify", "tabularize"))],
+                   default_tiers=("minify", "tabularize", "dictionary"), diff=False)
+    assert pol.reachable_tiers("kb") == {"minify", "tabularize"}
+    out = build_primer(pol, "kb")
+    assert PRIMER_TABLE in out and PRIMER_DICT not in out
+    # Unknown server identity cannot exclude anything, so the default still counts.
+    assert "dictionary" in pol.reachable_tiers(None)
+
+
+def test_reachable_tiers_never_undercounts_what_select_returns():
+    """THE invariant: `select(tool, server).tiers <= reachable_tiers(server)`, for every
+    tool. Under-inclusion means the client gets an envelope with nothing explaining it.
+
+    Pins the bug this gate shipped with in review: an earlier revision skipped rules whose
+    literal prefix named a different server, but `select` is candidate-major over
+    `_match_candidates`, whose second candidate is the tool's own UNQUALIFIED name — so
+    `kb.*` matches `kb.read.search` no matter which server serves it."""
+    from terse import policy as P
+    pol = P.Policy(
+        rules=[P.Rule(tool_glob="gh.*", tiers=("minify", "tabularize", "dictionary")),
+               P.Rule(tool_glob="kb.*", tiers=("minify", "tabularize", "dictionary")),
+               P.Rule(tool_glob="read.*", tiers=("minify", "tabularize"))],
+        default_tiers=("minify",), diff=False)
+    servers = ("kb", "knowledge", "runecho", "gh", None)
+    tools = ("kb.read.search", "gh.issues", "read.search", "structure", "kb.propose.extend")
+    for server in servers:
+        reachable = pol.reachable_tiers(server)
+        for tool in tools:
+            assert set(pol.select(tool, server).tiers) <= reachable, (server, tool)
+
+
+def test_a_server_serving_another_servers_tool_names_still_gets_its_primer():
+    """The live repro from review: config key `knowledge`, tools named `kb.read.*`, under
+    a hand-authored `kb.*` rule. The prefix-based exclusion emitted NO primer here while
+    `select` returned all three tiers — a `__terse_table__` envelope with no legend."""
+    from terse import policy as P
+    from terse.proxy import PRIMER_DICT, PRIMER_TABLE, build_primer
+    pol = P.Policy(rules=[P.Rule(tool_glob="kb.*",
+                                 tiers=("minify", "tabularize", "dictionary"))],
+                   default_tiers=("minify",), diff=False)
+    assert set(pol.select("kb.read.search", "knowledge").tiers) == {
+        "minify", "tabularize", "dictionary"}
+    out = build_primer(pol, "knowledge")
+    assert PRIMER_TABLE in out and PRIMER_DICT in out
+
+
+def test_a_covering_rule_still_terminates_the_walk():
+    """The one sound narrowing: `kb.*` matches every tool `kb` serves via candidate 0, so
+    `select` can never reach a later rule or the default for that server."""
+    from terse import policy as P
+    pol = P.Policy(rules=[P.Rule(tool_glob="kb.*", tiers=("minify", "tabularize")),
+                          P.Rule(tool_glob="*", tiers=("minify", "dictionary"))],
+                   default_tiers=("minify", "tabularize", "dictionary"), diff=False)
+    assert pol.reachable_tiers("kb") == {"minify", "tabularize"}
+    assert "dictionary" in pol.reachable_tiers(None)   # unknown identity narrows nothing

@@ -67,7 +67,8 @@ from . import policy as policy_mod
 from .proxy import (
     RETRIEVE_TOOL_DEF,
     SWALLOW,
-    TERSE_PRIMER,
+    PRIMER_HEAD,
+    union_primer,
     Interceptor,
     _build_capture_and_audit,
     _ignore_sigterm,
@@ -877,7 +878,8 @@ class Router:
         to agree in practice). `capabilities` = a shallow dict-union (last-peer-wins on a
         key clash — no ordering guarantee stronger than "arrival order", documented).
         `serverInfo` names US, not any one peer (merging N identities into one isn't
-        meaningful). `instructions` = ONE `TERSE_PRIMER`, first, then each peer's own
+        meaningful). `instructions` = ONE primer covering the union of what any peer can
+        emit (#168), first, then each peer's own
         non-empty instructions (skipping one that already carries the primer, so a peer
         that is ITSELF a terse proxy doesn't duplicate it)."""
         protocol_version: str | None = None
@@ -897,20 +899,31 @@ class Router:
             if isinstance(caps, dict):
                 capabilities.update(caps)
             instr = result.get("instructions")
-            if isinstance(instr, str) and instr.strip() and TERSE_PRIMER not in instr:
+            if isinstance(instr, str) and instr.strip() and PRIMER_HEAD not in instr:
                 instructions_parts.append(instr)
         if protocol_version is None:
             protocol_version = "2024-11-05"  # every peer errored/timed out — a safe fallback
-        instructions = TERSE_PRIMER
+        # ONE primer for the whole router, covering the UNION of what any peer can emit
+        # (#168). Peers may carry different policies (`downstreams[].policy`), and a form
+        # documented by none of them is a form the client will never see — but a form ANY
+        # peer can emit must be documented, so the union is the only sound scope here.
+        instructions = union_primer([(p.inter.policy, p.name) for p in self.peers])
         if instructions_parts:
-            instructions += "\n\n" + "\n\n".join(instructions_parts)
+            instructions = ((instructions + "\n\n") if instructions else "") \
+                + "\n\n".join(instructions_parts)
         from . import __version__
-        return {
+        merged = {
             "protocolVersion": protocol_version,
             "capabilities": capabilities,
             "serverInfo": {"name": "terse", "version": __version__},
-            "instructions": instructions,
         }
+        # OMIT the key rather than advertise `"instructions": ""` when no peer can emit a
+        # terse form and none supplied its own — empty-string and absent are a real
+        # distinction to a client that renders an instructions block, and the single-proxy
+        # path (`_augment_initialize`) already forwards unchanged in that case.
+        if instructions:
+            merged["instructions"] = instructions
+        return merged
 
     def _merge_prompts_list(self, pb: _PendingBroadcast) -> dict:
         """Concat every peer's prompts with `{peer}__` name prefixes — the prompts

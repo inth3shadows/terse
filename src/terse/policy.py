@@ -236,6 +236,77 @@ class Policy:
         return any(isinstance(s, dict) and s.get("lossy") == "drop-to-retrieve"
                    for r in self.rules for s in r.fields.values())
 
+    # -- primer gates (#168) ------------------------------------------------------------
+    #
+    # Each wire form terse can put on the wire is gated by policy the proxy already knows
+    # at `initialize` time. These predicates let the proxy explain ONLY the forms it can
+    # actually produce. That is a correctness property before it is a cost one: a primer
+    # that documents a table for a `tiers: ["minify"]` server describes behavior that
+    # cannot occur.
+    #
+    # They answer "could ANY tool on this server emit this form", not "will this one" —
+    # the primer is injected once at initialize, before any tool is named, so the union
+    # over every reachable rule is the only sound scope. Erring toward including a section
+    # is the safe direction: a surplus paragraph costs tokens, a missing one costs
+    # comprehension on every payload that uses the form.
+
+    @classmethod
+    def _glob_covers_server(cls, glob: str, server: str) -> bool:
+        """Does this glob match EVERY tool `server` can serve? If so, `select` never falls
+        through to the default for that server, and later rules are dead.
+
+        Sound because a covering glob always matches `_match_candidates[0]`
+        (`{server}.{bare}`), which `select` tries before any later rule."""
+        return glob in ("*", f"{server}.*", f"{server}*")
+
+    def reachable_tiers(self, server: str | None = None) -> set[str]:
+        """Union of tiers any tool on `server` could select — an OVER-approximation.
+
+        Every rule counts. It is tempting to skip rules whose glob looks scoped to a
+        different server (`gh.*` when serving `kb`), but that is unsound: `select` is
+        candidate-major over `_match_candidates`, whose second candidate is the tool's own
+        UNQUALIFIED name — so `gh.*` matches any tool literally named `gh.something`
+        regardless of which server serves it. The primer is built at `initialize`, before
+        `tools/list`, so the tool inventory is unknown and no name-shape exclusion is
+        available. An earlier revision filtered on the glob's literal prefix and produced
+        an EMPTY primer for a server named `knowledge` serving `kb.read.*` tools under a
+        `kb.*` rule, while `select` still returned all three tiers for them — a client
+        receiving a `__terse_table__` envelope with nothing explaining it.
+
+        The one sound narrowing is termination: a rule that totally covers the server ends
+        the walk, because `select` returns the first match, so neither later rules nor
+        `default_tiers` are reachable past it. Without it every server would inherit
+        `default_tiers` (all three tiers in the shipped policy) and the primer could never
+        shrink.
+
+        Invariant, pinned by test: `select(tool, server).tiers <= reachable_tiers(server)`
+        for every tool. Over-inclusion costs tokens; under-inclusion costs comprehension.
+        """
+        seen: set[str] = set()
+        for r in self.rules:
+            seen.update(r.tiers)
+            if server and self._glob_covers_server(r.tool_glob, server):
+                return seen
+        seen.update(self.default_tiers)
+        return seen
+
+    def emits_table(self, server: str | None = None) -> bool:
+        """True if `tabularize` is reachable, so a `__terse_table__` envelope can appear."""
+        return "tabularize" in self.reachable_tiers(server)
+
+    def emits_dict(self, server: str | None = None) -> bool:
+        """True if `dictionary` is reachable, so a `__terse_dict__` legend can appear."""
+        return "dictionary" in self.reachable_tiers(server)
+
+    def emits_diff(self, server: str | None = None) -> bool:
+        """True if a `__terse_diff__` / `__terse_textdiff__` envelope can appear.
+
+        Diffing is per-policy (`diff`), but it is also downstream of compression: a tool
+        whose rule is `tiers: ()` keeps no diff base at all (see the interceptor's
+        `if not ...tiers` guards). So the flag alone is not sufficient — some tier must
+        also be reachable."""
+        return self.diff and bool(self.reachable_tiers(server))
+
 
 def default_policy() -> Policy:
     """Lossless-everywhere default: full Tier-0/0.5 on every tool, no lossy."""
