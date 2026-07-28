@@ -66,7 +66,7 @@ then (optionally) serves it through a per-tool policy that decides which tiers r
 - **Tier 0.5 — dictionary code**: repeated string values *and repeated whole subtrees*
   are folded into an inline legend (`~0`, `~1`, …) proven disjoint from every literal in
   the payload. Committed only when it actually saves tokens, so it never regresses.
-- **Tier 0.7 — cross-call diff (stateful, ON by default)**: when the same tool is called
+- **Tier 0.7 — cross-call diff (stateful, OPT-IN — `"diff": true`)**: when the same tool is called
   repeatedly, the proxy emits a lossless delta against the prior result instead of
   the full payload (the 91%-overlap headroom). Self-describing, verified to reconstruct
   exactly, and emitted only when smaller — falls back to the full form otherwise.
