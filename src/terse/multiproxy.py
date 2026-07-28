@@ -65,10 +65,9 @@ from typing import Any, TextIO
 from . import lossy as lossy_mod
 from . import policy as policy_mod
 from .proxy import (
+    PRIMER_HEAD,
     RETRIEVE_TOOL_DEF,
     SWALLOW,
-    PRIMER_HEAD,
-    union_primer,
     Interceptor,
     _build_capture_and_audit,
     _ignore_sigterm,
@@ -76,6 +75,7 @@ from .proxy import (
     _new_session_id,
     _restore_sigterm,
     pump,
+    union_primer,
 )
 from .stats import build_stats_writer
 from .transport import Transport, build_transport

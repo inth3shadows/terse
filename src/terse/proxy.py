@@ -176,7 +176,7 @@ def _assemble_primer(*, table: bool, dictionary: bool, diff: bool, dropped: bool
     return PRIMER_HEAD + body + PRIMER_TAIL if body else ""
 
 
-def union_primer(pairs: "list[tuple[policy_mod.Policy, str | None]]") -> str:
+def union_primer(pairs: list[tuple[policy_mod.Policy, str | None]]) -> str:
     """One primer covering every form ANY of `policies` can emit (#168).
 
     `pairs` is [(policy, server_name)] — each peer is gated against its OWN name, since a
