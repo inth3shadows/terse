@@ -24,7 +24,37 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   router even when its stash lives under another scope. `--print` reports the permission
   rewrite: consolidating N servers changes the `mcp__<server>__` segment for every
   wrapped tool, and the tool segment changes too for any name two or more peers export —
-  the latter needs live tool names, so it is flagged rather than guessed.
+  the latter needs live tool names, so it is flagged rather than guessed. It also
+  **warns that the switch WIDENS permissions**: N per-server grants collapse onto one
+  `mcp__terse` segment, so a whole-server grant now reaches every peer. Re-running is
+  **additive** (folding one more server in keeps the fleet instead of evicting it), the
+  peers file is namespaced per scope (a local-scope fleet can't overwrite the user-scope
+  one), and every runtime flag a single-server wrap takes — `--capture-dir`, `--diff` /
+  `--no-diff`, `--no-stats`, `--no-join-blocks`, `--never-lossy` — applies to the router
+  too instead of being silently dropped.
+- **A multiproxy peer's `env`/`cwd` are honored at LAUNCH (#179).** The peers file
+  recorded them and the router ignored them: `DownstreamSpec` had no such fields and
+  `StdioTransport` called `Popen` without `env=`/`cwd=`, so a folded server lost a pinned
+  `PATH` (codegraph's node@22) and any `env`-borne credential started unauthenticated.
+  `env` is MERGED over the router's own environment, never a replacement — a bare mapping
+  would launch the child with no `PATH` or `HOME` at all. Setting either on a `url` peer
+  is now a config error rather than a silent no-op.
+- **Config-destroying edges around the router entry closed (#179).** The router entry is
+  written over rather than stashed, so `--multiproxy` now REFUSES a router name already
+  held by an unrelated live server (`terse` is the default name — this needed no unusual
+  flag to destroy a third party's entry with nothing to restore from). A `--router-name`
+  change now MOVES the router instead of leaving a second one on the same peers file —
+  two such entries launch every peer twice, and make the config uncleanable by terse,
+  since ambiguous detection returns None. Folding a wrapped-but-unstashed entry stashes
+  the unnested DOWNSTREAM, not the wrapper, so `uninstall` no longer reports
+  `restored: True` while writing a proxy line back. Re-running plain `install-mcp` on an
+  already-folded server is refused instead of running that downstream twice.
+- **`mcp-status` understands a folded fleet (#179).** A healthy multiproxy install used
+  to read as drift in both directions — every peer as `orphaned-stash`, the router as
+  `wrapped-unstashed` ("original command unrecoverable"). New states: `router` (with
+  `wraps=` listing its fleet) and `folded` (naming the router it sits behind).
+  `uninstall-mcp` also no longer mistakes an unrelated server whose own CLI takes a
+  `--config` flag for the router.
 
 ### Changed
 - **BREAKING (multiproxy): tool and prompt names are now qualified only on a genuine

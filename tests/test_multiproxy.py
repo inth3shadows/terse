@@ -483,7 +483,7 @@ def test_build_peers_closes_already_launched_peer_on_partial_failure(monkeypatch
 
     calls = {"n": 0}
 
-    def fake_build_transport(target, headers=None):
+    def fake_build_transport(target, headers=None, env=None, cwd=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return _FakeTransport()
@@ -521,7 +521,9 @@ def test_build_peers_closes_already_launched_peer_on_bad_peer_policy(monkeypatch
         def close(self):
             closed.append(True)
 
-    monkeypatch.setattr(mp, "build_transport", lambda target, headers=None: _FakeTransport())
+    monkeypatch.setattr(
+        mp, "build_transport",
+        lambda target, headers=None, env=None, cwd=None: _FakeTransport())
     bad_policy = tmp_path / "bad.json"
     bad_policy.write_text("not valid json", encoding="utf-8")
     specs = [
@@ -544,7 +546,7 @@ def test_build_peers_diff_override_reaches_peer_with_own_policy_path(monkeypatch
     from terse import multiproxy as mp
 
     monkeypatch.setattr(mp, "build_transport",
-                        lambda target, headers=None: _FakePeerTransport())
+                        lambda target, headers=None, env=None, cwd=None: _FakePeerTransport())
     own_policy = tmp_path / "own.json"
     own_policy.write_text(json.dumps({"version": 1, "policies": []}), encoding="utf-8")  # ("rules" was a schema typo the loader used to swallow — now rejected)
     specs = [
@@ -1640,3 +1642,89 @@ def test_merge_initialize_omits_instructions_when_nothing_to_say():
     quiet = P.Policy(rules=[], default_tiers=(), diff=False)
     assert union_primer([(quiet, "a")]) == ""
     assert union_primer([(quiet, "a"), (quiet, "b")]) == ""
+
+
+# --- per-peer env / cwd are applied at LAUNCH, not merely serialized (#179) ---
+
+# A peer that answers any request by reporting the environment it was actually launched
+# in. The point of this file (vs. asserting a field reached the peers JSON) is that a
+# written config field is not evidence the runtime reads it: the first cut of #179 wrote
+# `env`/`cwd` into the peers file, `DownstreamSpec` had no such fields, and `Popen` was
+# called without them — a green test proved only that json.dumps works.
+_REPORT_ENV_PEER = (
+    "import json,os,sys\n"
+    "for line in sys.stdin:\n"
+    "    line = line.strip()\n"
+    "    if not line: continue\n"
+    "    msg = json.loads(line)\n"
+    "    if msg.get('id') is None: continue\n"
+    "    body = json.dumps({'pinned': os.environ.get('TERSE_PEER_PIN'),\n"
+    "                       'inherited': os.environ.get('TERSE_ROUTER_PIN'),\n"
+    "                       'cwd': os.path.realpath(os.getcwd())})\n"
+    "    sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':msg['id'],\n"
+    "        'result':{'content':[{'type':'text','text':body}],'isError':False}})+'\\n')\n"
+    "    sys.stdout.flush()\n"
+)
+
+
+def _peer_report(tmp_path, cout: io.StringIO) -> dict:
+    """The one `tools/call` reply's payload, decoded."""
+    msgs = _lines(cout)
+    assert len(msgs) == 1, msgs
+    return transforms.decompress(msgs[0]["result"]["content"][0]["text"])
+
+
+def _call_reporting_peer(tmp_path, entry: dict) -> dict:
+    cfg = _write_config(tmp_path, [{"name": "p",
+                                    "command": [sys.executable, "-c", _REPORT_ENV_PEER],
+                                    **entry}])
+    cin = io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                  "params": {"name": "p__report"}}) + "\n")
+    cout = io.StringIO()
+    assert run_multi_proxy(str(cfg), PLAIN_POLICY, stdin=cin, stdout=cout) == 0
+    return _peer_report(tmp_path, cout)
+
+
+def test_peer_env_reaches_the_launched_child(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERSE_ROUTER_PIN", "from-router")
+    monkeypatch.delenv("TERSE_PEER_PIN", raising=False)
+    report = _call_reporting_peer(tmp_path, {"env": {"TERSE_PEER_PIN": "from-peers-file"}})
+    assert report["pinned"] == "from-peers-file"
+
+
+def test_peer_env_is_merged_over_the_routers_environment_not_a_replacement(tmp_path,
+                                                                           monkeypatch):
+    """A bare `env` mapping handed to Popen would launch the child with ONLY those two
+    keys — no PATH, no HOME. An MCP client's `env` block is additive, so the router's
+    must be too, or a peer that merely pins one variable loses everything else."""
+    monkeypatch.setenv("TERSE_ROUTER_PIN", "from-router")
+    report = _call_reporting_peer(tmp_path, {"env": {"TERSE_PEER_PIN": "x"}})
+    assert report["inherited"] == "from-router"
+
+
+def test_peer_without_env_still_inherits_the_router_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERSE_ROUTER_PIN", "from-router")
+    report = _call_reporting_peer(tmp_path, {})
+    assert report["inherited"] == "from-router" and report["pinned"] is None
+
+
+def test_peer_cwd_reaches_the_launched_child(tmp_path):
+    workdir = tmp_path / "peer-workdir"
+    workdir.mkdir()
+    report = _call_reporting_peer(tmp_path, {"cwd": str(workdir)})
+    assert report["cwd"] == str(pathlib.Path(workdir).resolve())
+
+
+def test_load_multi_config_rejects_env_or_cwd_on_a_url_peer(tmp_path):
+    import pytest
+    for bad in ({"env": {"K": "v"}}, {"cwd": "/tmp"}):
+        cfg = _write_config(tmp_path, [{"name": "h", "url": "https://x.example/mcp", **bad}])
+        with pytest.raises(ValueError, match="launches no process"):
+            load_multi_config(str(cfg))
+
+
+def test_load_multi_config_rejects_non_string_env_values(tmp_path):
+    import pytest
+    cfg = _write_config(tmp_path, [{"name": "p", "command": ["true"], "env": {"K": 7}}])
+    with pytest.raises(ValueError, match="string -> string"):
+        load_multi_config(str(cfg))

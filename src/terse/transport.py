@@ -17,6 +17,7 @@ from __future__ import annotations
 import http.client
 import ipaddress
 import json
+import os
 import queue
 import socket
 import subprocess
@@ -252,10 +253,16 @@ class StdioTransport:
     non-executable, ...) — `run_proxy` catches that exactly as it always has,
     to report a config error (exit 127) instead of an uncaught traceback (#19)."""
 
-    def __init__(self, cmd: list[str]):
+    def __init__(self, cmd: list[str], *, env: dict[str, str] | None = None,
+                 cwd: str | None = None):
+        # `env` is MERGED over the inherited environment, never a replacement: an MCP
+        # client's `env` block is additive (it pins one PATH or supplies one API key),
+        # and handing Popen a bare 2-key mapping would launch the child without PATH,
+        # HOME, or anything else it needs. `cwd=None` means "inherit", as before.
+        child_env = {**os.environ, **env} if env else None
         self.proc = subprocess.Popen(  # noqa: S603 — cmd is operator-supplied, by design
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
-            encoding="utf-8",
+            encoding="utf-8", env=child_env, cwd=cwd,
         )
         assert self.proc.stdin is not None and self.proc.stdout is not None
 
@@ -562,13 +569,20 @@ class HttpTransport:
         )
 
 
-def build_transport(target: list[str], *, headers: dict[str, str] | None = None) -> Transport:
+def build_transport(target: list[str], *, headers: dict[str, str] | None = None,
+                    env: dict[str, str] | None = None,
+                    cwd: str | None = None) -> Transport:
     """Build the right `Transport` for a proxy `cmd`/downstream target.
 
     A single element containing `"://"` is a URL -> `HttpTransport`; anything
     else is a stdio launch command -> `StdioTransport`. Mirrors
     `proxy.stdio_transport_error`'s own URL detection so the two can never
-    disagree about what counts as a URL downstream."""
+    disagree about what counts as a URL downstream.
+
+    `env`/`cwd` apply to a stdio downstream only — a multiproxy peer is launched by
+    the router, so the per-peer environment the CLIENT would have applied has to be
+    reapplied here (#179). They are ignored for a URL target, which launches nothing;
+    `load_multi_config` rejects that combination up front rather than silently."""
     if len(target) == 1 and "://" in target[0]:
         return HttpTransport(target[0], headers=headers)
-    return StdioTransport(target)
+    return StdioTransport(target, env=env, cwd=cwd)

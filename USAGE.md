@@ -171,6 +171,31 @@ This rewrites permission entries — `mcp__kb__kb.read.search` becomes
 `mcp__terse__kb.read.search` — so run `--print` first and update your allowlist before
 restarting the client.
 
+**It also widens them.** A whole-server grant (`mcp__kb`) used to reach exactly one
+server; after folding, the equivalent `mcp__terse` reaches *every* peer behind the
+router. If that matters, use the per-tool form (`mcp__terse__kb.read.search`) instead
+of the server-wide one. `--print` names both forms per server.
+
+Re-running is **additive**: `install-mcp c --multiproxy` after `install-mcp a b
+--multiproxy` leaves a fleet of three, not one. The peers file records the fleet and is
+namespaced per scope, so a local-scope router and a user-scope router (both living
+beside the same `~/.claude.json`) never overwrite each other.
+
+Every runtime flag a single-server wrap accepts — `--capture-dir`, `--diff`/`--no-diff`,
+`--no-stats`, `--no-join-blocks`, `--never-lossy` — works with `--multiproxy` too and is
+baked onto the router entry, which applies it to all peers. A peer's `env` and `cwd` are
+carried into the peers file and re-applied when the router launches it, so a server that
+needed a pinned `PATH` or an API key in `env` keeps getting one.
+
+`terse mcp-status` reports a folded fleet as one `router` row (with `wraps=` listing its
+peers) plus a `folded` row per peer naming the router it sits behind — not as drift.
+
+> **Project scope: the peers file carries secrets.** `--scope project` writes
+> `.terse-peers-project.json` next to the checked-in `.mcp.json`, and it contains each
+> peer's `env` block — API keys included. It is created `0600`, but that does not stop a
+> `git add -A`. **Add `.terse-peers-*.json` to `.gitignore`** before folding a fleet in
+> project scope.
+
 ### Wire terse into Claude Code automatically (`install-mcp`)
 
 Rather than editing `~/.claude.json` by hand, let terse wrap your MCP servers for you:

@@ -164,6 +164,8 @@ class DownstreamSpec:
     target: list[str]              # a stdio command, or a single-element [url]
     headers: dict[str, str]
     policy_path: str | None     # resolved relative to the config file; None = use the default
+    env: dict[str, str] | None = None   # stdio only: merged over the router's own environ
+    cwd: str | None = None              # stdio only: the peer's working directory
 
 
 def load_multi_config(path: str) -> list[DownstreamSpec]:
@@ -224,6 +226,26 @@ def load_multi_config(path: str) -> list[DownstreamSpec]:
         if not isinstance(headers, dict):
             raise ValueError(f"{path}: downstream {name!r}: 'headers' must be an object")
 
+        # `env`/`cwd` reapply, at the router, the per-server launch environment the MCP
+        # CLIENT would have applied had this peer still been its own top-level entry
+        # (#179). They only mean something for a process the router launches, so a URL
+        # peer carrying them is a config mistake worth naming rather than dropping: a
+        # silently-ignored `env` is how a credential-bearing key goes missing.
+        env = d.get("env")
+        if env is not None:
+            if not isinstance(env, dict) or not all(
+                    isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+                raise ValueError(f"{path}: downstream {name!r}: 'env' must be an object "
+                                 "of string -> string")
+            env = dict(env)
+        cwd = d.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            raise ValueError(f"{path}: downstream {name!r}: 'cwd' must be a string")
+        if url and (env or cwd):
+            raise ValueError(f"{path}: downstream {name!r}: 'env'/'cwd' apply to a "
+                             "'command' downstream only — a 'url' peer launches no "
+                             "process, so they would be silently ignored")
+
         policy_path = d.get("policy")
         if policy_path is not None:
             if not isinstance(policy_path, str):
@@ -233,7 +255,7 @@ def load_multi_config(path: str) -> list[DownstreamSpec]:
 
         specs.append(DownstreamSpec(name=name, target=target,
                                     headers={str(k): str(v) for k, v in headers.items()},
-                                    policy_path=policy_path))
+                                    policy_path=policy_path, env=env, cwd=cwd))
     return specs
 
 
@@ -1247,7 +1269,8 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                                 stats=stats, server_name=spec.name, store=store,
                                 store_lock=store_lock, dropped_bytes=dropped_bytes,
                                 log_prefix="[terse-multiproxy]")
-            transport = build_transport(spec.target, headers=spec.headers or None)
+            transport = build_transport(spec.target, headers=spec.headers or None,
+                                        env=spec.env, cwd=spec.cwd)
             peers.append(Peer(name=spec.name, transport=transport, inter=inter))
     except Exception:
         for peer in peers:

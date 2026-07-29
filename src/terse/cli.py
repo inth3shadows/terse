@@ -1210,6 +1210,12 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
               "wrapped tool:")
         for m in res["allowlist"]:
             print(f"    {m['from']:<34} ->  {m['to']}")
+            print(f"    {m['from_tool']:<34} ->  {m['to_tool']}")
+        if any(m.get("widens") for m in res["allowlist"]):
+            print(f"  WARNING: this WIDENS permissions — a whole-server grant "
+                  f"(`mcp__{res['allowlist'][0]['server']}`) used to reach one server; "
+                  f"`mcp__{res['router']}`\n  reaches every peer behind the router. "
+                  f"Prefer the per-tool form if that matters.")
         print("  ...and the TOOL segment changes for any name two or more peers both "
               "export\n  (`definition` -> `lsp-go__definition`). Those need live tool "
               "names, which install\n  time does not have, so they are NOT listed above "
@@ -1315,11 +1321,12 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
             if r["policy"]:
                 miss = " (MISSING)" if r.get("policy_missing") else ""
                 policy = f"  policy={r['policy']}{miss}"
-            print(f"  {r['server']:<20} {r['state']}{policy}")
+            suffix = f"  behind={r['router']}" if r.get("router") else ""
+            print(f"  {r['server']:<20} {r['state']}{policy}{suffix}")
             # For a wrapped entry, a second indented line surfaces what it actually
             # fronts and the tiers baked into the entry — the diagnostic the flat
             # "wrapped policy=…" line couldn't answer when a server misbehaves.
-            if r["state"] in ("wrapped", "wrapped-unstashed"):
+            if r["state"] in ("wrapped", "wrapped-unstashed", "router"):
                 stats = "on" if r.get("stats") else "off"
                 detail = (f"wraps={r.get('wraps') or '?'}  "
                           f"diff={r.get('diff') or '?'}  stats={stats}")
