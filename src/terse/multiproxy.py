@@ -233,15 +233,26 @@ def load_multi_config(path: str) -> list[DownstreamSpec]:
         # silently-ignored `env` is how a credential-bearing key goes missing.
         env = d.get("env")
         if env is not None:
-            if not isinstance(env, dict) or not all(
-                    isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
-                raise ValueError(f"{path}: downstream {name!r}: 'env' must be an object "
-                                 "of string -> string")
-            env = dict(env)
+            if not isinstance(env, dict):
+                raise ValueError(f"{path}: downstream {name!r}: 'env' must be an object")
+            # Scalars are COERCED, not rejected: an MCP client's own spawn coerces, so
+            # `{"PORT": 3000}` is a working entry in the config this file is generated
+            # from. Rejecting it would take down the whole fleet — every peer, not just
+            # this one — at router launch, long after the installer reported success.
+            # Containers and null stay hard errors: those are mistakes, not conventions.
+            bad = [k for k, v in env.items() if not isinstance(v, str | int | float | bool)]
+            if bad:
+                raise ValueError(f"{path}: downstream {name!r}: 'env' values must be "
+                                 f"scalars; {', '.join(sorted(bad))} is not")
+            env = {str(k): str(v) for k, v in env.items()}
         cwd = d.get("cwd")
-        if cwd is not None and not isinstance(cwd, str):
-            raise ValueError(f"{path}: downstream {name!r}: 'cwd' must be a string")
-        if url and (env or cwd):
+        if cwd is not None:
+            if not isinstance(cwd, str):
+                raise ValueError(f"{path}: downstream {name!r}: 'cwd' must be a string")
+            if not cwd:
+                # `Popen(cwd="")` fails with a bare `[Errno 2] ... : ''` naming nothing.
+                raise ValueError(f"{path}: downstream {name!r}: 'cwd' must not be empty")
+        if url and (env is not None or cwd is not None):
             raise ValueError(f"{path}: downstream {name!r}: 'env'/'cwd' apply to a "
                              "'command' downstream only — a 'url' peer launches no "
                              "process, so they would be silently ignored")

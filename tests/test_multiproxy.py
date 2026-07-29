@@ -1686,8 +1686,12 @@ def _call_reporting_peer(tmp_path, entry: dict) -> dict:
 
 
 def test_peer_env_reaches_the_launched_child(tmp_path, monkeypatch):
+    # The router's environ holds the SAME key with a different value, so this pins the
+    # merge DIRECTION, not just its presence: with the operands swapped the child would
+    # see the router's value. That is the credential case the fix exists for — a peer
+    # whose `env` pins an API key must not silently authenticate as the router's.
     monkeypatch.setenv("TERSE_ROUTER_PIN", "from-router")
-    monkeypatch.delenv("TERSE_PEER_PIN", raising=False)
+    monkeypatch.setenv("TERSE_PEER_PIN", "from-router")
     report = _call_reporting_peer(tmp_path, {"env": {"TERSE_PEER_PIN": "from-peers-file"}})
     assert report["pinned"] == "from-peers-file"
 
@@ -1723,8 +1727,28 @@ def test_load_multi_config_rejects_env_or_cwd_on_a_url_peer(tmp_path):
             load_multi_config(str(cfg))
 
 
-def test_load_multi_config_rejects_non_string_env_values(tmp_path):
+def test_load_multi_config_coerces_scalar_env_values_and_rejects_containers(tmp_path):
+    """A scalar is coerced, not rejected: an MCP client's own spawn coerces, so
+    `{"PORT": 3000}` is a working entry in the config the peers file is generated from,
+    and rejecting it takes down every peer in the fleet — not just this one — at router
+    launch. A container or null is a mistake, not a convention, so it stays an error."""
     import pytest
-    cfg = _write_config(tmp_path, [{"name": "p", "command": ["true"], "env": {"K": 7}}])
-    with pytest.raises(ValueError, match="string -> string"):
+    cfg = _write_config(tmp_path, [{"name": "p", "command": ["true"],
+                                    "env": {"PORT": 3000, "DEBUG": True, "S": "x"}}])
+    assert load_multi_config(str(cfg))[0].env == {"PORT": "3000", "DEBUG": "True",
+                                                  "S": "x"}
+    for bad in ({"K": ["a"]}, {"K": None}, {"K": {"n": 1}}):
+        cfg = _write_config(tmp_path, [{"name": "p", "command": ["true"], "env": bad}])
+        with pytest.raises(ValueError, match="must be scalars"):
+            load_multi_config(str(cfg))
+    cfg = _write_config(tmp_path, [{"name": "p", "command": ["true"], "env": "nope"}])
+    with pytest.raises(ValueError, match="'env' must be an object"):
+        load_multi_config(str(cfg))
+
+
+def test_load_multi_config_rejects_an_empty_cwd(tmp_path):
+    """`Popen(cwd="")` fails with a bare `[Errno 2] ... : ''` that names nothing."""
+    import pytest
+    cfg = _write_config(tmp_path, [{"name": "p", "command": ["true"], "cwd": ""}])
+    with pytest.raises(ValueError, match="must not be empty"):
         load_multi_config(str(cfg))

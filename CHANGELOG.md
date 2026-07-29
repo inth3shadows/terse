@@ -39,6 +39,12 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   `env` is MERGED over the router's own environment, never a replacement — a bare mapping
   would launch the child with no `PATH` or `HOME` at all. Setting either on a `url` peer
   is now a config error rather than a silent no-op.
+- **A peer's `env` values are coerced to strings on the way into the peers file (#179).**
+  An MCP client's own spawn coerces, so `{"PORT": 3000}` is a working config entry and a
+  plain wrap preserves it — but the router parses the peers file, and one non-string value
+  there took down the WHOLE fleet at launch, on an install that had reported success.
+  `load_multi_config` coerces scalars too; containers and null stay hard errors, and an
+  empty `cwd` is rejected rather than surfacing as `[Errno 2] ... : ''`.
 - **Config-destroying edges around the router entry closed (#179).** The router entry is
   written over rather than stashed, so `--multiproxy` now REFUSES a router name already
   held by an unrelated live server (`terse` is the default name — this needed no unusual
@@ -48,7 +54,18 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   since ambiguous detection returns None. Folding a wrapped-but-unstashed entry stashes
   the unnested DOWNSTREAM, not the wrapper, so `uninstall` no longer reports
   `restored: True` while writing a proxy line back. Re-running plain `install-mcp` on an
-  already-folded server is refused instead of running that downstream twice.
+  already-folded server — or on the router itself — is refused instead of running that
+  downstream twice or nesting a proxy inside a proxy. A router name belonging to a FOLDED
+  peer is refused too (a folded peer has no live entry, so a liveness check could not see
+  it, and a later `uninstall` wrote that peer's original over the router, stranding the
+  rest of the fleet while reporting success), as is folding the router into its own peers
+  file (a router that spawns a router, unbounded, at the next client restart). A rename
+  carries the router's hand-edited keys — an `env.PATH` pin is the base environment every
+  peer inherits. A peer leaves the fleet only when its live entry is BACK, never because
+  its stash entry drifted: the peers file is then the last record of how to launch it.
+  Runtime-flag inheritance is all-or-nothing, so `--no-stats`/`--capture-dir` (which have
+  no inverse flag) can still be cleared, and the result reports the flags actually baked
+  in rather than only those named on the command line.
 - **`mcp-status` understands a folded fleet (#179).** A healthy multiproxy install used
   to read as drift in both directions — every peer as `orphaned-stash`, the router as
   `wrapped-unstashed` ("original command unrecoverable"). New states: `router` (with

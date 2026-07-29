@@ -364,9 +364,17 @@ def _peer_spec(name: str, original: dict, policy: str) -> dict:
     spec: dict = {"name": name, "policy": policy}
     if original.get("command"):
         spec["command"] = [original["command"], *list(original.get("args", []))]
-        for k in ("env", "cwd"):
-            if original.get(k):
-                spec[k] = original[k]
+        env = original.get("env")
+        if env:
+            # COERCE to str->str, as the sibling `headers` handling below already does.
+            # A client's own spawn coerces (`{"PORT": 3000}` is a working Claude Code
+            # entry today, and a plain `wrap` preserves it untouched), but the router
+            # reads this file with `load_multi_config`, which rejects a non-string value —
+            # and that failure kills the WHOLE fleet at launch, not just this peer, on a
+            # config the installer reported as a success.
+            spec["env"] = {str(k): str(v) for k, v in env.items()}
+        if original.get("cwd"):
+            spec["cwd"] = original["cwd"]
     elif original.get("url"):
         spec["url"] = original["url"]
         if original.get("headers"):
@@ -406,11 +414,28 @@ def wrap_multi(config: dict, stash: dict, servers: list[str], policy: str,
     resurrected behind the router."""
     live_servers = config.setdefault("mcpServers", {})
     requested = set(servers)
+    # Staleness is LIVENESS, not stash membership. A peer is stale exactly when its live
+    # entry came back — which is what `do_uninstall` does when it detaches one. Testing
+    # `in stash` instead evicted any peer whose stash entry had drifted (#172 says that
+    # happens), and the peers file is precisely the LAST surviving record of how to launch
+    # such a peer: it would vanish from the stash, the live config, the peers file and
+    # status all at once, deleted by a run that never named it, with no `changes` row and
+    # no backup (`_backup` covers the client config only).
+    prior_router = _detect_router(config, Path(peers_file))
     downstreams: list[dict] = [
         d for d in ((existing_peers or {}).get("downstreams") or [])
-        if isinstance(d, dict) and d.get("name") not in requested and d.get("name") in stash
+        if isinstance(d, dict) and isinstance(d.get("name"), str)
+        and d["name"] not in requested and d["name"] not in live_servers
     ]
     for name in servers:
+        if name == prior_router:
+            # Folding the router into its own peers file writes a peer whose command is
+            # `terse proxy --config <this very file>`: starting it spawns a router that
+            # spawns a router, unbounded, on the next client restart. `_unnest` cannot
+            # catch it (a router entry has no `--`), so it has to be refused by name.
+            raise ValueError(
+                f"'{name}' is the router fronting {peers_file} — it cannot also be one "
+                f"of its own peers (that would launch a router inside itself)")
         if name in stash:
             original = stash[name]
         elif name in live_servers:
@@ -432,10 +457,14 @@ def wrap_multi(config: dict, stash: dict, servers: list[str], policy: str,
     # `proxy --config` launch every peer twice and export every tool twice, and
     # `_detect_router` then sees two matches, returns None, and neither status nor
     # `uninstall-mcp --all` can clean up the config at all.
-    prior = _detect_router(config, Path(peers_file))
-    if prior and prior != router:
-        live_servers.pop(prior, None)
-    live_router = live_servers.get(router)
+    prior_entry = None
+    if prior_router and prior_router != router:
+        prior_entry = live_servers.pop(prior_router, None)
+    # `prior_entry` is the fallback base so a RENAME carries the router's hand-edited keys
+    # (an `env.PATH` pin is the router's base environment, inherited by every peer) instead
+    # of dropping them — the same drift loss `wrap`'s guard exists to prevent, which the
+    # rename path had reintroduced by looking the base up under the NEW name only.
+    live_router = live_servers.get(router) or prior_entry
     new_entry = {k: v for k, v in (live_router or {}).items()
                  if k not in ("command", "args", "url", "headers")}
     new_entry["command"] = terse_cmd[0]
@@ -705,6 +734,16 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
                 f"{', '.join(clash)} already folded behind a --multiproxy router "
                 f"({peers_p}) — re-run with --multiproxy to refresh the fleet, or "
                 f"`uninstall-mcp {' '.join(clash)}` first to detach and wrap standalone")
+        # ...and the router itself: `wrap` would nest `terse proxy --policy ... -- terse
+        # proxy --config ...`, charging the primer twice — the exact cost --multiproxy
+        # exists to remove — while `_detect_router` still matches it (the `--config` token
+        # survives past the `--`), so status reports the nested entry as a healthy router.
+        this_router = _detect_router(node, peers_p)
+        if this_router and this_router in servers:
+            raise ValueError(
+                f"'{this_router}' is a --multiproxy router, not a wrappable server — "
+                f"wrapping it would nest a proxy inside a proxy. Re-run with "
+                f"--multiproxy to change the fleet, or `uninstall-mcp --all` first")
     if multiproxy:
         return _install_multiproxy(
             target, config, full_stash, stash, node, servers, policy_abs, terse_cmd,
@@ -816,30 +855,43 @@ def _install_multiproxy(target, config: dict, full_stash: dict, stash: dict, nod
     # router name, so this needs no unusual flag to hit. A terse-owned router (this
     # scope's, or one being renamed) is fine to overwrite; anything else is refused.
     live_now = node.get("mcpServers") or {}
-    if router in live_now and _detect_router(node, peers_p) != router:
+    current_router = _detect_router(node, peers_p)
+    folded_now = {d.get("name") for d in ((existing_peers or {}).get("downstreams") or [])
+                  if isinstance(d, dict)}
+    if router != current_router and (router in live_now or router in stash
+                                     or router in folded_now):
+        # A FOLDED peer has no live entry by construction, so `router in live_now` alone
+        # could not see it — and naming the router after one made `unwrap` later write
+        # that peer's original OVER the router entry, silently stranding every other peer
+        # (stashed, no live entry, no router left to serve them) while reporting success.
         raise ValueError(
-            f"'{router}' is already an MCP server in this config and is not a terse "
-            f"router — folding here would overwrite it with no stash to restore from. "
-            f"Pick another name with --router-name.")
+            f"'{router}' is already a server terse manages or that exists in this config, "
+            f"and the router entry is written over rather than stashed — folding here "
+            f"would destroy it with nothing to restore from. Pick another name with "
+            f"--router-name.")
     before = {s: (node.get("mcpServers") or {}).get(s) for s in servers}
     # The router honors every runtime flag `wrap` bakes onto a single-server entry —
     # `terse proxy` accepts them with `--config` too — so they must ride along here or
     # `--capture-dir`/`--no-stats`/`--diff` would be silently dropped by the very switch
     # that is supposed to be behavior-preserving.
-    # Per-flag INHERIT from the router already in place: an additive run ("fold one more
-    # server in") names the new server, not the flags the fleet was installed with, and
-    # rebuilding the args from this invocation alone silently cleared them for every peer
-    # at once — a capture run that records nothing is the exact failure `_runtime_opts`
-    # exists to prevent. A flag given now still wins.
-    inherited = _parse_router_opts(live_now.get(_detect_router(node, peers_p) or ""))
-    proxy_opts = _runtime_opts(
-        capture_dir=capture_dir if capture_dir is not None else inherited["capture_dir"],
-        no_stats=no_stats or inherited["no_stats"],
-        diff=diff if diff is not None else inherited["diff"],
-        diff_keyframe_interval=(diff_keyframe_interval
-                                if diff_keyframe_interval is not None
-                                else inherited["diff_keyframe_interval"]),
-        no_join_blocks=no_join_blocks or inherited["no_join_blocks"])
+    # ALL-OR-NOTHING inherit from the router already in place. An additive run ("fold one
+    # more server in") names the new server, not the flags the fleet was installed with,
+    # so rebuilding the args from that invocation alone silently cleared them for every
+    # peer at once — a capture run that records nothing. But a PER-FLAG `or`-merge is
+    # worse in the other direction: `--no-stats` and `--capture-dir` have no inverse flag,
+    # so once set they could never be cleared except by hand-editing the config, and
+    # `wrap`'s documented contract for a single-server entry is the opposite ("a re-wrap
+    # always reflects the latest invocation, flags never accumulate"). So: an invocation
+    # that names NO runtime flag inherits the whole set; one that names ANY defines the
+    # whole set, which is also how you clear them.
+    given = _runtime_opts(capture_dir=capture_dir, no_stats=no_stats, diff=diff,
+                          diff_keyframe_interval=diff_keyframe_interval,
+                          no_join_blocks=no_join_blocks)
+    effective = ({"capture_dir": capture_dir, "no_stats": no_stats, "diff": diff,
+                  "diff_keyframe_interval": diff_keyframe_interval,
+                  "no_join_blocks": no_join_blocks} if given
+                 else _parse_router_opts(live_now.get(current_router or "")))
+    proxy_opts = _runtime_opts(**effective)
     _, _, peers_doc = wrap_multi(node, stash, servers, policy_abs, terse_cmd,
                                  router=router, peers_file=peers_file,
                                  proxy_opts=proxy_opts, existing_peers=existing_peers)
@@ -848,8 +900,12 @@ def _install_multiproxy(target, config: dict, full_stash: dict, stash: dict, nod
     fleet = [d.get("name") for d in peers_doc["downstreams"]]
     result = {"config": str(target.cfg), "scope": scope, "policy": policy_abs,
               "available": available, "changes": changes, "dry_run": dry_run,
-              "backup": None, "capture_dir": capture_dir, "diff": diff,
-              "no_stats": no_stats,
+              # The EFFECTIVE values (what actually got baked into the entry), not this
+              # invocation's — an additive run that inherited `--capture-dir` otherwise
+              # reported `capture_dir: None`, so `--print` printed no capture line and
+              # cli's autotune follow-up hint never fired for any additive fleet run.
+              "backup": None, "capture_dir": effective["capture_dir"],
+              "diff": effective["diff"], "no_stats": effective["no_stats"],
               "never_lossy_added": [], "multiproxy": True, "router": router,
               "router_entry": node["mcpServers"][router], "peers_file": peers_file,
               "peers": peers_doc, "fleet": fleet,
