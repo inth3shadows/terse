@@ -114,10 +114,15 @@ HTTP — behind a single policy/primer/process instead of one wrapper per server
 uv run terse proxy --config peers.json
 ```
 
-Each peer's tools are advertised prefixed with its `name` (`gh__search_issues`,
-`kb__read`, ...) so the client can tell them apart and call the right one; terse strips
-the prefix before forwarding. The synthetic `terse.retrieve` tool (drop-to-retrieve) is
-advertised once, shared across every peer, regardless of which peer dropped the field.
+Each peer's tools are advertised **under their own names**. A name is qualified with the
+peer's `name` (`gh__search`, `kb__search`) only when two or more peers export the same
+one, and terse strips that prefix before forwarding. So a fleet whose tool names are
+already distinct — the normal case — is a drop-in: an existing client allowlist keeps
+working, and no name changes shape.
+
+The synthetic `terse.retrieve` tool (drop-to-retrieve) is advertised once, shared across
+every peer, regardless of which peer dropped the field; it is a reserved name, so a peer
+exporting `terse.retrieve` is qualified rather than shadowing it.
 This is an ergonomics convenience — MCP clients can already talk to several servers
 directly — so keep expectations proportionate: broadcast requests (`initialize`,
 `tools/list`) wait on every peer up to a bounded timeout before merging what arrived, and

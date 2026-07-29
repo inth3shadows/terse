@@ -413,7 +413,8 @@ by the next patch (PyPI versions cannot be re-uploaded).
   `Interceptor`/`pump` are transport-agnostic; drop-to-retrieve's swallow-and-reply logic
   never touches the downstream transport at all, so it needed zero HTTP-specific
   reimplementation). `--config peers.json` fronts N peers (any mix of stdio/HTTP) behind
-  one policy/primer/process, prefixing each peer's tools (`{peer}__{tool}`) and sharing one
+  one policy/primer/process, exposing each peer's tools under their own names (`{peer}__`
+  qualification only on a genuine cross-peer name collision, #168) and sharing one
   content-addressed drop-to-retrieve store across all of them (`multiproxy.py`). v1 scope
   is proportionate, not exhaustive: HTTP is synchronous POST-then-drain (no cross-request
   pipelining) with no standalone GET-SSE listener for unsolicited server pushes; multi-peer

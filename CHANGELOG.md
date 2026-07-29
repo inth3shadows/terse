@@ -10,6 +10,22 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Changed
+- **BREAKING (multiproxy): tool and prompt names are now qualified only on a genuine
+  cross-peer collision (#168).** `terse proxy --config peers.json` used to rename *every*
+  tool to `{peer}__{tool}` — `kb.read.search` surfaced to a client as
+  `mcp__terse__kb__kb.read.search`. That broke client allowlists and produced dotted names
+  (#331), which is the sole reason multiproxy was never shippable, even though it is the
+  only thing that erases the multi-server primer cost (measured: six standalone proxies
+  cost +23.1% raw input against an unwrapped control; the same six behind one multiproxy
+  cost +0.0%). A name exported by exactly one peer is now advertised **verbatim**, so a
+  fleet with distinct tool names is a drop-in. Only a name two or more peers both export
+  is qualified, on both sides. `terse.retrieve` is reserved, so a peer exporting it is
+  qualified rather than shadowing the router's own. Routing consults the advertised-name
+  table first — a tool whose own name contains `__` is no longer misread as a peer prefix
+  — and keeps the `{peer}__` split as a fallback for names that were never listed. Ledger
+  and capture bookkeeping still record the **peer-qualified** name, so per-server corpus
+  attribution is unchanged. Migration: if you had allowlisted `{peer}__{tool}` names,
+  switch them to the bare names now advertised by `tools/list`.
 - **Releases are now zero-touch.** `release.yml` runs on every push to `main`, derives the
   next version from the Conventional-Commit types since the last tag (`feat` → minor,
   `fix`/`perf` → patch, breaking → minor while 0.x; docs/chore/test/ci release nothing),

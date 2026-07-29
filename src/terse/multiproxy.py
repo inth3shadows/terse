@@ -1,7 +1,7 @@
 """Multi-downstream fan-out proxy (#5 Half B): ONE `terse proxy --config` process
 fronting N downstream MCP peers (any mix of stdio and HTTP, via `transport.py`),
-merging their `tools/list` under name prefixes, routing `tools/call` by prefix, and
-sharing the drop-to-retrieve store across all of them.
+merging their `tools/list` into one namespace, routing `tools/call` back to the owning
+peer, and sharing the drop-to-retrieve store across all of them.
 
 This is explicitly an ergonomics feature (single policy/primer/process) — MCP clients
 already multiplex servers natively — so the v1 scope below is deliberately
@@ -15,10 +15,12 @@ proportionate. Documented limitations are fine; silent gaps are not:
     rather than guessed at.
   - `initialize`, `tools/list`, `prompts/list`, `resources/list`,
     `resources/templates/list`, and `ping` are BROADCAST to every peer and their
-    replies AGGREGATED into one (concat the lists — `tools`/`prompts` names gain a
-    `{peer}__` prefix, `resources` keep their own `uri`; union the capabilities; a
-    single format primer). `tools/call` and `prompts/get` are ROUTED to the one peer
-    named by that `{peer}__` prefix. `resources/read`, `resources/subscribe`, and
+    replies AGGREGATED into one (concat the lists — a `tools`/`prompts` name gains a
+    `{peer}__` prefix ONLY when two or more peers export it (#168), `resources` keep
+    their own `uri`; union the capabilities; a single format primer). `tools/call` and
+    `prompts/get` are ROUTED to the one owning peer, resolved through the table the
+    merge built (advertised name first) with the `{peer}__` split as a fallback for a
+    name that was never listed. `resources/read`, `resources/subscribe`, and
     `resources/unsubscribe` are fanned out SCATTER-GATHER — a resource `uri` isn't
     peer-namespaced, so every peer is asked and the first success `result` is the one
     kept — a peer that doesn't own the `uri` errors and is discarded; on a `uri` owned
@@ -44,7 +46,7 @@ Reused, unchanged: `Interceptor` (per peer, sharing one drop store via its optio
 the server->client direction — that direction genuinely is 1:1, so pump is the right
 tool there), `SWALLOW`, `TERSE_PRIMER`, `RETRIEVE_TOOL_DEF`, `transport.build_transport`.
 New here: the client->server fan-out loop (NOT pump — fan-out from one source to N
-destinations is a genuinely different shape), tool-name prefixing/routing, and
+destinations is a genuinely different shape), collision-only tool naming/routing, and
 broadcast id-remapping/merge.
 """
 
@@ -330,7 +332,7 @@ class _PeerSender:
 
 
 class Router:
-    """Owns id-remapping, tool-name prefixing, broadcast/merge, and routing for a
+    """Owns id-remapping, collision-only tool naming, broadcast/merge, and routing for a
     multi-peer session. One `Router` per `run_multi_proxy` call; long-lived for the
     session's duration.
 
@@ -354,6 +356,19 @@ class Router:
         # One background sender per peer (index-aligned with `peers`) so a slow HTTP
         # peer's blocking send can't stall routing to any other peer — see _PeerSender.
         self._senders = [_PeerSender(p.transport, debug=debug) for p in peers]
+
+        # Routing tables built by `_merge_tools_list` / `_merge_prompts_list` (#168):
+        # exposed name -> (peer index, the bare name that peer actually expects). Names
+        # are prefixed ONLY on a genuine cross-peer collision, so most tools are exposed
+        # verbatim and these tables are what makes them routable.
+        #
+        # Written by the broadcast collector thread, read by the client-reader thread,
+        # with no lock: each merge assigns a COMPLETE, freshly-built dict in one
+        # statement, so a reader either sees the whole previous table or the whole new
+        # one — never a half-populated one. (A plain `dict` mutated in place would not
+        # be safe here; do not "optimize" these into `.update()` calls.)
+        self.tool_route: dict[str, tuple[int, str]] = {}
+        self.prompt_route: dict[str, tuple[int, str]] = {}
 
         self._pending_lock = Lock()
         # keyed by broadcast SEQUENCE NUMBER, not client id — see _PendingBroadcast.
@@ -480,64 +495,87 @@ class Router:
                 self._write_client(reply)
             return
 
-        if isinstance(name, str) and PREFIX_SEP in name:
-            peer_name, _, bare = name.partition(PREFIX_SEP)
-            if peer_name in self.by_name:
-                idx = self.by_name[peer_name]
-                rewritten = dict(msg)
-                rewritten["params"] = {**params, "name": bare}
-                rewritten_line = json.dumps(rewritten, separators=(",", ":"),
-                                            ensure_ascii=False)
-                # The CLIENT's original id passes through unchanged: exactly one peer
-                # ever answers a routed call, so there's no id collision risk here (that
-                # risk only exists for the broadcast methods, which DO remap ids).
-                # tool_name is the PEER-QUALIFIED name (e.g. "gh__search") — capture/
-                # audit bookkeeping must not collide two different peers' same-named
-                # tools into one corpus bucket, even though the wire line sent to the
-                # downstream uses the bare name it actually expects.
-                self.peers[idx].inter.note_request(rewritten_line, tool_name=name)
-                self._dispatch_routed(idx, rewritten_line, mid)
-                return
+        target = self._resolve(name, self.tool_route)
+        if target is not None:
+            idx, bare = target
+            rewritten = dict(msg)
+            rewritten["params"] = {**params, "name": bare}
+            rewritten_line = json.dumps(rewritten, separators=(",", ":"),
+                                        ensure_ascii=False)
+            # The CLIENT's original id passes through unchanged: exactly one peer
+            # ever answers a routed call, so there's no id collision risk here (that
+            # risk only exists for the broadcast methods, which DO remap ids).
+            # tool_name is the PEER-QUALIFIED name (e.g. "gh__search") — capture/
+            # audit bookkeeping must not collide two different peers' same-named
+            # tools into one corpus bucket, even though the wire line sent to the
+            # downstream uses the bare name it actually expects. It stays qualified
+            # even when the tool is EXPOSED bare (#168): collision-only prefixing is a
+            # client-facing naming choice and must not silently un-bucket the corpus.
+            self.peers[idx].inter.note_request(
+                rewritten_line, tool_name=f"{self.peers[idx].name}{PREFIX_SEP}{bare}")
+            self._dispatch_routed(idx, rewritten_line, mid)
+            return
 
-        # Unknown peer prefix (or no prefix at all) — a legible JSON-RPC error, not a
-        # crash or a silent hang, so the client sees exactly why the call went nowhere.
+        # Not advertised and not a resolvable peer prefix — a legible JSON-RPC error,
+        # not a crash or a silent hang, so the client sees exactly why the call went
+        # nowhere.
         if mid is not None:
             self._write_client(json.dumps(
                 {"jsonrpc": "2.0", "id": mid, "error": {
                     "code": -32601,
-                    "message": f"terse-multiproxy: unknown tool {name!r} (expected "
-                              f"'<peer>{PREFIX_SEP}<tool>' for one of: "
-                              f"{', '.join(self.by_name)})"}},
+                    "message": f"terse-multiproxy: unknown tool {name!r} (expected a "
+                              f"name from tools/list, or '<peer>{PREFIX_SEP}<tool>' for "
+                              f"one of: {', '.join(self.by_name)})"}},
                 separators=(",", ":"), ensure_ascii=False))
 
+    def _resolve(self, name: Any, route: dict[str, tuple[int, str]]) -> tuple[int, str] | None:
+        """Resolve a client-supplied tool/prompt name to `(peer index, bare name)`.
+
+        The routing table built by the merge is consulted FIRST, and an exact hit always
+        wins. That ordering is what makes collision-only prefixing safe for a peer whose
+        own tool name happens to contain `__`: an advertised name is never re-read as a
+        speculative `<peer>__<tool>` split.
+
+        The prefix split remains as a FALLBACK for names we never advertised — a client
+        that calls before any `tools/list`, or one holding a qualified name from an
+        earlier listing. Returns None when neither resolves."""
+        if not isinstance(name, str):
+            return None
+        hit = route.get(name)
+        if hit is not None:
+            return hit
+        peer_name, sep, bare = name.partition(PREFIX_SEP)
+        if sep and bare and peer_name in self.by_name:
+            return self.by_name[peer_name], bare
+        return None
+
     def _route_prompt_get(self, msg: dict) -> None:
-        """Route a `prompts/get` to the single peer named by its `<peer>__<prompt>`
-        name prefix — the prompts counterpart to `_route_call`. The merged prompts/list
-        (`_merge_prompts_list`) prefixed every prompt name the same way `_merge_tools_list`
-        prefixes tool names, so a client's get carries the prefix that names the peer.
+        """Route a `prompts/get` to the single peer that owns that prompt name — the
+        prompts counterpart to `_route_call`, resolved through the same
+        advertised-name-first table (`_merge_prompts_list` fills `prompt_route` exactly
+        as `_merge_tools_list` fills `tool_route`).
         Unlike `_route_call` this does NOT `note_request`: note_request only tracks
         tools/call (a prompts/get reply is a plain passthrough through the peer's
         Interceptor), so registering it would be a no-op anyway."""
         params = msg.get("params") or {}
         name = params.get("name")
         mid = msg.get("id")
-        if isinstance(name, str) and PREFIX_SEP in name:
-            peer_name, _, bare = name.partition(PREFIX_SEP)
-            if peer_name in self.by_name:
-                idx = self.by_name[peer_name]
-                rewritten = dict(msg)
-                rewritten["params"] = {**params, "name": bare}
-                rewritten_line = json.dumps(rewritten, separators=(",", ":"),
-                                            ensure_ascii=False)
-                self._dispatch_routed(idx, rewritten_line, mid)
-                return
+        target = self._resolve(name, self.prompt_route)
+        if target is not None:
+            idx, bare = target
+            rewritten = dict(msg)
+            rewritten["params"] = {**params, "name": bare}
+            rewritten_line = json.dumps(rewritten, separators=(",", ":"),
+                                        ensure_ascii=False)
+            self._dispatch_routed(idx, rewritten_line, mid)
+            return
         if mid is not None:
             self._write_client(json.dumps(
                 {"jsonrpc": "2.0", "id": mid, "error": {
                     "code": -32601,
-                    "message": f"terse-multiproxy: unknown prompt {name!r} (expected "
-                              f"'<peer>{PREFIX_SEP}<prompt>' for one of: "
-                              f"{', '.join(self.by_name)})"}},
+                    "message": f"terse-multiproxy: unknown prompt {name!r} (expected a "
+                              f"name from prompts/list, or '<peer>{PREFIX_SEP}<prompt>' "
+                              f"for one of: {', '.join(self.by_name)})"}},
                 separators=(",", ":"), ensure_ascii=False))
 
     def _dispatch_routed(self, idx: int, line: str, mid: Any) -> None:
@@ -853,22 +891,70 @@ class Router:
             return {"result": {}}  # MCP ping's result is an empty object
         return self._scatter_first_success(pb)  # _SCATTER_METHODS
 
-    def _merge_tools_list(self, pb: _PendingBroadcast) -> dict:
-        """Concat every peer's tools with `{peer}__` prefixes; append the single
-        unprefixed `RETRIEVE_TOOL_DEF` exactly once (never per-peer — each peer's own
-        `Interceptor._inject_retrieve_tool` is bypassed here since the peer-local-id
-        reply never reaches `transform_response`), and only if some peer's policy
-        actually enables drop-to-retrieve, matching single-peer behavior."""
-        tools: list[dict] = []
-        for i, peer in enumerate(self.peers):
+    def _collect_named(self, pb: _PendingBroadcast, key: str) -> list[tuple[int, dict]]:
+        """Every peer's `result[key]` entries that have a string `name`, paired with the
+        index of the peer that owns them, in config order. Shared pass 1 of the
+        collision-only naming used for both tools and prompts."""
+        out: list[tuple[int, dict]] = []
+        for i in range(len(self.peers)):
             result = pb.parts.get(i, {}).get("result")
-            peer_tools = result.get("tools") if isinstance(result, dict) else None
-            if not isinstance(peer_tools, list):
+            items = result.get(key) if isinstance(result, dict) else None
+            if not isinstance(items, list):
                 continue  # peer errored, never answered, or replied oddly — skip it
-            for t in peer_tools:
-                if not (isinstance(t, dict) and isinstance(t.get("name"), str)):
-                    continue
-                tools.append({**t, "name": f"{peer.name}{PREFIX_SEP}{t['name']}"})
+            for it in items:
+                if isinstance(it, dict) and isinstance(it.get("name"), str):
+                    out.append((i, it))
+        return out
+
+    def _expose_names(self, owned: list[tuple[int, dict]],
+                      reserved: tuple[str, ...] = ()) -> tuple[list[dict], dict]:
+        """Name each entry for the client and build its routing table (#168).
+
+        A bare name claimed by exactly ONE peer is exposed VERBATIM; only a name two or
+        more peers both export is qualified as `{peer}__{bare}`. Unconditional prefixing
+        was multiproxy's sole unshippable defect — it renamed every tool, breaking client
+        allowlists and producing dotted names (#331) — while the collision it defends
+        against is empty on a real fleet.
+
+        `reserved` names are pre-claimed by the router itself, so a peer exporting one is
+        forced to qualify rather than shadowing it.
+
+        Returns `(renamed_entries, {exposed: (peer_idx, bare)})`. A collision between a
+        qualified name and some other peer's verbatim name is impossible to resolve here
+        and is not silently dropped: last writer wins in the table, matching the merged
+        list's own order, and the debug stream says so.
+        """
+        counts: dict[str, int] = dict.fromkeys(reserved, 1)
+        for _, it in owned:
+            counts[it["name"]] = counts.get(it["name"], 0) + 1
+        entries: list[dict] = []
+        route: dict[str, tuple[int, str]] = {}
+        for idx, it in owned:
+            bare = it["name"]
+            exposed = bare if counts[bare] == 1 else f"{self.peers[idx].name}{PREFIX_SEP}{bare}"
+            if exposed in route and self.debug:
+                sys.stderr.write(
+                    f"[terse-multiproxy] name collision on {exposed!r}: peer "
+                    f"{self.peers[route[exposed][0]].name!r} shadowed by "
+                    f"{self.peers[idx].name!r}\n")
+            entries.append({**it, "name": exposed})
+            route[exposed] = (idx, bare)
+        return entries, route
+
+    def _merge_tools_list(self, pb: _PendingBroadcast) -> dict:
+        """Concat every peer's tools under collision-only `{peer}__` prefixes (#168 —
+        see `_expose_names`); append the single unprefixed `RETRIEVE_TOOL_DEF` exactly
+        once (never per-peer — each peer's own `Interceptor._inject_retrieve_tool` is
+        bypassed here since the peer-local-id reply never reaches `transform_response`),
+        and only if some peer's policy actually enables drop-to-retrieve, matching
+        single-peer behavior.
+
+        `RETRIEVE_TOOL` is reserved unconditionally, not just when `has_drop` — a peer
+        exporting that name must be qualified either way, since whether the router also
+        advertises its own retrieve is a policy detail the client can't see."""
+        tools, route = self._expose_names(self._collect_named(pb, "tools"),
+                                          reserved=(lossy_mod.RETRIEVE_TOOL,))
+        self.tool_route = route  # whole-dict replacement — see __init__
         if self.has_drop:
             tools.append(RETRIEVE_TOOL_DEF)
         return {"tools": tools}
@@ -926,20 +1012,17 @@ class Router:
         return merged
 
     def _merge_prompts_list(self, pb: _PendingBroadcast) -> dict:
-        """Concat every peer's prompts with `{peer}__` name prefixes — the prompts
-        analogue of `_merge_tools_list` (a prompt is invoked by `prompts/get` name, so
-        prefixing lets `_route_prompt_get` route it back to the owning peer exactly like
-        a prefixed tools/call). Pagination cursors are dropped, same as tools/list."""
-        prompts: list[dict] = []
-        for i, peer in enumerate(self.peers):
-            result = pb.parts.get(i, {}).get("result")
-            peer_prompts = result.get("prompts") if isinstance(result, dict) else None
-            if not isinstance(peer_prompts, list):
-                continue  # peer errored, never answered, or replied oddly — skip it
-            for p in peer_prompts:
-                if not (isinstance(p, dict) and isinstance(p.get("name"), str)):
-                    continue
-                prompts.append({**p, "name": f"{peer.name}{PREFIX_SEP}{p['name']}"})
+        """Concat every peer's prompts under the same collision-only naming as tools —
+        the prompts analogue of `_merge_tools_list` (a prompt is invoked by `prompts/get`
+        name, so the routing table lets `_route_prompt_get` reach the owning peer exactly
+        like a tools/call). Naming MUST match the tools rule: two surfaces that disagree
+        about when a name is qualified would be a client-visible inconsistency, not an
+        optimization. Pagination cursors are dropped, same as tools/list.
+
+        Prompt names share no namespace with `RETRIEVE_TOOL`, so nothing is reserved
+        here."""
+        prompts, route = self._expose_names(self._collect_named(pb, "prompts"))
+        self.prompt_route = route  # whole-dict replacement — see __init__
         return {"prompts": prompts}
 
     def _merge_list(self, pb: _PendingBroadcast, key: str) -> dict:
