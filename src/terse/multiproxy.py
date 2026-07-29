@@ -254,6 +254,10 @@ class _PendingBroadcast:
     kind: str
     client_id: Any
     remaining: set[int]
+    # The router-local sequence number this broadcast is keyed by in `_pending`. Carried
+    # on the object (not just as the dict key) so a merge can tell whether it is installing
+    # a listing NEWER than the one already installed — see `_merge_tools_list` (#168).
+    seq: int = -1
     parts: dict[int, dict] = field(default_factory=dict)
     timer: threading.Timer | None = None
     done: bool = False
@@ -375,9 +379,19 @@ class Router:
         # a partial listing that read the table before a complete one installed would
         # assign afterwards and wipe the peers it never saw — reintroducing the exact
         # -32601 the retention exists to prevent.
+        #
+        # The lock serializes installs but does not ORDER them, and two listings with
+        # different client ids are concurrently pending (`_active_seq` only supersedes a
+        # reuse of the SAME id). A broadcast that times out after BROADCAST_TIMEOUT would
+        # otherwise install a 30-second-old snapshot on top of a newer complete one —
+        # resurrecting a tool its peer has since dropped and erasing one it has since
+        # gained. `_*_route_seq` records the broadcast seq behind the installed table so a
+        # late arrival is answered but not installed.
         self._route_lock = Lock()
         self.tool_route: dict[str, tuple[int, str]] = {}
         self.prompt_route: dict[str, tuple[int, str]] = {}
+        self._tool_route_seq = -1
+        self._prompt_route_seq = -1
 
         self._pending_lock = Lock()
         # keyed by broadcast SEQUENCE NUMBER, not client id — see _PendingBroadcast.
@@ -545,21 +559,28 @@ class Router:
         own tool name happens to contain `__`: an advertised name is never re-read as a
         speculative `<peer>__<tool>` split.
 
-        The prefix split remains as a FALLBACK for names we never advertised — a client
-        that calls before any `tools/list`, or one holding a qualified name from an
-        earlier listing. Returns None when neither resolves.
+        The prefix split remains as a FALLBACK, but ONLY while the table is empty — a
+        client calling before any listing has landed. Returns None when neither resolves.
 
-        KNOWN GAP, bounded to the pre-listing window: with an empty table there is no
-        information to resolve with, so a peer's own tool named literally
-        `{otherpeer}__{tool}` is split and dispatched to the WRONG peer. Refusing instead
-        would break the legitimate pre-listing call this fallback exists for, and no
-        conformant client calls a tool it has not listed. Once any listing lands, the
-        table is authoritative and this cannot happen."""
+        The fallback is deliberately not used once a listing exists. Applying it to any
+        unadvertised name silently executed stale calls on the WRONG SERVER: with peer
+        `gh` exporting a tool literally named `kb__thing` (exposed verbatim, since nothing
+        collides), a client holding that name after `gh` dropped it would have the call
+        split and dispatched to peer `kb` as `thing` — with the client's arguments, and
+        succeeding. An unknown name after a listing is a -32601, which is what MCP means.
+
+        KNOWN GAP, now genuinely bounded to the pre-listing window: with an empty table
+        there is no information to resolve with, so that same `{otherpeer}__{tool}` name
+        is split and misrouted. Refusing instead would break the legitimate pre-listing
+        call this fallback exists for, and no conformant client calls a tool it has not
+        listed."""
         if not isinstance(name, str):
             return None
         hit = route.get(name)
         if hit is not None:
             return hit
+        if route:
+            return None
         peer_name, sep, bare = name.partition(PREFIX_SEP)
         if sep and bare and peer_name in self.by_name:
             return self.by_name[peer_name], bare
@@ -641,7 +662,7 @@ class Router:
                 prior = self._pending.pop(prior_seq, None)
                 if prior is not None and prior.timer is not None:
                     prior.timer.cancel()
-            pb = _PendingBroadcast(kind=kind, client_id=client_id,
+            pb = _PendingBroadcast(kind=kind, client_id=client_id, seq=seq,
                                    remaining=set(range(len(self.peers))))
             self._pending[seq] = pb
             self._active_seq[client_id] = seq
@@ -914,18 +935,21 @@ class Router:
         that actually ANSWERED with a list. Shared pass 1 of the collision-only naming
         used for both tools and prompts.
 
-        The answered set is not derivable from the entries: a peer that replies with an
-        empty list contributes no entries but HAS spoken, and `_install_route` must tell
-        that apart from a peer that timed out (the first genuinely has no tools now; the
-        second's previous tools are still there)."""
+        The answered set is not derivable from the entries. A peer that replies with an
+        EMPTY list, or with an explicit JSON-RPC `error`, or with a malformed result,
+        contributes no entries but HAS spoken — and `_rebuild_route` must tell that apart
+        from a peer that never replied at all. Only the latter keeps its old routes: an
+        error is a peer saying "not this", and retaining its tools forever would dispatch
+        calls to a server that has none (a 30s timeout instead of a clean -32601) and pin
+        an unrelated peer's names as qualified against a collision that no longer exists.
+        So membership in `pb.parts` — a reply arrived — is the test, not the shape of it."""
         out: list[tuple[int, dict]] = []
-        answered: set[int] = set()
-        for i in range(len(self.peers)):
+        answered = set(pb.parts)
+        for i in sorted(answered):
             result = pb.parts.get(i, {}).get("result")
             items = result.get(key) if isinstance(result, dict) else None
             if not isinstance(items, list):
-                continue  # peer errored, never answered, or replied oddly — skip it
-            answered.add(i)
+                continue  # replied, but with an error or an unusable shape — no entries
             for it in items:
                 if isinstance(it, dict) and isinstance(it.get("name"), str):
                     out.append((i, it))
@@ -952,6 +976,16 @@ class Router:
         to `gh__search` the next — silently breaking the very static client allowlist
         this change exists to preserve, and handing the same bare name to a different
         server between listings.
+
+        THIS HOLDS FROM THE SECOND LISTING ONWARD, not the first. On the very first
+        listing the table is empty, so a peer still cold-starting contributes nothing to
+        `absent` and its collisions cannot be seen — a name is bare that listing and
+        qualified the next, and a client that recorded the bare form gets a -32601 (the
+        `<peer>__` fallback cannot rescue a name with no separator in it). This is not
+        fixable here: the peer set is known at startup but its TOOL names are not, and
+        pessimistically qualifying everything whenever a peer is slow would break the
+        drop-in property in the other direction. It is bounded — one listing, only when a
+        peer misses the startup broadcast entirely, and self-correcting on the next.
 
         **Every entry's qualified form is reserved too, unconditionally.** Without that, a
         peer exporting a tool named literally `{otherpeer}__{tool}` is exposed verbatim
@@ -1036,8 +1070,10 @@ class Router:
         advertises its own retrieve is a policy detail the client can't see."""
         owned, answered = self._collect_named(pb, "tools")
         with self._route_lock:
-            tools, self.tool_route = self._rebuild_route(
+            tools, table = self._rebuild_route(
                 self.tool_route, owned, answered, reserved=(lossy_mod.RETRIEVE_TOOL,))
+            if pb.seq >= self._tool_route_seq:
+                self.tool_route, self._tool_route_seq = table, pb.seq
         if self.has_drop:
             tools.append(RETRIEVE_TOOL_DEF)
         return {"tools": tools}
@@ -1106,8 +1142,9 @@ class Router:
         here."""
         owned, answered = self._collect_named(pb, "prompts")
         with self._route_lock:
-            prompts, self.prompt_route = self._rebuild_route(
-                self.prompt_route, owned, answered)
+            prompts, table = self._rebuild_route(self.prompt_route, owned, answered)
+            if pb.seq >= self._prompt_route_seq:
+                self.prompt_route, self._prompt_route_seq = table, pb.seq
         return {"prompts": prompts}
 
     def _merge_list(self, pb: _PendingBroadcast, key: str) -> dict:
