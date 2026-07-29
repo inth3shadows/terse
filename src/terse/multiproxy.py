@@ -19,8 +19,10 @@ proportionate. Documented limitations are fine; silent gaps are not:
     `{peer}__` prefix ONLY when two or more peers export it (#168), `resources` keep
     their own `uri`; union the capabilities; a single format primer). `tools/call` and
     `prompts/get` are ROUTED to the one owning peer, resolved through the table the
-    merge built (advertised name first) with the `{peer}__` split as a fallback for a
-    name that was never listed. `resources/read`, `resources/subscribe`, and
+    merge built. The `{peer}__` split survives ONLY in the pre-listing window: once any
+    listing has installed, an unadvertised name is a clean -32601, never a speculative
+    dispatch (splitting one would execute a stale call on the WRONG peer — see
+    `_resolve`). `resources/read`, `resources/subscribe`, and
     `resources/unsubscribe` are fanned out SCATTER-GATHER — a resource `uri` isn't
     peer-namespaced, so every peer is asked and the first success `result` is the one
     kept — a peer that doesn't own the `uri` errors and is discarded; on a `uri` owned
@@ -1058,10 +1060,17 @@ class Router:
         for i, (idx, it) in enumerate(owned):
             exposed = quals[i] if qualified[i] else bares[i]
             if exposed in route:
+                # DROP the shadowed entry rather than advertising the name twice. A
+                # duplicate tool name is an MCP protocol violation, and a client that
+                # rejects the listing over it loses EVERY tool from EVERY peer — a blast
+                # radius wildly out of proportion to one unaddressable tool. First writer
+                # wins, so which survivor is kept is config order, not arrival order.
                 sys.stderr.write(
                     f"[terse-multiproxy] name collision on {exposed!r}: peer "
-                    f"{self.peers[route[exposed][0]].name!r} shadowed by "
-                    f"{self.peers[idx].name!r} — the shadowed tool is unaddressable\n")
+                    f"{self.peers[route[exposed][0]].name!r} keeps it; "
+                    f"{self.peers[idx].name!r}'s copy is DROPPED from tools/list "
+                    f"(a duplicate name would invalidate the whole listing)\n")
+                continue
             entries.append({**it, "name": exposed})
             route[exposed] = (idx, bares[i])
         return entries, route

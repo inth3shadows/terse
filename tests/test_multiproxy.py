@@ -1446,18 +1446,23 @@ def test_a_depth_two_shadow_chain_stays_unique_in_either_config_order():
 
 
 def test_an_unresolvable_duplicate_warns_without_debug(capsys):
-    # A peer listing the same name twice can't be disambiguated by qualification. Last
-    # writer wins, but the warning is UNCONDITIONAL — a silently unaddressable tool is
-    # the gap this module promises not to hide (cf. the peer-0 fallback notice).
+    # A peer listing the same name twice can't be disambiguated by qualification. The
+    # shadowed copy is DROPPED rather than advertised under a duplicate name — a duplicate
+    # is an MCP protocol violation, and a client that rejects the listing over it loses
+    # every peer's tools, not just this one. The warning is UNCONDITIONAL: a silently
+    # dropped tool is the gap this module promises not to hide (cf. the peer-0 notice).
     _, _, _, out, router = _two_peer_router()
     assert router.debug is False
     try:
         merged = _list_tools(router, out, [[{"name": "dup"}, {"name": "dup"}], []])
-        assert [t["name"] for t in merged["result"]["tools"]] == ["a__dup", "a__dup"]
+        names = [t["name"] for t in merged["result"]["tools"]]
+        assert names == ["a__dup"]                    # advertised ONCE, not twice
+        assert len(set(names)) == len(names)
+        assert router.tool_route["a__dup"] == (0, "dup")
     finally:
         router.close_senders()
     err = capsys.readouterr().err
-    assert "name collision on 'a__dup'" in err and "unaddressable" in err
+    assert "name collision on 'a__dup'" in err and "DROPPED" in err
 
 
 def test_tools_list_rebuilds_the_route_table_rather_than_accumulating():
