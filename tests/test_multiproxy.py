@@ -1146,6 +1146,92 @@ def test_qualified_name_still_routes_before_any_tools_list():
         router.close_senders()
 
 
+def test_a_timed_out_peer_keeps_its_tools_routable():
+    # A broadcast can complete on TIMEOUT with only the peers that answered. Replacing the
+    # table wholesale would erase a merely-SLOW peer — and a bare name has no `<peer>__`
+    # fallback to rescue it, so calls to a fully alive peer would fail -32601 until some
+    # later listing happened to complete with everyone present.
+    from terse.multiproxy import _PendingBroadcast
+    t0, t1, _, out, router = _two_peer_router()
+    try:
+        _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
+        assert set(router.tool_route) == {"only_a", "only_b"}
+        # second listing: peer b never answers, so its part is simply absent
+        router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=9, remaining={1},
+            parts={0: {"result": {"tools": [{"name": "only_a"}]}}}))
+        assert set(router.tool_route) == {"only_a", "only_b"}
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "only_b"}}))
+        assert _await_peer_call(t1)["params"]["name"] == "only_b"
+        assert _peer_calls(t0) == []
+        assert [m for m in _lines(out) if "error" in m] == []   # no -32601 to the client
+    finally:
+        router.close_senders()
+
+
+def test_a_peer_answering_with_an_empty_list_does_drop_its_tools():
+    # The other side of the same coin: an EMPTY reply is a peer speaking, not a peer
+    # missing, so its tools really are gone and must stop routing. If `_install_route`
+    # keyed on "contributed no entries" instead of "answered", this would wrongly persist.
+    from terse.multiproxy import _PendingBroadcast
+    _, _, _, out, router = _two_peer_router()
+    try:
+        _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
+        router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=9, remaining=set(),
+            parts={0: {"result": {"tools": [{"name": "only_a"}]}},
+                   1: {"result": {"tools": []}}}))
+        assert set(router.tool_route) == {"only_a"}
+    finally:
+        router.close_senders()
+
+
+def test_a_peer_cannot_shadow_another_peers_qualified_name():
+    # Peers "a" and "b" both export "search", so both are qualified to a__search /
+    # b__search. Peer "c" exports a tool named LITERALLY "a__search" — with only bare
+    # names reserved it would be exposed verbatim, advertise a DUPLICATE name, and hijack
+    # every a__search call. The qualified forms are reserved too, so "c" is qualified in
+    # turn and no two exposed names are equal.
+    t0, t1, t2 = _FakePeerTransport(), _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer(n, t, Interceptor(PLAIN_POLICY))
+             for n, t in (("a", t0), ("b", t1), ("c", t2))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        merged = _drive_broadcast(
+            router, out, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            [{"result": {"tools": [{"name": "search"}]}},
+             {"result": {"tools": [{"name": "search"}]}},
+             {"result": {"tools": [{"name": "a__search"}]}}])
+        names = [t["name"] for t in merged["result"]["tools"]]
+        assert names == ["a__search", "b__search", "c__a__search"]
+        assert len(set(names)) == len(names)          # no duplicate on the wire
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "a__search"}}))
+        sent = _await_peer_call(t0)                   # peer "a", NOT the shadower
+        assert sent["params"]["name"] == "search"
+        assert _peer_calls(t2) == []
+    finally:
+        router.close_senders()
+
+
+def test_an_unresolvable_duplicate_warns_without_debug(capsys):
+    # A peer listing the same name twice can't be disambiguated by qualification. Last
+    # writer wins, but the warning is UNCONDITIONAL — a silently unaddressable tool is
+    # the gap this module promises not to hide (cf. the peer-0 fallback notice).
+    _, _, _, out, router = _two_peer_router()
+    assert router.debug is False
+    try:
+        merged = _list_tools(router, out, [[{"name": "dup"}, {"name": "dup"}], []])
+        assert [t["name"] for t in merged["result"]["tools"]] == ["a__dup", "a__dup"]
+    finally:
+        router.close_senders()
+    err = capsys.readouterr().err
+    assert "name collision on 'a__dup'" in err and "unaddressable" in err
+
+
 def test_tools_list_rebuilds_the_route_table_rather_than_accumulating():
     # A peer can change its tool set and re-issue tools/list. A stale entry would keep
     # routing a tool the peer no longer has, so the table is REPLACED, not merged.
