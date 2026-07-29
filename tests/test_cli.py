@@ -887,3 +887,199 @@ def test_autotune_explicit_policy_resolves_only_corpus_and_announces_only_it(tmp
     assert rc == 0
     line = next(ln for ln in out.splitlines() if "resolved from install-mcp wiring" in ln)
     assert f"--corpus {corpus}" in line and "--policy" not in line
+
+
+# --- #136: autotune reads the LEDGER too — the corpus cannot show a capture:false tool ---
+
+def _ledger(tmp_path, rows):
+    p = tmp_path / "stats.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    return p
+
+
+def _rec(server, tool, raw_tokens, out_tokens):
+    return {"ts": 1, "server": server, "tool": tool, "decision": "passthrough",
+            "raw_chars": raw_tokens * 4, "out_chars": out_tokens * 4,
+            "raw_tokens": raw_tokens, "out_tokens": out_tokens}
+
+
+def test_autotune_names_live_tools_the_corpus_never_saw(tmp_path, capsys):
+    """#143's exact shape: a tool sitting at 0.0% on six figures of traffic, invisible to
+    every corpus because `capture: false` keeps its payloads off disk. A diff that omits it
+    reads as "the install is tuned now" while a fifth of the tokens were never an input."""
+    pol, corpus = _autotune_setup(tmp_path)
+    led = _ledger(tmp_path, [_rec("kb", "read.search", 122431, 122431)])
+    rc = main(["policy", "autotune", "--policy", str(pol), "--corpus", str(corpus),
+               "--ledger", str(led)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "not tunable from this corpus" in out
+    assert "kb.read.search" in out
+    assert "122,431 tok" in out
+    assert "cannot tune what it cannot see" in out
+
+
+def test_autotune_does_not_flag_a_tool_the_corpus_does_cover(tmp_path, capsys):
+    pol, corpus = _autotune_setup(tmp_path)
+    led = _ledger(tmp_path, [_rec("gh", "gh.items", 900, 400)])
+    main(["policy", "autotune", "--policy", str(pol), "--corpus", str(corpus),
+          "--ledger", str(led)])
+    assert "not tunable from this corpus" not in capsys.readouterr().out
+
+
+def test_autotune_blind_spot_survives_bare_vs_qualified_drift(tmp_path, capsys):
+    """The corpus records `gh.items` with no server (pre-#152 capture); the ledger records
+    server `gh` + tool `items`. Same tool, two spellings. Reporting it uncovered would be a
+    false alarm that trains the operator to ignore the section."""
+    pol, corpus = _autotune_setup(tmp_path)
+    led = _ledger(tmp_path, [_rec("gh", "items", 900, 400)])
+    main(["policy", "autotune", "--policy", str(pol), "--corpus", str(corpus),
+          "--ledger", str(led)])
+    out = capsys.readouterr().out
+    assert "not tunable from this corpus" not in out
+    assert "! items" not in out
+
+
+def test_autotune_without_any_ledger_says_nothing_about_one(tmp_path, capsys):
+    """The ledger is an enrichment, never a precondition: a machine that has never written
+    one must get byte-identical output. (conftest points XDG_STATE_HOME at a temp dir, so
+    the default path genuinely does not exist here.)"""
+    pol, corpus = _autotune_setup(tmp_path)
+    rc = main(["policy", "autotune", "--policy", str(pol), "--corpus", str(corpus)])
+    out, err = capsys.readouterr()
+    assert rc == 0
+    assert "ledger" not in out and "ledger" not in err
+    assert "gh.items" in out                                # the diff itself still ran
+
+
+def test_autotune_refuses_a_named_ledger_that_does_not_exist(tmp_path, capsys):
+    """Silently proceeding would misreport coverage on the one run where the operator
+    explicitly asked for it to be checked."""
+    pol, corpus = _autotune_setup(tmp_path)
+    before = pol.read_bytes()
+    rc = main(["policy", "autotune", "--policy", str(pol), "--corpus", str(corpus),
+               "--ledger", str(tmp_path / "absent.jsonl"), "--apply"])
+    assert rc == 2
+    assert pol.read_bytes() == before
+    assert "no ledger at" in capsys.readouterr().err
+
+
+def test_ledger_traffic_does_not_double_count_a_bare_named_tool():
+    """A row whose qualified and bare names collide contributes once per name, and a
+    lookup reads one — a row must never be summed into itself."""
+    from terse.cli import _ledger_traffic
+
+    idx = _ledger_traffic([{"server": "kb", "tool": "kb.search", "blocks": 3,
+                            "raw_tokens": 100, "out_tokens": 40}])
+    assert idx["kb.search"] == {"blocks": 3, "raw_tokens": 100, "out_tokens": 40}
+
+
+def test_autotune_downgrade_warning_carries_live_block_counts(tmp_path, capsys, monkeypatch):
+    """The frequency the corpus structurally lacks: it is idempotent by sha, so a tool
+    called twice and one called 800 times weigh the same in the decision being second-
+    guessed. The ledger has the denominator; print it rather than say "go look"."""
+    import terse.policy_gen as pg
+
+    pol, corpus = _autotune_setup(tmp_path)
+    real = pg.merge_policy
+    monkeypatch.setattr(pg, "merge_policy", lambda existing, generated, identities=None: (
+        real(existing, generated, identities)[0],
+        [{"kind": "tiers", "tool": "gh.items", "before": ["minify", "tabularize"],
+          "after": ["minify"], "preserved": []}]))
+    # Block counts come from the ledger RECORDS, one per emitted result block — so three
+    # records is three live blocks, not a field the caller gets to assert into place.
+    led = _ledger(tmp_path, [_rec("gh", "gh.items", 900, 400)] * 3)
+    main(["policy", "autotune", "--policy", str(pol), "--corpus", str(corpus),
+          "--ledger", str(led)])
+    out = capsys.readouterr().out
+    assert "would LOSE a tier" in out
+    assert "3 live block(s)" in out
+    assert "1,500 tok saved today" in out          # 3 x (900 - 400)
+
+
+# --- #136: install-mcp points at autotune once a corpus actually has payloads ---
+
+def _install_with_corpus(tmp_path, monkeypatch, payloads: int):
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {"demo": {"command": "uvx",
+                                                       "args": ["demo-mcp"]}}}),
+                   encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    policy = _write(tmp_path, "policy.json", json.dumps({"version": 1, "policies": []}))
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for i in range(payloads):
+        (corpus / f"demo__{i}.json").write_text("{}", encoding="utf-8")
+    rc = main(["install-mcp", "demo", "--policy", str(policy),
+               "--capture-dir", str(corpus)])
+    return rc, corpus
+
+
+def test_install_mcp_suggests_autotune_when_the_corpus_already_has_payloads(
+        tmp_path, monkeypatch, capsys):
+    rc, corpus = _install_with_corpus(tmp_path, monkeypatch, payloads=4)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "holds 4 payload(s)" in out
+    assert "terse policy autotune" in out
+
+
+def test_install_mcp_stays_quiet_on_a_first_install(tmp_path, monkeypatch, capsys):
+    """At first install the corpus is empty by definition, and shape decisions need
+    payloads — suggesting autotune there would send the operator to a command that can
+    only refuse."""
+    rc, _ = _install_with_corpus(tmp_path, monkeypatch, payloads=0)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "autotune" not in out
+
+
+def test_two_servers_sharing_a_bare_tool_name_are_not_one_tool(tmp_path, capsys):
+    """The bare-name fallback must not collapse `docs.search` and `other.search` into one
+    tool: capturing either would then mark the other covered, which is #143 with an extra
+    step. Both are ATTRIBUTED here, so neither side is missing the information."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for i in range(4):
+        (corpus / f"search__{i}.json").write_text(json.dumps({
+            "tool": "search", "server": "docs", "captured_at": 1_000_000_000 + i,
+            "raw": json.dumps({"result": [{"id": j, "hit": "x"} for j in range(20)]}),
+        }), encoding="utf-8")
+    pol = tmp_path / "policy.json"
+    pol.write_text(json.dumps({"version": 1, "policies": []}), encoding="utf-8")
+    led = _ledger(tmp_path, [_rec("other", "search", 100000, 100000)])
+    main(["policy", "autotune", "--policy", str(pol), "--corpus", str(corpus),
+          "--ledger", str(led)])
+    out = capsys.readouterr().out
+    assert "not tunable from this corpus" in out
+    assert "other.search" in out
+
+
+def test_unattributed_ledger_row_matches_a_captured_bare_tool(tmp_path, capsys):
+    """The ledger predates `server`, so it cannot say whose `gh.items` this is. Raising a
+    blind spot the operator cannot act on trains them to ignore the section."""
+    pol, corpus = _autotune_setup(tmp_path)
+    led = _ledger(tmp_path, [_rec("unknown", "gh.items", 900, 400)])
+    main(["policy", "autotune", "--policy", str(pol), "--corpus", str(corpus),
+          "--ledger", str(led)])
+    assert "not tunable from this corpus" not in capsys.readouterr().out
+
+
+def test_downgrade_tail_does_not_claim_counts_it_did_not_print(tmp_path, capsys, monkeypatch):
+    """A ledger full of OTHER tools' traffic must not make the warning say "live block
+    counts are shown above" beside a rule that carries no annotation."""
+    import terse.policy_gen as pg
+
+    pol, corpus = _autotune_setup(tmp_path)
+    real = pg.merge_policy
+    monkeypatch.setattr(pg, "merge_policy", lambda existing, generated, identities=None: (
+        real(existing, generated, identities)[0],
+        [{"kind": "tiers", "tool": "gh.items", "before": ["minify", "tabularize"],
+          "after": ["minify"], "preserved": []}]))
+    led = _ledger(tmp_path, [_rec("other", "unrelated", 900, 400)])
+    main(["policy", "autotune", "--policy", str(pol), "--corpus", str(corpus),
+          "--ledger", str(led)])
+    out = capsys.readouterr().out
+    assert "would LOSE a tier" in out
+    assert "shown above" not in out
+    assert "cross-check those tools in `terse stats`" in out

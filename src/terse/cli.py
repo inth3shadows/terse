@@ -37,6 +37,7 @@ from .capture import (
     coverage,
     extract_records,
     load_corpus,
+    qualify,
 )
 from .html_report import build_html_diff_report, build_html_report
 from .measure import cross_tokenizer_savings, measure_corpus
@@ -362,6 +363,103 @@ def _installed_autotune_defaults() -> tuple[str | None, str | None, str | None, 
             "; ".join(notes) or None, ambiguous)
 
 
+def _ledger_server(row: dict) -> str | None:
+    """A ledger row's server, or None when it carries no attribution — which is what
+    `stats.aggregate` writes as the literal "unknown" for a record predating the field."""
+    srv = row.get("server")
+    return srv if isinstance(srv, str) and srv and srv != "unknown" else None
+
+
+def _ledger_keys(server: str | None, tool: str) -> set[str]:
+    """The rule name(s) a ledger row could be governed under.
+
+    An ATTRIBUTED row has exactly one: its qualified name. Falling back to the bare name
+    there would collapse two servers that happen to expose the same generic tool (`search`,
+    `list`, `get`) into one — so capturing either would mark the other covered, which is
+    #143 recreated with an extra step.
+
+    An UNATTRIBUTED row genuinely could be any server's, so it matches on the bare name and
+    a bare corpus identity matches back. That direction is the safe one: the mistake it
+    risks is calling an uncovered tool covered ONLY when the ledger cannot say whose it is,
+    and the remedy for that is the same re-capture the identity note already asks for."""
+    from .capture import qualify
+
+    return {qualify(tool, server)} if server else {tool}
+
+
+def _ledger_traffic(rows: list[dict]) -> dict[str, dict[str, int]]:
+    """Live traffic per candidate rule name. A row contributes to each of its names
+    separately (a lookup reads exactly one), so a qualified/bare collision cannot
+    double-count."""
+    from .capture import qualify
+
+    idx: dict[str, dict[str, int]] = {}
+    for row in rows:
+        tool = row.get("tool", "")
+        # Deliberately more permissive than `_ledger_keys`: a rule named bare `search`
+        # DOES govern every server's `search` at runtime, so summing both spellings is
+        # what the rule actually carries. The blind-spot check cannot afford the same
+        # licence — there, a wrong match hides traffic instead of merely widening a count.
+        for key in {qualify(tool, _ledger_server(row)), tool}:
+            acc = idx.setdefault(key, {"blocks": 0, "raw_tokens": 0, "out_tokens": 0})
+            for f in acc:
+                acc[f] += row.get(f, 0)
+    return idx
+
+
+def _ledger_blind_spots(rows: list[dict],
+                        identities: dict[str, tuple[str, str | None]]) -> list[dict]:
+    """Ledger rows whose tool is NOT in the corpus — live traffic autotune is structurally
+    blind to (#143).
+
+    A `capture: false` tool is, by construction, absent from every corpus and present in
+    the ledger; so is any tool whose payloads were never captured. Without this, autotune
+    prints a diff that reads as "the install is tuned now" while a fifth of the tokens were
+    never in its input. Heaviest first, by the tokens they actually cost.
+
+    Bare-name matching is allowed only on the side that is actually MISSING attribution,
+    never as a blanket fallback: a corpus and a ledger can disagree about a tool's spelling
+    (#152), but two servers exposing a generic `search` are two tools, and treating one
+    capture as covering both is the very hole this exists to close."""
+    known = set(identities)
+    all_bare = {bare for bare, _srv in identities.values()}
+    unattributed_bare = {bare for bare, srv in identities.values() if srv is None}
+
+    def _covered(row: dict) -> bool:
+        srv, tool = _ledger_server(row), row.get("tool", "")
+        if _ledger_keys(srv, tool) & known:
+            return True
+        # The ledger cannot say whose tool this is, so any corpus tool of that name could
+        # be it — assume covered rather than raise a blind spot the operator cannot act on.
+        if srv is None:
+            return tool in all_bare
+        # Mirror image: the CORPUS predates `server`, so its rules are bare by construction
+        # and a bare rule of this name is the one governing this row.
+        return tool in unattributed_bare
+
+    spots = [r for r in rows if not _covered(r)]
+    return sorted(spots, key=lambda r: (r.get("raw_tokens", 0), r.get("raw_chars", 0)),
+                  reverse=True)
+
+
+def _resolve_ledger(arg: str | None) -> tuple[list[dict], Path | None, int]:
+    """`(rows, path, exit_code)`. The ledger is an ENRICHMENT, never a precondition —
+    autotune must behave identically on a machine that has never written one, so a missing
+    default path is skipped in silence. A path the operator *named*, though, is an error:
+    they asked for coverage to be checked against a specific file, and quietly proceeding
+    without it would misreport how much of the install was actually seen."""
+    from .stats import aggregate, default_stats_log, load_stats
+
+    explicit = arg is not None
+    path = Path(arg).expanduser() if explicit else default_stats_log()
+    if not path.exists() and not path.with_name(path.name + ".1").exists():
+        if explicit:
+            print(f"policy autotune: no ledger at {path}", file=sys.stderr)
+            return [], None, 2
+        return [], None, 0
+    return aggregate(load_stats(str(path)))["tools"], path, 0
+
+
 def _cmd_policy_autotune(args: argparse.Namespace) -> int:
     """Re-tune an EXISTING policy against a corpus (#136).
 
@@ -375,7 +473,12 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
     so a bare `terse policy autotune` closes the install -> corpus -> policy loop (#136).
     Resolution is fail-safe: it is used only when the wrapped servers agree on ONE policy
     (and one corpus); a disagreement refuses and lists them rather than guessing which
-    policy governs the wire."""
+    policy governs the wire.
+
+    The savings ledger is read alongside the corpus, for the two things a corpus
+    structurally cannot show: which live tools have NO captured payloads at all (a
+    `capture: false` tool appears only there — #143), and call FREQUENCY (the corpus is
+    idempotent by sha, so it holds each payload's first sighting, not every call)."""
     from .policy import load_policy
     from .policy_gen import generate_policy, merge_policy, resolve_identities
 
@@ -428,13 +531,20 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
               f"(`terse capture` or `proxy --capture-dir`).", file=sys.stderr)
         return 1
 
+    # Resolved BEFORE any analysis so a named-but-missing ledger fails before the operator
+    # has read a diff they would then have to discard.
+    ledger_rows, ledger_path, rc = _resolve_ledger(args.ledger)
+    if rc:
+        return rc
+
     # A policy that opted out of the #116 join must not be tuned on cross-block folding
     # it will never perform.
     generated, _rows = generate_policy(envelopes, threshold=args.threshold,
                                        join_blocks=bool(existing.get("join_blocks", True)))
     # Identities, not just names: the shadow check has to resolve a generated rule the way
     # the LOADER will, and a rule's server is not recoverable from its name alone.
-    merged, changes = merge_policy(existing, generated, resolve_identities(envelopes))
+    identities = resolve_identities(envelopes)
+    merged, changes = merge_policy(existing, generated, identities)
 
     kinds = {k: [c for c in changes if c["kind"] == k]
              for k in ("added", "tiers", "suggestions", "unchanged", "preserved",
@@ -472,6 +582,29 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
     if not (kinds["tiers"] or kinds["added"] or kinds["suggestions"]):
         print("  (no change — the deployed policy already matches this corpus)")
 
+    traffic = _ledger_traffic(ledger_rows)
+    if ledger_path:
+        blind = _ledger_blind_spots(ledger_rows, identities)
+        if blind:
+            print(f"\n  not tunable from this corpus — live in the ledger, no captured "
+                  f"payloads ({ledger_path}):")
+            for r in blind[:10]:
+                raw, out = r.get("raw_tokens", 0), r.get("out_tokens", 0)
+                unit = "tok"
+                if not raw:  # a tiktoken-less ledger records chars only; say which it is
+                    raw, out, unit = r.get("raw_chars", 0), r.get("out_chars", 0), "chars"
+                saved = f"{(raw - out) / raw * 100:5.1f}%" if raw else "    –"
+                name = qualify(r.get("tool", "?"), _ledger_server(r))
+                print(f"  ! {name:<28} {raw:>10,} {unit} at {saved} saved over "
+                      f"{r.get('blocks', 0)} block(s)")
+            if len(blind) > 10:
+                print(f"    ... and {len(blind) - 10} more")
+            # Naming the cause matters more than the list: `capture: false` is an operator
+            # decision autotune must never reverse (it is preserved verbatim above), so the
+            # remedy is a deliberate re-capture, not a flag autotune could set itself.
+            print("    (capture is off for these, or they were never captured — autotune "
+                  "cannot tune what it cannot see)")
+
     # A proposed DOWNGRADE deserves a second look. It removes a tier from a rule that is
     # working today, on the evidence of a corpus that is a SAMPLE — idempotent by sha, so
     # it holds each payload's first sighting rather than every call, and it holds nothing at
@@ -483,10 +616,30 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
     downgrades = [c for c in kinds["tiers"] + kinds["added"]
                   if len(c["after"]) < len(c.get("before") or [])]
     if downgrades:
-        print(f"\n[warn] {len(downgrades)} rule(s) would LOSE a tier "
-              f"({', '.join(c['tool'] for c in downgrades)}). The corpus is a sample; cross-"
-              "check those tools in `terse stats` — which counts every call, including ones "
-              "whose payloads were never captured — before applying a downgrade.")
+        # With a ledger in hand, print the live traffic instead of telling the operator to
+        # go and look it up. This is the frequency the CORPUS cannot carry: it is idempotent
+        # by sha, so a tool called twice and one called 800 times contribute alike to the
+        # decision being second-guessed here.
+        def _weight(c: dict) -> str:
+            t = traffic.get(c["tool"])
+            if not t:
+                return ""
+            saved = t["raw_tokens"] - t["out_tokens"]
+            return (f" [{t['blocks']} live block(s)"
+                    + (f", {saved:,} tok saved today]" if saved else "]"))
+
+        weights = {c["tool"]: _weight(c) for c in downgrades}
+        named = ", ".join(c["tool"] + weights[c["tool"]] for c in downgrades)
+        tail = ("The corpus is a sample; cross-check those tools in `terse stats` — which "
+                "counts every call, including ones whose payloads were never captured — "
+                "before applying a downgrade.")
+        # Gate on whether a DOWNGRADED tool has traffic, not on the ledger having any at
+        # all: "shown above" must not be printed beside a rule carrying no annotation.
+        if any(weights.values()):
+            tail = ("Live block counts from the ledger are shown above; a downgrade on a "
+                    "high-traffic rule gives back measured savings. `terse stats` has the "
+                    "full picture.")
+        print(f"\n[warn] {len(downgrades)} rule(s) would LOSE a tier ({named}). {tail}")
     if not args.apply:
         print("\nnothing written. Re-run with --apply to write the merged policy.")
         return 0
@@ -1078,7 +1231,26 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
         print(f"backup: {res['backup']}")
     if not res["dry_run"] and res["changes"]:
         print("→ restart Claude Code for the change to take effect.")
+        # Close the loop's last leg (#136): the corpus this install wires is only useful if
+        # something re-derives the policy from it, and nothing prompts that today. Only
+        # when payloads ALREADY exist — at first install the corpus is empty by definition,
+        # and shape decisions need payloads, not `tools/list`.
+        if n := _corpus_size(res.get("capture_dir")):
+            print(f"→ corpus at {res['capture_dir']} already holds {n} payload(s) — "
+                  f"`terse policy autotune` re-tunes {res['policy']} against them.")
     return 0
+
+
+def _corpus_size(capture_dir: str | None) -> int:
+    """Payload count in a capture dir, 0 for absent/unreadable. Counts filenames rather
+    than loading envelopes: this runs on every install and must not pay corpus-parse cost
+    (nor fail an install because one payload is malformed)."""
+    if not capture_dir:
+        return 0
+    try:
+        return sum(1 for p in Path(capture_dir).glob("*.json") if p.is_file())
+    except OSError:
+        return 0
 
 
 def _cmd_uninstall_mcp(args: argparse.Namespace) -> int:
@@ -1282,6 +1454,10 @@ def main(argv: list[str] | None = None) -> int:
                          f"install-mcp wiring, else {DEFAULT_CORPUS!r})")
     pa.add_argument("--threshold", type=float, default=5.0, metavar="PCT",
                     help="as `policy generate` (default 5.0)")
+    pa.add_argument("--ledger", default=None, metavar="FILE",
+                    help="savings ledger to cross-check coverage against (default: the "
+                         "one `terse stats` reads; skipped silently if absent). Names the "
+                         "live tools this corpus holds no payloads for.")
     pa.add_argument("--apply", action="store_true",
                     help="write the merged policy. Without it, nothing is written.")
     pa.set_defaults(func=_cmd_policy_autotune)
