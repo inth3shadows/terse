@@ -23,7 +23,8 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   is qualified, on both sides. `terse.retrieve` is reserved, so a peer exporting it is
   qualified rather than shadowing the router's own. Routing consults the advertised-name
   table first — a tool whose own name contains `__` is no longer misread as a peer prefix
-  — and keeps the `{peer}__` split as a fallback for names that were never listed. Ledger
+  — with the `{peer}__` split kept ONLY until the first listing installs, after which an
+  unadvertised name is a clean -32601 rather than a speculative dispatch. Ledger
   and capture bookkeeping still record the **peer-qualified** name, so per-server corpus
   attribution is unchanged. The routing table is exactly what the most recent `tools/list`
   advertised — a peer missing from a listing is missing from the client's tool list too, so

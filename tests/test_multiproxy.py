@@ -1225,10 +1225,54 @@ def test_a_late_timing_out_listing_does_not_clobber_a_newer_one():
         stale = router._merge_tools_list(_PendingBroadcast(
             kind="tools/list", client_id=9, seq=1, remaining={1},
             parts={0: {"result": {"tools": [{"name": "old"}]}}}))
-        assert [t["name"] for t in stale["tools"]] == ["old"]   # its own client is answered
-        assert set(router.tool_route) == {"new", "only_b"}      # ...but nothing installed
+        # its own client is still answered — but with what is ACTUALLY routable, not with
+        # this listing's stale view: advertising "old" here would hand the client a name
+        # that returns -32601 the moment it calls it.
+        assert [t["name"] for t in stale["tools"]] == ["new", "only_b"]
+        assert set(router.tool_route) == {"new", "only_b"}      # ...and nothing installed
     finally:
         router.close_senders()
+
+
+def test_the_prefix_fallback_is_off_once_any_listing_has_landed_even_an_empty_one():
+    # Gating the fallback on "the table is empty" rather than "a listing has ever landed"
+    # leaves the wrong-server misroute reachable: an all-peers-timed-out listing installs
+    # {}, and `prompts/list` is answered -32601 by most servers, so prompt_route would be
+    # empty FOREVER and the fallback would never disarm.
+    from terse.multiproxy import _PendingBroadcast
+    _, t1, _, out, router = _two_peer_router()
+    try:
+        _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
+        router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=9, seq=1, remaining=set(), parts={}))
+        assert router.tool_route == {}                       # every peer timed out
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "b__x"}}))
+        assert _peer_calls(t1) == []                         # NOT split onto peer b
+    finally:
+        router.close_senders()
+    errs = [m for m in _lines(out) if "error" in m]
+    assert len(errs) == 1 and errs[0]["error"]["code"] == -32601
+
+
+def test_prompts_get_does_not_fall_back_after_a_prompts_list_that_every_peer_refused():
+    # prompt_route stays {} for a fleet whose peers all answer prompts/list with -32601.
+    # An emptiness-gated fallback would dispatch every unknown prompt name to a peer.
+    from terse.multiproxy import _PendingBroadcast
+    t0, t1, _, out, router = _two_peer_router()
+    try:
+        router._merge_prompts_list(_PendingBroadcast(
+            kind="prompts/list", client_id=1, seq=0, remaining=set(),
+            parts={0: {"error": {"code": -32601, "message": "no"}},
+                   1: {"error": {"code": -32601, "message": "no"}}}))
+        assert router.prompt_route == {}
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 4, "method": "prompts/get", "params": {"name": "b__nope"}}))
+        assert _peer_calls(t0) == [] and _peer_calls(t1) == []
+    finally:
+        router.close_senders()
+    errs = [m for m in _lines(out) if "error" in m]
+    assert len(errs) == 1 and "unknown prompt" in errs[0]["error"]["message"]
 
 
 def test_the_prefix_fallback_is_off_once_a_listing_has_landed():

@@ -120,6 +120,13 @@ one, and terse strips that prefix before forwarding. So a fleet whose tool names
 already distinct — the normal case — is a drop-in: an existing client allowlist keeps
 working, and no name changes shape.
 
+Two caveats, both needing a peer to miss a `tools/list` broadcast. A tool is named from
+the listing it appeared in, so if two peers *do* export the same name and only one
+answers, that copy is advertised bare that listing and qualified the next. And the routing
+table is exactly the most recent listing — a peer that missed it is not advertised, and
+calling one of its tools from a stale client-side list returns -32601 until the next
+listing. See terse#178.
+
 The synthetic `terse.retrieve` tool (drop-to-retrieve) is advertised once, shared across
 every peer, regardless of which peer dropped the field; it is a reserved name, so a peer
 exporting `terse.retrieve` is qualified rather than shadowing it.

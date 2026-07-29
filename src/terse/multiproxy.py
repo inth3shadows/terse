@@ -253,11 +253,14 @@ class _PendingBroadcast:
     tracked in a second structure that could drift out of sync with `_local_id_map`."""
     kind: str
     client_id: Any
+    seq: int
     remaining: set[int]
     # The router-local sequence number this broadcast is keyed by in `_pending`. Carried
     # on the object (not just as the dict key) so a merge can tell whether it is installing
     # a listing NEWER than the one already installed — see `_merge_tools_list` (#168).
-    seq: int = -1
+    # REQUIRED, deliberately without a default: a sentinel default fails OPEN on the first
+    # listing (-1 >= -1) and silently CLOSED on every one after, which is two different
+    # wrong behaviours selected by timing.
     parts: dict[int, dict] = field(default_factory=dict)
     timer: threading.Timer | None = None
     done: bool = False
@@ -391,6 +394,10 @@ class Router:
         self.prompt_route: dict[str, tuple[int, str]] = {}
         self._tool_route_seq = -1
         self._prompt_route_seq = -1
+        # What the installed table advertises, so a listing refused as stale can be
+        # answered with names that are actually routable rather than its own stale view.
+        self._tool_entries: list[dict] = []
+        self._prompt_entries: list[dict] = []
 
         self._pending_lock = Lock()
         # keyed by broadcast SEQUENCE NUMBER, not client id — see _PendingBroadcast.
@@ -517,7 +524,7 @@ class Router:
                 self._write_client(reply)
             return
 
-        target = self._resolve(name, self.tool_route)
+        target = self._resolve(name, self.tool_route, self._tool_route_seq >= 0)
         if target is not None:
             idx, bare = target
             rewritten = dict(msg)
@@ -550,7 +557,8 @@ class Router:
                               f"one of: {', '.join(self.by_name)})"}},
                 separators=(",", ":"), ensure_ascii=False))
 
-    def _resolve(self, name: Any, route: dict[str, tuple[int, str]]) -> tuple[int, str] | None:
+    def _resolve(self, name: Any, route: dict[str, tuple[int, str]],
+                 listed: bool) -> tuple[int, str] | None:
         """Resolve a client-supplied tool/prompt name to `(peer index, bare name)`.
 
         The routing table built by the merge is consulted FIRST, and an exact hit always
@@ -558,8 +566,14 @@ class Router:
         own tool name happens to contain `__`: an advertised name is never re-read as a
         speculative `<peer>__<tool>` split.
 
-        The prefix split remains as a FALLBACK, but ONLY while the table is empty — a
-        client calling before any listing has landed. Returns None when neither resolves.
+        The prefix split remains as a FALLBACK, but ONLY while no listing has EVER been
+        installed (`listed` is False) — a client calling before the first listing lands.
+        Returns None when neither resolves.
+
+        `listed` is deliberately NOT "the table is empty". An empty table is a routine
+        state, not a pre-listing one: a listing in which every peer timed out installs
+        `{}`, and most MCP servers answer `prompts/list` with -32601, so `prompt_route`
+        would be empty FOREVER and the fallback would never disarm.
 
         The fallback is deliberately not used once a listing exists. Applying it to any
         unadvertised name silently executed stale calls on the WRONG SERVER: with peer
@@ -578,7 +592,7 @@ class Router:
         hit = route.get(name)
         if hit is not None:
             return hit
-        if route:
+        if listed:
             return None
         peer_name, sep, bare = name.partition(PREFIX_SEP)
         if sep and bare and peer_name in self.by_name:
@@ -596,7 +610,7 @@ class Router:
         params = msg.get("params") or {}
         name = params.get("name")
         mid = msg.get("id")
-        target = self._resolve(name, self.prompt_route)
+        target = self._resolve(name, self.prompt_route, self._prompt_route_seq >= 0)
         if target is not None:
             idx, bare = target
             rewritten = dict(msg)
@@ -1027,6 +1041,13 @@ class Router:
         with self._route_lock:
             if pb.seq >= self._tool_route_seq:
                 self.tool_route, self._tool_route_seq = table, pb.seq
+                self._tool_entries = tools
+            else:
+                # Refused as stale — but this client is still owed a reply, and answering
+                # from THIS listing would advertise names the installed table does not
+                # hold (a tools/call on one would be -32601 straight after being told it
+                # exists). Answer with what is actually routable instead.
+                tools = list(self._tool_entries)
         if self.has_drop:
             tools.append(RETRIEVE_TOOL_DEF)
         return {"tools": tools}
@@ -1097,6 +1118,9 @@ class Router:
         with self._route_lock:
             if pb.seq >= self._prompt_route_seq:
                 self.prompt_route, self._prompt_route_seq = table, pb.seq
+                self._prompt_entries = prompts
+            else:
+                prompts = list(self._prompt_entries)   # see _merge_tools_list
         return {"prompts": prompts}
 
     def _merge_list(self, pb: _PendingBroadcast, key: str) -> dict:
