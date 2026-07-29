@@ -1230,6 +1230,79 @@ def test_a_stale_listing_reply_does_not_duplicate_the_retrieve_tool(tmp_path):
         router.close_senders()
 
 
+def test_exposed_names_are_unique_across_an_exhaustive_small_configuration_sweep():
+    """The uniqueness invariant, checked by exhaustion rather than by argument.
+
+    Three separate hand-reasoned versions of `_expose_names` each shipped a duplicate
+    (rounds 2, 3 and 6 of review). The claim is now: for ANY assignment of names to peers,
+    no two exposed names are equal unless one peer listed the same name twice. The
+    alphabet deliberately includes the `{peer}__{name}` shapes that make a qualified form
+    land on another entry's bare name, plus the reserved `terse.retrieve`.
+    """
+    from itertools import combinations_with_replacement, product
+
+    from terse.lossy import RETRIEVE_TOOL
+    names = ["x", "a__x", "b__a__x", RETRIEVE_TOOL, f"a__{RETRIEVE_TOOL}"]
+    peer_names = ("a", "b", "c")
+    peers = [Peer(n, _FakePeerTransport(), Interceptor(PLAIN_POLICY)) for n in peer_names]
+    router = Router(peers, io.StringIO(), Lock(), broadcast_timeout=1000)
+    per_peer = [t for t in combinations_with_replacement(names, 2) if len(set(t)) == len(t)]
+    try:
+        checked = 0
+        for combo in product(per_peer, repeat=len(peer_names)):
+            owned = [(idx, {"name": t}) for idx, tools in enumerate(combo) for t in tools]
+            entries, route = router._expose_names(owned, reserved=(RETRIEVE_TOOL,))
+            exposed = [e["name"] for e in entries]
+            assert len(set(exposed)) == len(exposed), (combo, exposed)
+            assert len(route) == len(exposed), (combo, exposed)
+            # and every entry still routes back to its own peer and its real name
+            for (idx, it), name in zip(owned, exposed, strict=True):
+                assert route[name] == (idx, it["name"])
+            checked += 1
+        assert checked == len(per_peer) ** len(peer_names) == 1000, checked
+    finally:
+        router.close_senders()
+
+
+def test_a_peers_emitted_qualified_form_still_contests_its_own_sibling_name():
+    # The other half of the sibling rule, and the case a per-peer exclusion got wrong:
+    # gh's `search` DOES collide with kb's, so gh emits `gh__search` — which now contests
+    # gh's OWN tool literally named `gh__search`. Excluding the entry's own peer left both
+    # on the wire under one name, so gh's `search` became unaddressable.
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("gh", t0, Interceptor(PLAIN_POLICY)), Peer("kb", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        merged = _drive_broadcast(
+            router, out, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            [{"result": {"tools": [{"name": "search"}, {"name": "gh__search"}]}},
+             {"result": {"tools": [{"name": "search"}]}}])
+        names = [t["name"] for t in merged["result"]["tools"]]
+        assert len(set(names)) == len(names), names
+        assert names == ["gh__search", "gh__gh__search", "kb__search"]
+        assert router.tool_route["gh__search"] == (0, "search")
+        assert router.tool_route["gh__gh__search"] == (0, "gh__search")
+    finally:
+        router.close_senders()
+
+
+def test_a_reserved_name_contests_a_sibling_without_any_cross_peer_collision():
+    # Same shape, reached with ONE peer: `terse.retrieve` is reserved, so gh's copy is
+    # qualified to `gh__terse.retrieve` — which must then contest gh's own tool of that
+    # literal name. No second peer is needed to produce the duplicate.
+    from terse.lossy import RETRIEVE_TOOL
+    _, _, _, out, router = _two_peer_router()
+    try:
+        merged = _list_tools(router, out,
+                             [[{"name": RETRIEVE_TOOL}, {"name": f"a__{RETRIEVE_TOOL}"}], []])
+        names = [t["name"] for t in merged["result"]["tools"]]
+        assert len(set(names)) == len(names), names
+        assert names == [f"a__{RETRIEVE_TOOL}", f"a__a__{RETRIEVE_TOOL}"]
+    finally:
+        router.close_senders()
+
+
 def test_a_peer_does_not_qualify_a_tool_against_its_own_sibling_name():
     # `gh` exporting both `search` and a tool literally named `gh__search` has NO
     # cross-peer collision. Counting a peer's qualified form against its own bare names

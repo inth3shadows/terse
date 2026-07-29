@@ -117,8 +117,14 @@ uv run terse proxy --config peers.json
 Each peer's tools are advertised **under their own names**. A name is qualified with the
 peer's `name` (`gh__search`, `kb__search`) only when two or more peers export the same
 one, and terse strips that prefix before forwarding. A tool whose name no other peer
-claims keeps that name, so those entries in an existing client allowlist keep working
-untouched.
+claims keeps that name.
+
+Note this changes the TOOL segment only. A Claude Code permission entry is
+`mcp__<server>__<tool>`, and consolidating N servers behind one proxy rewrites the
+*server* segment either way — `mcp__kb__kb.read.search` becomes
+`mcp__terse__kb.read.search`. Collision-only naming removes one of the two mismatching
+segments, not both, so plan on revisiting the allowlist when you adopt `--config`; it is
+a smaller edit than before, not no edit.
 
 **Check your fleet before assuming it is a drop-in.** Collisions are not rare in
 practice: a real 9-server fleet measured 6 collisions across 49 distinct tool names —

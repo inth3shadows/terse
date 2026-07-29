@@ -1017,40 +1017,53 @@ class Router:
         duplicate when the peers happened to be ordered one way and not the other.
         Reserving all of them is order-independent and needs no fixpoint.
 
-        Returns `(renamed_entries, {exposed: (peer_idx, bare)})`. A residual collision now
-        requires a peer to list the SAME name twice, which qualification cannot
-        disambiguate; it is not silently dropped — last writer wins in the table, matching
+        Returns `(renamed_entries, {exposed: (peer_idx, bare)})`. At the fixpoint no two
+        exposed names can be equal unless a peer listed the SAME name twice — a
+        bare-vs-bare clash qualifies both, a bare-vs-qualified clash contests the bare one
+        into qualifying, and two equal qualified forms require equal (peer, name) pairs,
+        which peer-name uniqueness (`load_multi_config`) reduces to that one case.
+        Qualification cannot disambiguate it; it is not silently dropped — last writer wins in the table, matching
         the merged list's own order, and the warning is UNCONDITIONAL, not --debug-gated,
         for the same reason the peer-0 fallback notice is: a silently unaddressable tool
         is exactly the kind of gap this module promises not to hide.
         """
-        counts: dict[str, int] = dict.fromkeys(reserved, 1)
-        # Which PEERS would produce each qualified form. Tracked per-peer, not as a plain
-        # tally, so a peer's qualified form is not counted against that same peer's own
-        # bare names: `gh` exporting both `search` and a tool literally named `gh__search`
-        # has no cross-peer collision, and renaming its second tool to `gh__gh__search`
-        # would break the allowlist this feature exists to preserve — and contradict the
-        # documented rule that a name is qualified only when two or more PEERS export it.
-        qual_by: dict[str, set[int]] = {}
-        for idx, bare in ((i, it["name"]) for i, it in owned):
-            counts[bare] = counts.get(bare, 0) + 1
-            qual_by.setdefault(f"{self.peers[idx].name}{PREFIX_SEP}{bare}", set()).add(idx)
+        # A name is CONTESTED when something other than this entry would put that exact
+        # string on the wire: another entry sharing the bare name, a `reserved` name, or
+        # another entry whose QUALIFIED form lands on it. The third clause is recursive —
+        # qualifying an entry changes what it emits, which can contest a further name —
+        # so this is a monotone fixpoint, not a count. Three rounds of review each broke a
+        # one-pass approximation of it: a forward-only reservation missed depth-2 chains,
+        # reserving every qualified form renamed a peer's own sibling, and excluding the
+        # entry's own peer let a genuinely-emitted qualified form shadow that same peer's
+        # verbatim tool. The fixpoint has none of those edges because it asks the only
+        # question that matters — is this exact string emitted by anyone else?
+        #
+        # Terminates: each round only ever ADDS to `qualified`, bounded by len(owned).
+        bares = [it["name"] for _, it in owned]
+        quals = [f"{self.peers[idx].name}{PREFIX_SEP}{it['name']}" for idx, it in owned]
+        base = dict.fromkeys(reserved, 1)
+        for b in bares:
+            base[b] = base.get(b, 0) + 1
+        qualified = [base[b] > 1 for b in bares]
+        while True:
+            emitted = {q for q, isq in zip(quals, qualified, strict=True) if isq}
+            newly = [i for i, b in enumerate(bares) if not qualified[i] and b in emitted]
+            if not newly:
+                break
+            for i in newly:
+                qualified[i] = True
+
         entries: list[dict] = []
         route: dict[str, tuple[int, str]] = {}
-        for idx, it in owned:
-            bare = it["name"]
-            qualified = f"{self.peers[idx].name}{PREFIX_SEP}{bare}"
-            # Claimants of this bare name: entries sharing it (plus any `reserved`), and
-            # any OTHER peer whose qualified form would land on it.
-            claimed = counts[bare] + len(qual_by.get(bare, frozenset()) - {idx})
-            exposed = bare if claimed == 1 else qualified
+        for i, (idx, it) in enumerate(owned):
+            exposed = quals[i] if qualified[i] else bares[i]
             if exposed in route:
                 sys.stderr.write(
                     f"[terse-multiproxy] name collision on {exposed!r}: peer "
                     f"{self.peers[route[exposed][0]].name!r} shadowed by "
                     f"{self.peers[idx].name!r} — the shadowed tool is unaddressable\n")
             entries.append({**it, "name": exposed})
-            route[exposed] = (idx, bare)
+            route[exposed] = (idx, bares[i])
         return entries, route
 
     def _merge_tools_list(self, pb: _PendingBroadcast) -> dict:
