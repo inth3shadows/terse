@@ -153,6 +153,17 @@ install invocation. It honors `$CLAUDE_CONFIG` if your config isn't at
 `~/.claude.json`. Start with one high-win, read-only server (e.g. `runecho`) and
 confirm it works before wrapping more.
 
+If the capture dir you wire already holds payloads, the install ends by pointing at the
+command that turns them back into policy:
+
+```
+→ corpus at /home/you/corpus already holds 1,674 payload(s) — `terse policy autotune`
+  re-tunes /home/you/.config/terse/policy.json against them.
+```
+
+On a *first* install it stays quiet: the corpus is empty by definition, and per-tool shape
+decisions need payloads, not a `tools/list`.
+
 Hand-edits to a wrapped entry (say, an `env.PATH` pin) survive re-installs: the
 re-wrap rebuilds `command`/`args` from the stashed original but keeps every other
 live key, and reports what it carried (`kept hand-edited key(s) …`). One edge
@@ -328,6 +339,62 @@ A second note reports how many payloads predate `result_id` and therefore had th
 *results* reconstructed from capture timing rather than read. Neither field can be recovered
 after the fact, which is why both are reported rather than quietly assumed away — see
 [TECHNICAL.md](TECHNICAL.md) for what the timing heuristic can get wrong.
+
+### Re-tune a deployed policy (`policy autotune`)
+
+`policy generate` authors from nothing and **overwrites**. Run it on a policy that is
+already governing the wire and you silently lose every decision the corpus cannot see.
+`policy autotune` is the re-run: it *merges*, prints a diff, and writes nothing without
+`--apply`.
+
+```bash
+# the common case — --policy and --corpus resolve from what install-mcp wired:
+terse policy autotune
+
+# ...then, once you have read the diff:
+terse policy autotune --apply
+```
+
+Who owns what, on a re-run:
+
+| key | decided by | on autotune |
+|---|---|---|
+| `tiers` | the corpus | proposed, **including removals** |
+| `_suggested_fields` | the corpus | regenerated (stays inactive) |
+| `capture`, `structured`, `never_lossy_servers` | you | preserved verbatim |
+| active `fields` | you | preserved verbatim |
+| rules for tools absent from the corpus | you | preserved, in position |
+
+A corpus cannot see that a tool returns a plaintext credential, or that your client
+validates `outputSchema`. Those three keys are fail-safe everywhere else in terse, and
+regeneration is not allowed to be the one path that reverses them.
+
+Path resolution is fail-safe too: defaults are used only when the wrapped servers agree on
+exactly one policy (and one capture dir). A disagreement lists the paths and refuses rather
+than guessing which policy governs the wire.
+
+#### It reads the savings ledger too
+
+Two things the corpus structurally cannot show, so autotune cross-checks `terse stats`'
+ledger (`--ledger FILE`; defaults to the one `terse stats` reads, and is skipped in silence
+if you have none):
+
+```
+  not tunable from this corpus — live in the ledger, no captured payloads (~/.local/state/terse/stats.jsonl):
+  ! kb.read.search                 122,431 tok at   0.0% saved over 84 block(s)
+    (capture is off for these, or they were never captured — autotune cannot tune what it cannot see)
+```
+
+* **Coverage.** A `"capture": false` tool appears *only* in the ledger. Without this
+  section, a diff covering everything terse could see reads as "the install is tuned now"
+  while a fifth of your tokens were never an input at all.
+* **Frequency.** The corpus is idempotent by sha — it holds each payload's first sighting,
+  not every call — so a tool called twice and one called 800 times weigh the same in it. A
+  proposed tier *removal* now prints the live block count beside the rule, because giving
+  back measured savings on a hot tool is a different decision from doing it on a cold one.
+
+Fix a blind spot by capturing the tool, not by pointing autotune at something else: if
+`capture: false` is there on purpose, the blind spot is the correct outcome.
 
 ### Reaching a long-text tool (`$text.code_blocks`)
 
