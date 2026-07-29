@@ -9,6 +9,97 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Added
+- **`install-mcp --multiproxy` folds a fleet into ONE proxy (#179).** This is the step
+  that banks #168's measured win: six standalone proxies cost +23.1% raw input against an
+  unwrapped control, the same six behind one router cost +0.0%, because each standalone
+  proxy injects its own primer that the client re-reads every turn — cost scales with
+  (servers x turns) while savings scale with (compressible calls). The named entries are
+  replaced by a single `terse proxy --config` entry (`--router-name`, default `terse`)
+  plus a peers file next to the config. **The stash stays 1:1**, so `uninstall-mcp --all`
+  restores every original byte-for-byte with no special case, and uninstalling ONE peer
+  detaches it from the peers file while the router keeps serving the rest (the router
+  entry is removed once its last peer leaves). An already-wrapped entry is reduced to the
+  downstream it wraps before being folded in, so a proxy is never nested inside the
+  router even when its stash lives under another scope. `--print` reports the permission
+  rewrite: consolidating N servers changes the `mcp__<server>__` segment for every
+  wrapped tool, and the tool segment changes too for any name two or more peers export —
+  the latter needs live tool names, so it is flagged rather than guessed. It also
+  **warns that the switch WIDENS permissions**: N per-server grants collapse onto one
+  `mcp__terse` segment, so a whole-server grant now reaches every peer. Re-running is
+  **additive** (folding one more server in keeps the fleet instead of evicting it), the
+  peers file is namespaced per scope (a local-scope fleet can't overwrite the user-scope
+  one), and every runtime flag a single-server wrap takes — `--capture-dir`, `--diff` /
+  `--no-diff`, `--no-stats`, `--no-join-blocks`, `--never-lossy` — applies to the router
+  too instead of being silently dropped.
+- **A multiproxy peer's `env`/`cwd` are honored at LAUNCH (#179).** The peers file
+  recorded them and the router ignored them: `DownstreamSpec` had no such fields and
+  `StdioTransport` called `Popen` without `env=`/`cwd=`, so a folded server lost a pinned
+  `PATH` (codegraph's node@22) and any `env`-borne credential started unauthenticated.
+  `env` is MERGED over the router's own environment, never a replacement — a bare mapping
+  would launch the child with no `PATH` or `HOME` at all. Setting either on a `url` peer
+  is now a config error rather than a silent no-op.
+- **A peer's `env` values are coerced to strings on the way into the peers file (#179).**
+  An MCP client's own spawn coerces, so `{"PORT": 3000}` is a working config entry and a
+  plain wrap preserves it — but the router parses the peers file, and one non-string value
+  there took down the WHOLE fleet at launch, on an install that had reported success.
+  `load_multi_config` coerces scalars too; containers and null stay hard errors, and an
+  empty `cwd` is rejected rather than surfacing as `[Errno 2] ... : ''`.
+- **Config-destroying edges around the router entry closed (#179).** The router entry is
+  written over rather than stashed, so `--multiproxy` now REFUSES a router name already
+  held by an unrelated live server (`terse` is the default name — this needed no unusual
+  flag to destroy a third party's entry with nothing to restore from). A `--router-name`
+  change now MOVES the router instead of leaving a second one on the same peers file —
+  two such entries launch every peer twice, and make the config uncleanable by terse,
+  since ambiguous detection returns None. Folding a wrapped-but-unstashed entry stashes
+  the unnested DOWNSTREAM, not the wrapper, so `uninstall` no longer reports
+  `restored: True` while writing a proxy line back. Re-running plain `install-mcp` on an
+  already-folded server — or on the router itself — is refused instead of running that
+  downstream twice or nesting a proxy inside a proxy. A router name belonging to a FOLDED
+  peer is refused too (a folded peer has no live entry, so a liveness check could not see
+  it, and a later `uninstall` wrote that peer's original over the router, stranding the
+  rest of the fleet while reporting success), as is folding the router into its own peers
+  file (a router that spawns a router, unbounded, at the next client restart). A rename
+  carries the router's hand-edited keys — an `env.PATH` pin is the base environment every
+  peer inherits. A peer leaves the fleet only when its live entry is BACK, never because
+  its stash entry drifted: the peers file is then the last record of how to launch it.
+  Runtime-flag inheritance is all-or-nothing, so `--no-stats`/`--capture-dir` (which have
+  no inverse flag) can still be cleared, and the result reports the flags actually baked
+  in rather than only those named on the command line.
+- **`--multiproxy` writes recovery data before the destructive write (#179).** The three
+  files (stash, peers, client config) are each written atomically but not atomically
+  together, and folding DELETES a peer's live entry rather than rewriting it the way a
+  plain wrap does. Config-first left a window — one SIGKILL, OOM, or full disk wide — where
+  the live entry was already gone while the stash still described the previous state: the
+  original existed nowhere terse looks, so status reported nothing missing and
+  `uninstall --all` never mentioned the server. Only the timestamped config backup held it,
+  which no recovery path reads. The config is now written last. Also: a duplicated argument
+  (`install-mcp kb kb --multiproxy`) no longer folds the same peer twice, and folding a
+  terse router that fronts a DIFFERENT peers file is refused rather than nesting a proxy
+  inside a proxy (a router has `--config` and no `--`, so `_unnest` passed it through
+  verbatim).
+- **Every bad multiproxy state is now recoverable and reported (#179).** `uninstall-mcp
+  --all` restores a folded peer whose stash entry drifted away, rebuilding it from the
+  peers file (reported as a PARTIAL restore — the peers file records launch fields only);
+  it removes a stranded router whenever no peers remain, including when the peers file was
+  simply deleted, which no longer reads as "no multiproxy involved". A corrupt peers file
+  is reported with its path instead of tracebacking out of `mcp-status` (whose contract
+  says it never raises) and blocking every other command with a message naming no file.
+  Two entries fronting one peers file are NAMED rather than guessed through — the peers
+  file is left in place, status says `router-ambiguous`, and the old `--router-name` advice
+  (which added a third router and poisoned detection permanently) is gone. The peers
+  filename now always carries a hash tail: `local:/home/e/a/b` and `local:/home/e/a-b`
+  slugified identically, so two repos shared one fleet and one repo's router launched the
+  other's servers. Folding a server whose `env` is malformed fails with a message naming
+  it instead of an `AttributeError`, and a peers record that cannot launch anything is no
+  longer "restored" as `{"url": null}`.
+- **`mcp-status` understands a folded fleet (#179).** A healthy multiproxy install used
+  to read as drift in both directions — every peer as `orphaned-stash`, the router as
+  `wrapped-unstashed` ("original command unrecoverable"). New states: `router` (with
+  `wraps=` listing its fleet) and `folded` (naming the router it sits behind).
+  `uninstall-mcp` also no longer mistakes an unrelated server whose own CLI takes a
+  `--config` flag for the router.
+
 ### Changed
 - **BREAKING (multiproxy): tool and prompt names are now qualified only on a genuine
   cross-peer collision (#168).** `terse proxy --config peers.json` used to rename *every*

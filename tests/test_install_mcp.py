@@ -1032,3 +1032,697 @@ def test_uninstall_all_still_restores_a_properly_stashed_entry(tmp_path):
     out = im.do_uninstall(None, all_=True, cfg=cfg)
     assert out["changes"] == [{"server": "runecho", "restored": True}]
     assert json.loads(cfg.read_text())["mcpServers"]["runecho"] == original
+
+
+# --------------------------------------------------------------- #179 --multiproxy
+
+def _multi_cfg(tmp_path):
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "kb": {"type": "stdio", "command": "kb-mcp", "args": ["--x"], "env": {"K": "1"}},
+        "gh": {"url": "https://gh.example/mcp", "headers": {"Authorization": "Bearer t"}},
+        "other": {"command": "other-mcp"},
+    }}), encoding="utf-8")
+    pol = tmp_path / "p.json"
+    pol.write_text(json.dumps({"version": 1, "defaults": {"tiers": ["minify"]}}), encoding="utf-8")
+    return cfg, pol
+
+
+def test_multiproxy_folds_servers_into_one_router_entry_and_a_peers_file(tmp_path):
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    res = do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    live = json.loads(cfg.read_text())["mcpServers"]
+    # the two peers are GONE from the client's view; one router entry fronts them
+    assert set(live) == {"other", "terse"}
+    assert "--config" in live["terse"]["args"]
+    peers = json.loads(Path(res["peers_file"]).read_text())["downstreams"]
+    assert [d["name"] for d in peers] == ["kb", "gh"]
+    # stdio peer keeps command+args+env; http peer keeps url+headers
+    assert peers[0]["command"] == ["kb-mcp", "--x"] and peers[0]["env"] == {"K": "1"}
+    assert peers[1]["url"] == "https://gh.example/mcp"
+    assert peers[1]["headers"] == {"Authorization": "Bearer t"}
+
+
+def test_multiproxy_uninstall_all_restores_every_original_byte_for_byte(tmp_path):
+    # The load-bearing case: the stash is 1:1 but a multiproxy install collapses N live
+    # entries into 1, so `uninstall-mcp --all` has to restore N from a config that shows
+    # only the router. Tested BEFORE the happy path, per the issue.
+    from terse.install_mcp import do_install, do_uninstall
+    cfg, pol = _multi_cfg(tmp_path)
+    original = json.loads(cfg.read_text())
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    res = do_uninstall(None, all_=True, cfg=cfg)
+    assert json.loads(cfg.read_text()) == original          # byte-for-byte, router gone
+    assert {c["server"] for c in res["changes"] if c["restored"]} == {"kb", "gh"}
+    assert not Path(res["peers_file"]).exists()     # no zero-peer leftover
+
+
+def test_uninstalling_one_peer_detaches_it_and_leaves_the_router_serving_the_rest(tmp_path):
+    from terse.install_mcp import do_install, do_uninstall
+    cfg, pol = _multi_cfg(tmp_path)
+    res = do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    out = do_uninstall(["kb"], cfg=cfg)
+    live = json.loads(cfg.read_text())["mcpServers"]
+    assert "kb" in live and "terse" in live                  # kb back, router still there
+    assert out["changes"][0]["detached_from"] == "terse"
+    peers = json.loads(Path(res["peers_file"]).read_text())["downstreams"]
+    assert [d["name"] for d in peers] == ["gh"]              # pruned from the peers file
+
+
+def test_multiproxy_print_is_a_dry_run_and_reports_the_allowlist_rewrite(tmp_path):
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    before = cfg.read_text()
+    res = do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True, dry_run=True)
+    assert cfg.read_text() == before                          # writes nothing
+    assert not Path(res["peers_file"]).exists()
+    # both real permission forms, and the widening called out — not a `mcp__kb__*` glob,
+    # which is not a shape a Claude Code settings file ever holds
+    assert res["allowlist"] == [
+        {"server": "kb", "from": "mcp__kb", "to": "mcp__terse",
+         "from_tool": "mcp__kb__<tool>", "to_tool": "mcp__terse__<tool>", "widens": True},
+        {"server": "gh", "from": "mcp__gh", "to": "mcp__terse",
+         "from_tool": "mcp__gh__<tool>", "to_tool": "mcp__terse__<tool>", "widens": True}]
+
+
+def test_multiproxy_is_idempotent_and_never_nests_a_proxy(tmp_path):
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    res = do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    peers = json.loads(Path(res["peers_file"]).read_text())["downstreams"]
+    # re-described from the STASHED original, so the peer command is kb-mcp, not terse
+    assert peers[0]["command"] == ["kb-mcp", "--x"]
+
+
+def test_multiproxy_refuses_a_router_name_that_collides_with_a_peer(tmp_path):
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    with pytest.raises(ValueError, match="also a server being wrapped"):
+        do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True, router="kb")
+
+
+def test_multiproxy_never_folds_a_terse_wrapped_entry_in_verbatim(tmp_path):
+    # A server can be wrapped with its stash under a DIFFERENT scope, or missing (#172).
+    # Folding that entry in as a peer would nest `terse proxy ... -- kb-mcp` inside the
+    # router — the primer charged twice, defeating the point of consolidating.
+    from terse.install_mcp import do_install
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "kb": {"type": "stdio", "command": "/usr/bin/terse", "env": {"K": "1"},
+               "args": ["proxy", "--policy", "/old.json", "--server-name", "kb",
+                        "--", "kb-mcp", "--flag"]},
+        "gh": {"command": "/usr/bin/terse",
+               "args": ["proxy", "--policy", "/old.json", "--header",
+                        "Authorization=Bearer t", "--", "https://gh.example/mcp"]},
+    }}), encoding="utf-8")
+    pol = tmp_path / "p.json"
+    pol.write_text(json.dumps({"version": 1, "defaults": {"tiers": ["minify"]}}), encoding="utf-8")
+    res = do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    peers = json.loads(Path(res["peers_file"]).read_text())["downstreams"]
+    assert peers[0]["command"] == ["kb-mcp", "--flag"]     # the DOWNSTREAM, not terse
+    assert peers[0]["env"] == {"K": "1"}                   # non-terse keys survive
+    assert peers[1]["url"] == "https://gh.example/mcp"
+    assert peers[1]["headers"] == {"Authorization": "Bearer t"}
+
+
+def test_multiproxy_adds_to_the_fleet_instead_of_replacing_it(tmp_path):
+    """The second invocation is almost always "fold one more server in". Overwriting the
+    peers file from the argument list made that evict the earlier peers — which stay
+    stashed, so their live entries are gone too: the client loses them entirely."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    res = do_install(["other"], str(pol), cfg=cfg, multiproxy=True)
+    peers = json.loads(Path(res["peers_file"]).read_text())["downstreams"]
+    assert [d["name"] for d in peers] == ["kb", "gh", "other"]
+    assert res["fleet"] == ["kb", "gh", "other"]
+    # and the allowlist rewrite covers the whole fleet, not just this run's argument
+    assert [a["server"] for a in res["allowlist"]] == ["kb", "gh", "other"]
+    assert set(json.loads(cfg.read_text())["mcpServers"]) == {"terse"}
+
+
+def test_multiproxy_drops_a_stale_peer_that_was_already_uninstalled(tmp_path):
+    """A peers entry whose server is LIVE again is stale bookkeeping — re-running must not
+    resurrect it behind the router. `do_uninstall` also prunes the peers file, so the
+    peers file is hand-seeded here to exercise the retention filter itself rather than
+    a state `_prune_peer` already cleaned up."""
+    from terse.install_mcp import do_install, do_uninstall, peers_path
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    stale = json.loads(peers_path(cfg).read_text())
+    do_uninstall(["kb"], cfg=cfg)
+    peers_path(cfg).write_text(json.dumps(stale), encoding="utf-8")  # kb back in the file
+    res = do_install(["other"], str(pol), cfg=cfg, multiproxy=True)
+    assert res["fleet"] == ["gh", "other"]
+    assert "kb" in json.loads(cfg.read_text())["mcpServers"]   # still standalone
+
+
+def test_multiproxy_keeps_a_peer_whose_stash_entry_drifted_away(tmp_path):
+    """Staleness is LIVENESS, not stash membership. A peer whose stash entry went missing
+    (#172) is the peer that needs the peers file MOST — it is the last record of how to
+    launch it. Evicting it deleted the server from the stash, the live config, the peers
+    file and status at once, from a run that never named it."""
+    from terse.install_mcp import do_install, peers_path, stash_path
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    full = json.loads(stash_path(cfg).read_text())
+    del full["user"]["kb"]                                     # stash drift
+    stash_path(cfg).write_text(json.dumps(full), encoding="utf-8")
+    res = do_install(["other"], str(pol), cfg=cfg, multiproxy=True)
+    assert res["fleet"] == ["kb", "gh", "other"]
+    kb = [d for d in json.loads(peers_path(cfg).read_text())["downstreams"]
+          if d["name"] == "kb"][0]
+    assert kb["command"] == ["kb-mcp", "--x"]                  # still launchable
+
+
+def test_multiproxy_bakes_the_runtime_flags_onto_the_router_entry(tmp_path):
+    """--capture-dir/--no-stats/--no-diff/--no-join-blocks are accepted by `terse proxy`
+    with --config too, so the switch to a router must not silently drop them."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    res = do_install(["kb"], str(pol), cfg=cfg, multiproxy=True,
+                     capture_dir=str(tmp_path / "corpus"), no_stats=True, diff=False,
+                     no_join_blocks=True)
+    args = json.loads(cfg.read_text())["mcpServers"]["terse"]["args"]
+    assert "--capture-dir" in args and args[args.index("--capture-dir") + 1] == \
+        str((tmp_path / "corpus").resolve())
+    assert "--no-stats" in args and "--no-diff" in args and "--no-join-blocks" in args
+    assert args.index("--config") > args.index("proxy")
+    assert res["capture_dir"] == str((tmp_path / "corpus").resolve())
+    assert res["no_stats"] is True and res["diff"] is False
+
+
+def test_multiproxy_never_lossy_still_reaches_the_policy_file(tmp_path):
+    """`--never-lossy` bakes server names into the policy's never_lossy_servers. The
+    runtime matches on --server-name, which multiproxy sets per PEER, so a folded
+    credential server needs exactly the same protection it had standalone."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    res = do_install(["kb"], str(pol), cfg=cfg, multiproxy=True, never_lossy=True)
+    assert res["never_lossy_added"] == ["kb"]
+    assert json.loads(pol.read_text())["never_lossy_servers"] == ["kb"]
+
+
+def test_multiproxy_peers_file_is_scope_namespaced(tmp_path):
+    """User and local scope share one ~/.claude.json. One peers file beside it would let
+    a local-scope fleet silently overwrite the user-scope one — the collision
+    Target.stash_prefix already prevents for the stash."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    config = json.loads(cfg.read_text())
+    config["projects"] = {"/repo": {"mcpServers": {"loc": {"command": "loc-mcp"}}}}
+    cfg.write_text(json.dumps(config), encoding="utf-8")
+    user = do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    local = do_install(["loc"], str(pol), cfg=cfg, multiproxy=True, scope="local",
+                       repo_path="/repo")
+    assert user["peers_file"] != local["peers_file"]
+    assert [d["name"] for d in json.loads(Path(user["peers_file"]).read_text())
+            ["downstreams"]] == ["kb"]
+    assert [d["name"] for d in json.loads(Path(local["peers_file"]).read_text())
+            ["downstreams"]] == ["loc"]
+
+
+def test_uninstall_does_not_mistake_an_unrelated_config_taking_server_for_a_router(tmp_path):
+    """`"--config" in args` alone matched any server whose own CLI takes a --config flag.
+    Detaching the router's last peer deletes the router entry — so a false positive
+    deletes a third party's server."""
+    from terse.install_mcp import do_install, do_uninstall
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    live = json.loads(cfg.read_text())
+    # Pointed at the REAL peers file, so only the launcher check can reject it — a decoy
+    # with some other --config value is rejected by the path check alone and would leave
+    # the launcher guard untested.
+    peers_file = live["mcpServers"]["terse"]["args"][-1]
+    live["mcpServers"]["decoy"] = {"command": "some-mcp", "args": ["--config", peers_file]}
+    cfg.write_text(json.dumps(live), encoding="utf-8")
+    do_uninstall(["kb"], cfg=cfg)
+    after = json.loads(cfg.read_text())["mcpServers"]
+    assert "decoy" in after            # untouched
+    assert "terse" not in after        # the real router went, its last peer having left
+
+
+def test_status_reports_a_healthy_fleet_as_router_plus_folded_peers(tmp_path):
+    """Both halves of a multiproxy install read as drift to the stash/live classifier:
+    a folded peer is stashed-but-absent (orphaned-stash), the router is terse-launched
+    with no stash (wrapped-unstashed, "original unrecoverable"). Both are healthy."""
+    from terse.install_mcp import do_install, scan_scopes
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    rows = {r["server"]: r for r in scan_scopes(cfg=cfg) if r["scope"] == "user"}
+    assert rows["terse"]["state"] == "router"
+    assert rows["terse"]["wraps"] == "gh, kb"
+    assert rows["terse"]["policy"] == str(pol.resolve())
+    assert rows["kb"]["state"] == "folded" and rows["kb"]["router"] == "terse"
+    assert rows["gh"]["state"] == "folded"
+    assert rows["other"]["state"] == "unwrapped"
+
+
+def test_multiproxy_refuses_a_router_name_held_by_an_unrelated_live_server(tmp_path):
+    """The router entry is written over, not stashed — so a same-named live entry would be
+    destroyed with nothing to restore from. `terse` is the DEFAULT name."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    live = json.loads(cfg.read_text())
+    live["mcpServers"]["terse"] = {"command": "some-other-mcp", "args": ["--serve"]}
+    cfg.write_text(json.dumps(live), encoding="utf-8")
+    with pytest.raises(ValueError, match="Pick another name"):
+        do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    assert json.loads(cfg.read_text())["mcpServers"]["terse"]["command"] == "some-other-mcp"
+
+
+def test_multiproxy_rename_moves_the_router_instead_of_leaving_two(tmp_path):
+    """Two entries running the same `proxy --config` launch every peer twice and export
+    every tool twice — and `_detect_router` then sees two, returns None, and neither
+    status nor `uninstall-mcp --all` can clean the config up at all."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    do_install(["gh"], str(pol), cfg=cfg, multiproxy=True, router="router2")
+    live = json.loads(cfg.read_text())["mcpServers"]
+    assert "terse" not in live and "router2" in live
+    assert set(live) == {"other", "router2"}
+
+
+def test_multiproxy_additive_run_keeps_the_routers_runtime_flags(tmp_path):
+    """An additive run names the new server, not the flags the fleet was installed with.
+    Rebuilding the args from this invocation alone cleared --capture-dir/--no-stats for
+    every peer at once."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True,
+               capture_dir=str(tmp_path / "corpus"), no_stats=True, diff=False)
+    do_install(["gh"], str(pol), cfg=cfg, multiproxy=True)
+    args = json.loads(cfg.read_text())["mcpServers"]["terse"]["args"]
+    assert "--capture-dir" in args and "--no-stats" in args and "--no-diff" in args
+
+
+def test_multiproxy_stashes_the_downstream_not_the_wrapper_it_unnested(tmp_path):
+    """Folding a wrapped-but-unstashed entry used to stash the PROXY as its original, so
+    `uninstall` reported restored:True while writing the wrapper back into the config."""
+    from terse.install_mcp import do_install, do_uninstall
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "kb": {"command": "/usr/bin/terse", "env": {"K": "1"},
+               "args": ["proxy", "--policy", "/old.json", "--server-name", "kb",
+                        "--", "kb-mcp", "--flag"]}}}), encoding="utf-8")
+    pol = tmp_path / "p.json"
+    pol.write_text(json.dumps({"version": 1, "defaults": {"tiers": ["minify"]}}),
+                   encoding="utf-8")
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    do_uninstall(["kb"], cfg=cfg)
+    restored = json.loads(cfg.read_text())["mcpServers"]["kb"]
+    assert restored["command"] == "kb-mcp" and restored["args"] == ["--flag"]
+    assert restored["env"] == {"K": "1"}
+
+
+def test_uninstall_all_does_not_report_the_router_as_unrecoverable(tmp_path):
+    """The router is terse-launched with no stash, so `--all` filed it under #172's
+    "edit the config by hand" — on the documented undo path, about an entry `unwrap`
+    deletes for the operator one line later."""
+    from terse.install_mcp import do_install, do_uninstall
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    res = do_uninstall(None, all_=True, cfg=cfg)
+    assert [c["server"] for c in res["changes"]] == ["gh", "kb"]   # no `terse` row
+    assert all(c["restored"] for c in res["changes"])
+
+
+def test_plain_install_refuses_a_server_already_folded_behind_a_router(tmp_path):
+    """Without the guard it comes back as a standalone wrapped entry WHILE the router
+    keeps launching it: the same downstream twice, every tool exported twice."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    with pytest.raises(ValueError, match="already folded"):
+        do_install(["kb"], str(pol), cfg=cfg)
+    assert set(json.loads(cfg.read_text())["mcpServers"]) == {"other", "terse"}
+
+
+def test_allowlist_does_not_cry_widening_for_a_single_peer_router(tmp_path):
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    one = do_install(["kb"], str(pol), cfg=cfg, multiproxy=True, dry_run=True)
+    assert [m["widens"] for m in one["allowlist"]] == [False]
+    two = do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True, dry_run=True)
+    assert [m["widens"] for m in two["allowlist"]] == [True, True]
+
+
+def test_multiproxy_refuses_a_router_name_that_belongs_to_a_folded_peer(tmp_path):
+    """A folded peer has no live entry by construction, so a `router in live` check could
+    not see it. Naming the router after one made a later `unwrap` write that peer's
+    original OVER the router entry — stranding every other peer (stashed, no live entry,
+    no router) while reporting success."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    with pytest.raises(ValueError, match="Pick another name"):
+        do_install(["other"], str(pol), cfg=cfg, multiproxy=True, router="kb")
+    live = json.loads(cfg.read_text())["mcpServers"]
+    assert "terse" in live and set(live) == {"other", "terse"}
+
+
+def test_multiproxy_refuses_to_fold_the_router_into_its_own_peers_file(tmp_path):
+    """`terse proxy --config <this very file>` as a PEER spawns a router that spawns a
+    router, unbounded, at the next client restart. `_unnest` can't catch it — a router
+    entry has no `--`."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    with pytest.raises(ValueError, match="cannot also be one of its own peers"):
+        do_install(["terse"], str(pol), cfg=cfg, multiproxy=True, router="gw")
+
+
+def test_multiproxy_rename_carries_the_routers_hand_edited_keys(tmp_path):
+    """The router's `env` is the base environment every peer inherits. The rename path
+    looked the base entry up under the NEW name, so it silently dropped a PATH pin — the
+    same drift loss `wrap`'s guard exists to prevent."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    live = json.loads(cfg.read_text())
+    live["mcpServers"]["terse"]["env"] = {"PATH": "/opt/node22/bin:/usr/bin"}
+    cfg.write_text(json.dumps(live), encoding="utf-8")
+    do_install(["gh"], str(pol), cfg=cfg, multiproxy=True, router="gateway")
+    after = json.loads(cfg.read_text())["mcpServers"]
+    assert "terse" not in after
+    assert after["gateway"]["env"] == {"PATH": "/opt/node22/bin:/usr/bin"}
+
+
+def test_multiproxy_runtime_flags_can_be_cleared_by_a_run_that_names_others(tmp_path):
+    """Inheritance is all-or-nothing. `--no-stats`/`--capture-dir` have no inverse flag,
+    so a per-flag `or`-merge could only ever SET them: once a measurement run wired a
+    capture dir, every later install kept teeing raw payloads there with no way back
+    except hand-editing the config."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True,
+               capture_dir=str(tmp_path / "corpus"), no_stats=True)
+    res = do_install(["gh"], str(pol), cfg=cfg, multiproxy=True, diff=True)
+    args = json.loads(cfg.read_text())["mcpServers"]["terse"]["args"]
+    assert "--diff" in args
+    assert "--capture-dir" not in args and "--no-stats" not in args
+    assert res["capture_dir"] is None and res["no_stats"] is False
+
+
+def test_multiproxy_additive_run_reports_the_flags_it_actually_baked(tmp_path):
+    """An additive run that INHERITED --capture-dir used to report capture_dir=None, so
+    --print showed no capture line and cli's autotune follow-up hint never fired."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True,
+               capture_dir=str(tmp_path / "corpus"), no_stats=True)
+    res = do_install(["gh"], str(pol), cfg=cfg, multiproxy=True)
+    assert res["capture_dir"] == str((tmp_path / "corpus").resolve())
+    assert res["no_stats"] is True
+
+
+def test_plain_install_refuses_to_wrap_the_router_itself(tmp_path):
+    """`wrap` would nest `terse proxy ... -- terse proxy --config ...`, charging the
+    primer twice — the exact cost --multiproxy removes — and `_detect_router` still
+    matches it, so status would call the nested entry a healthy router."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    with pytest.raises(ValueError, match="nest a proxy inside a proxy"):
+        do_install(["terse"], str(pol), cfg=cfg)
+
+
+def test_multiproxy_coerces_a_numeric_env_value_the_client_would_have_accepted(tmp_path):
+    """A client's own spawn coerces, so `{"PORT": 3000}` is a working entry today and a
+    plain wrap preserves it. The router reads the peers file with load_multi_config —
+    a non-string value there kills the WHOLE fleet at launch, on an install that
+    reported success."""
+    from terse.install_mcp import do_install
+    from terse.multiproxy import load_multi_config
+    cfg, pol = _multi_cfg(tmp_path)
+    live = json.loads(cfg.read_text())
+    live["mcpServers"]["kb"]["env"] = {"PORT": 3000, "DEBUG": True}
+    cfg.write_text(json.dumps(live), encoding="utf-8")
+    res = do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    peers = json.loads(Path(res["peers_file"]).read_text())["downstreams"]
+    assert peers[0]["env"] == {"PORT": "3000", "DEBUG": "True"}
+    # and the router can actually load what the installer wrote
+    specs = load_multi_config(res["peers_file"])
+    assert specs[0].env == {"PORT": "3000", "DEBUG": "True"}
+
+
+# --------------------------------------- #179 round-4: recovery from every bad state
+
+def test_uninstall_all_restores_a_folded_peer_whose_stash_entry_vanished(tmp_path):
+    """A folded peer has no live entry by construction, so it can never be in `detected`;
+    with its stash entry gone it was in neither set — silently skipped by a run that
+    reported success, and absent from status too. The peers file still holds enough to
+    launch it, so it is restorable."""
+    from terse.install_mcp import do_install, do_uninstall, scan_scopes, stash_path
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    full = json.loads(stash_path(cfg).read_text())
+    del full["user"]["kb"]
+    stash_path(cfg).write_text(json.dumps(full), encoding="utf-8")
+    rows = {r["server"]: r for r in scan_scopes(cfg=cfg) if r["scope"] == "user"}
+    assert rows["kb"]["state"] == "folded-unstashed"        # visible at all
+    res = do_uninstall(None, all_=True, cfg=cfg)
+    kb_change = [c for c in res["changes"] if c["server"] == "kb"][0]
+    assert kb_change["restored"] is True and kb_change["partial"] is True
+    live = json.loads(cfg.read_text())["mcpServers"]
+    assert live["kb"] == {"command": "kb-mcp", "args": ["--x"], "env": {"K": "1"}}
+    assert "terse" not in live                              # router swept too
+
+
+def test_uninstall_all_removes_the_router_when_the_peers_file_was_deleted(tmp_path):
+    """The one bad state reachable with no JSON hand-edit at all. Router removal used to
+    be gated on a successful prune, so with peers_doc None every original was restored,
+    a clean uninstall reported, and an entry left running `terse proxy --config <missing>`
+    that exits 2 on every client start."""
+    from terse.install_mcp import do_install, do_uninstall, peers_path
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    peers_path(cfg).unlink()
+    res = do_uninstall(None, all_=True, cfg=cfg)
+    live = json.loads(cfg.read_text())["mcpServers"]
+    assert "terse" not in live and {"kb", "gh"} <= set(live)
+    assert [c for c in res["changes"] if c.get("router")][0]["server"] == "terse"
+    assert res["peers_file"] is not None       # not "no multiproxy involved"
+
+
+def test_uninstall_all_removes_the_router_when_downstreams_went_empty_or_malformed(tmp_path):
+    """`downstreams: []`, a non-list, or one nameless leftover all made `_prune_peer`
+    return False or never empty the list, so the router outlived its fleet. `_prune_peer`
+    and `wrap_multi` also disagreed about whether a nameless entry counts."""
+    from terse.install_mcp import do_install, do_uninstall, peers_path
+    for i, downs in enumerate(([], "nope", [{"policy": "/p.json"}])):
+        sub = tmp_path / f"case{i}"
+        sub.mkdir()
+        cfg, pol = _multi_cfg(sub)
+        do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+        peers_path(cfg).write_text(json.dumps({"downstreams": downs}), encoding="utf-8")
+        do_uninstall(None, all_=True, cfg=cfg)
+        live = json.loads(cfg.read_text())["mcpServers"]
+        assert "terse" not in live, downs
+        assert {"kb", "gh"} <= set(live), downs
+
+
+def test_a_corrupt_peers_file_never_tracebacks_and_always_names_the_path(tmp_path):
+    """It used to raise JSONDecodeError out of `mcp-status` (whose contract says it never
+    raises) and to block install-mcp, --multiproxy, uninstall-mcp and --all with a message
+    naming no file — every route out of the state closed, nothing saying which file."""
+    from terse.install_mcp import do_install, do_uninstall, peers_path, scan_scopes
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    peers_path(cfg).write_text("{ not json", encoding="utf-8")
+    rows = scan_scopes(cfg=cfg)                              # must not raise
+    assert any("unreadable peers file" in (r.get("peers_error") or "") for r in rows)
+    err = "unreadable peers file"
+    with pytest.raises(ValueError, match=err):
+        do_uninstall(None, all_=True, cfg=cfg)
+    with pytest.raises(ValueError, match=err):
+        do_uninstall(["kb"], cfg=cfg)
+    with pytest.raises(ValueError, match=err):
+        do_install(["other"], str(pol), cfg=cfg)
+    with pytest.raises(ValueError, match=err):
+        do_install(["other"], str(pol), cfg=cfg, multiproxy=True)
+
+
+def test_peers_path_does_not_collide_for_repo_paths_that_slugify_alike(tmp_path):
+    """The disambiguating hash was applied only past 40 chars, but the collision comes
+    from slugification: `/home/e/a/b` and `/home/e/a-b` both become `local-home-e-a-b`.
+    Two repos then shared one peers file — repo 1's router launching repo 2's servers."""
+    from terse.install_mcp import peers_path
+    cfg = tmp_path / "claude.json"
+    a = peers_path(cfg, "local:/home/e/a/b")
+    b = peers_path(cfg, "local:/home/e/a-b")
+    c = peers_path(cfg, "local:/home/e/my project")
+    d = peers_path(cfg, "local:/home/e/my-project")
+    assert len({a, b, c, d}) == 4
+    assert peers_path(cfg, "user") == peers_path(cfg, "user")     # still deterministic
+
+
+def test_two_routers_on_one_peers_file_are_named_not_guessed_at(tmp_path):
+    """Uninstall used to prune every peer, fail to remove either router (detection returns
+    None), then DELETE the peers file both entries depend on — and the error message's own
+    `--router-name` advice added a third router, poisoning detection permanently."""
+    from terse.install_mcp import do_install, do_uninstall, peers_path, scan_scopes
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    live = json.loads(cfg.read_text())
+    live["mcpServers"]["terse2"] = dict(live["mcpServers"]["terse"])
+    cfg.write_text(json.dumps(live), encoding="utf-8")
+    states = {r["server"]: r["state"] for r in scan_scopes(cfg=cfg) if r["scope"] == "user"}
+    assert states["terse"] == states["terse2"] == "router-ambiguous"
+    res = do_uninstall(None, all_=True, cfg=cfg)
+    assert sorted(res["router_ambiguous"]) == ["terse", "terse2"]
+    assert peers_path(cfg).exists()                    # NOT deleted out from under them
+    with pytest.raises(ValueError, match="all front"):
+        do_install(["other"], str(pol), cfg=cfg, multiproxy=True, router="terse3")
+
+
+def test_status_flags_a_peer_that_is_both_folded_and_live(tmp_path):
+    """`claude mcp add <name>` (or a hand-edit) can re-add an entry the operator folded.
+    The same downstream then runs twice, every tool exported twice at double cost, and
+    the old classification called it a plain `wrapped` entry."""
+    from terse.install_mcp import do_install, scan_scopes
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    live = json.loads(cfg.read_text())
+    live["mcpServers"]["kb"] = {"command": "kb-mcp", "args": ["--x"]}
+    cfg.write_text(json.dumps(live), encoding="utf-8")
+    rows = {r["server"]: r for r in scan_scopes(cfg=cfg) if r["scope"] == "user"}
+    assert rows["kb"]["state"] == "folded-and-live" and rows["kb"]["router"] == "terse"
+
+
+def test_detaching_the_last_peer_removes_the_router_despite_a_malformed_leftover(tmp_path):
+    """The single-peer path has no `--all` sweep, so `unwrap`'s own gate is what removes
+    the router. Gating it on "this server's prune fired AND downstreams is falsy" left the
+    router alive whenever one nameless entry kept the list non-empty — an entry running
+    `terse proxy --config <no usable peers>`, which exits 2 on every client start."""
+    from terse.install_mcp import do_install, do_uninstall, peers_path
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    doc = json.loads(peers_path(cfg).read_text())
+    doc["downstreams"].append({"policy": "/p.json"})          # nameless leftover
+    peers_path(cfg).write_text(json.dumps(doc), encoding="utf-8")
+    do_uninstall(["kb"], cfg=cfg)
+    live = json.loads(cfg.read_text())["mcpServers"]
+    assert "terse" not in live and "kb" in live
+    assert not peers_path(cfg).exists()
+
+
+def test_folding_a_server_with_a_malformed_env_fails_with_a_clear_message(tmp_path):
+    """A hand-edited `env` of the wrong shape used to reach `.items()` and crash with a
+    bare AttributeError naming no server and no file; a container value was `str()`-ed
+    into a garbage variable like `K="['x']"` that the peer read as meaningful."""
+    from terse.install_mcp import do_install
+    for i, (bad, msg) in enumerate((("string-env", "non-object 'env'"),
+                                    (["a"], "non-object 'env'"),
+                                    ({"K": ["x"]}, "are not scalars"),
+                                    ({"K": {"n": 1}}, "are not scalars"))):
+        sub = tmp_path / f"env{i}"
+        sub.mkdir()
+        cfg, pol = _multi_cfg(sub)
+        live = json.loads(cfg.read_text())
+        live["mcpServers"]["kb"]["env"] = bad
+        cfg.write_text(json.dumps(live), encoding="utf-8")
+        with pytest.raises(ValueError, match=msg):
+            do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+
+
+def test_a_peers_record_that_cannot_launch_anything_is_not_restored_as_a_broken_entry(
+        tmp_path):
+    """`peers_downstreams` only checks for a `name`, so a hand-edited record with no
+    `command`/`url` reached the rebuild path and wrote `{"url": null}` into the live
+    config — an entry no client can launch, reported as a successful restore."""
+    from terse.install_mcp import (
+        _entry_from_peer_spec,
+        do_install,
+        do_uninstall,
+        peers_path,
+        stash_path,
+    )
+    assert _entry_from_peer_spec({"name": "x"}) is None
+    assert _entry_from_peer_spec({"name": "x", "command": []}) is None
+    assert _entry_from_peer_spec({"name": "x", "url": None}) is None
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    peers_path(cfg).write_text(json.dumps(
+        {"downstreams": [{"name": "kb", "policy": str(pol)}]}), encoding="utf-8")
+    full = json.loads(stash_path(cfg).read_text())
+    del full["user"]["kb"]
+    stash_path(cfg).write_text(json.dumps(full), encoding="utf-8")
+    res = do_uninstall(None, all_=True, cfg=cfg)
+    kb = [c for c in res["changes"] if c["server"] == "kb"][0]
+    assert kb["restored"] is False
+    assert "kb" not in json.loads(cfg.read_text())["mcpServers"]
+
+
+# ------------------------------------------- #179 round-5: install-path review findings
+
+def test_multiproxy_writes_recovery_data_before_deleting_the_live_entries(tmp_path,
+                                                                         monkeypatch):
+    """`wrap_multi` DELETES a folded peer's live entry rather than rewriting it the way
+    `wrap` does, and the three writes are not atomic together. Config-first left a window
+    where the live entry was already gone while the stash still described the old state:
+    the original existed NOWHERE terse looks, so status reported nothing missing and
+    `uninstall --all` never mentioned the server. Recovery data must land first."""
+    from terse import install_mcp as im
+    cfg, pol = _multi_cfg(tmp_path)
+    original = json.loads(cfg.read_text())
+    real = im._write_json
+    calls: list[str] = []
+
+    def failing(path, obj, **kw):
+        calls.append(Path(path).name)
+        if len(calls) == 2:                       # die mid-sequence
+            raise OSError("disk full")
+        real(path, obj, **kw)
+
+    monkeypatch.setattr(im, "_write_json", failing)
+    with pytest.raises(OSError):
+        im.do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    # the client config is the LAST write, so it is untouched and both servers still work
+    assert json.loads(cfg.read_text()) == original
+    assert calls[0] == ".terse-mcp-stash.json"
+
+
+def test_multiproxy_does_not_fold_the_same_server_twice_from_a_duplicated_argument(
+        tmp_path):
+    """`servers` comes from a `nargs="+"` positional, so `install-mcp kb kb` is one typo
+    away — and it appended the same peer to `downstreams` twice, launching the downstream
+    twice with every tool exported twice."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    res = do_install(["kb", "kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    assert res["fleet"] == ["kb", "gh"]
+
+
+def test_multiproxy_refuses_to_fold_a_router_belonging_to_a_DIFFERENT_peers_file(tmp_path):
+    """`_unnest` recovers a downstream from the `--` a wrapped entry carries; a router has
+    `--config` and no `--`, so it came through VERBATIM and became a peer whose command is
+    `terse proxy --config <other fleet>` — a proxy nested in a proxy. The prior guard only
+    covered the router for THIS peers file."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    live = json.loads(cfg.read_text())
+    live["mcpServers"]["othermux"] = {
+        "command": "/usr/bin/terse",
+        "args": ["proxy", "--config", str(tmp_path / "other-fleet.json")]}
+    cfg.write_text(json.dumps(live), encoding="utf-8")
+    with pytest.raises(ValueError, match="nest a proxy inside a proxy"):
+        do_install(["othermux", "kb"], str(pol), cfg=cfg, multiproxy=True)
+    assert "othermux" in json.loads(cfg.read_text())["mcpServers"]
+
+
+def test_prune_peer_normalizes_away_malformed_entries(tmp_path):
+    """Pinned directly, not through a caller: every caller re-normalizes via
+    `peers_downstreams`, so reverting `_prune_peer` alone regressed silently with the
+    suite green. `downstreams` must not keep a nameless leftover that would strand the
+    router entry forever."""
+    from terse.install_mcp import _prune_peer
+    doc = {"downstreams": [{"name": "kb", "command": ["kb-mcp"]}, {"policy": "/p.json"},
+                           "junk", {"name": "gh", "url": "https://x"}]}
+    assert _prune_peer(doc, "kb") is True
+    assert doc["downstreams"] == [{"name": "gh", "url": "https://x"}]
+    assert _prune_peer(doc, "nope") is False
+    assert doc["downstreams"] == [{"name": "gh", "url": "https://x"}]   # still normalized

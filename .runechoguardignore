@@ -123,3 +123,8 @@ given
 # holding the deferred sink CALLABLE, invoked bare as run_sink(). Same local-variable
 # false-positive class as real/orig_send/real_minify above; pytest confirms it resolves.
 run_sink
+# A test-LOCAL class defined inside the test function and constructed on a changed
+# line (`lambda ...: _FakeTransport()`). The guard resolves module-level symbols, not
+# function-local classes, so any edit to that line re-flags it. pytest catches a real
+# typo instantly — this file is exercised on every run.
+_FakeTransport
