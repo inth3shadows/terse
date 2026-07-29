@@ -1217,6 +1217,101 @@ def test_a_peer_cannot_shadow_another_peers_qualified_name():
         router.close_senders()
 
 
+def test_installing_a_listing_is_serialized_against_a_concurrent_listing():
+    # Installing a listing is a read-modify-write (it retains peers that did not answer),
+    # and merges run on any peer-reader thread AND on the timeout Timer thread, with
+    # `_merge_broadcast` called outside `_pending_lock`. Unsynchronized, a PARTIAL listing
+    # that read the table before a COMPLETE one installed would assign afterwards and wipe
+    # the peers it never saw — the exact -32601 the retention exists to prevent.
+    from terse.multiproxy import _PendingBroadcast
+    _, _, _, out, router = _two_peer_router()
+    inside, release = threading.Event(), threading.Event()
+    original = router._expose_names
+
+    def slow_expose(*a, **kw):
+        inside.set()
+        release.wait(2.0)          # hold the critical section open
+        return original(*a, **kw)
+
+    try:
+        _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
+        router._expose_names = slow_expose
+        partial = threading.Thread(target=router._merge_tools_list, args=(_PendingBroadcast(
+            kind="tools/list", client_id=9, remaining={1},
+            parts={0: {"result": {"tools": [{"name": "only_a"}]}}}),))
+        partial.start()
+        assert inside.wait(2.0)
+        router._expose_names = original          # the second listing is not slowed
+        done = threading.Event()
+
+        def full():
+            router._merge_tools_list(_PendingBroadcast(
+                kind="tools/list", client_id=10, remaining=set(),
+                parts={0: {"result": {"tools": [{"name": "only_a"}]}},
+                       1: {"result": {"tools": [{"name": "only_b"}]}}}))
+            done.set()
+
+        second = threading.Thread(target=full)
+        second.start()
+        # the lock must keep the second listing out while the first holds the section
+        assert not done.wait(0.3), "a second listing installed while another was mid-install"
+        release.set()
+        partial.join(2.0), second.join(2.0)
+        assert set(router.tool_route) == {"only_a", "only_b"}
+    finally:
+        release.set()
+        router.close_senders()
+
+
+def test_a_slow_peer_does_not_silently_rename_a_surviving_peers_tool():
+    # Collision counting must include names still routable from peers that did NOT answer
+    # this listing. Otherwise the client-facing name of a tool is a function of peer
+    # TIMING, not of fleet config: with "gh" and "kb" both exporting "search", a listing
+    # in which kb is merely slow would expose gh's copy bare as "search", then re-qualify
+    # it to "gh__search" on the next full listing — breaking the static allowlist that is
+    # the entire point of #168, and handing "search" to a different server in between.
+    from terse.multiproxy import _PendingBroadcast
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("gh", t0, Interceptor(PLAIN_POLICY)), Peer("kb", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        merged = _list_tools(router, out, [[{"name": "search"}], [{"name": "search"}]])
+        assert [t["name"] for t in merged["result"]["tools"]] == ["gh__search", "kb__search"]
+        # kb is slow — only gh answers this time
+        partial = router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=9, remaining={1},
+            parts={0: {"result": {"tools": [{"name": "search"}]}}}))
+        assert [t["name"] for t in partial["tools"]] == ["gh__search"]   # NOT "search"
+        assert set(router.tool_route) == {"gh__search", "kb__search"}
+    finally:
+        router.close_senders()
+
+
+def test_a_depth_two_shadow_chain_stays_unique_in_either_config_order():
+    # The qualified-form reservation must not depend on config order. Reserving only the
+    # already-collided entries' qualified forms made it a single forward pass, so this
+    # chain produced a duplicate name in one order and not the other.
+    from terse.multiproxy import Router as R
+    chain = [("d", "c__a__x"), ("c", "a__x"), ("b", "x"), ("a", "x")]
+    for order in (chain, list(reversed(chain))):
+        transports = [_FakePeerTransport() for _ in order]
+        peers = [Peer(n, t, Interceptor(PLAIN_POLICY))
+                 for (n, _), t in zip(order, transports, strict=True)]
+        out = io.StringIO()
+        router = R(peers, out, Lock(), broadcast_timeout=1000)
+        try:
+            merged = _drive_broadcast(
+                router, out,
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                [{"result": {"tools": [{"name": tool}]}} for _, tool in order])
+            names = [t["name"] for t in merged["result"]["tools"]]
+            assert len(set(names)) == len(names), f"duplicate exposed name in {order}: {names}"
+            assert len(router.tool_route) == len(order)   # every peer stays addressable
+        finally:
+            router.close_senders()
+
+
 def test_an_unresolvable_duplicate_warns_without_debug(capsys):
     # A peer listing the same name twice can't be disambiguated by qualification. Last
     # writer wins, but the warning is UNCONDITIONAL — a silently unaddressable tool is

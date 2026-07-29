@@ -362,11 +362,20 @@ class Router:
         # are prefixed ONLY on a genuine cross-peer collision, so most tools are exposed
         # verbatim and these tables are what makes them routable.
         #
-        # Written by the broadcast collector thread, read by the client-reader thread,
-        # with no lock: each merge assigns a COMPLETE, freshly-built dict in one
-        # statement, so a reader either sees the whole previous table or the whole new
-        # one — never a half-populated one. (A plain `dict` mutated in place would not
-        # be safe here; do not "optimize" these into `.update()` calls.)
+        # READERS (`_resolve`, on the client-reader thread) take no lock: each merge
+        # assigns a COMPLETE, freshly-built dict in one statement, so a reader sees the
+        # whole previous table or the whole new one, never a half-populated one. (A plain
+        # `dict` mutated in place would not be safe; do not "optimize" these into
+        # `.update()` calls.)
+        #
+        # WRITERS must hold `_route_lock`. Installing a listing is a read-modify-write —
+        # it retains entries for peers that did not answer (`_rebuild_route`) — and merges
+        # run on any peer-reader thread (`_maybe_collect`) AND on the timeout `Timer`
+        # thread, with `_merge_broadcast` called OUTSIDE `_pending_lock`. Unsynchronized,
+        # a partial listing that read the table before a complete one installed would
+        # assign afterwards and wipe the peers it never saw — reintroducing the exact
+        # -32601 the retention exists to prevent.
+        self._route_lock = Lock()
         self.tool_route: dict[str, tuple[int, str]] = {}
         self.prompt_route: dict[str, tuple[int, str]] = {}
 
@@ -430,9 +439,9 @@ class Router:
             return
 
         if method == "prompts/get":
-            # Routed by name-prefix exactly like tools/call: the merged prompts/list
-            # advertised each prompt as `<peer>__<name>`, so the client's get carries
-            # that prefix and names the one peer to route to.
+            # Routed to one peer exactly like tools/call, through the table the merged
+            # prompts/list built (`prompt_route`), with the `<peer>__` split as a
+            # fallback — prompts are qualified only on a cross-peer collision (#168).
             self._route_prompt_get(msg)
             return
 
@@ -922,7 +931,7 @@ class Router:
                     out.append((i, it))
         return out, answered
 
-    def _expose_names(self, owned: list[tuple[int, dict]],
+    def _expose_names(self, owned: list[tuple[int, dict]], absent: list[tuple[int, str]],
                       reserved: tuple[str, ...] = ()) -> tuple[list[dict], dict]:
         """Name each entry for the client and build its routing table (#168).
 
@@ -935,32 +944,46 @@ class Router:
         `reserved` names are pre-claimed by the router itself, so a peer exporting one is
         forced to qualify rather than shadowing it.
 
-        **The qualified forms are reserved too.** Without that, a peer exporting a tool
-        named literally `{otherpeer}__{tool}` would be exposed verbatim (its own bare name
-        collides with nothing) and land on the exact name a genuinely-collided peer was
-        qualified to — advertising a DUPLICATE name and hijacking the other peer's calls.
-        Counting the qualified forms as claimed names forces that peer to qualify in turn,
-        so no two exposed names are equal by construction.
+        `absent` is `(peer_idx, bare)` for every name still routable from a peer that did
+        NOT answer this listing. Those names COUNT toward collisions but emit no entry.
+        Without them the exposed name of a tool would be a function of peer TIMING rather
+        than of fleet config: if `gh` and `kb` both export `search` but `kb` is merely
+        slow, `gh`'s copy would be exposed bare as `search` this listing and re-qualified
+        to `gh__search` the next — silently breaking the very static client allowlist
+        this change exists to preserve, and handing the same bare name to a different
+        server between listings.
 
-        Returns `(renamed_entries, {exposed: (peer_idx, bare)})`. A residual collision is
-        possible only from a name engineered to survive both passes (or a peer that lists
-        the same name twice); it is not silently dropped — last writer wins in the table,
-        matching the merged list's own order, and the warning is UNCONDITIONAL, not
-        --debug-gated, for the same reason the peer-0 fallback notice is: a silently
-        unaddressable tool is exactly the kind of gap this module promises not to hide.
+        **Every entry's qualified form is reserved too, unconditionally.** Without that, a
+        peer exporting a tool named literally `{otherpeer}__{tool}` is exposed verbatim
+        (its own bare name collides with nothing) and lands on the exact name a
+        genuinely-collided peer was qualified to — advertising a DUPLICATE name and
+        hijacking the other peer's calls. Reserving only the *collided* entries' qualified
+        forms was not enough: that made the reservation a single forward pass over config
+        order, so a depth-2 shadow chain (`x`, `a__x`, `c__a__x`) still produced a
+        duplicate when the peers happened to be ordered one way and not the other.
+        Reserving all of them is order-independent and needs no fixpoint.
+
+        Returns `(renamed_entries, {exposed: (peer_idx, bare)})`. A residual collision now
+        requires a peer to list the SAME name twice, which qualification cannot
+        disambiguate; it is not silently dropped — last writer wins in the table, matching
+        the merged list's own order, and the warning is UNCONDITIONAL, not --debug-gated,
+        for the same reason the peer-0 fallback notice is: a silently unaddressable tool
+        is exactly the kind of gap this module promises not to hide.
         """
         counts: dict[str, int] = dict.fromkeys(reserved, 1)
-        for _, it in owned:
-            counts[it["name"]] = counts.get(it["name"], 0) + 1
-        for idx, it in owned:
-            if counts[it["name"]] > 1:
-                q = f"{self.peers[idx].name}{PREFIX_SEP}{it['name']}"
-                counts[q] = counts.get(q, 0) + 1
+        for idx, bare in [(i, it["name"]) for i, it in owned] + absent:
+            counts[bare] = counts.get(bare, 0) + 1
+            q = f"{self.peers[idx].name}{PREFIX_SEP}{bare}"
+            counts[q] = counts.get(q, 0) + 1
+        # A name's own qualified form was just counted against it, so a bare name is
+        # unique iff its count is 1 — except when the qualified form IS the bare name of
+        # something else, which is precisely the shadow case that must qualify.
         entries: list[dict] = []
         route: dict[str, tuple[int, str]] = {}
         for idx, it in owned:
             bare = it["name"]
-            exposed = bare if counts[bare] == 1 else f"{self.peers[idx].name}{PREFIX_SEP}{bare}"
+            qualified = f"{self.peers[idx].name}{PREFIX_SEP}{bare}"
+            exposed = bare if counts[bare] == 1 else qualified
             if exposed in route:
                 sys.stderr.write(
                     f"[terse-multiproxy] name collision on {exposed!r}: peer "
@@ -970,26 +993,35 @@ class Router:
             route[exposed] = (idx, bare)
         return entries, route
 
-    def _install_route(self, current: dict[str, tuple[int, str]],
-                       fresh: dict[str, tuple[int, str]],
-                       answered: set[int]) -> dict[str, tuple[int, str]]:
-        """The routing table to install after a merge: `fresh` (this listing's result),
-        plus every entry of `current` owned by a peer that did NOT answer this listing.
+    def _rebuild_route(self, current: dict[str, tuple[int, str]],
+                       owned: list[tuple[int, dict]], answered: set[int],
+                       reserved: tuple[str, ...] = ()) -> tuple[list[dict], dict]:
+        """`(entries_to_advertise, the_routing_table_to_install)` for one listing.
 
-        Wholesale replacement is wrong because a broadcast can complete on TIMEOUT with
-        only the peers that answered in time (`_timeout_broadcast`). A merely-slow peer
-        would then be erased from the table, and — unlike the old unconditional-prefix
-        scheme, where routing was stateless prefix-splitting — a BARE name has no
-        `<peer>__` fallback to rescue it, so calls to a fully alive peer would fail
-        -32601 until some later listing happened to complete with everyone present.
+        The table is this listing's result PLUS every entry of `current` owned by a peer
+        that did NOT answer it. Wholesale replacement is wrong because a broadcast can
+        complete on TIMEOUT with only the peers that answered in time
+        (`_timeout_broadcast`). A merely-slow peer would then be erased — and unlike the
+        old unconditional-prefix scheme, where routing was stateless prefix-splitting, a
+        BARE name has no `<peer>__` fallback to rescue it, so calls to a fully alive peer
+        would fail -32601 until some later listing happened to complete with everyone
+        present.
 
         Retaining an absent peer's entries can leave a stale name routable for a listing
         or two. That is the correct trade: a stale route reaches a live peer that answers
-        or errors, while a missing route is a hard, self-inflicted -32601. `fresh` always
-        wins on a key held by both, so a peer that DID answer is fully re-described.
+        or errors, while a missing route is a hard, self-inflicted -32601. This listing
+        always wins on a key held by both, so a peer that DID answer is fully
+        re-described. The retained names are also fed back into collision counting — see
+        `_expose_names`'s `absent`.
+
+        MUST be called with `_route_lock` held: it reads `current` and its result is
+        assigned back, and that read-modify-write races with a concurrent listing
+        otherwise (broadcasts merge on peer-reader threads AND on the timeout Timer
+        thread).
         """
         keep = {name: owner for name, owner in current.items() if owner[0] not in answered}
-        return {**keep, **fresh}
+        entries, fresh = self._expose_names(owned, list(keep.values()), reserved)
+        return entries, {**keep, **fresh}
 
     def _merge_tools_list(self, pb: _PendingBroadcast) -> dict:
         """Concat every peer's tools under collision-only `{peer}__` prefixes (#168 —
@@ -1003,10 +1035,9 @@ class Router:
         exporting that name must be qualified either way, since whether the router also
         advertises its own retrieve is a policy detail the client can't see."""
         owned, answered = self._collect_named(pb, "tools")
-        tools, route = self._expose_names(owned, reserved=(lossy_mod.RETRIEVE_TOOL,))
-        # whole-dict replacement — see __init__; `_install_route` is what keeps a
-        # timed-out peer's tools routable rather than erasing them.
-        self.tool_route = self._install_route(self.tool_route, route, answered)
+        with self._route_lock:
+            tools, self.tool_route = self._rebuild_route(
+                self.tool_route, owned, answered, reserved=(lossy_mod.RETRIEVE_TOOL,))
         if self.has_drop:
             tools.append(RETRIEVE_TOOL_DEF)
         return {"tools": tools}
@@ -1074,8 +1105,9 @@ class Router:
         Prompt names share no namespace with `RETRIEVE_TOOL`, so nothing is reserved
         here."""
         owned, answered = self._collect_named(pb, "prompts")
-        prompts, route = self._expose_names(owned)
-        self.prompt_route = self._install_route(self.prompt_route, route, answered)
+        with self._route_lock:
+            prompts, self.prompt_route = self._rebuild_route(
+                self.prompt_route, owned, answered)
         return {"prompts": prompts}
 
     def _merge_list(self, pb: _PendingBroadcast, key: str) -> dict:
