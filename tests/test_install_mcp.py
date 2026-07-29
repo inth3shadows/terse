@@ -1655,3 +1655,74 @@ def test_a_peers_record_that_cannot_launch_anything_is_not_restored_as_a_broken_
     kb = [c for c in res["changes"] if c["server"] == "kb"][0]
     assert kb["restored"] is False
     assert "kb" not in json.loads(cfg.read_text())["mcpServers"]
+
+
+# ------------------------------------------- #179 round-5: install-path review findings
+
+def test_multiproxy_writes_recovery_data_before_deleting_the_live_entries(tmp_path,
+                                                                         monkeypatch):
+    """`wrap_multi` DELETES a folded peer's live entry rather than rewriting it the way
+    `wrap` does, and the three writes are not atomic together. Config-first left a window
+    where the live entry was already gone while the stash still described the old state:
+    the original existed NOWHERE terse looks, so status reported nothing missing and
+    `uninstall --all` never mentioned the server. Recovery data must land first."""
+    from terse import install_mcp as im
+    cfg, pol = _multi_cfg(tmp_path)
+    original = json.loads(cfg.read_text())
+    real = im._write_json
+    calls: list[str] = []
+
+    def failing(path, obj, **kw):
+        calls.append(Path(path).name)
+        if len(calls) == 2:                       # die mid-sequence
+            raise OSError("disk full")
+        real(path, obj, **kw)
+
+    monkeypatch.setattr(im, "_write_json", failing)
+    with pytest.raises(OSError):
+        im.do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    # the client config is the LAST write, so it is untouched and both servers still work
+    assert json.loads(cfg.read_text()) == original
+    assert calls[0] == ".terse-mcp-stash.json"
+
+
+def test_multiproxy_does_not_fold_the_same_server_twice_from_a_duplicated_argument(
+        tmp_path):
+    """`servers` comes from a `nargs="+"` positional, so `install-mcp kb kb` is one typo
+    away — and it appended the same peer to `downstreams` twice, launching the downstream
+    twice with every tool exported twice."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    res = do_install(["kb", "kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    assert res["fleet"] == ["kb", "gh"]
+
+
+def test_multiproxy_refuses_to_fold_a_router_belonging_to_a_DIFFERENT_peers_file(tmp_path):
+    """`_unnest` recovers a downstream from the `--` a wrapped entry carries; a router has
+    `--config` and no `--`, so it came through VERBATIM and became a peer whose command is
+    `terse proxy --config <other fleet>` — a proxy nested in a proxy. The prior guard only
+    covered the router for THIS peers file."""
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    live = json.loads(cfg.read_text())
+    live["mcpServers"]["othermux"] = {
+        "command": "/usr/bin/terse",
+        "args": ["proxy", "--config", str(tmp_path / "other-fleet.json")]}
+    cfg.write_text(json.dumps(live), encoding="utf-8")
+    with pytest.raises(ValueError, match="nest a proxy inside a proxy"):
+        do_install(["othermux", "kb"], str(pol), cfg=cfg, multiproxy=True)
+    assert "othermux" in json.loads(cfg.read_text())["mcpServers"]
+
+
+def test_prune_peer_normalizes_away_malformed_entries(tmp_path):
+    """Pinned directly, not through a caller: every caller re-normalizes via
+    `peers_downstreams`, so reverting `_prune_peer` alone regressed silently with the
+    suite green. `downstreams` must not keep a nameless leftover that would strand the
+    router entry forever."""
+    from terse.install_mcp import _prune_peer
+    doc = {"downstreams": [{"name": "kb", "command": ["kb-mcp"]}, {"policy": "/p.json"},
+                           "junk", {"name": "gh", "url": "https://x"}]}
+    assert _prune_peer(doc, "kb") is True
+    assert doc["downstreams"] == [{"name": "gh", "url": "https://x"}]
+    assert _prune_peer(doc, "nope") is False
+    assert doc["downstreams"] == [{"name": "gh", "url": "https://x"}]   # still normalized

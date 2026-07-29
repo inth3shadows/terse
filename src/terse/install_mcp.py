@@ -448,7 +448,16 @@ def wrap_multi(config: dict, stash: dict, servers: list[str], policy: str,
         if isinstance(d, dict) and isinstance(d.get("name"), str)
         and d["name"] not in requested and d["name"] not in live_servers
     ]
+    seen_peers: set[str] = set()
     for name in servers:
+        if name in seen_peers:
+            # `servers` comes from a `nargs="+"` positional, so `install-mcp a a` is one
+            # typo away. Appending twice put the SAME peer in `downstreams` twice: the
+            # downstream launched twice and every one of its tools exported twice — the
+            # double-serve failure class already guarded for hand-edits, reachable here
+            # from ordinary argv.
+            continue
+        seen_peers.add(name)
         if name == prior_router:
             # Folding the router into its own peers file writes a peer whose command is
             # `terse proxy --config <this very file>`: starting it spawns a router that
@@ -457,6 +466,17 @@ def wrap_multi(config: dict, stash: dict, servers: list[str], policy: str,
             raise ValueError(
                 f"'{name}' is the router fronting {peers_file} — it cannot also be one "
                 f"of its own peers (that would launch a router inside itself)")
+        if _is_router_entry(live_servers.get(name)):
+            # ANY terse router, not just this peers file's. `_unnest` recovers a downstream
+            # from the `--` a `wrap`ped entry carries; a router has `--config` and no `--`,
+            # so it comes through VERBATIM and becomes a peer whose command is
+            # `terse proxy --config <some other fleet>` — a proxy nested in a proxy, the
+            # double-primer cost this whole feature exists to remove. The `name ==
+            # prior_router` check above only covers the router for THIS file.
+            raise ValueError(
+                f"'{name}' is itself a terse multiproxy router (it runs `proxy --config`) "
+                f"— folding it in would nest a proxy inside a proxy. Uninstall its fleet "
+                f"first, or name its peers individually")
         if name in stash:
             original = stash[name]
         elif name in live_servers:
@@ -560,6 +580,15 @@ def _entry_from_peer_spec(spec: dict) -> dict | None:
         if spec.get(k):
             entry[k] = spec[k]
     return entry
+
+
+def _is_router_entry(entry: object) -> bool:
+    """True if `entry` is a terse MULTIPROXY router — a terse launcher carrying `--config`
+    — regardless of which peers file it fronts. `_detect_routers` answers the narrower
+    "is it THIS scope's router"; this one is what a fold has to refuse."""
+    if not isinstance(entry, dict) or not _looks_like_terse_launcher(entry):
+        return False
+    return "--config" in list(entry.get("args") or [])
 
 
 def _detect_routers(node: dict, peers_p: Path) -> list[str]:
@@ -1027,9 +1056,23 @@ def _install_multiproxy(target, config: dict, full_stash: dict, stash: dict, nod
               "allowlist": allowlist_mapping([f for f in fleet if f], router)}
     if not dry_run:
         result["backup"] = str(_backup(target.cfg))
-        _write_json(target.cfg, config, trailing_newline=had_nl)
+        # RECOVERY DATA FIRST, then the destructive write. Each `_write_json` is atomic on
+        # its own (mkstemp + os.replace) but the three together are not, and `wrap_multi`
+        # DELETES a folded peer's live entry rather than rewriting it the way `wrap` does.
+        # Config-first therefore had a window — one SIGKILL, OOM, or full disk wide — where
+        # the live entry was already gone while the stash and peers file still described
+        # the previous state: the original existed nowhere terse looks, so status reported
+        # nothing missing and `uninstall --all` never mentioned the server at all. Only the
+        # timestamped config backup held it, which no recovery path reads and
+        # `_prune_backups` eventually deletes.
+        #
+        # In this order a crash before the config write leaves every original LIVE and
+        # untouched; the stash and peers file merely describe a fold that didn't happen,
+        # which the next run reconciles and which status already reports loudly
+        # (`folded-and-live`). Recoverable beats silent.
         _write_json(stash_path(target.cfg), full_stash)
         _write_json(peers_p, peers_doc)
+        _write_json(target.cfg, config, trailing_newline=had_nl)
     if never_lossy:
         result["never_lossy_added"] = _apply_never_lossy(policy_abs, servers,
                                                           dry_run=dry_run)

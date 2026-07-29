@@ -66,6 +66,18 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   Runtime-flag inheritance is all-or-nothing, so `--no-stats`/`--capture-dir` (which have
   no inverse flag) can still be cleared, and the result reports the flags actually baked
   in rather than only those named on the command line.
+- **`--multiproxy` writes recovery data before the destructive write (#179).** The three
+  files (stash, peers, client config) are each written atomically but not atomically
+  together, and folding DELETES a peer's live entry rather than rewriting it the way a
+  plain wrap does. Config-first left a window — one SIGKILL, OOM, or full disk wide — where
+  the live entry was already gone while the stash still described the previous state: the
+  original existed nowhere terse looks, so status reported nothing missing and
+  `uninstall --all` never mentioned the server. Only the timestamped config backup held it,
+  which no recovery path reads. The config is now written last. Also: a duplicated argument
+  (`install-mcp kb kb --multiproxy`) no longer folds the same peer twice, and folding a
+  terse router that fronts a DIFFERENT peers file is refused rather than nesting a proxy
+  inside a proxy (a router has `--config` and no `--`, so `_unnest` passed it through
+  verbatim).
 - **Every bad multiproxy state is now recoverable and reported (#179).** `uninstall-mcp
   --all` restores a folded peer whose stash entry drifted away, rebuilding it from the
   peers file (reported as a PARTIAL restore — the peers file records launch fields only);
