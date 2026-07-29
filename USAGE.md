@@ -188,7 +188,15 @@ carried into the peers file and re-applied when the router launches it, so a ser
 needed a pinned `PATH` or an API key in `env` keeps getting one.
 
 `terse mcp-status` reports a folded fleet as one `router` row (with `wraps=` listing its
-peers) plus a `folded` row per peer naming the router it sits behind — not as drift.
+peers) plus a `folded` row per peer naming the router it sits behind — not as drift. Four
+more states exist for when something has gone wrong, each with a line saying what to do:
+`folded-unstashed` (stash entry gone — `uninstall-mcp --all` rebuilds it from the peers
+file, launch fields only), `folded-and-live` (in the peers file *and* live, so the
+downstream runs twice), `router-ambiguous` (two entries front one peers file — delete the
+duplicate), and an `unreadable peers file` note naming the path.
+
+`uninstall-mcp --all` is the escape hatch from every one of those, including a deleted or
+corrupt peers file. It removes the router once nothing is left for it to front.
 
 > **Project scope: the peers file carries secrets.** `--scope project` writes
 > `.terse-peers-project.json` next to the checked-in `.mcp.json`, and it contains each

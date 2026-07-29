@@ -1286,10 +1286,21 @@ def _cmd_uninstall_mcp(args: argparse.Namespace) -> int:
         print("nothing to do (no terse-managed servers).")
         return 0
     for c in res["changes"]:
-        if c.get("restored"):
+        if c.get("router"):
+            # Not a restore — the router is terse's own entry, removed once nothing is
+            # left for it to front. Saying "restored terse" would be a lie.
+            verb = "would remove" if res["dry_run"] else "removed"
+            print(f"{verb} router {c['server']}: {c.get('reason')}")
+        elif c.get("restored"):
             print(f"{tag} {c['server']}")
+            if c.get("partial"):
+                print(f"    PARTIAL: {c.get('reason')}")
         else:
             print(f"skip {c['server']}: {c.get('reason')}")
+    if res.get("router_ambiguous"):
+        print(f"WARNING: {', '.join(res['router_ambiguous'])} all front "
+              f"{res.get('peers_file')} — the peers file was left in place. Delete the "
+              f"duplicate entries (they are interchangeable) before re-running.")
     if res["backup"]:
         print(f"backup: {res['backup']}")
     if not res["dry_run"] and any(c.get("restored") for c in res["changes"]):
@@ -1326,7 +1337,18 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
             # For a wrapped entry, a second indented line surfaces what it actually
             # fronts and the tiers baked into the entry — the diagnostic the flat
             # "wrapped policy=…" line couldn't answer when a server misbehaves.
-            if r["state"] in ("wrapped", "wrapped-unstashed", "router"):
+            if r.get("peers_error"):
+                print(f"  {'':<20} {r['peers_error']} — fix or delete that file")
+            if r["state"] == "folded-and-live":
+                print(f"  {'':<20} ALSO live as its own entry: this downstream runs "
+                      f"TWICE, every tool exported twice. Remove one.")
+            elif r["state"] == "folded-unstashed":
+                print(f"  {'':<20} no stash entry — `uninstall-mcp --all` will rebuild "
+                      f"it from the peers file (launch fields only)")
+            elif r["state"] == "router-ambiguous":
+                print(f"  {'':<20} another entry fronts the same peers file — delete the "
+                      f"duplicate (they are interchangeable) before terse can manage it")
+            if r["state"] in ("wrapped", "wrapped-unstashed", "router", "router-ambiguous"):
                 stats = "on" if r.get("stats") else "off"
                 detail = (f"wraps={r.get('wraps') or '?'}  "
                           f"diff={r.get('diff') or '?'}  stats={stats}")

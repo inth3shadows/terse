@@ -66,6 +66,21 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   Runtime-flag inheritance is all-or-nothing, so `--no-stats`/`--capture-dir` (which have
   no inverse flag) can still be cleared, and the result reports the flags actually baked
   in rather than only those named on the command line.
+- **Every bad multiproxy state is now recoverable and reported (#179).** `uninstall-mcp
+  --all` restores a folded peer whose stash entry drifted away, rebuilding it from the
+  peers file (reported as a PARTIAL restore — the peers file records launch fields only);
+  it removes a stranded router whenever no peers remain, including when the peers file was
+  simply deleted, which no longer reads as "no multiproxy involved". A corrupt peers file
+  is reported with its path instead of tracebacking out of `mcp-status` (whose contract
+  says it never raises) and blocking every other command with a message naming no file.
+  Two entries fronting one peers file are NAMED rather than guessed through — the peers
+  file is left in place, status says `router-ambiguous`, and the old `--router-name` advice
+  (which added a third router and poisoned detection permanently) is gone. The peers
+  filename now always carries a hash tail: `local:/home/e/a/b` and `local:/home/e/a-b`
+  slugified identically, so two repos shared one fleet and one repo's router launched the
+  other's servers. Folding a server whose `env` is malformed fails with a message naming
+  it instead of an `AttributeError`, and a peers record that cannot launch anything is no
+  longer "restored" as `{"url": null}`.
 - **`mcp-status` understands a folded fleet (#179).** A healthy multiproxy install used
   to read as drift in both directions — every peer as `orphaned-stash`, the router as
   `wrapped-unstashed` ("original command unrecoverable"). New states: `router` (with

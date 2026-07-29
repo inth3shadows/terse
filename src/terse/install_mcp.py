@@ -317,11 +317,17 @@ def peers_path(cfg: Path, stash_prefix: str = "user") -> Path:
     `.terse-peers.json` beside it would let a local-scope install silently overwrite the
     user-scope fleet (and vice versa) — the same collision `Target.stash_prefix` exists
     to prevent. A local prefix carries a repo path, so it is slugified to a legal, bounded
-    filename; the hash tail keeps two long paths that share a 32-char prefix distinct."""
+    filename.
+
+    The hash tail is UNCONDITIONAL, because the collision comes from slugification, not
+    from truncation: `/home/e/a/b` and `/home/e/a-b` both slugify to `local-home-e-a-b`,
+    well under any length limit. Two repos then shared one peers file, so repo 1's router
+    launched repo 2's servers and exported their tools into repo 1's sessions — a
+    cross-repo capability leak, not a bookkeeping mixup. `stash_prefix` is injective and
+    the filename must not throw that away."""
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", stash_prefix).strip("-") or "scope"
-    if len(slug) > 40:
-        slug = f"{slug[:31]}-{hashlib.sha256(stash_prefix.encode()).hexdigest()[:8]}"
-    return cfg.parent / f"{PEERS_STEM}-{slug}.json"
+    digest = hashlib.sha256(stash_prefix.encode()).hexdigest()[:8]
+    return cfg.parent / f"{PEERS_STEM}-{slug[:31]}-{digest}.json"
 
 
 def _unnest(entry: dict) -> dict:
@@ -366,6 +372,21 @@ def _peer_spec(name: str, original: dict, policy: str) -> dict:
         spec["command"] = [original["command"], *list(original.get("args", []))]
         env = original.get("env")
         if env:
+            if not isinstance(env, dict):
+                # A hand-edited `env` of the wrong shape used to reach `.items()` and
+                # crash with a bare AttributeError — no server name, no file, no clue.
+                raise ValueError(
+                    f"server '{name}' has a non-object 'env' ({type(env).__name__}) — "
+                    f"fix that entry in the config before folding it")
+            nested = sorted(k for k, v in env.items()
+                            if isinstance(v, dict | list | type(None)))
+            if nested:
+                # `str()` of a container yields a garbage variable like `K="['x']"`, which
+                # the peer then reads as if it were meaningful. Scalars coerce; containers
+                # are a mistake worth naming.
+                raise ValueError(
+                    f"server '{name}': env value(s) {', '.join(nested)} are not scalars — "
+                    f"an MCP `env` maps names to strings")
             # COERCE to str->str, as the sibling `headers` handling below already does.
             # A client's own spawn coerces (`{"PORT": 3000}` is a working Claude Code
             # entry today, and a plain `wrap` preserves it untouched), but the router
@@ -507,6 +528,46 @@ def _detect_router(node: dict, peers_p: Path) -> str | None:
     claimed. And exactly one match: two routers pointing at the same peers file is a
     hand-edit terse should not guess its way through, so it reports None and leaves the
     entries alone rather than pruning an arbitrary one."""
+    routers = _detect_routers(node, peers_p)
+    return routers[0] if len(routers) == 1 else None
+
+
+def _entry_from_peer_spec(spec: dict) -> dict | None:
+    """The inverse of `_peer_spec`: an mcpServers entry rebuilt from a peers-file record,
+    or None when the record cannot launch anything.
+
+    Best-effort by construction — the peers file records only what the ROUTER needs to
+    launch the peer, so a `type` or any other key of the pre-terse entry is not in it.
+    Used only to recover a folded peer whose stash entry drifted away; the caller reports
+    the restore as partial so nobody mistakes it for the byte-for-byte stash path.
+
+    Returning None matters: `peers_downstreams` only checks for a `name`, so a hand-edited
+    record with a name and no `command`/`url` reaches here, and the old code wrote
+    `{"url": None}` into the live config — an entry no client can launch, presented as a
+    successful restore."""
+    cmd = spec.get("command")
+    if isinstance(cmd, list) and cmd and isinstance(cmd[0], str):
+        entry: dict = {"command": cmd[0]}
+        if len(cmd) > 1:
+            entry["args"] = list(cmd[1:])
+    elif isinstance(spec.get("url"), str) and spec["url"]:
+        entry = {"url": spec["url"]}
+        if spec.get("headers"):
+            entry["headers"] = spec["headers"]
+    else:
+        return None
+    for k in ("env", "cwd"):
+        if spec.get(k):
+            entry[k] = spec[k]
+    return entry
+
+
+def _detect_routers(node: dict, peers_p: Path) -> list[str]:
+    """EVERY entry fronting `peers_p`. More than one is a hand-edit terse must not guess
+    its way through — but it must still be able to NAME them, because the ambiguous state
+    is otherwise unreportable and unrepairable: status showed both entries as
+    unrecoverable, uninstall deleted the peers file out from under them, and the error
+    message's own advice (`--router-name`) added a third."""
     want = str(peers_p)
     routers = []
     for name, entry in (node.get("mcpServers") or {}).items():
@@ -517,19 +578,20 @@ def _detect_router(node: dict, peers_p: Path) -> str | None:
             i = args.index("--config")
             if i + 1 < len(args) and args[i + 1] == want:
                 routers.append(name)
-    return routers[0] if len(routers) == 1 else None
+    return routers
 
 
 def _prune_peer(peers_doc: dict, server: str) -> bool:
-    """Drop `server` from a peers doc. Returns True if it was there."""
+    """Drop `server` from a peers doc. Returns True if it was there. Also normalizes the
+    list to its valid entries (see `peers_downstreams`) so a malformed leftover can never
+    keep `downstreams` non-empty and strand the router entry forever."""
     downs = peers_doc.get("downstreams")
     if not isinstance(downs, list):
         return False
-    kept = [d for d in downs if not (isinstance(d, dict) and d.get("name") == server)]
-    if len(kept) == len(downs):
-        return False
+    kept = [d for d in peers_downstreams(peers_doc) if d.get("name") != server]
+    was_there = any(isinstance(d, dict) and d.get("name") == server for d in downs)
     peers_doc["downstreams"] = kept
-    return True
+    return was_there
 
 
 def unwrap(config: dict, stash: dict, server: str,
@@ -544,9 +606,15 @@ def unwrap(config: dict, stash: dict, server: str,
         raise KeyError(server)
     servers = config.setdefault("mcpServers", {})
     servers[server] = stash.pop(server)
-    if (peers_doc is not None and _prune_peer(peers_doc, server)
-            and not peers_doc.get("downstreams") and router):
-        servers.pop(router, None)
+    if peers_doc is not None:
+        _prune_peer(peers_doc, server)
+        # Gated on "no peers REMAIN", not on "this server's prune fired". Requiring the
+        # prune made router removal unreachable whenever the peers file had already
+        # drifted — `downstreams: []`, a non-list, or one malformed entry — leaving an
+        # entry that runs `terse proxy --config <nothing usable>` and exits 2 on every
+        # client start, while status called it the healthy `router` state.
+        if router and not peers_downstreams(peers_doc):
+            servers.pop(router, None)
     return config, stash
 
 
@@ -626,6 +694,37 @@ def discover_wrapped_opts(config: dict) -> list[dict[str, str]]:
 # ------------------------------------------------------------------ IO helpers
 def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def peers_downstreams(peers_doc: dict | None) -> list[dict]:
+    """The VALID peer entries in a peers doc — dicts carrying a string `name`.
+
+    One definition, used by every caller, because two callers disagreeing about what
+    counts is how the router outlived its fleet: `_prune_peer` kept a nameless entry
+    (so `downstreams` never emptied and the router was never removed) while `wrap_multi`
+    dropped it. A hand-edited peers file is an operator-facing artifact — USAGE tells
+    them where it lives — so malformed entries are expected input, not impossible."""
+    return [d for d in ((peers_doc or {}).get("downstreams") or [])
+            if isinstance(d, dict) and isinstance(d.get("name"), str) and d["name"]]
+
+
+def load_peers(path: Path) -> tuple[dict | None, str | None]:
+    """Read a peers file, returning `(doc, error)` — never raising.
+
+    A corrupt peers file used to traceback out of `mcp-status` (whose contract says it
+    never raises) and to block `install-mcp`, `install-mcp --multiproxy`, `uninstall-mcp`
+    and `uninstall-mcp --all` with a bare `json.decoder` message naming NO file: every
+    route out of the state was closed, and nothing said which file to fix. `doc` is None
+    when there is nothing usable; `error` is a message that names the path."""
+    if not path.exists():
+        return None, None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return None, f"{path}: unreadable peers file ({e})"
+    if not isinstance(doc, dict):
+        return None, f"{path}: peers file must be a JSON object"
+    return doc, None
 
 
 def _load_stash(path: Path) -> dict:
@@ -725,9 +824,10 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
     # with nothing to say why. Forgetting the flag on a policy refresh is all it takes.
     if not multiproxy:
         peers_p = peers_path(target.cfg, target.stash_prefix)
-        folded_now = {d.get("name") for d in
-                      ((_load_json(peers_p) if peers_p.exists() else {})
-                       .get("downstreams") or []) if isinstance(d, dict)}
+        peers_now, peers_err = load_peers(peers_p)
+        if peers_err:
+            raise ValueError(peers_err)
+        folded_now = {d["name"] for d in peers_downstreams(peers_now)}
         clash = [s for s in servers if s in folded_now]
         if clash:
             raise ValueError(
@@ -849,15 +949,26 @@ def _install_multiproxy(target, config: dict, full_stash: dict, stash: dict, nod
             f"--router-name, or the router entry would overwrite the peer it fronts")
     peers_p = peers_path(target.cfg, target.stash_prefix)
     peers_file = str(peers_p)
-    existing_peers = _load_json(peers_p) if peers_p.exists() else None
+    existing_peers, peers_err = load_peers(peers_p)
+    if peers_err:
+        raise ValueError(peers_err)
+    live_now = node.get("mcpServers") or {}
+    all_routers = _detect_routers(node, peers_p)
+    if len(all_routers) > 1:
+        # Two entries already front this peers file (a hand-edit). Folding again would
+        # write a third — which is exactly what the old "pick another name with
+        # --router-name" advice produced, permanently poisoning detection. Name the
+        # duplicates and stop.
+        raise ValueError(
+            f"{', '.join(sorted(all_routers))} all front {peers_file} — terse can't tell "
+            f"which is the real router. Delete the duplicate entries from the config "
+            f"(they are interchangeable; keep one), then re-run")
     # The router entry is WRITTEN OVER, not stashed — so a live entry that merely happens
     # to share the router's name is destroyed with no way back. `terse` is the DEFAULT
     # router name, so this needs no unusual flag to hit. A terse-owned router (this
     # scope's, or one being renamed) is fine to overwrite; anything else is refused.
-    live_now = node.get("mcpServers") or {}
-    current_router = _detect_router(node, peers_p)
-    folded_now = {d.get("name") for d in ((existing_peers or {}).get("downstreams") or [])
-                  if isinstance(d, dict)}
+    current_router = all_routers[0] if all_routers else None
+    folded_now = {d["name"] for d in peers_downstreams(existing_peers)}
     if router != current_router and (router in live_now or router in stash
                                      or router in folded_now):
         # A FOLDED peer has no live entry by construction, so `router in live_now` alone
@@ -962,13 +1073,18 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
     # (`wrapped-unstashed`, "original command unrecoverable"). Both are healthy here — the
     # peers file is what says so, so it is read before classifying, not after.
     peers_p = peers_path(target.cfg, target.stash_prefix)
-    peers_doc = _load_json(peers_p) if peers_p.exists() else None
-    router_name = _detect_router(node, peers_p)
-    folded = {d["name"] for d in ((peers_doc or {}).get("downstreams") or [])
-              if isinstance(d, dict) and isinstance(d.get("name"), str)}
+    # `load_peers` never raises: a corrupt peers file used to traceback straight out of
+    # `mcp-status`, whose own contract says it never raises — and status is exactly where
+    # you look when the config is broken.
+    peers_doc, peers_err = load_peers(peers_p)
+    all_routers = _detect_routers(node, peers_p)
+    router_name = all_routers[0] if len(all_routers) == 1 else None
+    folded = {d["name"] for d in peers_downstreams(peers_doc)}
 
     rows = []
-    for name in sorted(set(servers) | set(stash)):
+    # Every folded name gets a row even with no stash entry and no live entry — otherwise
+    # a peer whose stash drifted away appeared NOWHERE while the router kept launching it.
+    for name in sorted(set(servers) | set(stash) | folded):
         stashed = name in stash
         present = name in servers
         # Classify from the CONFIG, with the stash as recovery data rather than as the
@@ -979,8 +1095,23 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
         # skipped by `uninstall-mcp --all`. That is the exact inverse of the drift #58
         # surfaced as `orphaned-stash`; only one direction had been considered.
         launches_via_terse = present and _looks_like_terse_launcher(servers[name])
-        if name == router_name:
-            state = "router"
+        if name in all_routers:
+            # Two entries fronting one peers file is a hand-edit terse won't guess through
+            # (`_detect_routers`), but it must NAME the state — reporting both as
+            # `wrapped-unstashed` sent the operator to look for a `--` a router entry
+            # doesn't have, and nothing said the duplication was the problem.
+            state = "router" if router_name else "router-ambiguous"
+        elif name in folded and present:
+            # Listed as a peer AND live: the same downstream runs twice, every one of its
+            # tools exported twice at double cost. `do_install` refuses to create this,
+            # but a hand-edit or `claude mcp add <name>` still can, and the old
+            # classification called it a plain `wrapped` entry.
+            state = "folded-and-live"
+        elif name in folded and not stashed:
+            # Folded with its stash entry gone. Not healthy — but not lost either: the
+            # peers file records enough to relaunch it, and `uninstall-mcp --all` now
+            # rebuilds from exactly that.
+            state = "folded-unstashed"
         elif stashed and not present and name in folded:
             # Folded behind the router: its live entry is GONE by design (that is the
             # whole point — one entry instead of N), and its original is safely stashed.
@@ -1005,7 +1136,7 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
         wraps = None
         diff = None
         stats_on = None
-        if state in ("wrapped", "wrapped-unstashed", "router"):
+        if state in ("wrapped", "wrapped-unstashed", "router", "router-ambiguous"):
             # The launcher (`command`) is the entry's most silent failure mode: if it
             # no longer resolves, the client can't spawn the proxy at all and the server
             # just shows up with no tools. That is exactly what an upgrade moving a
@@ -1037,7 +1168,7 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
             diff = "off" if "--no-diff" in args else ("on" if "--diff" in args
                                                       else "default")
             stats_on = "--no-stats" not in args
-        if state == "router":
+        if state in ("router", "router-ambiguous"):
             # A router has no `--` downstream and no single `--policy`: what it fronts is
             # the peers file's list, and each peer carries its own policy there.
             wraps = ", ".join(sorted(folded)) or "(no peers)"
@@ -1048,9 +1179,13 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
                     "policy_missing": policy_missing, "launcher": launcher,
                     "launcher_missing": launcher_gone, "wraps": wraps, "diff": diff,
                     "stats": stats_on, "config": str(target.cfg),
-                    # Which router a `folded` peer sits behind — the one fact a folded row
-                    # can't otherwise state, and the first thing you need to un-fold it.
-                    "router": router_name if state == "folded" else None})
+                    # Which router a peer sits behind — the one fact a folded row can't
+                    # otherwise state, and the first thing you need to un-fold it.
+                    "router": (router_name if state in ("folded", "folded-unstashed",
+                                                        "folded-and-live") else None),
+                    # An unreadable peers file is reported, not raised: every route out of
+                    # that state ran through code that used to traceback on it.
+                    "peers_error": peers_err})
     return rows
 
 
@@ -1059,12 +1194,17 @@ def scan_scopes(*, cfg: Path | None = None, file: str | None = None,
     """Enumerate every terse-relevant mcpServers entry across all three scopes,
     read-only — no writes, no directory creation, never raises. One row per
     (scope, server): {scope, server, state, policy, policy_missing, launcher,
-    launcher_missing, wraps, diff, stats, config, router}, state one of "wrapped"
+    launcher_missing, wraps, diff, stats, config, router, peers_error}, state one of
+    "wrapped"
     (stashed and present), "wrapped-unstashed" (the entry launches via terse but has no
     stash, so its original command cannot be restored — #172), "router" (a --multiproxy
     entry fronting the peers file; `wraps` lists its fleet), "folded" (stashed, no live
     entry, and named in that peers file — healthy, `router` says which one it sits
-    behind), "orphaned-stash" (stashed
+    behind), "folded-unstashed" (named in the peers file with no stash entry — recoverable
+    from the peers file, which `uninstall-mcp --all` now does), "folded-and-live" (in the
+    peers file AND live, so the downstream runs twice), "router-ambiguous" (two entries
+    front one peers file — a hand-edit terse refuses to guess through),
+    "orphaned-stash" (stashed
     but the entry vanished — see `_scan_target`), or "unwrapped" (present, not terse's). The wrapped-only
     fields (policy_missing, launcher, launcher_missing, wraps, diff, stats) are
     None/False for non-wrapped rows. Local scope is
@@ -1097,20 +1237,29 @@ def do_uninstall(servers: list[str] | None, *, all_: bool = False,
     # servers a router fronts, so an uninstall must prune it there as well as restoring
     # the entry — otherwise the router keeps launching a peer the client no longer knows.
     peers_p = peers_path(target.cfg, target.stash_prefix)
-    peers_doc = _load_json(peers_p) if peers_p.exists() else None
-    router_name = _detect_router(node, peers_p)
+    peers_doc, peers_err = load_peers(peers_p)
+    if peers_err:
+        raise ValueError(peers_err)
+    all_routers = _detect_routers(node, peers_p)
+    router_name = all_routers[0] if len(all_routers) == 1 else None
+    folded = {d["name"] for d in peers_downstreams(peers_doc)}
     # `--all` walks the stash UNION anything the config shows as terse-launched, so a
     # wrapped-but-unstashed entry is reported (and refused with a reason) rather than
     # silently omitted from the run — see #172.
     if all_:
         detected = {n for n, e in (node.get("mcpServers") or {}).items()
                     if isinstance(e, dict) and _looks_like_terse_launcher(e)}
-        # ...but NOT the router itself. It is terse-launched and has no stash of its own,
-        # so it landed in the #172 "wrapped but unrecoverable — edit the config by hand"
-        # branch on the documented happy path, telling the operator to hand-repair an
-        # entry that `unwrap` deletes for them one line later. It is removed by the last
+        # ...but NOT the router(s) themselves. A router is terse-launched and has no stash
+        # of its own, so it landed in the #172 "wrapped but unrecoverable — edit the config
+        # by hand" branch on the documented happy path, telling the operator to hand-repair
+        # an entry that `unwrap` deletes for them one line later. It is removed by the last
         # peer detaching, never as a target in its own right.
-        targets = sorted((set(stash) | detected) - {router_name})
+        #
+        # `folded` IS unioned in: a folded peer has no live entry by construction, so it
+        # can never be in `detected`, and if its stash entry has drifted away it was in
+        # neither set — silently skipped by a run that reported success, and absent from
+        # status too. The peers file still holds enough to launch it, so it is restorable.
+        targets = sorted((set(stash) | detected | folded) - set(all_routers))
     else:
         targets = servers or []
 
@@ -1122,6 +1271,25 @@ def do_uninstall(servers: list[str] | None, *, all_: bool = False,
             # is gone — and silently reporting it as "not managed by terse" is how such a
             # server stays wrapped forever, invisible to both status and uninstall.
             entry = node.get("mcpServers", {}).get(s)
+            spec = next((d for d in peers_downstreams(peers_doc) if d["name"] == s), None)
+            rebuilt = _entry_from_peer_spec(spec) if spec is not None else None
+            if entry is None and rebuilt is not None and peers_doc is not None:
+                # Folded with its stash entry gone. Unlike the wrapped-unstashed case
+                # below, the original IS recoverable: `_peer_spec` wrote this peer's
+                # command/args (or url/headers) plus env/cwd into the peers file, which
+                # is the record the router itself launches from. Restore from it and say
+                # so — a peer that terse can relaunch but silently declines to restore is
+                # the worst of both worlds.
+                node.setdefault("mcpServers", {})[s] = rebuilt
+                _prune_peer(peers_doc, s)
+                changes.append({
+                    "server": s, "restored": True, "restored_from": "peers-file",
+                    "partial": True,
+                    "reason": "stash entry missing — rebuilt from the peers file, which "
+                              "records only the launch fields (command/args/env/cwd or "
+                              "url/headers); any other key of the original entry is gone",
+                })
+                continue
             if isinstance(entry, dict) and _looks_like_terse_launcher(entry):
                 changes.append({
                     "server": s, "restored": False,
@@ -1144,15 +1312,36 @@ def do_uninstall(servers: list[str] | None, *, all_: bool = False,
             change["detached_from"] = router_name
         changes.append(change)
 
+    # Router sweep, independent of any individual prune. `unwrap` can only remove the
+    # router when it was given a `peers_doc`; with the peers file DELETED (the one bad
+    # state reachable with no JSON hand-edit at all) `peers_doc` is None, so `--all`
+    # restored every original, reported a clean uninstall, and left an entry running
+    # `terse proxy --config <missing file>` that exits 2 on every client start forever.
+    stranded = (all_ and len(all_routers) == 1 and not peers_downstreams(peers_doc)
+                and node.get("mcpServers", {}).pop(all_routers[0], None) is not None)
+    if stranded:
+        changes.append({"server": all_routers[0], "restored": True, "router": True,
+                        "reason": "router entry removed — no peers left to front"})
+
     result = {"config": str(target.cfg), "scope": scope, "changes": changes,
               "dry_run": dry_run, "backup": None,
-              "peers_file": str(peers_p) if peers_doc is not None else None}
+              # Keyed on the ROUTER too, not just the doc: with the peers file missing a
+              # `--json` consumer otherwise saw `peers_file: null` and all-restored, i.e.
+              # "no multiproxy involved", while a router entry sat in the config.
+              "peers_file": (str(peers_p) if peers_doc is not None or all_routers
+                             else None),
+              "routers": all_routers}
+    if len(all_routers) > 1:
+        # Ambiguous by hand-edit. Terse must not guess which entry to keep — but it also
+        # must not destroy the peers file those entries depend on, which is what the old
+        # unlink did while leaving both behind, unrepairable.
+        result["router_ambiguous"] = all_routers
     if not dry_run and any(c.get("restored") for c in changes):
         result["backup"] = str(_backup(target.cfg))
         _write_json(target.cfg, config, trailing_newline=had_nl)
         _write_json(stash_path(target.cfg), full_stash)
         if peers_doc is not None:
-            if peers_doc.get("downstreams"):
+            if peers_downstreams(peers_doc) or len(all_routers) > 1:
                 _write_json(peers_p, peers_doc)
             else:
                 # Last peer detached: the router entry is gone (see `unwrap`), so an
