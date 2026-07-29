@@ -9,6 +9,23 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Added
+- **`install-mcp --multiproxy` folds a fleet into ONE proxy (#179).** This is the step
+  that banks #168's measured win: six standalone proxies cost +23.1% raw input against an
+  unwrapped control, the same six behind one router cost +0.0%, because each standalone
+  proxy injects its own primer that the client re-reads every turn — cost scales with
+  (servers x turns) while savings scale with (compressible calls). The named entries are
+  replaced by a single `terse proxy --config` entry (`--router-name`, default `terse`)
+  plus a peers file next to the config. **The stash stays 1:1**, so `uninstall-mcp --all`
+  restores every original byte-for-byte with no special case, and uninstalling ONE peer
+  detaches it from the peers file while the router keeps serving the rest (the router
+  entry is removed once its last peer leaves). An already-wrapped entry is reduced to the
+  downstream it wraps before being folded in, so a proxy is never nested inside the
+  router even when its stash lives under another scope. `--print` reports the permission
+  rewrite: consolidating N servers changes the `mcp__<server>__` segment for every
+  wrapped tool, and the tool segment changes too for any name two or more peers export —
+  the latter needs live tool names, so it is flagged rather than guessed.
+
 ### Changed
 - **BREAKING (multiproxy): tool and prompt names are now qualified only on a genuine
   cross-peer collision (#168).** `terse proxy --config peers.json` used to rename *every*

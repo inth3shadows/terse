@@ -1032,3 +1032,112 @@ def test_uninstall_all_still_restores_a_properly_stashed_entry(tmp_path):
     out = im.do_uninstall(None, all_=True, cfg=cfg)
     assert out["changes"] == [{"server": "runecho", "restored": True}]
     assert json.loads(cfg.read_text())["mcpServers"]["runecho"] == original
+
+
+# --------------------------------------------------------------- #179 --multiproxy
+
+def _multi_cfg(tmp_path):
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "kb": {"type": "stdio", "command": "kb-mcp", "args": ["--x"], "env": {"K": "1"}},
+        "gh": {"url": "https://gh.example/mcp", "headers": {"Authorization": "Bearer t"}},
+        "other": {"command": "other-mcp"},
+    }}), encoding="utf-8")
+    pol = tmp_path / "p.json"
+    pol.write_text(json.dumps({"version": 1, "defaults": {"tiers": ["minify"]}}), encoding="utf-8")
+    return cfg, pol
+
+
+def test_multiproxy_folds_servers_into_one_router_entry_and_a_peers_file(tmp_path):
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    res = do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    live = json.loads(cfg.read_text())["mcpServers"]
+    # the two peers are GONE from the client's view; one router entry fronts them
+    assert set(live) == {"other", "terse"}
+    assert "--config" in live["terse"]["args"]
+    peers = json.loads(Path(res["peers_file"]).read_text())["downstreams"]
+    assert [d["name"] for d in peers] == ["kb", "gh"]
+    # stdio peer keeps command+args+env; http peer keeps url+headers
+    assert peers[0]["command"] == ["kb-mcp", "--x"] and peers[0]["env"] == {"K": "1"}
+    assert peers[1]["url"] == "https://gh.example/mcp"
+    assert peers[1]["headers"] == {"Authorization": "Bearer t"}
+
+
+def test_multiproxy_uninstall_all_restores_every_original_byte_for_byte(tmp_path):
+    # The load-bearing case: the stash is 1:1 but a multiproxy install collapses N live
+    # entries into 1, so `uninstall-mcp --all` has to restore N from a config that shows
+    # only the router. Tested BEFORE the happy path, per the issue.
+    from terse.install_mcp import do_install, do_uninstall
+    cfg, pol = _multi_cfg(tmp_path)
+    original = json.loads(cfg.read_text())
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    res = do_uninstall(None, all_=True, cfg=cfg)
+    assert json.loads(cfg.read_text()) == original          # byte-for-byte, router gone
+    assert {c["server"] for c in res["changes"] if c["restored"]} == {"kb", "gh"}
+    assert not Path(res["peers_file"]).exists()     # no zero-peer leftover
+
+
+def test_uninstalling_one_peer_detaches_it_and_leaves_the_router_serving_the_rest(tmp_path):
+    from terse.install_mcp import do_install, do_uninstall
+    cfg, pol = _multi_cfg(tmp_path)
+    res = do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    out = do_uninstall(["kb"], cfg=cfg)
+    live = json.loads(cfg.read_text())["mcpServers"]
+    assert "kb" in live and "terse" in live                  # kb back, router still there
+    assert out["changes"][0]["detached_from"] == "terse"
+    peers = json.loads(Path(res["peers_file"]).read_text())["downstreams"]
+    assert [d["name"] for d in peers] == ["gh"]              # pruned from the peers file
+
+
+def test_multiproxy_print_is_a_dry_run_and_reports_the_allowlist_rewrite(tmp_path):
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    before = cfg.read_text()
+    res = do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True, dry_run=True)
+    assert cfg.read_text() == before                          # writes nothing
+    assert not (tmp_path / ".terse-peers.json").exists()
+    assert res["allowlist"] == [
+        {"from": "mcp__kb__*", "to": "mcp__terse__*", "server": "kb"},
+        {"from": "mcp__gh__*", "to": "mcp__terse__*", "server": "gh"}]
+
+
+def test_multiproxy_is_idempotent_and_never_nests_a_proxy(tmp_path):
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    res = do_install(["kb"], str(pol), cfg=cfg, multiproxy=True)
+    peers = json.loads(Path(res["peers_file"]).read_text())["downstreams"]
+    # re-described from the STASHED original, so the peer command is kb-mcp, not terse
+    assert peers[0]["command"] == ["kb-mcp", "--x"]
+
+
+def test_multiproxy_refuses_a_router_name_that_collides_with_a_peer(tmp_path):
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    with pytest.raises(ValueError, match="also a server being wrapped"):
+        do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True, router="kb")
+
+
+def test_multiproxy_never_folds_a_terse_wrapped_entry_in_verbatim(tmp_path):
+    # A server can be wrapped with its stash under a DIFFERENT scope, or missing (#172).
+    # Folding that entry in as a peer would nest `terse proxy ... -- kb-mcp` inside the
+    # router — the primer charged twice, defeating the point of consolidating.
+    from terse.install_mcp import do_install
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "kb": {"type": "stdio", "command": "/usr/bin/terse", "env": {"K": "1"},
+               "args": ["proxy", "--policy", "/old.json", "--server-name", "kb",
+                        "--", "kb-mcp", "--flag"]},
+        "gh": {"command": "/usr/bin/terse",
+               "args": ["proxy", "--policy", "/old.json", "--header",
+                        "Authorization=Bearer t", "--", "https://gh.example/mcp"]},
+    }}), encoding="utf-8")
+    pol = tmp_path / "p.json"
+    pol.write_text(json.dumps({"version": 1, "defaults": {"tiers": ["minify"]}}), encoding="utf-8")
+    res = do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    peers = json.loads(Path(res["peers_file"]).read_text())["downstreams"]
+    assert peers[0]["command"] == ["kb-mcp", "--flag"]     # the DOWNSTREAM, not terse
+    assert peers[0]["env"] == {"K": "1"}                   # non-terse keys survive
+    assert peers[1]["url"] == "https://gh.example/mcp"
+    assert peers[1]["headers"] == {"Authorization": "Bearer t"}

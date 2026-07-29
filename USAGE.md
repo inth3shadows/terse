@@ -151,6 +151,26 @@ directly — so keep expectations proportionate: broadcast requests (`initialize
 methods outside `initialize`/`tools/list`/`tools/call` fall back to peer 0 for now (a
 debug-logged, documented v1 limitation, not a silent gap).
 
+### Fold your whole fleet into one proxy (`install-mcp --multiproxy`)
+
+```
+# preview — config diff AND the permission entries you must update:
+uv run terse install-mcp kb runecho codegraph --policy policy.json --multiproxy --print
+
+uv run terse install-mcp kb runecho codegraph --policy policy.json --multiproxy
+uv run terse uninstall-mcp --all          # restores all three originals
+```
+
+Why bother: a standalone `terse proxy` per server injects its own format primer, which
+the client re-reads **every turn**, so cost scales with (servers x turns) while savings
+scale with (compressible calls). Measured, six servers: +23.1% raw input one-proxy-each,
++0.0% behind one router. Wrapping a single server is the case that already wins (-14.0%);
+consolidating is what stops a fleet from losing.
+
+This rewrites permission entries — `mcp__kb__kb.read.search` becomes
+`mcp__terse__kb.read.search` — so run `--print` first and update your allowlist before
+restarting the client.
+
 ### Wire terse into Claude Code automatically (`install-mcp`)
 
 Rather than editing `~/.claude.json` by hand, let terse wrap your MCP servers for you:

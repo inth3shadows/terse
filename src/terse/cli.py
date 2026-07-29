@@ -1188,7 +1188,8 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
                          diff_keyframe_interval=args.diff_keyframe_interval,
                          scope=args.scope, file=args.file, repo_path=args.repo_path,
                          no_stats=args.no_stats, no_join_blocks=args.no_join_blocks,
-                         never_lossy=args.never_lossy)
+                         never_lossy=args.never_lossy,
+                         multiproxy=args.multiproxy, router=args.router_name)
     except (FileNotFoundError, ValueError) as e:
         print(f"install-mcp: {e}", file=sys.stderr)
         return 2
@@ -1201,6 +1202,19 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
             print(f"    kept hand-edited key(s) from the live entry: "
                   f"{', '.join(c['preserved'])} (note: uninstall restores the "
                   f"pre-terse original, which does NOT carry them)")
+    if res.get("multiproxy"):
+        print(f"\nrouter: {res['router']}  ->  {_short_cmd(res['router_entry'])}")
+        print(f"peers:  {res['peers_file']}  ({len(res['peers']['downstreams'])} peer(s): "
+              f"{', '.join(d['name'] for d in res['peers']['downstreams'])})")
+        print("\npermission entries to update — the SERVER segment changes for every "
+              "wrapped tool:")
+        for m in res["allowlist"]:
+            print(f"    {m['from']:<34} ->  {m['to']}")
+        print("  ...and the TOOL segment changes for any name two or more peers both "
+              "export\n  (`definition` -> `lsp-go__definition`). Those need live tool "
+              "names, which install\n  time does not have, so they are NOT listed above "
+              "— run `tools/list` per peer to\n  enumerate them rather than trusting a "
+              "guess.")
     print(f"config: {res['config']}  scope: {res['scope']}  policy: {res['policy']}")
     if res.get("capture_dir"):
         print(f"capture: raw tool results → {res['capture_dir']}")
@@ -1664,6 +1678,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="bake `--no-stats` into the wrapped entry: no savings-ledger "
                          "records for this server (the ledger is otherwise the proxy "
                          "default — payload-free, read by `terse stats`)")
+    im.add_argument("--multiproxy", action="store_true",
+                    help="fold the named servers into ONE terse proxy fronting them all "
+                         "(writes a peers file next to the config). This is what banks "
+                         "#168's win: each standalone proxy injects its own primer, "
+                         "re-read every turn, so cost scales with servers x turns. "
+                         "REWRITES PERMISSION ENTRIES — see --print.")
+    im.add_argument("--router-name", default="terse", metavar="NAME",
+                    help="name of the single merged server entry (default: terse)")
     im.add_argument("--never-lossy", action="store_true",
                     help="mark the wrapped server(s) as never-lossy: bake them into the "
                          "policy's never_lossy_servers so lossy transforms are structurally "
