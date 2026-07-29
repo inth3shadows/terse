@@ -25,8 +25,12 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   table first — a tool whose own name contains `__` is no longer misread as a peer prefix
   — and keeps the `{peer}__` split as a fallback for names that were never listed. Ledger
   and capture bookkeeping still record the **peer-qualified** name, so per-server corpus
-  attribution is unchanged. Migration: if you had allowlisted `{peer}__{tool}` names,
-  switch them to the bare names now advertised by `tools/list`.
+  attribution is unchanged. The routing table is exactly what the most recent `tools/list`
+  advertised — a peer missing from a listing is missing from the client's tool list too, so
+  calling it is a clean -32601 (carrying routes forward across a missed listing was tried
+  and withdrawn; see #178). A listing that completes late by timeout is answered but not
+  installed, so it cannot clobber a newer one. Migration: if you had allowlisted
+  `{peer}__{tool}` names, switch them to the bare names now advertised by `tools/list`.
 - **Releases are now zero-touch.** `release.yml` runs on every push to `main`, derives the
   next version from the Conventional-Commit types since the last tag (`feat` → minor,
   `fix`/`perf` → patch, breaking → minor while 0.x; docs/chore/test/ci release nothing),

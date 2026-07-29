@@ -1146,47 +1146,6 @@ def test_qualified_name_still_routes_before_any_tools_list():
         router.close_senders()
 
 
-def test_a_timed_out_peer_keeps_its_tools_routable():
-    # A broadcast can complete on TIMEOUT with only the peers that answered. Replacing the
-    # table wholesale would erase a merely-SLOW peer — and a bare name has no `<peer>__`
-    # fallback to rescue it, so calls to a fully alive peer would fail -32601 until some
-    # later listing happened to complete with everyone present.
-    from terse.multiproxy import _PendingBroadcast
-    t0, t1, _, out, router = _two_peer_router()
-    try:
-        _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
-        assert set(router.tool_route) == {"only_a", "only_b"}
-        # second listing: peer b never answers, so its part is simply absent
-        router._merge_tools_list(_PendingBroadcast(
-            kind="tools/list", client_id=9, seq=1, remaining={1},
-            parts={0: {"result": {"tools": [{"name": "only_a"}]}}}))
-        assert set(router.tool_route) == {"only_a", "only_b"}
-        router.route_client_line(json.dumps(
-            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "only_b"}}))
-        assert _await_peer_call(t1)["params"]["name"] == "only_b"
-        assert _peer_calls(t0) == []
-        assert [m for m in _lines(out) if "error" in m] == []   # no -32601 to the client
-    finally:
-        router.close_senders()
-
-
-def test_a_peer_answering_with_an_empty_list_does_drop_its_tools():
-    # The other side of the same coin: an EMPTY reply is a peer speaking, not a peer
-    # missing, so its tools really are gone and must stop routing. If `_rebuild_route`
-    # keyed on "contributed no entries" instead of "replied", this would wrongly persist.
-    from terse.multiproxy import _PendingBroadcast
-    _, _, _, out, router = _two_peer_router()
-    try:
-        _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
-        router._merge_tools_list(_PendingBroadcast(
-            kind="tools/list", client_id=9, seq=1, remaining=set(),
-            parts={0: {"result": {"tools": [{"name": "only_a"}]}},
-                   1: {"result": {"tools": []}}}))
-        assert set(router.tool_route) == {"only_a"}
-    finally:
-        router.close_senders()
-
-
 def test_a_peer_cannot_shadow_another_peers_qualified_name():
     # Peers "a" and "b" both export "search", so both are qualified to a__search /
     # b__search. Peer "c" exports a tool named LITERALLY "a__search" — with only bare
@@ -1217,6 +1176,35 @@ def test_a_peer_cannot_shadow_another_peers_qualified_name():
         router.close_senders()
 
 
+def test_the_route_table_is_exactly_the_most_recent_listing():
+    # The contract after #178 withdrew route retention: no names are carried forward from
+    # peers that missed a listing. A peer absent from a listing is absent from the client's
+    # tool list too, so a call to it is a clean -32601 rather than a route into the dark.
+    # Whether that peer errored, timed out, or answered with an empty list is not a
+    # distinction the table draws — all three simply contribute nothing.
+    from terse.multiproxy import _PendingBroadcast
+    for i, part in enumerate([{"result": {"tools": []}},                       # empty
+                              {"error": {"code": -32601, "message": "nope"}},  # errored
+                              None]):                                          # timed out
+        _, _, _, out, router = _two_peer_router()
+        try:
+            _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
+            assert set(router.tool_route) == {"only_a", "only_b"}
+            parts = {0: {"result": {"tools": [{"name": "only_a"}]}}}
+            if part is not None:
+                parts[1] = part
+            router._merge_tools_list(_PendingBroadcast(
+                kind="tools/list", client_id=9, seq=1, remaining=set(), parts=parts))
+            assert set(router.tool_route) == {"only_a"}, f"case {i}"
+            router.route_client_line(json.dumps(
+                {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                 "params": {"name": "only_b"}}))
+        finally:
+            router.close_senders()
+        errs = [m for m in _lines(out) if "error" in m]
+        assert len(errs) == 1 and errs[0]["error"]["code"] == -32601, f"case {i}"
+
+
 def test_a_late_timing_out_listing_does_not_clobber_a_newer_one():
     # `_route_lock` serializes installs but does not ORDER them, and two listings with
     # different client ids are concurrently pending. A broadcast that times out after
@@ -1239,30 +1227,6 @@ def test_a_late_timing_out_listing_does_not_clobber_a_newer_one():
             parts={0: {"result": {"tools": [{"name": "old"}]}}}))
         assert [t["name"] for t in stale["tools"]] == ["old"]   # its own client is answered
         assert set(router.tool_route) == {"new", "only_b"}      # ...but nothing installed
-    finally:
-        router.close_senders()
-
-
-def test_a_peer_that_errors_is_not_treated_as_merely_slow():
-    # An explicit JSON-RPC error is a peer SPEAKING, not a peer missing. Retaining its
-    # routes forever would dispatch calls to a server that has no such tool (a broadcast
-    # timeout instead of a clean -32601) and pin an unrelated peer's names as qualified
-    # against a collision that no longer exists.
-    from terse.multiproxy import _PendingBroadcast
-    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
-    peers = [Peer("gh", t0, Interceptor(PLAIN_POLICY)), Peer("kb", t1, Interceptor(PLAIN_POLICY))]
-    out = io.StringIO()
-    router = Router(peers, out, Lock(), broadcast_timeout=1000)
-    try:
-        merged = _list_tools(router, out, [[{"name": "search"}], [{"name": "search"}]])
-        assert [t["name"] for t in merged["result"]["tools"]] == ["gh__search", "kb__search"]
-        after = router._merge_tools_list(_PendingBroadcast(
-            kind="tools/list", client_id=9, seq=1, remaining=set(),
-            parts={0: {"result": {"tools": [{"name": "search"}]}},
-                   1: {"error": {"code": -32601, "message": "Method not found"}}}))
-        # kb spoke: its route is dropped, and gh's tool goes back to its own bare name
-        assert [t["name"] for t in after["tools"]] == ["search"]
-        assert set(router.tool_route) == {"search"}
     finally:
         router.close_senders()
 
@@ -1292,126 +1256,6 @@ def test_the_prefix_fallback_is_off_once_a_listing_has_landed():
         router.close_senders()
     errs = [m for m in _lines(out) if "error" in m]
     assert len(errs) == 1 and errs[0]["error"]["code"] == -32601
-
-
-def test_a_removed_tool_stays_removed_even_while_another_peer_is_slow():
-    # Retention keeps an ABSENT peer's tools routable. It must not also protect a tool its
-    # own peer deliberately dropped: `keep` filters on who ANSWERED, so a peer that
-    # answers without a tool loses it regardless of how many other peers timed out. And
-    # once gone it must not resurrect on a later listing — `keep` only ever subsets the
-    # table, so there is no path that re-adds it.
-    from terse.multiproxy import _PendingBroadcast
-    _, _, _, out, router = _two_peer_router()
-    try:
-        _list_tools(router, out, [[{"name": "keep_me"}, {"name": "drop_me"}],
-                                  [{"name": "only_b"}]])
-        assert set(router.tool_route) == {"keep_me", "drop_me", "only_b"}
-        # peer a re-lists WITHOUT drop_me, while peer b times out
-        router._merge_tools_list(_PendingBroadcast(
-            kind="tools/list", client_id=9, seq=1, remaining={1},
-            parts={0: {"result": {"tools": [{"name": "keep_me"}]}}}))
-        # b's tool is retained (it never spoke); a's removed tool is gone (it did)
-        assert set(router.tool_route) == {"keep_me", "only_b"}
-        # ...and a later full listing does not bring it back
-        router._merge_tools_list(_PendingBroadcast(
-            kind="tools/list", client_id=10, seq=2, remaining=set(),
-            parts={0: {"result": {"tools": [{"name": "keep_me"}]}},
-                   1: {"result": {"tools": [{"name": "only_b"}]}}}))
-        assert set(router.tool_route) == {"keep_me", "only_b"}
-        router.route_client_line(json.dumps(
-            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "drop_me"}}))
-    finally:
-        router.close_senders()
-    errs = [m for m in _lines(out) if "error" in m]
-    assert len(errs) == 1 and errs[0]["error"]["code"] == -32601
-
-
-def test_retained_routes_do_not_accumulate_across_listings():
-    # Retention must be bounded by the peers' actual tool sets, not grow per listing —
-    # `keep` subsets the previous table rather than unioning history.
-    from terse.multiproxy import _PendingBroadcast
-    _, _, _, out, router = _two_peer_router()
-    try:
-        _list_tools(router, out, [[{"name": "a1"}], [{"name": "b1"}]])
-        for i, tool in enumerate(["a2", "a3", "a4"], start=9):
-            router._merge_tools_list(_PendingBroadcast(
-                kind="tools/list", client_id=i, seq=i - 8, remaining={1},
-                parts={0: {"result": {"tools": [{"name": tool}]}}}))
-        # only peer a's CURRENT tool plus peer b's retained one — not a1..a4
-        assert set(router.tool_route) == {"a4", "b1"}
-    finally:
-        router.close_senders()
-
-
-def test_installing_a_listing_is_serialized_against_a_concurrent_listing():
-    # Installing a listing is a read-modify-write (it retains peers that did not answer),
-    # and merges run on any peer-reader thread AND on the timeout Timer thread, with
-    # `_merge_broadcast` called outside `_pending_lock`. Unsynchronized, a PARTIAL listing
-    # that read the table before a COMPLETE one installed would assign afterwards and wipe
-    # the peers it never saw — the exact -32601 the retention exists to prevent.
-    from terse.multiproxy import _PendingBroadcast
-    _, _, _, out, router = _two_peer_router()
-    inside, release = threading.Event(), threading.Event()
-    original = router._expose_names
-
-    def slow_expose(*a, **kw):
-        inside.set()
-        release.wait(2.0)          # hold the critical section open
-        return original(*a, **kw)
-
-    try:
-        _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
-        router._expose_names = slow_expose
-        partial = threading.Thread(target=router._merge_tools_list, args=(_PendingBroadcast(
-            kind="tools/list", client_id=9, seq=1, remaining={1},
-            parts={0: {"result": {"tools": [{"name": "only_a"}]}}}),))
-        partial.start()
-        assert inside.wait(2.0)
-        router._expose_names = original          # the second listing is not slowed
-        done = threading.Event()
-
-        def full():
-            router._merge_tools_list(_PendingBroadcast(
-                kind="tools/list", client_id=10, seq=2, remaining=set(),
-                parts={0: {"result": {"tools": [{"name": "only_a"}]}},
-                       1: {"result": {"tools": [{"name": "only_b"}]}}}))
-            done.set()
-
-        second = threading.Thread(target=full)
-        second.start()
-        # the lock must keep the second listing out while the first holds the section
-        assert not done.wait(0.3), "a second listing installed while another was mid-install"
-        release.set()
-        partial.join(2.0), second.join(2.0)
-        assert set(router.tool_route) == {"only_a", "only_b"}
-    finally:
-        release.set()
-        router.close_senders()
-
-
-def test_a_slow_peer_does_not_silently_rename_a_surviving_peers_tool():
-    # Collision counting must include names still routable from peers that did NOT answer
-    # this listing. Otherwise the client-facing name of a tool is a function of peer
-    # TIMING, not of fleet config: with "gh" and "kb" both exporting "search", a listing
-    # in which kb is merely slow would expose gh's copy bare as "search", then re-qualify
-    # it to "gh__search" on the next full listing — breaking the static allowlist that is
-    # the entire point of #168, and handing "search" to a different server in between.
-    from terse.multiproxy import _PendingBroadcast
-    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
-    peers = [Peer("gh", t0, Interceptor(PLAIN_POLICY)), Peer("kb", t1, Interceptor(PLAIN_POLICY))]
-    out = io.StringIO()
-    router = Router(peers, out, Lock(), broadcast_timeout=1000)
-    try:
-        merged = _list_tools(router, out, [[{"name": "search"}], [{"name": "search"}]])
-        assert [t["name"] for t in merged["result"]["tools"]] == ["gh__search", "kb__search"]
-        # kb is slow — only gh answers this time
-        partial = router._merge_tools_list(_PendingBroadcast(
-            kind="tools/list", client_id=9, seq=1, remaining={1},
-            parts={0: {"result": {"tools": [{"name": "search"}]}}}))
-        assert [t["name"] for t in partial["tools"]] == ["gh__search"]   # NOT "search"
-        assert set(router.tool_route) == {"gh__search", "kb__search"}
-    finally:
-        router.close_senders()
 
 
 def test_a_depth_two_shadow_chain_stays_unique_in_either_config_order():
