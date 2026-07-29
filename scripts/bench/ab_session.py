@@ -195,7 +195,19 @@ class Arm:
 
     def __init__(self, paths: list[Path], label: str):
         self.label = label
-        self.runs = [SessionStats(p) for p in paths]
+        # The same transcript passed twice is not two replicates. It would report sd=0
+        # from non-independent data and manufacture confidence out of n=1 — the exact
+        # failure this outlier control exists to prevent. Drop repeats, keep order.
+        seen: set[Path] = set()
+        uniq: list[Path] = []
+        for p in paths:
+            rp = p.resolve()
+            if rp in seen:
+                print(f"  ! {label}: ignoring duplicate run {p.name[:8]}", file=sys.stderr)
+                continue
+            seen.add(rp)
+            uniq.append(p)
+        self.runs = [SessionStats(p) for p in uniq]
         self.kept: list[SessionStats] = list(self.runs)
         self.dropped: list[SessionStats] = []
 
@@ -236,7 +248,9 @@ def _row(label: str, a: Arm, b: Arm, field: str) -> tuple[str, bool]:
     ma, sa = a.stat(field)
     mb, sb = b.stat(field)
     d = mb - ma
-    pct = (d / ma * 100) if ma else 0.0
+    # A zero control mean has no percentage — printing +0.0% next to a large absolute
+    # delta reads as "no change", the opposite of the truth. Say n/a.
+    pct = f"{d / ma * 100:>+7.1f}%" if ma else f"{'n/a':>8}"
     pooled = (sa + sb) / 2
     # A delta smaller than twice the pooled spread is not distinguishable from run-to-run
     # variance at these sample sizes. Crude on purpose: with n<=6 a real significance test
@@ -245,16 +259,16 @@ def _row(label: str, a: Arm, b: Arm, field: str) -> tuple[str, bool]:
     # BOTH arms need n>=2 or there is no spread to compare against. A one-run arm reports
     # sd=0, which halves `pooled` and makes almost any delta look like SIGNAL — the exact
     # false confidence this outlier control exists to remove. Say "n<2" instead.
+    #
+    # pooled == 0 with n>=2 in both arms means every replicate landed on the same number:
+    # zero observed spread is the STRONGEST evidence a nonzero delta is real, not a reason
+    # to withhold judgement. Token counts here are deterministic given the same turns, so
+    # this is the common case for a clean pair, and `abs(d) > 0` is the right test.
     enough = len(a.kept) > 1 and len(b.kept) > 1
-    clears = enough and pooled > 0 and abs(d) > 2 * pooled
-    if not enough:
-        flag = "  n<2"
-    elif pooled == 0:
-        flag = ""
-    else:
-        flag = "  SIGNAL" if clears else "  noise"
+    clears = enough and abs(d) > 2 * pooled
+    flag = "  n<2" if not enough else ("  SIGNAL" if clears else "  noise")
     return (f"  {label:<18} {ma:>11,.0f} +/-{sa:>9,.0f} {mb:>11,.0f} +/-{sb:>9,.0f} "
-            f"{d:>+11,.0f} {pct:>+7.1f}%{flag}", clears)
+            f"{d:>+11,.0f} {pct}{flag}", clears)
 
 
 def _skew_warnings(a: Arm, b: Arm) -> list[str]:
