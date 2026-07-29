@@ -116,16 +116,25 @@ uv run terse proxy --config peers.json
 
 Each peer's tools are advertised **under their own names**. A name is qualified with the
 peer's `name` (`gh__search`, `kb__search`) only when two or more peers export the same
-one, and terse strips that prefix before forwarding. So a fleet whose tool names are
-already distinct — the normal case — is a drop-in: an existing client allowlist keeps
-working, and no name changes shape.
+one, and terse strips that prefix before forwarding. A tool whose name no other peer
+claims keeps that name, so those entries in an existing client allowlist keep working
+untouched.
 
-Two caveats, both needing a peer to miss a `tools/list` broadcast. A tool is named from
-the listing it appeared in, so if two peers *do* export the same name and only one
-answers, that copy is advertised bare that listing and qualified the next. And the routing
-table is exactly the most recent listing — a peer that missed it is not advertised, and
-calling one of its tools from a stale client-side list returns -32601 until the next
-listing. See terse#178.
+**Check your fleet before assuming it is a drop-in.** Collisions are not rare in
+practice: a real 9-server fleet measured 6 collisions across 49 distinct tool names —
+three language-server peers exporting an identical set (`definition`, `diagnostics`,
+`hover`, `references`, `rename_symbol`, `edit_file`). Every one of those 18 tool instances
+is qualified, so allowlist entries naming them must be updated. Servers that namespace
+their own tools (`kb.read.search`) never collide; servers with generic verb names usually
+do when you run more than one of a kind.
+
+Two caveats, both needing a peer to miss a `tools/list` broadcast entirely — the same
+measured fleet answers in 0.6-4.8s against a 30s broadcast timeout, so this means a hung
+server, not a slow one. A tool is named from the listing it appeared in, so if peers that
+*do* collide are reduced to one answering peer, that copy is advertised bare that listing
+and qualified the next. And the routing table is exactly the most recent listing — a peer
+that missed it is not advertised, and calling one of its tools from a stale client-side
+list returns -32601 until the next listing. See terse#178.
 
 The synthetic `terse.retrieve` tool (drop-to-retrieve) is advertised once, shared across
 every peer, regardless of which peer dropped the field; it is a reserved name, so a peer

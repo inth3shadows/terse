@@ -389,13 +389,22 @@ class Router:
         # would otherwise install a 30-second-old snapshot over a newer complete one,
         # resurrecting a tool its peer has since dropped. `_*_route_seq` records the seq
         # behind the installed table so a late listing is answered but not installed.
+        # ONE attribute per surface, holding (installed_seq, route). Routing needs BOTH
+        # — the table to look a name up in, and whether any listing has ever installed
+        # (which arms the pre-listing prefix fallback). Read as two attributes they could
+        # be torn: a reader preempted between the loads would pair the PRE-install table
+        # with the POST-install seq, missing the lookup AND suppressing the fallback, so a
+        # tool that is both advertised and routable answers -32601 — precisely when the
+        # first tools/list lands, which is when a real client sends its first tools/call.
         self._route_lock = Lock()
-        self.tool_route: dict[str, tuple[int, str]] = {}
-        self.prompt_route: dict[str, tuple[int, str]] = {}
-        self._tool_route_seq = -1
-        self._prompt_route_seq = -1
+        self._tool_state: tuple[int, dict[str, tuple[int, str]]] = (-1, {})
+        self._prompt_state: tuple[int, dict[str, tuple[int, str]]] = (-1, {})
         # What the installed table advertises, so a listing refused as stale can be
         # answered with names that are actually routable rather than its own stale view.
+        # Stored as a COPY: the caller appends RETRIEVE_TOOL_DEF to its own list after the
+        # lock, and aliasing would let that append accumulate into the stored one — a
+        # stale reply would then advertise `terse.retrieve` twice, which is a duplicate
+        # tool name on the wire and an MCP protocol violation.
         self._tool_entries: list[dict] = []
         self._prompt_entries: list[dict] = []
 
@@ -524,7 +533,8 @@ class Router:
                 self._write_client(reply)
             return
 
-        target = self._resolve(name, self.tool_route, self._tool_route_seq >= 0)
+        seq, route = self._tool_state          # ONE load — see __init__
+        target = self._resolve(name, route, seq >= 0)
         if target is not None:
             idx, bare = target
             rewritten = dict(msg)
@@ -556,6 +566,17 @@ class Router:
                               f"name from tools/list, or '<peer>{PREFIX_SEP}<tool>' for "
                               f"one of: {', '.join(self.by_name)})"}},
                 separators=(",", ":"), ensure_ascii=False))
+
+    @property
+    def tool_route(self) -> dict[str, tuple[int, str]]:
+        """The installed tools routing table. Read `_tool_state` for routing — this
+        accessor drops the seq half and must not be used to derive `listed`."""
+        return self._tool_state[1]
+
+    @property
+    def prompt_route(self) -> dict[str, tuple[int, str]]:
+        """The installed prompts routing table — see `tool_route`."""
+        return self._prompt_state[1]
 
     def _resolve(self, name: Any, route: dict[str, tuple[int, str]],
                  listed: bool) -> tuple[int, str] | None:
@@ -610,7 +631,8 @@ class Router:
         params = msg.get("params") or {}
         name = params.get("name")
         mid = msg.get("id")
-        target = self._resolve(name, self.prompt_route, self._prompt_route_seq >= 0)
+        seq, route = self._prompt_state        # ONE load — see __init__
+        target = self._resolve(name, route, seq >= 0)
         if target is not None:
             idx, bare = target
             rewritten = dict(msg)
@@ -1003,19 +1025,25 @@ class Router:
         is exactly the kind of gap this module promises not to hide.
         """
         counts: dict[str, int] = dict.fromkeys(reserved, 1)
+        # Which PEERS would produce each qualified form. Tracked per-peer, not as a plain
+        # tally, so a peer's qualified form is not counted against that same peer's own
+        # bare names: `gh` exporting both `search` and a tool literally named `gh__search`
+        # has no cross-peer collision, and renaming its second tool to `gh__gh__search`
+        # would break the allowlist this feature exists to preserve — and contradict the
+        # documented rule that a name is qualified only when two or more PEERS export it.
+        qual_by: dict[str, set[int]] = {}
         for idx, bare in ((i, it["name"]) for i, it in owned):
             counts[bare] = counts.get(bare, 0) + 1
-            q = f"{self.peers[idx].name}{PREFIX_SEP}{bare}"
-            counts[q] = counts.get(q, 0) + 1
-        # A name's own qualified form was just counted against it, so a bare name is
-        # unique iff its count is 1 — except when the qualified form IS the bare name of
-        # something else, which is precisely the shadow case that must qualify.
+            qual_by.setdefault(f"{self.peers[idx].name}{PREFIX_SEP}{bare}", set()).add(idx)
         entries: list[dict] = []
         route: dict[str, tuple[int, str]] = {}
         for idx, it in owned:
             bare = it["name"]
             qualified = f"{self.peers[idx].name}{PREFIX_SEP}{bare}"
-            exposed = bare if counts[bare] == 1 else qualified
+            # Claimants of this bare name: entries sharing it (plus any `reserved`), and
+            # any OTHER peer whose qualified form would land on it.
+            claimed = counts[bare] + len(qual_by.get(bare, frozenset()) - {idx})
+            exposed = bare if claimed == 1 else qualified
             if exposed in route:
                 sys.stderr.write(
                     f"[terse-multiproxy] name collision on {exposed!r}: peer "
@@ -1039,9 +1067,9 @@ class Router:
         tools, table = self._expose_names(self._collect_named(pb, "tools"),
                                           reserved=(lossy_mod.RETRIEVE_TOOL,))
         with self._route_lock:
-            if pb.seq >= self._tool_route_seq:
-                self.tool_route, self._tool_route_seq = table, pb.seq
-                self._tool_entries = tools
+            if pb.seq >= self._tool_state[0]:
+                self._tool_state = (pb.seq, table)
+                self._tool_entries = list(tools)   # COPY — see __init__
             else:
                 # Refused as stale — but this client is still owed a reply, and answering
                 # from THIS listing would advertise names the installed table does not
@@ -1116,9 +1144,9 @@ class Router:
         here."""
         prompts, table = self._expose_names(self._collect_named(pb, "prompts"))
         with self._route_lock:
-            if pb.seq >= self._prompt_route_seq:
-                self.prompt_route, self._prompt_route_seq = table, pb.seq
-                self._prompt_entries = prompts
+            if pb.seq >= self._prompt_state[0]:
+                self._prompt_state = (pb.seq, table)
+                self._prompt_entries = list(prompts)   # COPY — see __init__
             else:
                 prompts = list(self._prompt_entries)   # see _merge_tools_list
         return {"prompts": prompts}

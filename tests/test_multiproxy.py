@@ -1205,6 +1205,52 @@ def test_the_route_table_is_exactly_the_most_recent_listing():
         assert len(errs) == 1 and errs[0]["error"]["code"] == -32601, f"case {i}"
 
 
+def test_a_stale_listing_reply_does_not_duplicate_the_retrieve_tool(tmp_path):
+    # `_tool_entries` must be a COPY: the caller appends RETRIEVE_TOOL_DEF to its own list
+    # after the lock, and aliasing would accumulate that append into the stored entries, so
+    # a stale-refused reply would advertise `terse.retrieve` TWICE — a duplicate tool name
+    # on the wire, which is an MCP protocol violation some clients reject outright.
+    from terse.multiproxy import _PendingBroadcast
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(DROP_POLICY)), Peer("b", t1, Interceptor(DROP_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    assert router.has_drop
+    try:
+        _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
+        router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=9, seq=2, remaining=set(),
+            parts={0: {"result": {"tools": [{"name": "new"}]}}}))
+        stale = router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=8, seq=1, remaining=set(),
+            parts={0: {"result": {"tools": [{"name": "old"}]}}}))
+        names = [t["name"] for t in stale["tools"]]
+        assert names.count("terse.retrieve") == 1, names
+    finally:
+        router.close_senders()
+
+
+def test_a_peer_does_not_qualify_a_tool_against_its_own_sibling_name():
+    # `gh` exporting both `search` and a tool literally named `gh__search` has NO
+    # cross-peer collision. Counting a peer's qualified form against its own bare names
+    # renamed the second tool to `gh__gh__search`, contradicting the documented rule and
+    # breaking the allowlist #168 exists to preserve.
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("gh", t0, Interceptor(PLAIN_POLICY)), Peer("kb", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        merged = _drive_broadcast(
+            router, out, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            [{"result": {"tools": [{"name": "search"}, {"name": "gh__search"}]}},
+             {"result": {"tools": [{"name": "other"}]}}])
+        assert [t["name"] for t in merged["result"]["tools"]] == \
+            ["search", "gh__search", "other"]
+        assert router.tool_route["gh__search"] == (0, "gh__search")
+    finally:
+        router.close_senders()
+
+
 def test_a_late_timing_out_listing_does_not_clobber_a_newer_one():
     # `_route_lock` serializes installs but does not ORDER them, and two listings with
     # different client ids are concurrently pending. A broadcast that times out after
