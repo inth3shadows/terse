@@ -150,7 +150,10 @@ PLAIN_POLICY = Policy(rules=[Rule("gh.*", TIERS), Rule("items.*", TIERS)])
 
 # --- 1: tools/list merges + prefixes + single retrieve ---
 
-def test_tools_list_merges_prefixes_and_single_retrieve(tmp_path):
+def test_tools_list_exposes_uncollided_names_verbatim_and_single_retrieve(tmp_path):
+    # #168: names are qualified ONLY on a real cross-peer collision. These two peers share
+    # no tool name, so every tool keeps the name its own server gave it — which is what
+    # makes multiproxy a drop-in for a client allowlist instead of a migration.
     with _fake_http() as srv:
         cfg = _write_config(tmp_path, [
             {"name": "gh", "command": [sys.executable, str(FAKE)]},
@@ -164,8 +167,9 @@ def test_tools_list_merges_prefixes_and_single_retrieve(tmp_path):
     msgs = _lines(cout)
     assert len(msgs) == 1
     names = [t["name"] for t in msgs[0]["result"]["tools"]]
-    assert "gh__gh.api.items" in names and "gh__fs.read" in names
-    assert "http__items.get" in names and "http__items.body" in names
+    assert "gh.api.items" in names and "fs.read" in names
+    assert "items.get" in names and "items.body" in names
+    assert not [n for n in names if n.startswith(("gh__", "http__"))]
     assert names.count("terse.retrieve") == 1  # advertised exactly once, not per-peer
 
 
@@ -998,7 +1002,11 @@ def test_resource_templates_list_merges_concat():
         ["a://{x}", "b://{x}"]
 
 
-def test_prompts_list_merges_with_peer_prefix():
+def test_prompts_list_qualifies_only_the_collided_name():
+    # Prompts follow the SAME collision-only rule as tools (#168) — two surfaces that
+    # disagreed about when a name is qualified would be a client-visible inconsistency.
+    # "greet" is exported by both peers, so both copies are qualified; the two names
+    # unique to one peer are exposed verbatim.
     t0, t1 = _FakePeerTransport(), _FakePeerTransport()
     peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
     out = io.StringIO()
@@ -1007,12 +1015,470 @@ def test_prompts_list_merges_with_peer_prefix():
         merged = _drive_broadcast(
             router, out,
             {"jsonrpc": "2.0", "id": 5, "method": "prompts/list", "params": {}},
-            [{"result": {"prompts": [{"name": "greet"}]}},
-             {"result": {"prompts": [{"name": "farewell"}]}}])
+            [{"result": {"prompts": [{"name": "greet"}, {"name": "recap"}]}},
+             {"result": {"prompts": [{"name": "greet"}, {"name": "farewell"}]}}])
     finally:
         router.close_senders()
-    # prompt names ARE peer-prefixed (like tool names) so prompts/get can route by prefix
-    assert [p["name"] for p in merged["result"]["prompts"]] == ["a__greet", "b__farewell"]
+    assert [p["name"] for p in merged["result"]["prompts"]] == \
+        ["a__greet", "recap", "b__greet", "farewell"]
+    assert router.prompt_route == {"a__greet": (0, "greet"), "recap": (0, "recap"),
+                                   "b__greet": (1, "greet"), "farewell": (1, "farewell")}
+
+
+# --- #168: collision-only tool naming, and what must survive it ---
+
+def _two_peer_router(policy=None):
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    pol = policy or PLAIN_POLICY
+    peers = [Peer("a", t0, Interceptor(pol)), Peer("b", t1, Interceptor(pol))]
+    out = io.StringIO()
+    return t0, t1, peers, out, Router(peers, out, Lock(), broadcast_timeout=1000)
+
+
+def _peer_calls(t):
+    """Only the `tools/call` lines a peer received — the broadcast `tools/list` reaches
+    every peer, so a bare "did this peer get anything" check can't prove routing."""
+    return [m for m in (json.loads(ln) for ln in t.out.getvalue().splitlines() if ln.strip())
+            if m.get("method") == "tools/call"]
+
+
+def _await_peer_call(t, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while not _peer_calls(t) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    calls = _peer_calls(t)
+    assert len(calls) == 1
+    return calls[0]
+
+
+def _list_tools(router, out, per_peer):
+    return _drive_broadcast(
+        router, out, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        [{"result": {"tools": tools}} for tools in per_peer])
+
+
+def test_collided_tool_name_is_qualified_on_both_sides_and_routes_to_its_own_peer():
+    # The case unconditional prefixing existed to defend against: two peers both export
+    # "search". Both copies are qualified so the client can still address each one, and
+    # each qualified name must reach ITS peer with the bare name restored.
+    t0, t1, _, out, router = _two_peer_router()
+    try:
+        merged = _list_tools(router, out, [[{"name": "search"}], [{"name": "search"}]])
+        assert [t["name"] for t in merged["result"]["tools"]] == ["a__search", "b__search"]
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "b__search", "arguments": {"q": "x"}}}))
+        sent = _await_peer_call(t1)
+        assert _peer_calls(t0) == []                # routed to ONE peer, not fanned out
+        assert sent["params"] == {"name": "search", "arguments": {"q": "x"}}
+    finally:
+        router.close_senders()
+
+
+def test_uncollided_tool_routes_verbatim_but_bookkeeping_keeps_peer_attribution():
+    # The invariant collision-only naming could silently break: the tool is EXPOSED bare,
+    # so nothing in the wire name says which peer owns it — but `note_request` must still
+    # bucket it under the peer-qualified name, or two servers' corpora merge (#158/#143).
+    t0, t1, peers, out, router = _two_peer_router()
+    try:
+        merged = _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
+        assert [t["name"] for t in merged["result"]["tools"]] == ["only_a", "only_b"]
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "only_b"}}))
+        sent = _await_peer_call(t1)
+        assert _peer_calls(t0) == []
+        assert sent["params"]["name"] == "only_b"     # peer sees its own unchanged name
+        # ...but the audit/corpus bucket (pending = (wire_name, tracked_name, args_key))
+        # is peer-qualified, not the bare wire name
+        wire_name, tracked_name, _ = peers[1].inter.pending[2]
+        assert (wire_name, tracked_name) == ("only_b", "b__only_b")
+    finally:
+        router.close_senders()
+
+
+def test_advertised_name_containing_the_separator_is_not_re_split_as_a_peer_prefix():
+    # Peer "a" exports a tool literally named "b__thing". Exposed verbatim (no collision),
+    # a prefix-first router would re-read it as peer "b" + tool "thing" and misroute the
+    # call to the WRONG SERVER. The advertised-name table must win.
+    t0, t1, _, out, router = _two_peer_router()
+    try:
+        merged = _list_tools(router, out, [[{"name": "b__thing"}], [{"name": "other"}]])
+        assert [t["name"] for t in merged["result"]["tools"]] == ["b__thing", "other"]
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "b__thing"}}))
+        sent = _await_peer_call(t0)
+        assert _peer_calls(t1) == []                      # peer "b" never saw it
+        assert sent["params"]["name"] == "b__thing"       # name NOT stripped
+    finally:
+        router.close_senders()
+
+
+def test_retrieve_tool_name_is_reserved_so_a_peer_cannot_shadow_it():
+    # `terse.retrieve` is answered by the router itself. A peer exporting that name must
+    # be qualified even though no OTHER peer claims it, else the client's retrieve calls
+    # become ambiguous between the router and that peer.
+    from terse.lossy import RETRIEVE_TOOL
+    t0, t1, _, out, router = _two_peer_router()
+    try:
+        merged = _list_tools(router, out, [[{"name": RETRIEVE_TOOL}], [{"name": "other"}]])
+        assert [t["name"] for t in merged["result"]["tools"]] == [f"a__{RETRIEVE_TOOL}",
+                                                                  "other"]
+        assert RETRIEVE_TOOL not in router.tool_route
+    finally:
+        router.close_senders()
+
+
+def test_qualified_name_still_routes_before_any_tools_list():
+    # The prefix split survives as a FALLBACK: a client calling before it has listed
+    # (or holding a name from an earlier listing) must not get -32601.
+    t0, t1, _, out, router = _two_peer_router()
+    try:
+        assert router.tool_route == {}                 # nothing advertised yet
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "b__search"}}))
+        sent = _await_peer_call(t1)
+        assert _peer_calls(t0) == []
+        assert sent["params"]["name"] == "search"
+    finally:
+        router.close_senders()
+
+
+def test_a_peer_cannot_shadow_another_peers_qualified_name():
+    # Peers "a" and "b" both export "search", so both are qualified to a__search /
+    # b__search. Peer "c" exports a tool named LITERALLY "a__search" — with only bare
+    # names reserved it would be exposed verbatim, advertise a DUPLICATE name, and hijack
+    # every a__search call. The qualified forms are reserved too, so "c" is qualified in
+    # turn and no two exposed names are equal.
+    t0, t1, t2 = _FakePeerTransport(), _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer(n, t, Interceptor(PLAIN_POLICY))
+             for n, t in (("a", t0), ("b", t1), ("c", t2))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        merged = _drive_broadcast(
+            router, out, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            [{"result": {"tools": [{"name": "search"}]}},
+             {"result": {"tools": [{"name": "search"}]}},
+             {"result": {"tools": [{"name": "a__search"}]}}])
+        names = [t["name"] for t in merged["result"]["tools"]]
+        assert names == ["a__search", "b__search", "c__a__search"]
+        assert len(set(names)) == len(names)          # no duplicate on the wire
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "a__search"}}))
+        sent = _await_peer_call(t0)                   # peer "a", NOT the shadower
+        assert sent["params"]["name"] == "search"
+        assert _peer_calls(t2) == []
+    finally:
+        router.close_senders()
+
+
+def test_the_route_table_is_exactly_the_most_recent_listing():
+    # The contract after #178 withdrew route retention: no names are carried forward from
+    # peers that missed a listing. A peer absent from a listing is absent from the client's
+    # tool list too, so a call to it is a clean -32601 rather than a route into the dark.
+    # Whether that peer errored, timed out, or answered with an empty list is not a
+    # distinction the table draws — all three simply contribute nothing.
+    from terse.multiproxy import _PendingBroadcast
+    for i, part in enumerate([{"result": {"tools": []}},                       # empty
+                              {"error": {"code": -32601, "message": "nope"}},  # errored
+                              None]):                                          # timed out
+        _, _, _, out, router = _two_peer_router()
+        try:
+            _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
+            assert set(router.tool_route) == {"only_a", "only_b"}
+            parts = {0: {"result": {"tools": [{"name": "only_a"}]}}}
+            if part is not None:
+                parts[1] = part
+            router._merge_tools_list(_PendingBroadcast(
+                kind="tools/list", client_id=9, seq=1, remaining=set(), parts=parts))
+            assert set(router.tool_route) == {"only_a"}, f"case {i}"
+            router.route_client_line(json.dumps(
+                {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                 "params": {"name": "only_b"}}))
+        finally:
+            router.close_senders()
+        errs = [m for m in _lines(out) if "error" in m]
+        assert len(errs) == 1 and errs[0]["error"]["code"] == -32601, f"case {i}"
+
+
+def test_a_stale_listing_reply_does_not_duplicate_the_retrieve_tool(tmp_path):
+    # `_tool_entries` must be a COPY: the caller appends RETRIEVE_TOOL_DEF to its own list
+    # after the lock, and aliasing would accumulate that append into the stored entries, so
+    # a stale-refused reply would advertise `terse.retrieve` TWICE — a duplicate tool name
+    # on the wire, which is an MCP protocol violation some clients reject outright.
+    from terse.multiproxy import _PendingBroadcast
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(DROP_POLICY)), Peer("b", t1, Interceptor(DROP_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    assert router.has_drop
+    try:
+        _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
+        router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=9, seq=2, remaining=set(),
+            parts={0: {"result": {"tools": [{"name": "new"}]}}}))
+        stale = router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=8, seq=1, remaining=set(),
+            parts={0: {"result": {"tools": [{"name": "old"}]}}}))
+        names = [t["name"] for t in stale["tools"]]
+        assert names.count("terse.retrieve") == 1, names
+    finally:
+        router.close_senders()
+
+
+def test_exposed_names_are_unique_across_an_exhaustive_small_configuration_sweep():
+    """The uniqueness invariant, checked by exhaustion rather than by argument.
+
+    Three separate hand-reasoned versions of `_expose_names` each shipped a duplicate
+    (rounds 2, 3 and 6 of review). The claim is now: for ANY assignment of names to peers,
+    no two exposed names are equal unless one peer listed the same name twice. The
+    alphabet deliberately includes the `{peer}__{name}` shapes that make a qualified form
+    land on another entry's bare name, plus the reserved `terse.retrieve`.
+    """
+    from itertools import combinations_with_replacement, product
+
+    from terse.lossy import RETRIEVE_TOOL
+    names = ["x", "a__x", "b__a__x", RETRIEVE_TOOL, f"a__{RETRIEVE_TOOL}"]
+    peer_names = ("a", "b", "c")
+    peers = [Peer(n, _FakePeerTransport(), Interceptor(PLAIN_POLICY)) for n in peer_names]
+    router = Router(peers, io.StringIO(), Lock(), broadcast_timeout=1000)
+    per_peer = [t for t in combinations_with_replacement(names, 2) if len(set(t)) == len(t)]
+    try:
+        checked = 0
+        for combo in product(per_peer, repeat=len(peer_names)):
+            owned = [(idx, {"name": t}) for idx, tools in enumerate(combo) for t in tools]
+            entries, route = router._expose_names(owned, reserved=(RETRIEVE_TOOL,))
+            exposed = [e["name"] for e in entries]
+            assert len(set(exposed)) == len(exposed), (combo, exposed)
+            assert len(route) == len(exposed), (combo, exposed)
+            # and every entry still routes back to its own peer and its real name
+            for (idx, it), name in zip(owned, exposed, strict=True):
+                assert route[name] == (idx, it["name"])
+            checked += 1
+        assert checked == len(per_peer) ** len(peer_names) == 1000, checked
+    finally:
+        router.close_senders()
+
+
+def test_a_peers_emitted_qualified_form_still_contests_its_own_sibling_name():
+    # The other half of the sibling rule, and the case a per-peer exclusion got wrong:
+    # gh's `search` DOES collide with kb's, so gh emits `gh__search` — which now contests
+    # gh's OWN tool literally named `gh__search`. Excluding the entry's own peer left both
+    # on the wire under one name, so gh's `search` became unaddressable.
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("gh", t0, Interceptor(PLAIN_POLICY)), Peer("kb", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        merged = _drive_broadcast(
+            router, out, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            [{"result": {"tools": [{"name": "search"}, {"name": "gh__search"}]}},
+             {"result": {"tools": [{"name": "search"}]}}])
+        names = [t["name"] for t in merged["result"]["tools"]]
+        assert len(set(names)) == len(names), names
+        assert names == ["gh__search", "gh__gh__search", "kb__search"]
+        assert router.tool_route["gh__search"] == (0, "search")
+        assert router.tool_route["gh__gh__search"] == (0, "gh__search")
+    finally:
+        router.close_senders()
+
+
+def test_a_reserved_name_contests_a_sibling_without_any_cross_peer_collision():
+    # Same shape, reached with ONE peer: `terse.retrieve` is reserved, so gh's copy is
+    # qualified to `gh__terse.retrieve` — which must then contest gh's own tool of that
+    # literal name. No second peer is needed to produce the duplicate.
+    from terse.lossy import RETRIEVE_TOOL
+    _, _, _, out, router = _two_peer_router()
+    try:
+        merged = _list_tools(router, out,
+                             [[{"name": RETRIEVE_TOOL}, {"name": f"a__{RETRIEVE_TOOL}"}], []])
+        names = [t["name"] for t in merged["result"]["tools"]]
+        assert len(set(names)) == len(names), names
+        assert names == [f"a__{RETRIEVE_TOOL}", f"a__a__{RETRIEVE_TOOL}"]
+    finally:
+        router.close_senders()
+
+
+def test_a_peer_does_not_qualify_a_tool_against_its_own_sibling_name():
+    # `gh` exporting both `search` and a tool literally named `gh__search` has NO
+    # cross-peer collision. Counting a peer's qualified form against its own bare names
+    # renamed the second tool to `gh__gh__search`, contradicting the documented rule and
+    # breaking the allowlist #168 exists to preserve.
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("gh", t0, Interceptor(PLAIN_POLICY)), Peer("kb", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        merged = _drive_broadcast(
+            router, out, {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            [{"result": {"tools": [{"name": "search"}, {"name": "gh__search"}]}},
+             {"result": {"tools": [{"name": "other"}]}}])
+        assert [t["name"] for t in merged["result"]["tools"]] == \
+            ["search", "gh__search", "other"]
+        assert router.tool_route["gh__search"] == (0, "gh__search")
+    finally:
+        router.close_senders()
+
+
+def test_a_late_timing_out_listing_does_not_clobber_a_newer_one():
+    # `_route_lock` serializes installs but does not ORDER them, and two listings with
+    # different client ids are concurrently pending. A broadcast that times out after
+    # BROADCAST_TIMEOUT would otherwise install a 30-second-old snapshot over a newer
+    # complete one — resurrecting a tool its peer has since dropped ("old") and erasing
+    # one it has since gained ("new").
+    from terse.multiproxy import _PendingBroadcast
+    _, _, _, out, router = _two_peer_router()
+    try:
+        _list_tools(router, out, [[{"name": "old"}], [{"name": "only_b"}]])   # seq 0
+        # the client re-lists; everyone answers and peer a has replaced old with new
+        router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=10, seq=2, remaining=set(),
+            parts={0: {"result": {"tools": [{"name": "new"}]}},
+                   1: {"result": {"tools": [{"name": "only_b"}]}}}))
+        assert set(router.tool_route) == {"new", "only_b"}
+        # NOW the older broadcast finally times out with its stale snapshot
+        stale = router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=9, seq=1, remaining={1},
+            parts={0: {"result": {"tools": [{"name": "old"}]}}}))
+        # its own client is still answered — but with what is ACTUALLY routable, not with
+        # this listing's stale view: advertising "old" here would hand the client a name
+        # that returns -32601 the moment it calls it.
+        assert [t["name"] for t in stale["tools"]] == ["new", "only_b"]
+        assert set(router.tool_route) == {"new", "only_b"}      # ...and nothing installed
+    finally:
+        router.close_senders()
+
+
+def test_the_prefix_fallback_is_off_once_any_listing_has_landed_even_an_empty_one():
+    # Gating the fallback on "the table is empty" rather than "a listing has ever landed"
+    # leaves the wrong-server misroute reachable: an all-peers-timed-out listing installs
+    # {}, and `prompts/list` is answered -32601 by most servers, so prompt_route would be
+    # empty FOREVER and the fallback would never disarm.
+    from terse.multiproxy import _PendingBroadcast
+    _, t1, _, out, router = _two_peer_router()
+    try:
+        _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
+        router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=9, seq=1, remaining=set(), parts={}))
+        assert router.tool_route == {}                       # every peer timed out
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "b__x"}}))
+        assert _peer_calls(t1) == []                         # NOT split onto peer b
+    finally:
+        router.close_senders()
+    errs = [m for m in _lines(out) if "error" in m]
+    assert len(errs) == 1 and errs[0]["error"]["code"] == -32601
+
+
+def test_prompts_get_does_not_fall_back_after_a_prompts_list_that_every_peer_refused():
+    # prompt_route stays {} for a fleet whose peers all answer prompts/list with -32601.
+    # An emptiness-gated fallback would dispatch every unknown prompt name to a peer.
+    from terse.multiproxy import _PendingBroadcast
+    t0, t1, _, out, router = _two_peer_router()
+    try:
+        router._merge_prompts_list(_PendingBroadcast(
+            kind="prompts/list", client_id=1, seq=0, remaining=set(),
+            parts={0: {"error": {"code": -32601, "message": "no"}},
+                   1: {"error": {"code": -32601, "message": "no"}}}))
+        assert router.prompt_route == {}
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 4, "method": "prompts/get", "params": {"name": "b__nope"}}))
+        assert _peer_calls(t0) == [] and _peer_calls(t1) == []
+    finally:
+        router.close_senders()
+    errs = [m for m in _lines(out) if "error" in m]
+    assert len(errs) == 1 and "unknown prompt" in errs[0]["error"]["message"]
+
+
+def test_the_prefix_fallback_is_off_once_a_listing_has_landed():
+    # Peer "gh" exports a tool literally named "kb__thing" (exposed verbatim), then drops
+    # it while "kb" gains a tool called "thing". A fallback that fires on any unadvertised
+    # name would split the stale call and execute it on a DIFFERENT SERVER, with the
+    # client's arguments, successfully. After a listing exists, unknown means -32601.
+    from terse.multiproxy import _PendingBroadcast
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("gh", t0, Interceptor(PLAIN_POLICY)), Peer("kb", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        _list_tools(router, out, [[{"name": "kb__thing"}], []])
+        router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=9, seq=1, remaining=set(),
+            parts={0: {"result": {"tools": []}},
+                   1: {"result": {"tools": [{"name": "thing"}]}}}))
+        assert set(router.tool_route) == {"thing"}
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+             "params": {"name": "kb__thing", "arguments": {"danger": 1}}}))
+        assert _peer_calls(t1) == [] and _peer_calls(t0) == []   # no server ran it
+    finally:
+        router.close_senders()
+    errs = [m for m in _lines(out) if "error" in m]
+    assert len(errs) == 1 and errs[0]["error"]["code"] == -32601
+
+
+def test_a_depth_two_shadow_chain_stays_unique_in_either_config_order():
+    # The qualified-form reservation must not depend on config order. Reserving only the
+    # already-collided entries' qualified forms made it a single forward pass, so this
+    # chain produced a duplicate name in one order and not the other.
+    from terse.multiproxy import Router as R
+    chain = [("d", "c__a__x"), ("c", "a__x"), ("b", "x"), ("a", "x")]
+    for order in (chain, list(reversed(chain))):
+        transports = [_FakePeerTransport() for _ in order]
+        peers = [Peer(n, t, Interceptor(PLAIN_POLICY))
+                 for (n, _), t in zip(order, transports, strict=True)]
+        out = io.StringIO()
+        router = R(peers, out, Lock(), broadcast_timeout=1000)
+        try:
+            merged = _drive_broadcast(
+                router, out,
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                [{"result": {"tools": [{"name": tool}]}} for _, tool in order])
+            names = [t["name"] for t in merged["result"]["tools"]]
+            assert len(set(names)) == len(names), f"duplicate exposed name in {order}: {names}"
+            assert len(router.tool_route) == len(order)   # every peer stays addressable
+        finally:
+            router.close_senders()
+
+
+def test_an_unresolvable_duplicate_warns_without_debug(capsys):
+    # A peer listing the same name twice can't be disambiguated by qualification. The
+    # shadowed copy is DROPPED rather than advertised under a duplicate name — a duplicate
+    # is an MCP protocol violation, and a client that rejects the listing over it loses
+    # every peer's tools, not just this one. The warning is UNCONDITIONAL: a silently
+    # dropped tool is the gap this module promises not to hide (cf. the peer-0 notice).
+    _, _, _, out, router = _two_peer_router()
+    assert router.debug is False
+    try:
+        merged = _list_tools(router, out, [[{"name": "dup"}, {"name": "dup"}], []])
+        names = [t["name"] for t in merged["result"]["tools"]]
+        assert names == ["a__dup"]                    # advertised ONCE, not twice
+        assert len(set(names)) == len(names)
+        assert router.tool_route["a__dup"] == (0, "dup")
+    finally:
+        router.close_senders()
+    err = capsys.readouterr().err
+    assert "name collision on 'a__dup'" in err and "DROPPED" in err
+
+
+def test_tools_list_rebuilds_the_route_table_rather_than_accumulating():
+    # A peer can change its tool set and re-issue tools/list. A stale entry would keep
+    # routing a tool the peer no longer has, so the table is REPLACED, not merged.
+    _, _, _, out, router = _two_peer_router()
+    try:
+        _list_tools(router, out, [[{"name": "old"}], []])
+        assert "old" in router.tool_route
+        from terse.multiproxy import _PendingBroadcast
+        router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=1, seq=1, remaining=set(),
+            parts={0: {"result": {"tools": [{"name": "new"}]}}, 1: {"result": {"tools": []}}}))
+        assert set(router.tool_route) == {"new"}
+    finally:
+        router.close_senders()
 
 
 def test_ping_broadcast_replies_empty_result():
