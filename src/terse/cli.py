@@ -450,10 +450,9 @@ def _resolve_ledger(arg: str | None) -> tuple[list[dict], Path | None, int]:
     without it would misreport how much of the install was actually seen."""
     from .stats import aggregate, default_stats_log, load_stats
 
-    explicit = arg is not None
-    path = Path(arg).expanduser() if explicit else default_stats_log()
+    path = Path(arg).expanduser() if arg is not None else default_stats_log()
     if not path.exists() and not path.with_name(path.name + ".1").exists():
-        if explicit:
+        if arg is not None:
             print(f"policy autotune: no ledger at {path}", file=sys.stderr)
             return [], None, 2
         return [], None, 0
