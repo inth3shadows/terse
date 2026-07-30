@@ -193,14 +193,66 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   either way, but it is precisely the failure `reachable_tiers` exists to prevent. Unreachable
   via `policy generate` (which always pairs the two tiers) and untested because every test in
   the suite paired them too; both gaps now closed.
-- **`measure` gated a different pipeline than the one it scored.** `embedded`/`tier_total` are
-  computed from `compress_with(..., embedded=True)`, but the round-trip gate ran the default
+- **`measure` gated a different pipeline than the one it scored — in both functions, and the
+  first fix over-reached (#186, completed by #188).** `embedded`/`tier_total` are computed
+  from `compress_with(..., embedded=True)`, but the round-trip gate ran the default
   combination, so a failure that appeared only with the tier enabled would have kept its
-  savings banked and fed them to `policy generate`. The gate now validates the embedded
-  pipeline too. (The runtime was never at risk — `_lossless_stage` independently self-checks
-  the actually-applied combination.)
+  savings banked and fed them to `policy generate`.
+
+  The first pass fixed `measure_payload` and left `measure_joined` untouched — which is the
+  path that actually matters: `policy_gen._tool_decision` calls `measure_joined` FIRST for
+  every result group and falls back to `measure_payload` only when the join refuses, so on a
+  multi-block fleet the new gate never ran. It also folded both checks into ONE flag, so an
+  embedded-only failure zeroed `minify`/`tabularize`/`dictionary` as well and the generator
+  returned `tiers: []` — full passthrough for a tool whose default pipeline had just
+  round-tripped perfectly, plus a report claiming the codec was not lossless for it.
+
+  Both gates now run in both functions and are reported **separately**. `roundtrip_ok` covers
+  the default pipeline and still disqualifies the tool; the new `embedded_ok` covers the
+  opt-in fold and costs only that tier — `tier_total` falls back to the default pipeline's
+  own `raw - compressed` rather than to 0, `policy generate` drops just `embedded` and says
+  why (`embedded dropped — 1/4 result(s) failed the embedded round-trip`) instead of hiding a
+  losslessness failure behind "below threshold", and `terse verify --json` / the measurement
+  report carry an `embedded_gate` verdict so the split cannot make the failure invisible to
+  readers that filter on `roundtrip_ok` — the markdown report, `terse verify --json`, and
+  the `--html` banner all carry it. (The runtime was never at risk in any of this —
+  `_lossless_stage` independently self-checks the actually-applied combination.)
+
+  Two consequences of the split, both caught in review before merge and both about a
+  published number rather than the codec:
+
+  - **A dropped tier must not be counted in the savings it advertises.** `emb_fail` drops
+    `embedded` for the whole tool — the policy matches on tool *name*, so there is no
+    enabling it for only the results that round-tripped — yet `tier_total` still carried the
+    embedded saving of every row that *passed*. Measured on crafted rows: a tool reported
+    `22.5% saved` on tiers delivering `0.0%`, and cleared the passthrough threshold solely on
+    savings the generator had just refused to enable. `total` now falls back to the surviving
+    tiers' own `raw - compressed`, skipping rows the default gate already zeroed.
+  - **"Not evaluated" is not "failed".** When the default gate fails the embedded pipeline
+    never runs, and `embedded_ok` stays `False` rather than claim a pipeline is good on no
+    evidence — so every reader qualifies it with `roundtrip_ok`. Without that, the report
+    printed *"The default pipeline passed, so the savings below stand"* directly beneath
+    *"INVALID — 1/1 payloads FAILED the round-trip gate"*, listing the same sha twice, and a
+    CI job gating on `embedded_gate.ok` could not tell an opt-in-tier defect from total codec
+    failure.
+- **`mcp-status` resolved a RELATIVE `--policy` path against the scanner's own cwd (#188).**
+  `_default_diff_label` read the file and reported its `diff` setting, but a relative path
+  resolves against the MCP *launcher's* cwd — which a status scan cannot know, which is
+  exactly why the `policy_missing` check two lines away already skipped relative paths. So
+  the label could confidently report the setting of whatever `policy.json` happened to sit in
+  the scanner's directory. It now reports `policy (relative path — unknown)`.
+
+  Falling through to the dataclass default (`default (off)`) was the first fix and was
+  rejected in review: the file *does* state a value, the scanner simply cannot reach it, so
+  naming the built-in default is the same label-vs-reality divergence #181 exists to kill —
+  just pointing the other way, and with nothing to warn the reader that the value is a guess.
+  An unreachable value is now reported as unreachable. (`do_install` always writes an
+  absolute `--policy`, so only a hand-edited entry reaches this branch.)
 - **`_default_diff_label` now survives a pathologically deep policy file** (`RecursionError`
-  joins the caught set, matching every other `json.loads`-on-file site in the codebase).
+  joins the caught set — it is the *only* `json.loads`-on-file site that catches it; an
+  earlier draft of this entry claimed it "matches every other" such site, which is false:
+  `capture.py` catches `JSONDecodeError` alone and `policy.py` / `multiproxy.py` /
+  `install_mcp.py` catch nothing).
   Its truthiness check is deliberately UNCHANGED and now pinned by test: `load_policy` builds
   the policy with `bool(doc.get("diff", False))`, so `"diff": "false"` genuinely diffs at
   runtime, and reporting `policy (on)` is correct. A review flagged the truthiness as a bug;

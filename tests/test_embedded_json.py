@@ -372,19 +372,29 @@ def test_policy_with_embedded_but_not_tabularize_never_emits_a_table():
     assert T.decompress(out.text) == json.loads(raw)
 
 
-def test_measure_gate_covers_the_embedded_pipeline_it_scores():
-    """`measure` reports `embedded`/`tier_total` from `compress_with(embedded=True)`, so the
-    round-trip gate has to validate THAT pipeline — not just the default one. Otherwise a
-    tier that failed only with the flag on would keep its savings banked and feed them to
-    `policy generate`."""
-    from terse.measure import measure_payload
-    m = measure_payload(json.dumps({"response_text": json.dumps({"results": _records(20)})}))
-    assert m["roundtrip_ok"] is True
-    assert m["saved_cl100k"]["embedded"] > 0
+def _double_encoded(outer=6, inner=20) -> str:
+    """A payload that compresses under the DEFAULT pipeline *and* carries a JSON document
+    inside a string, so the two gates have visibly different consequences.
 
-    # Break ONLY the embedded pipeline. Patching `decompress` instead would also break
-    # `roundtrip_ok`, so the OLD gate would catch it and this test would pass with the fix
-    # reverted — mutation-tested, that is exactly what happened on the first attempt.
+    Both halves are load-bearing. Without the plain record array the default pipeline saves
+    exactly 0 here (`{"response_text": "..."}` has no repeated keys to fold), and a test
+    asserting that the default savings survive an embedded-gate failure would be asserting
+    `0 == 0` — green against the very over-reach it is meant to pin.
+
+    The inner array is the larger of the two on purpose: `embedded` is scored as a MARGINAL
+    tier, so it must clear `policy generate`'s threshold on its own to be offered at all.
+    At `outer == inner` it measures 3.4% and is dropped as uneconomic — which would let a
+    "the tier was dropped" assertion pass without the gate ever being consulted."""
+    return json.dumps({"results": _records(outer),
+                       "response_text": json.dumps({"results": _records(inner)})})
+
+
+def _break_only_embedded(monkeypatch):
+    """Corrupt the embedded pipeline and NOTHING else.
+
+    Patching `decompress` instead would also break `roundtrip_ok`, so the DEFAULT gate
+    would catch the mutation and a test built on it would pass with the fix reverted —
+    mutation-tested, that is exactly what happened on the first attempt."""
     import terse.measure as M
     real = M.transforms.compress_with
 
@@ -392,29 +402,193 @@ def test_measure_gate_covers_the_embedded_pipeline_it_scores():
         text = real(obj, *a, **kw)
         return T.minify({"corrupted": True}) if kw.get("embedded") else text
 
-    M.transforms.compress_with = only_embedded_is_broken
-    try:
-        bad = measure_payload(json.dumps({"response_text": json.dumps({"results": _records(20)})}))
-    finally:
-        M.transforms.compress_with = real
-    assert bad["roundtrip_ok"] is False       # the default pipeline is fine; the gate still fails
+    monkeypatch.setattr(M.transforms, "compress_with", only_embedded_is_broken)
+
+
+def test_measure_gate_covers_the_embedded_pipeline_it_scores(monkeypatch):
+    """`measure` reports `embedded`/`tier_total` from `compress_with(embedded=True)`, so the
+    round-trip gate has to validate THAT pipeline — not just the default one. Otherwise a
+    tier that failed only with the flag on would keep its savings banked and feed them to
+    `policy generate`."""
+    from terse.measure import measure_payload
+    m = measure_payload(_double_encoded())
+    assert m["roundtrip_ok"] is True and m["embedded_ok"] is True
+    assert m["saved_cl100k"]["embedded"] > 0
+
+    _break_only_embedded(monkeypatch)
+    bad = measure_payload(_double_encoded())
+    # #188: the two gates are SEPARATE. The default pipeline round-tripped, so the row is
+    # still valid and still banks its real savings — only the embedded tier is zeroed.
+    # Folding these into one flag (as #186 did) demoted a working tool to passthrough.
+    assert bad["roundtrip_ok"] is True
+    assert bad["embedded_ok"] is False
     assert bad["saved_cl100k"]["embedded"] == 0
-    assert bad["saved_cl100k"]["tier_total"] == 0
+    cl = bad["cl100k"]
+    assert bad["saved_cl100k"]["tier_total"] == cl["raw"] - cl["compressed"] > 0
+    # ...and every tier below embedded keeps its saving — the specific over-reach #188 names.
+    for tier in ("minify", "tabularize", "dictionary"):
+        assert bad["saved_cl100k"][tier] == m["saved_cl100k"][tier]
+    assert bad["saved_cl100k"]["tabularize"] > 0
 
 
-def test_diff_label_mirrors_the_runtime_coercion_rather_than_the_authors_intent():
+def test_measure_joined_gates_the_embedded_pipeline_it_scores(monkeypatch):
+    """The half #186 left unfixed (#188). `policy_gen._tool_decision` calls `measure_joined`
+    FIRST for every result group and only falls back to `measure_payload` when the join
+    refuses, so on a multi-block fleet this is the ONLY gate that ever runs."""
+    from terse.measure import measure_joined
+    raws = [_double_encoded(6) for _ in range(4)]
+    good = measure_joined(raws)
+    assert good is not None
+    assert good["roundtrip_ok"] is True and good["embedded_ok"] is True
+    assert good["saved_cl100k"]["embedded"] > 0
+
+    _break_only_embedded(monkeypatch)
+    bad = measure_joined(raws)
+    assert bad is not None
+    assert bad["roundtrip_ok"] is True        # default pipeline unaffected
+    assert bad["embedded_ok"] is False        # ...and this is what #186 never checked here
+    assert bad["saved_cl100k"]["embedded"] == 0
+    cl = bad["cl100k"]
+    assert bad["saved_cl100k"]["tier_total"] == cl["raw"] - cl["compressed"] > 0
+
+
+def test_policy_gen_drops_only_the_embedded_tier_when_its_gate_fails(monkeypatch):
+    """An embedded-only failure must cost the TIER, not the TOOL. #186's single flag sent
+    `_tool_decision` down the `gate_fail` branch to `tiers: []`, so a tool whose default
+    pipeline round-tripped fine lost its working compression entirely and the report claimed
+    the codec was not lossless for it."""
+    from terse.policy_gen import _tool_decision
+    groups = [[_double_encoded(6) for _ in range(4)]]
+    good = _tool_decision("srv.tool", groups, threshold=5.0)
+    assert "embedded" in good["tiers"] and good["emb_fail"] == 0
+
+    _break_only_embedded(monkeypatch)
+    bad = _tool_decision("srv.tool", groups, threshold=5.0)
+    assert bad["emb_fail"] == 1
+    assert "embedded" not in bad["tiers"]
+    assert bad["tiers"] == ["minify", "tabularize", "dictionary"]   # NOT [] — the tool works
+    assert bad["saved_pct"] > 5.0
+    # The reason must name the losslessness failure, not hide it behind "below threshold":
+    # `embedded` sums to 0 for these rows, so the economic branch would fire misleadingly.
+    assert "failed the embedded round-trip" in bad["reason"]
+
+
+def test_a_dropped_embedded_tier_is_not_counted_in_the_savings_it_advertises():
+    """`emb_fail` drops the tier for the WHOLE tool — the policy matches on tool name, so
+    there is no enabling it for only the results that round-tripped. Every row's embedded
+    saving is therefore undeliverable, INCLUDING the rows that passed the gate, and
+    `saved_pct` must fall back to what the surviving tiers actually ship.
+
+    Otherwise the generator writes a rule advertising savings it has just refused to enable
+    — and worse, a tool can clear the passthrough threshold entirely on them."""
+    import terse.policy_gen as PG
+    from terse.policy_gen import _tool_decision
+
+    def _row(embedded_ok, emb_saved):
+        # Crafted rows: zero default-pipeline savings, all of it in the embedded tier.
+        return {"shape": "s", "applicable": True, "roundtrip_ok": True,
+                "embedded_ok": embedded_ok,
+                "cl100k": {"raw": 100, "minified": 100, "tabular": 100,
+                           "compressed": 100, "embedded": 100 - emb_saved},
+                "saved_cl100k": {"minify": 0, "tabularize": 0, "dictionary": 0,
+                                 "embedded": emb_saved, "tier_total": emb_saved}}
+
+    crafted = [_row(False, 0), _row(True, 30), _row(True, 30), _row(True, 30)]
+    it = iter(crafted)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(PG, "measure_joined", lambda g: None)
+        mp.setattr(PG, "measure_payload", lambda r: next(it))
+        row = _tool_decision("t", [["x"]] * 4, threshold=5.0)
+
+    assert row["emb_fail"] == 1 and "embedded" not in row["tiers"]
+    # The three passing rows' 30% each must NOT be banked: the tier that would deliver them
+    # is off. Enabled tiers save 0 here, so the tool is passthrough — it never had 22.5%.
+    assert row["saved_pct"] == 0.0
+    assert row["embedded"] == 0
+    assert row["tiers"] == []
+
+
+def _decide(crafted, threshold=5.0):
+    import terse.policy_gen as PG
+    from terse.policy_gen import _tool_decision
+    it = iter(crafted)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(PG, "measure_joined", lambda g: None)
+        mp.setattr(PG, "measure_payload", lambda r: next(it))
+        return _tool_decision("t", [["x"]] * len(crafted), threshold=threshold)
+
+
+def _crafted(*, roundtrip_ok=True, embedded_ok=True, default_saved=0, emb_saved=0):
+    """One synthetic measure row. `saved_cl100k` is pre-zeroed when the default gate failed,
+    exactly as `measure` emits it, so these rows exercise the real contract."""
+    banked = {"minify": default_saved, "tabularize": 0, "dictionary": 0,
+              "embedded": emb_saved, "tier_total": default_saved + emb_saved}
+    if not roundtrip_ok:
+        banked = dict.fromkeys(banked, 0)
+    return {"shape": "s", "applicable": True, "roundtrip_ok": roundtrip_ok,
+            "embedded_ok": embedded_ok,
+            "cl100k": {"raw": 100, "minified": 100 - default_saved, "tabular": 100,
+                       "compressed": 100 - default_saved,
+                       "embedded": 100 - default_saved - emb_saved},
+            "saved_cl100k": banked}
+
+
+def test_a_default_gate_failure_does_not_read_as_an_embedded_gate_failure():
+    """`measure` leaves `embedded_ok` False when the default gate failed, because the
+    embedded pipeline was never evaluated there. Counting those as `emb_fail` would drop the
+    tier — and trigger the savings fallback — for a tool whose embedded fold never misbehaved
+    at all: one unrelated non-round-tripping payload silently repricing the whole tool."""
+    row = _decide([_crafted(roundtrip_ok=False, embedded_ok=False, default_saved=40),
+                   *[_crafted(emb_saved=30) for _ in range(3)]])
+    assert row["emb_fail"] == 0
+    # No fallback: the embedded savings of the three healthy results are still banked.
+    assert row["embedded"] == 90
+    assert row["saved_pct"] == 22.5
+
+
+def test_the_savings_fallback_does_not_resurrect_a_row_the_default_gate_zeroed():
+    """When `emb_fail` forces `total` to be recomputed from raw counts, rows that FAILED the
+    default gate must contribute 0 — `measure` already zeroed their banked savings, and
+    recomputing from `raw - compressed` would hand them back. The tool is passthrough either
+    way; what is at stake is the percentage its report row publishes."""
+    row = _decide([_crafted(roundtrip_ok=False, embedded_ok=False, default_saved=40),
+                   _crafted(embedded_ok=False, emb_saved=30),
+                   *[_crafted(emb_saved=30) for _ in range(2)]])
+    assert row["emb_fail"] == 1 and row["tiers"] == []
+    assert "failed round-trip" in row["reason"]      # the default gate disqualified it
+    assert row["saved_pct"] == 0.0                   # NOT 10.0 — the failed row banks nothing
+
+
+def test_diff_label_mirrors_the_runtime_coercion_rather_than_the_authors_intent(tmp_path):
     """DO NOT "fix" this to `is True`. `load_policy` builds the policy with
     `bool(doc.get("diff", False))`, so `"diff": "false"` genuinely diffs at runtime. The
     label reports EFFECTIVE behaviour; tightening it would print "off" while the proxy
     diffs — the label-vs-reality divergence #181 exists to kill. A review flagged the
     truthiness as a bug; this test is why it stays."""
-    import json as _json
-    import tempfile
-
     from terse.install_mcp import _default_diff_label
     from terse.policy import load_policy
-    for value in (True, False, "false", "no", 1, 0):
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
-            _json.dump({"version": 1, "diff": value}, fh)
-        label, runtime = _default_diff_label(fh.name), load_policy(fh.name).diff
+    for i, value in enumerate((True, False, "false", "no", 1, 0)):
+        path = tmp_path / f"policy{i}.json"
+        path.write_text(json.dumps({"version": 1, "diff": value}), encoding="utf-8")
+        label, runtime = _default_diff_label(str(path)), load_policy(str(path)).diff
         assert ("on" in label) is runtime, f"{value!r}: label {label} vs runtime {runtime}"
+
+
+def test_diff_label_refuses_to_resolve_a_relative_policy_path(tmp_path, monkeypatch):
+    """A relative `--policy` resolves against the MCP LAUNCHER's cwd, which a status scan
+    cannot know — `install_mcp`'s own `policy_missing` check skips relative paths for
+    exactly this reason. Reading one would resolve it against the SCANNER's cwd and report
+    the diff setting of whatever file happens to sit there: a confidently wrong label, the
+    same divergence #181 exists to kill."""
+    from terse.install_mcp import _default_diff_label
+    (tmp_path / "policy.json").write_text(json.dumps({"version": 1, "diff": True}),
+                                          encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    # The same file, named two ways. Absolute: read it and report what it says.
+    assert _default_diff_label(str(tmp_path / "policy.json")) == "policy (on)"
+    # Relative: say UNKNOWN. Not `default (off)` — the file states `"diff": true`, so
+    # naming the dataclass default here would assert a value that is wrong, just in the
+    # other direction. An unreachable value is reported as unreachable.
+    label = _default_diff_label("policy.json")
+    assert label == "policy (relative path — unknown)"
+    assert "on" not in label and "off" not in label

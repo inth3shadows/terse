@@ -14,6 +14,12 @@ can cost more than the keys it folds.
 
 Every measurement re-runs the lossless gate; a False here invalidates the row's
 savings (you cannot bank tokens you lost data to).
+
+There are TWO gates, reported separately (#188). `roundtrip_ok` covers the default
+pipeline and invalidates the whole row. `embedded_ok` covers the opt-in `embedded`
+fold and invalidates only that tier's saving — a tool whose embedded fold breaks
+keeps its working minify/tabularize/dictionary compression rather than being
+demoted to passthrough.
 """
 
 from __future__ import annotations
@@ -48,6 +54,8 @@ def measure_payload(raw: str) -> dict[str, Any]:
             "shape": shape,
             "applicable": False,
             "roundtrip_ok": True,
+            # Pass-through is trivially lossless under every tier, embedded included.
+            "embedded_ok": True,
             "cl100k": {"raw": raw_tok, "minified": raw_tok, "tabular": raw_tok,
                        "compressed": raw_tok, "embedded": raw_tok},
             "saved_cl100k": {"minify": 0, "tabularize": 0, "dictionary": 0, "embedded": 0,
@@ -62,18 +70,35 @@ def measure_payload(raw: str) -> dict[str, Any]:
     # decide it per tool on evidence, exactly as it does for `dictionary` — the tier is
     # opt-in precisely because it costs a primer paragraph, so it must earn its place.
     embedded = transforms.compress_with(obj, embedded=True)
-    # The gate must cover EVERY pipeline whose savings this row reports. `roundtrip_ok`
-    # exercises the default combination (embedded OFF), but the `embedded`/`tier_total`
-    # entries below are computed from `compress_with(..., embedded=True)` — scoring one
-    # pipeline while validating another. A tier that failed only with `embedded` on would
-    # have kept its savings banked here and fed them to `policy generate`. (The runtime is
-    # independently safe: `_lossless_stage` self-checks the actually-applied combination.)
+    # The gate must cover EVERY pipeline whose savings this row reports — as TWO verdicts,
+    # not one. `roundtrip_ok` exercises the default combination (embedded OFF), but the
+    # `embedded`/`tier_total` entries below are computed from
+    # `compress_with(..., embedded=True)`, so validating only the default would score one
+    # pipeline while gating another and feed a broken tier's savings to `policy generate`.
+    #
+    # They stay SEPARATE because the two failures mean different things and deserve
+    # different blast radii (#188). A default-pipeline failure says the codec cannot handle
+    # this tool's shape at all — it disqualifies the tool. An embedded-only failure says
+    # one opt-in tier broke; the tool's minify/tabularize/dictionary compression is still
+    # lossless and still worth banking. #186 folded both into a single flag, which zeroed
+    # every tier on an embedded-only failure and sent `policy_gen` to `tiers: []` — full
+    # passthrough for a tool that had just round-tripped fine.
+    #
+    # (The runtime is independently safe either way: `_lossless_stage` self-checks the
+    # actually-applied combination at request time.)
+    #
+    # When the default gate FAILS the embedded pipeline is never evaluated, and `embedded_ok`
+    # is left False rather than True: this flag never claims a pipeline is good on no
+    # evidence. "Not evaluated" is not "failed", though — every reader must therefore
+    # qualify an `embedded_ok` failure with `roundtrip_ok`, or it will report an
+    # embedded-tier defect for a payload whose real problem is the codec entirely.
     gate = transforms.roundtrip_ok(obj)
+    embedded_ok = gate
     if gate:
         try:
-            gate = transforms.decompress(embedded) == obj
+            embedded_ok = transforms.decompress(embedded) == obj
         except Exception:  # noqa: BLE001 — any decode failure is a failed gate
-            gate = False
+            embedded_ok = False
 
     raw_tok = count_cl100k(raw)
     min_tok = count_cl100k(minified)
@@ -94,13 +119,18 @@ def measure_payload(raw: str) -> dict[str, Any]:
         "minify": _saved(raw_tok, min_tok),
         "tabularize": _saved(min_tok, tab_tok),
         "dictionary": _saved(tab_tok, cmp_tok),
-        "embedded": _saved(cmp_tok, emb_tok),
+        # Zeroed on its own gate alone — you cannot bank tokens from a fold that lost data,
+        # but the tiers below it are untouched by that failure (#188).
+        "embedded": _saved(cmp_tok, emb_tok) if embedded_ok else 0,
         # Includes `embedded`, deliberately: this is what gates the passthrough decision, and
         # a tool whose ONLY saving is a double-encoded body (0.0% without the tier) would
         # otherwise score below threshold and never be offered the tier that unlocks it.
         # Safe to fold in, because `embedded` is size-guarded per occurrence and can never
         # come out larger — on a payload with no embedded JSON `emb_tok == cmp_tok` exactly.
-        "tier_total": _saved(raw_tok, emb_tok),
+        # When the embedded gate FAILED it falls back to the default pipeline's own total
+        # (`raw - compressed`), which is what the proxy would actually deliver — not 0,
+        # which would argue for passthrough on a tool that compresses fine.
+        "tier_total": _saved(raw_tok, emb_tok if embedded_ok else cmp_tok),
     }
     if not gate:
         saved = dict.fromkeys(saved, 0)
@@ -109,6 +139,7 @@ def measure_payload(raw: str) -> dict[str, Any]:
         "shape": shape,
         "applicable": True,
         "roundtrip_ok": gate,
+        "embedded_ok": embedded_ok,
         "cl100k": {"raw": raw_tok, "minified": min_tok, "tabular": tab_tok,
                    "compressed": cmp_tok, "embedded": emb_tok},
         "saved_cl100k": saved,
@@ -153,8 +184,20 @@ def measure_joined(raws: list[str]) -> dict[str, Any] | None:
     min_tok = count_cl100k(transforms.minify(objs))
     tab_tok = count_cl100k(transforms.compress_tabular(objs))
     cmp_tok = count_cl100k(transforms.compress(objs))
-    emb_tok = count_cl100k(transforms.compress_with(objs, embedded=True))
+    embedded = transforms.compress_with(objs, embedded=True)
+    emb_tok = count_cl100k(embedded)
+    # Two verdicts, exactly as in `measure_payload` — and this is the path that matters most:
+    # `policy_gen._tool_decision` calls `measure_joined` FIRST for every result group and
+    # only falls back to `measure_payload` when the join refuses, so on a multi-block fleet
+    # (the docstring's own motivating case) this is the only gate that ever runs. #186 fixed
+    # the fallback and left this one scoring a pipeline it did not validate (#188).
     gate = transforms.roundtrip_ok(objs)
+    embedded_ok = gate
+    if gate:
+        try:
+            embedded_ok = transforms.decompress(embedded) == objs
+        except Exception:  # noqa: BLE001 — any decode failure is a failed gate
+            embedded_ok = False
 
     def _saved(a: int | None, b: int | None) -> int | None:
         return None if a is None or b is None else a - b
@@ -163,8 +206,10 @@ def measure_joined(raws: list[str]) -> dict[str, Any] | None:
         "minify": _saved(raw_tok, min_tok),
         "tabularize": _saved(min_tok, tab_tok),
         "dictionary": _saved(tab_tok, cmp_tok),
-        "embedded": _saved(cmp_tok, emb_tok),
-        "tier_total": _saved(raw_tok, emb_tok),   # see measure_payload for why embedded counts
+        "embedded": _saved(cmp_tok, emb_tok) if embedded_ok else 0,
+        # see measure_payload for why embedded counts, and why an embedded-gate failure
+        # falls back to the default pipeline's total rather than to 0
+        "tier_total": _saved(raw_tok, emb_tok if embedded_ok else cmp_tok),
     }
     if not gate:
         saved = dict.fromkeys(saved, 0)       # same rule as measure_payload: no banking a loss
@@ -172,6 +217,7 @@ def measure_joined(raws: list[str]) -> dict[str, Any] | None:
         "shape": "joined-records",
         "applicable": True,
         "roundtrip_ok": gate,
+        "embedded_ok": embedded_ok,
         "blocks": len(raws),
         "cl100k": {"raw": raw_tok, "minified": min_tok, "tabular": tab_tok,
                    "compressed": cmp_tok, "embedded": emb_tok},

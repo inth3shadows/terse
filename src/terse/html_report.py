@@ -31,7 +31,7 @@ _CSS_VARS = """
   --grid: #e1e0d9; --baseline: #c3c2b7; --border: rgba(11,11,11,0.10);
   --series-1: #2a78d6; --series-2: #1baf7a; --series-3: #eda100;
   --diverging-pos: #2a78d6; --diverging-neg: #e34948; --diverging-mid: #f0efec;
-  --good: #0ca30c; --critical: #d03b3b;
+  --good: #0ca30c; --critical: #d03b3b; --warn: #b57a00;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -40,7 +40,7 @@ _CSS_VARS = """
     --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,0.10);
     --series-1: #3987e5; --series-2: #199e70; --series-3: #c98500;
     --diverging-pos: #3987e5; --diverging-neg: #e66767; --diverging-mid: #383835;
-    --good: #0ca30c; --critical: #d03b3b;
+    --good: #0ca30c; --critical: #d03b3b; --warn: #d9a520;
   }
 }
 """
@@ -64,6 +64,7 @@ h2 { font-size: 1.05rem; margin: 2.5rem 0 .75rem; padding-bottom: .4rem;
           border-radius: 8px; }
 .banner.good { color: var(--good); background: color-mix(in srgb, var(--good) 12%, transparent); }
 .banner.critical { color: var(--critical); background: color-mix(in srgb, var(--critical) 12%, transparent); }
+.banner.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
 table { border-collapse: collapse; width: 100%; font-size: .85rem; }
 th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid var(--grid); }
 th { color: var(--text-secondary); font-weight: 600; }
@@ -287,17 +288,36 @@ def forest_plot(rows: list[dict[str, Any]], form_label: str, control_label: str)
     return "".join(out)
 
 
+def _shas(rows: list[dict[str, Any]]) -> str:
+    return "".join(f"<li><code>{_esc(r.get('tool'))}</code> / "
+                   f"<code>{_esc(r.get('sha'))}</code> ({_esc(r.get('shape'))})</li>"
+                   for r in rows)
+
+
 def _gate_banner(rows: list[dict[str, Any]]) -> str:
     failures = [r for r in rows if not r.get("roundtrip_ok", False)]
     total, passed = len(rows), len(rows) - len(failures)
+    # The opt-in `embedded` fold carries its own verdict (#188), qualified by `roundtrip_ok`
+    # because `measure` leaves `embedded_ok` False when the default gate failed and the
+    # embedded pipeline was never evaluated. It is a WARNING, not a critical: the savings
+    # rendered below come from the default pipeline, which passed. Without it this banner
+    # rendered "✓ All N/N payloads round-trip losslessly" during a real tier failure —
+    # the headline artifact of `terse measure --html` showing all-green.
+    emb_failures = [r for r in rows
+                    if r.get("roundtrip_ok", False) and not r.get("embedded_ok", True)]
+    emb = ""
+    if emb_failures:
+        emb = (f'<div class="banner warn">! `embedded` tier — {len(emb_failures)}/{total} '
+               f'payloads FAILED its round-trip</div><ul>{_shas(emb_failures)}</ul>'
+               f'<p class="sub">The default pipeline passed, so the savings below stand; '
+               f'<code>policy generate</code> will not offer <code>embedded</code> for '
+               f'these tools.</p>')
     if failures:
-        items = "".join(f"<li><code>{_esc(r.get('tool'))}</code> / "
-                        f"<code>{_esc(r.get('sha'))}</code> ({_esc(r.get('shape'))})</li>"
-                        for r in failures)
         return (f'<div class="banner critical">✕ INVALID — {len(failures)}/{total} payloads '
-                f'FAILED the round-trip gate</div><ul>{items}</ul>'
-                f'<p class="sub">Savings below are meaningless until this is 0.</p>')
-    return f'<div class="banner good">✓ All {passed}/{total} payloads round-trip losslessly</div>'
+                f'FAILED the round-trip gate</div><ul>{_shas(failures)}</ul>'
+                f'<p class="sub">Savings below are meaningless until this is 0.</p>{emb}')
+    return (f'<div class="banner good">✓ All {passed}/{total} payloads round-trip '
+            f'losslessly</div>{emb}')
 
 
 def _details(summary: str, table_html: str) -> str:

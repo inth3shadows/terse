@@ -3,7 +3,8 @@
 report.py's existing markdown builders."""
 from __future__ import annotations
 
-from terse.report import build_trend_report, verify_summary
+from terse.html_report import build_html_report
+from terse.report import build_report, build_trend_report, verify_summary
 
 
 def test_verify_summary_passing_corpus_totals_and_gate():
@@ -35,6 +36,64 @@ def test_verify_summary_flags_gate_failures():
     assert s["lossless_gate"]["ok"] is False
     assert s["lossless_gate"]["passed"] == 1
     assert s["lossless_gate"]["failures"] == [{"tool": "t", "sha": "bad", "shape": "s"}]
+
+
+def test_embedded_gate_failure_is_reported_without_invalidating_the_run():
+    """#188 split the one gate into two. `embedded_ok` costs only its own tier, so it must
+    NOT flip `lossless_gate.ok` — but it must still appear, or every reader that filters on
+    `roundtrip_ok` (this summary, `build_report`, `history`, `html_report`) would show a
+    clean run while an opt-in tier was silently losing data."""
+    rows = [
+        {"tool": "t", "sha": "ok", "shape": "s", "roundtrip_ok": True, "embedded_ok": True,
+         "cl100k": {"raw": 10, "compressed": 5}},
+        {"tool": "t", "sha": "emb", "shape": "s", "roundtrip_ok": True, "embedded_ok": False,
+         "cl100k": {"raw": 10, "compressed": 5}},
+    ]
+    s = verify_summary(rows, {"total": 2}, "c")
+    assert s["lossless_gate"]["ok"] is True          # the default pipeline round-tripped
+    assert s["embedded_gate"]["ok"] is False
+    assert s["embedded_gate"]["failures"] == [{"tool": "t", "sha": "emb", "shape": "s"}]
+    # Same key names as its `lossless_gate` sibling, so a scripted reader can treat the two
+    # verdict blocks symmetrically instead of KeyError-ing on one of them.
+    assert s["embedded_gate"]["passed"] == 1
+    assert s["embedded_gate"]["evaluated"] == 2 and s["embedded_gate"]["total"] == 2
+
+    md = build_report(rows, {"total": 2, "by_tool": {"t": 2}, "by_shape": {"s": 2}})
+    assert "round-trip losslessly" in md                      # not marked INVALID
+    assert "`embedded` tier: 1/2 payloads FAILED" in md
+    assert "`t` / `emb` (s)" in md
+    html = build_html_report(rows, {"total": 2, "by_tool": {"t": 2}, "by_shape": {"s": 2}})
+    assert "banner warn" in html and "`embedded` tier" in html
+
+
+def test_an_unevaluated_embedded_gate_is_not_reported_as_a_failure():
+    """`measure` leaves `embedded_ok` False when the DEFAULT gate failed, because the
+    embedded pipeline was never run there — "not evaluated" is not "failed". Every reader
+    must qualify on `roundtrip_ok`, or a total codec failure also lands in the embedded
+    list: the markdown printed "The default pipeline passed, so the savings below stand"
+    directly beneath "INVALID — 1/1 payloads FAILED the round-trip gate", same sha twice."""
+    rows = [{"tool": "t", "sha": "x", "shape": "s", "roundtrip_ok": False,
+             "embedded_ok": False, "cl100k": {"raw": 10, "compressed": 10}}]
+    cov = {"total": 1, "by_tool": {"t": 1}, "by_shape": {"s": 1}}
+    s = verify_summary(rows, cov, "c")
+    assert s["lossless_gate"]["ok"] is False
+    # A CI job gating on this must be able to tell an opt-in-tier defect from total failure.
+    assert s["embedded_gate"] == {"ok": True, "passed": 0, "evaluated": 0, "total": 1,
+                                  "failures": []}
+    for doc in (build_report(rows, cov), build_html_report(rows, cov)):
+        assert "INVALID" in doc
+        assert "embedded" not in doc.split("Coverage")[0]
+
+
+def test_rows_predating_the_embedded_gate_read_as_clean():
+    """A corpus measured before #188 has no `embedded_ok` key. It must default to True —
+    absence of the field is not evidence of a failure, and defaulting the other way would
+    print an alarming (and unfounded) tier failure for every historical run."""
+    rows = [{"tool": "t", "sha": "a", "shape": "s", "roundtrip_ok": True,
+             "cl100k": {"raw": 10, "compressed": 5}}]
+    assert verify_summary(rows, {"total": 1}, "c")["embedded_gate"]["ok"] is True
+    assert "`embedded` tier" not in build_report(rows, {"total": 1, "by_tool": {"t": 1},
+                                                        "by_shape": {"s": 1}})
 
 _RUN_A = {"ts": "t1", "label": "corpus", "n_payloads": 3, "lossless_pass": 3,
           "raw_tok": 300, "compressed_tok": 180, "saved_tok": 120, "saved_pct": 40.0}

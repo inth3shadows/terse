@@ -630,6 +630,16 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
     # `non_json` is reported, not acted on (#147, and the reasoning at the branch below).
     non_json = sum(1 for r in rows if not r["applicable"])
     gate_fail = sum(1 for r in rows if not r["roundtrip_ok"])
+    # The embedded gate is counted separately and costs only its own tier (#188): the
+    # default pipeline round-tripped, so the tool still compresses — demoting it to
+    # passthrough would discard working savings and report the codec as not-lossless for a
+    # shape it handles. `.get` defaults True so a row from an older corpus/plugin that
+    # predates the field reads as "nothing to object to" rather than silently dropping the
+    # tier for every tool. Counted only over rows whose DEFAULT pipeline passed: when that
+    # gate fails the embedded one is never evaluated, and `embedded_ok` is left False to
+    # avoid claiming a pipeline is good on no evidence — which is not the same as a failure.
+    emb_fail = sum(1 for r in rows
+                   if r["roundtrip_ok"] and not r.get("embedded_ok", True))
 
     raw_tok = sum(r["cl100k"]["raw"] or 0 for r in rows)
     minify = sum(r["saved_cl100k"]["minify"] or 0 for r in rows)
@@ -640,6 +650,19 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
     # should read as "this tier saved nothing" rather than KeyError the whole run.
     embedded = sum(r["saved_cl100k"].get("embedded") or 0 for r in rows)
     total = sum(r["saved_cl100k"]["tier_total"] or 0 for r in rows)
+    if emb_fail:
+        # The tier is dropped for the WHOLE tool — the policy matches on tool name, so
+        # there is no way to enable it for only the results whose fold round-tripped. Every
+        # row's embedded saving is therefore undeliverable, including the rows that PASSED
+        # the gate, and `total` must fall back to what the surviving tiers actually ship.
+        # Without this the generator writes a rule advertising savings it has just refused
+        # to enable, and — worse — a tool can clear the passthrough threshold entirely on
+        # them: measured 22.5% saved on a tool whose remaining tiers deliver 0.0%.
+        embedded = 0
+        total = sum((r["cl100k"]["raw"] or 0) - (r["cl100k"]["compressed"] or 0)
+                    # A row that failed the DEFAULT gate banks nothing, per the zeroing rule
+                    # in `measure`; recomputing from raw counts here would resurrect it.
+                    for r in rows if r["roundtrip_ok"])
     total_pct = _pct(total, raw_tok)
     dict_pct = _pct(dictionary, raw_tok)
     emb_pct = _pct(embedded, raw_tok)
@@ -662,7 +685,7 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
         "saved_pct": round(total_pct, 1), "dict_pct": round(dict_pct, 1),
         "emb_pct": round(emb_pct, 1),
         "minify": minify, "tabularize": tabularize, "dictionary": dictionary,
-        "embedded": embedded,
+        "embedded": embedded, "emb_fail": emb_fail,
         "drop_suggestion": drop_suggestion, "drop_rows": drop_rows,
     }
 
@@ -703,7 +726,13 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
     # paragraph the client re-reads every turn (#168/#170), so it is added only where the
     # measurement says the tool actually ships JSON inside a string. On every other tool the
     # marginal saving is exactly 0 and this is silently skipped.
-    if emb_pct >= threshold:
+    # An embedded-gate failure drops the tier on its own evidence, ahead of the threshold
+    # test — `embedded` already sums to 0 for those rows, so without this branch the tool
+    # would read "below threshold" and hide a losslessness failure behind an economic one.
+    if emb_fail:
+        parts.append(f"embedded dropped — {emb_fail}/{len(rows)} result(s) failed the "
+                     f"embedded round-trip")
+    elif emb_pct >= threshold:
         tiers.append("embedded")
         parts.append(f"embedded +{emb_pct:.1f}%")
     elif embedded:
