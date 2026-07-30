@@ -473,6 +473,92 @@ def test_policy_gen_drops_only_the_embedded_tier_when_its_gate_fails(monkeypatch
     assert "failed the embedded round-trip" in bad["reason"]
 
 
+def test_a_dropped_embedded_tier_is_not_counted_in_the_savings_it_advertises():
+    """`emb_fail` drops the tier for the WHOLE tool — the policy matches on tool name, so
+    there is no enabling it for only the results that round-tripped. Every row's embedded
+    saving is therefore undeliverable, INCLUDING the rows that passed the gate, and
+    `saved_pct` must fall back to what the surviving tiers actually ship.
+
+    Otherwise the generator writes a rule advertising savings it has just refused to enable
+    — and worse, a tool can clear the passthrough threshold entirely on them."""
+    import terse.policy_gen as PG
+    from terse.policy_gen import _tool_decision
+
+    def _row(embedded_ok, emb_saved):
+        # Crafted rows: zero default-pipeline savings, all of it in the embedded tier.
+        return {"shape": "s", "applicable": True, "roundtrip_ok": True,
+                "embedded_ok": embedded_ok,
+                "cl100k": {"raw": 100, "minified": 100, "tabular": 100,
+                           "compressed": 100, "embedded": 100 - emb_saved},
+                "saved_cl100k": {"minify": 0, "tabularize": 0, "dictionary": 0,
+                                 "embedded": emb_saved, "tier_total": emb_saved}}
+
+    crafted = [_row(False, 0), _row(True, 30), _row(True, 30), _row(True, 30)]
+    it = iter(crafted)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(PG, "measure_joined", lambda g: None)
+        mp.setattr(PG, "measure_payload", lambda r: next(it))
+        row = _tool_decision("t", [["x"]] * 4, threshold=5.0)
+
+    assert row["emb_fail"] == 1 and "embedded" not in row["tiers"]
+    # The three passing rows' 30% each must NOT be banked: the tier that would deliver them
+    # is off. Enabled tiers save 0 here, so the tool is passthrough — it never had 22.5%.
+    assert row["saved_pct"] == 0.0
+    assert row["embedded"] == 0
+    assert row["tiers"] == []
+
+
+def _decide(crafted, threshold=5.0):
+    import terse.policy_gen as PG
+    from terse.policy_gen import _tool_decision
+    it = iter(crafted)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(PG, "measure_joined", lambda g: None)
+        mp.setattr(PG, "measure_payload", lambda r: next(it))
+        return _tool_decision("t", [["x"]] * len(crafted), threshold=threshold)
+
+
+def _crafted(*, roundtrip_ok=True, embedded_ok=True, default_saved=0, emb_saved=0):
+    """One synthetic measure row. `saved_cl100k` is pre-zeroed when the default gate failed,
+    exactly as `measure` emits it, so these rows exercise the real contract."""
+    banked = {"minify": default_saved, "tabularize": 0, "dictionary": 0,
+              "embedded": emb_saved, "tier_total": default_saved + emb_saved}
+    if not roundtrip_ok:
+        banked = dict.fromkeys(banked, 0)
+    return {"shape": "s", "applicable": True, "roundtrip_ok": roundtrip_ok,
+            "embedded_ok": embedded_ok,
+            "cl100k": {"raw": 100, "minified": 100 - default_saved, "tabular": 100,
+                       "compressed": 100 - default_saved,
+                       "embedded": 100 - default_saved - emb_saved},
+            "saved_cl100k": banked}
+
+
+def test_a_default_gate_failure_does_not_read_as_an_embedded_gate_failure():
+    """`measure` leaves `embedded_ok` False when the default gate failed, because the
+    embedded pipeline was never evaluated there. Counting those as `emb_fail` would drop the
+    tier — and trigger the savings fallback — for a tool whose embedded fold never misbehaved
+    at all: one unrelated non-round-tripping payload silently repricing the whole tool."""
+    row = _decide([_crafted(roundtrip_ok=False, embedded_ok=False, default_saved=40),
+                   *[_crafted(emb_saved=30) for _ in range(3)]])
+    assert row["emb_fail"] == 0
+    # No fallback: the embedded savings of the three healthy results are still banked.
+    assert row["embedded"] == 90
+    assert row["saved_pct"] == 22.5
+
+
+def test_the_savings_fallback_does_not_resurrect_a_row_the_default_gate_zeroed():
+    """When `emb_fail` forces `total` to be recomputed from raw counts, rows that FAILED the
+    default gate must contribute 0 — `measure` already zeroed their banked savings, and
+    recomputing from `raw - compressed` would hand them back. The tool is passthrough either
+    way; what is at stake is the percentage its report row publishes."""
+    row = _decide([_crafted(roundtrip_ok=False, embedded_ok=False, default_saved=40),
+                   _crafted(embedded_ok=False, emb_saved=30),
+                   *[_crafted(emb_saved=30) for _ in range(2)]])
+    assert row["emb_fail"] == 1 and row["tiers"] == []
+    assert "failed round-trip" in row["reason"]      # the default gate disqualified it
+    assert row["saved_pct"] == 0.0                   # NOT 10.0 — the failed row banks nothing
+
+
 def test_diff_label_mirrors_the_runtime_coercion_rather_than_the_authors_intent(tmp_path):
     """DO NOT "fix" this to `is True`. `load_policy` builds the policy with
     `bool(doc.get("diff", False))`, so `"diff": "false"` genuinely diffs at runtime. The
@@ -500,5 +586,9 @@ def test_diff_label_refuses_to_resolve_a_relative_policy_path(tmp_path, monkeypa
     monkeypatch.chdir(tmp_path)
     # The same file, named two ways. Absolute: read it and report what it says.
     assert _default_diff_label(str(tmp_path / "policy.json")) == "policy (on)"
-    # Relative: fall through to the dataclass default rather than trust the scanner's cwd.
-    assert _default_diff_label("policy.json").startswith("default (")
+    # Relative: say UNKNOWN. Not `default (off)` — the file states `"diff": true`, so
+    # naming the dataclass default here would assert a value that is wrong, just in the
+    # other direction. An unreachable value is reported as unreachable.
+    label = _default_diff_label("policy.json")
+    assert label == "policy (relative path — unknown)"
+    assert "on" not in label and "off" not in label

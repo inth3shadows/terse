@@ -86,6 +86,12 @@ def measure_payload(raw: str) -> dict[str, Any]:
     #
     # (The runtime is independently safe either way: `_lossless_stage` self-checks the
     # actually-applied combination at request time.)
+    #
+    # When the default gate FAILS the embedded pipeline is never evaluated, and `embedded_ok`
+    # is left False rather than True: this flag never claims a pipeline is good on no
+    # evidence. "Not evaluated" is not "failed", though — every reader must therefore
+    # qualify an `embedded_ok` failure with `roundtrip_ok`, or it will report an
+    # embedded-tier defect for a payload whose real problem is the codec entirely.
     gate = transforms.roundtrip_ok(obj)
     embedded_ok = gate
     if gate:

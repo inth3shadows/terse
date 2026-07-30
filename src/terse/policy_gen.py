@@ -635,8 +635,11 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
     # passthrough would discard working savings and report the codec as not-lossless for a
     # shape it handles. `.get` defaults True so a row from an older corpus/plugin that
     # predates the field reads as "nothing to object to" rather than silently dropping the
-    # tier for every tool.
-    emb_fail = sum(1 for r in rows if not r.get("embedded_ok", True))
+    # tier for every tool. Counted only over rows whose DEFAULT pipeline passed: when that
+    # gate fails the embedded one is never evaluated, and `embedded_ok` is left False to
+    # avoid claiming a pipeline is good on no evidence — which is not the same as a failure.
+    emb_fail = sum(1 for r in rows
+                   if r["roundtrip_ok"] and not r.get("embedded_ok", True))
 
     raw_tok = sum(r["cl100k"]["raw"] or 0 for r in rows)
     minify = sum(r["saved_cl100k"]["minify"] or 0 for r in rows)
@@ -647,6 +650,19 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
     # should read as "this tier saved nothing" rather than KeyError the whole run.
     embedded = sum(r["saved_cl100k"].get("embedded") or 0 for r in rows)
     total = sum(r["saved_cl100k"]["tier_total"] or 0 for r in rows)
+    if emb_fail:
+        # The tier is dropped for the WHOLE tool — the policy matches on tool name, so
+        # there is no way to enable it for only the results whose fold round-tripped. Every
+        # row's embedded saving is therefore undeliverable, including the rows that PASSED
+        # the gate, and `total` must fall back to what the surviving tiers actually ship.
+        # Without this the generator writes a rule advertising savings it has just refused
+        # to enable, and — worse — a tool can clear the passthrough threshold entirely on
+        # them: measured 22.5% saved on a tool whose remaining tiers deliver 0.0%.
+        embedded = 0
+        total = sum((r["cl100k"]["raw"] or 0) - (r["cl100k"]["compressed"] or 0)
+                    # A row that failed the DEFAULT gate banks nothing, per the zeroing rule
+                    # in `measure`; recomputing from raw counts here would resurrect it.
+                    for r in rows if r["roundtrip_ok"])
     total_pct = _pct(total, raw_tok)
     dict_pct = _pct(dictionary, raw_tok)
     emb_pct = _pct(embedded, raw_tok)

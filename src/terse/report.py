@@ -483,7 +483,14 @@ def verify_summary(rows: list[dict[str, Any]], coverage: dict[str, Any],
     # invalidate the savings below — those come from the default pipeline, which passed —
     # but an opt-in tier that loses data is still a codec defect, and splitting the gates
     # would otherwise make it vanish from every report that only reads `roundtrip_ok`.
-    emb_failures = [r for r in rows if not r.get("embedded_ok", True)]
+    #
+    # Qualified by `roundtrip_ok`, and that qualification is load-bearing: `measure` leaves
+    # `embedded_ok` False when the DEFAULT gate failed, because the embedded pipeline was
+    # never evaluated there. Counting those rows would put every total-codec-failure sha in
+    # the embedded list too, telling a CI job gating on `embedded_gate.ok` that an opt-in
+    # tier broke when in fact the codec failed outright.
+    emb_evaluated = [r for r in rows if r.get("roundtrip_ok", False)]
+    emb_failures = [r for r in emb_evaluated if not r.get("embedded_ok", True)]
     total = len(rows)
 
     def _bucket(sub: list[dict[str, Any]]) -> dict[str, Any]:
@@ -505,6 +512,13 @@ def verify_summary(rows: list[dict[str, Any]], coverage: dict[str, Any],
         },
         "embedded_gate": {
             "ok": not emb_failures,
+            # Same key names as `lossless_gate` so a scripted reader can treat the two
+            # verdict blocks symmetrically — plus `evaluated`, which the sibling does not
+            # need: the embedded gate only runs on payloads the default gate cleared, so
+            # `passed + failed` is `evaluated`, not `total`.
+            "passed": len(emb_evaluated) - len(emb_failures),
+            "evaluated": len(emb_evaluated),
+            "total": total,
             "failures": [{"tool": r.get("tool"), "sha": r.get("sha"),
                           "shape": r.get("shape")} for r in emb_failures],
         },
@@ -539,7 +553,12 @@ def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
     # The opt-in `embedded` fold gets its own verdict (#188): it costs only its own tier,
     # so it never marks the report INVALID — but it must still be visible, or splitting the
     # gates would hide a real losslessness failure from every reader of this section.
-    emb_failures = [r for r in rows if not r.get("embedded_ok", True)]
+    # Only among rows the default gate CLEARED — see `verify_summary` for why. Printing an
+    # embedded failure for a row already listed as INVALID above put "The default pipeline
+    # passed, so the savings below stand" directly beneath "INVALID — n/n payloads FAILED",
+    # with the same sha in both lists.
+    emb_failures = [r for r in rows
+                    if r.get("roundtrip_ok", False) and not r.get("embedded_ok", True)]
     if emb_failures:
         out += [
             f"**`embedded` tier: {len(emb_failures)}/{total} payloads FAILED its round-trip.**",

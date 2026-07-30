@@ -328,9 +328,16 @@ def _default_diff_label(policy_path: str | None) -> str:
     # against the MCP launcher's cwd, which a status scan cannot know. Reading it would
     # resolve against the *scanner's* cwd instead and report the diff setting of whatever
     # file happens to sit there — a confidently wrong label, which is precisely the
-    # label-vs-reality divergence #181 exists to kill. Falling through to the dataclass
-    # default is the honest answer: it is what the proxy uses when the file states nothing.
-    if policy_path and os.path.isabs(policy_path):
+    # label-vs-reality divergence #181 exists to kill.
+    #
+    # Falling through to the dataclass default would NOT be honest either: the file does
+    # state a value, the scanner simply cannot reach it, so printing `default (off)` while
+    # that file says `"diff": true` is the same divergence pointing the other way. Say
+    # unknown, and say why. (`do_install` always writes an absolute `--policy`, so only a
+    # hand-edited entry reaches this branch.)
+    if policy_path and not os.path.isabs(policy_path):
+        return "policy (relative path — unknown)"
+    if policy_path:
         try:
             doc = json.loads(Path(policy_path).read_text(encoding="utf-8"))
             # Truthiness is CORRECT here and must stay: `load_policy` builds the real policy
