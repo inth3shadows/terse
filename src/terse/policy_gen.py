@@ -16,8 +16,12 @@ round-trip-gated Tier-0/0.5 tiers, never a lossy mode):
        denominator, so a mostly-text tool falls below the threshold on its own.
     2. total savings %  < threshold                    -> passthrough  (transform cost
        not worth a marginal gain)
-    3. otherwise  ["minify","tabularize"] (+ "dictionary" iff its MARGINAL saving clears
-       the threshold — mirrors the hand-authored example dropping dictionary on `kb.*`).
+    3. otherwise  ["minify","tabularize"] (+ "dictionary" and/or "embedded", each iff its
+       own MARGINAL saving clears the threshold — mirrors the hand-authored example
+       dropping dictionary on `kb.*`). Both are opt-in for the same reason: each costs a
+       primer paragraph the client re-reads every turn (#168/#170), so it is enabled only
+       where measurement shows it pays. `embedded` is what makes a tool that ships its
+       body as a JSON string compressible at all (0.0% -> ~41% on the reference shape).
 
 Separately, it SUGGESTS drop-to-retrieve candidates (#47) — fields that are large AND
 near-unique, where the lossless tiers are structurally powerless — nothing repeats to fold —
@@ -631,9 +635,14 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
     minify = sum(r["saved_cl100k"]["minify"] or 0 for r in rows)
     tabularize = sum(r["saved_cl100k"]["tabularize"] or 0 for r in rows)
     dictionary = sum(r["saved_cl100k"]["dictionary"] or 0 for r in rows)
+    # `.get` with a default, defensively: every row here comes from `measure_payload` /
+    # `measure_joined`, which always emit the key — but a row reaching this sum without it
+    # should read as "this tier saved nothing" rather than KeyError the whole run.
+    embedded = sum(r["saved_cl100k"].get("embedded") or 0 for r in rows)
     total = sum(r["saved_cl100k"]["tier_total"] or 0 for r in rows)
     total_pct = _pct(total, raw_tok)
     dict_pct = _pct(dictionary, raw_tok)
+    emb_pct = _pct(embedded, raw_tok)
 
     # Drop-to-retrieve candidates are detected INDEPENDENTLY of the lossless-tier decision:
     # the highest-value case (kb `embedding`) is a tool whose lossless savings fall BELOW the
@@ -651,7 +660,9 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
         "tool": tool, "n": n, "n_results": len(groups), "joined_results": joined_results,
         "raw_tok": raw_tok,
         "saved_pct": round(total_pct, 1), "dict_pct": round(dict_pct, 1),
+        "emb_pct": round(emb_pct, 1),
         "minify": minify, "tabularize": tabularize, "dictionary": dictionary,
+        "embedded": embedded,
         "drop_suggestion": drop_suggestion, "drop_rows": drop_rows,
     }
 
@@ -685,11 +696,19 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
     tiers = list(_BASE_TIERS)
     if dict_pct >= threshold:
         tiers.append("dictionary")
-        reason = f"{total_pct:.1f}% saved (dictionary +{dict_pct:.1f}%){mixed}"
+        parts = [f"dictionary +{dict_pct:.1f}%"]
     else:
-        reason = (f"{total_pct:.1f}% saved (dictionary +{dict_pct:.1f}% below threshold "
-                  f"— dropped){mixed}")
-    return {**base, "tiers": tiers, "reason": reason}
+        parts = [f"dictionary +{dict_pct:.1f}% below threshold — dropped"]
+    # Same marginal test as `dictionary`, and for the same reason: `embedded` costs a primer
+    # paragraph the client re-reads every turn (#168/#170), so it is added only where the
+    # measurement says the tool actually ships JSON inside a string. On every other tool the
+    # marginal saving is exactly 0 and this is silently skipped.
+    if emb_pct >= threshold:
+        tiers.append("embedded")
+        parts.append(f"embedded +{emb_pct:.1f}%")
+    elif embedded:
+        parts.append(f"embedded +{emb_pct:.1f}% below threshold — dropped")
+    return {**base, "tiers": tiers, "reason": f"{total_pct:.1f}% saved ({', '.join(parts)}){mixed}"}
 
 
 def generate_policy(

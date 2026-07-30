@@ -128,3 +128,4 @@ run_sink
 # function-local classes, so any edit to that line re-flags it. pytest catches a real
 # typo instantly — this file is exercised on every run.
 _FakeTransport
+_saved

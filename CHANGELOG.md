@@ -10,6 +10,17 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Added
+- **`policy generate` / `autotune` can now recommend the `embedded` tier.** It shipped
+  opt-in but invisible to the generator, so nothing would ever turn it on and an operator
+  had to hand-edit a policy — which #144 is the standing proof goes stale, since nothing
+  re-derives a hand-authored tier decision after a codec change lands under it. `measure`
+  now reports `embedded` as its own marginal step (exactly like `dictionary`), and the
+  generator adds the tier per tool when that margin clears the threshold: a double-encoding
+  tool scores `41.0% saved (embedded +41.0%)` and gains it, an ordinary record tool scores
+  `+0.0%` and is not offered it — nor charged its primer paragraph. `tier_total` counts the
+  embedded step deliberately: a tool whose body is one JSON string saves ~0% under the other
+  tiers, so scoring it without `embedded` would mark it passthrough and permanently hide the
+  very tool the tier exists for.
 - **New `embedded` tier: compress JSON the server delivered as a STRING.** `minify`,
   `tabularize` and `dictionary` all walk parsed structure, so a body returned double-encoded
   (`{"response_text": json.dumps(body)}`) is a leaf none of them can reach. Measured on

@@ -270,3 +270,74 @@ def test_marker_is_reserved_so_a_literal_payload_containing_it_is_left_alone():
     assert P.apply(T.minify(payload), "t",
                    P.Policy(rules=[P.Rule("*", ("minify", "tabularize", "embedded"))])
                    ).text == T.minify(payload)
+
+
+# --------------------------------------------------------------------------- #
+# `policy generate` / autotune must be able to RECOMMEND the tier
+# --------------------------------------------------------------------------- #
+def _envs(tool, raw, n=4):
+    return [{"tool": tool, "raw": raw} for _ in range(n)]
+
+
+def _row(rows, tool):
+    return next(r for r in rows if r["tool"] == tool)
+
+
+def test_generate_recommends_the_tier_for_a_tool_that_double_encodes():
+    """The whole point of the tier being opt-in: something has to turn it on, on evidence.
+    Shipped without this, `embedded` is reachable only by hand-editing a policy — and #144
+    is the standing proof that hand-edited tier decisions go stale and nothing re-derives
+    them."""
+    from terse.policy_gen import generate_policy
+    raw = json.dumps({"response_text": json.dumps({"results": _records(20)})})
+    _doc, rows = generate_policy(_envs("broker.exa_search", raw))
+    row = _row(rows, "broker.exa_search")
+    assert "embedded" in row["tiers"]
+    assert row["emb_pct"] > 0
+    assert "embedded +" in row["reason"]
+
+
+def test_generate_withholds_the_tier_from_an_ordinary_record_tool():
+    """It must not be added everywhere: a tool with no embedded JSON gains nothing and would
+    pay a primer paragraph every turn for a form it can never emit."""
+    from terse.policy_gen import generate_policy
+    raw = json.dumps({"results": _records(20)})
+    _doc, rows = generate_policy(_envs("gh.list_items", raw))
+    row = _row(rows, "gh.list_items")
+    assert "embedded" not in row["tiers"]
+    assert row["emb_pct"] == 0
+    assert "embedded" not in row["reason"]      # silent when it saved nothing, not noise
+
+
+def test_a_tool_saved_ONLY_by_the_embedded_tier_is_not_marked_passthrough():
+    """`tier_total` has to include the embedded step. A body delivered as one JSON string
+    saves ~0% under the other tiers, so scoring it without `embedded` would put it below the
+    threshold and hand back `tiers: []` — permanently hiding the tool the tier exists for."""
+    from terse.policy_gen import generate_policy
+    raw = json.dumps({"response_text": json.dumps({"results": _records(20)})})
+    _doc, rows = generate_policy(_envs("broker.exa_search", raw))
+    row = _row(rows, "broker.exa_search")
+    assert row["tiers"] != []
+    assert row["saved_pct"] > 5.0
+    # ...and the same payload scores ~0 with the tier's contribution removed.
+    from terse.measure import measure_payload
+    m = measure_payload(raw)
+    without = m["cl100k"]["raw"] - m["cl100k"]["compressed"]
+    assert abs(without) < m["saved_cl100k"]["embedded"]
+
+
+def test_measure_reports_the_embedded_step_as_its_own_marginal_saving():
+    from terse.measure import measure_payload
+    raw = json.dumps({"response_text": json.dumps({"results": _records(20)})})
+    m = measure_payload(raw)
+    assert m["saved_cl100k"]["embedded"] > 0
+    assert m["cl100k"]["embedded"] < m["cl100k"]["compressed"]
+    # tier_total is measured against the embedded form, not the dictionary one
+    assert m["saved_cl100k"]["tier_total"] == m["cl100k"]["raw"] - m["cl100k"]["embedded"]
+
+
+def test_measure_reports_zero_when_there_is_no_embedded_json():
+    from terse.measure import measure_payload
+    m = measure_payload(json.dumps({"results": _records(20)}))
+    assert m["saved_cl100k"]["embedded"] == 0
+    assert m["cl100k"]["embedded"] == m["cl100k"]["compressed"]
