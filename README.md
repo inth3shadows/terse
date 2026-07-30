@@ -1,5 +1,10 @@
 # terse
 
+[![tests](https://github.com/inth3shadows/terse/actions/workflows/tests.yml/badge.svg)](https://github.com/inth3shadows/terse/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/terse-mcp.svg)](https://pypi.org/project/terse-mcp/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 The **lossless-first** MCP compression proxy: it makes tool output smaller without
 ever changing what your agent reads — byte-faithful by default, lossy only where you
 explicitly opt in.

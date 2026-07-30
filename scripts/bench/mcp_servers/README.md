@@ -46,11 +46,24 @@ Swap the server command for the others:
 | server | launch |
 |---|---|
 | filesystem | `npx -y @modelcontextprotocol/server-filesystem <repo>` |
-| git | `uvx --from mcp-server-git mcp-server-git --repository <repo>` |
+| git | `uvx --from mcp-server-git --with 'mcp<1.10' mcp-server-git --repository <repo>` |
 | memory | `npx -y @modelcontextprotocol/server-memory` |
-| fetch | `uvx mcp-server-fetch --ignore-robots-txt` |
+| fetch | `uvx --with 'mcp<1.10' mcp-server-fetch --ignore-robots-txt` |
 | serena | `uvx --from git+https://github.com/oraios/serena serena start-mcp-server --project <repo> --context ide-assistant --transport stdio --enable-web-dashboard false --enable-gui-log-window false` |
 | playwright | `npx -y @playwright/mcp@latest --browser chromium --headless --isolated --no-sandbox` |
+| sequential-thinking | `npx -y @modelcontextprotocol/server-sequential-thinking` |
+| everything | `npx -y @modelcontextprotocol/server-everything` |
+| duckduckgo-mcp-server | `uvx duckduckgo-mcp-server` |
+| hn-mcp-server | `npx -y @devabdultech/hn-mcp-server` |
+
+**`--with 'mcp<1.10'` is load-bearing, not optional**, as of 2026-07-30: `mcp-server-git`
+and `mcp-server-fetch` are built on the low-level `mcp` SDK's `@server.list_tools()`
+decorator API, which the current `mcp` PyPI release has dropped. Neither server pins an
+upper bound on `mcp`, so `uvx` resolves latest and both fail to start
+(`AttributeError: 'Server' object has no attribute 'list_tools'`) without the pin. Three
+other archived reference servers hit the same wall with no known-good pin at time of
+writing — `mcp-server-time`, `mcp-server-sqlite`, `mcp-server-calculator` — which is why
+they aren't in this table.
 
 ## Static web fixture (fetch + playwright)
 

@@ -1,12 +1,15 @@
 {
-  "baseline_commit": "660aee5cc7506c11bb05a3622f5199801c690695",
+  "baseline_commit": "50d74c26d50a8154bf8a8d6b6bdc480126a26f53",
   "known_dead": [
+    ".mcp.json",
     ".terse-mcp-stash.json",
+    ".terse-peers-project-<hash>.json",
     "_heterogeneous",
     "_marker",
     "_off",
     "_passthrough",
     "drop-policy.json",
+    "edit_file",
     "gh-policy.json",
     "gh__search_issues",
     "gh_commits_flat",
@@ -17,7 +20,12 @@
     "mcp.json",
     "peers.json",
     "policy.json",
+    "rename_symbol",
+    "reports/measure-history.jsonl",
+    "reports/verify-report.html",
+    "reports/verify-report.md",
     "some-output.json",
+    "terse-peers-project-<hash>.json",
     "terse-policy.json"
   ]
 }
