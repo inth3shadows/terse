@@ -124,11 +124,47 @@ own traffic). Do **not** read §3 as a claim about aggregate real-world savings;
 ## §4 — Competitor landscape (hands-on, tested 2026-07-17)
 
 Installed and tested, not cited from marketing. Only TOON (§1) is directly comparable on a
-lossless token axis; the rest measure *different guarantees*, so no head-to-head % is claimed.
+lossless token axis; the rest measure *different guarantees*, so no head-to-head % is
+claimed. TOON's row reproduced byte-identical on 2026-07-30 (see §1); headroom was
+re-tested the same day on real proxied traffic (below) — LLMLingua-2, mcp-compressor, and
+the native context-editing row are unchanged from the 2026-07-17 hands-on test.
+
+**Headroom re-tested 2026-07-30, on its real integration point.** `headroom-ai` moved from
+v0.32.0 to v0.33.0 and pivoted from "JSON compressor" to a full "Context Optimization
+Layer" — it's now an **LLM API proxy** (`headroom proxy --backend anthropic`) that sits
+between a coding agent and the model provider, compressing `tool_result` blocks inside real
+Anthropic Messages API traffic. Calling its old standalone compressor function directly (as
+attempted here previously) returns 0% — that function isn't the real path anymore. Correct
+method: stood up a mock Anthropic endpoint, routed realistic `tool_use` → `tool_result`
+conversations (our corpus JSON as the tool output) through a real `headroom proxy`, and
+measured what it actually forwarded upstream, cl100k, same method as §1:
+
+| file | raw tok | **terse** (lossless) | headroom, CCR default (lossy, recoverable) | headroom `--lossless` |
+|---|--:|--:|--:|--:|
+| gh_pulls | 151,165 | **76.1%** | 42.5% | 0.0% |
+| gh_issues | 48,032 | 32.7% | **33.1%** | 0.0% |
+| gh_commits | 69,652 | 26.5% | **46.6%** | 0.0% |
+| gh_rate_limit | 357 | 13.4% | 0.0% | 0.0% |
+
+The only headroom mechanism that moved anything on this corpus is **CCR row-dropping**:
+rows are deleted and replaced with a `<<ccr:HASH N_rows_offloaded>>` stub the model must
+call a `headroom_retrieve` tool to recover — a lossy, stateful contract, not a smaller
+lossless encoding. Its explicit `--lossless` mode (no CCR, format-native compaction only)
+gave **0% on all four files**; `/readyz` showed its ML backend (`kompress`) never came up
+healthy in this environment, the likely reason. Not tested: real Anthropic credentials or a
+different conversation shape might wake up the lossless path — flagged as an open gap, not
+assumed either way.
+
+**Read the table honestly, not as a sweep:** on two of four files (gh_issues, gh_commits)
+headroom's *lossy* number is larger than terse's *lossless* one — that is a real result, not
+spun away. On the biggest file (gh_pulls) and the smallest (gh_rate_limit), terse's
+unconditionally-lossless number wins outright even against headroom's lossy mode. The
+honest framing is the trade, not a single winner: headroom can go further by deleting data
+recoverably (or not, with `--no-ccr`); terse never deletes anything.
 
 | Tool | What it is (verified) | Comparable? |
 |---|---|---|
-| **headroom** (`headroom-ai`, v0.32.0) | JSON compressor is a **deterministic Rust transform, not ML**: lossless on uniform arrays, but **drops rows** on larger/irregular sets, recoverable only via a `retrieve` round-trip against a **time-boxed cache** (default 30-min TTL). Measured on our corpus: 33.1% (lossless reformat) to 42.5%/64.1% (lossy, dropping 13/30 and 13/20 rows). A separate optional text compressor *is* ML. | No — its larger numbers come from *dropping data* with time-limited recovery; terse's are unconditionally lossless. |
+| **headroom** (`headroom-ai`, v0.33.0) | LLM-API proxy compressing `tool_result` blocks in live Anthropic/OpenAI traffic. Its only active mechanism on this corpus is **CCR row-dropping** (lossy, recoverable via a `retrieve`-tool round-trip against a cache) or `--no-ccr` (lossy, unrecoverable); its `--lossless` mode measured **0%** here. Measured 2026-07-30 on real proxied traffic: 0%–46.6%, see table above. | Partially — same lossy/lossless split as before, but re-measured on its actual integration point (an LLM message proxy) rather than a removed standalone function. |
 | **LLMLingua-2** (Microsoft) | Lossy prompt token-classifier. Fed JSON it strips syntax (`{`,`}`,`:`,`"`) as low-information and emits **invalid, unparseable JSON**; truncates past 512 tokens. ~50% on both prose and JSON. | No — different axis (prompts, not tool output), lossy, corrupts structure. |
 | **Atlassian mcp-compressor** | Primarily lossless schema/description compression at connect time — **complementary and stackable** with terse (`terse proxy -- mcp-compressor -- <server>`). An opt-in `--toonify` flag also reformats results into TOON (off by default; no diffing/policy/state). | Adjacent, not competing. |
 | **Anthropic / OpenAI context editing** | Native, server-side, **lossy** history-pruning; no local artifact to run keylessly. | Different mechanism (drops old results server-side). |
