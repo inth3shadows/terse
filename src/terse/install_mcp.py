@@ -323,7 +323,14 @@ def _default_diff_label(policy_path: str | None) -> str:
     states `diff`, and otherwise against the `Policy.diff` field default itself, read from
     the dataclass so this label can never drift from the value it claims to describe (the
     #144 failure — a hand-copied constant outliving the decision behind it)."""
-    if policy_path:
+    # Only an ABSOLUTE path may be read here, for the same reason the caller's
+    # `policy_missing` check two lines away skips relative ones: a relative path resolves
+    # against the MCP launcher's cwd, which a status scan cannot know. Reading it would
+    # resolve against the *scanner's* cwd instead and report the diff setting of whatever
+    # file happens to sit there — a confidently wrong label, which is precisely the
+    # label-vs-reality divergence #181 exists to kill. Falling through to the dataclass
+    # default is the honest answer: it is what the proxy uses when the file states nothing.
+    if policy_path and os.path.isabs(policy_path):
         try:
             doc = json.loads(Path(policy_path).read_text(encoding="utf-8"))
             # Truthiness is CORRECT here and must stay: `load_policy` builds the real policy

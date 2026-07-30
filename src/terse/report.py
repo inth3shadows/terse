@@ -479,6 +479,11 @@ def verify_summary(rows: list[dict[str, Any]], coverage: dict[str, Any],
     `terse verify --json` (scriptable / CI-checkable). Numbers come from the same
     `_sum` path as the report, so the JSON can never disagree with it."""
     failures = [r for r in rows if not r.get("roundtrip_ok", False)]
+    # Reported as its own verdict, not folded into `lossless_gate` (#188). It does NOT
+    # invalidate the savings below — those come from the default pipeline, which passed —
+    # but an opt-in tier that loses data is still a codec defect, and splitting the gates
+    # would otherwise make it vanish from every report that only reads `roundtrip_ok`.
+    emb_failures = [r for r in rows if not r.get("embedded_ok", True)]
     total = len(rows)
 
     def _bucket(sub: list[dict[str, Any]]) -> dict[str, Any]:
@@ -497,6 +502,11 @@ def verify_summary(rows: list[dict[str, Any]], coverage: dict[str, Any],
             "total": total,
             "failures": [{"tool": r.get("tool"), "sha": r.get("sha"),
                           "shape": r.get("shape")} for r in failures],
+        },
+        "embedded_gate": {
+            "ok": not emb_failures,
+            "failures": [{"tool": r.get("tool"), "sha": r.get("sha"),
+                          "shape": r.get("shape")} for r in emb_failures],
         },
         "tokens_cl100k": _bucket(rows),
         "by_shape": {s: _bucket([r for r in rows if r["shape"] == s])
@@ -525,6 +535,22 @@ def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
         ]
     else:
         out += [f"All {passed}/{total} payloads round-trip losslessly. ✅", ""]
+
+    # The opt-in `embedded` fold gets its own verdict (#188): it costs only its own tier,
+    # so it never marks the report INVALID — but it must still be visible, or splitting the
+    # gates would hide a real losslessness failure from every reader of this section.
+    emb_failures = [r for r in rows if not r.get("embedded_ok", True)]
+    if emb_failures:
+        out += [
+            f"**`embedded` tier: {len(emb_failures)}/{total} payloads FAILED its round-trip.**",
+            "The default pipeline passed, so the savings below stand and the tool still "
+            "compresses — but `policy generate` will not offer `embedded` for it. "
+            "Failing shas:",
+            "",
+            *[f"- `{r.get('tool')}` / `{r.get('sha')}` ({r.get('shape')})"
+              for r in emb_failures],
+            "",
+        ]
 
     # --- Coverage ---
     out += ["## Coverage", "", f"Total payloads captured: **{coverage.get('total', 0)}**", ""]
