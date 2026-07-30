@@ -326,9 +326,16 @@ def _default_diff_label(policy_path: str | None) -> str:
     if policy_path:
         try:
             doc = json.loads(Path(policy_path).read_text(encoding="utf-8"))
+            # Truthiness is CORRECT here and must stay: `load_policy` builds the real policy
+            # with `bool(doc.get("diff", False))`, so `"diff": "false"` (a non-empty string)
+            # genuinely turns diffing ON at runtime. This label's job is to report EFFECTIVE
+            # behaviour, not the author's apparent intent — a review flagged the truthiness as
+            # a bug, but tightening it to `is True` would make the label print "off" while the
+            # proxy diffs, which is precisely the label-vs-reality divergence #181 exists to
+            # kill. If the coercion in `load_policy` ever changes, change it here too.
             if isinstance(doc, dict) and "diff" in doc:
                 return f"policy ({'on' if doc['diff'] else 'off'})"
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             pass  # unreadable or malformed: the built-in default is still the truth below
     field_default = fields(policy_mod.Policy)
     on = next(f.default for f in field_default if f.name == "diff")

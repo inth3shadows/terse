@@ -136,7 +136,7 @@ def _uniform_dict_list(value: Any) -> bool:
     return all(set(item.keys()) == first_keys for item in value[1:])
 
 
-def _embed_json_string(s: str) -> dict | None:
+def _embed_json_string(s: str, tabularize: bool = True) -> dict | None:
     """Fold a string leaf that is ITSELF a JSON document — or None to leave it alone.
 
     `tabularize`/`dictionary` walk PARSED structure, so a payload delivered as a JSON
@@ -169,7 +169,15 @@ def _embed_json_string(s: str) -> dict | None:
     form = next((f for f, kw in _EMBED_FORMS.items() if json.dumps(parsed, **kw) == s), None)
     if form is None:
         return None
-    wrapper = {JSON_STR_MARKER: 1, "f": form, "v": compress_structure(parsed, embedded=True)}
+    # `tabularize` is FORWARDED, not re-defaulted. Folding the string opens a new structural
+    # walk, and defaulting it to True there emitted `__terse_table__` inside `v` for a policy
+    # whose tiers were `["minify", "embedded"]` — a marker the primer never documented,
+    # because `emits_table()` was correctly False. Lossless either way, but it hands the model
+    # an envelope with no explanation, which is exactly what `reachable_tiers` exists to
+    # prevent. Found in adversarial review of #183; untested until then because every test
+    # paired the two tiers.
+    wrapper = {JSON_STR_MARKER: 1, "f": form,
+               "v": compress_structure(parsed, embedded=True, tabularize=tabularize)}
     # Per-occurrence size guard. `dict_encode` guards per alias and `compress_with` guards
     # the payload as a whole; neither can see a single embedded doc that grew inside a
     # payload that shrank overall. Compared against the string as a JSON VALUE, since that
@@ -230,7 +238,7 @@ def compress_structure(obj: Any, embedded: bool = False, tabularize: bool = True
             return table
         return [compress_structure(item, embedded, tabularize) for item in obj]
     if embedded and isinstance(obj, str):
-        return _embed_json_string(obj) or obj
+        return _embed_json_string(obj, tabularize) or obj
     return obj
 
 

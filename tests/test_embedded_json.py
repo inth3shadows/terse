@@ -341,3 +341,80 @@ def test_measure_reports_zero_when_there_is_no_embedded_json():
     m = measure_payload(json.dumps({"results": _records(20)}))
     assert m["saved_cl100k"]["embedded"] == 0
     assert m["cl100k"]["embedded"] == m["cl100k"]["compressed"]
+
+
+# --------------------------------------------------------------------------- #
+# Adversarial-review follow-ups (#183)
+# --------------------------------------------------------------------------- #
+def test_embedded_honours_tabularize_off_and_emits_no_undocumented_marker():
+    """Folding a string opens a NEW structural walk, and it must inherit the caller's
+    `tabularize`. Defaulting it to True inside the fold emitted `__terse_table__` for a
+    policy whose tiers were ["minify","embedded"] — while `emits_table()` was correctly
+    False, so the primer never documented it and the model got an unexplained envelope.
+
+    Every other test in this file enables both tiers together, which is exactly why this
+    went unnoticed until an adversarial review pulled them apart."""
+    payload = {"body": json.dumps({"results": _records(20)})}
+    wire = T.compress_with(payload, tabularize=False, embedded=True)
+    assert T.JSON_STR_MARKER in wire          # the tier still does its job
+    assert T.TABLE_MARKER not in wire         # ...without a tier the caller disabled
+    assert T.decompress(wire) == payload
+
+
+def test_policy_with_embedded_but_not_tabularize_never_emits_a_table():
+    """End-to-end through the runtime path, against the invariant the codebase states:
+    `select(tool).tiers <= reachable_tiers()`, i.e. never emit a form the primer omits."""
+    pol = P.Policy(rules=[], default_tiers=("minify", "embedded"))
+    raw = T.minify({"response_text": json.dumps({"results": _records(20)})})
+    out = P.apply(raw, "t", pol)
+    assert not pol.emits_table()
+    assert T.TABLE_MARKER not in out.text
+    assert T.decompress(out.text) == json.loads(raw)
+
+
+def test_measure_gate_covers_the_embedded_pipeline_it_scores():
+    """`measure` reports `embedded`/`tier_total` from `compress_with(embedded=True)`, so the
+    round-trip gate has to validate THAT pipeline — not just the default one. Otherwise a
+    tier that failed only with the flag on would keep its savings banked and feed them to
+    `policy generate`."""
+    from terse.measure import measure_payload
+    m = measure_payload(json.dumps({"response_text": json.dumps({"results": _records(20)})}))
+    assert m["roundtrip_ok"] is True
+    assert m["saved_cl100k"]["embedded"] > 0
+
+    # Break ONLY the embedded pipeline. Patching `decompress` instead would also break
+    # `roundtrip_ok`, so the OLD gate would catch it and this test would pass with the fix
+    # reverted — mutation-tested, that is exactly what happened on the first attempt.
+    import terse.measure as M
+    real = M.transforms.compress_with
+
+    def only_embedded_is_broken(obj, *a, **kw):
+        text = real(obj, *a, **kw)
+        return T.minify({"corrupted": True}) if kw.get("embedded") else text
+
+    M.transforms.compress_with = only_embedded_is_broken
+    try:
+        bad = measure_payload(json.dumps({"response_text": json.dumps({"results": _records(20)})}))
+    finally:
+        M.transforms.compress_with = real
+    assert bad["roundtrip_ok"] is False       # the default pipeline is fine; the gate still fails
+    assert bad["saved_cl100k"]["embedded"] == 0
+    assert bad["saved_cl100k"]["tier_total"] == 0
+
+
+def test_diff_label_mirrors_the_runtime_coercion_rather_than_the_authors_intent():
+    """DO NOT "fix" this to `is True`. `load_policy` builds the policy with
+    `bool(doc.get("diff", False))`, so `"diff": "false"` genuinely diffs at runtime. The
+    label reports EFFECTIVE behaviour; tightening it would print "off" while the proxy
+    diffs — the label-vs-reality divergence #181 exists to kill. A review flagged the
+    truthiness as a bug; this test is why it stays."""
+    import json as _json
+    import tempfile
+
+    from terse.install_mcp import _default_diff_label
+    from terse.policy import load_policy
+    for value in (True, False, "false", "no", 1, 0):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            _json.dump({"version": 1, "diff": value}, fh)
+        label, runtime = _default_diff_label(fh.name), load_policy(fh.name).diff
+        assert ("on" in label) is runtime, f"{value!r}: label {label} vs runtime {runtime}"

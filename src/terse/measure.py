@@ -62,7 +62,18 @@ def measure_payload(raw: str) -> dict[str, Any]:
     # decide it per tool on evidence, exactly as it does for `dictionary` — the tier is
     # opt-in precisely because it costs a primer paragraph, so it must earn its place.
     embedded = transforms.compress_with(obj, embedded=True)
+    # The gate must cover EVERY pipeline whose savings this row reports. `roundtrip_ok`
+    # exercises the default combination (embedded OFF), but the `embedded`/`tier_total`
+    # entries below are computed from `compress_with(..., embedded=True)` — scoring one
+    # pipeline while validating another. A tier that failed only with `embedded` on would
+    # have kept its savings banked here and fed them to `policy generate`. (The runtime is
+    # independently safe: `_lossless_stage` self-checks the actually-applied combination.)
     gate = transforms.roundtrip_ok(obj)
+    if gate:
+        try:
+            gate = transforms.decompress(embedded) == obj
+        except Exception:  # noqa: BLE001 — any decode failure is a failed gate
+            gate = False
 
     raw_tok = count_cl100k(raw)
     min_tok = count_cl100k(minified)

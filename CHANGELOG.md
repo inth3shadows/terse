@@ -184,6 +184,28 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   time runecho gained a tool — is off the primary path.
 
 ### Fixed
+- **`embedded` re-defaulted `tabularize` inside the fold, leaking an undocumented marker
+  (adversarial review of #183).** Folding a string opens a new structural walk, and
+  `_embed_json_string` called `compress_structure(parsed, embedded=True)` without forwarding
+  the caller's `tabularize`. A policy with `tiers: ["minify", "embedded"]` therefore emitted
+  `__terse_table__` inside `v` while `emits_table()` was correctly False — so the primer never
+  documented the form and the model received an envelope with nothing explaining it. Lossless
+  either way, but it is precisely the failure `reachable_tiers` exists to prevent. Unreachable
+  via `policy generate` (which always pairs the two tiers) and untested because every test in
+  the suite paired them too; both gaps now closed.
+- **`measure` gated a different pipeline than the one it scored.** `embedded`/`tier_total` are
+  computed from `compress_with(..., embedded=True)`, but the round-trip gate ran the default
+  combination, so a failure that appeared only with the tier enabled would have kept its
+  savings banked and fed them to `policy generate`. The gate now validates the embedded
+  pipeline too. (The runtime was never at risk — `_lossless_stage` independently self-checks
+  the actually-applied combination.)
+- **`_default_diff_label` now survives a pathologically deep policy file** (`RecursionError`
+  joins the caught set, matching every other `json.loads`-on-file site in the codebase).
+  Its truthiness check is deliberately UNCHANGED and now pinned by test: `load_policy` builds
+  the policy with `bool(doc.get("diff", False))`, so `"diff": "false"` genuinely diffs at
+  runtime, and reporting `policy (on)` is correct. A review flagged the truthiness as a bug;
+  tightening it to `is True` would have made the label print "off" while the proxy diffs —
+  reintroducing the label-vs-reality divergence #181 was filed to kill.
 - **`mcp-status` reported `diff=default` when the default is OFF, and the docs said the
   opposite (#181).** #170 flipped cross-call diffing off, but three signals still pointed the
   other way, and together they produced a repeatable misdiagnosis: a real session saw
