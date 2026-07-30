@@ -2076,8 +2076,12 @@ def test_a_reconnect_makes_a_reused_jsonrpc_id_a_different_result():
 # forms it can actually emit.
 # ---------------------------------------------------------------------------
 
-def _pol(tiers=("minify", "tabularize", "dictionary"), *, diff=True, drop=False, rules=None):
+def _pol(tiers=None, *, diff=True, drop=False, rules=None):
+    """Default tiers = EVERY valid tier, derived rather than spelled out: the
+    "reaches every form" primer test below is only meaningful if adding a tier
+    automatically widens this helper, instead of leaving it silently stale."""
     from terse import policy as P
+    tiers = P.VALID_TIERS if tiers is None else tiers
     rs = list(rules or [])
     if drop:
         rs.append(P.Rule(tool_glob="*", tiers=tuple(tiers),

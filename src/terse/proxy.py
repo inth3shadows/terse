@@ -135,6 +135,11 @@ PRIMER_DIFF = (
     "that prior text for a `=` op or inserting its literal string for a `+` op, then "
     "concatenating everything.\n"
 )
+PRIMER_EMBEDDED = (
+    '- Embedded JSON {"__terse_json__":1,"f":F,"v":...}: "v" is a JSON document the tool '
+    'returned as a STRING — read it as that document. "f" is a re-serialization tag; '
+    "ignore it.\n"
+)
 PRIMER_DROPPED = (
     '- Dropped field {"__terse_dropped__":"H","bytes":N,"retrieve":"terse.retrieve"}: a '
     "large field value was omitted to save context. It is NOT lost — when you actually need "
@@ -144,8 +149,8 @@ PRIMER_TAIL = "Always reason about the fully reconstructed result."
 
 # The full assembly, for tests and for callers that want every section regardless of
 # policy. `build_primer(default_policy())` reproduces this exactly.
-TERSE_PRIMER = (PRIMER_HEAD + PRIMER_TABLE + PRIMER_DICT + PRIMER_DIFF + PRIMER_DROPPED
-                + PRIMER_TAIL)
+TERSE_PRIMER = (PRIMER_HEAD + PRIMER_TABLE + PRIMER_DICT + PRIMER_EMBEDDED + PRIMER_DIFF
+                + PRIMER_DROPPED + PRIMER_TAIL)
 
 
 def build_primer(pol: policy_mod.Policy, server: str | None = None) -> str:
@@ -161,15 +166,18 @@ def build_primer(pol: policy_mod.Policy, server: str | None = None) -> str:
     """
     return _assemble_primer(
         table=pol.emits_table(server), dictionary=pol.emits_dict(server),
+        embedded=pol.emits_embedded(server),
         diff=pol.emits_diff(server), dropped=pol.has_drop(),
     )
 
 
-def _assemble_primer(*, table: bool, dictionary: bool, diff: bool, dropped: bool) -> str:
+def _assemble_primer(*, table: bool, dictionary: bool, diff: bool, dropped: bool,
+                     embedded: bool = False) -> str:
     """Join the selected sections, or "" when none are selected."""
     body = "".join(s for gate, s in (
         (table, PRIMER_TABLE),
         (dictionary, PRIMER_DICT),
+        (embedded, PRIMER_EMBEDDED),
         (diff, PRIMER_DIFF),
         (dropped, PRIMER_DROPPED),
     ) if gate)
@@ -189,6 +197,7 @@ def union_primer(pairs: list[tuple[policy_mod.Policy, str | None]]) -> str:
     return _assemble_primer(
         table=any(p.emits_table(s) for p, s in pairs),
         dictionary=any(p.emits_dict(s) for p, s in pairs),
+        embedded=any(p.emits_embedded(s) for p, s in pairs),
         diff=any(p.emits_diff(s) for p, s in pairs),
         dropped=any(p.has_drop() for p, _ in pairs),
     )

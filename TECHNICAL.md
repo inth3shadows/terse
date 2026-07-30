@@ -10,8 +10,9 @@ is built around it.
 raw tool output (JSON text)
         │
         ▼
- json.loads ──► compress_structure  (Tier 0: tabularize, recursive nested-key fold)
-        │              │
+ json.loads ──► compress_structure  (Tier 0: tabularize, recursive nested-key fold;
+        │              │            Tier 0.6 `embedded`: fold a string leaf that is
+        │              │            itself a JSON document, byte-exact only)
         │              ▼
         │        dict_encode        (Tier 0.5: fold repeated string values -> legend)
         │              │
@@ -198,8 +199,18 @@ raw tool output (JSON text)
   and which multiproxy supplies per-peer from each peer's `name`. Without it, matching is
   unchanged (bare names only). A tool that already self-prefixes is never double-qualified
   (`kb.read.search` under server `kb` stays `kb.read.search`, not `kb.kb.read.search`).
-- **Tiers:** any subset of `minify` / `tabularize` / `dictionary`. `minify` is implied
-  by serialization (a warning is emitted if omitted). `[]` = passthrough.
+- **Tiers:** any subset of `minify` / `tabularize` / `dictionary` / `embedded`. `minify` is
+  implied by serialization (a warning is emitted if omitted). `[]` = passthrough.
+  `VALID_TIERS` and `DEFAULT_TIERS` are deliberately distinct: a policy file that omits
+  `defaults.tiers` gets `DEFAULT_TIERS`, so adding a tier to the valid set never silently
+  switches it on for configs already on disk.
+- **`embedded` (opt-in):** folds a string leaf that is itself a JSON document into
+  `{"__terse_json__":1,"f":F,"v":...}`, so the other tiers can reach a body the server
+  double-encoded (`{"response_text": json.dumps(body)}` → measured 0.0% → 41.4%). Fires
+  ONLY when one of a fixed registry of serializations (`_EMBED_FORMS`) reproduces the
+  original string byte-for-byte; `f` records which. Declines duplicate keys, `1.50`/`1.5e0`
+  renormalization, unusual whitespace, and any embedded `__terse_*` key. The form ids are a
+  wire contract — append, never edit, or payloads already encoded decode wrong.
 - **`structured` (default `"auto"`, #128):** `"compress"` also runs this tool's
   `structuredContent` through the codec, replacing the typed field with a terse envelope.
   MCP 2025-06-18 lets a tool return that field beside a text block mirroring it, and
