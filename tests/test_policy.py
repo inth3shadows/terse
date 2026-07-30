@@ -219,7 +219,7 @@ def test_load_example_policy_validates(tmp_path):
     example = pathlib.Path(__file__).resolve().parents[1] / "policy.example.json"
     p = load_policy(example)
     assert p.select("gh.api.repos").tiers == ("minify", "tabularize", "dictionary")
-    assert p.select("kb.read.list_nodes").tiers == ("minify", "tabularize")
+    assert p.select("kb.read.list_nodes").tiers == ("minify", "tabularize", "dictionary")
     assert p.select("gh.api.rate_limit").tiers == ("minify", "tabularize", "dictionary")  # gh.* before *.rate_limit
     assert p.select("ci.api.rate_limit").tiers == ()
 

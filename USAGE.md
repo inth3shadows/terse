@@ -199,10 +199,10 @@ duplicate), and an `unreadable peers file` note naming the path.
 corrupt peers file. It removes the router once nothing is left for it to front.
 
 > **Project scope: the peers file carries secrets.** `--scope project` writes
-> `.terse-peers-project.json` next to the checked-in `.mcp.json`, and it contains each
-> peer's `env` block — API keys included. It is created `0600`, but that does not stop a
-> `git add -A`. **Add `.terse-peers-*.json` to `.gitignore`** before folding a fleet in
-> project scope.
+> `.terse-peers-project-<hash>.json` next to the checked-in `.mcp.json`, and it contains
+> each peer's `env` block — API keys included. It is created `0600`, but that does not
+> stop a `git add -A`. **Add `.terse-peers-*.json` to `.gitignore`** before folding a
+> fleet in project scope.
 
 ### Wire terse into Claude Code automatically (`install-mcp`)
 

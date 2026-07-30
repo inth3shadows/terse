@@ -28,9 +28,9 @@
       }
     },
     {
-      "_comment": "Already field-projected + high-cardinality content; dictionary added ~nothing (+2.6% total). Keep cheap structural tiers, drop dictionary.",
+      "_comment": "Re-measured post-#116 join on 1,657 captured payloads: dictionary now has a multi-block record array to fold into, not the single-block case the original +2.6%-total call was made on. Fleet: 7.5% -> 8.0% (+0.6pp). Per-tool: kb.read.node_history 8.6% -> 18.5%, lodestone_search 10.9% -> 44.0%, kb.read.changelog 37.4% -> 44.7% (#144).",
       "match": { "tool": "kb.*" },
-      "tiers": ["minify", "tabularize"]
+      "tiers": ["minify", "tabularize", "dictionary"]
     },
     {
       "_comment": "Status/single-object endpoints measured +0% — skip entirely to avoid transform cost.",

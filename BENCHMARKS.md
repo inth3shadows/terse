@@ -1,8 +1,10 @@
 # terse — Benchmarks
 
-**Last updated: 2026-07-22.** Every figure is dated by section — §1–4 were produced
-2026-07-17, §5–6 on 2026-07-22 — and nothing here is hand-typed or estimated. If you
-re-run and get different numbers, the code changed; open an issue.
+**Last updated: 2026-07-30.** Every figure is dated by section — §1–4 were produced
+2026-07-17 and reproduced byte-identical on 2026-07-30, §5 is a live number pulled fresh
+each time, §6 was re-measured in full on 2026-07-30 (10 servers, up from 6) — and nothing
+here is hand-typed or estimated. If you re-run and get different numbers, the code
+changed; open an issue.
 
 Two different kinds of evidence live here, and the difference matters:
 
@@ -122,11 +124,47 @@ own traffic). Do **not** read §3 as a claim about aggregate real-world savings;
 ## §4 — Competitor landscape (hands-on, tested 2026-07-17)
 
 Installed and tested, not cited from marketing. Only TOON (§1) is directly comparable on a
-lossless token axis; the rest measure *different guarantees*, so no head-to-head % is claimed.
+lossless token axis; the rest measure *different guarantees*, so no head-to-head % is
+claimed. TOON's row reproduced byte-identical on 2026-07-30 (see §1); headroom was
+re-tested the same day on real proxied traffic (below) — LLMLingua-2, mcp-compressor, and
+the native context-editing row are unchanged from the 2026-07-17 hands-on test.
+
+**Headroom re-tested 2026-07-30, on its real integration point.** `headroom-ai` moved from
+v0.32.0 to v0.33.0 and pivoted from "JSON compressor" to a full "Context Optimization
+Layer" — it's now an **LLM API proxy** (`headroom proxy --backend anthropic`) that sits
+between a coding agent and the model provider, compressing `tool_result` blocks inside real
+Anthropic Messages API traffic. Calling its old standalone compressor function directly (as
+attempted here previously) returns 0% — that function isn't the real path anymore. Correct
+method: stood up a mock Anthropic endpoint, routed realistic `tool_use` → `tool_result`
+conversations (our corpus JSON as the tool output) through a real `headroom proxy`, and
+measured what it actually forwarded upstream, cl100k, same method as §1:
+
+| file | raw tok | **terse** (lossless) | headroom, CCR default (lossy, recoverable) | headroom `--lossless` |
+|---|--:|--:|--:|--:|
+| gh_pulls | 151,165 | **76.1%** | 42.5% | 0.0% |
+| gh_issues | 48,032 | 32.7% | **33.1%** | 0.0% |
+| gh_commits | 69,652 | 26.5% | **46.6%** | 0.0% |
+| gh_rate_limit | 357 | 13.4% | 0.0% | 0.0% |
+
+The only headroom mechanism that moved anything on this corpus is **CCR row-dropping**:
+rows are deleted and replaced with a `<<ccr:HASH N_rows_offloaded>>` stub the model must
+call a `headroom_retrieve` tool to recover — a lossy, stateful contract, not a smaller
+lossless encoding. Its explicit `--lossless` mode (no CCR, format-native compaction only)
+gave **0% on all four files**; `/readyz` showed its ML backend (`kompress`) never came up
+healthy in this environment, the likely reason. Not tested: real Anthropic credentials or a
+different conversation shape might wake up the lossless path — flagged as an open gap, not
+assumed either way.
+
+**Read the table honestly, not as a sweep:** on two of four files (gh_issues, gh_commits)
+headroom's *lossy* number is larger than terse's *lossless* one — that is a real result, not
+spun away. On the biggest file (gh_pulls) and the smallest (gh_rate_limit), terse's
+unconditionally-lossless number wins outright even against headroom's lossy mode. The
+honest framing is the trade, not a single winner: headroom can go further by deleting data
+recoverably (or not, with `--no-ccr`); terse never deletes anything.
 
 | Tool | What it is (verified) | Comparable? |
 |---|---|---|
-| **headroom** (`headroom-ai`, v0.32.0) | JSON compressor is a **deterministic Rust transform, not ML**: lossless on uniform arrays, but **drops rows** on larger/irregular sets, recoverable only via a `retrieve` round-trip against a **time-boxed cache** (default 30-min TTL). Measured on our corpus: 33.1% (lossless reformat) to 42.5%/64.1% (lossy, dropping 13/30 and 13/20 rows). A separate optional text compressor *is* ML. | No — its larger numbers come from *dropping data* with time-limited recovery; terse's are unconditionally lossless. |
+| **headroom** (`headroom-ai`, v0.33.0) | LLM-API proxy compressing `tool_result` blocks in live Anthropic/OpenAI traffic. Its only active mechanism on this corpus is **CCR row-dropping** (lossy, recoverable via a `retrieve`-tool round-trip against a cache) or `--no-ccr` (lossy, unrecoverable); its `--lossless` mode measured **0%** here. Measured 2026-07-30 on real proxied traffic: 0%–46.6%, see table above. | Partially — same lossy/lossless split as before, but re-measured on its actual integration point (an LLM message proxy) rather than a removed standalone function. |
 | **LLMLingua-2** (Microsoft) | Lossy prompt token-classifier. Fed JSON it strips syntax (`{`,`}`,`:`,`"`) as low-information and emits **invalid, unparseable JSON**; truncates past 512 tokens. ~50% on both prose and JSON. | No — different axis (prompts, not tool output), lossy, corrupts structure. |
 | **Atlassian mcp-compressor** | Primarily lossless schema/description compression at connect time — **complementary and stackable** with terse (`terse proxy -- mcp-compressor -- <server>`). An opt-in `--toonify` flag also reformats results into TOON (off by default; no diffing/policy/state). | Adjacent, not competing. |
 | **Anthropic / OpenAI context editing** | Native, server-side, **lossy** history-pruning; no local artifact to run keylessly. | Different mechanism (drops old results server-side). |
@@ -203,26 +241,46 @@ claim, and a better pitch besides.
 
 ---
 
-## §6 — Popular third-party MCP servers (measured 2026-07-22)
+## §6 — Popular third-party MCP servers (measured 2026-07-30)
 
 §5 is one person's traffic. This section is the other half: what terse does **automatically,
 zero-config** to the output of widely-used, **credential-free** MCP servers that anyone can
 run. Reproduce with `scripts/bench/mcp_servers/` (pinned repo fixtures, a static local web
 fixture, one command per server).
 
-Servers: the official reference set (`modelcontextprotocol/servers`, 88.8k★) plus the two
-most-starred credential-free third-party servers — **serena** (26.7k★) and
-**playwright-mcp** (35.4k★).
+Servers: the official reference set (`modelcontextprotocol/servers`) plus four widely-used
+credential-free third-party servers — **serena**, **playwright-mcp**,
+**@modelcontextprotocol/server-sequential-thinking**'s companion tools, and two more
+credential-free community servers added in this round, **duckduckgo-mcp-server** and
+**@devabdultech/hn-mcp-server** (Hacker News), to broaden shape coverage beyond the original
+six.
 
 | server | tool | output shape | codec % (1-shot) | an *unchanged* repeat | reaches the model? |
 |---|---|---|--:|---|---|
 | filesystem | `directory_tree` | JSON, pretty-printed | **50–58%** | diff | ⚠️ no — see below |
 | filesystem | `read_text_file` | source text | 0% | text-diff | ⚠️ no — see below |
 | git | `git_log` | long text | 0% | text-diff | yes |
-| memory | `read_graph`, `search_nodes`, `create_entities` | JSON | **40–42%** | — | ⚠️ no — see below |
-| serena | `get_symbols_overview`, `find_symbol` | JSON, already compact | **18–22%** | diff | yes |
+| memory | `read_graph`, `search_nodes`, `create_entities` | JSON | **27–52%** | diff (on `read_graph`) | ⚠️ no — see below |
+| serena | `get_symbols_overview`, `find_symbol` | JSON, already compact | **22–37%** | diff (on `get_symbols_overview`) | yes |
 | playwright | `browser_snapshot` | accessibility tree (text) | 0% | text-diff | yes |
 | fetch | `fetch` | markdown | 0% | text-diff | yes |
+| sequential-thinking | `sequentialthinking` | JSON, pretty-printed | **34%** | — (identical args, diff not smaller) | yes |
+| everything | `get-structured-content` | JSON, tiny (14 raw tok) | 0% (below the small-payload floor) | — | ⚠️ no — declares `outputSchema` |
+| duckduckgo-mcp-server | `search` | formatted text | 0% | text-diff | yes |
+| hn-mcp-server | `getStories` | formatted text | 0% | text-diff | yes |
+
+**New in this round — two rows don't fit the "one shape, one number" mold:**
+`sequential-thinking`'s single-thought payload is small enough (82 raw tokens) that the
+34% comes almost entirely from minify, not structural folding — read it as a bound, not a
+ceiling: real chains with many thoughts will look more like a JSON-array-of-records row.
+`everything`'s `get-structured-content` payload (14 raw tokens, a toy weather object) is
+the smallest thing measured in this table and it demonstrates the **floor**, not a
+weakness: terse correctly does nothing to a payload with no redundancy left to fold rather
+than emitting a larger "compressed" form. `duckduckgo` and `hn-mcp-server` both return
+**prose, not JSON** — 0% one-shot like `git_log`/`fetch`, and both still won an
+*unchanged*-repeat text-diff; note duckduckgo's second call hits a live search endpoint
+(not a pinned fixture like the rest of this table), so unlike every other row here its
+repeat isn't guaranteed byte-identical run to run.
 
 ### Honest scope note: on two of these servers the codec % never reaches the model
 
@@ -246,9 +304,17 @@ Which servers do, measured by `outputSchema` declarations and confirmed on the w
 | playwright | 0 / 24 |
 | git | 0 / 12 |
 | fetch | 0 / 1 |
+| sequential-thinking | **1 / 1** |
+| everything | 1 / 13 |
+| duckduckgo-mcp-server | **2 / 2** |
+| hn-mcp-server | 0 / 9 |
 
 It splits along SDK generation, not by accident: the newer TypeScript servers declare
-schemas on every tool. Expect this to grow.
+schemas on every tool. Expect this to grow — of the four servers added this round, both
+`sequential-thinking` and `duckduckgo-mcp-server` (newer, actively-maintained) declare it
+on everything they return; `everything`'s lone declaring tool (`get-structured-content`) is
+too small (14 raw tokens) for the distinction to matter in practice; `hn-mcp-server`
+declares it on nothing, consistent with returning formatted text rather than JSON.
 
 `filesystem`/`directory_tree`, re-measured end to end:
 
@@ -326,13 +392,13 @@ alone can never evidence the repeat column, only the ledger can.
 
 ### Repo size barely moves the codec
 
-`directory_tree` across three pinned fixtures — express v5.2.1 (218 files), fastapi 0.139.2
-(3,131), django 5.2.16 (6,926):
+`directory_tree` across three pinned fixtures — express v5.2.1 (218 tracked files), fastapi
+0.139.2 (3,131), django 5.2.16 (6,922):
 
 | fixture | raw tok | codec % | repeat |
 |---|--:|--:|---|
 | express | 116 | 54.3% | diff not smaller (payload too small) |
-| fastapi | 1,328 | 50.3% | **diff emitted** |
+| fastapi | 1,328 | 50.5% | **diff emitted** |
 | django | 2,696 | 58.0% | **diff emitted** |
 
 The codec sits in a **50–58% band across a 23× payload-size range** — it tracks JSON
@@ -348,12 +414,26 @@ conservative, lossless policy every time with no hand-tuning: `directory_tree` �
 `tiers: []` passthrough (detected as non-JSON), memory's three record tools → all folded.
 That is the "does it just work on a server it has never seen" question, answered yes.
 
+### Aside: three archived reference servers are currently broken, unrelated to terse
+
+Not a terse finding, but worth recording since it shaped which servers ended up in this
+table. `mcp-server-time`, `mcp-server-sqlite`, and `mcp-server-calculator` (all Python,
+built on the low-level `mcp` SDK) fail to start against the `mcp` package version `uvx`
+resolves today — `AttributeError: 'Server' object has no attribute 'list_tools'` /
+`'list_resources'`, and a separate `ImportError: cannot import name 'McpError'` (renamed to
+`MCPError`). None of these servers pin an upper bound on their `mcp` dependency, so `uvx`
+always resolves the latest release, which has since dropped the decorator API they were
+written against. `mcp-server-git` and `mcp-server-fetch` hit the identical failure and were
+only recovered by forcing an older SDK: `uvx --from mcp-server-git --with 'mcp<1.10' ...`.
+Time and sqlite were swapped for `sequential-thinking`, `everything`,
+`duckduckgo-mcp-server`, and `hn-mcp-server` — all four launch clean with no pin.
+
 ### Transports: HTTP downstream and multi-peer fan-out
 
 Everything above is a **stdio** downstream. terse also proxies an MCP **Streamable-HTTP**
-endpoint and can front *N* servers from one process, and neither had third-party evidence.
-Both were exercised against the reference `everything` server run in `streamableHttp` mode.
-**Scope: a single run on 2026-07-22, not part of the pinned size sweep** — these establish
+endpoint and can front *N* servers from one process. Both were re-exercised this round
+against the reference `everything` server run in `streamableHttp` mode.
+**Scope: a single run on 2026-07-30, not part of the pinned size sweep** — these establish
 that the transports work end-to-end, not a measured savings result:
 
 - **HTTP downstream** — `terse proxy -- http://127.0.0.1:3001/mcp`. `initialize`,
@@ -364,11 +444,17 @@ that the transports work end-to-end, not a measured savings result:
 
   | check | result |
   |---|---|
-  | merged `tools/list` | 36 tools, peer-prefixed (`fs`=14, `mem`=9, `ev`=13) |
+  | merged `tools/list` | 36 tools, **unqualified** (`fs`=14, `mem`=9, `ev`=13, no name collisions) |
   | `initialize` primer | injected **exactly once** across all peers |
-  | call routing | each `peer__tool` reached its own peer, including the HTTP one |
-  | per-peer compression | `fs__directory_tree` 54.3% (express v5.2.1 `lib/`), `mem__read_graph` 42.1% |
-  | ledger attribution | per-peer, under the peer-qualified tool name |
+  | call routing | each bare tool name reached its own peer, including the HTTP one |
+  | per-peer compression | `directory_tree` 54.3% (express v5.2.1 `lib/`), `read_graph` 54.1% |
+  | ledger attribution | per-peer internally (`fs.directory_tree`, `mem.read_graph`), regardless of the client-facing name |
+
+  **Correction from the 2026-07-22 measurement:** that run predates #168 (`feat(multiproxy)!:
+  qualify tool names only on a real cross-peer collision`) and reported tools as
+  peer-prefixed (`fs__directory_tree`). Since fs/mem/ev's 36 tools have zero name overlap,
+  none are qualified now — a client calls `directory_tree`, not `fs__directory_tree`. The
+  qualifier only appears when two peers genuinely share a tool name.
 
 This round also turned up a real defect, now fixed: a server-initiated request
 (`roots/list`, `sampling/createMessage`) uses its **own** id space, so its id can collide
