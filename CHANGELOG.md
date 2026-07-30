@@ -145,6 +145,14 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   time runecho gained a tool — is off the primary path.
 
 ### Fixed
+- **`policy.example.json` disabled `dictionary` on `kb.*` from a measurement that predates
+  the #116 multi-block join (#144).** The original call (+2.6% total, not worth the tier)
+  was made before that join gave `dictionary` a multi-block record array to fold into.
+  Re-measured on 1,657 real captured payloads with the join in the path: fleet-wide 7.5% →
+  8.0%, and per-tool up to `lodestone_search` 10.9% → 44.0%. `kb.*` now ships with
+  `["minify", "tabularize", "dictionary"]`. The underlying `policy autotune` generator was
+  never stale — it re-derives the marginal-savings threshold from fresh measurements every
+  run — only this hand-authored example had gone stale after a codec change landed under it.
 - **The savings ledger charged `structuredContent` at its COMPRESSED size on the raw side,
   understating the real wire saving by ~15 points (#141, part 1).** Since #134 the typed
   field can itself be compressed (`"structured": "compress"/"replace"`), but `_emit_stats`
