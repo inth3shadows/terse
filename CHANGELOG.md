@@ -10,6 +10,34 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Added
+- **New `embedded` tier: compress JSON the server delivered as a STRING.** `minify`,
+  `tabularize` and `dictionary` all walk parsed structure, so a body returned double-encoded
+  (`{"response_text": json.dumps(body)}`) is a leaf none of them can reach. Measured on
+  identical data: **41.9% saved as a real record array, 0.0% inside a string** — and #143
+  measured ~21.6% of one fleet's tokens sitting at 0.0% from exactly that one return
+  convention, across seven tools. Adding `"embedded"` to a rule's `tiers` folds such a string
+  into `{"__terse_json__":1,"f":F,"v":...}`, after which the other tiers apply inside `v`
+  normally; the reference double-encoded payload goes **0.0% → 41.4%**.
+
+  **It fires only when it can rebuild the original string byte-for-byte.** `f` names the
+  serialization that reproduces it, chosen from a fixed registry (`json.dumps` defaults,
+  minified, `indent=2`, `indent=4`, each with/without `ensure_ascii`); when none match, terse
+  leaves the string alone. That bar is deliberately stricter than "parses to the same data",
+  because `json.dumps(json.loads(s))` is not `s`: duplicate keys collapse to the last one and
+  `1.50`/`1.5e0` renormalize to `1.5`. Both decline here rather than decode to bytes the
+  server never sent — the guarantee terse sells is byte-faithfulness, not equivalent JSON.
+  Also declines an embedded doc carrying a `__terse_*` key, one past the depth cap, and any
+  occurrence where the envelope would not pay for itself (a per-occurrence size guard, since
+  the whole-payload guard cannot see one small document growing inside a payload that shrank).
+
+  **Opt-in, and `VALID_TIERS` is now distinct from `DEFAULT_TIERS`** so widening the valid set
+  cannot silently switch a tier on for policy files already on disk. Each documented form
+  costs a primer paragraph the client re-reads every turn (#168), and #170 is the precedent
+  for what that costs when a tier rarely fires — so this one is charged only to policies that
+  enable it (53 tok), and `policy generate`/`autotune` can enable it per tool on measured
+  evidence. Verified: 10 mutations of the codec's guards each caught by the new suite, 0
+  losslessness failures and 0 token regressions across the committed corpus plus every
+  payload re-wrapped double-encoded in all five serializations.
 - **`install-mcp --multiproxy` folds a fleet into ONE proxy (#179).** This is the step
   that banks #168's measured win: six standalone proxies cost +23.1% raw input against an
   unwrapped control, the same six behind one router cost +0.0%, because each standalone

@@ -30,7 +30,14 @@ from typing import Any
 from . import lossy as lossy_mod
 from . import transforms
 
-VALID_TIERS = ("minify", "tabularize", "dictionary")
+VALID_TIERS = ("minify", "tabularize", "dictionary", "embedded")
+
+# What `defaults.tiers` means when a policy file omits it. Deliberately NOT `VALID_TIERS`:
+# `embedded` is opt-in, so widening the valid set must not silently switch a new tier on for
+# every policy file already on disk. Each costs a primer paragraph the client re-reads every
+# turn (#168), and #170 is the precedent for what that costs when the tier rarely fires —
+# so a tier joins this tuple on measured evidence (`policy generate`), never by default.
+DEFAULT_TIERS = ("minify", "tabularize", "dictionary")
 LOSSY_MODES = ("truncate", "drop-to-retrieve")  # implemented; summarize is still deferred
 
 # multiproxy's peer-qualifier separator (e.g. "gh__search" for peer "gh"'s "search"
@@ -150,7 +157,7 @@ class Rule:
 @dataclass
 class Policy:
     rules: list[Rule]
-    default_tiers: tuple[str, ...] = ("minify", "tabularize", "dictionary")
+    default_tiers: tuple[str, ...] = DEFAULT_TIERS
     # Cross-call diffing is OFF by default (#170). Opt IN per-policy (`"diff": true`) or
     # with `proxy --diff`; the tier itself is unchanged and still falls back to the full
     # compressed form whenever a diff doesn't apply or win.
@@ -313,6 +320,10 @@ class Policy:
         """True if `dictionary` is reachable, so a `__terse_dict__` legend can appear."""
         return "dictionary" in self.reachable_tiers(server)
 
+    def emits_embedded(self, server: str | None = None) -> bool:
+        """True if `embedded` is reachable, so a `__terse_json__` envelope can appear."""
+        return "embedded" in self.reachable_tiers(server)
+
     def emits_diff(self, server: str | None = None) -> bool:
         """True if a `__terse_diff__` / `__terse_textdiff__` envelope can appear.
 
@@ -325,7 +336,7 @@ class Policy:
 
 def default_policy() -> Policy:
     """Lossless-everywhere default: full Tier-0/0.5 on every tool, no lossy."""
-    return Policy(rules=[], default_tiers=("minify", "tabularize", "dictionary"))
+    return Policy(rules=[], default_tiers=DEFAULT_TIERS)
 
 
 def _coerce_tiers(raw: Any, where: str) -> tuple[str, ...]:
@@ -429,7 +440,7 @@ def load_policy(path: str | Path) -> Policy:
         raise ValueError(f"unsupported policy version: {doc.get('version')!r} (expected 1)")
     defaults = doc.get("defaults", {})
     _reject_unknown_keys(defaults, _DEFAULTS_KEYS, "defaults")
-    default_tiers = _coerce_tiers(defaults.get("tiers", list(VALID_TIERS)), "defaults")
+    default_tiers = _coerce_tiers(defaults.get("tiers", list(DEFAULT_TIERS)), "defaults")
     rules: list[Rule] = []
     for i, r in enumerate(doc.get("policies", [])):
         _reject_unknown_keys(r, _RULE_KEYS, f"policies[{i}]")
@@ -559,7 +570,8 @@ def _lossy_stage(obj: Any, rule: Rule, *, tool: str, never_lossy: bool,
 
 
 def _lossless_stage(data: Any, rule: Rule, warnings: list[str]) -> tuple[str, tuple[str, ...]]:
-    """Always-on Tier-0/0.5 codec (minify/tabularize/dictionary) over `data`, with the
+    """Always-on Tier-0/0.5/0.6 codec (minify/tabularize/dictionary/embedded) over `data`,
+    with the
     verify-before-emit self-check: re-parse what we're about to emit and confirm it
     reconstructs `data`; on any mismatch (or decode error) fall back to the plain minified
     form, which is lossless by construction, and record why. This is the codec's
@@ -569,6 +581,7 @@ def _lossless_stage(data: Any, rule: Rule, warnings: list[str]) -> tuple[str, tu
         data,
         tabularize="tabularize" in rule.tiers,
         dictionary="dictionary" in rule.tiers,
+        embedded="embedded" in rule.tiers,
     )
     try:
         emit_ok = transforms.decompress(text) == data
@@ -576,7 +589,7 @@ def _lossless_stage(data: Any, rule: Rule, warnings: list[str]) -> tuple[str, tu
         emit_ok = False
     if not emit_ok:
         text = transforms.minify(data)
-        warnings.append("codec self-check failed (tabularize/dictionary did not "
+        warnings.append("codec self-check failed (tabularize/dictionary/embedded did not "
                         "round-trip); emitted minified-lossless form instead")
         return text, ()
     return text, rule.tiers

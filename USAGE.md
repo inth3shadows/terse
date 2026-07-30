@@ -614,6 +614,52 @@ terse install-mcp kb --policy policy.json --never-lossy
 enforcement keys off the server's verified identity (the `--server-name` terse bakes into the
 wrap), so it can't be defeated by a mislabeled rule.
 
+### Reaching a payload the server double-encoded (`"embedded"`)
+
+Some servers return their whole body as a **JSON string** rather than as JSON:
+
+```json
+{ "response_text": "{\"results\": [{\"id\": 1, ...}, ...]}" }
+```
+
+`minify`, `tabularize` and `dictionary` all walk *parsed* structure, and a string is a leaf —
+so the record array terse is best at is invisible to every tier. Measured on identical data:
+**41.9% saved as a real array, 0.0% inside a string.** This is not one tool's quirk; #143
+measured ~21.6% of one fleet's tokens sitting at 0.0% from a single return convention.
+
+The `embedded` tier reaches it — add it to a rule's `tiers`:
+
+```json
+{ "match": { "tool": "secret-broker.*" },
+  "tiers": ["minify", "tabularize", "dictionary", "embedded"] }
+```
+
+A folded string ships as `{"__terse_json__":1,"f":F,"v":<the document>}`, and the other tiers
+then apply *inside* `v` normally — that is the point, the fold exists to let them in.
+
+**It only fires when it can rebuild the original string byte-for-byte.** `f` names the exact
+serialization that reproduces it. terse tries a fixed set of forms (`json.dumps` defaults,
+minified, `indent=2`, `indent=4`, each with and without `ensure_ascii`) and **declines
+whenever none of them match**, because `json.dumps(json.loads(s))` is not `s` in general:
+
+| the string contains | why terse declines |
+|---|---|
+| `{"a": 1, "a": 2}` | duplicate keys — `json.loads` keeps only the last |
+| `{"n": 1.50}` | re-encodes as `1.5`; the value survives, the spelling does not |
+| `{"n": 1.5e0}` | re-encodes as `1.5` |
+| unusual spacing, leading/trailing whitespace | no registered form emits it |
+| a `__terse_*` key | would be misread as one of terse's own envelopes |
+
+Declining is always safe; folding a string terse cannot reproduce exactly would not be. The
+bar is byte-equality rather than "same data" on purpose — the guarantee terse sells is
+byte-faithfulness, and a tier that quietly relaxed that to "equivalent JSON" would be
+selling something else.
+
+It is **opt-in**, like every tier that costs a primer paragraph: a form the client is told
+about is re-read every turn (#168), so a server that never double-encodes should not pay for
+the explanation. `policy generate` / `policy autotune` will add it where the measurement
+justifies it.
+
 ### Compressing `structuredContent` (`"structured": "compress"`)
 
 Some MCP servers return a typed `structuredContent` field beside a text block that

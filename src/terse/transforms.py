@@ -2,6 +2,8 @@
 
 Tier 0   — minify (whitespace) + tabularize (fold repeated KEYS of record arrays)
 Tier 0.5 — dictionary coding (fold repeated VALUES via an inline legend)
+Tier 0.6 — embedded JSON (fold a string leaf that is itself a JSON document, so the
+           tiers above can reach records delivered double-encoded; opt-in)
 Tier 0.7 — cross-call diffing (encode a result as a lossless delta vs the prior
            same-tool result; stateful, applied by the proxy, opt-in)
 
@@ -37,6 +39,8 @@ from .tokenize import count_cl100k
 TABLE_MARKER = "__terse_table__"
 DICT_MARKER = "__terse_dict__"
 DIFF_MARKER = "__terse_diff__"
+# Tier 0.6: a string leaf that is itself a JSON document (`embedded`).
+JSON_STR_MARKER = "__terse_json__"
 # The drop-to-retrieve inline handle marker (#10). Not a transforms envelope — it is
 # produced by the lossy layer and consumed by the proxy's retrieve handler — but it lives
 # in this registry so all `__terse_*` wire keys have one home and are reserved together.
@@ -47,7 +51,29 @@ ALIAS_SIGIL = "~"
 # can't be safely compressed: the consumer reads these markers per the format primer,
 # so it would mis-reconstruct the user's literal dict as a terse envelope. The codec
 # has no escape convention, so the only lossless move is to leave such a payload alone.
-_RESERVED_MARKERS = frozenset({TABLE_MARKER, DICT_MARKER, DIFF_MARKER, DROPPED_MARKER})
+_RESERVED_MARKERS = frozenset({TABLE_MARKER, DICT_MARKER, DIFF_MARKER, DROPPED_MARKER,
+                               JSON_STR_MARKER})
+
+# The serializations the `embedded` tier can reproduce EXACTLY. A string leaf is folded only
+# when one of these regenerates it byte-for-byte, so the id stored in "f" is a complete
+# recipe for rebuilding the original bytes — decode never has to guess at formatting.
+#
+# WIRE CONTRACT: these ids are permanent. Adding a form is backward-safe (payloads already
+# on the wire keep decoding); renaming one, or re-pointing it at different kwargs, silently
+# corrupts every payload that used it. Append, never edit.
+_EMBED_FORMS: dict[str, dict[str, Any]] = {
+    # `json.dumps(body)` with no kwargs — what a server that double-encodes usually emits.
+    "p": {},
+    "P": {"ensure_ascii": False},
+    # Minified. "C" is terse's own `minify` form, so terse-on-terse nests cleanly.
+    "c": {"separators": (",", ":")},
+    "C": {"separators": (",", ":"), "ensure_ascii": False},
+    # Pretty-printed.
+    "i2": {"indent": 2},
+    "I2": {"indent": 2, "ensure_ascii": False},
+    "i4": {"indent": 4},
+    "I4": {"indent": 4, "ensure_ascii": False},
+}
 
 # Nesting cap shared by every codec boundary (capture's shape classifier, policy.apply,
 # the proxy's diff path, measure). The transforms themselves recurse without a depth
@@ -110,7 +136,50 @@ def _uniform_dict_list(value: Any) -> bool:
     return all(set(item.keys()) == first_keys for item in value[1:])
 
 
-def _fold_records(records: list[dict]) -> tuple[dict, list]:
+def _embed_json_string(s: str) -> dict | None:
+    """Fold a string leaf that is ITSELF a JSON document — or None to leave it alone.
+
+    `tabularize`/`dictionary` walk PARSED structure, so a payload delivered as a JSON
+    *string* is a leaf they cannot reach. Measured on identical data: 41.9% saved as a real
+    record array, 0.0% inside a string. Double-encoding is a common server convention —
+    #143 measured ~21.6% of one fleet's tokens sitting at 0.0% from a single
+    `{"response_text": json.dumps(body)}` return shape, and noted "it is not one tool".
+
+    Folded ONLY when a form in `_EMBED_FORMS` reproduces `s` byte-for-byte. That bar is
+    deliberately stricter than "parses to equal data", because `json.dumps(json.loads(s))`
+    is not `s` in general: duplicate keys collapse to the last one, and `1.50` renormalizes
+    to `1.5`. Both SKIP here rather than decode to something the server never sent —
+    terse's guarantee is byte-faithfulness, and a tier that quietly downgraded it to
+    "equivalent data" would redefine the property the project exists to provide.
+    """
+    # Every form emits a container with no leading whitespace, so anything else could not
+    # be reproduced byte-exactly anyway — reject before paying for a parse.
+    if s[:1] not in ("{", "["):
+        return None
+    try:
+        parsed = json.loads(s)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(parsed, (dict, list)):
+        return None
+    # The same two invariants the outer codec honours: an embedded doc carrying a terse
+    # marker would be mis-read as an envelope, and one past the depth cap would recurse.
+    if has_terse_marker(parsed) or exceeds_depth(parsed):
+        return None
+    form = next((f for f, kw in _EMBED_FORMS.items() if json.dumps(parsed, **kw) == s), None)
+    if form is None:
+        return None
+    wrapper = {JSON_STR_MARKER: 1, "f": form, "v": compress_structure(parsed, embedded=True)}
+    # Per-occurrence size guard. `dict_encode` guards per alias and `compress_with` guards
+    # the payload as a whole; neither can see a single embedded doc that grew inside a
+    # payload that shrank overall. Compared against the string as a JSON VALUE, since that
+    # is what shipping it unfolded actually costs.
+    if _tok_text(minify(wrapper)) >= _tok(s):
+        return None
+    return wrapper
+
+
+def _fold_records(records: list[dict], embedded: bool = False) -> tuple[dict, list]:
     """Fold a uniform-dict list into (spec, positional rows), recursing on dict-columns.
 
     A column whose values are themselves all uniform dicts is hoisted: its key-set
@@ -125,27 +194,32 @@ def _fold_records(records: list[dict]) -> tuple[dict, list]:
     for ci, k in enumerate(keys):
         col = [posrows[ri][ci] for ri in range(n)]
         if _uniform_dict_list(col):
-            sub_spec, sub_pos = _fold_records(col)
+            sub_spec, sub_pos = _fold_records(col, embedded)
             subcols[k] = sub_spec
             for ri in range(n):
                 posrows[ri][ci] = sub_pos[ri]
         else:
             for ri in range(n):
-                posrows[ri][ci] = compress_structure(posrows[ri][ci])
+                posrows[ri][ci] = compress_structure(posrows[ri][ci], embedded)
     spec: dict = {"cols": keys}
     if subcols:
         spec["subcols"] = subcols
     return spec, posrows
 
 
-def compress_structure(obj: Any) -> Any:
+def compress_structure(obj: Any, embedded: bool = False, tabularize: bool = True) -> Any:
     """Recursively fold every qualifying list-of-uniform-dicts into a table,
-    hoisting nested uniform-dict columns into a shared subcols header."""
+    hoisting nested uniform-dict columns into a shared subcols header.
+
+    `embedded` additionally folds string leaves that are themselves JSON documents
+    (Tier 0.6, opt-in). Both flags default to today's behaviour, so every existing caller
+    is unchanged: `tabularize=False, embedded=True` runs the embedded fold alone.
+    """
     if isinstance(obj, dict):
-        return {k: compress_structure(v) for k, v in obj.items()}
+        return {k: compress_structure(v, embedded, tabularize) for k, v in obj.items()}
     if isinstance(obj, list):
-        if _uniform_dict_list(obj):
-            spec, posrows = _fold_records(obj)
+        if tabularize and _uniform_dict_list(obj):
+            spec, posrows = _fold_records(obj, embedded)
             # `n` is a redundant row-count hint: it lets a reader self-check that it
             # enumerated every row (fidelity probe found terse's only recall gap was
             # under-enumeration of wide positional tables). decompress ignores it, so
@@ -154,7 +228,9 @@ def compress_structure(obj: Any) -> Any:
             if "subcols" in spec:
                 table["subcols"] = spec["subcols"]
             return table
-        return [compress_structure(item) for item in obj]
+        return [compress_structure(item, embedded, tabularize) for item in obj]
+    if embedded and isinstance(obj, str):
+        return _embed_json_string(obj) or obj
     return obj
 
 
@@ -178,6 +254,15 @@ def decompress_structure(obj: Any) -> Any:
             cols = obj["cols"]
             subcols = obj.get("subcols", {})
             return [_unfold_row(row, cols, subcols) for row in obj["rows"]]
+        if obj.get(JSON_STR_MARKER) == 1 and "f" in obj and "v" in obj:
+            kwargs = _EMBED_FORMS.get(obj["f"])
+            if kwargs is None:
+                # A form id this build doesn't know — a forward/corrupt payload. Raise
+                # rather than hand back the envelope dict as if it were the data: the
+                # proxy's verify-before-emit self-check turns this into a fall-back to
+                # the plain minified form, which is the safe outcome.
+                raise ValueError(f"unknown embedded-JSON form {obj['f']!r}")
+            return json.dumps(decompress_structure(obj["v"]), **kwargs)
         return {k: decompress_structure(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [decompress_structure(item) for item in obj]
@@ -584,7 +669,8 @@ def compress_tabular(obj: Any) -> str:
     return minify(compress_structure(obj))
 
 
-def compress_with(obj: Any, tabularize: bool = True, dictionary: bool = True) -> str:
+def compress_with(obj: Any, tabularize: bool = True, dictionary: bool = True,
+                  embedded: bool = False) -> str:
     """Apply a selectable subset of lossless tiers, then minify.
 
     `decompress` auto-detects the markers, so any combination round-trips. minify is
@@ -600,9 +686,10 @@ def compress_with(obj: Any, tabularize: bool = True, dictionary: bool = True) ->
     diff tier holds the identical "emit the delta only when it's smaller" contract.
     """
     plain = minify(obj)  # the lossless floor: never larger than a well-formed raw payload
-    if not tabularize and not dictionary:
+    if not tabularize and not dictionary and not embedded:
         return plain
-    structure = compress_structure(obj) if tabularize else obj
+    structure = (compress_structure(obj, embedded=embedded, tabularize=tabularize)
+                 if (tabularize or embedded) else obj)
     candidate = minify(structure)
     if dictionary:
         base, memo = _build_canon_memo(structure)  # root canon doubles as the minified base
