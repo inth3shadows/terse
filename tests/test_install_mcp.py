@@ -633,7 +633,9 @@ def test_scan_scopes_surfaces_wraps_diff_stats_and_missing_policy(tmp_path, monk
     assert cg["policy_missing"] is True
     ru = by["runecho"]
     assert ru["wraps"] == "runecho-mcp"
-    assert ru["diff"] == "default" and ru["stats"] is True
+    # Resolved, not merely named: a bare "default" read as "on" and convinced a reader
+    # diffing was unimplemented (#181). The label states the value it actually inherits.
+    assert ru["diff"] == "default (off)" and ru["stats"] is True
     assert ru["policy_missing"] is False
 
 
@@ -1726,3 +1728,71 @@ def test_prune_peer_normalizes_away_malformed_entries(tmp_path):
     assert doc["downstreams"] == [{"name": "gh", "url": "https://x"}]
     assert _prune_peer(doc, "nope") is False
     assert doc["downstreams"] == [{"name": "gh", "url": "https://x"}]   # still normalized
+
+
+# --------------------------------------------------------------------------- #
+# #181: `mcp-status` must resolve the diff setting, not just name it
+# --------------------------------------------------------------------------- #
+def test_default_diff_label_resolves_against_the_builtin_default():
+    """A bare "default" reads as "the feature's normal state, i.e. on". #170 made it off, so
+    that label actively misled a reader into concluding diffing was never implemented."""
+    from terse.install_mcp import _default_diff_label
+    assert _default_diff_label(None) == "default (off)"
+
+
+def test_default_diff_label_tracks_the_dataclass_instead_of_a_copied_constant():
+    """Derived from `Policy.diff`, so a future flip of the default cannot leave this label
+    asserting the opposite of what the proxy does (the #144 failure mode)."""
+    from dataclasses import fields
+
+    from terse import policy as P
+    from terse.install_mcp import _default_diff_label
+    on = next(f.default for f in fields(P.Policy) if f.name == "diff")
+    assert _default_diff_label(None) == f"default ({'on' if on else 'off'})"
+
+
+@pytest.mark.parametrize("value, expected", [(True, "policy (on)"), (False, "policy (off)")])
+def test_default_diff_label_prefers_the_entrys_own_policy_file(tmp_path, value, expected):
+    from terse.install_mcp import _default_diff_label
+    pol = tmp_path / "p.json"
+    pol.write_text(json.dumps({"version": 1, "diff": value}), encoding="utf-8")
+    assert _default_diff_label(str(pol)) == expected
+
+
+@pytest.mark.parametrize("body", ["{ not json", json.dumps({"version": 1})])
+def test_default_diff_label_falls_back_when_the_policy_cannot_answer(tmp_path, body):
+    """Malformed, or simply silent on `diff` — either way the built-in default is the truth,
+    and an unreadable policy must not crash `mcp-status`."""
+    from terse.install_mcp import _default_diff_label
+    pol = tmp_path / "p.json"
+    pol.write_text(body, encoding="utf-8")
+    assert _default_diff_label(str(pol)) == "default (off)"
+    assert _default_diff_label("/nonexistent/absent.json") == "default (off)"
+
+
+def _agg_with(diff_reasons):
+    from terse.stats import aggregate, build_record
+    recs = []
+    for reason, n in diff_reasons.items():
+        for _ in range(n):
+            r = build_record("s", "t", '{"a":1}', '{"a":1}', passthrough=False)
+            r["diff_reason"] = reason
+            recs.append(r)
+    return aggregate(recs)
+
+
+def test_stats_explains_diff_off_when_it_is_the_only_reason():
+    """The reader's question ("why did my repeat call not diff?") is asked at this line, so
+    the answer belongs here rather than only in the policy dataclass (#181)."""
+    from terse.stats import build_stats_report
+    out = build_stats_report(_agg_with({"diff_off": 3}), log_path="/x/s.jsonl")
+    assert "OFF by default since #170" in out
+    assert "--diff" in out
+
+
+def test_stats_does_not_explain_diff_off_when_diffing_is_actually_working():
+    """A session with real diff activity does not need the explainer, and printing it there
+    would imply diffing is disabled when it plainly is not."""
+    from terse.stats import build_stats_report
+    out = build_stats_report(_agg_with({"diff_off": 3, "emitted": 1}), log_path="/x/s.jsonl")
+    assert "OFF by default since #170" not in out

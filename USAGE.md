@@ -918,8 +918,14 @@ final-answer accuracy — gated on the worst model. Run this before enabling
 
 The proxy emits a lossless **delta** against the prior same-tool result instead of
 the full payload — big in agent loops that call the same tool repeatedly (~91% overlap).
-It is stateful and **on by default** (its validation program — pair fluency,
-nested-record coverage, and the drift soak — has passed; see TECHNICAL.md):
+It is stateful and **OFF by default** — opt in with `--diff` (or `"diff": true` in a policy).
+Its validation program passed (pair fluency, nested-record coverage, drift soak; see
+TECHNICAL.md), so the default is a *cost* decision, not a confidence one: the primer
+paragraph explaining the diff format is 190 of 402 cl100k tokens and the client re-reads it
+every turn, per wrapped server, against a measured **0.38% hit rate** (7 diffs in 1,828
+blocks over 13.3 days). At that rate the explanation cost ~900–2,700x what the tier saved,
+so #170 flipped it off. Turn it on for a workload that genuinely re-calls the same tool with
+the same arguments — `terse stats` shows your own hit rate under `diff reasons`:
 
 ```
 # nothing to enable — a plain proxy diffs. Opt OUT per proxy:

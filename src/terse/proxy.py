@@ -643,7 +643,13 @@ class Interceptor:
                         block["text"] = new_text
                         changed = True
                 if len(text_blocks) == 1:
-                    diff_reason = "diff_off"   # diffing disabled for a single-block result
+                    # Diffing is off BY POLICY here — this is the `else` of
+                    # `elif self.diff and len(text_blocks) == 1`. The block count only
+                    # decides whether the label applies, it is not the cause. The old
+                    # wording ("disabled for a single-block result") read as a structural
+                    # exclusion and helped convince a reader diffing was unimplemented
+                    # rather than deliberately off (#181, #170).
+                    diff_reason = "diff_off"
                 # A per-block result the model receives as N blocks has no single JSON value
                 # a later diff could reference (and its actual prior same-tool result was
                 # these N blocks, not the stale base) — drop any base so the next result
