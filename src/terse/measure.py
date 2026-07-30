@@ -48,20 +48,27 @@ def measure_payload(raw: str) -> dict[str, Any]:
             "shape": shape,
             "applicable": False,
             "roundtrip_ok": True,
-            "cl100k": {"raw": raw_tok, "minified": raw_tok, "tabular": raw_tok, "compressed": raw_tok},
-            "saved_cl100k": {"minify": 0, "tabularize": 0, "dictionary": 0, "tier_total": 0},
+            "cl100k": {"raw": raw_tok, "minified": raw_tok, "tabular": raw_tok,
+                       "compressed": raw_tok, "embedded": raw_tok},
+            "saved_cl100k": {"minify": 0, "tabularize": 0, "dictionary": 0, "embedded": 0,
+                             "tier_total": 0},
         }
         return row
 
     minified = transforms.minify(obj)
     tabular = transforms.compress_tabular(obj)  # Tier-0 only (minify + tabularize)
     compressed = transforms.compress(obj)       # + Tier-0.5 dictionary coding
+    # + Tier-0.6 embedded. Measured as its own marginal step so `policy generate` can
+    # decide it per tool on evidence, exactly as it does for `dictionary` — the tier is
+    # opt-in precisely because it costs a primer paragraph, so it must earn its place.
+    embedded = transforms.compress_with(obj, embedded=True)
     gate = transforms.roundtrip_ok(obj)
 
     raw_tok = count_cl100k(raw)
     min_tok = count_cl100k(minified)
     tab_tok = count_cl100k(tabular)
     cmp_tok = count_cl100k(compressed)
+    emb_tok = count_cl100k(embedded)
 
     def _saved(a: int | None, b: int | None) -> int | None:
         return None if a is None or b is None else a - b
@@ -76,7 +83,13 @@ def measure_payload(raw: str) -> dict[str, Any]:
         "minify": _saved(raw_tok, min_tok),
         "tabularize": _saved(min_tok, tab_tok),
         "dictionary": _saved(tab_tok, cmp_tok),
-        "tier_total": _saved(raw_tok, cmp_tok),
+        "embedded": _saved(cmp_tok, emb_tok),
+        # Includes `embedded`, deliberately: this is what gates the passthrough decision, and
+        # a tool whose ONLY saving is a double-encoded body (0.0% without the tier) would
+        # otherwise score below threshold and never be offered the tier that unlocks it.
+        # Safe to fold in, because `embedded` is size-guarded per occurrence and can never
+        # come out larger — on a payload with no embedded JSON `emb_tok == cmp_tok` exactly.
+        "tier_total": _saved(raw_tok, emb_tok),
     }
     if not gate:
         saved = dict.fromkeys(saved, 0)
@@ -85,7 +98,8 @@ def measure_payload(raw: str) -> dict[str, Any]:
         "shape": shape,
         "applicable": True,
         "roundtrip_ok": gate,
-        "cl100k": {"raw": raw_tok, "minified": min_tok, "tabular": tab_tok, "compressed": cmp_tok},
+        "cl100k": {"raw": raw_tok, "minified": min_tok, "tabular": tab_tok,
+                   "compressed": cmp_tok, "embedded": emb_tok},
         "saved_cl100k": saved,
     }
 
@@ -128,6 +142,7 @@ def measure_joined(raws: list[str]) -> dict[str, Any] | None:
     min_tok = count_cl100k(transforms.minify(objs))
     tab_tok = count_cl100k(transforms.compress_tabular(objs))
     cmp_tok = count_cl100k(transforms.compress(objs))
+    emb_tok = count_cl100k(transforms.compress_with(objs, embedded=True))
     gate = transforms.roundtrip_ok(objs)
 
     def _saved(a: int | None, b: int | None) -> int | None:
@@ -137,7 +152,8 @@ def measure_joined(raws: list[str]) -> dict[str, Any] | None:
         "minify": _saved(raw_tok, min_tok),
         "tabularize": _saved(min_tok, tab_tok),
         "dictionary": _saved(tab_tok, cmp_tok),
-        "tier_total": _saved(raw_tok, cmp_tok),
+        "embedded": _saved(cmp_tok, emb_tok),
+        "tier_total": _saved(raw_tok, emb_tok),   # see measure_payload for why embedded counts
     }
     if not gate:
         saved = dict.fromkeys(saved, 0)       # same rule as measure_payload: no banking a loss
@@ -147,7 +163,7 @@ def measure_joined(raws: list[str]) -> dict[str, Any] | None:
         "roundtrip_ok": gate,
         "blocks": len(raws),
         "cl100k": {"raw": raw_tok, "minified": min_tok, "tabular": tab_tok,
-                   "compressed": cmp_tok},
+                   "compressed": cmp_tok, "embedded": emb_tok},
         "saved_cl100k": saved,
     }
 
