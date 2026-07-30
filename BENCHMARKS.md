@@ -255,19 +255,48 @@ credential-free community servers added in this round, **duckduckgo-mcp-server**
 **@devabdultech/hn-mcp-server** (Hacker News), to broaden shape coverage beyond the original
 six.
 
-| server | tool | output shape | codec % (1-shot) | an *unchanged* repeat | reaches the model? |
-|---|---|---|--:|---|---|
-| filesystem | `directory_tree` | JSON, pretty-printed | **50–58%** | diff | ⚠️ no — see below |
-| filesystem | `read_text_file` | source text | 0% | text-diff | ⚠️ no — see below |
-| git | `git_log` | long text | 0% | text-diff | yes |
-| memory | `read_graph`, `search_nodes`, `create_entities` | JSON | **27–52%** | diff (on `read_graph`) | ⚠️ no — see below |
-| serena | `get_symbols_overview`, `find_symbol` | JSON, already compact | **22–37%** | diff (on `get_symbols_overview`) | yes |
-| playwright | `browser_snapshot` | accessibility tree (text) | 0% | text-diff | yes |
-| fetch | `fetch` | markdown | 0% | text-diff | yes |
-| sequential-thinking | `sequentialthinking` | JSON, pretty-printed | **34%** | — (identical args, diff not smaller) | yes |
-| everything | `get-structured-content` | JSON, tiny (14 raw tok) | 0% (below the small-payload floor) | — | ⚠️ no — declares `outputSchema` |
-| duckduckgo-mcp-server | `search` | formatted text | 0% | text-diff | yes |
-| hn-mcp-server | `getStories` | formatted text | 0% | text-diff | yes |
+| server | tool | output shape | codec % (1-shot) | TOON % | an *unchanged* repeat | reaches the model? |
+|---|---|---|--:|--:|---|---|
+| filesystem | `directory_tree` | JSON, pretty-printed | **50–58%** | 50–69% | diff | ⚠️ no — see below |
+| filesystem | `read_text_file` | source text | 0% | n/a | text-diff | ⚠️ no — see below |
+| git | `git_log` | long text | 0% | n/a | text-diff | yes |
+| memory | `read_graph`, `search_nodes`, `create_entities` | JSON | **27–52%** | 35–39% | diff (on `read_graph`) | ⚠️ no — see below |
+| serena | `get_symbols_overview`, `find_symbol` | JSON, already compact | **22–37%** | 6–30% | diff (on `get_symbols_overview`) | yes |
+| playwright | `browser_snapshot` | accessibility tree (text) | 0% | n/a | text-diff | yes |
+| fetch | `fetch` | markdown | 0% | n/a | text-diff | yes |
+| sequential-thinking | `sequentialthinking` | JSON, pretty-printed | **34%** | 32% | — (identical args, diff not smaller) | yes |
+| everything | `get-structured-content` | JSON, tiny (14 raw tok) | 0% (below the small-payload floor) | 0% | — | ⚠️ no — declares `outputSchema` |
+| duckduckgo-mcp-server | `search` | formatted text | 0% | n/a | text-diff | yes |
+| hn-mcp-server | `getStories` | formatted text | 0% | n/a | text-diff | yes |
+
+**`n/a` is not `0%`.** TOON is a JSON serialization; on the six text rows it cannot encode
+the payload at all, which is a different fact from "encoded it and tied". terse also scores
+0% one-shot there — the honest reading of those rows is that *neither* tool claims anything
+on prose, and both fall back to the diff tier. 13 of the 25 captured payloads in this table
+are non-JSON.
+
+Weighted over only the 12 payloads TOON *can* encode (5,408 raw cl100k tokens):
+**terse 53.6%, TOON 49.5%.** terse wins the two largest JSON payloads
+(`directory_tree` 58.0% vs 56.3%; `memory.read_graph` 54.1% vs 35.4%) and loses two small
+ones — TOON takes the 116-token `directory_tree` (69.0% vs 54.3%) and the 123-token
+`serena.get_symbols_overview` (30.1% vs 28.5%). Published as the trade, not smoothed into a
+single verdict: TOON's header-once row format wins where a payload is small and perfectly
+uniform, which is the same shape-conditional result §1 and §2 found.
+
+Reproduce the TOON column from the same capture dirs the codec column came from:
+
+```bash
+uv run python scripts/bench/mcp_servers/toon_column.py "$CORPUS" [more CORPUS dirs...]
+```
+
+> **Discrepancy, stated rather than smoothed (2026-07-30).** The TOON column was computed
+> by re-measuring this round's saved capture dirs, so both columns describe the same bytes.
+> That re-measure reproduces `filesystem` (50.5/54.3/58.0%), `sequential-thinking` (34.1%)
+> and `everything` (0%) exactly, but gives **memory 44–54%** against the 27–52% published
+> above, and **serena 22–29%** against 22–37%. The published cells are left as-is because
+> the saved captures cannot be *proven* to be the exact ones those two ranges were written
+> from — a memory-server graph accumulates across runs. Settling it needs a cold re-probe
+> of `memory` and `serena`, tracked on #138.
 
 **New in this round — two rows don't fit the "one shape, one number" mold:**
 `sequential-thinking`'s single-thought payload is small enough (82 raw tokens) that the

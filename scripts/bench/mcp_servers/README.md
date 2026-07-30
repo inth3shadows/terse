@@ -39,7 +39,18 @@ python mcp_probe.py filesystem "$CORPUS" "$LEDGER" \
 terse measure --corpus "$CORPUS"   # per-tool codec %, shape bucket, tier attribution
 terse stats   --log    "$LEDGER"   # decisions + diff-reason breakdown
 terse policy generate --corpus "$CORPUS"   # what terse auto-authors for these tools
+
+# competitor column (#138) — TOON on the SAME captured payloads, not a re-run:
+#   requires `cd scripts/bench && npm install` for the pinned @toon-format/toon encoder
+uv run python toon_column.py "$CORPUS" [more CORPUS dirs...]
 ```
+
+`toon_column.py` accepts as many capture dirs as you have and dedupes payloads by content
+sha, so the whole round's dirs can be passed at once — the size-axis and multi-peer runs
+re-capture byte-identical payloads, and counting one three times would weight the total
+toward whichever tool was probed most. It drops any payload either encoder failed a
+round-trip on (reported by name, never silently) and prints `n/a` — not `0%` — where TOON
+cannot encode the payload at all. Produces BENCHMARKS.md §6's `TOON %` column.
 
 Swap the server command for the others:
 
