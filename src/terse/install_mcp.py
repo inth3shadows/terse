@@ -43,9 +43,10 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
+from . import policy as policy_mod
 from ._secure_io import write_restricted
 
 STASH_NAME = ".terse-mcp-stash.json"
@@ -308,6 +309,30 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
                 new_entry[k] = v
     servers[server] = new_entry
     return config, stash
+
+
+def _default_diff_label(policy_path: str | None) -> str:
+    """Describe the diff setting of an entry that passes neither `--diff` nor `--no-diff`.
+
+    Printing a bare `default` caused a real misdiagnosis (#181): #170 flipped the default to
+    OFF, so `default` read as "the feature's normal state, i.e. on", and a session that saw
+    `diffs=0` concluded cross-call diffing was never implemented. It is implemented and
+    deliberately off — a reporting bug, not a behavioural one, but the reader cannot tell.
+
+    So resolve it rather than name it: against the entry's own policy file when that file
+    states `diff`, and otherwise against the `Policy.diff` field default itself, read from
+    the dataclass so this label can never drift from the value it claims to describe (the
+    #144 failure — a hand-copied constant outliving the decision behind it)."""
+    if policy_path:
+        try:
+            doc = json.loads(Path(policy_path).read_text(encoding="utf-8"))
+            if isinstance(doc, dict) and "diff" in doc:
+                return f"policy ({'on' if doc['diff'] else 'off'})"
+        except (OSError, ValueError):
+            pass  # unreadable or malformed: the built-in default is still the truth below
+    field_default = fields(policy_mod.Policy)
+    on = next(f.default for f in field_default if f.name == "diff")
+    return f"default ({'on' if on else 'off'})"
 
 
 def peers_path(cfg: Path, stash_prefix: str = "user") -> Path:
@@ -1208,8 +1233,8 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
                 downstream = args[args.index("--") + 1:]
                 if downstream:
                     wraps = " ".join(downstream)
-            diff = "off" if "--no-diff" in args else ("on" if "--diff" in args
-                                                      else "default")
+            diff = ("off" if "--no-diff" in args
+                    else "on" if "--diff" in args else _default_diff_label(policy))
             stats_on = "--no-stats" not in args
         if state in ("router", "router-ambiguous"):
             # A router has no `--` downstream and no single `--policy`: what it fronts is

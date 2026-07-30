@@ -342,12 +342,16 @@ well as raw JSON?* — now has a measured answer: on a stress corpus, Claude Hai
 and Gemini 2.5 Flash match raw-JSON accuracy on the compressed form (100% paired) at a
 37% token saving (`terse fluency`; see TECHNICAL.md). Whole-subtree aliasing (folding
 repeated objects, not just strings) is built. Cross-call diffing is a lossless tier
-that is now **on by default** — its full validation program passed: pair fluency
+that is **off by default** (#170) — not for lack of confidence, but on cost: its primer
+paragraph is 190 of 402 cl100k tokens, re-read every turn per wrapped server, against a
+measured 0.38% hit rate, so the explanation cost ~900–2,700x what the tier saved. Its full
+validation program did pass: pair fluency
 (`fluency --diff`, 4-model panel 100%), the nested-record surface (`structure`: diff
 100% vs full-terse 94%), and long-chain drift soaked from both sides — mechanically
 (`tests/test_diff_soak.py` — exact reconstruction hundreds of chained hops deep) and
 behaviorally (`fluency --diff-soak` — no depth-correlated accuracy loss up to the
-keyframe bound). Opt out per proxy (`--no-diff`) or per policy (`"diff": false`).
+keyframe bound). Opt IN per proxy (`--diff`) or per policy (`"diff": true`) — worth it for a
+workload that really does re-call the same tool with the same arguments.
 Cross-block joining (N content blocks
 folded into one record array before compressing) is built and on by default — it removed
 the structural exclusion that kept 71% of real traffic out of the diff tier entirely.

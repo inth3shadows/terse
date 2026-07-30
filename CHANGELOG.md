@@ -184,6 +184,20 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   time runecho gained a tool — is off the primary path.
 
 ### Fixed
+- **`mcp-status` reported `diff=default` when the default is OFF, and the docs said the
+  opposite (#181).** #170 flipped cross-call diffing off, but three signals still pointed the
+  other way, and together they produced a repeatable misdiagnosis: a real session saw
+  `diffs=0` with `diff_off` on every block, found no `diff` key in its policy, and concluded
+  diffing "isn't wired into policy-based tools at all" and "may have been scoped out". It is
+  implemented and deliberately off. Fixed all three: `mcp-status` now RESOLVES the value
+  rather than naming it (`default (off)`, or `policy (on|off)` when the entry's own policy
+  file says), reading the built-in from the `Policy.diff` dataclass field so the label cannot
+  drift from the value it describes; `terse stats` explains `diff_off` where the question is
+  actually asked, when it is the only diff reason present; and the misleading comment at the
+  `diff_off` assignment (which read as a structural exclusion for single-block results, when
+  the real cause is policy) is corrected. **README and USAGE both still claimed diffing was
+  "on by default"** — the strongest of the misleading signals, now corrected with the measured
+  reason it is off (primer 190/402 tokens re-read every turn vs a 0.38% hit rate).
 - **`policy.example.json` disabled `dictionary` on `kb.*` from a measurement that predates
   the #116 multi-block join (#144).** The original call (+2.6% total, not worth the tier)
   was made before that join gave `dictionary` a multi-block record array to fold into.
