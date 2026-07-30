@@ -10,6 +10,30 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Added
+- **`terse stats` now shows what the primer costs (#168).** The ledger charges terse for the
+  payloads it compresses and never for the context it adds, so `terse stats` could report a
+  win in a session that was a net loss — measured from outside terse as a **14.0% win at one
+  wrapped server and a 2.1% loss at three**. The report gains a `primer liability` block:
+  tokens per turn across the installed wrapped servers, how many turns the window's savings
+  cover, a `NET NEGATIVE` call-out when they cover less than one, and a list of wrapped
+  servers that pay every turn but were never called. `terse stats --json` carries the same
+  under `primer_liability`.
+
+  **It does not charge a per-turn cost into the ledger, deliberately.** `turns` is not
+  observable: a `terse proxy` is a stdio process that sees one `initialize` per process
+  lifetime and then `tools/call` requests, several of which can share a turn — nothing in
+  MCP reports the client's turn count. Inventing one would be the #144/#186/#188 defect
+  family again, a number describing something the code never measured. A break-even
+  statement gives the operator the same decision with no fabricated denominator.
+
+  Sized from the **install**, not from the ledger, because a wrapped server nobody called
+  still ships its primer every turn and contributes zero ledger rows — sizing it from the
+  ledger would hide exactly the worst case. Each server is measured from its own policy via
+  `build_primer`, so a default-deny server correctly pays 0 rather than a shared constant; a
+  router is sized as one `union_primer` over its **peers'** names, since gating the union on
+  the router's own name tests rules like `kb.*` against the router and over-reports. A server
+  whose policy cannot be read is excluded and the total is labelled a lower bound, rather
+  than substituting the built-in default and overstating.
 - **`policy generate` / `autotune` can now recommend the `embedded` tier.** It shipped
   opt-in but invisible to the generator, so nothing would ever turn it on and an operator
   had to hand-edit a policy — which #144 is the standing proof goes stale, since nothing

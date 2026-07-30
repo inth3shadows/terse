@@ -256,6 +256,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         default_stats_log,
         load_stats,
         parse_window,
+        primer_liability,
     )
 
     log_path = args.log or str(default_stats_log())
@@ -272,10 +273,22 @@ def _cmd_stats(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
     agg = aggregate(load_stats(log_path, since_ts))
+    # The primer is a real cost the ledger never sees (#168), so the report is incomplete
+    # without it. `scan_scopes` is read-only and documented never to raise, but a report
+    # must not die because a config file is malformed — the ledger numbers are still worth
+    # printing without the liability line.
+    try:
+        from .install_mcp import scan_scopes
+        liability = primer_liability(scan_scopes(), agg)
+    except Exception as e:  # noqa: BLE001
+        print(f"stats: could not size the primer liability ({e}) — ledger totals below "
+              f"EXCLUDE the per-turn primer cost", file=sys.stderr)
+        liability = None
     if args.json:
-        print(json.dumps(agg, indent=2))
+        print(json.dumps({**agg, "primer_liability": liability}, indent=2))
     else:
-        print(build_stats_report(agg, log_path=log_path, window=args.since), end="")
+        print(build_stats_report(agg, log_path=log_path, window=args.since,
+                                 liability=liability), end="")
     return 0
 
 

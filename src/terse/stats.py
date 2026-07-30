@@ -272,7 +272,8 @@ def _hit_rate(diffs: int, blocks: int) -> str:
 
 
 def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
-                       window: str | None = None) -> str:
+                       window: str | None = None,
+                       liability: dict[str, Any] | None = None) -> str:
     """Human-readable rollup. Tokens are the headline when available; chars are the
     honest fallback, labeled as such (never silently presented as tokens)."""
     total, decisions, tools = agg["total"], agg["decisions"], agg["tools"]
@@ -287,6 +288,11 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
         else:
             lines.append("no results recorded — has a terse-wrapped server handled a "
                          "tool call since stats shipped?")
+        # Still print the liability: an install with wrapped servers and NO recorded results
+        # is the purest net-negative case there is, and suppressing the line here would hide
+        # it behind "nothing to report" (#168).
+        if liability:
+            lines += build_primer_section(liability)
         return "\n".join(lines) + "\n"
     tok_raw, tok_out = total["raw_tokens"], total["out_tokens"]
     lines.append(f"blocks: {total['blocks']}   "
@@ -335,7 +341,135 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
                      f"{_hit_rate(row['diffs'], row['blocks']):>5} "
                      f"{raw_n:>10,} {out_n:>10,} "
                      f"{_pct_saved(raw_n, out_n):>6}")
+    if liability:
+        lines += build_primer_section(liability)
     return "\n".join(lines) + "\n"
+
+
+# --- primer liability (#168) ----------------------------------------------------------
+#
+# The ledger charges terse for the payloads it compresses and never for the context it
+# adds, so `terse stats` can report a win in a session that was a net loss. The primer is
+# injected into each wrapped server's `initialize.instructions` and the client re-reads it
+# as `cache_read` EVERY turn, so its cost scales with (servers x turns) while the savings
+# scale with (compressible tool calls). Measured from outside terse: a 14.0% win at one
+# wrapped server, a 2.1% LOSS at three.
+#
+# What this deliberately does NOT do is charge a per-turn cost into the ledger. `turns` is
+# not observable: a `terse proxy` is a stdio process that sees one `initialize` per process
+# lifetime and then `tools/call` requests, and several calls can share a turn. Nothing in
+# MCP reports the client's turn count. Inventing one would be the same defect family as
+# #144/#186/#188 — a number describing something the code did not measure.
+#
+# So the output is a BREAK-EVEN statement instead: what one turn costs, what the window
+# banked, and how many turns of primer those savings cover. Same decision for the operator,
+# no fabricated denominator.
+
+# States whose entry runs its own `terse proxy`/`multiproxy` and therefore pays a primer at
+# `initialize`. "folded*" peers are stashed BEHIND a router — the router pays one union
+# primer for the fleet and the peers pay nothing, so counting them would double-charge.
+_PAYS_PRIMER = ("wrapped", "wrapped-unstashed", "router", "router-ambiguous")
+
+
+def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> dict[str, Any]:
+    """Per-turn primer cost of the INSTALLED wrapped servers, against the window's savings.
+
+    Installed, not ledger-derived, and that distinction is the whole point: a wrapped server
+    nobody called still ships its primer every turn and contributes zero ledger rows. Sizing
+    this from the ledger would hide exactly the worst case — the install that is pure cost.
+
+    Each server is sized from ITS OWN policy via `build_primer`, not from a shared constant:
+    the primer is assembled per-server from policy-gated sections, so a `minify`-only or
+    default-deny server legitimately pays 0. A server whose policy cannot be read is counted
+    as `unresolved` and left OUT of the total, which is therefore a LOWER bound and is
+    labelled as one — better than substituting the built-in default and overstating.
+
+    Entries are de-duplicated by server name across scopes: the same name in project and user
+    scope is one server to the client, not two primers.
+    """
+    # Imported here, not at module scope: `stats` is on the proxy's hot path and these pull
+    # in the policy/primer machinery only when a report is actually being rendered.
+    from .policy import default_policy, load_policy
+    from .proxy import build_primer, union_primer
+
+    by_label: dict[str, int] = {}
+    for trow in agg.get("tools", []):
+        by_label[trow["server"]] = by_label.get(trow["server"], 0) + trow["blocks"]
+    servers: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in scan_rows:
+        name, state = row.get("server"), row.get("state")
+        if state not in _PAYS_PRIMER or not name or name in seen:
+            continue
+        seen.add(name)
+        is_router = state in ("router", "router-ambiguous")
+        # `wraps` means two different things by state, and reading it the wrong way is how
+        # a busy router reports as never-called: for a wrapped entry it is the downstream
+        # COMMAND (the ledger keys on `server_label` of that, not on the MCP entry name),
+        # for a router it is the comma-joined peer NAMES — and multiproxy tags each peer's
+        # ledger records with its own name, so those names ARE the labels.
+        wraps = row.get("wraps") or ""
+        peers = [p for p in (q.strip() for q in wraps.split(",")) if p] if is_router else []
+        labels = peers if is_router else ([server_label(wraps.split())] if wraps else [])
+        pol_path = row.get("policy")
+        tokens: int | None = None
+        try:
+            pol = load_policy(pol_path) if pol_path else default_policy()
+            # A router ships ONE primer covering every form any peer can emit, and each
+            # peer's policy is gated against its OWN name — gating the union on the router's
+            # name would test rules like `kb.*` against "terse" and silently under-report.
+            tokens = count_cl100k(union_primer([(pol, p) for p in peers]) if is_router
+                                  else build_primer(pol, name))
+        except Exception:  # noqa: BLE001 — an unreadable policy is reported, never raised
+            tokens = None
+        # None, not 0, when no label could be recovered: "unknown" and "never called" are
+        # different claims, and only the second one accuses an install of being pure cost.
+        blocks = sum(by_label.get(lbl, 0) for lbl in labels) if labels else None
+        servers.append({"server": name, "scope": row.get("scope"), "state": state,
+                        "primer_tokens": tokens, "ledger_labels": labels, "blocks": blocks})
+
+    per_turn = sum(s["primer_tokens"] or 0 for s in servers)
+    unresolved = sum(1 for s in servers if s["primer_tokens"] is None)
+    total = agg.get("total") or {}
+    saved = (total.get("raw_tokens") or 0) - (total.get("out_tokens") or 0)
+    return {
+        "servers": servers,
+        "per_turn_tokens": per_turn,
+        "unresolved": unresolved,
+        # Servers that pay every turn and banked nothing in this window — pure cost.
+        "idle": [s["server"] for s in servers if s["blocks"] == 0 and s["primer_tokens"]],
+        "saved_tokens": saved,
+        # None, not 0 or infinity: with no primer to pay there is nothing to break even on,
+        # and rendering "inf turns" would read as a measurement.
+        "turns_covered": (saved / per_turn) if per_turn else None,
+    }
+
+
+def build_primer_section(liab: dict[str, Any]) -> list[str]:
+    """The break-even lines for `build_stats_report`. Empty when nothing pays a primer."""
+    per_turn, servers = liab["per_turn_tokens"], liab["servers"]
+    if not servers:
+        return []
+    lines = ["", f"primer liability: {per_turn:,} tok/turn across {len(servers)} wrapped "
+                 f"server(s) — NOT in the totals above."]
+    lines.append("  the client re-reads each server's `initialize.instructions` every turn "
+                 "as cache_read,")
+    lines.append("  so this is charged per turn while the savings above are charged per "
+                 "call.")
+    if liab["unresolved"]:
+        lines.append(f"  {liab['unresolved']} server(s) have an unreadable policy and are "
+                     f"NOT counted — treat the figure as a lower bound.")
+    turns = liab["turns_covered"]
+    if turns is not None:
+        lines.append(f"  the {liab['saved_tokens']:,} tok saved in this window pays for "
+                     f"~{turns:,.0f} turn(s) of primer.")
+        if turns < 1:
+            lines.append("  NET NEGATIVE over this window: the primer costs more per turn "
+                         "than the codec banked in total.")
+    if liab["idle"]:
+        lines.append(f"  paying but never called here: {', '.join(sorted(liab['idle']))} "
+                     f"— pure cost until they handle a compressible result.")
+    return lines
 
 
 def build_stats_writer(stats_log: str | Path, server: str):
