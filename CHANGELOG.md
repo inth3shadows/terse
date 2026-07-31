@@ -208,6 +208,12 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   time runecho gained a tool — is off the primary path.
 
 ### Fixed
+- **`mcp-status` labelled every router row's diff before the peers policy resolved (#191).**
+  A router entry carries `--config`, never `--policy`, so `policy` was still `None` when the
+  diff label was computed and `_peers_policy` only ran eight lines later. Every `router` /
+  `router-ambiguous` row therefore printed `default (off)` even when the shared peers policy
+  set `"diff": true` — the proxy diffs, status said it does not. Same label-vs-reality
+  divergence as #181, in the one branch #188/#190 didn't reach.
 - **`embedded` re-defaulted `tabularize` inside the fold, leaking an undocumented marker
   (adversarial review of #183).** Folding a string opens a new structural walk, and
   `_embed_json_string` called `compress_structure(parsed, embedded=True)` without forwarding

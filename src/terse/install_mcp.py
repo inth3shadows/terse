@@ -1254,6 +1254,14 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
                 downstream = args[args.index("--") + 1:]
                 if downstream:
                     wraps = " ".join(downstream)
+            # A router's policy lives in the peers file, not in `--policy` (it carries
+            # `--config`), and it has to resolve BEFORE the label below reads it: resolving
+            # it afterwards made every router row print the dataclass default `default
+            # (off)` even when the shared peers policy set `"diff": true` — the proxy
+            # diffs, the status line said it did not. That is #181's divergence again, in
+            # the one branch #188/#190 didn't touch (#191).
+            if state in ("router", "router-ambiguous"):
+                policy = policy or _peers_policy(peers_doc)
             diff = ("off" if "--no-diff" in args
                     else "on" if "--diff" in args else _default_diff_label(policy))
             stats_on = "--no-stats" not in args
@@ -1261,7 +1269,6 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
             # A router has no `--` downstream and no single `--policy`: what it fronts is
             # the peers file's list, and each peer carries its own policy there.
             wraps = ", ".join(sorted(folded)) or "(no peers)"
-            policy = policy or _peers_policy(peers_doc)
             policy_missing = bool(policy and os.path.isabs(policy)
                                   and not os.path.exists(policy))
         rows.append({"scope": scope, "server": name, "state": state, "policy": policy,

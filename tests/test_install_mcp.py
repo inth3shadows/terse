@@ -1282,6 +1282,23 @@ def test_status_reports_a_healthy_fleet_as_router_plus_folded_peers(tmp_path):
     assert rows["other"]["state"] == "unwrapped"
 
 
+def test_status_resolves_a_routers_peers_policy_before_labelling_its_diff(tmp_path):
+    """#191. The diff label was computed while `policy` was still None for a router (it
+    carries `--config`, never `--policy`), and the peers policy resolved eight lines
+    later — so every router row printed the dataclass default `default (off)` even when
+    the shared peers policy said `"diff": true`. Same label-vs-reality divergence as #181:
+    the proxy diffs, the status line says it does not."""
+    from terse.install_mcp import do_install, scan_scopes
+    cfg, pol = _multi_cfg(tmp_path)
+    pol.write_text(json.dumps({"version": 1, "diff": True,
+                               "defaults": {"tiers": ["minify"]}}), encoding="utf-8")
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    rows = {r["server"]: r for r in scan_scopes(cfg=cfg) if r["scope"] == "user"}
+    assert rows["terse"]["state"] == "router"
+    assert rows["terse"]["policy"] == str(pol.resolve())
+    assert rows["terse"]["diff"] == "policy (on)"
+
+
 def test_multiproxy_refuses_a_router_name_held_by_an_unrelated_live_server(tmp_path):
     """The router entry is written over, not stashed — so a same-named live entry would be
     destroyed with nothing to restore from. `terse` is the DEFAULT name."""
