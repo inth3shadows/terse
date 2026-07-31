@@ -13,6 +13,8 @@ from terse.stats import (
     build_record,
     build_stats_report,
     build_stats_writer,
+    build_version_section,
+    canonical_tool,
     classify_decision,
     default_stats_log,
     load_stats,
@@ -337,3 +339,103 @@ def test_one_structured_value_still_lands_on_both_sides():
     rec = build_record("s", "records", RAW, RAW, False, None, dup)   # no structured_out
     assert rec["structured_chars"] == rec["structured_out_chars"] == len(dup)
     assert rec["raw_chars"] == rec["out_chars"]
+
+
+# --- ledger identity + writer version -------------------------------------------------
+
+
+def test_canonical_tool_strips_only_a_redundant_self_prefix():
+    # The router qualifies a peer's tools with its own name, so ONE tool reaches the
+    # ledger under two spellings depending on topology. Only the redundant one folds.
+    assert canonical_tool("kb", "kb__kb.read.get") == "kb.read.get"
+    assert canonical_tool("kb", "kb.read.get") == "kb.read.get"
+    # A genuine CROSS-peer qualification must survive: the prefix is the only record of
+    # which peer answered, so folding it would attribute gh's traffic to kb.
+    assert canonical_tool("kb", "gh__search") == "gh__search"
+    # Partial/near matches are not prefixes and must not be mangled.
+    assert canonical_tool("kb", "kb_read") == "kb_read"
+    assert canonical_tool("kbx", "kb__x") == "kb__x"
+
+
+def test_canonical_tool_never_returns_an_empty_tool_name():
+    # A tool named exactly `<server>__` would canonicalize to "" and silently merge with
+    # any other row keyed on the empty string. The length guard is what stops that.
+    assert canonical_tool("kb", "kb__") == "kb__"
+
+
+def test_aggregate_merges_the_two_spellings_into_one_row():
+    # The defect this fixes: the same tool split across two rows, so whichever an
+    # operator read understated it. Read-time canonicalization also repairs records
+    # already on disk, which a writer-side fix could never reach.
+    recs = [
+        {"ts": 1, "server": "kb", "tool": "kb.read.get", "decision": "compressed",
+         "raw_chars": 100, "out_chars": 60, "raw_tokens": 50, "out_tokens": 30},
+        {"ts": 2, "server": "kb", "tool": "kb__kb.read.get", "decision": "compressed",
+         "raw_chars": 100, "out_chars": 60, "raw_tokens": 50, "out_tokens": 30},
+    ]
+    agg = aggregate(recs)
+    assert len(agg["tools"]) == 1
+    assert agg["tools"][0]["tool"] == "kb.read.get"
+    assert agg["tools"][0]["blocks"] == 2
+    assert agg["tools"][0]["raw_tokens"] == 100
+
+
+def test_build_record_stamps_the_writing_version():
+    from terse import __version__
+
+    rec = build_record("s", "records", RAW, RAW, False)
+    assert rec["version"] == __version__
+
+
+def test_aggregate_splits_savings_by_writer_version():
+    # Counts alone can't answer "did that release help?" — that needs token sums per
+    # version, or the only available comparison is the payload-mix-confounded time axis
+    # the field exists to replace.
+    recs = [
+        {"ts": 1, "version": "0.1.0", "server": "s", "tool": "t", "decision": "compressed",
+         "raw_chars": 100, "out_chars": 90, "raw_tokens": 100, "out_tokens": 90},
+        {"ts": 2, "version": "0.2.0", "server": "s", "tool": "t", "decision": "compressed",
+         "raw_chars": 100, "out_chars": 50, "raw_tokens": 100, "out_tokens": 50},
+    ]
+    agg = aggregate(recs)
+    assert agg["versions"]["0.1.0"] == {"blocks": 1, "tokenized": 1,
+                                        "raw_tokens": 100, "out_tokens": 90}
+    assert agg["versions"]["0.2.0"]["out_tokens"] == 50
+    assert agg["total"]["unversioned"] == 0
+
+
+def test_records_predating_the_version_field_are_counted_not_bucketed():
+    # A record with no version is an UNKNOWN writer, not a writer named None: bucketing
+    # it under a "None" key would put it in the comparison table as if it were a release.
+    recs = [
+        {"ts": 1, "server": "s", "tool": "t", "decision": "compressed",
+         "raw_chars": 10, "out_chars": 8, "raw_tokens": 10, "out_tokens": 8},
+    ]
+    agg = aggregate(recs)
+    assert agg["versions"] == {}
+    assert agg["total"]["unversioned"] == 1
+    assert "None" not in agg["versions"]
+
+
+def test_version_section_is_suppressed_when_nothing_is_versioned():
+    # Every pre-existing ledger is all-unversioned; a table of one "unknown" row states
+    # the obvious at the cost of a screen.
+    agg = aggregate([
+        {"ts": 1, "server": "s", "tool": "t", "decision": "compressed",
+         "raw_chars": 10, "out_chars": 8, "raw_tokens": 10, "out_tokens": 8},
+    ])
+    assert build_version_section(agg) == []
+
+
+def test_version_section_warns_when_the_table_is_partial():
+    # Versioned rows beside unversioned ones is the case where a reader would otherwise
+    # mistake a partial table for the whole window.
+    agg = aggregate([
+        {"ts": 1, "version": "0.2.0", "server": "s", "tool": "t", "decision": "compressed",
+         "raw_chars": 100, "out_chars": 50, "raw_tokens": 100, "out_tokens": 50},
+        {"ts": 2, "server": "s", "tool": "t", "decision": "compressed",
+         "raw_chars": 10, "out_chars": 8, "raw_tokens": 10, "out_tokens": 8},
+    ])
+    text = "\n".join(build_version_section(agg))
+    assert "0.2.0" in text
+    assert "predate the version field" in text

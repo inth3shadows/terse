@@ -76,9 +76,9 @@ raw tool output (JSON text)
   the downstream server as a subprocess and wires `Interceptor` to stdio with two
   pump threads.
 - **`stats.py`** — the live savings ledger + `terse stats`. `build_record` /
-  `classify_decision` produce one payload-FREE line per result (ts, server, tool,
-  decision, char + cl100k token sizes — never content, which is what makes always-on
-  safe where capture/audit must stay opt-in); the decision label is derived by
+  `classify_decision` produce one payload-FREE line per result (ts, version, server,
+  tool, decision, char + cl100k token sizes — never content, which is what makes
+  always-on safe where capture/audit must stay opt-in); the decision label is derived by
   sniffing the emitted text's envelope head (diff/textdiff marker, `== raw`,
   policy-tiers-empty), not by threading state out of the compression paths.
   `append_stats` rotates at 10 MB (one prior generation kept; single O_APPEND writes
@@ -86,7 +86,13 @@ raw tool output (JSON text)
   crashed writer is self-healed with a newline before the next append).
   `load_stats`/`aggregate`/`build_stats_report` back the `stats` subcommand; token
   totals sum only fully-tokenized records (`untokenized` counts the rest — reported,
-  never blended). The record's `server` is `proxy --server-name` when given (the config's
+  never blended). `aggregate` also rolls up `versions` (per-writer-version blocks and
+  token sums, so "did that release help?" is answerable without a payload-mix-confounded
+  time slice) and `total.unversioned` (records predating the field — never bucketed
+  under a `None` key), and canonicalizes tool names at READ time via `canonical_tool`,
+  which strips a router's `<server>__` qualification when it merely repeats the record's
+  own server label. Read-time, not write-time, so it also repairs records already on
+  disk, where the same tool split into two rows depending on which topology handled it. The record's `server` is `proxy --server-name` when given (the config's
   own name — truthful, and what `install-mcp` bakes in), else `server_label`'s guess from
   the command basename, which misreads a launcher-wrapped server (kb behind secret-broker
   labels itself `sb-run`) — #83. Default path `$XDG_STATE_HOME/terse/stats.jsonl`; the

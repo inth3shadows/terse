@@ -7,7 +7,8 @@ payloads (the same secrets exposure as capture), so nobody leaves it on.
 
 This ledger stores ONLY sizes and decisions — never payload content — so it is safe
 to leave always-on (the proxy default; `--no-stats` opts out). One JSON line per
-tool-result block: ts, server, tool, decision, raw/out chars, raw/out cl100k tokens
+tool-result block: ts, version (the terse that wrote it), server, tool, decision,
+diff_reason, raw/out chars, raw/out cl100k tokens, structured_* sizes
 (null when tiktoken is unavailable — `terse stats` then reports chars, showing the
 gap explicitly rather than substituting, same contract as report.py). Writes are
 fail-open side effects with the same contract as capture/audit: a full disk can
@@ -66,6 +67,59 @@ def server_label(cmd: list[str]) -> str:
     return Path(target).name or target
 
 
+def _ledger_version() -> str:
+    """The terse that wrote this record, resolved once per process.
+
+    Records carried no version, so a ledger spanning a week of releases could not be
+    asked "did that change help?" — the only available axis was time, and time is
+    confounded by payload mix (a handful of huge calls moves a day's average far more
+    than any codec change). Cached at module scope because `build_record` is on the
+    proxy's hot path and this is a constant for the process's lifetime.
+
+    Forward-only by construction: records written before this field cannot be
+    backfilled, and `aggregate` reports them as `unversioned` rather than guessing.
+    """
+    global _VERSION_CACHE
+    if _VERSION_CACHE is None:
+        from . import __version__
+        _VERSION_CACHE = __version__
+    return _VERSION_CACHE
+
+
+_VERSION_CACHE: str | None = None
+
+
+def canonical_tool(server: str, tool: str) -> str:
+    """Strip a router's `<server>__` qualification when it merely repeats `server`.
+
+    multiproxy qualifies a peer's tool names on a real cross-peer collision (#168), so
+    the SAME tool appears in the ledger under two spellings depending on which topology
+    handled it — `kb.read.get` behind a plain proxy, `kb__kb.read.get` behind a router.
+    They aggregated as two rows, splitting one tool's stats and understating whichever
+    row an operator happened to read.
+
+    Only an EXACTLY redundant prefix is removed — the qualifier must equal this record's
+    own server label. A genuine cross-peer qualification (`gh__search` recorded under
+    server `kb`) is left alone, because there the prefix is the only surviving evidence
+    of which peer answered.
+
+    The strip is unconditional, NOT collision-gated against the downstream's advertised
+    tool names: a server labelled `kb` that genuinely exports both `x` and a tool named
+    literally `kb__x` would sum two distinct tools into one row. multiproxy cannot
+    produce that case (it qualifies every peer tool unconditionally — `multiproxy.py`
+    `f"{peer}{PREFIX_SEP}{bare}"`), so it needs a plain `terse proxy` whose command
+    basename happens to match a real tool's own `__` prefix. Accepted rather than
+    threading a live tool list into a pure report helper to defend against a name no
+    observed server has.
+
+    The `len(tool) > len(prefix)` guard is load-bearing: without it a tool named exactly
+    `kb__` canonicalizes to the empty string and silently joins whatever other row is
+    keyed on `""`.
+    """
+    prefix = f"{server}__"
+    return tool[len(prefix):] if tool.startswith(prefix) and len(tool) > len(prefix) else tool
+
+
 def classify_decision(raw: str, emitted: str, passthrough: bool) -> str:
     """What the proxy did with one result, derived from the texts alone. A keyframe is
     reported as `compressed` (it IS the full form) — the diff hit-rate is the metric
@@ -118,6 +172,9 @@ def build_record(server: str, tool: str, raw: str, emitted: str,
     extra_out_tok = count_cl100k(extra_out)
     return {
         "ts": int(time.time()),
+        # The writer's version, so a later "did release X help?" is answerable from the
+        # ledger instead of from a time slice that payload mix confounds.
+        "version": _ledger_version(),
         "server": server,
         "tool": tool,
         "decision": classify_decision(raw, emitted, passthrough),
@@ -219,8 +276,15 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     # N and a joined/partial one contributes 1 per folded unit. Naming it `blocks` keeps
     # the count honest — it moves with join behaviour by design, not by call volume (#141).
     total = {"blocks": 0, "raw_chars": 0, "out_chars": 0,
-             "raw_tokens": 0, "out_tokens": 0, "untokenized": 0}
+             "raw_tokens": 0, "out_tokens": 0, "untokenized": 0, "unversioned": 0}
     decisions: dict[str, int] = {}
+    # Which terse wrote each record (forward-only — see `_ledger_version`), carrying the
+    # SAME token sums as the per-tool rows. A `{version: count}` counter would have been
+    # cheaper and useless: block counts across versions say how much traffic each build
+    # handled, not what it saved, so the "did that release help?" question this field
+    # exists for would still only be answerable through the payload-mix-confounded time
+    # axis it was added to replace.
+    versions: dict[str, dict[str, int]] = {}
     # Phase 1: why the cross-call diff did/didn't fire (only present on newer records).
     diff_reasons: dict[str, int] = {}
     tools: dict[tuple[str, str], dict[str, int]] = {}
@@ -236,7 +300,20 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         reason = rec.get("diff_reason")
         if isinstance(reason, str):
             diff_reasons[reason] = diff_reasons.get(reason, 0) + 1
-        key = (str(rec.get("server", "unknown")), str(rec.get("tool", "unknown")))
+        srv = str(rec.get("server", "unknown"))
+        # Canonicalized at READ time, not at write time: this also repairs the 2,000+
+        # records already on disk, which a writer-side fix could never reach.
+        key = (srv, canonical_tool(srv, str(rec.get("tool", "unknown"))))
+        ver = rec.get("version")
+        vrow = None
+        if isinstance(ver, str):
+            vrow = versions.setdefault(ver, {"blocks": 0, "tokenized": 0,
+                                             "raw_tokens": 0, "out_tokens": 0})
+            vrow["blocks"] += 1
+        else:
+            # Counted, never bucketed under a "None" key: a record written before the
+            # field existed is an unknown writer, not a writer named None.
+            total["unversioned"] += 1
         row = tools.setdefault(key, {"blocks": 0, "tokenized": 0,
                                      "raw_tokens": 0, "out_tokens": 0,
                                      "raw_chars": 0, "out_chars": 0, "diffs": 0})
@@ -255,9 +332,16 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             # row's savings by its call count, and `blocks` counts untokenized records the
             # token sums skipped. Only this counter makes the two halves the same row set.
             row["tokenized"] += 1
+            if vrow is not None:
+                vrow["raw_tokens"] += raw_t
+                vrow["out_tokens"] += out_t
+                # Same tokenized/blocks split as the per-tool rows: a per-version rate
+                # divided by `blocks` would be diluted by exactly the untokenized share.
+                vrow["tokenized"] += 1
         else:
             total["untokenized"] += 1
     return {"total": total, "decisions": decisions, "diff_reasons": diff_reasons,
+            "versions": versions,
             "tools": [{"server": s, "tool": t, **row}
                       for (s, t), row in sorted(
                           tools.items(),
@@ -346,9 +430,39 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
                      f"{_hit_rate(row['diffs'], row['blocks']):>5} "
                      f"{raw_n:>10,} {out_n:>10,} "
                      f"{_pct_saved(raw_n, out_n):>6}")
+    lines += build_version_section(agg)
     if liability:
         lines += build_primer_section(liability)
     return "\n".join(lines) + "\n"
+
+
+def build_version_section(agg: dict[str, Any]) -> list[str]:
+    """Per-writer-version savings — "did that release help?", asked directly.
+
+    Rendered, not just carried in `--json`: the field's whole purpose is to replace a
+    time-slice comparison an operator would otherwise do by eye, and one that only
+    appears under `--json` does not replace anything.
+
+    Suppressed entirely when no record carries a version, which is every ledger written
+    before the field shipped — an all-`unversioned` table states the obvious at the cost
+    of a screen. The `unversioned` count still prints whenever versioned rows exist
+    beside it, because THAT is the case where a reader would otherwise mistake a partial
+    table for the whole window.
+    """
+    versions = agg.get("versions") or {}
+    if not versions:
+        return []
+    lines = ["", f"  {'version':<28} {'blocks':>7} {'tok raw':>10} {'tok out':>10} "
+                 f"{'saved':>6}"]
+    for ver, row in sorted(versions.items()):
+        raw_n, out_n = row["raw_tokens"], row["out_tokens"]
+        lines.append(f"  {ver[:28]:<28} {row['blocks']:>7} {raw_n:>10,} {out_n:>10,} "
+                     f"{_pct_saved(raw_n, out_n):>6}")
+    unversioned = (agg.get("total") or {}).get("unversioned") or 0
+    if unversioned:
+        lines.append(f"  ({unversioned:,} record(s) predate the version field and are NOT "
+                     f"in this table — compare versions only within it.)")
+    return lines
 
 
 # --- primer liability (#168) ----------------------------------------------------------
