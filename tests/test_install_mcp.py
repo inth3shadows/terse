@@ -1282,6 +1282,46 @@ def test_status_reports_a_healthy_fleet_as_router_plus_folded_peers(tmp_path):
     assert rows["other"]["state"] == "unwrapped"
 
 
+def test_status_resolves_a_routers_peers_policy_before_labelling_its_diff(tmp_path):
+    """#191. The diff label was computed while `policy` was still None for a router (it
+    carries `--config`, never `--policy`), and the peers policy resolved eight lines
+    later — so every router row printed the dataclass default `default (off)` even when
+    the shared peers policy said `"diff": true`. Same label-vs-reality divergence as #181:
+    the proxy diffs, the status line says it does not."""
+    from terse.install_mcp import do_install, scan_scopes
+    cfg, pol = _multi_cfg(tmp_path)
+    pol.write_text(json.dumps({"version": 1, "diff": True,
+                               "defaults": {"tiers": ["minify"]}}), encoding="utf-8")
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    rows = {r["server"]: r for r in scan_scopes(cfg=cfg) if r["scope"] == "user"}
+    assert rows["terse"]["state"] == "router"
+    assert rows["terse"]["policy"] == str(pol.resolve())
+    assert rows["terse"]["diff"] == "policy (on)"
+
+
+def test_status_labels_a_mixed_path_router_fleet_from_the_peers_answers_not_the_default(tmp_path):
+    """Review of #191: the first fix was partial. `_peers_policy` returns None when peers
+    carry different policy PATHS, so a fleet built additively (`--policy` is required, so
+    each run names its own file) fell straight through to `default (off)` even when both
+    files set `"diff": true`. Different paths, same answer — report the answer."""
+    from terse.install_mcp import do_install, scan_scopes
+    cfg, pol_a = _multi_cfg(tmp_path)
+    pol_b = tmp_path / "b.json"
+    for p in (pol_a, pol_b):
+        p.write_text(json.dumps({"version": 1, "diff": True,
+                                 "defaults": {"tiers": ["minify"]}}), encoding="utf-8")
+    do_install(["kb"], str(pol_a), cfg=cfg, multiproxy=True)
+    do_install(["gh"], str(pol_b), cfg=cfg, multiproxy=True)
+    row = next(r for r in scan_scopes(cfg=cfg) if r["server"] == "terse")
+    assert row["state"] == "router"
+    assert row["policy"] is None          # honest: two paths, one column
+    assert row["diff"] == "policy (on)"   # but the ANSWER is unambiguous
+    # Now make them genuinely disagree — that, and only that, is "mixed".
+    pol_b.write_text(json.dumps({"version": 1, "diff": False}), encoding="utf-8")
+    row = next(r for r in scan_scopes(cfg=cfg) if r["server"] == "terse")
+    assert row["diff"] == "peers (mixed)"
+
+
 def test_multiproxy_refuses_a_router_name_held_by_an_unrelated_live_server(tmp_path):
     """The router entry is written over, not stashed — so a same-named live entry would be
     destroyed with nothing to restore from. `terse` is the DEFAULT name."""
