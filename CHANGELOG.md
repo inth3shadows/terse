@@ -11,12 +11,17 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ### Added
 - **Per-server break-even in `terse stats` (#175).** The primer-liability block gained a
-  per-server table: `primer`, `blocks`, `saved/call`, and `calls/turn to break even`. #175
+  per-server table: `primer`, `blocks`, `saved/block`, and `blocks/turn to break even`. #175
   established the rule — *wrap a server when its typical payload saves more than
   `primer x turns-per-call` tokens* — and then computed the evidence for it by hand from the
-  ledger; this makes it self-service. `terse stats --json` carries `saved_per_call`,
-  `calls_to_break_even`, `tokenized_blocks`, and `break_even_verdict` per server under
+  ledger; this makes it self-service. `terse stats --json` carries `saved_per_block`,
+  `blocks_to_break_even`, `tokenized_blocks`, and `break_even_verdict` per server under
   `primer_liability.servers`.
+
+  Stated per **block**, not per call: a block is what the ledger counts — one record per
+  emitted tool-result text block, which is `>= 1` per call and moves with join behaviour by
+  design (#141). A `/call` label over that counter would silently overstate the break-even
+  by the blocks-per-call factor, so the reported bar is deliberately the conservative one.
 
   A rate is a number **or** a verdict naming why there isn't one — never a `0` standing in
   for a missing measurement, because each of these accuses the install of something
