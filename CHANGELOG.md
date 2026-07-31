@@ -10,6 +10,39 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Added
+- **Per-server break-even in `terse stats` (#175).** The primer-liability block gained a
+  per-server table: `primer`, `blocks`, `saved/block`, and `blocks/turn to break even`. #175
+  established the rule — *wrap a server when its typical payload saves more than
+  `primer x turns-per-call` tokens* — and then computed the evidence for it by hand from the
+  ledger; this makes it self-service. `terse stats --json` carries `saved_per_block`,
+  `blocks_to_break_even`, `tokenized_blocks`, and `break_even_verdict` per server under
+  `primer_liability.servers`.
+
+  Stated per **block**, not per call: a block is what the ledger counts — one record per
+  emitted tool-result text block, which is `>= 1` per call and moves with join behaviour by
+  design (#141). A `/call` label over that counter would silently overstate the break-even
+  by the blocks-per-call factor, so the reported bar is deliberately the conservative one.
+
+  A rate is a number **or** a verdict naming why there isn't one — never a `0` standing in
+  for a missing measurement, because each of these accuses the install of something
+  different and `None` alone cannot tell them apart: `no ledger label` (the entry matched no
+  ledger rows, so we cannot even say it went uncalled), `never called`, `no token data`
+  (recorded without tiktoken — savings in *tokens* are unknown, not zero, and dividing a
+  cl100k primer by a char-derived rate would silently mix units), `primer unknown` (the rate
+  is real but the policy could not be read), `no primer` (a default-deny policy emits none,
+  so there is nothing to earn back), and `never` (a known non-positive rate, which no call
+  volume earns back — the one verdict here that should stop an operator, so it is a word
+  rather than a large number).
+
+  The denominator is the **tokenized** block count, not every block: `aggregate` counts
+  every record in `blocks` but only tokenized ones in the token sums, so a ledger spanning
+  an offline session (`count_cl100k` returns `None`) and later online ones would divide a
+  partial numerator by a full denominator — always understating the rate, i.e. always
+  arguing to unwrap a server that is in fact paying for itself. The table prints
+  `tokenized/blocks` when they differ, so the contamination shows in the column whose number
+  it changed. A router's rate pools every peer it fronts, matching the single union primer
+  it actually pays.
+
 - **`terse stats` now shows what the primer costs (#168).** The ledger charges terse for the
   payloads it compresses and never for the context it adds, so `terse stats` could report a
   win in a session that was a net loss — measured from outside terse as a **14.0% win at one
