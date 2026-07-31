@@ -4,6 +4,7 @@
 [![PyPI](https://img.shields.io/pypi/v/terse-mcp.svg)](https://pypi.org/project/terse-mcp/)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![terse MCP server](https://glama.ai/mcp/servers/inth3shadows/terse/badges/score.svg)](https://glama.ai/mcp/servers/inth3shadows/terse)
 
 The **lossless-first** MCP compression proxy: it makes tool output smaller without
 ever changing what your agent reads — byte-faithful by default, lossy only where you
