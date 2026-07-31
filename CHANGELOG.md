@@ -34,7 +34,7 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   volume earns back — the one verdict here that should stop an operator, so it is a word
   rather than a large number).
 
-  The denominator is the **tokenized** call count, not the block count: `aggregate` counts
+  The denominator is the **tokenized** block count, not every block: `aggregate` counts
   every record in `blocks` but only tokenized ones in the token sums, so a ledger spanning
   an offline session (`count_cl100k` returns `None`) and later online ones would divide a
   partial numerator by a full denominator — always understating the rate, i.e. always
