@@ -96,7 +96,7 @@ def measure_payload(raw: str) -> dict[str, Any]:
     embedded_ok = gate
     if gate:
         try:
-            embedded_ok = transforms.decompress(embedded) == obj
+            embedded_ok = transforms.values_equal(transforms.decompress(embedded), obj)
         except Exception:  # noqa: BLE001 — any decode failure is a failed gate
             embedded_ok = False
 
@@ -195,7 +195,7 @@ def measure_joined(raws: list[str]) -> dict[str, Any] | None:
     embedded_ok = gate
     if gate:
         try:
-            embedded_ok = transforms.decompress(embedded) == objs
+            embedded_ok = transforms.values_equal(transforms.decompress(embedded), objs)
         except Exception:  # noqa: BLE001 — any decode failure is a failed gate
             embedded_ok = False
 

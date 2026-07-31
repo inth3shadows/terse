@@ -584,7 +584,7 @@ def _lossless_stage(data: Any, rule: Rule, warnings: list[str]) -> tuple[str, tu
         embedded="embedded" in rule.tiers,
     )
     try:
-        emit_ok = transforms.decompress(text) == data
+        emit_ok = transforms.values_equal(transforms.decompress(text), data)
     except Exception:  # noqa: BLE001 — any decode failure is a failed self-check
         emit_ok = False
     if not emit_ok:
