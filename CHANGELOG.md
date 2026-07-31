@@ -9,6 +9,39 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Fixed
+- **`has_drop` was the last primer gate ignoring the server (#168).** The other four
+  (`emits_table`/`emits_dict`/`emits_embedded`/`emits_diff`) all take a server name and walk
+  rules the way `select` does; `has_drop` scanned every rule in the file unconditionally. Peers
+  commonly share ONE policy file, so it effectively answered *"does this file contain a drop
+  rule"* — and a server whose own rule totally covers it, and can therefore never reach the drop
+  rule at all, still paid the 64-token dropped-field paragraph **and** advertised a
+  `terse.retrieve` tool it could never mint a handle for.
+
+  Measured on this operator's live policy: **192 tok/turn** across six separately-wrapped
+  servers (`secret-broker`, `gh`, `runecho` each 212 -> 148; `codegraph`, `kb`, `shot-mcp`
+  unchanged because they genuinely reach the drop rule). That is the six-separate-proxies
+  configuration #168 measured at **+23.1% RAW**. A single `multiproxy` router is **unchanged at
+  212** — one peer that can drop is enough for the union primer, since the client sees one
+  server and cannot be told per-peer. On an install that is one router plus a standalone
+  proxy launched without `--server-name` (`server=None` -> whole-file scan, unchanged), the
+  realized saving is **0 tok/turn**; 192 is the fan-out configuration, not a number anyone
+  banks by upgrading.
+
+  Answering `terse.retrieve` is deliberately left **ungated** while advertising it is gated:
+  answer >= advertise, matching `multiproxy`. A retrieve call reaching a server this build
+  believes cannot drop is the symptom of the `_glob_covers_server` cases in #199, and
+  forwarding it downstream would turn one wasted paragraph into an unredeemable handle plus
+  a `-32601` from a server that never had the tool.
+
+  The narrowing taken is only the sound one, the same `reachable_tiers` uses: terminate the
+  walk at a rule that totally covers the server, because `select` returns the first match.
+  A rule whose glob merely *looks* scoped elsewhere still counts — `_match_candidates`' second
+  candidate is the tool's own unqualified name. Pinned by an under-inclusion invariant test
+  (`select` drops for a server => `has_drop(server)` is True), because the failure directions
+  are not symmetric: a surplus paragraph costs tokens, a missing retrieve tool costs a handle
+  nobody can redeem.
+
 ### Added
 - **Per-server break-even in `terse stats` (#175).** The primer-liability block gained a
   per-server table: `primer`, `blocks`, `saved/block`, and `blocks/turn to break even`. #175

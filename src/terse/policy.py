@@ -252,11 +252,57 @@ class Policy:
             candidates.insert(0, f"{server}.{bare}")
         return candidates
 
-    def has_drop(self) -> bool:
-        """True if any rule marks a field drop-to-retrieve. Gates whether the proxy injects
-        the synthetic terse.retrieve tool into tools/list (#10)."""
-        return any(isinstance(s, dict) and s.get("lossy") == "drop-to-retrieve"
-                   for r in self.rules for s in r.fields.values())
+    def has_drop(self, server: str | None = None) -> bool:
+        """True if a field drop-to-retrieve is reachable for `server`. Gates whether the
+        proxy injects the synthetic terse.retrieve tool into tools/list (#10) AND whether
+        its primer carries the 64-token dropped-field paragraph (#168).
+
+        Server-aware for the same reason — and by exactly the same walk — as
+        `reachable_tiers`: `select` returns the FIRST matching rule, so a rule that totally
+        covers this server ends the walk, and a drop rule sitting after it can never fire
+        here. This was the one primer gate still scanning every rule unconditionally while
+        the other four took a server, so a wrapped server paid to explain (and advertised a
+        tool for) a lossy form only some OTHER server's rule could produce.
+
+        Same asymmetry of risk as `reachable_tiers`, resolved the same way: over-inclusion
+        costs tokens, under-inclusion costs a handle nobody can retrieve. A rule whose glob
+        merely LOOKS scoped elsewhere still counts, because `_match_candidates`' second
+        candidate is the tool's own unqualified name.
+
+        Termination is not the ONLY sound narrowing, just the only one taken here.
+        `server_never_lossy(server)` structurally forbids every drop for a server, so it
+        could return False on the same proof standard — left for #199 rather than folded in,
+        since it is a second gate with its own blast radius.
+
+        Inherits `_glob_covers_server`'s unsound cases (#199), which `reachable_tiers` has
+        today too. Both stem from it deciding cover by STRING EQUALITY while `select` matches
+        by fnmatch over `_match_candidates`:
+
+          * any tool name carrying `PREFIX_SEP` whose bare part self-prefixes the server —
+            multiproxy's `gh__gh.api.items` is the common shape, but a single proxy given
+            `--server-name kb` and a downstream tool `mcp__kb.search` hits it identically.
+            Candidate[0] keeps the `__`, which `kb.*` does not match, so `select` can reach a
+            drop rule this walk terminated before.
+          * a server name containing an fnmatch metacharacter (`kb[1]`), where `kb[1].*`
+            compares equal but does not fnmatch.
+
+        Neither is reachable under the shipped or example policy — but NOT because the drop
+        rule comes first (it does not: index 4 of 8 live, index 2 of the example, in both
+        cases after covering rules). It is that no drop rule's glob matches a `{peer}__*`
+        candidate for any server whose walk terminates early. Validating a future policy edit
+        against rule ORDER alone would conclude "safe" incorrectly.
+
+        `server=None` scans every rule, which is both the previous behaviour and the right
+        answer for a caller with no server in hand (`terse fluency --drop-eval` evaluating a
+        policy file on its own).
+        """
+        for r in self.rules:
+            if any(isinstance(f, dict) and f.get("lossy") == "drop-to-retrieve"
+                   for f in r.fields.values()):
+                return True
+            if server and self._glob_covers_server(r.tool_glob, server):
+                return False
+        return False
 
     # -- primer gates (#168) ------------------------------------------------------------
     #

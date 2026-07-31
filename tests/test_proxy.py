@@ -2292,3 +2292,164 @@ def test_a_covering_rule_still_terminates_the_walk():
                    default_tiers=("minify", "tabularize", "dictionary"), diff=False)
     assert pol.reachable_tiers("kb") == {"minify", "tabularize"}
     assert "dictionary" in pol.reachable_tiers(None)   # unknown identity narrows nothing
+
+
+# --- has_drop is a primer gate too, and was the one still ignoring the server (#168) ----
+
+
+def _drop_rule(glob: str):
+    from terse import policy as P
+    return P.Rule(tool_glob=glob, tiers=("minify", "tabularize"),
+                  fields={"$text.code_blocks": {"lossy": "drop-to-retrieve"}})
+
+
+def test_a_total_cover_rule_hides_a_later_drop_rule_from_that_server():
+    """`has_drop` was the last primer gate scanning every rule unconditionally while the
+    other four took a server. Peers commonly share ONE policy file, so it answered "does
+    this FILE contain a drop rule" — and a server whose own rule totally covers it, and
+    therefore can never reach the drop rule at all, still paid the 64-token dropped-field
+    paragraph AND advertised a `terse.retrieve` tool it could never mint a handle for.
+
+    `select` returns the FIRST match, so the walk terminates at a total-cover rule for
+    exactly the reason `reachable_tiers` terminates there."""
+    from terse import policy as P
+    from terse.proxy import PRIMER_DROPPED, build_primer
+
+    pol = P.Policy(
+        rules=[P.Rule(tool_glob="runecho.*", tiers=("minify", "tabularize")),
+               _drop_rule("*codegraph_explore")],
+        default_tiers=("minify", "tabularize"), diff=False)
+
+    assert pol.has_drop("runecho") is False       # terminated before the drop rule
+    assert pol.has_drop("codegraph") is True      # reaches it
+    assert pol.has_drop() is True                 # no server: scan everything, as before
+    assert PRIMER_DROPPED not in build_primer(pol, "runecho")
+    assert PRIMER_DROPPED in build_primer(pol, "codegraph")
+
+
+def test_rule_ORDER_decides_it_not_the_glob_text():
+    """The narrowing is termination, not prefix matching. Move the drop rule ahead of the
+    cover rule and the same server reaches it — which is what `select` would do."""
+    from terse import policy as P
+
+    after = P.Policy(rules=[P.Rule(tool_glob="kb.*", tiers=("minify",)), _drop_rule("gh.*")],
+                     default_tiers=("minify",), diff=False)
+    before = P.Policy(rules=[_drop_rule("gh.*"), P.Rule(tool_glob="kb.*", tiers=("minify",))],
+                      default_tiers=("minify",), diff=False)
+    assert after.has_drop("kb") is False
+    assert before.has_drop("kb") is True
+
+
+def test_has_drop_never_undercounts_what_select_would_actually_drop():
+    """THE safety invariant, and the one that matters more than the tokens: if `select`
+    hands any tool a drop-to-retrieve field for this server, `has_drop(server)` MUST be
+    True. Under-inclusion means the proxy drops a field and then does not advertise
+    `terse.retrieve` — a handle nobody can redeem, which is worse than a wasted paragraph.
+
+    Mirrors `test_reachable_tiers_never_undercounts_what_select_returns`."""
+    from terse import policy as P
+
+    pol = P.Policy(
+        rules=[P.Rule(tool_glob="gh.*", tiers=("minify", "tabularize")),
+               _drop_rule("*codegraph_explore"),
+               P.Rule(tool_glob="kb.*", tiers=("minify", "tabularize")),
+               _drop_rule("read.*")],
+        default_tiers=("minify",), diff=False)
+    servers = ("gh", "kb", "codegraph", "knowledge", "runecho", None)
+    tools = ("gh.issues", "kb.read.search", "codegraph_explore", "read.search",
+             "structure", "codegraph.codegraph_explore")
+    for server in servers:
+        drops_somewhere = any(
+            isinstance(f, dict) and f.get("lossy") == "drop-to-retrieve"
+            for tool in tools for f in pol.select(tool, server).fields.values())
+        if drops_somewhere:
+            assert pol.has_drop(server) is True, (server, "would drop with no retrieve tool")
+
+
+def test_a_router_still_documents_a_form_only_one_peer_can_emit():
+    """The union errs toward inclusion: one peer that can drop is enough for the whole
+    router's primer, because the client sees one server and cannot be told per-peer."""
+    from terse import policy as P
+    from terse.proxy import PRIMER_DROPPED, union_primer
+
+    pol = P.Policy(
+        rules=[P.Rule(tool_glob="runecho.*", tiers=("minify", "tabularize")),
+               _drop_rule("*codegraph_explore")],
+        default_tiers=("minify", "tabularize"), diff=False)
+    assert PRIMER_DROPPED not in union_primer([(pol, "runecho")])
+    assert PRIMER_DROPPED in union_primer([(pol, "runecho"), (pol, "codegraph")])
+
+
+def test_the_covering_rule_can_ITSELF_be_the_drop_rule():
+    """Ordering inside the walk: the rule's own fields are checked BEFORE its glob is
+    tested for cover, so the single most ordinary per-server policy — one rule, scoped to
+    the server, carrying the drop — is not terminated out of its own drop (review of #198).
+
+    Nothing pinned this: the pre-existing union fixture happens to use glob `*`, so
+    swapping the two checks failed only incidentally."""
+    from terse import policy as P
+    from terse.proxy import PRIMER_DROPPED, build_primer
+
+    pol = P.Policy(rules=[_drop_rule("kb.*")], default_tiers=("minify",), diff=False)
+    assert pol.has_drop("kb") is True
+    assert PRIMER_DROPPED in build_primer(pol, "kb")
+
+
+# --- the RUNTIME half of #168: the gate has to reach tools/list, not just the primer ---
+
+
+_SHARED_POLICY_RULES = [
+    ("runecho.*", None),
+    ("*codegraph_explore", {"$text.code_blocks": {"lossy": "drop-to-retrieve"}}),
+    ("kb.*", None),
+]
+
+
+def _shared_file_policy():
+    """The shape every one of these peers actually ships with: ONE policy file, a drop rule
+    for exactly one of them, and a covering rule per peer."""
+    from terse import policy as P
+    return P.Policy(
+        rules=[P.Rule(tool_glob=g, tiers=("minify", "tabularize"), fields=f or {})
+               for g, f in _SHARED_POLICY_RULES],
+        default_tiers=("minify", "tabularize"), diff=False)
+
+
+def test_a_server_that_cannot_drop_stops_advertising_terse_retrieve():
+    """Round-2 review of #198: every new test sat at the `has_drop`/`build_primer` level, so
+    reverting all three runtime call sites left the suite fully green — the behaviour the
+    change leads with ("advertised a terse.retrieve it could never mint a handle for") had
+    no test at all.
+
+    This is the tools/list gate (`transform_response`), keyed on the Interceptor's own
+    server name."""
+    pol = _shared_file_policy()
+    tl = _tools_list(1, ["runecho.structure"])
+    assert "terse.retrieve" not in Interceptor(pol, server_name="runecho").transform_response(tl)
+    # ...and the peer that genuinely reaches the drop rule still gets it.
+    assert "terse.retrieve" in Interceptor(pol, server_name="codegraph").transform_response(
+        _tools_list(1, ["codegraph_explore"]))
+    # No server name = no basis to narrow, so the old whole-file answer stands.
+    assert "terse.retrieve" in Interceptor(pol).transform_response(tl)
+
+
+def test_answering_retrieve_is_ungated_even_where_advertising_is_not():
+    """Answer >= advertise, matching multiproxy (round-2 review of #198).
+
+    A retrieve call arriving at a server this build believes cannot drop is precisely the
+    symptom of `_glob_covers_server`'s unsound cases (#199). Gating the ANSWER there would
+    forward it to a downstream that never had the tool — turning one wasted paragraph into
+    an unredeemable handle plus a -32601. Answering costs nothing when nothing was dropped:
+    a legible miss, and the request never reaches downstream."""
+    pol = _shared_file_policy()
+    assert pol.has_drop("runecho") is False                 # would not advertise it
+    cin = io.StringIO(_retrieve_call(1, "nope") + "\n")
+    cout = io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], pol, stdin=cin, stdout=cout,
+                   server_name="runecho")
+    assert rc == 0
+    resp = json.loads([ln for ln in cout.getvalue().splitlines() if ln.strip()][0])
+    # OUR synthesized miss, and the downstream fake never saw the call — it would have
+    # answered with its own records (or a -32601) had the request been forwarded.
+    assert resp["id"] == 1 and resp["result"]["isError"] is True
+    assert '"status"' not in resp["result"]["content"][0]["text"]
