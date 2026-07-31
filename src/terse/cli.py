@@ -1470,13 +1470,14 @@ def _terse_version() -> str:
     terse is run from a source tree that was never `pip install`ed (e.g. `python -m terse`
     in a checkout). importlib.metadata reflects the ACTUAL installed dist, so it stays
     correct once tag-derived versioning lands."""
-    from importlib.metadata import PackageNotFoundError
-    from importlib.metadata import version as _dist_version
-    try:
-        return _dist_version("terse")
-    except PackageNotFoundError:
-        from . import __version__
-        return __version__
+    # ONE source, deliberately: `__init__` already prefers the build-generated
+    # `_version.py` and falls back to dist metadata. Resolving the dist here as well
+    # let the two disagree — an editable install freezes venv metadata at the tagged
+    # version while a later `uv run` regenerates `_version.py` as `…dev+g…`, so
+    # `terse --version` and the ledger's `version` field would name different builds
+    # of the same running code, with no signal to the operator correlating them.
+    from . import __version__
+    return __version__
 
 
 def main(argv: list[str] | None = None) -> int:

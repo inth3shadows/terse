@@ -22,6 +22,10 @@ except ImportError:
     from importlib.metadata import version as _dist_version
 
     try:
-        __version__ = _dist_version("terse")
+        # The DIST is `terse-mcp` (pyproject `name`); only the import package is `terse`.
+        # Looking up "terse" here always raised and fell through to the sentinel, so a
+        # source tree with terse installed reported `0.0.0+unknown` instead of its real
+        # version — invisible until the ledger started recording it per record.
+        __version__ = _dist_version("terse-mcp")
     except PackageNotFoundError:
         __version__ = "0.0.0+unknown"
