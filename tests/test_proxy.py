@@ -2393,3 +2393,63 @@ def test_the_covering_rule_can_ITSELF_be_the_drop_rule():
     pol = P.Policy(rules=[_drop_rule("kb.*")], default_tiers=("minify",), diff=False)
     assert pol.has_drop("kb") is True
     assert PRIMER_DROPPED in build_primer(pol, "kb")
+
+
+# --- the RUNTIME half of #168: the gate has to reach tools/list, not just the primer ---
+
+
+_SHARED_POLICY_RULES = [
+    ("runecho.*", None),
+    ("*codegraph_explore", {"$text.code_blocks": {"lossy": "drop-to-retrieve"}}),
+    ("kb.*", None),
+]
+
+
+def _shared_file_policy():
+    """The shape every one of these peers actually ships with: ONE policy file, a drop rule
+    for exactly one of them, and a covering rule per peer."""
+    from terse import policy as P
+    return P.Policy(
+        rules=[P.Rule(tool_glob=g, tiers=("minify", "tabularize"), fields=f or {})
+               for g, f in _SHARED_POLICY_RULES],
+        default_tiers=("minify", "tabularize"), diff=False)
+
+
+def test_a_server_that_cannot_drop_stops_advertising_terse_retrieve():
+    """Round-2 review of #198: every new test sat at the `has_drop`/`build_primer` level, so
+    reverting all three runtime call sites left the suite fully green — the behaviour the
+    change leads with ("advertised a terse.retrieve it could never mint a handle for") had
+    no test at all.
+
+    This is the tools/list gate (`transform_response`), keyed on the Interceptor's own
+    server name."""
+    pol = _shared_file_policy()
+    tl = _tools_list(1, ["runecho.structure"])
+    assert "terse.retrieve" not in Interceptor(pol, server_name="runecho").transform_response(tl)
+    # ...and the peer that genuinely reaches the drop rule still gets it.
+    assert "terse.retrieve" in Interceptor(pol, server_name="codegraph").transform_response(
+        _tools_list(1, ["codegraph_explore"]))
+    # No server name = no basis to narrow, so the old whole-file answer stands.
+    assert "terse.retrieve" in Interceptor(pol).transform_response(tl)
+
+
+def test_answering_retrieve_is_ungated_even_where_advertising_is_not():
+    """Answer >= advertise, matching multiproxy (round-2 review of #198).
+
+    A retrieve call arriving at a server this build believes cannot drop is precisely the
+    symptom of `_glob_covers_server`'s unsound cases (#199). Gating the ANSWER there would
+    forward it to a downstream that never had the tool — turning one wasted paragraph into
+    an unredeemable handle plus a -32601. Answering costs nothing when nothing was dropped:
+    a legible miss, and the request never reaches downstream."""
+    pol = _shared_file_policy()
+    assert pol.has_drop("runecho") is False                 # would not advertise it
+    cin = io.StringIO(_retrieve_call(1, "nope") + "\n")
+    cout = io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], pol, stdin=cin, stdout=cout,
+                   server_name="runecho")
+    assert rc == 0
+    resp = json.loads([ln for ln in cout.getvalue().splitlines() if ln.strip()][0])
+    # OUR synthesized miss, and the downstream fake never saw the call — it would have
+    # answered with its own records (or a -32601) had the request been forwarded.
+    assert resp["id"] == 1 and resp["result"]["isError"] is True
+    assert '"status"' not in resp["result"]["content"][0]["text"]

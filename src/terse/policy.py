@@ -274,11 +274,23 @@ class Policy:
         could return False on the same proof standard — left for #199 rather than folded in,
         since it is a second gate with its own blast radius.
 
-        Inherits `_glob_covers_server`'s one unsound case (#199): a multiproxy peer whose
-        downstream tools are self-prefixed produces a peer-qualified candidate
-        (`gh__gh.api.items`) that `gh.*` does not match, so `select` can reach a drop rule
-        this walk terminated before. Not reachable under the shipped policy — its drop rule
-        precedes every covering rule — and `reachable_tiers` has the same hole today.
+        Inherits `_glob_covers_server`'s unsound cases (#199), which `reachable_tiers` has
+        today too. Both stem from it deciding cover by STRING EQUALITY while `select` matches
+        by fnmatch over `_match_candidates`:
+
+          * any tool name carrying `PREFIX_SEP` whose bare part self-prefixes the server —
+            multiproxy's `gh__gh.api.items` is the common shape, but a single proxy given
+            `--server-name kb` and a downstream tool `mcp__kb.search` hits it identically.
+            Candidate[0] keeps the `__`, which `kb.*` does not match, so `select` can reach a
+            drop rule this walk terminated before.
+          * a server name containing an fnmatch metacharacter (`kb[1]`), where `kb[1].*`
+            compares equal but does not fnmatch.
+
+        Neither is reachable under the shipped or example policy — but NOT because the drop
+        rule comes first (it does not: index 4 of 8 live, index 2 of the example, in both
+        cases after covering rules). It is that no drop rule's glob matches a `{peer}__*`
+        candidate for any server whose walk terminates early. Validating a future policy edit
+        against rule ORDER alone would conclude "safe" incorrectly.
 
         `server=None` scans every rule, which is both the previous behaviour and the right
         answer for a caller with no server in hand (`terse fluency --drop-eval` evaluating a
