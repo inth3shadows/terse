@@ -59,7 +59,7 @@ Every candidate gets sorted by which of those it does *not* do:
 
 ### token-optimizer-mcp (ooples)
 
-- ~456★ as listed on GitHub, 2026-07-31 (unverified).
+- 456★, verified via the GitHub API 2026-07-31 (see the identifier table below).
 - **Axis:** agent-callable + result-side. Lossless **Brotli** compression with
   cache-and-retrieve-by-key, plus its own `smart_read` / `smart_grep` / `smart_glob`
   replacements for the built-in file tools. `optimize_text` is the generic path and
@@ -87,7 +87,7 @@ Every candidate gets sorted by which of those it does *not* do:
 
 ### Schema-side proxies (a category now, not one entrant)
 
-`atlassian-labs/mcp-compressor` (~97★) already has a README row. Add siblings to
+`atlassian-labs/mcp-compressor` (104★, verified 2026-07-31) already has a README row. Add siblings to
 that row rather than new rows:
 
 - **mcpproxy-go** (smart-mcp-proxy, ~305★) — federates many servers behind one
