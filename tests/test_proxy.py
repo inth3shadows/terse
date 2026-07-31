@@ -126,6 +126,26 @@ def test_notification_and_non_json_pass_through():
     assert inter.transform_response("not json") == "not json"
 
 
+def test_note_request_survives_non_dict_params_instead_of_killing_the_pump():
+    # `msg.get("params") or {}` only neutralised FALSY junk, so a truthy non-object
+    # `params` raised AttributeError out of note_request. That exception surfaces in the
+    # client->server pump THREAD (proxy.pump -> fwd -> note_request), which kills
+    # forwarding for the rest of the session — a malformed request taking the whole proxy
+    # down, from a method that only does bookkeeping. Found via the demo server's tests.
+    inter = Interceptor(FULL)
+    for junk in ("not-an-object", [1, 2], 7):
+        inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                       "params": junk}))
+        inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "initialize",
+                                       "params": junk}))
+    assert inter.pending == {}      # nothing recordable was recorded
+    assert inter.client_name is None
+    # and a well-formed call after the junk is still tracked — the state machine is intact
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                                   "params": {"name": "gh.x"}}))
+    assert inter.pending[3][0] == "gh.x"
+
+
 def test_non_json_text_content_is_left_alone():
     inter = Interceptor(FULL)
     inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 5, "method": "tools/call",

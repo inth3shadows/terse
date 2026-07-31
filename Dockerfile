@@ -39,8 +39,12 @@ RUN set -eux; \
 WORKDIR /src
 COPY . /src
 
+# Deliberately no `git config --global --add safe.directory`: git resolves the repository
+# even for a `--global` write, so with a worktree-pointer `.git` (the layout this repo is
+# developed in) it exits 128 on a path that does not exist in the container — failing the
+# build BEFORE the TERSE_VERSION branch could rescue it. /src is root-owned and built as
+# root, so there is no ownership check to appease in the first place.
 RUN set -eux; \
-    git config --global --add safe.directory /src; \
     if [ -n "${TERSE_VERSION}" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="${TERSE_VERSION}"; fi; \
     pip wheel --no-cache-dir --no-deps --wheel-dir /wheels .
 
@@ -55,6 +59,15 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     TIKTOKEN_CACHE_DIR=/opt/tiktoken
+
+# `uvx` so the documented `docker run -i --rm terse uvx some-mcp-server` actually works:
+# the runtime stage is otherwise python-slim plus one wheel, with no launcher on PATH at
+# all, and most real MCP servers are uvx-launched. Pinned, not `:latest` — the tag is the
+# only thing keeping this reproducible. Node/`npx` is deliberately NOT installed (~150MB
+# for a second ecosystem); for an npx-launched server, FROM this image and add Node.
+# Note a uvx downstream needs the network at run time to resolve the package; only the
+# bundled demo path is network-free.
+COPY --from=ghcr.io/astral-sh/uv:0.11.31 /uv /uvx /usr/local/bin/
 
 COPY --from=builder /wheels /wheels
 RUN set -eux; \

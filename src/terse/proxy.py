@@ -380,6 +380,14 @@ class Interceptor:
             return
         mid = msg.get("id")
         method = msg.get("method")
+        # `msg.get("params") or {}` only neutralises FALSY junk: a client that sends
+        # `"params": "oops"` (or a list) passes that guard and then raises AttributeError
+        # on the first `.get` below. That exception escapes into the client->server pump
+        # THREAD and kills forwarding for the rest of the session — a malformed request
+        # taking the whole proxy down, when this method is side-effect-only bookkeeping
+        # and should simply decline to record anything it cannot parse.
+        raw_params = msg.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
         with self._local_lock:
             if method == "initialize":
                 # A re-handshake means the client rebuilt its MCP connection — and almost
@@ -417,7 +425,7 @@ class Interceptor:
                 # field only for clients measured not to validate it (#128) — an observed
                 # name, not a heuristic. Absent/malformed leaves it None, which the
                 # resolver treats as "unknown" and therefore "leave".
-                info = (msg.get("params") or {}).get("clientInfo")
+                info = params.get("clientInfo")
                 if isinstance(info, dict) and isinstance(info.get("name"), str):
                     self.client_name = info["name"]
                     if self.debug:
@@ -430,7 +438,6 @@ class Interceptor:
                 return
             if method != "tools/call":
                 return
-            params = msg.get("params") or {}
             name = params.get("name")
             if mid is not None and isinstance(name, str):
                 self.pending[mid] = (name, tool_name if tool_name is not None else name,

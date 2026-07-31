@@ -36,14 +36,19 @@ def _drive(*requests: dict) -> list[dict]:
     return [json.loads(ln) for ln in cout.getvalue().splitlines() if ln.strip()]
 
 
-def test_dockerfile_cmd_points_at_a_demo_server_that_exists():
-    # A rename would leave a container that exits instantly — and Docker cannot fail the
-    # build over it, because CMD is resolved at run time.
+def _exec_form(directive: str) -> list[str]:
+    m = re.search(rf'^{directive} \[(.+)\]', DOCKERFILE.read_text(), re.M)
+    assert m, f"Dockerfile lost its {directive}"
+    return [p.strip().strip('"') for p in m.group(1).split(",")]
+
+
+def test_dockerfile_entrypoint_and_cmd_form_the_command_this_module_drives():
+    # Neither directive can fail the BUILD — both resolve at run time — so dropping
+    # `proxy` or the `--` yields an image that starts and quietly does nothing useful.
+    # The `--` is load-bearing: it is what makes CMD the downstream server command.
+    assert _exec_form("ENTRYPOINT") == ["terse", "proxy", "--"]
     assert DEMO.exists()
-    cmd = re.search(r'^CMD \[(.+)\]', DOCKERFILE.read_text(), re.M)
-    assert cmd, "Dockerfile lost its CMD — the container has no downstream to proxy"
-    referenced = [p.strip().strip('"') for p in cmd.group(1).split(",")]
-    assert referenced[-1].endswith("examples/demo_mcp_server.py")
+    assert _exec_form("CMD")[-1].endswith("examples/demo_mcp_server.py")
 
 
 def test_demo_server_answers_the_handshake_a_registry_inspector_performs():
@@ -92,6 +97,37 @@ def test_demo_tools_survive_junk_arguments_without_killing_the_stream():
     # through to `ORDERS[:-5]`, which would quietly serve 35 records for a request of -5.
     orders = decompress(limit["result"]["content"][0]["text"])["orders"]
     assert len(orders) == 1
+
+
+def test_malformed_requests_are_answered_not_fatal():
+    # Each of these used to raise an uncaught AttributeError inside the demo server. That
+    # is far worse than a failed call: the process dies and every LATER request on the
+    # stream goes unanswered, which an inspector reads as a dead server. So the real
+    # assertion is the trailing well-formed tools/list — it proves the wire survived.
+    replies = _drive(
+        # a JSON-RPC BATCH: legal 2.0, part of MCP through 2025-03-26, unsupported here
+        [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}],           # type: ignore[arg-type]
+        # `arguments` present but not an object — truthy, so `or {}` does not catch it
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": "demo_orders", "arguments": [1, 2]}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": "not-an-object"},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/list"},
+    )
+    assert replies[-1]["result"]["tools"], "the server died and stopped answering"
+    # a batch cannot be correlated to an id, so it draws no reply at all; the other two
+    # are answerable and must come back as errors or as clamped-to-default successes
+    assert {r["id"] for r in replies} == {2, 3, 4}
+
+
+def test_a_notification_with_a_known_method_draws_no_reply():
+    # `{"method": "tools/list"}` with no id is a legal NOTIFICATION. Dispatching it and
+    # replying `"id": null` is a protocol violation a strict client may reject, so the
+    # id check has to sit ahead of the method dispatch, not behind it.
+    replies = _drive(
+        {"jsonrpc": "2.0", "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 9, "method": "tools/list"},
+    )
+    assert [r["id"] for r in replies] == [9]
 
 
 def _orders() -> list[dict]:

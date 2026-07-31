@@ -13,7 +13,9 @@ Deliberately NOT `tests/fake_mcp_server.py`: that fixture omits `description` an
 
 The payload shape is chosen to exercise the codec end to end:
   - `demo_orders` -> a record array, so tabularize folds it to one header + N rows, and
-    the repeated `status`/`region` values dictionary-code to `~N` aliases.
+    the repeated `region` values dictionary-code to `~N` aliases. (`status` repeats just
+    as often but stays literal: its values are short enough that a quoted `~N` alias
+    would not pay. That asymmetry is the dictionary tier working, not a gap in it.)
   - `demo_logs`   -> plain non-JSON text, so the text tier (and cross-call text diff)
     has something to work on rather than every tool being record-shaped.
 
@@ -120,8 +122,15 @@ def _result(mid: object, text: str) -> dict:
 def _dispatch(msg: dict) -> dict | None:
     """One request in, one response out; None for anything that takes no reply."""
     mid, method = msg.get("id"), msg.get("method")
-    params = msg.get("params") or {}
-    args = params.get("arguments") or {}
+    # A request without an id is a NOTIFICATION whatever its method, so the check has to
+    # come BEFORE the dispatch below — answering `{"method": "tools/list"}` with an
+    # `"id": null` response is a protocol violation a strict client may reject.
+    if mid is None:
+        return None
+    params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+    # `or {}` would only neutralise FALSY junk; `"arguments": [1, 2]` is truthy and would
+    # blow up on the first `.get` below.
+    args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
 
     if method == "initialize":
         return {
@@ -154,10 +163,6 @@ def _dispatch(msg: dict) -> dict | None:
                 "isError": True,
             },
         }
-    if method and method.startswith("notifications/"):
-        return None  # notifications are one-way by definition
-    if mid is None:
-        return None  # an unknown NOTIFICATION, still no reply
     return {"jsonrpc": "2.0", "id": mid,
             "error": {"code": -32601, "message": f"method not found: {method!r}"}}
 
@@ -171,7 +176,21 @@ def main() -> None:
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue  # a torn line is not worth killing the stream over
-        resp = _dispatch(msg)
+        try:
+            # A BATCH (`[{...}]`) is legal JSON-RPC 2.0 and was part of MCP through
+            # 2025-03-26, so `msg` is not necessarily a dict. Batches are not supported
+            # here, but an unsupported request must be ANSWERED, not fatal: an uncaught
+            # exception kills the process and every later request on the stream goes
+            # unanswered, which an inspector sees as a dead server.
+            if not isinstance(msg, dict):
+                raise TypeError(f"expected a JSON-RPC object, got {type(msg).__name__}")
+            resp = _dispatch(msg)
+        except Exception as exc:  # noqa: BLE001 — the wire outlives any one bad request
+            mid = msg.get("id") if isinstance(msg, dict) else None
+            if mid is None:
+                continue  # nothing to answer: no id to correlate a reply to
+            resp = {"jsonrpc": "2.0", "id": mid,
+                    "error": {"code": -32603, "message": f"internal error: {exc}"}}
         if resp is None:
             continue
         sys.stdout.write(json.dumps(resp) + "\n")

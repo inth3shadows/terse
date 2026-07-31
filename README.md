@@ -134,8 +134,12 @@ nothing to compress. The default is `examples/demo_mcp_server.py`, a stdlib-only
 whose `demo_orders` tool returns a 40-record order book — you get back terse's compressed
 form of it (9,019 → 3,187 chars), which is the fastest way to see what the proxy does.
 
-The build reads the version from `git describe`, so build from a git clone; from a source
-tarball, pass `--build-arg TERSE_VERSION=0.3.1`.
+The image ships `uv`/`uvx` so `uvx`-launched servers work out of the box. Node is **not**
+installed — for an `npx`-launched server, build `FROM` this image and add it.
+
+The build reads the version from `git describe`, so build from a normal git clone. Any
+context without a resolvable `.git` — a source tarball, or a git worktree whose `.git` is
+a pointer file — needs `--build-arg TERSE_VERSION=0.3.1` instead.
 
 ## Quick Start (under a minute)
 
