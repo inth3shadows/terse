@@ -8,6 +8,8 @@ lists) and still stay lossless.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from terse import transforms
@@ -162,3 +164,73 @@ def test_aliases_never_collide_with_literals():
     assert transforms.roundtrip_ok(obj)
     _data, legend = transforms.dict_encode(transforms.compress_structure(obj))
     assert "~0" not in legend and "~1" not in legend
+
+
+# --- the gate's own equality (#187) ---------------------------------------------------
+# `roundtrip_ok` used plain `==`, and IEEE-754 says `nan != nan`, so a payload the codec
+# handled PERFECTLY was reported as a losslessness failure. The direction was safe — a
+# failed self-check falls back to the plain minified form — but the number was wrong, and
+# `policy_gen._tool_decision` marks a tool `passthrough` permanently on a gate_fail while
+# `measure` zeroes its banked savings. The codec was fine; the checker was not.
+
+def test_nan_payload_passes_the_gate_because_its_bytes_are_exact():
+    obj = {"v": float("nan")}
+    # the premise: json emits and re-reads the non-standard NaN token faithfully
+    assert transforms.compress(obj) == '{"v":NaN}'
+    assert transforms.minify(transforms.decompress(transforms.compress(obj))) \
+        == transforms.minify(obj)
+    assert transforms.roundtrip_ok(obj)
+    # and NaN nested inside the record/table path, not just at the top level
+    assert transforms.roundtrip_ok({"rows": [{"id": i, "score": float("nan")} for i in range(6)]})
+
+
+def test_infinity_and_negative_zero_were_never_affected():
+    # scope check from the issue: only NaN needed the special case, so if either of these
+    # ever starts failing it is a NEW break, not this one resurfacing.
+    assert transforms.roundtrip_ok({"v": float("inf")})
+    assert transforms.roundtrip_ok({"v": float("-inf")})
+    assert transforms.roundtrip_ok({"v": -0.0})
+
+
+def test_values_equal_still_rejects_every_real_difference():
+    # The contract is "same as ==, plus NaN". A NaN-blind gate that also stopped catching
+    # genuine corruption would be far worse than the false alarm it replaces.
+    ve = transforms.values_equal
+    assert not ve({"v": float("nan")}, {"v": 1.0})       # NaN is not equal to a number
+    assert not ve({"v": 1.0}, {"v": float("nan")})       # ...in either order
+    assert not ve({"a": 1}, {"a": 1, "b": 2})            # missing key
+    assert not ve([1, 2], [1, 2, 3])                     # length
+    assert not ve({"a": [{"b": float("nan")}]}, {"a": [{"b": 0.0}]})  # nested
+    assert not ve("1", 1)
+
+
+def test_values_equal_does_not_tighten_what_equality_already_allowed():
+    ve = transforms.values_equal
+    assert ve({"a": 1, "b": 2}, {"b": 2, "a": 1})  # dicts compare order-insensitively
+    assert ve({"a": True}, {"a": 1})               # bool/int cross-equality, as `==` has it
+    assert ve({"a": 1}, {"a": 1.0})                # int/float, likewise
+
+
+def test_the_gate_no_longer_leans_on_jsons_shared_NaN_object():
+    """Why #187 never fired in production, and why the fix is still right.
+
+    `json` hands back ONE module-level NaN object for every `NaN` token — both the C
+    accelerator and the pure-Python scanner (`_CONSTANTS['NaN']`). Container `==` compares
+    elements identity-first, so when BOTH sides come off the wire the comparison short-
+    circuits and plain `==` already answered correctly. That is why `policy._lossless_stage`
+    and `measure_payload` — whose two sides are always parsed — were never actually
+    affected, contrary to the issue's blast-radius note.
+
+    The break needs one side built in PYTHON, which is exactly the fuzz/property surface
+    that certifies the lossless claim. Leaning on a shared-singleton implementation detail
+    for the correctness of the gate is the fragility worth removing either way.
+    """
+    parsed = json.loads('{"v": NaN}')
+    assert parsed["v"] is json.loads('{"v": NaN}')["v"]        # the singleton, both scanners
+    assert transforms.values_equal(parsed, json.loads('{"v": NaN}'))
+    # the case that actually failed: a Python-constructed NaN has no such identity
+    built = {"v": float("nan")}
+    assert built["v"] is not parsed["v"]
+    assert built != parsed                                     # plain `==` still says no
+    assert transforms.values_equal(built, parsed)              # the gate no longer does
+    assert transforms.roundtrip_ok(built)

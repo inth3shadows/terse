@@ -30,6 +30,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 from collections import Counter
 from typing import Any
 
@@ -733,6 +734,43 @@ def decompress(text: str) -> Any:
     return decompress_structure(parsed)
 
 
+def values_equal(a: Any, b: Any) -> bool:
+    """Value equality for the lossless gate — identical to `==` except that two NaNs in
+    the same position compare EQUAL.
+
+    Plain `==` answers the gate's question wrongly for NaN. IEEE-754 says `nan != nan`, so
+    a payload the codec handled perfectly is reported as a losslessness failure: Python's
+    `json` emits the non-standard `NaN` token and reads it straight back, and the bytes
+    are exact. The failure DIRECTION is safe (a failed self-check falls back to the plain
+    minified form, so nothing is corrupted) — what it breaks is the measurement, and that
+    has a track record of driving wrong decisions here. `policy_gen._tool_decision`
+    disqualifies a whole tool on `gate_fail`, marking it `passthrough` permanently for a
+    shape the codec handles fine, and `measure` zeroes its banked savings so real
+    compression reads as 0%. Same family as #144: the codec is fine, the number
+    describing it is not (#187).
+
+    Only NaN needs this. `Infinity` compares equal to itself; `-0.0 == 0.0` is True and
+    `-0.0` serialises back as `-0.0`, so both already pass unaided.
+
+    Deliberately NOT a canonical-bytes comparison: that would also make key REORDERING
+    visible, which `==` has always ignored and which the codec is free to do.
+    """
+    if isinstance(a, float) and isinstance(b, float):
+        # `or` not `and`: two NaNs are equal here, and a NaN against any other float is
+        # not — which `==` already gets right.
+        return a == b or (math.isnan(a) and math.isnan(b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        # key SET first: `==` compares dicts order-insensitively and so must this.
+        return a.keys() == b.keys() and all(values_equal(v, b[k]) for k, v in a.items())
+    if isinstance(a, list) and isinstance(b, list):
+        # `strict=True` is redundant behind the length check but keeps a future edit that
+        # drops that check from silently comparing only the shorter prefix.
+        return len(a) == len(b) and all(values_equal(x, y) for x, y in zip(a, b, strict=True))
+    # Everything else defers to `==` unchanged — including bool/int cross-equality, which
+    # this must not tighten: the gate's contract is "same as ==, plus NaN".
+    return bool(a == b)
+
+
 def roundtrip_ok(obj: Any) -> bool:
     """The lossless GATE. True iff the full pipeline is byte-faithful by value."""
-    return decompress(compress(obj)) == obj
+    return values_equal(decompress(compress(obj)), obj)
