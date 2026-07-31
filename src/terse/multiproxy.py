@@ -394,7 +394,14 @@ class Router:
         # True if ANY peer's policy enables drop-to-retrieve — gates whether the merged
         # tools/list advertises the single synthetic terse.retrieve tool at all, mirroring
         # single-peer Interceptor.policy.has_drop() (#10).
-        self.has_drop = any(p.inter.policy.has_drop() for p in peers)
+        #
+        # Each peer is gated against its OWN name (#168), the same correction `union_primer`
+        # already applies: peers commonly share one policy file, so an unscoped scan asked
+        # "does this FILE contain a drop rule" and answered yes for every peer as soon as
+        # any one of them had one. That is only invisible here because the router's answer
+        # is an `any()` — but the per-peer value is what `_augment_initialize` sizes the
+        # union primer from, and it decides retrieve-tool advertisement for a single proxy.
+        self.has_drop = any(p.inter.policy.has_drop(p.inter.server_name) for p in peers)
         # One background sender per peer (index-aligned with `peers`) so a slow HTTP
         # peer's blocking send can't stall routing to any other peer — see _PeerSender.
         self._senders = [_PeerSender(p.transport, debug=debug) for p in peers]

@@ -167,7 +167,7 @@ def build_primer(pol: policy_mod.Policy, server: str | None = None) -> str:
     return _assemble_primer(
         table=pol.emits_table(server), dictionary=pol.emits_dict(server),
         embedded=pol.emits_embedded(server),
-        diff=pol.emits_diff(server), dropped=pol.has_drop(),
+        diff=pol.emits_diff(server), dropped=pol.has_drop(server),
     )
 
 
@@ -199,7 +199,7 @@ def union_primer(pairs: list[tuple[policy_mod.Policy, str | None]]) -> str:
         dictionary=any(p.emits_dict(s) for p, s in pairs),
         embedded=any(p.emits_embedded(s) for p, s in pairs),
         diff=any(p.emits_diff(s) for p, s in pairs),
-        dropped=any(p.has_drop() for p, _ in pairs),
+        dropped=any(p.has_drop(s) for p, s in pairs),
     )
 
 
@@ -516,7 +516,7 @@ class Interceptor:
                 # we advertise the synthetic terse.retrieve tool so the model knows
                 # how to fetch a dropped field back (#10) — only for the untracked
                 # case, never for a tracked call's error reply.
-                if tracked is None and self.policy.has_drop():
+                if tracked is None and self.policy.has_drop(self.server_name):
                     injected = self._inject_retrieve_tool(msg)
                     if injected is not None:
                         return injected
@@ -1702,7 +1702,7 @@ def run_proxy(
                 # `pending`, since we don't call note_request for it). This never touches
                 # `transport` at all — retrieve is a pure client<->proxy exchange, which is
                 # exactly why it needed zero HTTP-specific reimplementation for #5.
-                if inter.policy.has_drop():
+                if inter.policy.has_drop(inter.server_name):
                     reply = inter.answer_retrieve(line)
                     if reply is not None:
                         with out_lock:

@@ -252,11 +252,35 @@ class Policy:
             candidates.insert(0, f"{server}.{bare}")
         return candidates
 
-    def has_drop(self) -> bool:
-        """True if any rule marks a field drop-to-retrieve. Gates whether the proxy injects
-        the synthetic terse.retrieve tool into tools/list (#10)."""
-        return any(isinstance(s, dict) and s.get("lossy") == "drop-to-retrieve"
-                   for r in self.rules for s in r.fields.values())
+    def has_drop(self, server: str | None = None) -> bool:
+        """True if a field drop-to-retrieve is reachable for `server`. Gates whether the
+        proxy injects the synthetic terse.retrieve tool into tools/list (#10) AND whether
+        its primer carries the 64-token dropped-field paragraph (#168).
+
+        Server-aware for the same reason — and by exactly the same walk — as
+        `reachable_tiers`: `select` returns the FIRST matching rule, so a rule that totally
+        covers this server ends the walk, and a drop rule sitting after it can never fire
+        here. This was the one primer gate still scanning every rule unconditionally while
+        the other four took a server, so a wrapped server paid to explain (and advertised a
+        tool for) a lossy form only some OTHER server's rule could produce.
+
+        Same asymmetry of risk as `reachable_tiers`, resolved the same way: over-inclusion
+        costs tokens, under-inclusion costs a handle nobody can retrieve. Only the
+        termination narrowing is sound, and it is the only one taken — a rule whose glob
+        merely LOOKS scoped elsewhere still counts, because `_match_candidates`' second
+        candidate is the tool's own unqualified name.
+
+        `server=None` scans every rule, which is both the previous behaviour and the right
+        answer for a caller with no server in hand (`terse fluency --drop-eval` evaluating a
+        policy file on its own).
+        """
+        for r in self.rules:
+            if any(isinstance(f, dict) and f.get("lossy") == "drop-to-retrieve"
+                   for f in r.fields.values()):
+                return True
+            if server and self._glob_covers_server(r.tool_glob, server):
+                return False
+        return False
 
     # -- primer gates (#168) ------------------------------------------------------------
     #
