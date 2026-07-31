@@ -10,6 +10,22 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Added
+- **Per-server break-even in `terse stats` (#175).** The primer-liability block gained a
+  per-server table: `primer`, `blocks`, `saved/call`, and `calls/turn to break even`. #175
+  established the rule — *wrap a server when its typical payload saves more than
+  `primer x turns-per-call` tokens* — and then computed the evidence for it by hand from the
+  ledger; this makes it self-service. `terse stats --json` carries `saved_per_call` and
+  `calls_to_break_even` per server under `primer_liability.servers`.
+
+  Each way the answer is not a number is its own value, because each accuses the install of
+  something different: **`no token data`** (rows recorded without tiktoken — savings in
+  tokens are unknown, not zero, and dividing a cl100k primer by a char-derived rate would
+  silently mix units), **`never`** (a known non-positive rate, which no call volume earns
+  back — a word rather than a large number, because it is the one verdict here that should
+  stop an operator), and **`free (no primer)`** (a default-deny policy emits no primer, so
+  there is nothing to earn back). A router's rate pools every peer it fronts, matching the
+  single union primer it actually pays.
+
 - **`terse stats` now shows what the primer costs (#168).** The ledger charges terse for the
   payloads it compresses and never for the context it adds, so `terse stats` could report a
   win in a session that was a net loss — measured from outside terse as a **14.0% win at one
