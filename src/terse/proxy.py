@@ -439,7 +439,10 @@ class Interceptor:
             if method != "tools/call":
                 return
             name = params.get("name")
-            if mid is not None and isinstance(name, str):
+            # `mid` becomes a dict KEY below, so a non-hashable id (`"id": {"a": 1}`) would
+            # raise TypeError out of this same pump thread — the identical failure the
+            # params guard above closes, by a different door.
+            if isinstance(mid, (str, int)) and isinstance(name, str):
                 self.pending[mid] = (name, tool_name if tool_name is not None else name,
                                      _args_key(params.get("arguments")))
                 # dict preserves insertion order; drop the oldest tracked id(s) once over
@@ -1324,11 +1327,19 @@ class Interceptor:
             return None
         if not isinstance(msg, dict) or msg.get("method") != "tools/call":
             return None
-        params = msg.get("params") or {}
+        # Same trap as note_request: `or {}` only neutralises FALSY junk, so a truthy
+        # non-object `params` (or `arguments`) raised AttributeError straight out of `fwd`
+        # into the client->server pump THREAD and stopped forwarding for the session. This
+        # path runs BEFORE note_request whenever the policy has a drop rule — which the
+        # default policy does not, but a deployed one does — so it is the branch that
+        # actually fires in production.
+        raw_params = msg.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
         if params.get("name") != lossy_mod.RETRIEVE_TOOL:
             return None
         mid = msg.get("id")
-        handle = (params.get("arguments") or {}).get("handle")
+        raw_args = params.get("arguments")
+        handle = raw_args.get("handle") if isinstance(raw_args, dict) else None
         if not isinstance(handle, str):
             handle = ""  # a malformed/absent handle can only ever be a miss below
         value = None

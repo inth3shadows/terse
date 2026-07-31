@@ -146,6 +146,35 @@ def test_note_request_survives_non_dict_params_instead_of_killing_the_pump():
     assert inter.pending[3][0] == "gh.x"
 
 
+def test_malformed_requests_cannot_kill_the_pump_on_the_drop_policy_path():
+    # `answer_retrieve` runs BEFORE note_request whenever the policy has a drop rule, so
+    # it — not note_request — is the branch that fires on a deployed install. The default
+    # policy has no drop, which is exactly why the earlier test passed while this path was
+    # still live. `bool` is intentionally NOT excluded: it is a hashable int subclass.
+    from terse.lossy import RETRIEVE_TOOL
+    pol = Policy(rules=[Rule("gh.*", ("minify",),
+                             fields={"$.big": {"lossy": "drop-to-retrieve"}})])
+    assert pol.has_drop()
+    inter = Interceptor(pol)
+    for junk in ("oops", [1, 2], 7):
+        assert inter.answer_retrieve(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": junk}) ) is None
+    # a real retrieve call with non-object `arguments` must answer, not raise
+    reply = inter.answer_retrieve(json.dumps(
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": RETRIEVE_TOOL, "arguments": "oops"}}))
+    assert reply is not None and json.loads(reply)["id"] == 2
+
+
+def test_note_request_declines_a_non_hashable_id_instead_of_raising():
+    # `mid` becomes a dict key, so `"id": {"a": 1}` raised TypeError out of the same pump
+    # thread — the identical session-wide forwarding death by a different door.
+    inter = Interceptor(FULL)
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": {"a": 1}, "method": "tools/call",
+                                   "params": {"name": "gh.x"}}))
+    assert inter.pending == {}
+
+
 def test_non_json_text_content_is_left_alone():
     inter = Interceptor(FULL)
     inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
