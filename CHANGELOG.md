@@ -23,7 +23,16 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   unchanged because they genuinely reach the drop rule). That is the six-separate-proxies
   configuration #168 measured at **+23.1% RAW**. A single `multiproxy` router is **unchanged at
   212** — one peer that can drop is enough for the union primer, since the client sees one
-  server and cannot be told per-peer.
+  server and cannot be told per-peer. On an install that is one router plus a standalone
+  proxy launched without `--server-name` (`server=None` -> whole-file scan, unchanged), the
+  realized saving is **0 tok/turn**; 192 is the fan-out configuration, not a number anyone
+  banks by upgrading.
+
+  Answering `terse.retrieve` is deliberately left **ungated** while advertising it is gated:
+  answer >= advertise, matching `multiproxy`. A retrieve call reaching a server this build
+  believes cannot drop is the symptom of the `_glob_covers_server` cases in #199, and
+  forwarding it downstream would turn one wasted paragraph into an unredeemable handle plus
+  a `-32601` from a server that never had the tool.
 
   The narrowing taken is only the sound one, the same `reachable_tiers` uses: terminate the
   walk at a rule that totally covers the server, because `select` returns the first match.
