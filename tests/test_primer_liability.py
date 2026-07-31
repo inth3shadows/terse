@@ -225,7 +225,8 @@ def test_a_zero_primer_server_breaks_even_at_no_calls_at_all(tmp_path):
     srv = liab["servers"][0]
     assert srv["primer_tokens"] == 0
     assert srv["calls_to_break_even"] == 0.0
-    assert "free (no primer)" in "\n".join(build_primer_section(liab))
+    assert srv["break_even_verdict"] == "no primer"
+    assert "no primer" in "\n".join(build_primer_section(liab))
 
 
 def test_a_routers_rate_pools_every_peer_it_fronts(tmp_path):
@@ -247,3 +248,74 @@ def test_the_table_is_suppressed_when_no_server_has_a_rate(tmp_path):
     text = "\n".join(build_primer_section(liab))
     assert "primer liability" in text
     assert "calls/turn to break even" not in text
+
+
+def test_an_unreadable_policy_is_primer_unknown_not_never(tmp_path):
+    """Review of #197: `never` and "we could not read the policy" both produced
+    `calls_to_break_even is None`, and the renderer read that single sentinel as the first.
+    A server saving 600 tok/call was condemned as `never` — the one verdict here meant to
+    stop an operator — on evidence about a missing FILE."""
+    liab = primer_liability([_scan("b", "wrapped", "b", str(tmp_path / "gone.json"))],
+                            _agg(("b", 5, 5_000, 2_000)))
+    srv = liab["servers"][0]
+    assert srv["primer_tokens"] is None                 # policy unreadable
+    assert srv["saved_per_call"] == 600.0               # ...but the rate is real
+    assert srv["break_even_verdict"] == "primer unknown"
+    text = "\n".join(build_primer_section(liab))
+    assert "primer unknown" in text and "never" not in text
+
+
+def test_the_rate_divides_by_TOKENIZED_calls_not_by_every_block(tmp_path):
+    """Review of #197: `aggregate` counts every record in `blocks` but only tokenized ones
+    in the token sums, so a ledger spanning one offline session (`count_cl100k` -> None) and
+    later online ones divided a partial numerator by a full denominator. The error is always
+    pessimistic, i.e. it argues for unwrapping a server that is paying for itself."""
+    from terse.stats import aggregate
+
+    recs = [{"server": "kb", "tool": "t", "raw_chars": 10, "out_chars": 4}
+            for _ in range(90)]                                   # recorded without tiktoken
+    recs += [{"server": "kb", "tool": "t", "raw_chars": 10, "out_chars": 4,
+              "raw_tokens": 1_000, "out_tokens": 400} for _ in range(10)]
+    agg = aggregate(recs)
+    assert agg["tools"][0]["blocks"] == 100 and agg["tools"][0]["tokenized"] == 10
+
+    liab = primer_liability([_scan("kb", "wrapped", "kb", _policy(tmp_path))], agg)
+    srv = liab["servers"][0]
+    assert srv["blocks"] == 100 and srv["tokenized_blocks"] == 10
+    assert srv["saved_per_call"] == 600.0            # 6,000 tok over the 10 MEASURED calls
+    assert srv["calls_to_break_even"] == srv["primer_tokens"] / 600.0
+    # And the contaminated denominator is visible where it changed the number.
+    assert "10/100" in "\n".join(build_primer_section(liab))
+
+
+def test_an_unrecoverable_ledger_label_is_not_the_tiktoken_accusation(tmp_path):
+    """Review of #197: `blocks is None` (no label could be derived) and `blocks == 0` (never
+    called) both rendered `no token data`, which blames the tokenizer for a missing label."""
+    liab = primer_liability([_scan("x", "wrapped", "", _policy(tmp_path))],
+                            _agg(("kb", 4, 400, 100)))
+    srv = liab["servers"][0]
+    assert srv["blocks"] is None
+    assert srv["break_even_verdict"] == "no ledger label"
+
+
+def test_a_losing_server_sorts_below_one_that_merely_breaks_even(tmp_path):
+    """Review of #197: the `or -1` sort key coerced a 0.0 rate (falsy) to -1 while leaving
+    -0.5 (truthy) alone, so the server actively EXPANDING payloads printed above the one
+    that merely broke even. The gap only opens for losses inside (-1, 0), which is why this
+    fixture uses -0.5 rather than a large loss."""
+    pol = _policy(tmp_path)
+    liab = primer_liability([_scan("losing", "wrapped", "losing", pol),
+                             _scan("flat", "wrapped", "flat", pol)],
+                            _agg(("losing", 4, 100, 102), ("flat", 4, 100, 100)))
+    rows = [ln for ln in build_primer_section(liab) if "losing" in ln or "flat" in ln]
+    assert len(rows) == 2 and "flat" in rows[0] and "losing" in rows[1]
+
+
+def test_a_sub_unit_rate_does_not_print_as_zero(tmp_path):
+    """Review of #197: `:,.0f` rendered every rate in (-1, 1) as `0`/`-0`, which sat beside
+    a finite break-even and read as a contradiction."""
+    pol = _policy(tmp_path)
+    liab = primer_liability([_scan("kb", "wrapped", "kb", pol)],
+                            _agg(("kb", 10, 1_004, 1_000)))     # 0.4 tok/call
+    assert liab["servers"][0]["saved_per_call"] == 0.4
+    assert "0.4" in "\n".join(build_primer_section(liab))

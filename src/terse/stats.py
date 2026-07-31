@@ -237,7 +237,8 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(reason, str):
             diff_reasons[reason] = diff_reasons.get(reason, 0) + 1
         key = (str(rec.get("server", "unknown")), str(rec.get("tool", "unknown")))
-        row = tools.setdefault(key, {"blocks": 0, "raw_tokens": 0, "out_tokens": 0,
+        row = tools.setdefault(key, {"blocks": 0, "tokenized": 0,
+                                     "raw_tokens": 0, "out_tokens": 0,
                                      "raw_chars": 0, "out_chars": 0, "diffs": 0})
         row["blocks"] += 1
         row["raw_chars"] += raw_c
@@ -250,6 +251,10 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             total["out_tokens"] += out_t
             row["raw_tokens"] += raw_t
             row["out_tokens"] += out_t
+            # Per-row, not just `total["untokenized"]`: the #175 break-even divides this
+            # row's savings by its call count, and `blocks` counts untokenized records the
+            # token sums skipped. Only this counter makes the two halves the same row set.
+            row["tokenized"] += 1
         else:
             total["untokenized"] += 1
     return {"total": total, "decisions": decisions, "diff_reasons": diff_reasons,
@@ -372,7 +377,7 @@ _PAYS_PRIMER = ("wrapped", "wrapped-unstashed", "router", "router-ambiguous")
 
 
 def _break_even(primer_tokens: int | None, blocks: int | None,
-                saved: int, raw: int) -> dict[str, Any]:
+                tokenized: int, saved: int) -> dict[str, Any]:
     """Per-server `saved/call` and `calls/turn to break even` (#175).
 
     The rule the positioning issue states — *wrap a server when its typical payload saves
@@ -380,26 +385,51 @@ def _break_even(primer_tokens: int | None, blocks: int | None,
     read both halves per server. #175 computed this table by hand from the ledger; this puts
     it in `terse stats`.
 
-    Every "I don't know" is its own value rather than a 0, because each accuses the install
-    of something different:
-      * `saved_per_call is None`  — no ledger rows, or rows recorded without tiktoken. Not
-        a claim about the server's compressibility at all.
-      * `calls_to_break_even is None` with a known `saved_per_call <= 0` — it never breaks
-        even at any call volume. That IS a claim, and the strongest one here.
-      * `calls_to_break_even == 0.0` — the server's policy emits no primer, so there is
-        nothing to earn back.
+    A rate is a number OR a `verdict` naming why there isn't one — never a 0 standing in for
+    a missing measurement, because each of these accuses the install of something different
+    and `None` alone cannot tell them apart (either in the table or in `--json`):
+
+      no ledger label   the config entry's downstream command matched no ledger rows, so we
+                        cannot even say whether it was called. NOT "never called".
+      never called      installed, pays a primer, banked nothing this window.
+      no token data     called, but every matching row was recorded without tiktoken. The
+                        savings in TOKENS are unknown, not zero — and dividing a cl100k
+                        primer by a char-derived rate would silently mix units.
+      primer unknown    the rate is real but the server's policy could not be read, so the
+                        threshold it must clear is unknown. Reporting this as `never` would
+                        condemn a server on evidence about a missing FILE (found in review
+                        of #197).
+      no primer         a default-deny policy emits no compressed form and therefore no
+                        primer — nothing to earn back, at any rate, positive or negative.
+
+    `tokenized` — not `blocks` — is the denominator. `aggregate` counts every record in
+    `blocks` but only tokenized ones in the token sums, so a ledger that spans an offline
+    session (`count_cl100k` returns None) and later online ones carries a full block count
+    against a partial savings sum. Dividing by `blocks` there under-reports the rate by
+    exactly the untokenized fraction, and always in the direction that argues for unwrapping
+    a server that is in fact paying for itself (found in review of #197).
     """
-    # `raw == 0` with rows present means the ledger recorded them without tiktoken: savings
-    # in TOKENS are unknown, not zero, and dividing a primer measured in cl100k tokens by a
-    # char-derived rate would silently mix units.
-    if not blocks or raw <= 0:
-        return {"saved_per_call": None, "calls_to_break_even": None}
-    per_call = saved / blocks
+    if blocks is None:
+        return {"saved_per_call": None, "calls_to_break_even": None,
+                "break_even_verdict": "no ledger label"}
+    if blocks == 0:
+        return {"saved_per_call": None, "calls_to_break_even": None,
+                "break_even_verdict": "never called"}
+    if tokenized <= 0:
+        return {"saved_per_call": None, "calls_to_break_even": None,
+                "break_even_verdict": "no token data"}
+    per_call = saved / tokenized
+    if primer_tokens is None:
+        return {"saved_per_call": per_call, "calls_to_break_even": None,
+                "break_even_verdict": "primer unknown"}
     if primer_tokens == 0:
-        return {"saved_per_call": per_call, "calls_to_break_even": 0.0}
-    if primer_tokens is None or per_call <= 0:
-        return {"saved_per_call": per_call, "calls_to_break_even": None}
-    return {"saved_per_call": per_call, "calls_to_break_even": primer_tokens / per_call}
+        return {"saved_per_call": per_call, "calls_to_break_even": 0.0,
+                "break_even_verdict": "no primer"}
+    if per_call <= 0:
+        return {"saved_per_call": per_call, "calls_to_break_even": None,
+                "break_even_verdict": "never"}
+    return {"saved_per_call": per_call, "calls_to_break_even": primer_tokens / per_call,
+            "break_even_verdict": None}
 
 
 def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> dict[str, Any]:
@@ -428,13 +458,20 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
     # by the other, and rolling them up in the same pass keeps them from being taken over
     # different row sets.
     saved_by_label: dict[str, int] = {}
-    raw_by_label: dict[str, int] = {}
+    tokenized_by_label: dict[str, int] = {}
     for trow in agg.get("tools", []):
         by_label[trow["server"]] = by_label.get(trow["server"], 0) + trow["blocks"]
         lbl = trow["server"]
         raw_t, out_t = trow.get("raw_tokens") or 0, trow.get("out_tokens") or 0
         saved_by_label[lbl] = saved_by_label.get(lbl, 0) + (raw_t - out_t)
-        raw_by_label[lbl] = raw_by_label.get(lbl, 0) + raw_t
+        # `.get("tokenized")`, defaulted: a caller may hand us a hand-rolled agg (the tests
+        # do) or one produced before this counter existed. Falling back to `blocks` there
+        # keeps the old — merely coarser — behaviour instead of reporting `no token data`
+        # for a row that plainly has token sums.
+        tok = trow.get("tokenized")
+        if tok is None:
+            tok = trow["blocks"] if raw_t or out_t else 0
+        tokenized_by_label[lbl] = tokenized_by_label.get(lbl, 0) + tok
     servers: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in scan_rows:
@@ -465,11 +502,12 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # None, not 0, when no label could be recovered: "unknown" and "never called" are
         # different claims, and only the second one accuses an install of being pure cost.
         blocks = sum(by_label.get(lbl, 0) for lbl in labels) if labels else None
+        tokenized = sum(tokenized_by_label.get(lbl, 0) for lbl in labels)
         servers.append({"server": name, "scope": row.get("scope"), "state": state,
                         "primer_tokens": tokens, "ledger_labels": labels, "blocks": blocks,
-                        **_break_even(tokens, blocks,
-                                      sum(saved_by_label.get(lbl, 0) for lbl in labels),
-                                      sum(raw_by_label.get(lbl, 0) for lbl in labels))})
+                        "tokenized_blocks": tokenized,
+                        **_break_even(tokens, blocks, tokenized,
+                                      sum(saved_by_label.get(lbl, 0) for lbl in labels))})
 
     per_turn = sum(s["primer_tokens"] or 0 for s in servers)
     unresolved = sum(1 for s in servers if s["primer_tokens"] is None)
@@ -516,21 +554,38 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _fmt_rate(per_call: float) -> str:
+    """`saved/call`, with a decimal below 10.
+
+    `:,.0f` alone renders every rate in (-1, 1) as `0` or `-0`, which sits in the same column
+    as a finite break-even like `500.00` and reads as a contradiction (found in review of
+    #197). Only an exactly-zero rate should print as zero."""
+    return f"{per_call:,.1f}" if abs(per_call) < 10 else f"{per_call:,.0f}"
+
+
 def _fmt_break_even(srv: dict[str, Any]) -> tuple[str, str]:
     """The two right-hand columns of the break-even table, as text.
 
-    Kept apart from the row loop so each of the four not-a-number cases reads as a distinct
-    sentence rather than a nested conditional: no token data, never, free, and a rate."""
-    per_call, calls = srv.get("saved_per_call"), srv.get("calls_to_break_even")
-    if per_call is None:
-        return "–", "no token data"
-    if calls is None:
-        # A known non-positive rate: no call volume earns this primer back. The one verdict
-        # in this table that should stop an operator, so it is a word, not a large number.
-        return f"{per_call:,.0f}", "never"
-    if calls == 0.0:
-        return f"{per_call:,.0f}", "free (no primer)"
-    return f"{per_call:,.0f}", f"{calls:,.2f}"
+    A verdict from `_break_even` wins over the number: it is the reason there ISN'T one."""
+    per_call, verdict = srv.get("saved_per_call"), srv.get("break_even_verdict")
+    rate = "–" if per_call is None else _fmt_rate(per_call)
+    if verdict:
+        return rate, verdict
+    return rate, f"{srv['calls_to_break_even']:,.2f}"
+
+
+def _fmt_denominator(srv: dict[str, Any]) -> str:
+    """The call count the rate was taken over.
+
+    Shown as `tokenized/blocks` when they differ, so a partially-untokenized ledger says so
+    in the column whose number it changes rather than only in the header's `N uncounted`
+    aside (found in review of #197)."""
+    blocks, tok = srv["blocks"], srv.get("tokenized_blocks")
+    if blocks is None:
+        return "–"
+    if tok is not None and tok != blocks:
+        return f"{tok:,}/{blocks:,}"
+    return f"{blocks:,}"
 
 
 def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
@@ -543,13 +598,18 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
     exactly the row that sends the operator to fix it."""
     if not any(s.get("blocks") for s in servers):
         return []
-    lines = ["", f"  {'server':<18} {'primer':>7} {'blocks':>7} {'saved/call':>11} "
+    lines = ["", f"  {'server':<18} {'primer':>7} {'calls':>13} {'saved/call':>11} "
                  f"{'calls/turn to break even':>25}"]
-    for srv in sorted(servers, key=lambda s: s.get("saved_per_call") or -1, reverse=True):
+    # Rateless rows sort last as a group rather than tying with a 0.0 rate: `or -1` treated
+    # a break-even server (0.0, falsy) as worse than one actively LOSING tokens (-0.5,
+    # truthy), inverting the two rows an operator most needs ordered (review of #197).
+    for srv in sorted(servers, reverse=True,
+                      key=lambda s: (s.get("saved_per_call") is not None,
+                                     s.get("saved_per_call") or 0.0)):
         per_call, calls = _fmt_break_even(srv)
         primer = "?" if srv["primer_tokens"] is None else f"{srv['primer_tokens']:,}"
-        blocks = "–" if srv["blocks"] is None else f"{srv['blocks']:,}"
-        lines.append(f"  {srv['server'][:18]:<18} {primer:>7} {blocks:>7} "
+        name = srv["server"] if len(srv["server"]) <= 18 else srv["server"][:17] + "…"
+        lines.append(f"  {name:<18} {primer:>7} {_fmt_denominator(srv):>13} "
                      f"{per_call:>11} {calls:>25}")
     lines.append("  wrap a server when it clears its own row: below that rate the primer "
                  "costs more than the codec banks (#175).")
