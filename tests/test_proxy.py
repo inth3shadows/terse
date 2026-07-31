@@ -2378,3 +2378,18 @@ def test_a_router_still_documents_a_form_only_one_peer_can_emit():
         default_tiers=("minify", "tabularize"), diff=False)
     assert PRIMER_DROPPED not in union_primer([(pol, "runecho")])
     assert PRIMER_DROPPED in union_primer([(pol, "runecho"), (pol, "codegraph")])
+
+
+def test_the_covering_rule_can_ITSELF_be_the_drop_rule():
+    """Ordering inside the walk: the rule's own fields are checked BEFORE its glob is
+    tested for cover, so the single most ordinary per-server policy — one rule, scoped to
+    the server, carrying the drop — is not terminated out of its own drop (review of #198).
+
+    Nothing pinned this: the pre-existing union fixture happens to use glob `*`, so
+    swapping the two checks failed only incidentally."""
+    from terse import policy as P
+    from terse.proxy import PRIMER_DROPPED, build_primer
+
+    pol = P.Policy(rules=[_drop_rule("kb.*")], default_tiers=("minify",), diff=False)
+    assert pol.has_drop("kb") is True
+    assert PRIMER_DROPPED in build_primer(pol, "kb")

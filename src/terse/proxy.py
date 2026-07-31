@@ -1702,6 +1702,12 @@ def run_proxy(
                 # `pending`, since we don't call note_request for it). This never touches
                 # `transport` at all — retrieve is a pure client<->proxy exchange, which is
                 # exactly why it needed zero HTTP-specific reimplementation for #5.
+                # Gated per-server (#168), so a server that can never drop no longer
+                # answers retrieve at all — a stray call (stale handle from a resumed
+                # transcript, or a hallucinated one) is forwarded downstream and fails
+                # there rather than returning `answer_retrieve`'s legible miss. Accepted:
+                # advertising stays in lockstep with answering (same expression as the
+                # tools/list gate above), so no client is told the tool exists here.
                 if inter.policy.has_drop(inter.server_name):
                     reply = inter.answer_retrieve(line)
                     if reply is not None:

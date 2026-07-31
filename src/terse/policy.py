@@ -265,10 +265,20 @@ class Policy:
         tool for) a lossy form only some OTHER server's rule could produce.
 
         Same asymmetry of risk as `reachable_tiers`, resolved the same way: over-inclusion
-        costs tokens, under-inclusion costs a handle nobody can retrieve. Only the
-        termination narrowing is sound, and it is the only one taken — a rule whose glob
+        costs tokens, under-inclusion costs a handle nobody can retrieve. A rule whose glob
         merely LOOKS scoped elsewhere still counts, because `_match_candidates`' second
         candidate is the tool's own unqualified name.
+
+        Termination is not the ONLY sound narrowing, just the only one taken here.
+        `server_never_lossy(server)` structurally forbids every drop for a server, so it
+        could return False on the same proof standard — left for #199 rather than folded in,
+        since it is a second gate with its own blast radius.
+
+        Inherits `_glob_covers_server`'s one unsound case (#199): a multiproxy peer whose
+        downstream tools are self-prefixed produces a peer-qualified candidate
+        (`gh__gh.api.items`) that `gh.*` does not match, so `select` can reach a drop rule
+        this walk terminated before. Not reachable under the shipped policy — its drop rule
+        precedes every covering rule — and `reachable_tiers` has the same hole today.
 
         `server=None` scans every rule, which is both the previous behaviour and the right
         answer for a caller with no server in hand (`terse fluency --drop-eval` evaluating a
