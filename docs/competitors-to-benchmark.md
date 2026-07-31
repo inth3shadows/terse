@@ -179,6 +179,22 @@ Options if a Glama-native stand-in is wanted, both imperfect:
   `v3nom/toon-fetch` (unverified). This compares terse to someone's wrapper rather
   than to TOON, so only do it knowingly.
 
+### Using the picker — type the display NAME, not the slug
+
+Glama's "Alternatives to terse" picker matches on a server's **display name**, not on
+`owner/repo`. Searching `respawn-llc/tool-filter-mcp` finds nothing; searching
+`Tool Filter MCP` finds it. Exact strings to type are the "Glama page title" column
+above, minus the `by <owner> | Glama` suffix.
+
+Anything genuinely absent from the registry goes in via the **Suggest Server** button
+at the top-right of the same panel — that is the route for headroom.
+
+**Currently listed on terse (2026-07-31):** `kweinmeister/toon-mcp` — 13★,
+Apache-2.0, *"MCP server for converting JSON ↔ TOON to reduce LLM token usage."*
+A better TOON stand-in than the `elminson/toon-mcp` (3★) this file first suggested:
+more stars, more recently maintained, and A/A/B on Glama's own license / quality /
+maintenance grades. Still a third-party wrapper, not `toon-format/toon` itself.
+
 ### Traps found while verifying
 
 - **`microsoft/LLMLingua` is a false positive.** That Glama path returns a live page
