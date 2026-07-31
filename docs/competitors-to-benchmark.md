@@ -93,7 +93,8 @@ that row rather than new rows:
 - **mcpproxy-go** (smart-mcp-proxy, ~305★) — federates many servers behind one
   `retrieve_tools` call; claims ~99% token reduction and +43% accuracy, all of it
   on tool *definitions*. Results untouched.
-- **Tool Filter MCP** (respawn-app) — exposes a filtered subset of tools.
+- **Tool Filter MCP** (`respawn-llc/tool-filter-mcp`, 36★) — exposes a filtered
+  subset of tools.
 
 All complementary and stackable with terse; none competes on the result axis.
 
@@ -105,8 +106,8 @@ one-line entry someone can promote if that changes.
 
 | Candidate | Axis | Note |
 |---|---|---|
-| entroly-context-engine | result-side (claimed) | Claims 78% average via compression + reinforcement learning. Would be Tier 1 *if the claim held on structured tool output* — the mechanism is on-axis, the evidence is a marketing line. Worth 20 minutes to install and point at the GitHub corpus; promote or park with a reason. |
-| Agent Context Optimizer MCP | result-side (claimed) | Claims "up to 85% less context waste". Same treatment as entroly — unverified, on-axis, cheap to check. |
+| entroly-context-engine (433★) | result-side (claimed) | Claims 78% average via compression + reinforcement learning. Would be Tier 1 *if the claim held on structured tool output* — the mechanism is on-axis, the evidence is a marketing line. 433★ is real adoption, more than most of this table; worth 20 minutes to install and point at the GitHub corpus, then promote or park with a reason. |
+| Agent Context Optimizer MCP (1★) | result-side (claimed) | Claims "up to 85% less context waste". Same treatment as entroly — unverified, on-axis, cheap to check. |
 | mcp-compress (ShipItAndPray) | agent-callable | Returns gzip/brotli/deflate bytes with lossless verification. Same non-readable-output problem as token-optimizer-mcp, without the caching design. Useful as a *second* data point that "compress the bytes" is a recurring wrong turn. |
 | JSON Skeleton MCP | agent-callable, lossy | Truncates string values and dedupes arrays. Comparable to terse's Tier 1 lossy `truncate` mode, not to the codec. |
 | shared-context-cache-mcp | avoidance | Cross-session cache dedup, not an encoding. |
@@ -121,61 +122,80 @@ are better.
 
 ---
 
-## Glama "alternatives" list — exact identifiers
+## Glama "alternatives" list — verified identifiers
 
-Glama's picker matches against **its own registry of MCP servers**, so an entry is
-only selectable if someone has listed that repo there. Two consequences worth
-knowing before hunting: TOON and headroom are *not primarily MCP servers* (TOON is an
-encoding; headroom is a library + proxy that also ships a server), so a Glama search
-for them surfaces **third-party wrappers, not the upstream project** — pick those
-only knowingly. LLMLingua-2 is not on Glama at all.
+**Verified 2026-07-31.** Every row below was checked twice: the repo against the
+GitHub API (`gh api repos/<owner>/<name>`), and the Glama listing by fetching
+`https://glama.ai/mcp/servers/<owner>/<name>` and reading the page `<title>`.
 
-Slugs below are `owner/name` as they appear on GitHub. Glama paths sometimes carry an
-`@` prefix (`@owner/name`) and sometimes not — both forms resolve.
+*Method note, because the obvious check is wrong:* Glama is an SPA that returns
+**HTTP 200 for a nonexistent server**, so status codes prove nothing. Its 404 shell
+is a constant **21,211 bytes** (calibrated against a deliberately fake slug) — that
+size, or a `<title>` naming a *different* project, is the real signal.
 
-### Directly on-axis — pick these first
+### Listed on Glama — selectable now
 
-| Pick | GitHub `owner/name` | Glama path | State |
-|---|---|---|---|
-| Atlassian mcp-compressor | `atlassian-labs/mcp-compressor` | `/mcp/servers/@atlassian-labs/mcp-compressor` | Tested (§4). Safe to list. |
-| token-optimizer-mcp | `ooples/token-optimizer-mcp` | search "token-optimizer-mcp" | Untested. Listed in README with an explicit not-installed caveat. |
-| mcpproxy-go | `smart-mcp-proxy/mcpproxy-go` | `/mcp/servers/smart-mcp-proxy/mcpproxy-go` | Schema-side, complementary. |
-| Tool Filter MCP | `respawn-app/tool-filter-mcp` | `/mcp/servers/@respawn-app/tool-filter-mcp` | Schema-side, complementary. |
+| Pick | GitHub `owner/name` | ★ | Glama page title |
+|---|---|--:|---|
+| mcp-compressor | `atlassian-labs/mcp-compressor` | 104 | mcp-compressor by atlassian-labs |
+| token-optimizer-mcp | `ooples/token-optimizer-mcp` | 456 | token-optimizer-mcp by ooples |
+| mcpproxy-go | `smart-mcp-proxy/mcpproxy-go` | 305 | mcpproxy-go by smart-mcp-proxy |
+| Tool Filter MCP | `respawn-llc/tool-filter-mcp` | 36 | Tool Filter MCP by respawn-llc |
+| entroly-context-engine | `juyterman1000/entroly` | 433 | entroly-context-engine by juyterman1000 |
+| Agent Context Optimizer | `AiAgentKarl/agent-context-optimizer-mcp` | 1 | Agent Context Optimizer MCP by AiAgentKarl |
+| shared-context-cache | `AiAgentKarl/shared-context-cache-mcp-server` | 1 | shared-context-cache-mcp-server by AiAgentKarl |
+| context-diamond | `RainCherb/context-diamond` | 20 | context-diamond by RainCherb |
+| mcp-compress | `ShipItAndPray/mcp-compress` | 2 | mcp-compress by ShipItAndPray |
+| JSON Skeleton MCP | `jskorlol/json-skeleton-mcp` | 10 | JSON Skeleton MCP Server by jskorlol |
+| mcp-code-context | `achatainga/mcp-code-context` | 3 | mcp-code-context by achatainga |
+| mcp-json | `pipeworx-io/mcp-json` | 0 | mcp-json by pipeworx-io |
+| JSON Filter MCP | `kehvinbehvin/json-mcp-filter` | 25 | JSON Filter MCP by kehvinbehvin |
+| mcp-json-tools | `rog0x/mcp-json-tools` | 0 | mcp-json-tools by rog0x |
+| MCP Code Execution Mode | `elusznik/mcp-server-code-execution-mode` | 338 | MCP Server Code Execution Mode by elusznik |
+| TOON MCP Server | `elminson/toon-mcp` | 3 | TOON MCP Server by elminson |
 
-### Upstream projects — not Glama-native
+Two zero-star entries sit in that table on purpose. See the screening note: terse has
+none either.
 
-| Project | GitHub `owner/name` | Note |
-|---|---|---|
-| headroom | `headroomlabs-ai/headroom` | Closest product competitor, tested (§4). Its README now says "Library, proxy, **MCP server**" — so a first-party server entry may exist; check before settling for a wrapper. **Also re-check the star figure:** one aggregator now cites 63.3k against our README's "~29–49k, unverified". |
-| TOON | `toon-format/toon` | The encoding itself, benchmarked in §1. Not an MCP server. |
-| LLMLingua-2 | `microsoft/LLMLingua` | Different axis (input prompts). Do not list as an alternative. |
+### NOT on Glama — the two biggest competitors, and why
 
-Third-party TOON MCP wrappers, if a Glama-native TOON entry is wanted — these are
-*other people's* wrappers, so listing one compares terse to a wrapper rather than to
-TOON: `elminson/toon-mcp`, `mhabedini/json-to-toon-mcp-server`,
-`HasnainAli47/toon-mcp-server`, `v3nom/toon-fetch`.
+| Project | GitHub `owner/name` | ★ | Why absent |
+|---|---|--:|---|
+| headroom | `headroomlabs-ai/headroom` | **63,510** | Confirmed 404 (21,211-byte shell). It is a library + proxy that *also* ships an MCP server, but nobody has listed the repo in the registry. |
+| TOON | `toon-format/toon` | **25,035** | Confirmed 404. TOON is an encoding, not a server — structurally unlistable. |
 
-### Tier 3 slugs — list them too
+This is the finding that matters: **the two projects terse most needs to be compared
+against cannot be picked in Glama at all.** The registry indexes MCP servers, and
+terse's real rivals aren't MCP servers. Any Glama alternatives list is therefore a
+partial picture by construction, and the README table — not Glama — stays the
+authoritative comparison.
 
-Zero stars is not a reason to omit (see the screening note). Exact identifiers:
+Options if a Glama-native stand-in is wanted, both imperfect:
 
-`juyterman1000/entroly` (entroly-context-engine) ·
-`AiAgentKarl/agent-context-optimizer-mcp` ·
-`AiAgentKarl/shared-context-cache-mcp-server` ·
-`RainCherb/context-diamond` ·
-`ShipItAndPray/mcp-compress` ·
-`jskorlol/json-skeleton-mcp` ·
-`achatainga/mcp-code-context` ·
-`pipeworx-io/mcp-json` ·
-`kehvinbehvin/json-mcp` ·
-`rog0x/mcp-json-tools`
+- Submit `headroomlabs-ai/headroom` to the registry ourselves. It does ship a server,
+  so it plausibly qualifies. Listing a competitor is a real (small) favour to them.
+- Pick a third-party TOON *wrapper* instead of TOON: `elminson/toon-mcp` (3★, listed),
+  or `mhabedini/json-to-toon-mcp-server`, `HasnainAli47/toon-mcp-server`,
+  `v3nom/toon-fetch` (unverified). This compares terse to someone's wrapper rather
+  than to TOON, so only do it knowingly.
 
-### Code Mode
+### Traps found while verifying
 
-`cloudflare/agents` carries the Code Mode SDK; it is an SDK, not a listed server.
-The Glama-native stand-in is `elusznik/mcp-server-code-execution-mode`. Pick that
-only if the listing should represent the *pattern* rather than Cloudflare's
-implementation.
+- **`microsoft/LLMLingua` is a false positive.** That Glama path returns a live page
+  titled *"DebugMCP by microsoft"* — a different repo by the same owner. LLMLingua is
+  not on Glama. (It should not be listed regardless: wrong axis, input prompts.)
+- **`cloudflare/agents` resolves, but titled *"Cloudflare MCP Server by cloudflare"***
+  — not obviously the Agents SDK that carries Code Mode. Check by eye before picking;
+  `elusznik/mcp-server-code-execution-mode` (338★) is the cleaner stand-in for the
+  *pattern*.
+- **`respawn-app/tool-filter-mcp` does not exist** — the owner is `respawn-llc`. The
+  wrong form 404s on both GitHub and Glama.
+- **`kehvinbehvin/json-mcp` redirects** to `json-mcp-filter`; use the canonical name.
 
-**Every slug on this page came from a directory listing or search result, not from a
-repo I opened.** Confirm each resolves before selecting it in Glama.
+### Star counts, corrected
+
+Verification moved four numbers that were in this repo's docs. All now reflect the
+GitHub API on 2026-07-31: headroom **63.5k** (README previously said "~29–49k,
+unverified"), TOON **25.0k** (was 24.9k), mcp-compressor **104** (was 97),
+LLMLingua **6.5k** (was 6.4k). `entroly` has **433★**, not the "no adoption" this
+file asserted in its first draft.
