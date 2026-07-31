@@ -1703,9 +1703,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="also tee raw tool results into this corpus dir for later "
                          "`terse measure`/`verify` (opt-in; never affects forwarding)")
     im.add_argument("--diff", action="store_true",
-                    help="bake an explicit `--diff` into the wrapped entry (diffing is "
-                         "already the proxy DEFAULT since #75 — only needed to override "
-                         'a policy file\'s "diff": false)')
+                    help="bake an explicit `--diff` into the wrapped entry. Diffing is OFF "
+                         "by default (#170 reverted #75's default-on: the primer costs "
+                         "every turn, the diff tier hit ~1 call in 250), so this is what "
+                         "turns it on for a server whose policy file does not")
     im.add_argument("--no-diff", action="store_true",
                     help="bake `--no-diff` into the wrapped entry: this server gets "
                          "full results every call, no cross-call diffing")

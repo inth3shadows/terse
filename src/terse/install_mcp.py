@@ -1148,6 +1148,24 @@ def _peers_policy(peers_doc: dict | None) -> str | None:
     return paths.pop() if len(paths) == 1 else None
 
 
+def _peers_diff_label(peers_doc: dict | None) -> str | None:
+    """The diff label a router should print: the one label every peer agrees on, or
+    `peers (mixed)` when they genuinely disagree. None when there are no peers.
+
+    `_peers_policy` returns None for a fleet whose peers carry DIFFERENT policy paths —
+    correct for the `policy=` column, which has one slot and must not name one peer's file
+    as the fleet's. But letting that None reach `_default_diff_label` printed the dataclass
+    default `default (off)` while every peer diffed, which is #181's divergence surviving
+    the first half of #191's fix. Two peers with different paths can still agree on `diff`,
+    and that answer is knowable: resolve PER PEER and say "mixed" only when the answers
+    differ, not when the paths do."""
+    labels = {_default_diff_label(d.get("policy"))
+              for d in ((peers_doc or {}).get("downstreams") or []) if isinstance(d, dict)}
+    if not labels:
+        return None
+    return labels.pop() if len(labels) == 1 else "peers (mixed)"
+
+
 def _scan_target(target: Target, scope: str) -> list[dict]:
     if not target.cfg.exists():
         return []
@@ -1262,8 +1280,15 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
             # the one branch #188/#190 didn't touch (#191).
             if state in ("router", "router-ambiguous"):
                 policy = policy or _peers_policy(peers_doc)
+                # Not `_default_diff_label(policy)`: a mixed-path fleet leaves `policy` None
+                # by design, and that None would print `default (off)` over peers that diff.
+                default_label = _peers_diff_label(peers_doc) or _default_diff_label(None)
+            else:
+                default_label = _default_diff_label(policy)
+            # The router's own `--diff` / `--no-diff` still wins outright — `_build_peers`
+            # applies the CLI flag over every peer's policy, so the label must too.
             diff = ("off" if "--no-diff" in args
-                    else "on" if "--diff" in args else _default_diff_label(policy))
+                    else "on" if "--diff" in args else default_label)
             stats_on = "--no-stats" not in args
         if state in ("router", "router-ambiguous"):
             # A router has no `--` downstream and no single `--policy`: what it fronts is

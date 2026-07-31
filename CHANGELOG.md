@@ -213,7 +213,12 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   diff label was computed and `_peers_policy` only ran eight lines later. Every `router` /
   `router-ambiguous` row therefore printed `default (off)` even when the shared peers policy
   set `"diff": true` — the proxy diffs, status said it does not. Same label-vs-reality
-  divergence as #181, in the one branch #188/#190 didn't reach.
+  divergence as #181, in the one branch #188/#190 didn't reach. A fleet whose peers carry
+  *different* policy paths now reports the answer they agree on (`policy (on)`) rather than
+  the dataclass default, and `peers (mixed)` only when they genuinely disagree.
+- **`install-mcp --diff` help text claimed diffing was already the default.** #170 reverted
+  #75's default-on, so the flag's own help sent operators to omit the one flag that turns
+  diffing on — the same divergence one layer up, in the text.
 - **`embedded` re-defaulted `tabularize` inside the fold, leaking an undocumented marker
   (adversarial review of #183).** Folding a string opens a new structural walk, and
   `_embed_json_string` called `compress_structure(parsed, embedded=True)` without forwarding
