@@ -1,0 +1,22 @@
+# `.git` is deliberately NOT ignored: hatch-vcs reads the version from `git describe`, so
+# excluding it breaks the build outright (see the ARG TERSE_VERSION note in Dockerfile).
+# It stays in the builder stage only — the runtime stage copies a wheel, never the tree.
+
+.venv/
+venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.egg-info/
+dist/
+build/
+
+# Captured payload corpora and benchmark artifacts: build inputs for `terse measure`,
+# not for the image.
+corpus/
+scripts/bench/corpus/
+*.jsonl

@@ -120,6 +120,23 @@ uv tool install terse-mcp   # global `terse` CLI  (or: pipx install terse-mcp)
 
 Or `pip install terse-mcp` into a virtualenv for library/embedded use.
 
+### Docker
+
+```bash
+docker build -t terse .
+docker run -i --rm terse                      # proxies the bundled demo server
+docker run -i --rm terse uvx some-mcp-server  # proxies a real one
+```
+
+`-i` is required — MCP stdio *is* stdin/stdout. Everything after the image name is the
+downstream server command; terse has no tools of its own, so with no downstream there is
+nothing to compress. The default is `examples/demo_mcp_server.py`, a stdlib-only server
+whose `demo_orders` tool returns a 40-record order book — you get back terse's compressed
+form of it (9,019 → 3,187 chars), which is the fastest way to see what the proxy does.
+
+The build reads the version from `git describe`, so build from a git clone; from a source
+tarball, pass `--build-arg TERSE_VERSION=0.3.1`.
+
 ## Quick Start (under a minute)
 
 terse sits between your MCP client and a server and shrinks the server's tool results in
@@ -208,7 +225,11 @@ scripts/
                         (fetch_corpus.sh, benchmark.py, diff_demo.py, toon_encode.mjs)
   bench/mcp_servers/    what terse does, zero-config, to popular third-party MCP servers
                         (mcp_probe.py harness + pinned repo/web fixtures; BENCHMARKS §6)
+examples/
+  demo_mcp_server.py    stdlib-only stdio MCP server; the container's default downstream,
+                        so `docker run` demonstrates the proxy without a real server
 tests/           round-trip, measurement, probe, policy, and fluency tests
+Dockerfile       terse + the demo downstream, for registries and one-command trials
 policy.example.json   selective policy encoding the measured per-tool insight
 corpus/          captured tool outputs (gitignored; may contain real data)
 ```
