@@ -60,7 +60,7 @@ def test_deref_question_targets_an_object_valued_alias():
     qs = {q.qtype: q for q in fluency.gen_questions(BLOB_PAYLOAD)}
     assert "deref" in qs
     assert isinstance(qs["deref"].expected, dict)
-    assert qs["deref"].transform == "table+dict"  # the object is dict-coded
+    assert qs["deref"].transform == "table"  # union-schema: config is a sub-table row, aliased as a whole subtree, not as individual strings
 
 
 def test_aliased_helpers_survive_unhashable_subtree_legend():
