@@ -248,7 +248,13 @@ class Policy:
         # candidate already outranks its bare fallback. Skipped when the tool already
         # carries the server as its own prefix (kb's `kb.read.*`), which would otherwise
         # synthesize a double-qualified `kb.kb.read.search` and miss the `kb.*` rule.
-        if server and not bare.startswith(f"{server}."):
+        #
+        # PREFIX_SEP tools are an exception: a peer-qualified name like `gh__gh.api.items`
+        # has bare=`gh.api.items` which DOES self-prefix, but the raw tool's `__` prevents
+        # `gh.*` from fnmatch-ing candidate[0]. Inserting `gh.gh.api.items` is NOT a
+        # double-qualify — `gh.` + `gh.api.items` is the canonical form, not a doubling of
+        # the same prefix — and it is the only candidate `gh.*` can fnmatch (#199).
+        if server and (PREFIX_SEP in tool or not bare.startswith(f"{server}.")):
             candidates.insert(0, f"{server}.{bare}")
         return candidates
 
@@ -269,10 +275,9 @@ class Policy:
         merely LOOKS scoped elsewhere still counts, because `_match_candidates`' second
         candidate is the tool's own unqualified name.
 
-        Termination is not the ONLY sound narrowing, just the only one taken here.
-        `server_never_lossy(server)` structurally forbids every drop for a server, so it
-        could return False on the same proof standard — left for #199 rather than folded in,
-        since it is a second gate with its own blast radius.
+        Two sound narrowings: glob-based termination AND `server_never_lossy(server)`, which
+        structurally forbids every drop for this server regardless of what the policy rules
+        say (#199).
 
         Inherits `_glob_covers_server`'s unsound cases (#199), which `reachable_tiers` has
         today too. Both stem from it deciding cover by STRING EQUALITY while `select` matches
@@ -296,6 +301,8 @@ class Policy:
         answer for a caller with no server in hand (`terse fluency --drop-eval` evaluating a
         policy file on its own).
         """
+        if server and self.server_never_lossy(server):
+            return False
         for r in self.rules:
             if any(isinstance(f, dict) and f.get("lossy") == "drop-to-retrieve"
                    for f in r.fields.values()):
@@ -323,9 +330,11 @@ class Policy:
         """Does this glob match EVERY tool `server` can serve? If so, `select` never falls
         through to the default for that server, and later rules are dead.
 
-        Sound because a covering glob always matches `_match_candidates[0]`
-        (`{server}.{bare}`), which `select` tries before any later rule."""
-        return glob in ("*", f"{server}.*", f"{server}*")
+        Verified by fnmatch against the qualified canonical form, not string equality:
+        a server name containing an fnmatch metacharacter (e.g. ``kb[1]``) compares equal
+        to ``kb[1].*`` but does not fnmatch it, because ``[1]`` is a character class.
+        `select` matches by fnmatch, so cover must agree with it (#199)."""
+        return fnmatch.fnmatch(f"{server}.x", glob)
 
     def reachable_tiers(self, server: str | None = None) -> set[str]:
         """Union of tiers any tool on `server` could select — an OVER-approximation.

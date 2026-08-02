@@ -2395,6 +2395,86 @@ def test_the_covering_rule_can_ITSELF_be_the_drop_rule():
     assert PRIMER_DROPPED in build_primer(pol, "kb")
 
 
+# --- _glob_covers_server fnmatch soundness (#199) ---
+
+
+def test_glob_covers_server_handles_metacharacters_in_server_name():
+    """`_glob_covers_server` decides cover by fnmatch, not string equality. A server name
+    containing an fnmatch metacharacter (`kb[1]`) compares equal to `kb[1].*` but does not
+    fnmatch it — `[1]` is a character class. Cover must not claim a match `select` won't
+    return (#199)."""
+    from terse import policy as P
+    assert not P.Policy._glob_covers_server("kb[1].*", "kb[1]")
+    assert not P.Policy._glob_covers_server("kb[1]*", "kb[1]")
+
+
+def test_glob_covers_server_accepts_the_three_normal_forms():
+    from terse import policy as P
+    assert P.Policy._glob_covers_server("*", "kb")
+    assert P.Policy._glob_covers_server("kb.*", "kb")
+    assert P.Policy._glob_covers_server("kb*", "kb")
+
+
+# --- _match_candidates PREFIX_SEP insertion (#199) ---
+
+
+def test_match_candidates_inserts_qualified_for_prefix_sep_tool():
+    """A peer-qualified tool `gh__gh.api.items` has bare=`gh.api.items` which self-prefixes
+    the server, so the old guard skipped insertion. But candidate[0]=`gh__gh.api.items` is
+    NOT fnmatch-able by `gh.*` (double-underscore vs dot). The fix inserts `gh.gh.api.items`
+    at position 0 so `gh.*` can match it (#199)."""
+    from terse import policy as P
+    candidates = P.Policy._match_candidates("gh__gh.api.items", "gh")
+    assert candidates[0] == "gh.gh.api.items"
+
+
+def test_match_candidates_still_skips_double_qualify_for_self_prefixed_no_sep():
+    """kb names its own tools `kb.read.*` — no PREFIX_SEP involved. Inserting
+    `kb.kb.read.search` would be a genuine double-qualify, and the skip for it must
+    survive the PREFIX_SEP fix."""
+    from terse import policy as P
+    candidates = P.Policy._match_candidates("kb.read.search", "kb")
+    assert candidates[0] == "kb.read.search"
+
+
+def test_match_candidates_prefix_sep_insertion_works_cross_peer():
+    """Cross-peer: tool `mcp__kb.search` on server `gh`. The old guard already inserted
+    here (bare=`kb.search` does NOT start with `gh.`). Verify the fix doesn't break it."""
+    from terse import policy as P
+    candidates = P.Policy._match_candidates("mcp__kb.search", "gh")
+    assert candidates[0] == "gh.kb.search"
+
+
+# --- has_drop + server_never_lossy (#199) ---
+
+
+def test_has_drop_returns_false_for_never_lossy_server():
+    """A server that structurally forbids every drop returns False from `has_drop`, saving
+    the 64-token dropped-field primer paragraph and the `terse.retrieve` advertisement."""
+    from terse import policy as P
+    pol = P.Policy(
+        rules=[_drop_rule("*codegraph_explore")],
+        default_tiers=("minify", "tabularize"),
+        never_lossy_servers=frozenset(["vault-mcp"]),
+        diff=False)
+    assert pol.has_drop("vault-mcp") is False
+    assert pol.has_drop("codegraph") is True   # not in the never_lossy set
+
+
+def test_has_drop_never_lossy_overrides_even_a_covering_drop_rule():
+    """`server_never_lossy` is checked BEFORE the rule walk, so even a drop rule whose glob
+    totally covers the server yields False when the server is never-lossy."""
+    from terse import policy as P
+    from terse.proxy import PRIMER_DROPPED, build_primer
+    pol = P.Policy(
+        rules=[_drop_rule("vault-mcp.*")],
+        default_tiers=("minify",),
+        never_lossy_servers=frozenset(["vault-mcp"]),
+        diff=False)
+    assert pol.has_drop("vault-mcp") is False
+    assert PRIMER_DROPPED not in build_primer(pol, "vault-mcp")
+
+
 # --- the RUNTIME half of #168: the gate has to reach tools/list, not just the primer ---
 
 
