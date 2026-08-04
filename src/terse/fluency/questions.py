@@ -112,10 +112,12 @@ def _nested_record_group(obj: Any) -> tuple[str, list[dict], list[str]] | None:
     match in source order, first parent in map order — else None.
 
     Fluency-local by design: it does NOT touch `extract_records`/`_uniform_dict_list`,
-    which the tabularizer, probe, and drop-path logic (#47) share — widening their notion
-    of a record would change what the codec folds. This only widens what the fluency
+    which the probe and drop-path logic (#47) share. This only widens what the fluency
     harness can ASK about, so `proxy --diff` gets exercised on structure-shaped output
-    (issue #71).
+    (issue #71). NOTE the original rationale — "widening their notion of a record would
+    change what the codec folds" — no longer holds: union-schema tabularize already folds
+    these non-uniform lists, so the extractor is now NARROWER than the codec rather than
+    equal to it. See `capture._find_record_list` for why that gap is deliberate for now.
 
     Preferred OVER the uniform extractor for the dict-map case: an unscoped "how many
     records" is ambiguous when the payload holds many groups, and `extract_records` would

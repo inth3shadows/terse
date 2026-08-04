@@ -25,7 +25,7 @@ from . import policy as policy_mod
 from ._secure_io import append_restricted, mkdir_restricted, write_restricted
 from .transforms import (
     MAX_DEPTH,
-    _uniform_dict_list,  # the one canonical "what tabularize folds" rule
+    _uniform_dict_list,  # NARROWER than what tabularize folds — see _find_record_list
 )
 
 # Shape buckets. classify_shape returns one of these.
@@ -52,11 +52,21 @@ _MAX_SHAPE_DEPTH = MAX_DEPTH
 def _find_record_list(obj: Any, _depth: int = 0) -> list[dict] | None:
     """The first list-of-uniform-dicts at ANY depth in obj (depth-first), else None.
 
-    This is exactly what `transforms.compress_structure` folds into a table — a list
-    of >=2 dicts that share one key set, nested arbitrarily deep — and it reuses the
-    canonical `_uniform_dict_list` rule so the shape classifier, the probe/fluency
-    record extractor, and the tabularizer can never drift on what counts as
-    record-shaped (the bug behind #4: three hand-rolled "mirror" checks disagreed)."""
+    Shares `_uniform_dict_list` with the tabularizer rather than hand-rolling a second
+    "mirror" check, which is the bug behind #4 (three such checks disagreed).
+
+    KNOWN NARROWER than what the codec folds, deliberately and for now. Union-schema
+    tabularize also folds NON-uniform record lists, so a payload where two thirds of the
+    rows carry `line` classifies as `compact-json` with no record list, while the codec
+    tabularizes it at 30.6%. Everything reading this — `classify_shape`'s buckets,
+    `policy_gen`'s auto drop-path generation, `dropeval`, `measure`'s shape coverage,
+    `fluency.questions` — therefore under-fires on exactly the traffic union-schema
+    tabularize was built for.
+
+    Not widened here on purpose: this function feeds the measurement stack, and changing
+    what counts as record-shaped moves reported coverage and generated policy at the same
+    time as the codec change, with no clean before/after. Widening it is its own change
+    with its own numbers."""
     if _depth > _MAX_SHAPE_DEPTH:
         return None
     if isinstance(obj, list):
@@ -97,7 +107,8 @@ def find_record_list_with_path(obj: Any, _prefix: tuple[str, ...] = ()) -> tuple
     Walks DICT KEYS only, not into intermediate lists: a record list nested inside another
     list has no simple expressible path, so it returns (records, None-path) is avoided —
     such a list yields (None, None). Returns the first record list reached through keys,
-    depth-first, matching `_find_record_list`'s canonical `_uniform_dict_list` rule."""
+    depth-first, using the same `_uniform_dict_list` rule as `_find_record_list` — and
+    inheriting the same known gap against what the codec folds."""
     if len(_prefix) > _MAX_SHAPE_DEPTH:
         return None, None
     if isinstance(obj, list):

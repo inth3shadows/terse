@@ -57,7 +57,17 @@ ALIAS_SIGIL = "~"
 # so it would mis-reconstruct the user's literal dict as a terse envelope. The codec
 # has no escape convention, so the only lossless move is to leave such a payload alone.
 _RESERVED_MARKERS = frozenset({TABLE_MARKER, DICT_MARKER, DIFF_MARKER, DROPPED_MARKER,
-                               JSON_STR_MARKER, ABSENT_MARKER})
+                               JSON_STR_MARKER})
+
+# Reserved as a VALUE, not a key — the one sentinel the codec writes into a cell rather
+# than into a header. It needs its own set because `has_terse_marker` screens keys, and
+# listing ABSENT_MARKER alongside the envelope keys would be a silent no-op: a payload
+# whose own string value is "__terse_absent__" never trips a key check. Left unscreened,
+# that value in a sentinel column decodes as "key absent" and the record loses the field —
+# caught by `_lossless_stage`'s verify-before-emit, but at the cost of the whole payload's
+# compression AND a `gate_fail` that `policy_gen._tool_decision` reads as "this tool's
+# shape defeats the codec", marking it passthrough permanently.
+_RESERVED_VALUES = frozenset({ABSENT_MARKER})
 
 # The serializations the `embedded` tier can reproduce EXACTLY. A string leaf is folded only
 # when one of these regenerates it byte-for-byte, so the id stored in "f" is a complete
@@ -107,7 +117,8 @@ def exceeds_depth(obj: Any, cap: int = MAX_DEPTH) -> bool:
 
 
 def has_terse_marker(obj: Any) -> bool:
-    """True if obj contains, at ANY depth, a dict key reserved for a terse envelope.
+    """True if obj contains, at ANY depth, a dict key reserved for a terse envelope or a
+    string equal to a reserved sentinel VALUE.
 
     decompress / the model's primer interpret these markers wherever they appear, so a
     collision anywhere — not just top-level — makes a payload unsafe to compress."""
@@ -117,7 +128,9 @@ def has_terse_marker(obj: Any) -> bool:
         return any(has_terse_marker(v) for v in obj.values())
     if isinstance(obj, list):
         return any(has_terse_marker(x) for x in obj)
-    return False
+    # isinstance, not `type(obj) is str`: a str subclass compares equal to the sentinel and
+    # would decode as "absent" just the same, so it has to be screened too.
+    return isinstance(obj, str) and obj in _RESERVED_VALUES
 
 
 # --------------------------------------------------------------------------- #

@@ -123,6 +123,27 @@ def test_nested_key_folding_hoists_subcols():
 
 # ── union-schema tabularize tests ──
 
+def _assert_union_roundtrip(records, expect_table=True):
+    """Round-trip a union-schema payload at BOTH layers, and say which.
+
+    `roundtrip_ok` alone is not enough here and quietly proves nothing: it goes through
+    `compress_with`, whose emit-only-if-smaller guard ships plain minify for a payload too
+    small to amortize the table header — which is every hand-written test record set. Under
+    that guard the decoder's absent-cell branches are never executed, so deleting either of
+    them leaves the whole suite green while a 30-record payload round-trips FALSE.
+
+    So assert on `compress_structure`/`decompress_structure` directly (no size guard, the
+    codec layer the absent-cell logic actually lives in), and keep the full-pipeline check
+    as the second half.
+    """
+    structural = transforms.compress_structure(records)
+    if expect_table:
+        assert isinstance(structural, dict), "payload did not tabularize — test is vacuous"
+        assert structural.get(transforms.TABLE_MARKER) == 1
+    assert transforms.decompress_structure(structural) == records
+    assert transforms.roundtrip_ok(records)
+
+
 def test_union_schema_runecho_shape_no_explicit_null():
     """Non-uniform keys with no explicit nulls: absent cells encode as None, decoder
     strips them from the reconstructed dict."""
@@ -137,7 +158,7 @@ def test_union_schema_runecho_shape_no_explicit_null():
     assert keys == ["name", "kind", "line", "hash"]
     assert absent == {2}  # "line" column at index 2 has a hole
     assert sentinel == set()  # no explicit nulls, so no sentinel
-    assert transforms.roundtrip_ok(records)
+    _assert_union_roundtrip(records)
 
 
 def test_union_schema_explicit_null_vs_absent():
@@ -160,7 +181,7 @@ def test_union_schema_explicit_null_vs_absent():
     assert table["rows"][0] == [1, None]
     assert table["rows"][1] == [2, transforms.ABSENT_MARKER]
     assert table["rows"][2] == [3, 5]
-    assert transforms.roundtrip_ok(records)
+    _assert_union_roundtrip(records)
     result = transforms.decompress(transforms.compress(records))
     assert result == records
 
@@ -177,7 +198,7 @@ def test_union_schema_mixed_absent_columns():
     assert keys == ["name", "score", "tag"]
     assert absent == {1}  # only score column has holes
     assert sentinel == {1}  # score has explicit null (row 0) AND absent (row 1)
-    assert transforms.roundtrip_ok(records)
+    _assert_union_roundtrip(records)
 
 
 def test_union_schema_sparse_rejection():
@@ -226,7 +247,7 @@ def test_union_schema_subcols_inherit_absent_info():
     assert meta_spec["cols"] == ["x", "y"]
     assert meta_spec["absent_cols"] == [0]  # x absent in row 1
     assert "sentinel_cols" not in meta_spec  # no explicit nulls
-    assert transforms.roundtrip_ok(records)
+    _assert_union_roundtrip(records)
 
 
 def test_union_schema_subtable_sentinel_roundtrip():
@@ -245,36 +266,47 @@ def test_union_schema_subtable_sentinel_roundtrip():
     assert cfg_spec["cols"] == ["host", "port"]
     assert cfg_spec["absent_cols"] == [1]
     assert cfg_spec["sentinel_cols"] == [1]
-    assert transforms.roundtrip_ok(records)
+    _assert_union_roundtrip(records)
     result = transforms.decompress(transforms.compress(records))
     assert result == records
 
 
-def test_union_schema_dict_coding_does_not_alias_sentinel():
-    """ABSENT_MARKER appears multiple times but must not be aliased away by
-    dict_encode, or the decoder won't recognize it."""
-    # 8 rows, 4 have absent cells in a sentinel column.
-    records = []
-    for i in range(8):
-        d = {"id": i}
-        if i % 2 == 0:
-            d["flag"] = None
-        records.append(d)
+def test_union_schema_dict_coding_ALIASES_the_sentinel_and_still_decodes():
+    """The sentinel IS aliased by `dict_encode`, and that is fine — assert the real
+    contract rather than a stricter one that does not hold.
 
-    ok, _, absent, sentinel = transforms._tabularizable_dict_list(records)
-    assert ok and 1 in sentinel
-    # Compress and verify each absent row reconstructed without the key.
+    An earlier version of this test claimed the sentinel "must not be aliased away".
+    It cannot hold: ABSENT_MARKER is a repeated 16-char string, exactly what dictionary
+    coding exists to fold. It is safe because `decompress` runs `dict_decode` FIRST, so
+    the structural pass never sees `~K` — only the expanded literal. The payload has to be
+    wide enough that the dict tier actually engages, or the assertion proves nothing.
+    """
+    records = [{"id": i, "note": "a repeated note string for the legend to fold"}
+               for i in range(30)]
+    for i in range(0, 30, 2):
+        records[i]["flag"] = None      # explicit null -> sentinel column
+    for i in range(1, 30, 4):
+        records[i].pop("note")         # a second, non-sentinel absent column
+
+    ok, keys, absent, sentinel = transforms._tabularizable_dict_list(records)
+    assert ok
+    assert sentinel == {keys.index("flag")}          # explicit null AND absent
+    assert absent == {keys.index("note"), keys.index("flag")}
+
     text = transforms.compress(records)
+    assert transforms.DICT_MARKER in text, "dict tier did not engage — test is vacuous"
+    assert transforms.TABLE_MARKER in text, "table did not survive the size guard"
+    # Aliased, not emitted literally — and the legend is what carries it.
+    assert transforms.ABSENT_MARKER not in text.split('"data"')[1]
+    assert transforms.ABSENT_MARKER in text.split('"data"')[0]
+
     result = transforms.decompress(text)
     assert result == records
-    # The sentinel string must not have been replaced by an alias.
-    assert transforms.ABSENT_MARKER not in text  # all replaced by alias or absent
-    # But the decoder must still see it — check that even rows have no "flag" key.
     for i, d in enumerate(result):
-        if i % 2 == 1:  # odd rows: absent
-            assert "flag" not in d
-        else:  # even rows: explicit null
-            assert d["flag"] is None
+        if i % 2 == 0:
+            assert d["flag"] is None   # explicit null preserved
+        else:
+            assert "flag" not in d     # absent stayed absent
 
 
 def test_nested_heterogeneous_sparse_rejected_by_density_gate():
@@ -282,7 +314,7 @@ def test_nested_heterogeneous_sparse_rejected_by_density_gate():
     records = [{"id": 1, "meta": {"a": 1}}, {"id": 2, "meta": {"b": 2}}]
     table = transforms.compress_structure(records)
     assert "subcols" not in table  # too sparse for union-schema tabularize
-    assert transforms.roundtrip_ok(records)
+    _assert_union_roundtrip(records, expect_table=False)
 
 
 def test_dictionary_coding_folds_repeated_values():
