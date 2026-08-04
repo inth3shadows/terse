@@ -10,6 +10,49 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Fixed
+- **README and BENCHMARKS published the pre-#202 numbers, and nothing was checking (#206).**
+  Union-schema tabularize moved the bench corpus and both documents went on claiming the old
+  figures. §1: weighted total **58.3% → 59.1%**, `gh_issues` **32.7% → 38.8%** — every other
+  row and the entire TOON column byte-identical, the whole delta being one payload's
+  tabularize tier (+0 → +4,718) where union-schema reaches a nested non-uniform array. §3
+  moved with it, because its "full re-send" column *is* that same single-shot codec:
+  `gh_issues` 32,608 → 29,611 tok (**86.4% → 85.0%**) and the total 152,837 → 149,840
+  (**73.7% → 73.2%**). Both re-measured from live `benchmark.py` / `diff_demo.py` runs rather
+  than hand-patched. §2's width sweep re-ran byte-identical, as expected for synthetic
+  uniform tables.
+
+  §3 is worth calling out separately: it was missed on the first pass at this very issue, by
+  the same mechanism — a table nobody thought to re-run because nothing failed when it went
+  stale. Review caught it.
+
+  §4's headroom comparison inherited the same stale cell, and fixing it **flipped a
+  conclusion**: at 38.8% terse now beats headroom's lossy 33.1% on `gh_issues`, so the honest
+  reading goes from "on two of four files headroom's lossy number beats terse's lossless one"
+  to one file. That paragraph now also states what it is comparing — terse at 2026-08-04
+  against headroom at 2026-07-30, since re-running headroom means standing its proxy back up.
+
+  **§6 is explicitly NOT re-measured** and now says so in a banner: it needs three pinned repo
+  clones and live `npx`/`uvx` servers, and whether #202 moves it depends on whether those
+  servers emit non-uniform record arrays — plausible, unverified, not assumed either way.
+
+  The durable half is `tests/test_published_benchmarks.py`. Both files are hand-maintained
+  prose, so "remember to update the table" was the only thing standing between a codec change
+  and a stale published claim — principle #134's argument exactly. Now asserted against live
+  output on the tracked corpus: §1's rows (raw tokens, record count, terse %) and total, §3's
+  diff table (by importing `diff_demo.py` rather than reimplementing its churn model), §4's
+  terse column (which reprints §1's numbers in a different table shape and so drifts on its
+  own), that no corpus payload is missing from a table, and that the two documents agree
+  where they overlap. Percentages are checked by `round(measured, 1) == published`, not a
+  tolerance window — at 80.3477 a `< 0.05` band left `gh_workflow_runs` 0.002pp from failing
+  while correct. The weighted total mirrors `benchmark.py`'s rule of dropping a payload that
+  fails its round-trip, so the two cannot diverge if one ever goes lossy.
+
+  Scoped to what runs keylessly in CI: §1's TOON column comes from a pinned npm encoder there
+  is no node for and cannot move without a visible dependency bump; §4's headroom columns need
+  a live proxy; §6 needs three pinned repo clones and live servers. Those are dated in the
+  documents instead. Verified by mutation — 10 hand-built regressions (stale cell in each
+  section, wrong raw count, wrong record count, deleted row, 0.1pp drift, one document updated
+  without the other) and all 10 fail the suite.
 - **Three `policy.py` soundness gaps the #198 review parked as one issue (#199).**
   1. `_glob_covers_server` decided cover by string equality against three literal forms
      while `select` matches by `fnmatch`, so a server literally named `kb[1]` counted

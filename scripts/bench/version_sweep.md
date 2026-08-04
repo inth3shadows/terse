@@ -66,9 +66,11 @@ traffic, previously compressing at 0.6%). That is the point of keeping this swee
 says what a change does *not* regress, on a corpus that has not moved in twenty
 releases.
 
-**`README.md` and `BENCHMARKS.md` still publish the pre-#202 figures** (58.3% weighted,
-`gh_issues` 32.7%). Tracked in #206 — refresh them from one `terse measure` run rather
-than by hand-patching the two headline cells.
+`README.md` and `BENCHMARKS.md` published the pre-#202 figures (58.3% weighted,
+`gh_issues` 32.7%) until #206 refreshed them from a live `benchmark.py` run — and §3's
+"full re-send" column, which is this same codec, with them. `tests/test_published_
+benchmarks.py` now asserts those tables against the codec's live output, so the next
+codec change fails the suite instead of quietly outdating the docs.
 
 ## Provenance
 

@@ -1,10 +1,11 @@
 # terse — Benchmarks
 
-**Last updated: 2026-07-30.** Every figure is dated by section — §1–4 were produced
-2026-07-17 and reproduced byte-identical on 2026-07-30, §5 is a live number pulled fresh
-each time, §6 was re-measured in full on 2026-07-30 (10 servers, up from 6) — and nothing
-here is hand-typed or estimated. If you re-run and get different numbers, the code
-changed; open an issue.
+**Last updated: 2026-08-04.** Every figure is dated by section — §1, §3, and the terse
+column of §4 were re-measured 2026-08-04 on the merge of #202; §2 was produced 2026-07-17
+and re-runs byte-identical today; §5 is a live number pulled fresh each time; **§6
+predates #202 and has not been re-measured** — see the note there. Nothing here is
+hand-typed or estimated. If you re-run and get different numbers, the code changed; open
+an issue.
 
 Two different kinds of evidence live here, and the difference matters:
 
@@ -46,20 +47,29 @@ cat scripts/bench/mcp_servers/README.md  # §6  popular third-party MCP servers 
 The corpus is real GitHub API output (`scripts/bench/corpus/`) — the nested, record-shaped
 tool traffic terse targets. `cl100k` tokens, all lossless.
 
+Re-measured **2026-08-04** on the merge of #202, straight from
+`uv run scripts/bench/benchmark.py` — both columns from the same run, no hand-patched
+cells. Union-schema tabularize moved exactly one payload here and the total: `gh_issues`
+32.7% → 38.8%, weighted 58.3% → 59.1%. Every other row, and the whole TOON column, is
+byte-identical to the previous measurement. §3 moved with it — its "full re-send"
+column *is* this codec — and was re-measured the same day. See
+[`scripts/bench/version_sweep.md`](scripts/bench/version_sweep.md) for why 58.3% had
+stood unchanged from `v0.5.1` to `v0.17.0`.
+
 | payload | records | raw tok | **terse** | TOON |
 |---|--:|--:|--:|--:|
 | gh_pulls | 30 | 151,165 | **76.1%** | −8.4% |
 | gh_workflow_runs | 20 | 76,032 | **80.3%** | −7.5% |
-| gh_issues | 30 | 48,032 | **32.7%** | −8.0% |
+| gh_issues | 30 | 48,032 | **38.8%** | −8.0% |
 | gh_commits | 30 | 69,652 | **26.5%** | −4.5% |
 | gh_dir_listing | 24 | 6,736 | **31.4%** | −7.7% |
 | gh_rate_limit | 1 obj | 357 | **13.4%** | −36.7% |
-| gh_repo_single | 1 obj | 1,652 | 0.0% | −4.4% |
+| gh_repo_single | 1 obj | 1,652 | **0.0%** | −4.4% |
 | gh_commits_flat | 30 | 10,886 | **2.4%** | 1.7% |
 | gh_labels | 9 | 632 | 15.2% | **19.0%** |
-| **weighted total** | | **365,144** | **58.3%** | **−7.1%** |
+| **weighted total** | | **365,144** | **59.1%** | **−7.1%** |
 
-**Plain reading:** on real nested records terse cuts tokens **58%**; TOON *regresses* to −7%
+**Plain reading:** on real nested records terse cuts tokens **59%**; TOON *regresses* to −7%
 (worse than raw) because it adds a key-path per nesting level, while terse folds the repeated
 subtrees and long repeated strings (e.g. `gh_pulls` = 60 copies of the same repo object
 collapsed to one legend entry → 76%). TOON wins only on `gh_labels` — a flat, short-valued
@@ -110,9 +120,9 @@ single-shot codec all pay the full column every call. Modeling one repeat call p
 | repeated call | full re-send | diff | smaller by |
 |---|--:|--:|--:|
 | gh_commits_flat | 10,681 | 812 | **92.4%** |
-| gh_issues | 32,608 | 4,448 | **86.4%** |
+| gh_issues | 29,611 | 4,448 | **85.0%** |
 | gh_pulls | 37,776 | 15,292 | **59.5%** |
-| **weighted total** | 152,837 | 40,138 | **73.7%** |
+| **weighted total** | 149,840 | 40,138 | **73.2%** |
 
 **Honest caveat (read this):** these are *modeled* repeat-call savings. How *often* the
 pattern occurs in a real agent loop is workload-dependent and is being measured directly (the
@@ -142,9 +152,9 @@ measured what it actually forwarded upstream, cl100k, same method as §1:
 | file | raw tok | **terse** (lossless) | headroom, CCR default (lossy, recoverable) | headroom `--lossless` |
 |---|--:|--:|--:|--:|
 | gh_pulls | 151,165 | **76.1%** | 42.5% | 0.0% |
-| gh_issues | 48,032 | 32.7% | **33.1%** | 0.0% |
+| gh_issues | 48,032 | **38.8%** | 33.1% | 0.0% |
 | gh_commits | 69,652 | 26.5% | **46.6%** | 0.0% |
-| gh_rate_limit | 357 | 13.4% | 0.0% | 0.0% |
+| gh_rate_limit | 357 | **13.4%** | 0.0% | 0.0% |
 
 The only headroom mechanism that moved anything on this corpus is **CCR row-dropping**:
 rows are deleted and replaced with a `<<ccr:HASH N_rows_offloaded>>` stub the model must
@@ -155,12 +165,18 @@ healthy in this environment, the likely reason. Not tested: real Anthropic crede
 different conversation shape might wake up the lossless path — flagged as an open gap, not
 assumed either way.
 
-**Read the table honestly, not as a sweep:** on two of four files (gh_issues, gh_commits)
-headroom's *lossy* number is larger than terse's *lossless* one — that is a real result, not
-spun away. On the biggest file (gh_pulls) and the smallest (gh_rate_limit), terse's
-unconditionally-lossless number wins outright even against headroom's lossy mode. The
-honest framing is the trade, not a single winner: headroom can go further by deleting data
-recoverably (or not, with `--no-ccr`); terse never deletes anything.
+**Read the table honestly, not as a sweep:** on `gh_commits`, headroom's *lossy* number is
+larger than terse's *lossless* one — that is a real result, not spun away. On the other
+three files terse's unconditionally-lossless number wins outright even against headroom's
+lossy mode. The honest framing is the trade, not a single winner: headroom can go further
+by deleting data recoverably (or not, with `--no-ccr`); terse never deletes anything.
+
+The terse column here was **re-measured 2026-08-04**; headroom's was not. `gh_issues` moved
+32.7% → 38.8% under union-schema tabularize (#202) and so crossed above headroom's 33.1%,
+which is why this paragraph now names one file where it used to name two. The comparison is
+therefore terse-at-2026-08-04 against headroom-at-2026-07-30 — fine for the direction of the
+trade, not for a tight margin. Re-running headroom means standing its proxy back up (see the
+method note above).
 
 | Tool | What it is (verified) | Comparable? |
 |---|---|---|
@@ -242,6 +258,13 @@ claim, and a better pitch besides.
 ---
 
 ## §6 — Popular third-party MCP servers (measured 2026-07-30)
+
+> **Predates #202 and has not been re-measured.** Union-schema tabularize widened what
+> the codec folds, and it moved §1 by +0.8pp. Whether it moves anything here depends on
+> whether these servers emit non-uniform record arrays — plausible, unverified, and not
+> assumed either way. Re-running is a live exercise (three pinned repo clones plus real
+> `npx`/`uvx` servers), tracked separately. §1 and §3 above were re-measured 2026-08-04;
+> §4's terse column too, though its headroom column is still 2026-07-30.
 
 §5 is one person's traffic. This section is the other half: what terse does **automatically,
 zero-config** to the output of widely-used, **credential-free** MCP servers that anyone can
