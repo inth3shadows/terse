@@ -133,7 +133,11 @@ def test_nested_group_uses_intersection_columns_only():
     assert grp is not None
     label, records, cols = grp
     assert label == 'files["a/first.py"]'
-    assert cols == ["kind", "name"]  # sorted intersection; line/hash excluded (non-uniform)
+    # first-seen intersection; line/hash excluded (absent from the import symbol). Order is
+    # first-seen rather than sorted so that for a UNIFORM list the result is exactly
+    # `records[0].keys()` — which is what keeps #204's widening from re-picking id/target
+    # columns on every payload that came before it.
+    assert cols == ["name", "kind"]
     assert len(records) == 3
 
 
@@ -169,7 +173,10 @@ def test_nested_aggregate_appears_when_a_numeric_col_is_shared():
         {"name": "b", "kind": "fn", "line": 9},          # no hash -> still non-uniform
         {"name": "c", "kind": "var", "line": 1, "hash": "h2"}]}}}
     from terse.capture import extract_records
-    assert extract_records(obj) is None
+    # Since #204 the extractor DOES reach this list — it is what the tabularizer folds.
+    # `gen_questions` still prefers the nested path, so the questions are unchanged; the
+    # point of asserting it here is that the two no longer disagree about the shape.
+    assert extract_records(obj) == obj["files"]["f"]["symbols"]
     qs = {q.qtype: q for q in fluency.gen_questions(obj)}
     assert qs["aggregate"].expected == 9
 

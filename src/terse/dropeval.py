@@ -300,7 +300,10 @@ def _questions_and_staging(
     if applied.skipped or not staging:
         return [], None, None  # every candidate field was under the size floor, or the gate failed
 
-    cols = list(records[0].keys())
+    # Intersection, not `records[0].keys()`: #204 widened `find_record_list_with_path` to
+    # whatever the tabularizer folds, so a record may lack a key the first one has, and the
+    # pickers index every record by these columns.
+    cols = fluency._intersection_cols(records)
     idcol = fluency._pick_id_col(records, cols)
     if idcol is None:
         return [], None, None  # can't address a specific record without a unique scalar id column

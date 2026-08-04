@@ -95,13 +95,23 @@ def _pick_numeric_col(records: list[dict], cols: list[str], exclude: str | None 
 
 
 def _intersection_cols(records: list[dict]) -> list[str]:
-    """Keys present in EVERY record, sorted for determinism. For a non-uniform record
-    list (e.g. structure symbols, where only some carry line/hash) these are the only
-    columns safe to index across all records."""
-    common = set(records[0].keys())
+    """Keys present in EVERY record, in first-seen order. For a non-uniform record list
+    (e.g. structure symbols, where only some carry line/hash) these are the only columns
+    safe to index across all records.
+
+    First-seen rather than sorted, and that is load-bearing in two ways. The pickers below
+    take the FIRST column satisfying their predicate, so the order decides which column
+    becomes the id and which the target — sorting would silently re-pick those on payloads
+    whose questions must not move. And for a uniform record list this returns exactly
+    `records[0].keys()`, so widening `capture.extract_records` to non-uniform lists (#204)
+    changes nothing for the uniform ones that came before it.
+    """
+    if not records:
+        return []
+    common = set(records[0])
     for r in records[1:]:
-        common &= set(r.keys())
-    return sorted(common)
+        common &= r.keys()
+    return [k for k in records[0] if k in common]
 
 
 def _nested_record_group(obj: Any) -> tuple[str, list[dict], list[str]] | None:
@@ -259,7 +269,12 @@ def gen_questions(obj: Any) -> list[Question]:
     records = extract_records(obj)
     if not records:
         return _flat_record_questions(obj)
-    cols = list(records[0].keys())
+    cols = _intersection_cols(records)
+    if not cols:
+        # Non-uniform records with nothing in common: every column-scoped question below
+        # would address a field some record lacks. The count question alone is not worth a
+        # harness run, so fall through to the flat-record path.
+        return _flat_record_questions(obj)
     n = len(records)
     aliased = _aliased_strings(obj)
     canon = _aliased_canon(obj)
