@@ -2399,10 +2399,10 @@ def test_the_covering_rule_can_ITSELF_be_the_drop_rule():
 
 
 def test_glob_covers_server_handles_metacharacters_in_server_name():
-    """`_glob_covers_server` decides cover by fnmatch, not string equality. A server name
-    containing an fnmatch metacharacter (`kb[1]`) compares equal to `kb[1].*` but does not
-    fnmatch it — `[1]` is a character class. Cover must not claim a match `select` won't
-    return (#199)."""
+    """`_glob_covers_server` must agree with `select`, which matches by fnmatch. A server
+    name containing an fnmatch metacharacter (`kb[1]`) compares EQUAL to `kb[1].*` but does
+    not fnmatch it — `[1]` is a character class, so that rule matches none of the server's
+    tools. Cover must not claim a match `select` won't return (#199)."""
     from terse import policy as P
     assert not P.Policy._glob_covers_server("kb[1].*", "kb[1]")
     assert not P.Policy._glob_covers_server("kb[1]*", "kb[1]")
@@ -2415,34 +2415,84 @@ def test_glob_covers_server_accepts_the_three_normal_forms():
     assert P.Policy._glob_covers_server("kb*", "kb")
 
 
+def test_glob_covers_server_refuses_a_glob_that_only_matches_some_tools():
+    """The other failure direction, and the one a single representative probe walks into:
+    `fnmatch(f"{server}.x", glob)` calls `kb.?` and `kb.*x` covering, because both match
+    the literal probe `kb.x` — while matching no real tool. Cover means "matches
+    `{server}.` + ANY bare name", so a glob that constrains what follows the prefix, or
+    anchors its end, covers nothing (#199)."""
+    from terse import policy as P
+    assert not P.Policy._glob_covers_server("kb.?", "kb")       # one char only
+    assert not P.Policy._glob_covers_server("kb.*x", "kb")      # must end in x
+    assert not P.Policy._glob_covers_server("kb.read.*", "kb")  # a real sub-namespace rule
+    assert not P.Policy._glob_covers_server("kb.x", "kb")       # exact-name rule
+    assert not P.Policy._glob_covers_server("gh.*", "kb")       # another server entirely
+
+
+def test_a_partial_glob_does_not_hide_a_later_drop_rule():
+    """The consequence of the case above, end to end. A false cover terminates `has_drop`'s
+    walk early, so the proxy reports no-drop for a server that still reaches the drop rule:
+    the dropped-field paragraph and the `terse.retrieve` tool both go missing while
+    `apply` keeps minting handles, leaving the model an unretrievable
+    `__terse_dropped__`. That is #168's failure re-entered through the cover check."""
+    from terse import policy as P
+    from terse.proxy import PRIMER_DROPPED, build_primer
+    pol = P.Policy(
+        rules=[P.Rule(tool_glob="kb.?", tiers=("minify",)), _drop_rule("*")],
+        default_tiers=("minify",),
+        diff=False)
+    # `kb.?` matches no real kb tool, so `select` falls through to the drop rule.
+    assert "$text.code_blocks" in pol.select("kb.read.search", "kb").fields
+    assert pol.has_drop("kb") is True
+    assert PRIMER_DROPPED in build_primer(pol, "kb")
+
+
 # --- _match_candidates PREFIX_SEP insertion (#199) ---
 
 
-def test_match_candidates_inserts_qualified_for_prefix_sep_tool():
-    """A peer-qualified tool `gh__gh.api.items` has bare=`gh.api.items` which self-prefixes
-    the server, so the old guard skipped insertion. But candidate[0]=`gh__gh.api.items` is
-    NOT fnmatch-able by `gh.*` (double-underscore vs dot). The fix inserts `gh.gh.api.items`
-    at position 0 so `gh.*` can match it (#199)."""
+def test_a_server_scoped_rule_already_matches_a_self_prefixed_peer_qualified_tool():
+    """#199 proposed synthesizing `gh.gh.api.items` for peer-qualified tools, on the theory
+    that `gh.*` had nothing to match. It does: `select` also tries the BARE candidate, and
+    `gh.api.items` fnmatches `gh.*`. Pinned because the proposed fix was reverted — if this
+    ever fails, the premise becomes real and the insertion is worth revisiting."""
     from terse import policy as P
-    candidates = P.Policy._match_candidates("gh__gh.api.items", "gh")
-    assert candidates[0] == "gh.gh.api.items"
+    pol = P.Policy(rules=[P.Rule(tool_glob="gh.*", tiers=("minify", "tabularize"))],
+                   default_tiers=(), diff=False)
+    for tool in ("gh__gh.api.items", "gh__gh.rate_limit", "mcp__gh.search"):
+        assert pol.select(tool, "gh").tool_glob == "gh.*", tool
 
 
-def test_match_candidates_still_skips_double_qualify_for_self_prefixed_no_sep():
-    """kb names its own tools `kb.read.*` — no PREFIX_SEP involved. Inserting
-    `kb.kb.read.search` would be a genuine double-qualify, and the skip for it must
-    survive the PREFIX_SEP fix."""
+def test_match_candidates_never_double_qualifies_a_self_prefixed_tool():
+    """No insertion when the bare name already carries the server, with or without a
+    PREFIX_SEP: `kb.kb.read.search` / `gh.gh.api.items` are not names any rule is written
+    against, and offering them FIRST hands the match to a broader rule (see below)."""
     from terse import policy as P
-    candidates = P.Policy._match_candidates("kb.read.search", "kb")
-    assert candidates[0] == "kb.read.search"
+    assert P.Policy._match_candidates("kb.read.search", "kb")[0] == "kb.read.search"
+    assert P.Policy._match_candidates("gh__gh.api.items", "gh")[0] == "gh__gh.api.items"
 
 
-def test_match_candidates_prefix_sep_insertion_works_cross_peer():
-    """Cross-peer: tool `mcp__kb.search` on server `gh`. The old guard already inserted
-    here (bare=`kb.search` does NOT start with `gh.`). Verify the fix doesn't break it."""
+def test_match_candidates_still_qualifies_when_the_bare_name_is_cross_peer():
+    """The insertion that IS load-bearing: tool `mcp__kb.search` on server `gh`, where
+    bare=`kb.search` does not start with `gh.` and a `gh.*` rule would otherwise miss."""
     from terse import policy as P
-    candidates = P.Policy._match_candidates("mcp__kb.search", "gh")
-    assert candidates[0] == "gh.kb.search"
+    assert P.Policy._match_candidates("mcp__kb.search", "gh")[0] == "gh.kb.search"
+
+
+def test_a_broad_rule_must_not_outrank_a_specific_passthrough_rule():
+    """Why the #199 insertion was reverted. Candidate order is major over rule order, so a
+    synthesized `gh.gh.rate_limit` lets `gh.*` win one candidate BEFORE the specific
+    `*.rate_limit` rule can match the bare name — turning an operator's explicit `tiers: []`
+    passthrough into a lossy rule, and a `capture: false` exclusion into a capturable one."""
+    from terse import policy as P
+    passthrough = P.Rule(tool_glob="*.rate_limit", tiers=(), capture=False)
+    broad = P.Rule(tool_glob="gh.*", tiers=("minify", "tabularize"),
+                   fields={"result[].body": {"lossy": "truncate"}})
+    pol = P.Policy(rules=[passthrough, broad], default_tiers=(), diff=False)
+    chosen = pol.select("gh__gh.rate_limit", "gh")
+    assert chosen.tool_glob == "*.rate_limit"
+    assert chosen.tiers == ()          # still lossless
+    assert chosen.capture is False     # still off-disk
+    assert not chosen.fields           # no truncation inherited from the broad rule
 
 
 # --- has_drop + server_never_lossy (#199) ---

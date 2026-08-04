@@ -230,8 +230,14 @@ class Policy:
            rule authored against a downstream tool's own name still matches a
            multiproxy-captured corpus entry for it.
 
-        Every step is additive: a policy that already matched keeps matching the same
-        rule, since the pre-existing candidates are still tried in their original order.
+        Candidate order is MAJOR over rule order: candidate 1 is tried against EVERY rule
+        before candidate 2 is tried against any. So adding a candidate ahead of another does
+        not merely widen what matches — it can hand the match to a different rule, and a
+        broad rule reached one candidate earlier outranks a specific rule that would have
+        matched one candidate later. That is why candidate 1 is synthesized only when the
+        bare name cannot already carry a server-scoped rule; see `_match_candidates`, where
+        #199 proposed relaxing that guard and the relaxation was measured to be both
+        unnecessary and unsafe.
         """
         for candidate in self._match_candidates(tool, server):
             for rule in self.rules:
@@ -249,12 +255,24 @@ class Policy:
         # carries the server as its own prefix (kb's `kb.read.*`), which would otherwise
         # synthesize a double-qualified `kb.kb.read.search` and miss the `kb.*` rule.
         #
-        # PREFIX_SEP tools are an exception: a peer-qualified name like `gh__gh.api.items`
-        # has bare=`gh.api.items` which DOES self-prefix, but the raw tool's `__` prevents
-        # `gh.*` from fnmatch-ing candidate[0]. Inserting `gh.gh.api.items` is NOT a
-        # double-qualify — `gh.` + `gh.api.items` is the canonical form, not a doubling of
-        # the same prefix — and it is the only candidate `gh.*` can fnmatch (#199).
-        if server and (PREFIX_SEP in tool or not bare.startswith(f"{server}.")):
+        # #199 proposed extending the insertion to every PREFIX_SEP tool, on the theory that
+        # a peer-qualified `gh__gh.api.items` self-prefixes `gh.` and so was skipped, while
+        # candidate[0] `gh__gh.api.items` cannot be fnmatch-ed by `gh.*` — leaving the
+        # server-scoped rule with nothing to match. NOT DONE, because the premise is false:
+        # `select` also tries the BARE candidate `gh.api.items`, which `gh.*` matches, so the
+        # rule was never missing. Verified across `gh__gh.api.items`, `gh__gh.rate_limit`,
+        # `mcp__gh.search` and friends — `gh.*` matches all of them on the unmodified code.
+        #
+        # And the insertion is not free. Inserting at position 0 makes `gh.*` win one
+        # candidate BEFORE a specific rule can match the bare name, which on terse's own
+        # `policy.example.json` turns `{"tool": "*.rate_limit", "tiers": []}` — an explicit
+        # passthrough — into `gh.*` with `result[].body` truncation (a 2,125-byte lossless
+        # payload became 626 bytes with the body cut), and turns a
+        # `{"tiers": [], "capture": false}` rule (USAGE.md's documented way to keep a
+        # credential tool's output off disk) into a rule with `capture: true`. An operator's
+        # exclusion silently becoming lossy — and capturable — is a far worse failure than
+        # the one #199 set out to fix, which does not exist.
+        if server and not bare.startswith(f"{server}."):
             candidates.insert(0, f"{server}.{bare}")
         return candidates
 
@@ -279,23 +297,22 @@ class Policy:
         structurally forbids every drop for this server regardless of what the policy rules
         say (#199).
 
-        Inherits `_glob_covers_server`'s unsound cases (#199), which `reachable_tiers` has
-        today too. Both stem from it deciding cover by STRING EQUALITY while `select` matches
-        by fnmatch over `_match_candidates`:
+        `_glob_covers_server`'s two documented unsound cases are both closed as of #199 and
+        this docstring no longer inherits them. The metacharacter case — `kb[1]` vs `kb[1].*`,
+        equal as strings but not as fnmatch patterns — is gone because cover is now proved
+        structurally rather than by string equality. The `PREFIX_SEP` case — the claim that
+        `gh__gh.api.items` or `mcp__kb.search` lets `select` reach a drop rule this walk
+        terminated before — was never real: `select` tries the BARE candidate too, so the
+        covering rule still matches and the termination was correct. Confirmed by
+        differential enumeration against the pre-#199 code, and by a 200k-policy fuzz that
+        found no server where `has_drop` is False while some tool selects a drop rule.
 
-          * any tool name carrying `PREFIX_SEP` whose bare part self-prefixes the server —
-            multiproxy's `gh__gh.api.items` is the common shape, but a single proxy given
-            `--server-name kb` and a downstream tool `mcp__kb.search` hits it identically.
-            Candidate[0] keeps the `__`, which `kb.*` does not match, so `select` can reach a
-            drop rule this walk terminated before.
-          * a server name containing an fnmatch metacharacter (`kb[1]`), where `kb[1].*`
-            compares equal but does not fnmatch.
-
-        Neither is reachable under the shipped or example policy — but NOT because the drop
-        rule comes first (it does not: index 4 of 8 live, index 2 of the example, in both
-        cases after covering rules). It is that no drop rule's glob matches a `{peer}__*`
-        candidate for any server whose walk terminates early. Validating a future policy edit
-        against rule ORDER alone would conclude "safe" incorrectly.
+        What has NOT changed is the shape of the risk: over-inclusion costs tokens,
+        under-inclusion costs a handle nobody can retrieve, so any future narrowing needs the
+        same standard of proof. In particular, "the drop rule comes first" is not that proof —
+        it does not come first: index 4 of 8 live, index 2 of the example, both after covering
+        rules. Validating a policy edit against rule ORDER alone would conclude "safe"
+        incorrectly.
 
         `server=None` scans every rule, which is both the previous behaviour and the right
         answer for a caller with no server in hand (`terse fluency --drop-eval` evaluating a
@@ -330,11 +347,31 @@ class Policy:
         """Does this glob match EVERY tool `server` can serve? If so, `select` never falls
         through to the default for that server, and later rules are dead.
 
-        Verified by fnmatch against the qualified canonical form, not string equality:
-        a server name containing an fnmatch metacharacter (e.g. ``kb[1]``) compares equal
-        to ``kb[1].*`` but does not fnmatch it, because ``[1]`` is a character class.
-        `select` matches by fnmatch, so cover must agree with it (#199)."""
-        return fnmatch.fnmatch(f"{server}.x", glob)
+        Cover means the glob matches ``{server}.`` followed by ANY bare tool name, since
+        that is the shape of `_match_candidates`' first candidate and `select` tries it
+        before any later rule. Proved structurally, not by probing a representative name:
+        a single probe such as `fnmatch(f"{server}.x", glob)` is unsound in the OTHER
+        direction — ``kb.?`` and ``kb.*x`` both match ``kb.x`` while matching no real tool,
+        so cover would claim later rules are dead when `select` still reaches them, #199.
+
+        So: the whole-world glob, or a literal prefix followed by ``*`` where the prefix is
+        no longer than ``{server}.``. Everything else is refused. That refusal is the safe
+        direction — a missed cover only means the walk continues and the caller
+        over-approximates, which is `reachable_tiers`' documented contract and, for
+        `has_drop`, the direction that keeps a primer paragraph rather than dropping one.
+
+        Metacharacters are handled by the same rule rather than a special case: a server
+        literally named ``kb[1]`` is NOT covered by ``kb[1].*``, because `select` fnmatches
+        ``[1]`` as a character class and never matches that server's tools at all. String
+        equality answered True here, which is the bug this replaces."""
+        if glob == "*":
+            return True
+        if not glob.endswith("*"):
+            return False
+        prefix = glob[:-1]
+        if any(ch in prefix for ch in "*?["):
+            return False
+        return f"{server}.".startswith(prefix)
 
     def reachable_tiers(self, server: str | None = None) -> set[str]:
         """Union of tiers any tool on `server` could select — an OVER-approximation.
