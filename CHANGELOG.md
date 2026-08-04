@@ -9,6 +9,22 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Added
+- **A fourth fluency arm, `inline_ok`, measures #168's "lazy primer" proposal before it
+  ships.** `run_payload`/`run_fluency` now also ask each question with the format primer
+  riding inline in the user message (no system prompt at all) — the exact delivery mode a
+  primer attached to the first compressed result would use, instead of `initialize`'s
+  `instructions` field. `build_fluency_report` renders it as a `terse+inline` column,
+  falling back to `n/a` (never `0%`) for older result files that predate the arm.
+
+  Measured against two live models over the synthetic stress corpus
+  (`scripts/gen_stress_corpus.py`): `glm-5.2` scored raw 100% / terse 96% / terse+primer
+  100% / **terse+inline 100%**; `deepseek-v4-flash` scored raw 100% / terse 92% /
+  terse+primer 96% / **terse+inline 100%** — inline delivery matched or beat the
+  system-level primer on both. Answers the open question #168 left explicitly blocking a
+  lazy-primer implementation: comprehension does not depend on the primer riding in the
+  system slot.
+
 ### Fixed
 - **The shape classifier was narrower than the codec, so the measurement stack under-fired
   on union-schema traffic (#204).** `capture._find_record_list` still used the strict
