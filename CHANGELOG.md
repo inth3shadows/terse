@@ -10,6 +10,31 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Fixed
+- **README and BENCHMARKS published the pre-#202 numbers, and nothing was checking (#206).**
+  Union-schema tabularize moved the bench corpus and both §1 tables went on claiming the old
+  figures: weighted total **58.3% → 59.1%**, `gh_issues` **32.7% → 38.8%**. Every other row,
+  and the entire TOON column, is byte-identical — the whole delta is one payload's tabularize
+  tier (+0 → +4,718) where union-schema reaches a nested non-uniform array. Re-measured from
+  one `scripts/bench/benchmark.py` run rather than hand-patched, and §2's width sweep
+  re-ran byte-identical, as expected for synthetic uniform tables.
+
+  §4's headroom comparison inherited the same stale cell, and fixing it **flipped a
+  conclusion**: at 38.8% terse now beats headroom's lossy 33.1% on `gh_issues`, so the honest
+  reading goes from "on two of four files headroom's lossy number beats terse's lossless one"
+  to one file. That paragraph now also states what it is comparing — terse at 2026-08-04
+  against headroom at 2026-07-30, since re-running headroom means standing its proxy back up.
+
+  **§6 is explicitly NOT re-measured** and now says so in a banner: it needs three pinned repo
+  clones and live `npx`/`uvx` servers, and whether #202 moves it depends on whether those
+  servers emit non-uniform record arrays — plausible, unverified, not assumed either way.
+
+  The durable half is `tests/test_published_benchmarks.py`: the published tables are now
+  asserted against the codec's live output on the tracked corpus, per-row, per-total, and
+  README-vs-BENCHMARKS for agreement. Both files are hand-maintained prose, so "remember to
+  update the table" was the only thing standing between a codec change and a stale published
+  claim — principle #134's argument exactly. Scoped to the terse column: the TOON column
+  comes from a pinned npm encoder CI has no node for, and it cannot move without a visible
+  dependency bump. Verified by mutation — restoring either stale figure fails the suite.
 - **Three `policy.py` soundness gaps the #198 review parked as one issue (#199).**
   1. `_glob_covers_server` decided cover by string equality against three literal forms
      while `select` matches by `fnmatch`, so a server literally named `kb[1]` counted

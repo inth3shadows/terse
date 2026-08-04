@@ -275,14 +275,14 @@ structural* gain, the hardest honest case:
 |---|--:|--:|--:|--:|
 | gh_pulls | 30 | 151,165 | **76.1%** | −8.4% |
 | gh_workflow_runs | 20 | 76,032 | **80.3%** | −7.5% |
-| gh_issues | 30 | 48,032 | **32.7%** | −8.0% |
+| gh_issues | 30 | 48,032 | **38.8%** | −8.0% |
 | gh_commits | 30 | 69,652 | **26.5%** | −4.5% |
 | gh_dir_listing | 24 | 6,736 | **31.4%** | −7.7% |
 | gh_rate_limit | 1 obj | 357 | **13.4%** | −36.7% |
 | gh_repo_single | 1 obj | 1,652 | 0.0% | −4.4% |
 | gh_commits_flat | 30 | 10,886 | **2.4%** | 1.7% |
 | gh_labels | 9 | 632 | 15.2% | **19.0%** |
-| **weighted total** | | 365,144 | **58.3%** | **−7.1%** |
+| **weighted total** | | 365,144 | **59.1%** | **−7.1%** |
 
 *(% = fewer cl100k tokens than raw; higher is better; **bold** = winner.)*
 
