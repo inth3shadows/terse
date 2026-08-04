@@ -271,7 +271,8 @@ class Interceptor:
                  store: OrderedDict[str, Any] | None = None,
                  store_lock: Lock | None = None,
                  dropped_bytes: list[int] | None = None,
-                 log_prefix: str = "[terse-proxy]"):
+                 log_prefix: str = "[terse-proxy]",
+                 lazy_primer: bool = True):
         self.policy = pol
         # The downstream server's name, when the caller knows it (`proxy --server-name`,
         # or a multiproxy peer's config name). Passed to every `policy.select`/`apply` so
@@ -371,6 +372,22 @@ class Interceptor:
         # `clientInfo.name` from the handshake, when the client declared one (#128). Drives
         # `"structured": "auto"`; None until an initialize is seen, and None means "leave".
         self.client_name: str | None = None
+        # Lazy primer (#168 phase 2): when True, `initialize` is left unprimed and the
+        # primer instead attaches to the first `tools/call` result that actually carries a
+        # terse wire form — paid once per SESSION, not once per TURN. False preserves the
+        # old always-eager `_augment_initialize` behavior; multiproxy passes False for every
+        # peer, since the router already primes eagerly once via `union_primer` and a peer
+        # going lazy too would just double the explanation on top of that (see
+        # `_build_peers`). Computed once here, not lazily: `pol` is finalized by every
+        # caller before construction, so there's nothing to gain by deferring it, and
+        # deferring would mean recomputing `build_primer` on every reconnect reset instead
+        # of once.
+        self._lazy_primer = lazy_primer
+        self._primer_text = build_primer(pol, server_name) if lazy_primer else ""
+        # True = "nothing left to do" — collapses `lazy_primer=False` and "this policy
+        # emits no compressible form at all" (`build_primer` returns "" for a default-deny
+        # policy) into the same no-op state, so neither needs its own branch later.
+        self._primer_sent = not (lazy_primer and self._primer_text)
         # The two proxy pump threads call note_request (client->server) and
         # transform_response (server->client) concurrently, both mutating pending/last/
         # since_keyframe/init_id state. `_local_lock` serializes each method against the
@@ -441,6 +458,12 @@ class Interceptor:
                 self.last_text.clear()
                 self.since_text_keyframe.clear()
                 self.pending.clear()
+                # Same reasoning as the diff-base clears above, applied to the lazy primer:
+                # a reconnect means the model's context — and with it, any primer it
+                # previously read — is gone. Without this reset, a reconnected session's
+                # tools/call results would compress freely with no primer ever explaining
+                # the wire forms to the NEW context.
+                self._primer_sent = not (self._lazy_primer and self._primer_text)
                 # A reconnecting client restarts its JSON-RPC ids at 1 while this process
                 # keeps one session id, so `sess:1` from before and after the reconnect
                 # would name two unrelated results the same and the corpus would fuse them
@@ -536,6 +559,10 @@ class Interceptor:
         with self._local_lock:
             if msg["id"] == self.init_id:
                 self.init_id = None  # one-time
+                if self._lazy_primer:
+                    # #168 phase 2: no eager priming — the primer attaches to the first
+                    # qualifying tools/call result instead (see the end of this method).
+                    return line
                 primed = self._augment_initialize(msg)
                 return primed if primed is not None else line
             # Pop BEFORE the "result" check (not after, as a top-level early-return
@@ -771,6 +798,37 @@ class Interceptor:
                     sys.stderr.write(
                         f"[terse-proxy] {tool}: dropped {len(mirror['text'])}-char text "
                         f"mirror of structuredContent (structured=replace)\n")
+
+            # #168 phase 2 (lazy primer): attach the format primer to the FIRST result that
+            # actually carries a terse wire form, instead of eagerly at `initialize`. Once
+            # per session (`_primer_sent` latches True below); a no-op after that or when
+            # `lazy_primer` is off.
+            #
+            # The trigger is "does the FINAL content contain a terse marker", not the
+            # coarser `changed` flag — `changed` is also True for a pure mirror-drop
+            # (nothing terse-encoded survives to explain) and for a `structuredContent`-only
+            # rewrite (see the guard below).
+            #
+            # `structuredContent` guard: measured (`scripts/probe/structured_content/`) that
+            # Claude Code discards the text block ENTIRELY whenever a result also carries
+            # `structuredContent` — a primer text block inserted here would be thrown away
+            # right alongside it, regardless of whether the marker itself landed in text or
+            # in `structuredContent` (an untouched `structuredContent` still wins the
+            # client's preference over text). Skip attaching on THIS result rather than
+            # attach somewhere it can't be seen; a later, text-only compressible result
+            # still gets it. A session whose every wrapped-tool call carries
+            # `structuredContent` never finds that later call — a known, narrow, accepted
+            # gap (see #168 plan notes), not silently pretended away.
+            structured_present = isinstance(result, dict) and "structuredContent" in result
+            if not self._primer_sent and self._lazy_primer and not structured_present:
+                marker_in_text = any(
+                    isinstance(b, dict) and b.get("type") == "text"
+                    and isinstance(b.get("text"), str) and '"__terse_' in b["text"]
+                    for b in content)
+                if marker_in_text:
+                    content.insert(0, {"type": "text", "text": self._primer_text})
+                    self._primer_sent = True
+                    changed = True
 
             if self.stats is not None:
                 deferred.append((
@@ -1635,6 +1693,7 @@ def run_proxy(
     headers: dict[str, str] | None = None,
     stats_log: str | None = None,
     server_name: str | None = None,
+    lazy_primer: bool = True,
 ) -> int:
     """Launch the downstream MCP peer `cmd` and proxy JSON-RPC through `Interceptor`.
     `cmd` is either a stdio launch command, or a single-element list holding a URL — in
@@ -1664,6 +1723,11 @@ def run_proxy(
     `server_name` is this downstream's name in the MCP config. It makes a server-scoped
     policy rule (`runecho.*`) match a server whose tools aren't self-prefixed, and labels
     the stats ledger with the real server identity instead of the command basename (#83).
+
+    `lazy_primer` (#168 phase 2), default True, is the CLI's real default and not exposed
+    as a flag — passed through from here only so a test that isn't about primer behavior
+    can pin the old always-eager `Interceptor` shape (`lazy_primer=False`) instead of
+    threading a leading primer block through every first-compressed-result assertion.
 
     Return code: for a stdio downstream, the child's real exit code (or 127 if it could
     never be launched — #19), exactly as before this function grew a second transport.
@@ -1695,7 +1759,7 @@ def run_proxy(
         stats = build_stats_writer(stats_log, label)
 
     inter = Interceptor(pol, debug=debug, capture=capture, audit=audit, stats=stats,
-                        server_name=server_name)
+                        server_name=server_name, lazy_primer=lazy_primer)
 
     try:
         transport = build_transport(cmd, headers=headers)

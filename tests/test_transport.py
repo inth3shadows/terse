@@ -18,7 +18,7 @@ import pytest
 from terse import transforms
 from terse.lossy import _handle, _serialize
 from terse.policy import Policy, Rule
-from terse.proxy import Interceptor, run_proxy
+from terse.proxy import PRIMER_HEAD, Interceptor, run_proxy
 from terse.transport import HttpTransport, build_transport
 
 RECORDS = [{"id": i, "status": "active", "url": "https://x.example/api/items"} for i in range(20)]
@@ -155,11 +155,17 @@ def test_http_end_to_end_compresses_losslessly():
     by_id = {json.loads(ln)["id"]: json.loads(ln)
             for ln in cout.getvalue().splitlines() if ln.strip()}
 
-    # initialize: serverInfo intact, format primer injected over HTTP exactly like stdio
+    # initialize: serverInfo intact, no eager primer (#168 phase 2 default over HTTP,
+    # exactly like stdio)
     assert by_id[1]["result"]["serverInfo"]["name"] == "fake-http"
-    assert "__terse_table__" in by_id[1]["result"]["instructions"]
-    # tools/call result compressed, smaller, and round-trips to the exact original
-    text = by_id[2]["result"]["content"][0]["text"]
+    assert "instructions" not in by_id[1]["result"]
+    # tools/call result: this is the first compressible result, so the primer arrives as a
+    # LEADING block ahead of the compressed data block
+    blocks = by_id[2]["result"]["content"]
+    assert len(blocks) == 2
+    assert PRIMER_HEAD in blocks[0]["text"]
+    # the compressed data block round-trips to the exact original and is smaller
+    text = blocks[1]["text"]
     expected = {"result": RECORDS}
     assert transforms.decompress(text) == expected
     assert len(text) < len(json.dumps(expected))
