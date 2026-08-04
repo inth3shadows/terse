@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import json
 
-from terse.capture import extract_records
+from terse import probes, transforms
+from terse.capture import (
+    ARRAY_OF_RECORDS,
+    classify_shape,
+    extract_records,
+    find_record_list_with_path,
+)
 from terse.probes import (
     cross_call_overlap,
     cross_server_overlap,
@@ -71,12 +77,34 @@ def test_extract_records_recurses_to_match_the_tabularizer():
     assert extract_records(nested) == [{"id": 1, "s": "a"}, {"id": 2, "s": "b"}]
 
 
-def test_extract_records_requires_uniform_keys():
-    # A non-uniform dict list is NOT what the tabularizer folds (it needs one shared key
-    # set), so it must not be returned — callers index every record by the first record's
-    # columns and would KeyError otherwise.
+def test_extract_records_follows_the_tabularizer_not_a_stricter_rule():
+    """The extractor's job is to agree with the codec about what is record-shaped (#204).
+
+    It used to require an identical key set, which was right until union-schema tabularize
+    widened the codec — after which a payload the codec folded at 55.8% classified as
+    `compact-json` with no record list, and the probes, `policy_gen`'s drop-path
+    generation, `dropeval` and coverage all skipped it.
+    """
+    non_uniform = {"result": [{"id": 1, "x": 0}, {"id": 2}]}
+    assert transforms.is_tabularizable(non_uniform["result"])
+    assert extract_records(non_uniform) == non_uniform["result"]
+
+    # Still bounded by the codec's own density gate, not by uniformity: 2 keys x 2 rows
+    # with 2 cells filled is 50%, which the tabularizer refuses, so this is not a record
+    # list for either of them.
+    assert not transforms.is_tabularizable([{"a": 1}, {"b": 2}])
     assert extract_records([{"a": 1}, {"b": 2}]) is None
-    assert extract_records({"result": [{"id": 1, "x": 0}, {"id": 2}]}) is None
+
+
+def test_records_from_a_widened_extract_are_safe_for_the_probes():
+    """`probes` is the consumer that needed NO change: it walks `rec.items()` and counts
+    per-field presence, so an absent key is data, not a KeyError."""
+    records = [{"name": "a", "kind": "fn", "line": 1}, {"name": "b", "kind": "fn"},
+               {"name": "c", "kind": "var", "line": 3}]
+    profiles = probes.field_profiles(records)
+    assert profiles["line"]["n"] == 2      # present in 2 of 3, counted as such
+    assert profiles["name"]["n"] == 3
+    probes.value_redundancy(records)       # must not raise
 
 
 def test_server_of_tool_maps_the_three_known_servers():
@@ -215,3 +243,79 @@ def test_field_profiles_size_and_cardinality():
     assert p["blob"]["n"] == 10
     # tok_share is a fraction of the record list's total tokens
     assert abs(sum(f["tok_share"] for f in p.values()) - 1.0) < 1e-6
+
+
+# --- #204: the shape classifier must agree with the codec ---
+
+
+def test_classify_shape_buckets_a_non_uniform_record_list_as_records():
+    """The reported symptom: a payload two thirds of whose rows carry `line` bucketed as
+    `compact-json` with no record list, while the codec compressed it 55.8%. Coverage
+    reporting then said there was nothing record-shaped to compress on a tool that
+    compresses well."""
+    obj = {"symbols": [{"name": f"s{i}", "kind": "fn", **({"line": i} if i % 3 else {})}
+                       for i in range(30)]}
+    raw = json.dumps(obj)
+    assert not transforms._uniform_dict_list(obj["symbols"])   # the old rule said no
+    assert transforms.is_tabularizable(obj["symbols"])         # the codec says yes
+    assert classify_shape(raw) == ARRAY_OF_RECORDS
+    assert extract_records(obj) == obj["symbols"]
+
+
+def test_drop_path_generation_reaches_a_non_uniform_record_list():
+    """`policy_gen` builds auto drop-path suggestions from `find_record_list_with_path`, so
+    the narrow rule meant no record list, no suggestion — on exactly the traffic
+    union-schema tabularize was built for."""
+    from terse import policy_gen
+    # Bodies must be DISTINCT: an identical value across records is dictionary-folded, so
+    # it is correctly not a drop candidate. High-cardinality bulk is what drop targets.
+    recs = [{"name": f"s{i}", "kind": "fn", "body": "x" * 4000 + str(i),
+             **({"line": i} if i % 3 else {})} for i in range(20)]
+    payload = json.dumps({"symbols": recs})
+    records, path = find_record_list_with_path(json.loads(payload))
+    assert path == "symbols[]" and records is not None
+    suggestion, rows = policy_gen._drop_candidates([payload])
+    assert "symbols[].body" in suggestion, "the big field should now be a drop candidate"
+    assert rows
+
+
+def test_shape_classifier_and_codec_agree_on_every_bench_payload():
+    """The invariant #4 established and #204 restored: `_has_record_list` is true exactly
+    when the tabularizer folds something in the payload.
+
+    The oracle is `compress_structure`'s actual OUTPUT — does a `__terse_table__` appear —
+    not a second call to `is_tabularizable`. Asking the predicate about itself is a
+    tautology that stays green through the very regression this test is named for: with the
+    classifier reverted to the strict rule it still passed, and with the codec's union
+    branch disabled while the classifier stayed correct it still passed.
+
+    Deliberately at the `compress_structure` layer, not the wire: `compress_with`'s
+    emit-only-if-smaller can ship plain minify for a payload that DID tabularize, so the
+    equivalence is about what the codec folds, not about what survives the size guard.
+    """
+    from pathlib import Path
+
+    from terse.capture import _has_record_list
+
+    def codec_folds(o):
+        """True if compressing `o` actually produces a table anywhere in the result."""
+        def has_table(node):
+            if isinstance(node, dict):
+                if node.get(transforms.TABLE_MARKER) == 1:
+                    return True
+                return any(has_table(v) for v in node.values())
+            if isinstance(node, list):
+                return any(has_table(x) for x in node)
+            return False
+        return has_table(transforms.compress_structure(o))
+
+    corpus = Path(__file__).resolve().parent.parent / "scripts" / "bench" / "corpus"
+    payloads = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(corpus.glob("*.json"))]
+    payloads += [
+        {"symbols": [{"a": i, "b": "x", **({"c": i} if i % 3 else {})} for i in range(30)]},
+        [{"a": 1}, {"b": 2}],                       # too sparse for either
+        {"n": 1},                                   # no list at all
+        [{"id": i, "v": "x"} for i in range(5)],    # plain uniform
+    ]
+    for obj in payloads:
+        assert _has_record_list(obj) == codec_folds(obj), obj if len(str(obj)) < 200 else "…"

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from terse import capture
+from terse import capture, transforms
 from terse.measure import cross_tokenizer_savings, measure_corpus, measure_payload
 from terse.tokenize import CL100K, O200K
 
@@ -62,12 +62,19 @@ def test_deeply_nested_record_list_is_array_of_records():
     assert capture.classify_shape(plain) == capture.COMPACT_JSON
 
 
-def test_non_uniform_dict_list_is_not_array_of_records():
-    # The tabularizer only folds dict lists that share one key set; a non-uniform list
-    # is a measured no-op for tabularize, so it must NOT bucket as array-of-records and
-    # overstate coverage (matches transforms._uniform_dict_list, the canonical rule).
-    nonuniform = json.dumps([{"a": 1}, {"b": 2}])
-    assert capture.classify_shape(nonuniform) == capture.COMPACT_JSON
+def test_a_too_sparse_dict_list_is_not_array_of_records():
+    # Since #204 the bucket follows `transforms.is_tabularizable`, so a non-uniform list is
+    # NOT excluded for being non-uniform — this one is excluded by the codec's own density
+    # gate (2 keys x 2 rows, 2 cells filled = 50%), which is exactly the point: the bucket
+    # must not claim coverage the tabularizer would not deliver.
+    sparse = json.dumps([{"a": 1}, {"b": 2}])
+    assert not transforms.is_tabularizable(json.loads(sparse))
+    assert capture.classify_shape(sparse) == capture.COMPACT_JSON
+
+    # ...whereas a non-uniform list the codec DOES fold must bucket as records (#204).
+    dense = [{"a": i, "b": "x", **({"c": i} if i % 3 else {})} for i in range(30)]
+    assert transforms.is_tabularizable(dense)
+    assert capture.classify_shape(json.dumps(dense)) == capture.ARRAY_OF_RECORDS
 
 
 def test_classify_shape_survives_pathological_nesting():

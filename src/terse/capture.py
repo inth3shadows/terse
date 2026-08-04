@@ -25,7 +25,7 @@ from . import policy as policy_mod
 from ._secure_io import append_restricted, mkdir_restricted, write_restricted
 from .transforms import (
     MAX_DEPTH,
-    _uniform_dict_list,  # NARROWER than what tabularize folds — see _find_record_list
+    is_tabularizable,  # the canonical "what tabularize folds" rule
 )
 
 # Shape buckets. classify_shape returns one of these.
@@ -50,27 +50,24 @@ _MAX_SHAPE_DEPTH = MAX_DEPTH
 
 
 def _find_record_list(obj: Any, _depth: int = 0) -> list[dict] | None:
-    """The first list-of-uniform-dicts at ANY depth in obj (depth-first), else None.
+    """The first list the TABULARIZER would fold, at any depth in obj (depth-first), else
+    None.
 
-    Shares `_uniform_dict_list` with the tabularizer rather than hand-rolling a second
-    "mirror" check, which is the bug behind #4 (three such checks disagreed).
+    Shares `is_tabularizable` with the codec rather than hand-rolling a second "mirror"
+    check, which is the bug behind #4 (three such checks disagreed) — and #204, where the
+    shared rule was the strict identical-keyset one while the codec had moved on. A payload
+    where two thirds of the rows carry `line` bucketed as `compact-json` with no record
+    list while the codec compressed it 55.8%, so `classify_shape`'s buckets, `policy_gen`'s
+    auto drop-path generation, `dropeval`, `measure`'s coverage and `fluency.questions` all
+    under-fired on exactly the traffic union-schema tabularize was built for.
 
-    KNOWN NARROWER than what the codec folds, deliberately and for now. Union-schema
-    tabularize also folds NON-uniform record lists, so a payload where two thirds of the
-    rows carry `line` classifies as `compact-json` with no record list, while the codec
-    tabularizes it at 30.6%. Everything reading this — `classify_shape`'s buckets,
-    `policy_gen`'s auto drop-path generation, `dropeval`, `measure`'s shape coverage,
-    `fluency.questions` — therefore under-fires on exactly the traffic union-schema
-    tabularize was built for.
-
-    Not widened here on purpose: this function feeds the measurement stack, and changing
-    what counts as record-shaped moves reported coverage and generated policy at the same
-    time as the codec change, with no clean before/after. Widening it is its own change
-    with its own numbers."""
+    Records reached this way may have DIFFERING key sets. Callers that index a record by
+    another record's columns must intersect first; `extract_records` says so, and
+    `fluency._intersection_cols` is the shared helper for it."""
     if _depth > _MAX_SHAPE_DEPTH:
         return None
     if isinstance(obj, list):
-        if _uniform_dict_list(obj):
+        if is_tabularizable(obj):
             return obj
         for x in obj:
             found = _find_record_list(x, _depth + 1)
@@ -90,11 +87,16 @@ def _has_record_list(obj: Any) -> bool:
 
 
 def extract_records(obj: Any) -> list[dict] | None:
-    """Return the list-of-uniform-dicts inside obj (at any depth), else None.
+    """Return the record list inside obj (at any depth) that the tabularizer would fold,
+    else None.
 
-    Mirrors what the tabularizer folds, so the probes reason about the same cells.
-    Uniform keys are guaranteed, so callers may index every record by the first
-    record's columns without a KeyError.
+    Mirrors what the codec folds, so the probes reason about the same cells.
+
+    Key sets are NOT guaranteed to be identical, as of #204 — union-schema tabularize folds record lists
+    where some rows omit a key, and this follows it. Indexing every record by
+    `records[0].keys()` is therefore a KeyError waiting to happen — take the intersection
+    (`fluency._intersection_cols`) when a column must exist in every record. `probes` needs no
+    change: it iterates `rec.items()` and already counts per-field presence.
     """
     return _find_record_list(obj)
 
@@ -107,12 +109,12 @@ def find_record_list_with_path(obj: Any, _prefix: tuple[str, ...] = ()) -> tuple
     Walks DICT KEYS only, not into intermediate lists: a record list nested inside another
     list has no simple expressible path, so it returns (records, None-path) is avoided —
     such a list yields (None, None). Returns the first record list reached through keys,
-    depth-first, using the same `_uniform_dict_list` rule as `_find_record_list` — and
-    inheriting the same known gap against what the codec folds."""
+    depth-first, using the same `is_tabularizable` rule as `_find_record_list` — so the
+    same non-uniform key-set caveat applies to the records it returns."""
     if len(_prefix) > _MAX_SHAPE_DEPTH:
         return None, None
     if isinstance(obj, list):
-        if _uniform_dict_list(obj):
+        if is_tabularizable(obj):
             prefix = ".".join(_prefix)
             return obj, (f"{prefix}[]" if prefix else "[]")
         return None, None  # list-of-non-records / list-of-lists: no simple field path

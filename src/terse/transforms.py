@@ -154,6 +154,17 @@ def _uniform_dict_list(value: Any) -> bool:
     return all(set(item.keys()) == first_keys for item in value[1:])
 
 
+def is_tabularizable(value: Any) -> bool:
+    """Would `compress_structure` fold this into a table? The canonical record-shape rule.
+
+    The boolean front door onto `_tabularizable_dict_list`, for callers that only need the
+    verdict — `capture`'s shape classifier and record extractor, which must agree with the
+    codec on what "record-shaped" means or the measurement stack under-reports exactly the
+    traffic the codec is best at (#204).
+    """
+    return _tabularizable_dict_list(value)[0]
+
+
 def _tabularizable_dict_list(value: Any) -> tuple[bool, list | None, set | None, set | None]:
     """Return (ok, union_keys, absent_columns, sentinel_columns) for a list-of-dicts.
 

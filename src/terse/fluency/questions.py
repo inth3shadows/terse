@@ -95,29 +95,40 @@ def _pick_numeric_col(records: list[dict], cols: list[str], exclude: str | None 
 
 
 def _intersection_cols(records: list[dict]) -> list[str]:
-    """Keys present in EVERY record, sorted for determinism. For a non-uniform record
-    list (e.g. structure symbols, where only some carry line/hash) these are the only
-    columns safe to index across all records."""
-    common = set(records[0].keys())
+    """Keys present in EVERY record, in first-seen order. For a non-uniform record list
+    (e.g. structure symbols, where only some carry line/hash) these are the only columns
+    safe to index across all records.
+
+    First-seen rather than sorted, and that is load-bearing: the pickers below take the
+    FIRST column satisfying their predicate, so the order decides which column becomes the
+    id and which the target. For a UNIFORM record list this returns exactly
+    `records[0].keys()`, which is what lets #204 widen `capture.extract_records` without
+    moving a single question on the payloads that came before it — verified over the whole
+    bench corpus, where only `gh_issues` changes at all.
+
+    It is NOT a no-op for this function's original caller. `_nested_record_group` (#71) by
+    construction only ever sees non-uniform child lists, where sorted and first-seen differ,
+    so its id/target column choice can move — a structure payload with `sym` before `path`
+    now enumerates `sym` where it used to enumerate `path`. Same information, different
+    question; the alternative was leaving the flat path picking columns by alphabet.
+    """
+    if not records:
+        return []
+    common = set(records[0])
     for r in records[1:]:
-        common &= set(r.keys())
-    return sorted(common)
+        common &= r.keys()
+    return [k for k in records[0] if k in common]
 
 
 def _nested_record_group(obj: Any) -> tuple[str, list[dict], list[str]] | None:
-    """Reach a record list that terse's STRICT uniform extractor skips: a dict-map of
+    """Reach a GROUPED record list that the flat extractor cannot scope: a dict-map of
     parent records each holding a child list of dicts (runecho.structure's
-    `files{path: {symbols: [...]}}`), where the child list is non-uniform (symbol kinds
-    carry different keys). Returns (label, records, common_cols) deterministically — first
-    match in source order, first parent in map order — else None.
+    `files{path: {symbols: [...]}}`). Returns (label, records, common_cols)
+    deterministically — first match in source order, first parent in map order — else None.
 
-    Fluency-local by design: it does NOT touch `extract_records`/`_uniform_dict_list`,
-    which the probe and drop-path logic (#47) share. This only widens what the fluency
-    harness can ASK about, so `proxy --diff` gets exercised on structure-shaped output
-    (issue #71). NOTE the original rationale — "widening their notion of a record would
-    change what the codec folds" — no longer holds: union-schema tabularize already folds
-    these non-uniform lists, so the extractor is now NARROWER than the codec rather than
-    equal to it. See `capture._find_record_list` for why that gap is deliberate for now.
+    Historically this also existed because `extract_records` refused non-uniform child
+    lists; #204 removed that reason by making the extractor follow the codec. What remains,
+    and is the reason it is still preferred for the dict-map case, is SCOPING: see below.
 
     Preferred OVER the uniform extractor for the dict-map case: an unscoped "how many
     records" is ambiguous when the payload holds many groups, and `extract_records` would
@@ -259,7 +270,12 @@ def gen_questions(obj: Any) -> list[Question]:
     records = extract_records(obj)
     if not records:
         return _flat_record_questions(obj)
-    cols = list(records[0].keys())
+    cols = _intersection_cols(records)
+    if not cols:
+        # Non-uniform records with nothing in common: every column-scoped question below
+        # would address a field some record lacks. The count question alone is not worth a
+        # harness run, so fall through to the flat-record path.
+        return _flat_record_questions(obj)
     n = len(records)
     aliased = _aliased_strings(obj)
     canon = _aliased_canon(obj)

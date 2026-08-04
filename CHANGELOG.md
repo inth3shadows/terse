@@ -10,6 +10,47 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Fixed
+- **The shape classifier was narrower than the codec, so the measurement stack under-fired
+  on union-schema traffic (#204).** `capture._find_record_list` still used the strict
+  identical-keyset rule after #202 widened what the tabularizer folds. A payload where two
+  thirds of the rows carry `line` bucketed as `compact-json` with **no record list** while
+  the codec compressed it **55.8%** — so `classify_shape`'s buckets, `measure`/`report`
+  coverage, `policy_gen`'s auto drop-path generation, `dropeval` and `fluency.questions` all
+  skipped exactly the traffic union-schema tabularize was built for. Deferred out of #202 on
+  purpose, because moving the measurement stack in the same commit as the codec leaves no
+  clean before/after; this is that change, with the numbers.
+
+  `transforms.is_tabularizable` is now the single canonical "would the codec fold this"
+  rule, and capture uses it. On synthetic runecho-shaped payloads: `compact-json` →
+  `array-of-records`, `extract_records` 0/3 → 3/3, drop-path 0/3 → 3/3. End to end,
+  `terse policy generate` over a runecho-shaped corpus now emits
+  `↳ drop-candidate symbols[].body (~96% of tokens, 100% unique)` where it previously
+  emitted nothing — the same shape the regression test carries, so the claim is auditable
+  from the branch.
+
+  On the tracked bench corpus exactly **one** payload moves — `gh_issues`, from
+  no-record-list to `array-of-records` — which is the same payload, and the same nested
+  non-uniform array, that #202 moved from 32.7% to 38.8%. The classifier and the codec now
+  agree on all nine; a test pins that equivalence over the corpus plus the shapes that broke
+  it before, so the two cannot drift again silently.
+
+  **The uniform-keys guarantee is gone, and that was the real work.** `extract_records` used
+  to promise callers could index every record by `records[0].keys()`. Three consumers relied
+  on it and would now raise `KeyError` on a record missing a key: `fluency`'s column pickers,
+  `gen_questions`, and `dropeval`. They now take the intersection via the
+  `_intersection_cols` helper the nested-record path already had — which is also the
+  semantically right answer, since a column some records lack cannot be the subject of "for
+  the record whose id is X, what is Y?". `probes` needed no change: it walks `rec.items()`
+  and already counts per-field presence.
+
+  That helper changed from sorted to **first-seen** order, because the pickers take the
+  first column matching their predicate and sorting would re-pick id/target columns. For a
+  uniform list first-seen returns exactly `records[0].keys()`, so no pre-existing payload's
+  questions move — verified across the whole bench corpus, where only `gh_issues` changes at
+  all. It is **not** a no-op for the helper's original caller: `_nested_record_group` (#71)
+  only ever sees non-uniform child lists, so a structure payload whose keys run `sym` before
+  `path` now enumerates `sym` where it enumerated `path`. Same information, different
+  question — the alternative was leaving the flat path picking columns alphabetically.
 - **README and BENCHMARKS published the pre-#202 numbers, and nothing was checking (#206).**
   Union-schema tabularize moved the bench corpus and both documents went on claiming the old
   figures. §1: weighted total **58.3% → 59.1%**, `gh_issues` **32.7% → 38.8%** — every other
