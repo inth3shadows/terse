@@ -255,6 +255,23 @@ def test_run_payload_trials_count_partial_successes():
     assert 0 <= count_row["terse_ok"] <= 3
 
 
+def test_run_payload_inline_arm_delivers_the_primer_with_no_system_message():
+    # #168's lazy-primer proposal rides the primer with the DATA, not `initialize` ->
+    # no system prompt at all. An answerer that only succeeds when it sees primer text
+    # in `user` AND an EMPTY `system` isolates that exact delivery mode from every other
+    # arm: raw/terse carry no primer text anywhere, and primer_ok's primer sits in
+    # `system`, not `user`, so all three still read as wrong.
+    marker = "'terse' compressed"  # substring of fluency.pack.PRIMER
+    def inline_only(system, user):
+        return "6" if system == "" and marker in user else "nope"
+    rows = fluency.run_payload(PAYLOAD, fluency.compress(PAYLOAD), inline_only)
+    count_row = next(r for r in rows if r["qid"] == "count")
+    assert count_row["inline_ok"]
+    assert not count_row["raw_ok"]
+    assert not count_row["terse_ok"]
+    assert not count_row["primer_ok"]
+
+
 def test_score_pack_accepts_multi_trial_lists():
     pack = fluency.build_pack([{"tool": "demo", "sha": "abc123", "raw": fluency_raw()}], trials=2)
     assert pack["trials"] == 2
@@ -278,6 +295,33 @@ def test_multi_trial_report_shows_bound():
     assert "±" in report
     verdict = report.split("## Verdict", 1)[1]
     assert "pts)" in verdict  # the gap carries a confidence interval
+
+
+def test_fluency_report_renders_inline_column_when_rows_carry_it():
+    from terse.report import build_fluency_report
+    # a row set including inline_ok (a live `run_fluency` run, post-#168 arm) must show
+    # a real accuracy figure in the terse+inline column, not the "not measured" fallback
+    rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
+             "trials": 1, "raw_ok": 1, "terse_ok": 1, "primer_ok": 1, "inline_ok": 1}
+            for i in range(10)]
+    report = build_fluency_report({"m": rows}, [])
+    assert "terse+inline" in report
+    assert "n/a" not in report
+    assert "100%" in report
+
+
+def test_fluency_report_renders_na_for_inline_when_rows_predate_the_arm():
+    from terse.report import build_fluency_report
+    # rows from a result file recorded before the inline arm existed carry no
+    # inline_ok key at all. That must render as "n/a" (not measured), never as "0%"
+    # (which would misread as "inline comprehension collapsed").
+    rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
+             "trials": 1, "raw_ok": 1, "terse_ok": 1, "primer_ok": 1} for i in range(10)]
+    report = build_fluency_report({"m": rows}, [])
+    row_line = next(line for line in report.splitlines() if line.startswith("| `m`"))
+    cells = [c.strip() for c in row_line.split("|")]
+    inline_cell = cells[6]  # '' | model | n | raw | terse | primer | inline | ...
+    assert inline_cell == "n/a"
 
 
 def test_build_pack_then_score_pack_roundtrips_through_ground_truth():

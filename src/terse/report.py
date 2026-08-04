@@ -1022,8 +1022,9 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         f"Trials per question: **{trials}**. `±` is the 95% half-width of a pooled "
         "binomial bound on the accuracy.",
         "",
-        "| Model | q | raw | terse | terse+primer | regressions | primer recovers |",
-        "|---|---|---|---|---|---|---|",
+        "| Model | q | raw | terse | terse+primer | terse+inline | regressions | "
+        "primer recovers |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     summary: dict[str, dict[str, float]] = {}
     for model, rows in results.items():
@@ -1033,15 +1034,23 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         racc, rse = _form_stats(rows, "raw_ok")
         tacc, tse = _form_stats(rows, "terse_ok")
         pacc, pse = _form_stats(rows, "primer_ok")
+        # #168: the same primer delivered with the RESULT instead of at `initialize`. Absent
+        # from older result files, which predate the arm — rendered as `n/a`, never as 0%,
+        # which would read as "inline comprehension collapsed" rather than "not measured".
+        has_inline = any("inline_ok" in r for r in rows)
+        iacc, ise = _form_stats(rows, "inline_ok") if has_inline else (0.0, 0.0)
         regr = sum(1 for r in rows if int(r["raw_ok"]) == r.get("trials", 1)
                    and int(r["terse_ok"]) < r.get("trials", 1))
         rec = sum(1 for r in rows if int(r["terse_ok"]) < r.get("trials", 1)
                   and int(r["primer_ok"]) == r.get("trials", 1))
         summary[model] = {"n": n, "raw": racc, "raw_se": rse,
                           "terse": tacc, "terse_se": tse, "primer": pacc, "primer_se": pse}
+        if has_inline:
+            summary[model].update({"inline": iacc, "inline_se": ise})
+        inline_cell = (f"{iacc:.0%} ±{_ci(ise) * 100:.0f}" if has_inline else "n/a")
         out.append(
             f"| `{model}` | {n} | {racc:.0%} ±{_ci(rse) * 100:.0f} | {tacc:.0%} ±{_ci(tse) * 100:.0f} "
-            f"| {pacc:.0%} ±{_ci(pse) * 100:.0f} | {regr} | {rec} |"
+            f"| {pacc:.0%} ±{_ci(pse) * 100:.0f} | {inline_cell} | {regr} | {rec} |"
         )
     out.append("")
 

@@ -45,22 +45,41 @@ def _ask_n(answerer: Answerer, system: str, user: str,
 
 def run_payload(obj: Any, raw_text: str, answerer: Answerer,
                 primer: str = PRIMER, trials: int = 1) -> list[dict]:
-    """Ask one payload's questions over raw / terse / terse+primer, `trials` times each.
+    """Ask one payload's questions over raw / terse / terse+primer / terse+inline-primer,
+    `trials` times each.
 
     Each returned row carries per-form success COUNTS (0..trials) plus `trials`, not
     booleans. At trials=1 a count is 0 or 1 — truthy/falsy exactly like the old bool —
     so every existing aggregation keeps working unchanged.
+
+    `inline_ok` is the fourth arm and exists to decide #168's lazy primer. Today the primer
+    ships in `initialize.instructions` and the client re-reads it EVERY turn as cache_read,
+    which is why terse measures a 14.0% win at one wrapped server and a loss at three. The
+    proposed fix attaches it to the FIRST COMPRESSED RESULT instead — paid once per session,
+    not once per turn.
+
+    `proxy.py` records a measurement that a *system-level* primer beat an inline per-result
+    note, but that compared the primer against a short note, not against the same primer
+    delivered inline. This arm closes that gap: identical primer text, identical questions,
+    the only difference being that it rides with the DATA rather than in the system slot —
+    which is exactly what the proxy could do, since a stdio proxy cannot set a system prompt.
     """
     terse_text = compress(obj)
     out: list[dict] = []
     for q in gen_questions(obj):
         raw_u = _user_prompt(q.prompt, q.instruction, raw_text)
         terse_u = _user_prompt(q.prompt, q.instruction, terse_text)
+        # The primer PREFIXES the result body, which is where a lazy primer would put it:
+        # the proxy owns the result text and nothing else.
+        inline_u = _user_prompt(q.prompt, q.instruction, f"{primer}\n\n{terse_text}")
         out.append({
             "qid": q.qid, "qtype": q.qtype, "transform": q.transform, "trials": trials,
             "raw_ok": _ask_n(answerer, "", raw_u, q.qtype, q.expected, trials),
             "terse_ok": _ask_n(answerer, "", terse_u, q.qtype, q.expected, trials),
             "primer_ok": _ask_n(answerer, primer, terse_u, q.qtype, q.expected, trials),
+            # No system message: the whole point is that the model was never told anything
+            # at initialize time.
+            "inline_ok": _ask_n(answerer, "", inline_u, q.qtype, q.expected, trials),
         })
     return out
 
