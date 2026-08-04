@@ -1,11 +1,11 @@
 # terse — Benchmarks
 
-**Last updated: 2026-08-04.** Every figure is dated by section — §1 and the terse column
-of §4 were re-measured 2026-08-04 on the merge of #202 (which moved `gh_issues` and the
-weighted total, and nothing else); §2–3 were produced 2026-07-17 and reproduce
-byte-identical today; §5 is a live number pulled fresh each time; **§6 predates #202 and
-has not been re-measured** — see the note there. Nothing here is hand-typed or
-estimated. If you re-run and get different numbers, the code changed; open an issue.
+**Last updated: 2026-08-04.** Every figure is dated by section — §1, §3, and the terse
+column of §4 were re-measured 2026-08-04 on the merge of #202; §2 was produced 2026-07-17
+and re-runs byte-identical today; §5 is a live number pulled fresh each time; **§6
+predates #202 and has not been re-measured** — see the note there. Nothing here is
+hand-typed or estimated. If you re-run and get different numbers, the code changed; open
+an issue.
 
 Two different kinds of evidence live here, and the difference matters:
 
@@ -49,9 +49,10 @@ tool traffic terse targets. `cl100k` tokens, all lossless.
 
 Re-measured **2026-08-04** on the merge of #202, straight from
 `uv run scripts/bench/benchmark.py` — both columns from the same run, no hand-patched
-cells. Union-schema tabularize moved exactly one payload and the total: `gh_issues`
+cells. Union-schema tabularize moved exactly one payload here and the total: `gh_issues`
 32.7% → 38.8%, weighted 58.3% → 59.1%. Every other row, and the whole TOON column, is
-byte-identical to the previous measurement. See
+byte-identical to the previous measurement. §3 moved with it — its "full re-send"
+column *is* this codec — and was re-measured the same day. See
 [`scripts/bench/version_sweep.md`](scripts/bench/version_sweep.md) for why 58.3% had
 stood unchanged from `v0.5.1` to `v0.17.0`.
 
@@ -63,7 +64,7 @@ stood unchanged from `v0.5.1` to `v0.17.0`.
 | gh_commits | 30 | 69,652 | **26.5%** | −4.5% |
 | gh_dir_listing | 24 | 6,736 | **31.4%** | −7.7% |
 | gh_rate_limit | 1 obj | 357 | **13.4%** | −36.7% |
-| gh_repo_single | 1 obj | 1,652 | 0.0% | −4.4% |
+| gh_repo_single | 1 obj | 1,652 | **0.0%** | −4.4% |
 | gh_commits_flat | 30 | 10,886 | **2.4%** | 1.7% |
 | gh_labels | 9 | 632 | 15.2% | **19.0%** |
 | **weighted total** | | **365,144** | **59.1%** | **−7.1%** |
@@ -119,9 +120,9 @@ single-shot codec all pay the full column every call. Modeling one repeat call p
 | repeated call | full re-send | diff | smaller by |
 |---|--:|--:|--:|
 | gh_commits_flat | 10,681 | 812 | **92.4%** |
-| gh_issues | 32,608 | 4,448 | **86.4%** |
+| gh_issues | 29,611 | 4,448 | **85.0%** |
 | gh_pulls | 37,776 | 15,292 | **59.5%** |
-| **weighted total** | 152,837 | 40,138 | **73.7%** |
+| **weighted total** | 149,840 | 40,138 | **73.2%** |
 
 **Honest caveat (read this):** these are *modeled* repeat-call savings. How *often* the
 pattern occurs in a real agent loop is workload-dependent and is being measured directly (the
@@ -153,7 +154,7 @@ measured what it actually forwarded upstream, cl100k, same method as §1:
 | gh_pulls | 151,165 | **76.1%** | 42.5% | 0.0% |
 | gh_issues | 48,032 | **38.8%** | 33.1% | 0.0% |
 | gh_commits | 69,652 | 26.5% | **46.6%** | 0.0% |
-| gh_rate_limit | 357 | 13.4% | 0.0% | 0.0% |
+| gh_rate_limit | 357 | **13.4%** | 0.0% | 0.0% |
 
 The only headroom mechanism that moved anything on this corpus is **CCR row-dropping**:
 rows are deleted and replaced with a `<<ccr:HASH N_rows_offloaded>>` stub the model must
@@ -262,8 +263,8 @@ claim, and a better pitch besides.
 > the codec folds, and it moved §1 by +0.8pp. Whether it moves anything here depends on
 > whether these servers emit non-uniform record arrays — plausible, unverified, and not
 > assumed either way. Re-running is a live exercise (three pinned repo clones plus real
-> `npx`/`uvx` servers), tracked separately; §1–§4 below the fold are current as of
-> 2026-08-04.
+> `npx`/`uvx` servers), tracked separately. §1 and §3 above were re-measured 2026-08-04;
+> §4's terse column too, though its headroom column is still 2026-07-30.
 
 §5 is one person's traffic. This section is the other half: what terse does **automatically,
 zero-config** to the output of widely-used, **credential-free** MCP servers that anyone can

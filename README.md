@@ -279,7 +279,7 @@ structural* gain, the hardest honest case:
 | gh_commits | 30 | 69,652 | **26.5%** | −4.5% |
 | gh_dir_listing | 24 | 6,736 | **31.4%** | −7.7% |
 | gh_rate_limit | 1 obj | 357 | **13.4%** | −36.7% |
-| gh_repo_single | 1 obj | 1,652 | 0.0% | −4.4% |
+| gh_repo_single | 1 obj | 1,652 | **0.0%** | −4.4% |
 | gh_commits_flat | 30 | 10,886 | **2.4%** | 1.7% |
 | gh_labels | 9 | 632 | 15.2% | **19.0%** |
 | **weighted total** | | 365,144 | **59.1%** | **−7.1%** |
@@ -319,11 +319,11 @@ changed, one appended — the poll-again pattern), the **second** call costs
 |---|--:|--:|--:|--:|
 | gh_commits_flat | 30 | 10,681 | 812 | **92.4%** |
 | gh_commits | 30 | 51,623 | 6,273 | **87.8%** |
-| gh_issues | 30 | 32,608 | 4,448 | **86.4%** |
+| gh_issues | 30 | 29,611 | 4,448 | **85.0%** |
 | gh_dir_listing | 24 | 4,779 | 977 | **79.6%** |
 | gh_pulls | 30 | 37,776 | 15,292 | **59.5%** |
 | gh_workflow_runs | 20 | 15,370 | 12,336 | 19.7% |
-| **weighted total** | | 152,837 | 40,138 | **73.7%** |
+| **weighted total** | | 149,840 | 40,138 | **73.2%** |
 
 The diff cost scales with *what changed*, not with payload size — so its win compounds
 exactly where token cost otherwise does: a long agent loop re-fetching mostly-unchanged
