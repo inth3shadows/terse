@@ -921,7 +921,7 @@ the full payload — big in agent loops that call the same tool repeatedly (~91%
 It is stateful and **OFF by default** — opt in with `--diff` (or `"diff": true` in a policy).
 Its validation program passed (pair fluency, nested-record coverage, drift soak; see
 TECHNICAL.md), so the default is a *cost* decision, not a confidence one: the primer
-paragraph explaining the diff format is 190 of 402 cl100k tokens and the client re-reads it
+paragraph explaining the diff format is 190 of 555 cl100k tokens and the client re-reads it
 every turn, per wrapped server, against a measured **0.38% hit rate** (7 diffs in 1,828
 blocks over 13.3 days). At that rate the explanation cost ~900–2,700x what the tier saved,
 so #170 flipped it off. Turn it on for a workload that genuinely re-calls the same tool with

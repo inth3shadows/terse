@@ -74,6 +74,61 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   nobody can redeem.
 
 ### Added
+- **Union-schema tabularize — non-uniform record arrays now fold.** `_uniform_dict_list`
+  required an identical key set across every row, so `runecho structure` (where `import`/
+  `export` rows lack the `line` that `class`/`function` rows carry) fell straight through
+  the tabularizer: **10% of real fleet traffic, 190 blocks, 181K tokens, compressing at
+  0.6%**. The header is now the union of all keys in first-seen order; a row that omits a
+  key gets `null`, or the `__terse_absent__` sentinel in a column that also carries an
+  explicit `null`, so "key omitted" and "key present, value null" stay distinguishable.
+  `absent_cols` / `sentinel_cols` in the table header tell the decoder which is which, and
+  are emitted only when a hole exists. A 50%-fill density gate refuses payloads too sparse
+  to amortize the header, with `compress_with`'s emit-only-if-smaller (#154) as the
+  backstop. Measured: 14–20% on runecho-shaped payloads, 62.7% on the GitHub bench corpus
+  (no regression against the 58.3% baseline).
+
+  Three things this needed beyond the codec:
+  - **The primer had to learn the vocabulary, and it is load-bearing.** A wire token the
+    codec emits but the paragraph never names is invisible to the reader — a fidelity gap
+    the round-trip gate structurally cannot see, since it only proves terse decodes its own
+    output. Measured on 24 absent-vs-null questions over a non-uniform table, three models
+    (Haiku 4, DeepSeek-V4-Flash, GLM-5.2) scored **54.2% / 54.2% / 79.2%** against the
+    unextended paragraph — a binary question answered near chance — and **95.8% / 100% /
+    100%** with the shipped paragraph (single trial, n=24). A cheaper encoding exists (one sentinel in
+    EVERY absent cell, no index arrays: 87 tokens total, also 100% on the same probe),
+    traded away because it costs more on the wire at scale (31.8% vs 33.5% saved on a
+    200-record table) — the primer is paid per turn, the wire per payload.
+
+    Making that coupling a test rather than a promise then surfaced a **pre-existing** gap:
+    `subcols` has been on the wire since nested key folding shipped and the paragraph never
+    named it, so a model received a nested positional tuple with no rule for reading it. Now
+    explained. `PRIMER_TABLE` goes 55 → 155 cl100k tokens and the whole primer 402 → 555,
+    which makes this the section to attack first if #168's per-server tax reopens.
+  - **The offline eval's primer was brought back in step.** `fluency.pack.PRIMER` is served
+    against the same `compress()` output; left on the old rule, every future `terse fluency`
+    run would have read as a codec fidelity regression caused by this change, when the stale
+    preamble belonged to the harness doing the measuring. A test now pins both primers to a
+    real emission.
+  - **The sentinel needed a real collision guard.** `ABSENT_MARKER` is the one marker the
+    codec writes into a *cell*, so it collides as a string VALUE and never as a key —
+    listing it beside the envelope keys in `_RESERVED_MARKERS` was a silent no-op. A record
+    whose own value is `"__terse_absent__"` in a sentinel column decoded as "key absent" and
+    lost the field; `_lossless_stage`'s verify-before-emit caught it, but only by discarding
+    the whole payload's compression and recording a `gate_fail` that
+    `policy_gen._tool_decision` reads as "this tool's shape defeats the codec", marking it
+    passthrough permanently. `has_terse_marker` now screens reserved string values too, so
+    `apply` passes such a payload through one layer earlier.
+
+  Known and deliberately deferred: `capture._find_record_list` still uses the strict
+  `_uniform_dict_list` rule, so it is now NARROWER than what the codec folds — a payload
+  where two thirds of the rows carry `line` classifies as `compact-json` with no record
+  list while the codec tabularizes it at 30.6%. Everything downstream (`classify_shape`
+  buckets, `policy_gen`'s auto drop-path generation, `dropeval`, `measure` coverage,
+  `fluency.questions`) therefore under-fires on exactly the traffic this change targets.
+  Not widened here on purpose: that function feeds the measurement stack, and moving it in
+  the same commit as the codec leaves no clean before/after. The comments that claimed the
+  two could "never drift" have been corrected to describe the gap.
+
 - **Per-server break-even in `terse stats` (#175).** The primer-liability block gained a
   per-server table: `primer`, `blocks`, `saved/block`, and `blocks/turn to break even`. #175
   established the rule — *wrap a server when its typical payload saves more than

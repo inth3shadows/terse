@@ -2157,7 +2157,7 @@ def test_minify_only_policy_emits_no_primer_at_all():
 
 def test_deny_everything_policy_emits_no_primer():
     """secret-broker's default-deny shape: no tiers, no diff, no drop. Today it pays the
-    full 402-token primer to describe forms it is structurally forbidden from producing."""
+    full 555-token primer to describe forms it is structurally forbidden from producing."""
     from terse.proxy import build_primer
     assert build_primer(_pol((), diff=False)) == ""
 
@@ -2169,6 +2169,39 @@ def test_diff_flag_alone_cannot_resurrect_the_primer_when_no_tier_is_reachable()
     assert build_primer(_pol((), diff=True)) == ""
 
 
+def test_primer_names_every_wire_token_the_table_codec_can_emit():
+    """The codec and the paragraph that explains it must stay in step: a wire token the
+    tabularizer emits but the primer never names is invisible to the reader, which is a
+    fidelity bug the round-trip gate cannot see (it only proves terse can decode its own
+    output, not that the model can). Union-schema tabularize shipped `absent_cols`,
+    `sentinel_cols` and the `__terse_absent__` cell sentinel; measured on 24
+    absent-vs-null questions, three models scored 54.2%/54.2%/79.2% against the
+    unextended paragraph and 100% against this one.
+
+    Derived from a real emission rather than a hardcoded list, so the next header key
+    added to the codec fails here instead of shipping unexplained."""
+    from terse import transforms as T
+    from terse.proxy import PRIMER_TABLE
+
+    records = [{"name": f"sym_{i}", "kind": "function",
+                "owner": {"login": "eric", "type": "User"}} for i in range(8)]
+    for i in (1, 5):
+        records[i].pop("kind")                       # holes -> absent_cols
+    for i in (0, 2, 4):
+        records[i]["note"] = None                    # explicit null -> sentinel_cols
+    records[3]["note"] = "x"
+
+    table = T.compress_structure(records)
+    assert table.get(T.TABLE_MARKER) == 1
+    # Every optional header key the encoder can attach, in one emission — otherwise the
+    # loop below silently vouches for a key it never saw.
+    assert {"absent_cols", "sentinel_cols", "subcols"} <= set(table)
+
+    for key in table:
+        assert key in PRIMER_TABLE, f"table header key {key!r} is unexplained in the primer"
+    assert T.ABSENT_MARKER in PRIMER_TABLE
+
+
 def test_tabularize_without_dictionary_documents_the_table_but_not_the_legend():
     from terse.proxy import PRIMER_DICT, PRIMER_TABLE, build_primer
     out = build_primer(_pol(("minify", "tabularize"), diff=False))
@@ -2177,7 +2210,7 @@ def test_tabularize_without_dictionary_documents_the_table_but_not_the_legend():
 
 
 def test_diff_section_is_omitted_when_diffing_is_off():
-    """The diff paragraph is 190 of the primer's 402 cl100k tokens — the single largest
+    """The diff paragraph is 190 of the primer's 555 cl100k tokens — the single largest
     section — for a tier measured at a ~0.4% hit rate in production."""
     from terse.proxy import PRIMER_DIFF, build_primer
     assert PRIMER_DIFF not in build_primer(_pol(diff=False))

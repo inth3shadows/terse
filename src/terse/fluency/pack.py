@@ -17,13 +17,26 @@ from .scoring import _score_form
 
 # One-time format primer. Deliberately short — in deployment it would be a single
 # system note, not a per-call preamble (which would cost tokens on every call).
+#
+# This has to cover every wire form `compress` can emit, because `build_pack` renders the
+# full pipeline. When union-schema tabularize widened what `compress` folds, the eval would
+# otherwise have gone on serving the OLD rule against the NEW wire — models would read a
+# hole-filling `null` as a real null, and `terse fluency` would report the resulting miss as
+# a codec fidelity regression rather than as its own stale preamble. Keep in step with
+# `proxy.PRIMER_TABLE`; that one is measured (see the note above it), this one is its
+# offline twin.
 PRIMER = (
     "Some data below is in 'terse' compressed JSON — a lossless, denser encoding. "
     "Read it as the equivalent expanded JSON:\n"
     '- A table object {"__terse_table__":1,"n":N,"cols":[...],"rows":[[...],...]} '
     "is N records. Each row is POSITIONAL: the i-th value in a row belongs to the "
     'i-th column name in "cols". "n" is the exact row count — use it to check you '
-    "read every row.\n"
+    "read every row. Records need not share a key set: "
+    '"absent_cols":[i,...] lists columns where some records have NO such key, written '
+    'null there — or "__terse_absent__" for columns also in "sentinel_cols", where a null '
+    "is a real null. An absent cell means the key is missing from that record, not that "
+    'its value is null. "subcols":{name:SPEC} means that column\'s cells are themselves '
+    "positional rows, read against SPEC the same way.\n"
     '- A dict object {"__terse_dict__":1,"legend":{"~0":"value",...},"data":...} '
     'means every "~K" token appearing inside "data" is shorthand for legend["~K"]; '
     "substitute the legend value back wherever you see its alias."

@@ -60,7 +60,7 @@ def test_deref_question_targets_an_object_valued_alias():
     qs = {q.qtype: q for q in fluency.gen_questions(BLOB_PAYLOAD)}
     assert "deref" in qs
     assert isinstance(qs["deref"].expected, dict)
-    assert qs["deref"].transform == "table+dict"  # the object is dict-coded
+    assert qs["deref"].transform == "table"  # union-schema: config is a sub-table row, aliased as a whole subtree, not as individual strings
 
 
 def test_aliased_helpers_survive_unhashable_subtree_legend():
@@ -644,3 +644,32 @@ def test_flat_record_questions_stay_silent_when_underqualified():
     assert fluency.gen_questions({"just": "an object", "two": 2}) == []   # <3 lookable
     assert fluency.gen_questions({"__terse_dict__": 1, "a": 1, "b": 2, "c": 3}) == []
     assert fluency.gen_questions({"a": "", "b": "y" * 999, "c": None, "d": True}) == []
+
+
+def test_the_eval_pack_primer_explains_every_form_it_renders():
+    """`build_pack` renders `compress(obj)` — the full pipeline — so `pack.PRIMER` has to
+    cover the same wire vocabulary the deployed `proxy.PRIMER_TABLE` does.
+
+    These two drifted once already: union-schema tabularize widened what `compress` folds
+    and only the proxy's paragraph was updated, so the eval went on serving the OLD rule
+    against the NEW wire. That does not fail loudly — it shows up as models missing
+    absent-vs-null questions, which reads as a codec fidelity regression rather than as a
+    stale preamble in the harness measuring it."""
+    from terse import transforms as T
+    from terse.fluency.pack import PRIMER
+    from terse.proxy import PRIMER_TABLE
+
+    records = [{"name": f"sym_{i}", "kind": "function",
+                "owner": {"login": "eric", "type": "User"}} for i in range(8)]
+    for i in (1, 5):
+        records[i].pop("kind")
+    for i in (0, 2, 4):
+        records[i]["note"] = None
+    records[3]["note"] = "x"
+
+    table = T.compress_structure(records)
+    assert {"absent_cols", "sentinel_cols", "subcols"} <= set(table)
+    for key in table:
+        assert key in PRIMER, f"eval pack primer never names {key!r}"
+        assert key in PRIMER_TABLE, f"proxy primer never names {key!r}"
+    assert T.ABSENT_MARKER in PRIMER

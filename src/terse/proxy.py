@@ -104,9 +104,29 @@ def _args_key(arguments: Any) -> str:
 # section documents ONE wire form, and the form is gated by policy the proxy already knows
 # at initialize time — so a server explains only what it can actually put on the wire.
 #
-# Measured cost of the whole primer, cl100k: header 41, table 55, dict 44, diff 190,
-# dropped 64, tail 8 = 402. Paid per wrapped server, re-read every turn as cache_read.
-# That is why terse measured a 14.0% win at one wrapped server and a loss at three.
+# Measured cost of the whole primer, cl100k: header 41, table 155, dict 44, diff 190,
+# embedded 53, dropped 64, tail 8 = 555. Paid per wrapped server, re-read every turn as
+# cache_read. That is why terse measured a 14.0% win at one wrapped server and a loss at
+# three.
+#
+# `table` went 55 -> 155, and this is the section to attack first if #168's per-server tax
+# reopens. Two things drove it:
+#
+#   * Union-schema tabularize's absent-cell vocabulary (+74). NOT optional decoration:
+#     measured on 24 absent-vs-null questions over a non-uniform table, three models scored
+#     54.2% / 54.2% / 79.2% against the old 55-token paragraph — a binary question answered
+#     near chance, because a `null` filling a hole is indistinguishable from a real null
+#     without the rule — and 95.8% / 100% / 100% with the shipped paragraph (single
+#     trial, n=24; the wording measured before `subcols` was folded in scored 100% on
+#     all three). A cheaper encoding exists (one
+#     ABSENT_MARKER in EVERY absent cell, no `absent_cols`/`sentinel_cols` arrays: 87 tokens
+#     total, also 100% on the same probe), traded away because it costs more on the wire at
+#     scale (31.8% vs 33.5% saved on a 200-record table) — the primer is paid once per turn,
+#     the wire per payload.
+#   * `subcols` (+26), which the codec has emitted since nested key folding shipped and this
+#     paragraph never named. Found by making the coupling a test rather than a promise: the
+#     guard derives the required vocabulary from a real emission, so a header key added to
+#     the codec fails there instead of reaching a model with no rule for reading it.
 #
 # PRIMER_HEAD is the idempotency sentinel: it appears in every non-empty assembly, so
 # `_augment_initialize` can detect its own prior injection without knowing which sections
@@ -118,7 +138,12 @@ PRIMER_HEAD = (
 )
 PRIMER_TABLE = (
     '- Table {"__terse_table__":1,"n":N,"cols":[...],"rows":[[...]]}: N records, each row '
-    'POSITIONAL — its i-th value belongs to the i-th name in "cols". "n" is the exact count.\n'
+    'POSITIONAL — its i-th value belongs to the i-th name in "cols". "n" is the exact count. '
+    'Records need not share a key set: "absent_cols":[i,...] lists columns where some records '
+    'have NO such key, written null there — or "__terse_absent__" for columns also in '
+    '"sentinel_cols", where a null is a real null. An absent cell means the key is missing '
+    'from that record, not that its value is null. "subcols":{name:SPEC} means that column\'s '
+    'cells are themselves positional rows, read against SPEC the same way.\n'
 )
 PRIMER_DICT = (
     '- Dict {"__terse_dict__":1,"legend":{"~0":value,...},"data":...}: every "~K" token '
@@ -158,7 +183,7 @@ def build_primer(pol: policy_mod.Policy, server: str | None = None) -> str:
 
     Returns "" when the policy can emit no compressed form at all (every reachable rule is
     `tiers: ()` with diffing therefore dead and no field drop). secret-broker's
-    default-deny policy is exactly that case, and today it pays 402 tokens per turn to
+    default-deny policy is exactly that case, and today it pays 555 tokens per turn to
     explain forms it is structurally forbidden from producing.
 
     `minify` alone is deliberately NOT a reason to emit a primer: minified JSON is just

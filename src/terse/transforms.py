@@ -46,6 +46,10 @@ JSON_STR_MARKER = "__terse_json__"
 # produced by the lossy layer and consumed by the proxy's retrieve handler — but it lives
 # in this registry so all `__terse_*` wire keys have one home and are reserved together.
 DROPPED_MARKER = "__terse_dropped__"
+# Sentinel for non-uniform record tabularization: when a column carries explicit JSON
+# `null`, an absent key is encoded as this sentinel rather than `null`, so the decoder
+# can distinguish "key omitted" from "key present, value null" unambiguously.
+ABSENT_MARKER = "__terse_absent__"
 ALIAS_SIGIL = "~"
 
 # Keys reserved for terse's own envelopes. A real payload that already contains one
@@ -54,6 +58,16 @@ ALIAS_SIGIL = "~"
 # has no escape convention, so the only lossless move is to leave such a payload alone.
 _RESERVED_MARKERS = frozenset({TABLE_MARKER, DICT_MARKER, DIFF_MARKER, DROPPED_MARKER,
                                JSON_STR_MARKER})
+
+# Reserved as a VALUE, not a key — the one sentinel the codec writes into a cell rather
+# than into a header. It needs its own set because `has_terse_marker` screens keys, and
+# listing ABSENT_MARKER alongside the envelope keys would be a silent no-op: a payload
+# whose own string value is "__terse_absent__" never trips a key check. Left unscreened,
+# that value in a sentinel column decodes as "key absent" and the record loses the field —
+# caught by `_lossless_stage`'s verify-before-emit, but at the cost of the whole payload's
+# compression AND a `gate_fail` that `policy_gen._tool_decision` reads as "this tool's
+# shape defeats the codec", marking it passthrough permanently.
+_RESERVED_VALUES = frozenset({ABSENT_MARKER})
 
 # The serializations the `embedded` tier can reproduce EXACTLY. A string leaf is folded only
 # when one of these regenerates it byte-for-byte, so the id stored in "f" is a complete
@@ -103,7 +117,8 @@ def exceeds_depth(obj: Any, cap: int = MAX_DEPTH) -> bool:
 
 
 def has_terse_marker(obj: Any) -> bool:
-    """True if obj contains, at ANY depth, a dict key reserved for a terse envelope.
+    """True if obj contains, at ANY depth, a dict key reserved for a terse envelope or a
+    string equal to a reserved sentinel VALUE.
 
     decompress / the model's primer interpret these markers wherever they appear, so a
     collision anywhere — not just top-level — makes a payload unsafe to compress."""
@@ -113,7 +128,9 @@ def has_terse_marker(obj: Any) -> bool:
         return any(has_terse_marker(v) for v in obj.values())
     if isinstance(obj, list):
         return any(has_terse_marker(x) for x in obj)
-    return False
+    # isinstance, not `type(obj) is str`: a str subclass compares equal to the sentinel and
+    # would decode as "absent" just the same, so it has to be screened too.
+    return isinstance(obj, str) and obj in _RESERVED_VALUES
 
 
 # --------------------------------------------------------------------------- #
@@ -135,6 +152,59 @@ def _uniform_dict_list(value: Any) -> bool:
         return False
     first_keys = set(value[0].keys())
     return all(set(item.keys()) == first_keys for item in value[1:])
+
+
+def _tabularizable_dict_list(value: Any) -> tuple[bool, list | None, set | None, set | None]:
+    """Return (ok, union_keys, absent_columns, sentinel_columns) for a list-of-dicts.
+
+    union_keys is the union of all keys in deterministic first-seen order.
+    absent_columns is every column index where at least one row omits the key (stored in
+    the table so the decoder strips those cells). sentinel_columns is the subset of
+    absent_columns where at least one row also carries an explicit JSON null — those
+    columns encode absent cells as ABSENT_MARKER rather than plain null so the decoder
+    can distinguish "omitted" from "present, value null".
+
+    Returns (False, None, None, None) when the list is too small, not all-dicts, or too
+    sparse (fewer than half the cells would be filled — the table header costs more than
+    folding saves at that density; #154's emit-only-if-smaller is the last-resort backstop).
+    """
+    if not isinstance(value, list) or len(value) < 2:
+        return False, None, None, None
+    if not all(isinstance(item, dict) for item in value):
+        return False, None, None, None
+
+    # Union of all keys in deterministic first-seen order.
+    seen: set[str] = set()
+    union_keys: list[str] = []
+    for d in value:
+        for k in d:
+            if k not in seen:
+                seen.add(k)
+                union_keys.append(k)
+
+    # All-uniform is the common case — still tabularizable, just no absent cells.
+    if len(union_keys) == len(value[0]) and all(len(d) == len(union_keys) for d in value):
+        return True, union_keys, set(), set()
+
+    # Shared-key density gate: refuse when fewer than half the cells are filled.
+    total_cells = len(union_keys) * len(value)
+    filled = sum(len(d) for d in value)
+    if filled * 2 <= total_cells:
+        return False, None, None, None
+
+    # Per-column analysis.
+    key_to_idx = {k: i for i, k in enumerate(union_keys)}
+    has_explicit_null: set[int] = set()
+    has_absent: set[int] = set()
+    for d in value:
+        for k, v in d.items():
+            if v is None:
+                has_explicit_null.add(key_to_idx[k])
+        for k in seen - d.keys():
+            has_absent.add(key_to_idx[k])
+
+    sentinel_columns = has_explicit_null & has_absent
+    return True, union_keys, has_absent, sentinel_columns
 
 
 def _embed_json_string(s: str, tabularize: bool = True) -> dict | None:
@@ -188,31 +258,73 @@ def _embed_json_string(s: str, tabularize: bool = True) -> dict | None:
     return wrapper
 
 
-def _fold_records(records: list[dict], embedded: bool = False) -> tuple[dict, list]:
-    """Fold a uniform-dict list into (spec, positional rows), recursing on dict-columns.
+def _fold_records(records: list[dict], embedded: bool = False,
+                  union_keys: list | None = None,
+                  absent_columns: set | None = None,
+                  sentinel_columns: set | None = None) -> tuple[dict, list]:
+    """Fold a (possibly non-uniform) dict list into (spec, positional rows), recursing
+    on dict-columns.
+
+    When `union_keys` is given, rows may omit keys — absent cells are filled with None
+    or ABSENT_MARKER depending on `sentinel_columns`. Without it, assumes uniform dicts
+    (the common case, and the only path before union-schema tabularize).
 
     A column whose values are themselves all uniform dicts is hoisted: its key-set
     moves to spec['subcols'][col] once, and each cell becomes a positional tuple.
     Non-dict columns are recursed through compress_structure (so a list-of-dicts cell
-    becomes its own sub-table). spec = {'cols': [...], 'subcols': {col: spec, ...}}.
+    becomes its own sub-table). spec = {'cols': [...], 'subcols': {col: spec, ...},
+    'absent_cols': [...]}.
     """
-    keys = list(records[0].keys())
-    posrows = [[rec[k] for k in keys] for rec in records]
+    keys = union_keys if union_keys is not None else list(records[0].keys())
+    absent_cols = absent_columns if absent_columns is not None else set()
+    sentinel_cols = sentinel_columns if sentinel_columns is not None else set()
+    key_to_idx = {k: i for i, k in enumerate(keys)}
+
+    posrows = []
+    for rec in records:
+        row = []
+        for k in keys:
+            if k in rec:
+                row.append(rec[k])
+            else:
+                row.append(ABSENT_MARKER if key_to_idx[k] in sentinel_cols else None)
+        posrows.append(row)
+
     subcols: dict = {}
     n = len(records)
     for ci, k in enumerate(keys):
         col = [posrows[ri][ci] for ri in range(n)]
-        if _uniform_dict_list(col):
-            sub_spec, sub_pos = _fold_records(col, embedded)
-            subcols[k] = sub_spec
-            for ri in range(n):
-                posrows[ri][ci] = sub_pos[ri]
+        # Skip sentinel cells when checking for nested uniform-dict columns.
+        live_rows = [c for c in col if c is not ABSENT_MARKER]
+        if len(live_rows) == n:
+            if _uniform_dict_list(col):
+                sub_spec, sub_pos = _fold_records(col, embedded)
+                subcols[k] = sub_spec
+                for ri in range(n):
+                    posrows[ri][ci] = sub_pos[ri]
+            else:
+                ok, sub_union_keys, sub_absent, sub_sentinel = _tabularizable_dict_list(col)
+                if ok:
+                    sub_spec, sub_pos = _fold_records(col, embedded, sub_union_keys,
+                                                       sub_absent, sub_sentinel)
+                    subcols[k] = sub_spec
+                    for ri in range(n):
+                        posrows[ri][ci] = sub_pos[ri]
+                else:
+                    for ri in range(n):
+                        posrows[ri][ci] = compress_structure(posrows[ri][ci], embedded)
         else:
+            # Non-uniform column with holes — can't be a sub-table.
             for ri in range(n):
                 posrows[ri][ci] = compress_structure(posrows[ri][ci], embedded)
+
     spec: dict = {"cols": keys}
     if subcols:
         spec["subcols"] = subcols
+    if absent_cols:
+        spec["absent_cols"] = sorted(absent_cols)
+        if sentinel_cols:
+            spec["sentinel_cols"] = sorted(sentinel_cols)
     return spec, posrows
 
 
@@ -229,31 +341,68 @@ def compress_structure(obj: Any, embedded: bool = False, tabularize: bool = True
     if isinstance(obj, list):
         if tabularize and _uniform_dict_list(obj):
             spec, posrows = _fold_records(obj, embedded)
-            # `n` is a redundant row-count hint: it lets a reader self-check that it
-            # enumerated every row (fidelity probe found terse's only recall gap was
-            # under-enumeration of wide positional tables). decompress ignores it, so
-            # the round-trip stays exact.
             table = {TABLE_MARKER: 1, "n": len(posrows), "cols": spec["cols"], "rows": posrows}
             if "subcols" in spec:
                 table["subcols"] = spec["subcols"]
+            if "absent_cols" in spec:
+                table["absent_cols"] = spec["absent_cols"]
+            if "sentinel_cols" in spec:
+                table["sentinel_cols"] = spec["sentinel_cols"]
             return table
+        if tabularize:
+            ok, union_keys, absent_columns, sentinel_columns = _tabularizable_dict_list(obj)
+            if ok:
+                spec, posrows = _fold_records(obj, embedded, union_keys,
+                                               absent_columns, sentinel_columns)
+                table = {TABLE_MARKER: 1, "n": len(posrows),
+                         "cols": spec["cols"], "rows": posrows}
+                if "subcols" in spec:
+                    table["subcols"] = spec["subcols"]
+                if "absent_cols" in spec:
+                    table["absent_cols"] = spec["absent_cols"]
+                if "sentinel_cols" in spec:
+                    table["sentinel_cols"] = spec["sentinel_cols"]
+                return table
         return [compress_structure(item, embedded, tabularize) for item in obj]
     if embedded and isinstance(obj, str):
         return _embed_json_string(obj, tabularize) or obj
     return obj
 
 
-def _unfold_row(row: list, cols: list, subcols: dict) -> dict:
-    """Rebuild one record from a positional row + its (possibly nested) header."""
+def _unfold_row(row: list, cols: list, subcols: dict,
+                absent_cols: set | frozenset = frozenset(),
+                sentinel_cols: set | frozenset = frozenset()) -> dict:
+    """Rebuild one record from a positional row + its (possibly nested) header.
+
+    `absent_cols` lists columns where at least one row omits the key. `sentinel_cols`
+    (a subset of absent_cols) lists columns where explicit null also appears — there,
+    ABSENT_MARKER fills absent cells and `None` is preserved as a real value. In
+    non-sentinel absent columns, `None` unambiguously means "key absent" and is skipped.
+    """
     rec = {}
     for ci, k in enumerate(cols):
         cell = row[ci]
+        if ci in absent_cols and ci not in sentinel_cols and cell is None:
+            continue
+        if ci in sentinel_cols and cell == ABSENT_MARKER:
+            continue
         sub = subcols.get(k)
         if sub is not None:
-            rec[k] = _unfold_row(cell, sub["cols"], sub.get("subcols", {}))
+            rec[k] = _unfold_row(cell, sub["cols"], sub.get("subcols", {}),
+                                 _absent_cols_set(sub), _sentinel_cols_set(sub))
         else:
             rec[k] = decompress_structure(cell)
     return rec
+
+
+def _absent_cols_set(spec: dict) -> set:
+    ac = spec.get("absent_cols")
+    return set(ac) if ac else set()
+
+
+def _sentinel_cols_set(spec: dict) -> set:
+    sc = spec.get("sentinel_cols")
+    return set(sc) if sc else set()
 
 
 def decompress_structure(obj: Any) -> Any:
@@ -262,7 +411,10 @@ def decompress_structure(obj: Any) -> Any:
         if obj.get(TABLE_MARKER) == 1 and "cols" in obj and "rows" in obj:
             cols = obj["cols"]
             subcols = obj.get("subcols", {})
-            return [_unfold_row(row, cols, subcols) for row in obj["rows"]]
+            absent_cols = _absent_cols_set(obj)
+            sentinel_cols = _sentinel_cols_set(obj)
+            return [_unfold_row(row, cols, subcols, absent_cols, sentinel_cols)
+                    for row in obj["rows"]]
         if obj.get(JSON_STR_MARKER) == 1 and "f" in obj and "v" in obj:
             kwargs = _EMBED_FORMS.get(obj["f"])
             if kwargs is None:

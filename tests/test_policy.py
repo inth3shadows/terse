@@ -185,6 +185,53 @@ def test_has_terse_marker_detects_reserved_keys_at_any_depth():
     assert not transforms.has_terse_marker({"terse_table": 1, "~0": "not a marker"})
 
 
+def test_has_terse_marker_detects_the_absent_sentinel_as_a_VALUE():
+    """ABSENT_MARKER is the one marker the codec writes into a CELL, so it collides as a
+    string value and never as a key — a key-only screen would be a silent no-op for it."""
+    assert transforms.has_terse_marker({"a": transforms.ABSENT_MARKER})
+    assert transforms.has_terse_marker([{"x": 1}, {"x": transforms.ABSENT_MARKER}])
+    assert transforms.has_terse_marker(transforms.ABSENT_MARKER)              # bare string
+    assert transforms.has_terse_marker({"deep": {"er": [transforms.ABSENT_MARKER]}})
+    assert not transforms.has_terse_marker({"a": "__terse_absent"})           # near-miss
+    assert not transforms.has_terse_marker({transforms.ABSENT_MARKER: 1})     # key is fine
+
+
+def test_absent_sentinel_collision_would_have_lost_a_field_without_the_guard():
+    """Proves the guard is load-bearing, not decorative. In a column carrying BOTH an
+    explicit null and an absent key, absent cells encode as ABSENT_MARKER — so a record
+    whose real value IS that string decodes as "key absent" and the field vanishes. The
+    round-trip gate catches it, but only by throwing the whole payload's compression away
+    AND recording a `gate_fail` that `policy_gen` reads as "this tool defeats the codec".
+    The guard screens it one layer earlier, at `apply`."""
+    # Wide enough that the table beats plain minify — `compress_with`'s emit-only-if-smaller
+    # backstop otherwise ships the plain form, and the collision never gets the chance to
+    # bite. That is a size accident, not a guarantee, which is why the guard is the fix.
+    recs = []
+    for i in range(10):
+        d = {"name": f"symbol_number_{i}", "kind": "function",
+             "signature": "(a,b,c)->int"}
+        if i % 2 == 0:
+            d["line"] = i * 10
+        if i % 4 == 0:
+            d["note"] = None                              # explicit null -> sentinel column
+        elif i % 4 == 1:
+            d["note"] = transforms.ABSENT_MARKER          # a REAL value that collides
+        recs.append(d)                                    # else: note absent
+
+    # Without the guard this is what the codec would do to it: three records silently
+    # lose "note" entirely, and only the round-trip gate stands between that and the wire.
+    assert transforms.roundtrip_ok(recs) is False
+    decoded = transforms.decompress(transforms.compress(recs))
+    assert [r for r in decoded if "note" not in r] != [r for r in recs if "note" not in r]
+
+    # With it, `apply` never hands the payload to the codec at all.
+    raw = json.dumps(recs)
+    result = apply(raw, "gh.api.x", _policy())
+    assert result.skipped is True
+    assert result.text == raw
+    assert any("reserved terse marker" in w for w in result.warnings)
+
+
 def test_marker_collision_payload_passes_through_uncompressed():
     # A payload that already carries a reserved marker can't be compressed: the consumer
     # reads the marker per the primer and would mis-reconstruct the user's own dict. The

@@ -168,7 +168,7 @@ class Policy:
     # holds. What it did not measure is net token value, because the primer was not yet
     # known to be the dominant cost term.
     #
-    # It is: the primer paragraph explaining the diff envelopes is 190 of 402 cl100k
+    # It is: the primer paragraph explaining the diff envelopes is 190 of 555 cl100k
     # tokens (47%, the largest section) and is re-read every turn per wrapped server. The
     # live all-time ledger over 13.3 days: 7 diff emissions in 1,828 blocks (0.38%),
     # saving 5,052 tokens, against 24,252 assistant turns in the same window — 912x the

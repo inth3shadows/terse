@@ -377,7 +377,7 @@ and Gemini 2.5 Flash match raw-JSON accuracy on the compressed form (100% paired
 37% token saving (`terse fluency`; see TECHNICAL.md). Whole-subtree aliasing (folding
 repeated objects, not just strings) is built. Cross-call diffing is a lossless tier
 that is **off by default** (#170) — not for lack of confidence, but on cost: its primer
-paragraph is 190 of 402 cl100k tokens, re-read every turn per wrapped server, against a
+paragraph is 190 of 555 cl100k tokens, re-read every turn per wrapped server, against a
 measured 0.38% hit rate, so the explanation cost ~900–2,700x what the tier saved. Its full
 validation program did pass: pair fluency
 (`fluency --diff`, 4-model panel 100%), the nested-record surface (`structure`: diff
