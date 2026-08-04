@@ -324,6 +324,23 @@ def test_fluency_report_renders_na_for_inline_when_rows_predate_the_arm():
     assert inline_cell == "n/a"
 
 
+def test_fluency_report_degrades_to_na_when_rows_mix_pre_and_post_arm():
+    from terse.report import build_fluency_report
+    # A results file accumulated/republished over time (this repo's own pattern) can
+    # mix pre-arm rows (no inline_ok) with post-arm ones for the SAME model. `any()`
+    # would pass the has_inline gate on the post-arm row present, then crash in
+    # _form_stats when it unconditionally indexes r["inline_ok"] on the pre-arm row.
+    # Must degrade to n/a for the whole model, not raise.
+    rows = ([{"tool": "t", "sha": "s", "qid": "old", "qtype": "count", "transform": "table",
+              "trials": 1, "raw_ok": 1, "terse_ok": 1, "primer_ok": 1}]
+            + [{"tool": "t", "sha": "s", "qid": "new", "qtype": "count", "transform": "table",
+                "trials": 1, "raw_ok": 1, "terse_ok": 1, "primer_ok": 1, "inline_ok": 1}])
+    report = build_fluency_report({"m": rows}, [])  # must not raise KeyError
+    row_line = next(line for line in report.splitlines() if line.startswith("| `m`"))
+    cells = [c.strip() for c in row_line.split("|")]
+    assert cells[6] == "n/a"
+
+
 def test_build_pack_then_score_pack_roundtrips_through_ground_truth():
     pack = fluency.build_pack([{"tool": "demo", "sha": "abc123", "raw": fluency_raw()}])
     assert len(pack["payloads"]) == 1

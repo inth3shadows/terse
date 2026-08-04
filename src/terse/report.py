@@ -1037,7 +1037,11 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         # #168: the same primer delivered with the RESULT instead of at `initialize`. Absent
         # from older result files, which predate the arm — rendered as `n/a`, never as 0%,
         # which would read as "inline comprehension collapsed" rather than "not measured".
-        has_inline = any("inline_ok" in r for r in rows)
+        # ALL rows, not any: a result file that MIXES pre-arm rows (no `inline_ok`) with
+        # post-arm ones would otherwise pass this gate and then crash in `_form_stats`,
+        # which indexes `r[form]` unconditionally — n/a is the correct degrade for a
+        # partially-measured model, not a KeyError.
+        has_inline = bool(rows) and all("inline_ok" in r for r in rows)
         iacc, ise = _form_stats(rows, "inline_ok") if has_inline else (0.0, 0.0)
         regr = sum(1 for r in rows if int(r["raw_ok"]) == r.get("trials", 1)
                    and int(r["terse_ok"]) < r.get("trials", 1))
