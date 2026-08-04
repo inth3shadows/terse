@@ -281,20 +281,33 @@ def test_drop_path_generation_reaches_a_non_uniform_record_list():
 
 def test_shape_classifier_and_codec_agree_on_every_bench_payload():
     """The invariant #4 established and #204 restored: `_has_record_list` is true exactly
-    when the tabularizer would fold something in the payload. Checked over the tracked
-    corpus plus the shapes that broke it before."""
+    when the tabularizer folds something in the payload.
+
+    The oracle is `compress_structure`'s actual OUTPUT — does a `__terse_table__` appear —
+    not a second call to `is_tabularizable`. Asking the predicate about itself is a
+    tautology that stays green through the very regression this test is named for: with the
+    classifier reverted to the strict rule it still passed, and with the codec's union
+    branch disabled while the classifier stayed correct it still passed.
+
+    Deliberately at the `compress_structure` layer, not the wire: `compress_with`'s
+    emit-only-if-smaller can ship plain minify for a payload that DID tabularize, so the
+    equivalence is about what the codec folds, not about what survives the size guard.
+    """
     from pathlib import Path
 
     from terse.capture import _has_record_list
 
     def codec_folds(o):
-        if transforms.is_tabularizable(o):
-            return True
-        if isinstance(o, dict):
-            return any(codec_folds(v) for v in o.values())
-        if isinstance(o, list):
-            return any(codec_folds(x) for x in o)
-        return False
+        """True if compressing `o` actually produces a table anywhere in the result."""
+        def has_table(node):
+            if isinstance(node, dict):
+                if node.get(transforms.TABLE_MARKER) == 1:
+                    return True
+                return any(has_table(v) for v in node.values())
+            if isinstance(node, list):
+                return any(has_table(x) for x in node)
+            return False
+        return has_table(transforms.compress_structure(o))
 
     corpus = Path(__file__).resolve().parent.parent / "scripts" / "bench" / "corpus"
     payloads = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(corpus.glob("*.json"))]

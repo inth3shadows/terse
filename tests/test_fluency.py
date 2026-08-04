@@ -680,3 +680,49 @@ def test_the_eval_pack_primer_explains_every_form_it_renders():
         assert key in PRIMER, f"eval pack primer never names {key!r}"
         assert key in PRIMER_TABLE, f"proxy primer never names {key!r}"
     assert T.ABSENT_MARKER in PRIMER
+
+
+# --- #204: the widened extractor can hand back records with differing key sets ---
+
+# Nested one level so `_nested_record_group` (which prefers dict-maps) does not shadow the
+# uniform path — this is the shape that actually reaches `extract_records`.
+_NON_UNIFORM = {"data": {"result": [
+    {"id": 1, "body": "B" * 300, "extra": "e"},
+    {"id": 2, "body": "C" * 300},
+    {"id": 3, "body": "D" * 300},
+]}}
+
+
+def test_gen_questions_survives_records_with_differing_key_sets():
+    """Before #204 the extractor guaranteed identical key sets, so the pickers indexed
+    every record by `records[0].keys()`. Widening it to whatever the tabularizer folds made
+    that a KeyError: `extra` exists only on the first record. Verified — reverting
+    `_intersection_cols` back to `list(records[0].keys())` raises `KeyError: 'extra'` here."""
+    from terse.capture import extract_records
+    records = extract_records(_NON_UNIFORM)
+    assert records == _NON_UNIFORM["data"]["result"]      # the widened extractor reaches it
+    assert not all(set(r) == set(records[0]) for r in records)   # and they differ
+
+    qs = {q.qtype: q for q in fluency.gen_questions(_NON_UNIFORM)}
+    assert qs, "a non-uniform record list should still produce questions"
+    # Only columns present in EVERY record may be asked about — `extra` is not askable.
+    for q in qs.values():
+        assert "extra" not in q.prompt
+
+
+def test_question_columns_are_the_intersection_not_the_first_records_keys():
+    assert fluency._intersection_cols(_NON_UNIFORM["data"]["result"]) == ["id", "body"]
+    # A record list with nothing in common has no well-posed column question at all.
+    assert fluency._intersection_cols([{"a": 1}, {"b": 2}]) == []
+
+
+def test_drop_questions_survive_records_with_differing_key_sets():
+    """`dropeval` fed `records[0].keys()` into the same pickers, so it inherited the same
+    KeyError from the same widening."""
+    from terse import dropeval
+    from terse.policy import Rule
+
+    rule = Rule(tool_glob="*", tiers=("minify", "tabularize"),
+                fields={"data.result[].body": {"lossy": "drop-to-retrieve", "min": 100}})
+    qs, _applied, _staging = dropeval._questions_and_staging(_NON_UNIFORM, rule, "t.x")
+    assert isinstance(qs, list)   # must not raise; content depends on the drop gate
