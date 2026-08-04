@@ -10,6 +10,37 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Fixed
+- **Three `policy.py` soundness gaps the #198 review parked as one issue (#199).**
+  1. `_glob_covers_server` decided cover by string equality against three literal forms
+     while `select` matches by `fnmatch`, so a server literally named `kb[1]` counted
+     `kb[1].*` as covering — `[1]` is a character class and that rule matches none of its
+     tools. Cover is now proved structurally: the whole-world glob, or a metacharacter-free
+     literal prefix no longer than `{server}.` followed by `*`. Deliberately NOT a probe
+     against a representative name (`fnmatch(f"{server}.x", glob)`): that is unsound the
+     other way, calling `kb.?` and `kb.*x` covering because both match the literal `kb.x`
+     while matching no real tool — which terminates `has_drop`'s walk early and drops the
+     dropped-field paragraph **and** the `terse.retrieve` tool from a server that still
+     reaches the drop rule, leaving the model an unretrievable `__terse_dropped__`. Refusing
+     an unproven cover is the safe direction: the walk continues and the caller
+     over-approximates, which is already `reachable_tiers`' contract.
+  2. `_match_candidates`' reported gap — that a peer-qualified `gh__gh.api.items` leaves a
+     server-scoped `gh.*` rule with nothing to match, because candidate[0] keeps the `__` —
+     **was investigated and is not a bug; no change shipped.** `select` also tries the BARE
+     candidate `gh.api.items`, which `gh.*` fnmatches, so the rule was never missing
+     (verified across `gh__gh.api.items`, `gh__gh.rate_limit`, `mcp__gh.search`). The
+     proposed fix was actively harmful: candidate order is major over rule order, so
+     synthesizing `gh.gh.rate_limit` at position 0 lets `gh.*` win one candidate *before* a
+     specific rule can match the bare name. On terse's own `policy.example.json` that turned
+     `{"tool": "*.rate_limit", "tiers": []}` — an explicit passthrough — into `gh.*` with
+     `result[].body` truncation (2,125 bytes lossless became 626 with the body cut), and
+     turned USAGE.md's documented `{"tiers": [], "capture": false}` recipe for keeping a
+     credential tool's output off disk into a rule with `capture: true`, making the payload
+     eligible for the `--capture-dir` corpus and the `--debug-log` replay trace. The guard
+     is unchanged and now carries that measurement; a regression test pins that a specific
+     passthrough rule keeps its `tiers: ()`, its `capture: false` and its empty field map.
+  3. `has_drop` ignored `server_never_lossy`. A server that structurally forbids every drop
+     still paid the 64-token dropped-field paragraph and advertised a `terse.retrieve` it
+     could never mint a handle for.
 - **`has_drop` was the last primer gate ignoring the server (#168).** The other four
   (`emits_table`/`emits_dict`/`emits_embedded`/`emits_diff`) all take a server name and walk
   rules the way `select` does; `has_drop` scanned every rule in the file unconditionally. Peers
