@@ -128,6 +128,16 @@ def _args_key(arguments: Any) -> str:
 #     guard derives the required vocabulary from a real emission, so a header key added to
 #     the codec fails there instead of reaching a model with no rule for reading it.
 #
+# Reconfirmed 2026-08-04 (issue #168): the 87-token encoding was NOT adopted. #168's own
+# weighted-cost model (cache_read 0.1x, cache_write 1.25x) makes the 68-token primer delta
+# worth only ~6.8 weighted tokens/turn, while the 1.7pp of wire savings it trades away
+# lands on cache_write-priced payload tokens — ~12.5x more expensive per token. This
+# repo's own live ledger (`terse stats`) has single table-shaped tools (e.g.
+# kb.read.list_principles: 823 calls, 435,876 raw tokens) large enough that a sliver of
+# non-uniform traffic erases the entire primer-side gain accumulated across every logged
+# call in the ledger's history. Don't re-litigate this without a traffic mix that inverts
+# that ratio.
+#
 # PRIMER_HEAD is the idempotency sentinel: it appears in every non-empty assembly, so
 # `_augment_initialize` can detect its own prior injection without knowing which sections
 # were selected.
