@@ -561,6 +561,34 @@ def test_build_peers_diff_override_reaches_peer_with_own_policy_path(monkeypatch
     assert peers[1].inter.policy.diff_keyframe_interval == 8
 
 
+def test_build_peers_never_attaches_a_lazy_primer(monkeypatch):
+    # #168 phase 2: the router already primes eagerly once via `union_primer` at
+    # `initialize` (`_merge_initialize`) — a peer going lazy too would attach its OWN
+    # primer on its own first compression, on top of that. Pins the explicit
+    # `lazy_primer=False` `_build_peers` passes into every peer's `Interceptor`.
+    from terse import multiproxy as mp
+
+    monkeypatch.setattr(mp, "build_transport",
+                        lambda target, headers=None, env=None, cwd=None: _FakePeerTransport())
+    specs = [DownstreamSpec(name="a", target=["a"], headers={}, policy_path=None)]
+    peers = _build_peers(specs, PLAIN_POLICY, debug=False, capture=None, audit=None,
+                         store=OrderedDict(), store_lock=Lock(), dropped_bytes=[0])
+    inter = peers[0].inter
+    assert inter._lazy_primer is False
+
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "gh.api.items"}}))
+    payload = {"result": [{"id": i, "status": "active"} for i in range(20)]}
+    out = json.loads(inter.transform_response(json.dumps(
+        {"jsonrpc": "2.0", "id": 1,
+         "result": {"content": [{"type": "text", "text": json.dumps(payload)}]}})))
+    # still compressed (the codec is unaffected), but no leading primer block appears —
+    # the router's own eager union primer already covers it
+    blocks = out["result"]["content"]
+    assert len(blocks) == 1
+    assert transforms.TABLE_MARKER in blocks[0]["text"]
+
+
 def test_load_multi_config_rejects_name_containing_prefix_sep(tmp_path):
     # Regression: a name like "gh__api" wasn't rejected, so it could shadow a shorter
     # peer name ("gh") under _route_call's first-occurrence "__" split.
@@ -1605,7 +1633,9 @@ def test_peer_initiated_request_does_not_consume_that_peers_interceptor_pending(
     # does mean this test alone will NOT catch a from_peer regression; the _routed_timers
     # test above is what pins that branch's own behavior.
     t0 = _FakePeerTransport()
-    inter = Interceptor(PLAIN_POLICY)
+    # lazy_primer=False: matches how _build_peers actually constructs a peer's Interceptor
+    # in production (#168 phase 2) — this test is about request-tracking, not primer.
+    inter = Interceptor(PLAIN_POLICY, lazy_primer=False)
     peers = [Peer("a", t0, inter)]
     out = io.StringIO()
     router = Router(peers, out, Lock(), broadcast_timeout=1000)

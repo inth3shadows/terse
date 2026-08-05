@@ -1283,10 +1283,15 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
             # grouping key meaningful without parsing prefixes back out).
             stats = (build_stats_writer(stats_log, spec.name)
                      if stats_log is not None else None)
+            # lazy_primer=False: the router already primes eagerly, once, via
+            # `union_primer` in `_merge_initialize` (#168) — a peer going lazy too would
+            # attach its OWN primer on its own first compression, on top of that, a
+            # redundant (not wrong, just wasteful) double explanation. Peer behavior is
+            # deliberately unchanged by #168 phase 2; see that plan's Scope section.
             inter = Interceptor(pol, debug=debug, capture=capture, audit=audit,
                                 stats=stats, server_name=spec.name, store=store,
                                 store_lock=store_lock, dropped_bytes=dropped_bytes,
-                                log_prefix="[terse-multiproxy]")
+                                log_prefix="[terse-multiproxy]", lazy_primer=False)
             transport = build_transport(spec.target, headers=spec.headers or None,
                                         env=spec.env, cwd=spec.cwd)
             peers.append(Peer(name=spec.name, transport=transport, inter=inter))

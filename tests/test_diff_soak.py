@@ -82,7 +82,9 @@ class Soak:
     def __init__(self, interval: int):
         pol = Policy(rules=[Rule("*", TIERS)], diff=True,
                      diff_keyframe_interval=interval)
-        self.inter = Interceptor(pol)
+        # lazy_primer=False: this harness is about diff-chain drift, not primer delivery —
+        # ModelView reads content[0] as the sole emitted form per call.
+        self.inter = Interceptor(pol, lazy_primer=False)
         self.view = ModelView()
         self.mid = 0
         self.consec: dict[str, int] = {}     # tool -> consecutive emitted diffs

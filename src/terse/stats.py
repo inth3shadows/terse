@@ -563,6 +563,18 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
     nobody called still ships its primer every turn and contributes zero ledger rows. Sizing
     this from the ledger would hide exactly the worst case — the install that is pure cost.
 
+    NOTE (#168 phase 2, lazy primer): the "every turn" premise above is now only true for
+    `state in ("router", "router-ambiguous")` — a multiproxy router still primes eagerly at
+    `initialize` via `union_primer`, unchanged. A standalone `state in ("wrapped",
+    "wrapped-unstashed")` entry (`run_proxy`, `lazy_primer=True` by default) now pays its
+    primer ONCE per session, on its first compressible result, not every turn. This
+    function's `per_turn_tokens`/`tok/turn` figures are therefore a WORST-CASE UPPER BOUND
+    for wrapped/wrapped-unstashed entries (what they would have cost under the old
+    always-eager behavior) and still an accurate live figure for router/router-ambiguous
+    entries. The table/computation below is unchanged; only this framing note and the
+    rendered caveat in `build_primer_section` reflect it — fully re-deriving what "turns
+    covered" should mean for a one-time-not-recurring cost is a follow-up, not this fix.
+
     Each server is sized from ITS OWN policy via `build_primer`, not from a shared constant:
     the primer is assembled per-server from policy-gated sections, so a `minify`-only or
     default-deny server legitimately pays 0. A server whose policy cannot be read is counted
@@ -661,10 +673,12 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         return []
     lines = ["", f"primer liability: {per_turn:,} tok/turn across {len(servers)} wrapped "
                  f"server(s) — NOT in the totals above."]
-    lines.append("  the client re-reads each server's `initialize.instructions` every turn "
-                 "as cache_read,")
-    lines.append("  so this is charged per turn while the savings above are charged per "
-                 "call.")
+    lines.append("  a multiproxy router still re-reads its `initialize.instructions` every "
+                 "turn as cache_read, so that")
+    lines.append("  part of this figure is live. A standalone `terse proxy` entry now pays "
+                 "its primer ONCE per session")
+    lines.append("  (#168 phase 2) — for those, treat this as a WORST-CASE figure, not a "
+                 "live per-turn cost.")
     if liab["unresolved"]:
         lines.append(f"  {liab['unresolved']} server(s) have an unreadable policy and are "
                      f"NOT counted — treat the figure as a lower bound.")

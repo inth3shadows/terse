@@ -10,7 +10,7 @@ import sys
 
 from terse import text_diff, transforms
 from terse.policy import Policy, Rule
-from terse.proxy import Interceptor, run_proxy
+from terse.proxy import PRIMER_HEAD, Interceptor, run_proxy
 
 FULL = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))])
 FAKE = pathlib.Path(__file__).parent / "fake_mcp_server.py"
@@ -29,7 +29,7 @@ def _result_msg(mid, text):
 # --- pure Interceptor logic ---
 
 def test_tracks_request_and_compresses_matching_result():
-    inter = Interceptor(FULL)
+    inter = Interceptor(FULL, lazy_primer=False)
     inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
                                    "params": {"name": "gh.api.items"}}))
     out = inter.transform_response(_result_msg(7, _records_text()))
@@ -215,7 +215,7 @@ def _emit(inter, mid, tool, payload):
 
 
 def test_first_call_has_no_prior_so_sends_full_compressed():
-    inter = Interceptor(DIFF)
+    inter = Interceptor(DIFF, lazy_primer=False)
     text = _emit(inter, 1, "gh.api.items", _records(40))
     assert transforms.DIFF_MARKER not in text
     assert transforms.decompress(text) == _records(40)
@@ -247,17 +247,17 @@ def test_diff_base_is_not_shared_across_interceptors():
     # full. This pins the invariant that makes the diff safe: it names "the prior result
     # already in the model's context", which a cross-session base would not be.
     prev, curr = _records(40), _records(40, change=5)
-    a = Interceptor(DIFF)
+    a = Interceptor(DIFF, lazy_primer=False)
     _emit(a, 1, "gh.api.items", prev)
     assert transforms.DIFF_MARKER in _emit(a, 2, "gh.api.items", curr)   # A diffs
-    b = Interceptor(DIFF)                                                # new session
+    b = Interceptor(DIFF, lazy_primer=False)                             # new session
     assert transforms.DIFF_MARKER not in _emit(b, 1, "gh.api.items", curr)  # no shared base
 
 
 def test_reconnect_clears_diff_base_and_args_so_next_result_re_anchors():
     # An `initialize` means the client rebuilt its context window, so no prior result a diff
     # could reference survives — every base (and its args attribution) must drop.
-    inter = Interceptor(DIFF)
+    inter = Interceptor(DIFF, lazy_primer=False)
     prev, curr = _records(40), _records(40, change=5)
     _emit(inter, 1, "gh.api.items", prev)
     assert transforms.DIFF_MARKER in _emit(inter, 2, "gh.api.items", curr)
@@ -349,7 +349,7 @@ def test_keyframe_forces_full_after_k_consecutive_diffs():
     # chained diff never drifts more than K turns from a self-contained anchor (#8).
     pol = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))],
                  diff=True, diff_keyframe_interval=3)
-    inter = Interceptor(pol)
+    inter = Interceptor(pol, lazy_primer=False)
     texts = [_emit(inter, 1, "gh.api.items", _records(40))]            # full (no prior)
     for i in range(2, 8):                                              # small change each call
         texts.append(_emit(inter, i, "gh.api.items", _records(40, change=i % 40)))
@@ -390,7 +390,7 @@ def test_reinitialize_resets_diff_bases_to_prevent_desync():
     # A client re-handshake (new `initialize`) means the model's context — and the prior
     # result a diff would reference — is gone. Every diff base must drop so the next
     # result re-anchors as a full, never a delta against a lost base (#20).
-    inter = Interceptor(DIFF)
+    inter = Interceptor(DIFF, lazy_primer=False)
     _emit(inter, 1, "gh.api.items", _records(40))            # sets the diff base
     assert "gh.api.items" in inter.last
     inter.note_request(_req(9, "gh.api.slow"))              # an in-flight, unanswered call
@@ -429,7 +429,7 @@ def test_first_non_json_result_has_no_prior_so_passes_through_raw():
 
 
 def test_second_non_json_result_emits_smaller_lossless_text_diff():
-    inter = Interceptor(DIFF)
+    inter = Interceptor(DIFF, lazy_primer=False)
     prev, curr = _log_text(200), _log_text(200, changed_line=100)
     raw_first = _emit_text(inter, 1, "fs.read", prev)
     diff_text = _emit_text(inter, 2, "fs.read", curr)
@@ -442,7 +442,7 @@ def test_second_non_json_result_emits_smaller_lossless_text_diff():
 
 def test_text_diff_off_by_default_and_policy_true_enables():
     # Same default for the CDC text path: off by default (#170), on via "diff": true.
-    inter = Interceptor(DIFF)
+    inter = Interceptor(DIFF, lazy_primer=False)
     prev, curr = _log_text(80), _log_text(80, changed_line=40)
     _emit_text(inter, 1, "fs.read", prev)
     t2 = _emit_text(inter, 2, "fs.read", curr)
@@ -450,7 +450,7 @@ def test_text_diff_off_by_default_and_policy_true_enables():
     assert env.get(text_diff.DIFF_MARKER) == 1
     assert text_diff.text_diff_decode(prev, env) == curr
     off = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))], diff=False)
-    inter = Interceptor(off)
+    inter = Interceptor(off, lazy_primer=False)
     t1 = _emit_text(inter, 1, "fs.read", prev)
     t2 = _emit_text(inter, 2, "fs.read", curr)
     assert t1 == prev and t2 == curr
@@ -522,7 +522,10 @@ def _init_resp(mid=1, instructions=None):
 
 
 def test_initialize_reply_gets_format_primer():
-    inter = Interceptor(DIFF)      # diff opt-in, so the primer covers every form
+    # lazy_primer=False: exercises the still-preserved eager `_augment_initialize` path
+    # (what every multiproxy peer runs) directly. The new default (lazy_primer=True) is
+    # covered by the lazy-primer test block near the bottom of this file (#168 phase 2).
+    inter = Interceptor(DIFF, lazy_primer=False)   # diff opt-in, so the primer covers every form
     inter.note_request(_init_req(1))
     out = json.loads(inter.transform_response(_init_resp(1)))
     instr = out["result"]["instructions"]
@@ -532,7 +535,8 @@ def test_initialize_reply_gets_format_primer():
 
 
 def test_initialize_preserves_existing_instructions():
-    inter = Interceptor(FULL)
+    # lazy_primer=False: same reasoning as test_initialize_reply_gets_format_primer above.
+    inter = Interceptor(FULL, lazy_primer=False)
     inter.note_request(_init_req(1))
     out = json.loads(inter.transform_response(_init_resp(1, "USE TOOL X FIRST.")))
     instr = out["result"]["instructions"]
@@ -575,6 +579,163 @@ def test_primer_injected_once_not_per_message():
     # a second initialize-shaped reply with the same id is no longer tracked -> untouched
     resp2 = _init_resp(1)
     assert inter.transform_response(resp2) == resp2
+
+
+# --- #168 phase 2: lazy primer (default lazy_primer=True) ---
+
+def test_lazy_primer_attaches_to_first_compressible_result_not_initialize():
+    inter = Interceptor(FULL)      # lazy_primer=True is the default
+    inter.note_request(_init_req(1))
+    init_out = json.loads(inter.transform_response(_init_resp(1)))
+    assert "instructions" not in init_out["result"]      # no eager priming
+
+    _note_call(inter, 2, "gh.api.items")
+    out = json.loads(inter.transform_response(_result_msg(2, _records_text())))
+    blocks = out["result"]["content"]
+    assert len(blocks) == 2
+    assert PRIMER_HEAD in blocks[0]["text"]                # leading primer block
+    assert transforms.decompress(blocks[1]["text"]) == json.loads(_records_text())
+    assert inter._primer_sent is True
+
+
+def test_lazy_primer_never_sent_if_no_wrapped_tool_called():
+    inter = Interceptor(FULL)
+    inter.note_request(_init_req(1))
+    out = json.loads(inter.transform_response(_init_resp(1)))
+    assert "instructions" not in out["result"]
+    assert inter._primer_sent is False     # still owed — nothing was ever called to pay it
+
+
+def test_lazy_primer_skips_a_changed_result_with_no_wire_form_marker():
+    # minify-only tier: bytes change (whitespace stripped) but no terse marker is ever
+    # emitted, so `changed=True` alone must not be misread as "a wire form appeared."
+    # Isolates the marker-substring check from the structuredContent guard (see the next
+    # test for that one).
+    pol = Policy(rules=[Rule("plain.*", ("minify",)),
+                        Rule("gh.*", ("minify", "tabularize", "dictionary"))])
+    inter = Interceptor(pol)
+    _note_call(inter, 1, "plain.get")
+    spaced = json.dumps({"a": 1}, indent=2)
+    out1 = json.loads(inter.transform_response(_result_msg(1, spaced)))
+    assert out1["result"]["content"][0]["text"] != spaced   # actually changed (minified)
+    assert len(out1["result"]["content"]) == 1               # no primer block inserted
+    assert inter._primer_sent is False
+
+    # a later call that DOES emit a marker is the one that gets it
+    _note_call(inter, 2, "gh.api.items")
+    out2 = json.loads(inter.transform_response(_result_msg(2, _records_text())))
+    blocks = out2["result"]["content"]
+    assert len(blocks) == 2 and PRIMER_HEAD in blocks[0]["text"]
+    assert inter._primer_sent is True
+
+
+def test_lazy_primer_skips_a_pure_mirror_drop():
+    # structured: replace drops the text mirror entirely — changed=True (the block is
+    # gone) but nothing terse-encoded survives in `content` to explain.
+    pol = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"),
+                             structured="replace")])
+    inter = Interceptor(pol)
+    _note_call(inter, 1, "gh.items")
+    payload = {"rows": [{"id": i, "status": "active"} for i in range(12)]}
+    result = {"content": [{"type": "text", "text": json.dumps(payload)}],
+             "structuredContent": payload}
+    out = json.loads(inter.transform_response(json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "result": result})))
+    assert out["result"]["content"] == []      # mirror dropped, nothing left to attach to
+    assert inter._primer_sent is False
+
+    # a later, text-only compressible call (no structuredContent) still gets it
+    _note_call(inter, 2, "gh.api.items")
+    out2 = json.loads(inter.transform_response(_result_msg(2, _records_text())))
+    blocks = out2["result"]["content"]
+    assert len(blocks) == 2 and PRIMER_HEAD in blocks[0]["text"]
+    assert inter._primer_sent is True
+
+
+def test_lazy_primer_skips_when_structuredcontent_carries_the_marker_too():
+    # structured: compress keeps the text block (unlike "replace" above) but rewrites
+    # structuredContent with the same terse markers. Claude Code discards the text block
+    # entirely whenever structuredContent is present (measured,
+    # scripts/probe/structured_content/) — a leading primer block here would be thrown
+    # away right alongside it, regardless of which field the marker landed in.
+    pol = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"),
+                             structured="compress")])
+    inter = Interceptor(pol)
+    _note_call(inter, 1, "gh.items")
+    payload = {"rows": [{"id": i, "status": "active"} for i in range(12)]}
+    result = {"content": [{"type": "text", "text": json.dumps(payload)}],
+             "structuredContent": payload}
+    out = json.loads(inter.transform_response(json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "result": result})))
+    assert '"__terse_' in json.dumps(out["result"]["structuredContent"])  # it DID rewrite
+    assert len(out["result"]["content"]) == 1       # text block untouched, not dropped
+    assert inter._primer_sent is False              # but no primer attached to it
+
+    # a later, text-only compressible call (no structuredContent) still gets it
+    _note_call(inter, 2, "gh.api.items")
+    out2 = json.loads(inter.transform_response(_result_msg(2, _records_text())))
+    blocks = out2["result"]["content"]
+    assert len(blocks) == 2 and PRIMER_HEAD in blocks[0]["text"]
+    assert inter._primer_sent is True
+
+
+def test_lazy_primer_skips_when_structuredcontent_present_but_untouched():
+    # structured: leave (the default for an unknown/no client) never rewrites
+    # structuredContent — it stays the tool's own native shape, no terse marker in it
+    # at all. The guard is on PRESENCE, not on whether terse rewrote it: this is the
+    # most common real-world trigger for the accepted residual gap (most tools don't
+    # opt a client into structured rewriting), so it needs its own coverage rather than
+    # riding on the "compress" test above.
+    pol = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"),
+                             structured="leave")])
+    inter = Interceptor(pol)
+    _note_call(inter, 1, "gh.items")
+    payload = {"rows": [{"id": i, "status": "active"} for i in range(12)]}
+    result = {"content": [{"type": "text", "text": json.dumps(payload)}],
+             "structuredContent": payload}
+    out = json.loads(inter.transform_response(json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "result": result})))
+    assert out["result"]["structuredContent"] == payload   # left alone, no marker
+    assert '"__terse_' in out["result"]["content"][0]["text"]  # text block DID compress
+    assert len(out["result"]["content"]) == 1               # but no primer block attached
+    assert inter._primer_sent is False
+
+    # a later, text-only compressible call (no structuredContent) still gets it
+    _note_call(inter, 2, "gh.api.items")
+    out2 = json.loads(inter.transform_response(_result_msg(2, _records_text())))
+    blocks = out2["result"]["content"]
+    assert len(blocks) == 2 and PRIMER_HEAD in blocks[0]["text"]
+    assert inter._primer_sent is True
+
+
+def test_lazy_primer_sent_exactly_once_across_many_calls():
+    inter = Interceptor(FULL)
+    for i in range(1, 6):
+        _note_call(inter, i, "gh.api.items")
+        out = json.loads(inter.transform_response(_result_msg(i, _records_text())))
+        blocks = out["result"]["content"]
+        if i == 1:
+            assert len(blocks) == 2 and PRIMER_HEAD in blocks[0]["text"]
+        else:
+            assert len(blocks) == 1
+            assert PRIMER_HEAD not in blocks[0]["text"]
+    assert inter._primer_sent is True
+
+
+def test_lazy_primer_resets_on_reconnect():
+    inter = Interceptor(FULL)
+    _note_call(inter, 1, "gh.api.items")
+    out1 = json.loads(inter.transform_response(_result_msg(1, _records_text())))
+    assert PRIMER_HEAD in out1["result"]["content"][0]["text"]
+    assert inter._primer_sent is True
+
+    inter.note_request(_init_req(2))       # reconnect: new context, new session
+    assert inter._primer_sent is False     # owed again
+
+    _note_call(inter, 3, "gh.api.items")
+    out2 = json.loads(inter.transform_response(_result_msg(3, _records_text())))
+    blocks = out2["result"]["content"]
+    assert len(blocks) == 2 and PRIMER_HEAD in blocks[0]["text"]
 
 
 # --- raw-payload capture tee (#32) ---
@@ -621,7 +782,7 @@ def test_note_request_tool_name_qualifies_capture_but_not_policy_selection():
 def test_capture_failure_never_affects_forwarding():
     def boom(tool: str, raw: str) -> None:
         raise OSError("read-only corpus")
-    inter = Interceptor(FULL, capture=boom)
+    inter = Interceptor(FULL, capture=boom, lazy_primer=False)
     inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                                    "params": {"name": "gh.api.items"}}))
     out = inter.transform_response(_result_msg(1, _records_text()))
@@ -658,8 +819,9 @@ def test_run_proxy_capture_dir_failure_does_not_break_traffic(tmp_path):
     requests = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                            "params": {"name": "gh.api.items"}}) + "\n"
     cin, cout = io.StringIO(requests), io.StringIO()
+    # lazy_primer=False: this test is about capture-sink resilience, not primer delivery.
     rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout,
-                   capture_dir=str(blocker))
+                   capture_dir=str(blocker), lazy_primer=False)
     assert rc == 0
     line = [ln for ln in cout.getvalue().splitlines() if ln.strip()][0]
     text = json.loads(line)["result"]["content"][0]["text"]
@@ -680,8 +842,9 @@ def test_run_proxy_broken_capture_warns_once_without_debug(tmp_path, capsys):
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("x")
     cin, cout = io.StringIO(_two_tool_calls()), io.StringIO()
+    # lazy_primer=False: this test is about capture-sink resilience, not primer delivery.
     rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout,
-                   capture_dir=str(blocker))
+                   capture_dir=str(blocker), lazy_primer=False)
     assert rc == 0
     warnings = [ln for ln in capsys.readouterr().err.splitlines()
                 if "capture skipped" in ln]
@@ -811,11 +974,15 @@ def test_run_proxy_end_to_end_compresses_losslessly():
     assert rc == 0
     by_id = {json.loads(ln)["id"]: json.loads(ln) for ln in cout.getvalue().splitlines() if ln.strip()}
 
-    # initialize: serverInfo intact, and the format primer was injected end-to-end
+    # initialize: serverInfo intact, no eager primer (#168 phase 2 default)
     assert by_id[1]["result"]["serverInfo"]["name"] == "fake"
-    assert "__terse_table__" in by_id[1]["result"]["instructions"]
-    # tools/call result compressed, smaller, and round-trips to the exact original
-    text = by_id[2]["result"]["content"][0]["text"]
+    assert "instructions" not in by_id[1]["result"]
+    # tools/call result: first compressible result, so the primer arrives as a LEADING
+    # block ahead of the compressed data block, end-to-end over the real subprocess
+    blocks = by_id[2]["result"]["content"]
+    assert len(blocks) == 2
+    assert PRIMER_HEAD in blocks[0]["text"]
+    text = blocks[1]["text"]
     expected = {"result": [{"id": i, "status": "active", "url": "https://x.example/api/items"}
                            for i in range(20)]}
     assert transforms.decompress(text) == expected
@@ -835,7 +1002,8 @@ def test_run_proxy_end_to_end_text_diffs_repeated_non_json_reads():
                     "params": {"name": "fs.read"}}),
     ]) + "\n"
     cin, cout = io.StringIO(requests), io.StringIO()
-    rc = run_proxy([sys.executable, str(FAKE)], pol, stdin=cin, stdout=cout)
+    # lazy_primer=False: this test is about text-diff mechanics, not primer delivery.
+    rc = run_proxy([sys.executable, str(FAKE)], pol, stdin=cin, stdout=cout, lazy_primer=False)
     assert rc == 0
     by_id = {json.loads(ln)["id"]: json.loads(ln) for ln in cout.getvalue().splitlines() if ln.strip()}
 
@@ -888,7 +1056,7 @@ def test_audit_logs_unchanged_passthrough_result():
 def test_audit_failure_never_breaks_forwarding():
     def boom(_record):
         raise RuntimeError("disk full")
-    inter = Interceptor(FULL, audit=boom)
+    inter = Interceptor(FULL, audit=boom, lazy_primer=False)
     _note_call(inter, 9, "gh.api.items")
     out = inter.transform_response(_result_msg(9, _records_text()))
     # Forwarding is unaffected by the audit explosion: still the compressed, lossless result.
@@ -1038,7 +1206,9 @@ def test_run_proxy_capture_false_writes_no_corpus_file_for_that_tool(tmp_path):
 def test_stats_callback_sees_raw_and_emitted_per_result():
     from terse.stats import classify_decision
     seen = []
-    inter = Interceptor(FULL, stats=lambda *a: seen.append(a))
+    # lazy_primer=False: this test pins content[0] as the emitted block, orthogonal to
+    # primer delivery (#168 phase 2).
+    inter = Interceptor(FULL, stats=lambda *a: seen.append(a), lazy_primer=False)
     _note_call(inter, 1, "gh.api.items")
     out = inter.transform_response(_result_msg(1, _records_text()))
     assert len(seen) == 1
@@ -1082,7 +1252,7 @@ def test_stats_passthrough_tool_is_labeled_passthrough():
 def test_stats_failure_never_breaks_forwarding():
     def boom(*_a):
         raise RuntimeError("disk full")
-    inter = Interceptor(FULL, stats=boom)
+    inter = Interceptor(FULL, stats=boom, lazy_primer=False)
     _note_call(inter, 9, "gh.api.items")
     out = inter.transform_response(_result_msg(9, _records_text()))
     text = json.loads(out)["result"]["content"][0]["text"]
@@ -1373,7 +1543,7 @@ def _emit_text(inter, mid, tool, text):
 
 
 def test_text_drop_emits_marker_stores_original_and_retrieve_serves_it_back():
-    inter = Interceptor(TEXT_DROP)
+    inter = Interceptor(TEXT_DROP, lazy_primer=False)
     out = _emit_text(inter, 1, "codegraph_explore", _MD)
     assert transforms.DROPPED_MARKER in out
     assert "line 10 of a source file" not in out       # the block really left the wire
@@ -1428,7 +1598,7 @@ def _emit_multi(inter, mid, tool, texts, extra_blocks=None):
 
 
 def test_join_collapses_n_text_blocks_to_one_record_array():
-    inter = Interceptor(DIFF)
+    inter = Interceptor(DIFF, lazy_primer=False)
     raws = _rec_blocks(5)
     content = _emit_multi(inter, 1, "gh.api.items", raws)
     assert len(content) == 1 and content[0]["type"] == "text"
@@ -1531,7 +1701,7 @@ def test_join_refusals_fall_back_to_per_block_and_record_why():
 def test_partial_join_folds_record_run_beside_a_trailing_error_string():
     # kb.read.list_principles in the wild: many object blocks + one bare error string.
     # The FULL join refuses (non_json), but the records must still fold.
-    inter = Interceptor(DIFF)
+    inter = Interceptor(DIFF, lazy_primer=False)
     raws = _rec_blocks(5)
     err = "Error executing tool gh.api.items: upstream 503"
     content = _emit_multi(inter, 1, "gh.api.items", raws + [err])
@@ -1669,7 +1839,7 @@ def test_join_diff_off_folds_records_but_never_diffs():
     nodiff = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))],
                     diff=False, join_blocks=True)
     reasons, stats = _capture_stats()
-    inter = Interceptor(nodiff, stats=stats)
+    inter = Interceptor(nodiff, stats=stats, lazy_primer=False)
     raws = _rec_blocks(5)
     c1 = _emit_multi(inter, 1, "gh.api.items", raws)
     c2 = _emit_multi(inter, 2, "gh.api.items", raws)
@@ -1686,7 +1856,7 @@ def test_server_initiated_request_with_colliding_id_does_not_break_tracking():
     # with an in-flight tools/call id. Popping `pending` for it left the REAL result
     # untracked: silently forwarded UNCOMPRESSED and missing from the ledger.
     reasons, stats = _capture_stats()
-    inter = Interceptor(FULL, stats=stats)
+    inter = Interceptor(FULL, stats=stats, lazy_primer=False)
     inter.note_request(_req(1, "gh.api.items"))
     assert 1 in inter.pending
 
@@ -1707,7 +1877,7 @@ def test_method_bearing_response_still_takes_the_response_path():
     # a `result` is a response (however spec-sloppy), not a server-initiated request. If it
     # were forwarded as a request, every such result would silently go uncompressed and its
     # `pending` entry would leak to PENDING_MAX eviction. Same predicate multiproxy uses.
-    inter = Interceptor(FULL)
+    inter = Interceptor(FULL, lazy_primer=False)
     inter.note_request(_req(2, "gh.api.items"))
     payload = _records(30)
     odd = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
@@ -1729,8 +1899,9 @@ def test_true_notification_returns_before_the_server_request_guard():
 def test_server_initiated_request_colliding_with_initialize_id_keeps_the_primer():
     # The init_id branch has the same exposure: a server request colliding with the
     # initialize id would consume it, and the REAL initialize reply would then never get
-    # the terse primer injected.
-    inter = Interceptor(FULL)
+    # the terse primer injected. lazy_primer=False: exercises the still-preserved eager
+    # path (as run by every multiproxy peer).
+    inter = Interceptor(FULL, lazy_primer=False)
     inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 5, "method": "initialize"}))
     server_req = json.dumps({"jsonrpc": "2.0", "id": 5, "method": "roots/list"})
     assert inter.transform_response(server_req) == server_req
@@ -1874,7 +2045,10 @@ def test_explicit_leave_overrides_a_safe_client():
 def _replace_run(result: dict, *, mode="replace", tiers=("minify", "tabularize", "dictionary"),
                  stats=None):
     """Drive one tools/call whose result is `result`, under `structured=mode`."""
-    inter = Interceptor(Policy(rules=[Rule("gh.*", tiers, structured=mode)]), stats=stats)
+    # lazy_primer=False: these tests are about the mirror-drop mechanism, not primer
+    # delivery (that has its own dedicated coverage, #168 phase 2).
+    inter = Interceptor(Policy(rules=[Rule("gh.*", tiers, structured=mode)]), stats=stats,
+                        lazy_primer=False)
     inter.note_request('{"jsonrpc":"2.0","id":1,"method":"tools/call",'
                        '"params":{"name":"gh.items"}}')
     line = json.dumps({"jsonrpc": "2.0", "id": 1, "result": result})

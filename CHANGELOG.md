@@ -10,6 +10,36 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Added
+- **Lazy primer (#168 phase 2): the format primer no longer rides on every `initialize`
+  reply, paid every turn for the life of the connection.** It now attaches to the first
+  `tools/call` result that actually carries a terse wire form — once per session, as a
+  new leading content block ahead of the compressed data — instead of costing
+  `servers x turns` of cached context regardless of whether a wrapped server is ever
+  called. A session that never touches a wrapped tool now pays zero primer bytes; a
+  session with real tool use pays it once. This is the runtime implementation of the fix
+  the `inline_ok` fluency arm (below, #210) measured safe before it shipped.
+
+  `lazy_primer=True` is the new `Interceptor`/`run_proxy` default (not a CLI flag —
+  ships the same way #204's union-schema tabularize did). Multiproxy peers are
+  explicitly excluded (`_build_peers` passes `lazy_primer=False`): the router already
+  primes eagerly, once, via `union_primer` at its own merged `initialize` — a peer going
+  lazy too would just attach a second, redundant explanation on top of that.
+
+  A result carrying `structuredContent` never gets the lazy-attach treatment, even when
+  a terse marker landed there: measured (`scripts/probe/structured_content/`) that
+  Claude Code discards the text block entirely whenever `structuredContent` is present,
+  so a primer block sitting next to it would be silently thrown away. The proxy waits
+  for a text-only compressible result instead. A session whose *every* wrapped-tool call
+  happens to carry `structuredContent` under a rewriting-eligible client never finds that
+  later call — a known, narrow, accepted gap (comprehension degrades to the un-primed
+  level for that traffic, not to broken output), not a silent one.
+
+  `terse stats`'s primer-liability figure is now a worst-case upper bound for a
+  standalone `terse proxy` entry (it still reflects the old always-eager cost, not the
+  new one-time cost) — still live and accurate for a multiproxy router entry, which is
+  unaffected by this change. Full re-derivation of what "liability" means for a one-time
+  charge is a follow-up.
+
 - **A fourth fluency arm, `inline_ok`, measures #168's "lazy primer" proposal before it
   ships.** `run_payload`/`run_fluency` now also ask each question with the format primer
   riding inline in the user message (no system prompt at all) — the exact delivery mode a
