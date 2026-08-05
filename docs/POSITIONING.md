@@ -1,8 +1,9 @@
 # When to use terse — and when not to
 
-terse has never stated this plainly, and a full measurement session (2026-07-28)
-showed why it needs to: the same codec measures **58.5%** on public GitHub API
-payloads and **6.8%** on this operator's own personal MCP fleet. Both numbers are
+terse has never stated this plainly, and a full measurement session showed why it
+needs to: the same codec measures **59.1%** on public GitHub API payloads
+(`BENCHMARKS.md` §1, re-measured 2026-08-04) and **6.8%** on this operator's own
+personal MCP fleet. Both numbers are
 correct — they are the same tool measured on two different shapes of input. Quoted
 without the shape attached, either one misrepresents what terse does. This doc is
 that attachment.
@@ -12,15 +13,15 @@ that attachment.
 terse's cost and its payoff are charged on different clocks:
 
 - **Savings are paid ONCE, per tool call.** Compress a payload, bank the tokens.
-- **The primer is paid EVERY TURN, PER WRAPPED SERVER.** 212 cl100k tokens (402
-  before #170) are injected into that server's MCP `initialize.instructions` and
-  re-read by the client every request — whether or not that server is actually
-  called on that turn.
+- **The primer is paid EVERY TURN, PER WRAPPED SERVER.** Up to 365 cl100k tokens —
+  every primer section except the diff paragraph, which is off by default (#170) —
+  are injected into that server's MCP `initialize.instructions` and re-read by the
+  client every request, whether or not that server is actually called on that turn.
 
-Break-even at one wrapped server therefore needs **212 tokens of savings per
+Break-even at one wrapped server therefore needs **365 tokens of savings per
 turn**. That single line explains every result below, with no A/B harness required
 to evaluate a new candidate server: estimate its typical payload size and call
-frequency, multiply, compare to 212.
+frequency, multiply, compare to 365.
 
 For a router/multiproxy setup wrapping several servers behind one shared primer, the
 break-even arithmetic is different in *kind*, not degree. The router's
@@ -49,23 +50,25 @@ change needed.
 
 ## Where terse pays off — public API servers
 
-Measured from `scripts/bench/corpus/` (real GitHub REST payloads), current codec:
+Measured from `scripts/bench/corpus/` (real GitHub REST payloads) via
+`uv run scripts/bench/benchmark.py`, current codec — identical to `BENCHMARKS.md`
+§1:
 
 | payload | raw tok | saved | saved% | calls/turn to break even |
 |---|--:|--:|--:|--:|
-| gh_pulls | 152,047 | 115,861 | 76.2% | 0.002 |
-| gh_workflow_runs | 76,260 | 61,318 | 80.4% | 0.003 |
-| gh_commits | 69,910 | 18,702 | 26.8% | 0.011 |
-| gh_issues | 48,811 | 16,483 | 33.8% | 0.013 |
-| gh_dir_listing | 6,736 | 2,114 | 31.4% | 0.100 |
-| gh_commits_flat | 11,015 | 387 | 3.5% | 0.548 |
-| gh_labels | 632 | 96 | 15.2% | 2.208 |
-| gh_rate_limit | 357 | 48 | 13.4% | 4.417 |
-| gh_repo_single | 1,655 | 3 | 0.2% | 70.7 |
-| **weighted** | **367,423** | **215,012** | **58.5%** | |
+| gh_pulls | 151,165 | 114,979 | 76.1% | 0.003 |
+| gh_workflow_runs | 76,032 | 61,090 | 80.3% | 0.006 |
+| gh_issues | 48,032 | 18,629 | 38.8% | 0.020 |
+| gh_commits | 69,652 | 18,444 | 26.5% | 0.020 |
+| gh_dir_listing | 6,736 | 2,114 | 31.4% | 0.173 |
+| gh_commits_flat | 10,886 | 258 | 2.4% | 1.415 |
+| gh_labels | 632 | 96 | 15.2% | 3.802 |
+| gh_rate_limit | 357 | 48 | 13.4% | 7.604 |
+| gh_repo_single | 1,652 | 0 | 0.0% | never |
+| **weighted** | **365,144** | **215,658** | **59.1%** | |
 
-Mean 23,890 tokens saved per call. One `gh_pulls` call pays the primer for roughly
-546 turns.
+Mean 23,962 tokens saved per call. One `gh_pulls` call pays the primer for roughly
+315 turns.
 
 ## Where it does not — pre-projected personal servers
 
@@ -73,14 +76,14 @@ From the live proxy ledger (1,999 blocks, 13.3 days), same codec:
 
 | tool | calls | saved/call | calls/turn to break even |
 |---|--:|--:|--:|
-| kb.read.list_nodes | 6 | 2,176 | 0.1 |
-| secret.list_credentials | 10 | 2,080 | 0.1 |
-| runecho structure (large) | 6 | 898 | 0.2 |
-| codegraph_explore | 7 | 440 | 0.5 |
-| kb.read.get | 45 | 99 | 2.1 |
-| kb.read.list_principles | 962 | 39 | 5.4 |
-| kb.read.search | 188 | 28 | 7.5 |
-| runecho structure (small) | 190 | 6 | 35.7 |
+| kb.read.list_nodes | 6 | 2,176 | 0.2 |
+| secret.list_credentials | 10 | 2,080 | 0.2 |
+| runecho structure (large) | 6 | 898 | 0.4 |
+| codegraph_explore | 7 | 440 | 0.8 |
+| kb.read.get | 45 | 99 | 3.7 |
+| kb.read.list_principles | 962 | 39 | 9.4 |
+| kb.read.search | 188 | 28 | 13.0 |
+| runecho structure (small) | 190 | 6 | 60.8 |
 | secret.* proxy ops | 54 | 0 | never |
 
 Mean 53 tokens saved per call — three orders of magnitude below the public corpus.
@@ -98,7 +101,7 @@ big-payload tool.
 > how often it is called.
 
 Concretely: **wrap a server when its typical payload saves more than
-`212 * (turns per call)` tokens.** Do not wrap it otherwise — the primer is charged
+`365 * (turns per call)` tokens.** Do not wrap it otherwise — the primer is charged
 whether the server is called that turn or not.
 
 ## codegraph — a third category, not an average
@@ -122,8 +125,10 @@ measure the same way it measures JSON.
 
 Router-level primer economics are resolved (see above, #212, closed as no-op): the
 shared `union_primer` is bounded at ~555 tokens independent of peer count, not a
-scaling liability. Diff-tier defaults and the mcp-status classifier that surfaces
-this trade-off at wrap time are tracked in #168 and #174.
+scaling liability. There is no open tracker for diff-tier defaults or an
+mcp-status classifier surfacing this trade-off at wrap time — #168 (the per-server
+primer tax this doc quotes) and #172 (mcp-status stash-membership classification)
+are both closed; nothing currently open covers either follow-up.
 
 ## Related
 
