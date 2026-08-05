@@ -360,6 +360,9 @@ everything screened out and why, is
 
 ## Related Documentation
 
+- [When to use terse (and when not to)](docs/POSITIONING.md) — the economic model
+  (primer cost vs. per-call savings), the break-even rule, and where the codec does
+  and doesn't pay off
 - [Benchmarks](BENCHMARKS.md) — dated, reproducible numbers: terse-vs-TOON (§1–2), the
   cross-call diff axis (§3), competitors (§4), the live production ledger (§5), and
   popular third-party MCP servers + a repo-size sweep (§6)
