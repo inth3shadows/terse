@@ -36,6 +36,7 @@ from .capture import (
     classify_shape,
     coverage,
     extract_records,
+    is_sidecar_filename,
     load_corpus,
     qualify,
 )
@@ -1094,6 +1095,15 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         # the same way, not via plain write_text.
         pack = fluency.build_pack(envelopes, trials=args.trials)
         out = Path(args.pack)
+        # Deliberately a plain mkdir, not mkdir_restricted, despite the file itself being
+        # write_restricted below: `reports/` is a shared, multi-purpose directory (8 other
+        # call sites in this file write spike/probe/diff/verify/tokenizer reports into it
+        # via the same plain out.parent.mkdir), several of them explicitly written 0644
+        # (see write_restricted(..., mode=0o644) elsewhere in this file) because they're
+        # meant to be shared/viewed. Pinning it to 0700 here would silently lock every
+        # OTHER report command's output behind whichever command happened to create the
+        # directory first -- exactly the surprising side effect mkdir_restricted's own
+        # docstring says a directory the operator didn't ask to be restricted must not get.
         out.parent.mkdir(parents=True, exist_ok=True)
         write_restricted(out, _json.dumps(pack, ensure_ascii=False, indent=2))
         nq = sum(len(p["questions"]) for p in pack["payloads"])
@@ -1276,15 +1286,15 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
 def _corpus_size(capture_dir: str | None) -> int:
     """Payload count in a capture dir, 0 for absent/unreadable. Counts filenames rather
     than loading envelopes: this runs on every install and must not pay corpus-parse cost
-    (nor fail an install because one payload is malformed). Skips `_`-prefixed filenames
-    (e.g. `scripts/bench/mcp_servers/mcp_probe.py`'s `_calls.json` sidecar) without
-    opening them — a real capture envelope is never written under that name, so the
-    filter stays free of the parse cost above."""
+    (nor fail an install because one payload is malformed). Skips a sidecar filename (e.g.
+    `scripts/bench/mcp_servers/mcp_probe.py`'s `_calls.json`) without opening it — a real
+    capture envelope is never written under that name, so the filter stays free of the
+    parse cost above."""
     if not capture_dir:
         return 0
     try:
         return sum(1 for p in Path(capture_dir).glob("*.json")
-                   if p.is_file() and not p.name.startswith("_"))
+                   if p.is_file() and not is_sidecar_filename(p.name))
     except OSError:
         return 0
 

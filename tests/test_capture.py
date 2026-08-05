@@ -11,6 +11,7 @@ from terse.capture import (
     append_audit,
     capture_payload,
     find_record_list_with_path,
+    is_sidecar_filename,
     load_corpus,
 )
 
@@ -49,6 +50,37 @@ def test_capture_payload_preserves_captured_at_on_rewrite(tmp_path):
     first = json.loads(p.read_text(encoding="utf-8"))["captured_at"]
     capture_payload("t", json.dumps({"v": 1}), corpus)
     assert json.loads(p.read_text(encoding="utf-8"))["captured_at"] == first
+
+
+def test_load_corpus_silently_skips_a_sidecar_file(tmp_path, capsys):
+    # A `_`-prefixed sidecar (e.g. mcp_probe.py's `_calls.json`, #138) lacks "raw"/"tool",
+    # so it's excluded by the existing envelope-shape check -- no warning, no count, same
+    # as any other non-envelope JSON file. Confirms load_corpus needs no separate by-name
+    # skip: the shape check already handles it correctly and for free.
+    corpus = tmp_path / "corpus"
+    capture_payload("t", json.dumps({"v": 1}), corpus)
+    corpus.joinpath("_calls.json").write_text(
+        json.dumps({"server_name": "memory", "calls": []}), encoding="utf-8")
+    envelopes = load_corpus(corpus)
+    assert len(envelopes) == 1
+    assert capsys.readouterr().err == ""                    # no spurious "skipped" warning
+
+
+def test_load_corpus_still_warns_on_a_corrupt_sidecar(tmp_path, capsys):
+    # A sidecar isn't exempt from the corrupt-JSON warning just because it's never
+    # counted as a payload -- the warning's whole point is "something in this directory
+    # didn't parse", which is just as true of a torn `_calls.json` as a torn envelope.
+    corpus = tmp_path / "corpus"
+    corpus.mkdir(parents=True)
+    corpus.joinpath("_calls.json").write_text("{not valid json", encoding="utf-8")
+    assert load_corpus(corpus) == []
+    assert "skipped 1" in capsys.readouterr().err
+
+
+def test_is_sidecar_filename():
+    assert is_sidecar_filename("_calls.json") is True
+    assert is_sidecar_filename("read_graph__a1b2c3d4.json") is False
+    assert is_sidecar_filename("") is False
 
 
 def test_append_audit_writes_owner_only_and_appends(tmp_path):
