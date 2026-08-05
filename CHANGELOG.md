@@ -10,6 +10,15 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Added
+- **`scripts/bench/mcp_servers/mcp_probe.py` now persists a probe's exact call arguments
+  beside its corpus** (`<corpus_dir>/_calls.json`, #138 step 0). A saved §6 corpus dir
+  previously carried no record of what it was called with — `{tool, shape, bytes, sha,
+  captured_at, server, result_id, raw}`, no `arguments` — which is exactly what blocked a
+  faithful cold re-probe of `memory`/`serena` after the 2026-07-30 round (documented as a
+  blocker in that round's notes). The sidecar is `_`-prefixed so it reads as auxiliary, not
+  a capture envelope; `toon_column.py`'s envelope glob now skips it by name instead of
+  falling through to its (still-correct, just noisier) generic SKIP path.
+
 - **Lazy primer (#168 phase 2): the format primer no longer rides on every `initialize`
   reply, paid every turn for the life of the connection.** It now attaches to the first
   `tools/call` result that actually carries a terse wire form — once per session, as a
@@ -56,6 +65,49 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   system slot.
 
 ### Fixed
+- **§6 re-measured against the merge of #202, and a genuinely cold, argument-recording
+  round settled the two-round-old memory/serena discrepancy (#138 phase 2).** Fresh probes
+  of all 10 servers plus the repo-size sweep, using the new `_calls.json` sidecar so this
+  round's numbers are reproducible in a way earlier ones weren't. Net effect of #202 on the
+  codec column is small: `filesystem/directory_tree` 58.0% → 57.3% (within noise, not the
+  direction #202 usually pushes); every other reproducing row is unchanged.
+
+  Two fixture bugs found and fixed along the way, unrelated to #202: `express` and
+  `fastapi` under `/tmp/mcp-fixtures` had silently become **1-commit shallow clones**
+  despite being pinned at the right tag, degenerating the `git_log` row to a single commit
+  — `git fetch --unshallow` recovered full history (6,103 / 7,521 commits) without a
+  re-clone. And `memory`'s graph was confirmed empty (`MEMORY_FILE_PATH` pointed at a path
+  verified not to exist) before this round's cold probe, closing the "was it warm?"
+  question the 2026-07-30 round couldn't answer for lack of recorded arguments.
+
+  **serena's published 22–37% never reproduces at either edge under two independent
+  re-measures** (the 2026-07-30 reprocessing: 22.2–28.5%; this round's fresh cold probe:
+  21.4–21.7%) — serena carries no session state, so this isn't a warm-state artifact; the
+  most likely explanation is the original high end came from different, unrecorded
+  arguments. §6 now publishes the reproducible range. **memory's gap is re-scoped, not
+  resolved**: a genuinely cold graph this round measured 35.1–41.1%, inside the originally
+  published 27–52% but below the 2026-07-30 reprocessed-capture's 43.9–54.1% — expected,
+  since the percentage is a function of what's actually in the graph, which is
+  round-specific by construction.
+
+  Separately, and unrelated to #202: **cross-call diffing has been opt-in since #170
+  (2026-07-28)**, which predates even the 2026-07-30 §6 round, so §6's "diff tier is
+  universal, zero-config" framing was already stale and nobody had caught it. A plain
+  `terse proxy` today reports `diff_off` for every row in §6's table; the repeat column
+  now documents that it requires `--diff` explicitly (`mcp_probe.py` has no CLI hook to add
+  a proxy flag, so this round used a small `TERSE_BIN` shim — see the updated
+  `scripts/bench/mcp_servers/README.md`). The underlying mechanism is unchanged: re-run
+  with `--diff` and every row reproduces its originally-published diff/text-diff behavior
+  exactly.
+
+  TOON column re-measured on the same fresh captures — **terse 48.0%, TOON 47.5%** over
+  6,243 raw cl100k tokens across 14 JSON-encodable payloads: both serena rows flipped from
+  TOON's best case in the 2026-07-30 round to terse's this round (`get_symbols_overview`
+  21.4% vs 7.1%, `find_symbol` 21.7% vs 4.3%) — plausibly
+  #202's union-schema tabularize, whose fold targets exactly serena's array-of-symbol-record
+  shape, though the original round's unrecorded arguments mean this isn't provable, only
+  plausible. TOON still wins the smallest, most uniform rows, same as before.
+
 - **The shape classifier was narrower than the codec, so the measurement stack under-fired
   on union-schema traffic (#204).** `capture._find_record_list` still used the strict
   identical-keyset rule after #202 widened what the tabularizer folds. A payload where two

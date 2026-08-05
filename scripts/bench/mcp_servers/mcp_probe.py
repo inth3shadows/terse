@@ -187,6 +187,15 @@ def main(argv: list[str]) -> int:
         print(f"calls_json is not valid JSON: {exc}")
         return 2
 
+    # Self-describing runs (#138 Phase 2): persist the exact call arguments beside the
+    # corpus, right after the corpus dir is confirmed to exist. Without this, a later
+    # re-measure of a saved capture dir cannot tell what arguments produced it -- exactly
+    # what blocked the cold memory/serena re-probe last round. `_`-prefixed so it reads
+    # as a sidecar, not a capture envelope, and `toon_column.py`'s envelope glob skips it.
+    os.makedirs(corpus, exist_ok=True)
+    with open(os.path.join(corpus, "_calls.json"), "w", encoding="utf-8") as fh:
+        json.dump({"server_name": server_name, "calls": calls}, fh, indent=2)
+
     proxy_argv = [TERSE_BIN, "proxy", "--server-name", server_name,
                   "--capture-dir", corpus, "--stats-log", stats_log, "--"] + server_argv
 

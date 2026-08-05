@@ -25,6 +25,14 @@ git clone https://github.com/django/django.git     && git -C django  checkout 5.
 
 Small → medium → large: 218 / 3,131 / 6,926 tracked files.
 
+**Verify these aren't shallow.** A plain `git clone` above should give full history, but
+if a fixture dir already exists from a prior round, check `git -C <dir> rev-list --count
+HEAD` isn't suspiciously small (e.g. `1`) before trusting it for `git_log` — a `.git/shallow`
+file (`ls <dir>/.git/shallow`) means a truncated clone happened at some point (found on the
+2026-08-04 round: express and fastapi were both 1-commit shallow clones despite being
+pinned at the right tag, which silently degenerated the `git_log` row to a single commit).
+Fix in place without a full re-clone: `git -C <dir> fetch --unshallow`.
+
 ## Run
 
 ```bash
@@ -147,3 +155,28 @@ all peers, and the ledger attributes savings per peer.
   deadline on a large repo.
 - Tool argument names are worth reading off `tools/list` rather than guessing — e.g.
   serena's `find_symbol` takes `name_path_pattern`, not `name_path`.
+- **Every run now self-describes its arguments.** `mcp_probe.py` writes the exact
+  `calls_json` it was invoked with to `<corpus_dir>/_calls.json` (#138 step 0) — read it
+  back with `python3 -c "import json; print(json.load(open('$CORPUS/_calls.json')))"` to
+  confirm what a saved corpus was actually probed with, instead of guessing from BENCHMARKS
+  prose. `toon_column.py` skips the sidecar by name (it isn't a capture envelope).
+- **Cross-call diffing needs `--diff` since #170 (2026-07-28)** — it is no longer the
+  zero-config default, so a plain `mcp_probe.py` run now reports `diff_off` for every
+  `diff_reason` in `terse stats --log`, even on a repeat with identical arguments.
+  `mcp_probe.py` hard-codes its `proxy_argv` and has no flag to add `--diff` itself; the
+  2026-08-04 §6 round worked around this with a one-line `TERSE_BIN` shim:
+  ```bash
+  cat > /tmp/terse-diff <<'EOF'
+  #!/bin/bash
+  cmd="$1"; shift
+  exec terse "$cmd" --diff "$@"
+  EOF
+  chmod +x /tmp/terse-diff
+  TERSE_BIN=/tmp/terse-diff python mcp_probe.py ...
+  ```
+  Codec % and TOON % are unaffected either way — both are measured off the raw payload
+  captured before any diff decision — only the repeat/`diff_reason` column needs this.
+- **`@modelcontextprotocol/server-memory` accumulates a graph across runs.** For a genuinely
+  cold `read_graph`/`search_nodes` measurement, point `MEMORY_FILE_PATH` at a path you've
+  confirmed doesn't exist yet before populating it — the default location (next to the
+  installed package under `~/.npm/_npx/`) persists between invocations otherwise.

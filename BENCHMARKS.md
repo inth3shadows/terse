@@ -2,10 +2,10 @@
 
 **Last updated: 2026-08-04.** Every figure is dated by section — §1, §3, and the terse
 column of §4 were re-measured 2026-08-04 on the merge of #202; §2 was produced 2026-07-17
-and re-runs byte-identical today; §5 is a live number pulled fresh each time; **§6
-predates #202 and has not been re-measured** — see the note there. Nothing here is
-hand-typed or estimated. If you re-run and get different numbers, the code changed; open
-an issue.
+and re-runs byte-identical today; §5 is a live number pulled fresh each time; **§6 was
+re-measured 2026-08-04**, a fresh, cold, argument-recording run against the same merge —
+see the note there for what moved and what didn't. Nothing here is hand-typed or
+estimated. If you re-run and get different numbers, the code changed; open an issue.
 
 Two different kinds of evidence live here, and the difference matters:
 
@@ -257,14 +257,19 @@ claim, and a better pitch besides.
 
 ---
 
-## §6 — Popular third-party MCP servers (measured 2026-07-30)
+## §6 — Popular third-party MCP servers (re-measured 2026-08-04)
 
-> **Predates #202 and has not been re-measured.** Union-schema tabularize widened what
-> the codec folds, and it moved §1 by +0.8pp. Whether it moves anything here depends on
-> whether these servers emit non-uniform record arrays — plausible, unverified, and not
-> assumed either way. Re-running is a live exercise (three pinned repo clones plus real
-> `npx`/`uvx` servers), tracked separately. §1 and §3 above were re-measured 2026-08-04;
-> §4's terse column too, though its headroom column is still 2026-07-30.
+> **Re-measured against the merge of #202** (union-schema tabularize), superseding the
+> 2026-07-30 numbers below. This was a genuinely fresh, cold run — new `express`/`fastapi`
+> clones (the pinned tags were already checked out but as **shallow** clones, `git log`
+> from a single commit; unshallowed to get a real `git_log` payload), a `memory` graph
+> started empty and verified so before populating it, and every call's exact tool
+> arguments now persisted beside its corpus (`mcp_probe.py`'s new `_calls.json` sidecar,
+> #138 step 0) so the next re-measure never has to guess. Net effect on the codec column:
+> small and mixed — `filesystem/directory_tree` moved 58.0% → 57.3% (a wash, within
+> measurement noise, not the direction #202 usually pushes); every other row that
+> reproduces the same shape is unchanged. **The bigger finding this round is unrelated to
+> #202**: see the "diff tier now needs `--diff`" note below.
 
 §5 is one person's traffic. This section is the other half: what terse does **automatically,
 zero-config** to the output of widely-used, **credential-free** MCP servers that anyone can
@@ -278,31 +283,50 @@ credential-free community servers added in this round, **duckduckgo-mcp-server**
 **@devabdultech/hn-mcp-server** (Hacker News), to broaden shape coverage beyond the original
 six.
 
-| server | tool | output shape | codec % (1-shot) | TOON % | an *unchanged* repeat | reaches the model? |
+| server | tool | output shape | codec % (1-shot) | TOON % | an *unchanged* repeat† | reaches the model? |
 |---|---|---|--:|--:|---|---|
-| filesystem | `directory_tree` | JSON, pretty-printed | **50–58%** | 50–69% | diff | ⚠️ no — see below |
+| filesystem | `directory_tree` | JSON, pretty-printed | **57.3%** | 56.3% | diff | ⚠️ no — see below |
 | filesystem | `read_text_file` | source text | 0% | n/a | text-diff | ⚠️ no — see below |
 | git | `git_log` | long text | 0% | n/a | text-diff | yes |
-| memory | `read_graph`, `search_nodes`, `create_entities` | JSON | **27–52%** | 35–39% | diff (on `read_graph`) | ⚠️ no — see below |
-| serena | `get_symbols_overview`, `find_symbol` | JSON, already compact | **22–37%** | 6–30% | diff (on `get_symbols_overview`) | yes |
+| memory | `read_graph`, `search_nodes`, `create_entities` | JSON | **35.1–41.1%** | 26.6–42.1% | diff (on `read_graph`, `search_nodes`) | ⚠️ no — see below |
+| serena | `get_symbols_overview`, `find_symbol` | JSON, already compact | **21.4–21.7%** | 4.3–7.1% | — (too small to beat a re-send at this size; diff does land at ~300 tok, see below) | yes |
 | playwright | `browser_snapshot` | accessibility tree (text) | 0% | n/a | text-diff | yes |
 | fetch | `fetch` | markdown | 0% | n/a | text-diff | yes |
-| sequential-thinking | `sequentialthinking` | JSON, pretty-printed | **34%** | 32% | — (identical args, diff not smaller) | yes |
+| sequential-thinking | `sequentialthinking` | JSON, pretty-printed | **34.1%** | 31.7% | — (identical args, diff not smaller) | yes |
 | everything | `get-structured-content` | JSON, tiny (14 raw tok) | 0% (below the small-payload floor) | 0% | — | ⚠️ no — declares `outputSchema` |
 | duckduckgo-mcp-server | `search` | formatted text | 0% | n/a | text-diff | yes |
 | hn-mcp-server | `getStories` | formatted text | 0% | n/a | text-diff | yes |
 
-**`n/a` is not `0%`.** TOON is a JSON serialization; on the six text rows it cannot encode
-the payload at all, which is a different fact from "encoded it and tied". terse also scores
-0% one-shot there — the honest reading of those rows is that *neither* tool claims anything
-on prose, and both fall back to the diff tier. 13 of the 25 captured payloads in this table
-are non-JSON.
+**† Since #170 (2026-07-28) cross-call diffing is no longer the zero-config default** —
+every cell in this column was measured with `--diff` passed explicitly (a tiny `TERSE_BIN`
+wrapper this round, since `mcp_probe.py` has no CLI hook to add a proxy flag; see the
+methodology note below the headline). Run these servers with a plain `terse proxy`
+(no `--diff`) today and every one of these rows reads `diff_off` in the ledger instead —
+a real behavior change from when this table was first published, not a measurement
+artifact. The **codec %** and **TOON %** columns are unaffected either way: they come from
+the raw payload terse tees to the capture dir *before* any diff decision, so #170 doesn't
+touch them.
 
-Weighted over only the 12 payloads TOON *can* encode (5,408 raw cl100k tokens):
-**terse 53.6%, TOON 49.5%.** terse wins the two largest JSON payloads
-(`directory_tree` 58.0% vs 56.3%; `memory.read_graph` 54.1% vs 35.4%) and loses two small
-ones — TOON takes the 116-token `directory_tree` (69.0% vs 54.3%) and the 123-token
-`serena.get_symbols_overview` (30.1% vs 28.5%). Published as the trade, not smoothed into a
+**`n/a` is not `0%`.** TOON is a JSON serialization; on the six text-shaped tools it cannot
+encode the payload at all, which is a different fact from "encoded it and tied". terse also
+scores 0% one-shot there — the honest reading of those rows is that *neither* tool claims
+anything on prose, and both fall back to the diff tier. 14 of the 28 payloads captured this
+round (across the 11 headline tools, the repo-size sweep, and one supplementary larger
+serena call — see below) are non-JSON.
+
+Weighted over only the 14 payloads TOON *can* encode (6,243 raw cl100k tokens):
+**terse 48.0%, TOON 47.5%.** terse still wins the largest JSON payload
+(`directory_tree` 2,696 tok, 57.3% vs 56.3%) and the next-largest (`memory.read_graph`
+610 tok, 40.3% vs 37.4%). The bigger change from the 2026-07-30 round is **serena**: both
+its rows flipped from TOON's best case to terse's — `get_symbols_overview` 21.4% vs 7.1%,
+`find_symbol` 21.7% vs 4.3%, where the previous round had TOON winning the smaller of the
+two. The most likely explanation is #202's union-schema tabularize, whose fold targets
+exactly serena's shape (an array of symbol records) — plausible, not proven here (the
+original round's exact serena arguments were never recorded, which is the gap step 0
+fixes going forward). TOON still wins the smallest, most uniform rows —
+`filesystem-sweep-express`'s 116-token `directory_tree` (69.0% vs 54.3%, unchanged from
+before) and two of memory's four sub-tools (`create_relations` 57.1% vs 49.0%,
+`search_nodes` 42.1% vs 41.1%, both near-ties). Published as the trade, not smoothed into a
 single verdict: TOON's header-once row format wins where a payload is small and perfectly
 uniform, which is the same shape-conditional result §1 and §2 found.
 
@@ -312,19 +336,41 @@ Reproduce the TOON column from the same capture dirs the codec column came from:
 uv run python scripts/bench/mcp_servers/toon_column.py "$CORPUS" [more CORPUS dirs...]
 ```
 
-> **Discrepancy, stated rather than smoothed (2026-07-30).** The TOON column was computed
-> by re-measuring this round's saved capture dirs, so both columns describe the same bytes.
-> That re-measure reproduces `filesystem` (50.5/54.3/58.0%), `sequential-thinking` (34.1%)
-> and `everything` (0%) exactly, but gives **memory 44–54%** against the 27–52% published
-> above, and **serena 22–29%** against 22–37%. The published cells are left as-is because
-> the saved captures cannot be *proven* to be the exact ones those two ranges were written
-> from — a memory-server graph accumulates across runs. Settling it needs a cold re-probe
-> of `memory` and `serena`, tracked on #138.
+> **Discrepancy, resolved for serena and re-scoped for memory (2026-08-04, #138 step 0-3).**
+> The 2026-07-30 round left this exact gap open because the original probe's call
+> arguments were never recorded — `mcp_probe.py` now writes them beside every corpus
+> (`_calls.json`), so this round's numbers are reproducible in a way the old ones weren't.
+>
+> **serena had no warm-state excuse to begin with** (it carries no persistent graph), and
+> two independent re-measures now agree it doesn't reach the published high end: the
+> 2026-07-30 reprocessing of the saved capture landed at 22.2–28.5%, and this round's fresh
+> cold probe — same two tools, a freshly-indexed project, arguments now on record — lands
+> at **21.4–21.7%**, tighter still. Neither run gets anywhere near the published 37%. The
+> most likely explanation is that the original high end came from a different (larger or
+> deeper) symbol query that was simply never written down — not a measurement error, just
+> an unrecorded one, which is exactly the gap step 0 closes for every future round. The
+> table above now publishes the reproducible range. Separately, this round found serena's
+> diff tier *does* land once a payload clears roughly 300 tokens (a supplementary
+> `get_symbols_overview` on a larger file measured 42.3% saved on an identical repeat,
+> against 0% at the ~30-token size in the headline row) — consistent with the repo-size
+> sweep's floor finding below, just observed on a new server.
+>
+> **memory does carry real state**, so "cold" only means "verified-empty before this
+> round's own graph was written" — it says nothing about what the original round's graph
+> held. This round's graph was built from scratch and confirmed empty first
+> (`rm`'d `MEMORY_FILE_PATH` under a fresh path, checked it didn't exist, then populated
+> it), and measured **35.1–41.1%** across `read_graph`/`search_nodes`/`create_entities` —
+> inside the originally published 27–52%, but below the 2026-07-30 reprocessed-capture's
+> 43.9–54.1%. Unlike serena, this gap is not resolved to one number, because it can't be:
+> the percentage is a function of *what's in the graph*, which is round-specific by
+> design, so a different but equally "cold" graph legitimately lands somewhere else in a
+> wide band. The published range below is this round's actual measurement, stated as
+> such rather than reconciled with a number built from different content.
 
-**New in this round — two rows don't fit the "one shape, one number" mold:**
-`sequential-thinking`'s single-thought payload is small enough (82 raw tokens) that the
-34% comes almost entirely from minify, not structural folding — read it as a bound, not a
-ceiling: real chains with many thoughts will look more like a JSON-array-of-records row.
+**Two rows don't fit the "one shape, one number" mold** (both reproduce byte-for-byte this
+round): `sequential-thinking`'s single-thought payload is small enough (82 raw tokens) that
+the 34% comes almost entirely from minify, not structural folding — read it as a bound, not
+a ceiling: real chains with many thoughts will look more like a JSON-array-of-records row.
 `everything`'s `get-structured-content` payload (14 raw tokens, a toy weather object) is
 the smallest thing measured in this table and it demonstrates the **floor**, not a
 weakness: terse correctly does nothing to a payload with no redundancy left to fold rather
@@ -384,11 +430,13 @@ Note the structured form is *larger* than the text block it mirrors — the JSON
 re-encodes newlines as `\n` escapes — so on this tool the client's choice costs more than
 the text block would have, before terse enters the picture at all.
 
-**What survives this correction:** serena's 18–22% is the only non-zero one-shot codec
-number in the table that reaches the model, and the diff tier still lands on `git`,
-`serena`, `playwright` and `fetch`. The claim below — codec narrow, diff broad — holds;
-it is narrower than first published, and the two rows carrying the biggest codec numbers
-are the two that don't count.
+**What survives this correction:** serena's 21.4–21.7% (this round's re-measure, above) is
+the only non-zero one-shot codec number in the table that reaches the model, and the diff
+tier still lands on `git`, `playwright` and `fetch` — and on `serena` too, just not at the
+headline row's small size (see the size-floor note above the table: it needs roughly
+300 raw tokens before a diff beats a re-send). The claim below — codec narrow, diff
+broad — holds; it is narrower than first published, and the two rows carrying the biggest
+codec numbers are the two that don't count.
 
 Tracked in #128. The ledger was corrected first (it had the same flaw one level down, and
 now counts the untouched duplicate on both sides); re-running these numbers per-server is
@@ -404,19 +452,26 @@ result — the duplicate is a *wire* cost on this client, not a context one, so 
 2,596-char mirror shows up in the ledger's `raw_chars` and never in a token bill. A client
 that forwarded both fields would be the one that benefits, and none has been measured.
 
-### The headline: the codec is narrow, the diff tier is universal
+### The headline: the codec is narrow, the diff tier is broad — and opt-in since #170
 
-Two things fall out, and they matter more than any single percentage:
+Two things fall out, and they matter more than any single percentage. A third, new this
+round: **since #170 (2026-07-28) the diff tier is opt-in, not automatic.** Everything the
+repeat column shows below describes `terse proxy --diff`, not the zero-config default a
+user gets by just pointing `terse proxy` at a server — that default now reads `diff_off`
+in the ledger for every row in this table. The codec % and TOON % columns are unaffected
+(they're measured off the raw payload, captured before any diff decision); only the
+*repeat* story requires the flag.
 
 1. **The one-shot codec pays only on JSON — and how much depends on whether the server
    pretty-prints.** filesystem pretty-prints its tree, so minify alone is most of 50–58%.
-   memory returns compact-ish JSON records (40–42%). serena emits *already-compact* JSON, so
-   only the structural fold is left (18–22%) — the hardest honest case, and exactly the
-   "pure structural gain" framing at the top of this file.
+   memory returns compact-ish JSON records (35–41% this round). serena emits
+   *already-compact* JSON, so only the structural fold is left (21–22%, this round tighter
+   than the 22–37% first published — see the discrepancy note above) — the hardest honest
+   case, and exactly the "pure structural gain" framing at the top of this file.
 2. **Every text-shaped tool is 0% on the codec — and every one still wins on an *unchanged*
-   repeat.** `read_text_file`, `git_log`, `browser_snapshot`, and `fetch` are all
-   uncompressible one-shot, yet all four emit a content-defined-chunking text diff the
-   second time they are called.
+   repeat, once `--diff` is on.** `read_text_file`, `git_log`, `browser_snapshot`, and
+   `fetch` are all uncompressible one-shot, yet all four emit a content-defined-chunking
+   text diff the second time they are called under `--diff`.
 
 **Read the repeat column as a ceiling, not a typical delta.** Both calls send identical
 arguments against an unchanged fixture, so `prev == curr`: the diff encodes an empty
@@ -427,36 +482,45 @@ column is a *number* and this one is only qualitative (`diff` / `text-diff` / `�
 loop re-fetches results that have **changed**, and how much the delta grows with the change
 is workload-specific and **not measured here**.
 
-So on third-party servers the **cross-call diff is the broad, shape-independent win, and the
-codec is the JSON-specific one** — narrowed further by the `structuredContent` note above,
-which removes both of the codec's biggest rows from what the model actually receives, and
-leaves the diff tier landing on four of the six servers. That is a sharper claim than a blended average, and it
-predicts where terse helps: agent loops that call the same tool repeatedly. Browser
-automation is the shape it should suit best — navigate → snapshot → act → snapshot produces
-consecutive, largely-overlapping accessibility trees. Stated as a *prediction*, not a
-result: what was measured is an identical repeat; a post-click tree is a different and
-untested experiment.
+So on third-party servers the **cross-call diff is the broad, shape-independent win once
+opted in, and the codec is the JSON-specific, zero-config one** — narrowed further by the
+`structuredContent` note above, which removes both of the codec's biggest rows from what
+the model actually receives, and leaves the diff tier landing on 8 of the 11 rows measured
+this round — every row except `sequential-thinking`, `everything`, and serena's headline
+row, all three blocked by the same small-payload floor, not by shape (serena's own diff
+does land once its payload clears ~300 tokens, see above). That is a sharper claim than a
+blended average, and it
+predicts where terse helps: agent loops that call the same tool repeatedly, run with
+`--diff` turned on. Browser automation is the shape it should suit best — navigate →
+snapshot → act → snapshot produces consecutive, largely-overlapping accessibility trees.
+Stated as a *prediction*, not a result: what was measured is an identical repeat; a
+post-click tree is a different and untested experiment.
 
 **Which command produces which column:** codec % comes from `terse measure --corpus`; the
-repeat column comes from `terse stats --log` (its `diff_reason` breakdown). Capture is
-content-addressed, so two identical repeats collapse into one corpus file — the corpus
-alone can never evidence the repeat column, only the ledger can.
+repeat column comes from `terse stats --log` (its `diff_reason` breakdown) on a proxy run
+with **`--diff`** (no longer the default post-#170 — `mcp_probe.py` has no CLI hook to add
+the flag itself, so this round used a one-line `TERSE_BIN` wrapper that inserts it; see
+`scripts/bench/mcp_servers/README.md`). Capture is content-addressed, so two identical
+repeats collapse into one corpus file — the corpus alone can never evidence the repeat
+column, only the ledger can, and only when that ledger came from a `--diff` run.
 
 ### Repo size barely moves the codec
 
 `directory_tree` across three pinned fixtures — express v5.2.1 (218 tracked files), fastapi
 0.139.2 (3,131), django 5.2.16 (6,922):
 
-| fixture | raw tok | codec % | repeat |
+| fixture | raw tok | codec % | repeat† |
 |---|--:|--:|---|
 | express | 116 | 54.3% | diff not smaller (payload too small) |
 | fastapi | 1,328 | 50.5% | **diff emitted** |
-| django | 2,696 | 58.0% | **diff emitted** |
+| django | 2,696 | 57.3% | **diff emitted** |
 
-The codec sits in a **50–58% band across a 23× payload-size range** — it tracks JSON
+Reproduces the 2026-07-30 round almost exactly (express and fastapi byte-identical; django
+58.0% → 57.3%, inside measurement noise and not the direction #202 usually pushes). The
+codec sits in a **50–58% band across a 23× payload-size range** — it tracks JSON
 structure, not repo size. What size *does* change is the **diff**: below roughly a thousand
 tokens the delta loses to simply re-sending the compressed form; above it the diff wins and
-keeps winning.
+keeps winning. † Same `--diff`-required caveat as the main table.
 
 ### Zero-config auto-policy holds up
 
