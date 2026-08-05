@@ -21,7 +21,11 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "bench" / "mcp_server
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("mcp_probe", SCRIPT)
+    # Registered under a test-file-qualified name, not the bare script name -- avoids
+    # colliding in sys.modules with anything else that might load a same-named script
+    # (the repo has a few of these importlib.util-loaded test modules for scripts/ files
+    # outside the installed package; each uses its own ad hoc name today).
+    spec = importlib.util.spec_from_file_location("tests.test_mcp_probe._mcp_probe", SCRIPT)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod

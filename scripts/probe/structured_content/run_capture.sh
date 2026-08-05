@@ -31,7 +31,15 @@ TOOL="${TOOL:-records}"
 [ -n "$TERSE_BIN" ]  || { echo "no terse on PATH; set TERSE_BIN"  >&2; exit 2; }
 [ -f "$CA" ] || { echo "mitmproxy CA missing at $CA — run mitmdump once to generate it" >&2; exit 2; }
 
-mkdir -p "$OUTDIR"; chmod 700 "$OUTDIR"
+# -m at creation, not a separate chmod after: the two-syscall mkdir+chmod sequence left a
+# window where $OUTDIR was briefly at the shell's umask (world/group-readable+listable),
+# exposing a real capture's tool-call inventory to another local user during it. `-p`
+# leaves an ALREADY-existing dir at whatever mode it already has (same "operator's
+# directory, operator's mode" rule terse's own mkdir_restricted follows) -- only a fresh
+# creation is affected.
+# shellcheck disable=SC2174  # -m only applying to the deepest dir is fine here: $OUTDIR's
+# parent (${TMPDIR:-/tmp}) always already exists, so the deepest dir IS the one we want.
+mkdir -p -m 700 "$OUTDIR"
 
 # --no-stats: this probe must not write into the user's real savings ledger. Its calls are
 # synthetic and would skew `terse stats` for every genuinely-wrapped server.

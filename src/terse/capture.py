@@ -270,6 +270,18 @@ def append_audit(record: dict[str, Any], log_path: str | Path) -> None:
     append_restricted(p, json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def is_sidecar_filename(name: str) -> bool:
+    """True for a `_`-prefixed filename in a corpus/capture dir -- never a real capture
+    envelope (e.g. `scripts/bench/mcp_servers/mcp_probe.py`'s `_calls.json`, #138).
+    Shared so the places that scan such a directory by filename (this module's own
+    `load_corpus` shape check already excludes it structurally; `cli.py`'s
+    `_corpus_size` and `toon_column.py`'s loader need it explicitly, since both count/
+    load by filename before -- or instead of -- opening the file) stay in sync by
+    construction rather than by three hand-copied `.startswith("_")` checks drifting
+    apart under a future second sidecar type."""
+    return name.startswith("_")
+
+
 def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
     """Load every captured envelope from corpus/, in CAPTURE order.
 
@@ -284,13 +296,6 @@ def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
     loaded: list[tuple[int, str, dict[str, Any]]] = []
     skipped = 0
     for path in corpus.glob("*.json"):
-        # `_`-prefixed files (e.g. scripts/bench/mcp_servers/mcp_probe.py's `_calls.json`
-        # sidecar, #138) are never capture envelopes -- skip by name before paying the
-        # read+parse cost the `"raw" in env and "tool" in env` check below would discard
-        # it on anyway. Same convention `cli.py`'s `_corpus_size` and
-        # `toon_column.py`'s loader already use.
-        if path.name.startswith("_"):
-            continue
         try:
             env = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
