@@ -52,7 +52,7 @@ import subprocess
 import sys
 import threading
 
-from terse._secure_io import mkdir_restricted
+from terse._secure_io import mkdir_restricted, write_restricted
 
 TERSE_BIN = os.environ.get("TERSE_BIN", "terse")
 DEADLINE = float(os.environ.get("PROBE_DEADLINE", "300"))
@@ -177,6 +177,32 @@ def _describe(msg: dict | None) -> tuple[bool, str]:
     return True, f"blocks={len(content)} chars={len(text)}{' DIFF' if is_diff else ''}"
 
 
+def _write_calls_sidecar(corpus: str, server_name: str, calls: list[dict]) -> None:
+    """Persist the exact call arguments beside the corpus (#138 step 0), owner-restricted
+    the same way terse secures a real capture. Without this, a later re-measure of a saved
+    corpus dir cannot tell what arguments produced it -- exactly what blocked the cold
+    memory/serena re-probe in an earlier round. `_`-prefixed so it reads as a sidecar, not
+    a capture envelope; `toon_column.py`'s envelope glob and `cli.py`'s `_corpus_size` both
+    skip it by that convention.
+
+    `mkdir_restricted` (not `os.makedirs`) so a not-yet-existing corpus dir is created
+    owner-only (0700) here, same as terse's own proxy would do inside `terse proxy
+    --capture-dir`. That call runs AFTER this one and no-ops on an existing directory by
+    design (an operator's directory is left at the operator's mode) -- so creating it
+    first at the process umask would silently strip the restriction a corpus dir is
+    supposed to have (capture filenames encode tool + payload hash).
+
+    `write_restricted` (not a plain `open(..., "w")`) for the same reason terse uses it
+    for every other secret-shaped write in this codebase: 0600 instead of the process
+    umask, a symlink guard, and an atomic mkstemp+fsync+replace instead of a truncate-in-
+    place a kill mid-write could leave half-written. The file holds real MCP tool-call
+    arguments, which is the same shape of data `capture_payload()` already protects this
+    way (see `src/terse/capture.py`)."""
+    mkdir_restricted(corpus)
+    write_restricted(os.path.join(corpus, "_calls.json"),
+                      json.dumps({"server_name": server_name, "calls": calls}, indent=2))
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 7 or argv[5] != "--":
         print(__doc__)
@@ -189,21 +215,8 @@ def main(argv: list[str]) -> int:
         print(f"calls_json is not valid JSON: {exc}")
         return 2
 
-    # Self-describing runs (#138 Phase 2): persist the exact call arguments beside the
-    # corpus, right after the corpus dir is confirmed to exist. Without this, a later
-    # re-measure of a saved capture dir cannot tell what arguments produced it -- exactly
-    # what blocked the cold memory/serena re-probe last round. `_`-prefixed so it reads
-    # as a sidecar, not a capture envelope, and `toon_column.py`'s envelope glob skips it.
     try:
-        # mkdir_restricted (not os.makedirs) so a not-yet-existing corpus dir is created
-        # owner-only (0700) here, same as terse's own proxy would do inside `terse
-        # proxy --capture-dir`. That call runs AFTER this one and no-ops on an existing
-        # directory by design (an operator's directory is left at the operator's mode) --
-        # so creating it first at the process umask would silently strip the restriction
-        # a corpus dir is supposed to have (capture filenames encode tool + payload hash).
-        mkdir_restricted(corpus)
-        with open(os.path.join(corpus, "_calls.json"), "w", encoding="utf-8") as fh:
-            json.dump({"server_name": server_name, "calls": calls}, fh, indent=2)
+        _write_calls_sidecar(corpus, server_name, calls)
     except OSError as exc:
         print(f"could not write _calls.json sidecar to {corpus!r}: {exc}")
         return 2
