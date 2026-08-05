@@ -52,6 +52,8 @@ import subprocess
 import sys
 import threading
 
+from terse._secure_io import mkdir_restricted
+
 TERSE_BIN = os.environ.get("TERSE_BIN", "terse")
 DEADLINE = float(os.environ.get("PROBE_DEADLINE", "300"))
 INHERIT_STDERR = os.environ.get("PROBE_STDERR") == "1"
@@ -193,7 +195,13 @@ def main(argv: list[str]) -> int:
     # what blocked the cold memory/serena re-probe last round. `_`-prefixed so it reads
     # as a sidecar, not a capture envelope, and `toon_column.py`'s envelope glob skips it.
     try:
-        os.makedirs(corpus, exist_ok=True)
+        # mkdir_restricted (not os.makedirs) so a not-yet-existing corpus dir is created
+        # owner-only (0700) here, same as terse's own proxy would do inside `terse
+        # proxy --capture-dir`. That call runs AFTER this one and no-ops on an existing
+        # directory by design (an operator's directory is left at the operator's mode) --
+        # so creating it first at the process umask would silently strip the restriction
+        # a corpus dir is supposed to have (capture filenames encode tool + payload hash).
+        mkdir_restricted(corpus)
         with open(os.path.join(corpus, "_calls.json"), "w", encoding="utf-8") as fh:
             json.dump({"server_name": server_name, "calls": calls}, fh, indent=2)
     except OSError as exc:
