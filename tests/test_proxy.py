@@ -679,6 +679,35 @@ def test_lazy_primer_skips_when_structuredcontent_carries_the_marker_too():
     assert inter._primer_sent is True
 
 
+def test_lazy_primer_skips_when_structuredcontent_present_but_untouched():
+    # structured: leave (the default for an unknown/no client) never rewrites
+    # structuredContent — it stays the tool's own native shape, no terse marker in it
+    # at all. The guard is on PRESENCE, not on whether terse rewrote it: this is the
+    # most common real-world trigger for the accepted residual gap (most tools don't
+    # opt a client into structured rewriting), so it needs its own coverage rather than
+    # riding on the "compress" test above.
+    pol = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"),
+                             structured="leave")])
+    inter = Interceptor(pol)
+    _note_call(inter, 1, "gh.items")
+    payload = {"rows": [{"id": i, "status": "active"} for i in range(12)]}
+    result = {"content": [{"type": "text", "text": json.dumps(payload)}],
+             "structuredContent": payload}
+    out = json.loads(inter.transform_response(json.dumps(
+        {"jsonrpc": "2.0", "id": 1, "result": result})))
+    assert out["result"]["structuredContent"] == payload   # left alone, no marker
+    assert '"__terse_' in out["result"]["content"][0]["text"]  # text block DID compress
+    assert len(out["result"]["content"]) == 1               # but no primer block attached
+    assert inter._primer_sent is False
+
+    # a later, text-only compressible call (no structuredContent) still gets it
+    _note_call(inter, 2, "gh.api.items")
+    out2 = json.loads(inter.transform_response(_result_msg(2, _records_text())))
+    blocks = out2["result"]["content"]
+    assert len(blocks) == 2 and PRIMER_HEAD in blocks[0]["text"]
+    assert inter._primer_sent is True
+
+
 def test_lazy_primer_sent_exactly_once_across_many_calls():
     inter = Interceptor(FULL)
     for i in range(1, 6):
