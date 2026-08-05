@@ -13,15 +13,23 @@ that attachment.
 terse's cost and its payoff are charged on different clocks:
 
 - **Savings are paid ONCE, per tool call.** Compress a payload, bank the tokens.
-- **The primer is paid EVERY TURN, PER WRAPPED SERVER.** Up to 365 cl100k tokens —
-  every primer section except the diff paragraph, which is off by default (#170) —
-  are injected into that server's MCP `initialize.instructions` and re-read by the
-  client every request, whether or not that server is actually called on that turn.
+- **The primer is paid ONCE, PER SESSION, lazily.** As of #211 (`lazy_primer=True`,
+  the CLI's actual default — see `run_proxy` in `src/terse/proxy.py`), a standalone
+  wrapped server no longer injects its primer into `initialize.instructions` at
+  all. It attaches once, to the first `tools/call` result that actually carries a
+  terse wire form. A session that never calls a wrapped tool pays zero primer
+  bytes, instead of paying servers × turns — the architecture a pre-#211 version of
+  this doc described.
 
-Break-even at one wrapped server therefore needs **365 tokens of savings per
-turn**. That single line explains every result below, with no A/B harness required
-to evaluate a new candidate server: estimate its typical payload size and call
-frequency, multiply, compare to 365.
+Break-even at one wrapped server is therefore a ONE-TIME question, not a per-turn
+one: does this server's typical call save more tokens than the primer it will
+attach to costs? The full-gate primer ceiling — every section on, matching the
+router table below — is **555 cl100k tokens** (a server whose policy can't emit
+every wire form pays less). A single call that saves more than 555 tokens repays
+the entire session's primer cost by itself; every call after that — and every call
+in a session where the server is never invoked at all — costs nothing further
+toward the primer. There is no recurring ratio to maintain, because #211 removed
+the recurring charge.
 
 For a router/multiproxy setup wrapping several servers behind one shared primer, the
 break-even arithmetic is different in *kind*, not degree. The router's
@@ -54,43 +62,50 @@ Measured from `scripts/bench/corpus/` (real GitHub REST payloads) via
 `uv run scripts/bench/benchmark.py`, current codec — identical to `BENCHMARKS.md`
 §1:
 
-| payload | raw tok | saved | saved% | calls/turn to break even |
+| payload | raw tok | saved | saved% | calls to clear the one-time 555-tok primer |
 |---|--:|--:|--:|--:|
-| gh_pulls | 151,165 | 114,979 | 76.1% | 0.003 |
-| gh_workflow_runs | 76,032 | 61,090 | 80.3% | 0.006 |
-| gh_issues | 48,032 | 18,629 | 38.8% | 0.020 |
-| gh_commits | 69,652 | 18,444 | 26.5% | 0.020 |
-| gh_dir_listing | 6,736 | 2,114 | 31.4% | 0.173 |
-| gh_commits_flat | 10,886 | 258 | 2.4% | 1.415 |
-| gh_labels | 632 | 96 | 15.2% | 3.802 |
-| gh_rate_limit | 357 | 48 | 13.4% | 7.604 |
-| gh_repo_single | 1,652 | 0 | 0.0% | never |
+| gh_pulls | 151,165 | 114,979 | 76.1% | 0.005 |
+| gh_workflow_runs | 76,032 | 61,090 | 80.3% | 0.009 |
+| gh_issues | 48,032 | 18,629 | 38.8% | 0.030 |
+| gh_commits | 69,652 | 18,444 | 26.5% | 0.030 |
+| gh_dir_listing | 6,736 | 2,114 | 31.4% | 0.263 |
+| gh_commits_flat | 10,886 | 258 | 2.4% | 2.151 |
+| gh_labels | 632 | 96 | 15.2% | 5.781 |
+| gh_rate_limit | 357 | 48 | 13.4% | 11.563 |
+| gh_repo_single | 1,652 | 0 | 0.0% | never (lossless, nothing to compress) |
 | **weighted** | **365,144** | **215,658** | **59.1%** | |
 
-Mean 23,962 tokens saved per call. One `gh_pulls` call pays the primer for roughly
-315 turns.
+Mean 23,962 tokens saved per call. A single `gh_pulls` call alone saves 114,979
+tokens — 207x the entire one-time 555-token primer — so it clears the whole
+session's primer cost by itself; every call before or after that, on this server
+or in any session where it's never invoked, adds nothing further to the primer
+side of the ledger.
 
 ## Where it does not — pre-projected personal servers
 
-From the live proxy ledger (1,999 blocks, 13.3 days), same codec:
+From the live proxy ledger (2,101 blocks, spans 2026-07-15 to 2026-08-05, snapshot
+2026-08-05 — `terse stats`), same codec:
 
-| tool | calls | saved/call | calls/turn to break even |
+| tool | calls | saved/call | calls to clear the one-time 555-tok primer |
 |---|--:|--:|--:|
-| kb.read.list_nodes | 6 | 2,176 | 0.2 |
-| secret.list_credentials | 10 | 2,080 | 0.2 |
-| runecho structure (large) | 6 | 898 | 0.4 |
-| codegraph_explore | 7 | 440 | 0.8 |
-| kb.read.get | 45 | 99 | 3.7 |
-| kb.read.list_principles | 962 | 39 | 9.4 |
-| kb.read.search | 188 | 28 | 13.0 |
-| runecho structure (small) | 190 | 6 | 60.8 |
-| secret.* proxy ops | 54 | 0 | never |
+| secret.list_credentials | 10 | 2,080 | 0.267 |
+| kb.read.list_nodes | 11 | 1,690 | 0.328 |
+| codegraph_explore | 11 | 1,589 | 0.349 |
+| runecho structure (large) | 6 | 898 | 0.618 |
+| kb.read.get | 62 | 80 | 6.92 |
+| kb.read.list_principles | 823 | 56 | 9.90 |
+| kb.read.search | 216 | 38 | 14.46 |
+| runecho structure (small) | 209 | 6 | 87.1 |
+| secret.* proxy ops | 59 | 0 | never |
 
-Mean 53 tokens saved per call — three orders of magnitude below the public corpus.
-The highest-*volume* tools here are also the *worst* compressors. The live policy
-already says why for kb: "already field-projected + high-cardinality content."
-These servers pre-optimize their own output before terse ever sees it, so there is
-nothing structural left to remove.
+Mean 73 tokens saved per call across the whole ledger (154,101 saved / 2,101
+blocks) — three orders of magnitude below the public corpus (23,962). The
+highest-*volume* tools here are also the *worst* compressors: 823 calls to
+`kb.read.list_principles` bank 56 tokens each, while `codegraph_explore` — called
+only 11 times — banks nearly 30x that per call. The live policy already says why
+for kb: "already field-projected + high-cardinality content." These servers
+pre-optimize their own output before terse ever sees it, so there is nothing
+structural left to remove.
 
 ## The rule
 
@@ -100,9 +115,14 @@ big-payload tool.
 > A server that already projects its fields is not a terse candidate, no matter
 > how often it is called.
 
-Concretely: **wrap a server when its typical payload saves more than
-`365 * (turns per call)` tokens.** Do not wrap it otherwise — the primer is charged
-whether the server is called that turn or not.
+Concretely: **wrap a server when its typical session-lifetime savings clear the
+one-time 555-token primer ceiling.** That can be a single big call (`gh_pulls`
+clears it 207x over on its own) or many small ones accumulating across a session
+(`kb.read.list_principles` needs about 10 calls). Once cleared, every further
+call — in that session or any other session where the server never gets invoked
+at all — costs nothing more toward the primer. Do not wrap a server whose
+realistic session savings can't clear 555; that bar is now paid once, not every
+turn.
 
 ## codegraph — a third category, not an average
 
@@ -111,9 +131,9 @@ one would hide why it wins. Its payload is markdown-plus-source, not JSON — th
 JSON-tier codec measures 0.0% on it because it cannot parse it at all. Its real
 saving comes from a dedicated lossy rule (`$text.code_blocks -> terse.retrieve`,
 #139) — the fleet's *only* lossy-by-default rule — which evicts the fenced-source
-field for a ~90% saving on that field. The 440 tokens/call it shows in the personal
-fleet table above is only the JSON-tier's leftover; the drop rule is where the real
-win lives, and it isn't represented in either table's methodology.
+field for a ~90% saving on that field. The 1,589 tokens/call it shows in the
+personal fleet table above is only the JSON-tier's leftover; the drop rule is
+where the real win lives, and it isn't represented in either table's methodology.
 
 CodeGraph is structurally closer to the GitHub-API case than to the kb case: it's a
 code-intelligence server whose output is inherently large and un-projected. Its win
@@ -125,10 +145,11 @@ measure the same way it measures JSON.
 
 Router-level primer economics are resolved (see above, #212, closed as no-op): the
 shared `union_primer` is bounded at ~555 tokens independent of peer count, not a
-scaling liability. There is no open tracker for diff-tier defaults or an
-mcp-status classifier surfacing this trade-off at wrap time — #168 (the per-server
-primer tax this doc quotes) and #172 (mcp-status stash-membership classification)
-are both closed; nothing currently open covers either follow-up.
+scaling liability. Standalone-server primer economics are resolved too (#211,
+lazy primer). There is no open tracker for diff-tier defaults or an mcp-status
+classifier surfacing this trade-off at wrap time — #168 (per-server primer
+gating) and #172 (mcp-status stash-membership classification) are both closed;
+nothing currently open covers either follow-up.
 
 ## Related
 
