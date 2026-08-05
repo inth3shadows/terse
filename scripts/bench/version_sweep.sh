@@ -51,7 +51,11 @@ have=$(count_json "$ENV_DIR")
 if [ "$have" -ne "$want" ]; then
   [ "$have" -eq 0 ] || echo "envelopes: found $have of $want — rebuilding" >&2
   rm -rf "${ENV_DIR:?}"
-  mkdir -p "$ENV_DIR"
+  # No `mkdir -p "$ENV_DIR"` here: `terse capture`'s own `mkdir_restricted()` creates it
+  # on the first iteration below, owner-only (0700). Pre-creating it at the shell's
+  # umask would make `mkdir_restricted` no-op on an already-existing directory (by
+  # design -- an operator's directory is left at the operator's mode), silently
+  # stripping the restriction envelope filenames (tool + payload hash) are meant to have.
   for f in "$CORPUS"/*.json; do
     (cd "$REPO" && uv run --quiet python -m terse capture "$f" \
         --tool "$(basename "$f" .json)" --server bench --corpus "$ENV_DIR" >/dev/null)

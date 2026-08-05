@@ -284,6 +284,13 @@ def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
     loaded: list[tuple[int, str, dict[str, Any]]] = []
     skipped = 0
     for path in corpus.glob("*.json"):
+        # `_`-prefixed files (e.g. scripts/bench/mcp_servers/mcp_probe.py's `_calls.json`
+        # sidecar, #138) are never capture envelopes -- skip by name before paying the
+        # read+parse cost the `"raw" in env and "tool" in env` check below would discard
+        # it on anyway. Same convention `cli.py`'s `_corpus_size` and
+        # `toon_column.py`'s loader already use.
+        if path.name.startswith("_"):
+            continue
         try:
             env = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
