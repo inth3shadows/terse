@@ -40,3 +40,8 @@ scripts/bench/node_modules/
 # playwright-mcp writes session artifacts (console logs, page snapshots) into its CWD,
 # so running the §6 benchmark from the repo root drops them here (scripts/bench/mcp_servers).
 .playwright-mcp/
+
+# serena-mcp writes its own project index/cache into whatever dir it's pointed at; a §6
+# benchmark round that pointed --project at this repo instead of a pinned fixture (e.g.
+# /tmp/mcp-fixtures/fastapi) drops it here.
+.serena/
