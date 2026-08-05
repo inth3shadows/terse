@@ -64,7 +64,10 @@ def load_payloads(dirs: list[Path]) -> list[dict]:
     """Every capture envelope under `dirs`, deduped by raw-content sha, sorted stably."""
     seen: dict[str, dict] = {}
     for d in dirs:
-        for f in sorted(d.glob("*.json")):
+        # `_calls.json` (mcp_probe.py's argument sidecar, #138 Phase 2) is not a capture
+        # envelope -- skip it by name rather than falling through to the noisy SKIP path
+        # below, which would otherwise fire on every corpus dir from a self-describing run.
+        for f in sorted(p for p in d.glob("*.json") if not p.name.startswith("_")):
             try:
                 env = json.loads(f.read_text())
             except (json.JSONDecodeError, OSError) as exc:
