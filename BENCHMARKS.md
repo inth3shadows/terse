@@ -136,18 +136,20 @@ own traffic). Do **not** read §3 as a claim about aggregate real-world savings;
 Installed and tested, not cited from marketing. Only TOON (§1) is directly comparable on a
 lossless token axis; the rest measure *different guarantees*, so no head-to-head % is
 claimed. TOON's row reproduced byte-identical on 2026-07-30 (see §1); headroom was
-re-tested the same day on real proxied traffic (below) — LLMLingua-2, mcp-compressor, and
+re-tested on 2026-08-05 on real proxied traffic (below) — LLMLingua-2, mcp-compressor, and
 the native context-editing row are unchanged from the 2026-07-17 hands-on test.
 
-**Headroom re-tested 2026-07-30, on its real integration point.** `headroom-ai` moved from
-v0.32.0 to v0.33.0 and pivoted from "JSON compressor" to a full "Context Optimization
+**Headroom re-tested 2026-08-05, on its real integration point.** `headroom-ai` moved from
+v0.33.0 (2026-07-30) to v0.34.0 (this run) — same architecture, same numbers below,
+reproduced exactly. It pivoted from "JSON compressor" to a full "Context Optimization
 Layer" — it's now an **LLM API proxy** (`headroom proxy --backend anthropic`) that sits
 between a coding agent and the model provider, compressing `tool_result` blocks inside real
 Anthropic Messages API traffic. Calling its old standalone compressor function directly (as
 attempted here previously) returns 0% — that function isn't the real path anymore. Correct
 method: stood up a mock Anthropic endpoint, routed realistic `tool_use` → `tool_result`
-conversations (our corpus JSON as the tool output) through a real `headroom proxy`, and
-measured what it actually forwarded upstream, cl100k, same method as §1:
+conversations (our corpus JSON as the tool output) through a real `headroom proxy`
+(`--mode token`, `--stateless`), and measured what it actually forwarded upstream, cl100k,
+same method as §1:
 
 | file | raw tok | **terse** (lossless) | headroom, CCR default (lossy, recoverable) | headroom `--lossless` |
 |---|--:|--:|--:|--:|
@@ -156,14 +158,24 @@ measured what it actually forwarded upstream, cl100k, same method as §1:
 | gh_commits | 69,652 | 26.5% | **46.6%** | 0.0% |
 | gh_rate_limit | 357 | **13.4%** | 0.0% | 0.0% |
 
-The only headroom mechanism that moved anything on this corpus is **CCR row-dropping**:
-rows are deleted and replaced with a `<<ccr:HASH N_rows_offloaded>>` stub the model must
-call a `headroom_retrieve` tool to recover — a lossy, stateful contract, not a smaller
-lossless encoding. Its explicit `--lossless` mode (no CCR, format-native compaction only)
-gave **0% on all four files**; `/readyz` showed its ML backend (`kompress`) never came up
-healthy in this environment, the likely reason. Not tested: real Anthropic credentials or a
-different conversation shape might wake up the lossless path — flagged as an open gap, not
-assumed either way.
+The only headroom mechanism that moved anything on this corpus is **CCR offloading**: a
+span is deleted and replaced with a `<<ccr:HASH ...>>` stub the model must call a
+`headroom_retrieve` tool to recover — a lossy, stateful contract, not a smaller lossless
+encoding. What gets offloaded differs per file: `gh_pulls`/`gh_commits` each get one
+`N_rows_offloaded` marker (row-drop), but `gh_issues` gets **30 markers, all large-string
+offloads** (`string,3.5KB` etc.) — zero rows dropped, same mechanism family, different unit.
+`gh_rate_limit` is untouched content-wise (0%) but still pays for it: CCR unconditionally
+injects a `headroom_retrieve` tool definition (114 cl100k tokens) into every request whether
+or not anything was offloaded, so on this file the net effect of CCR is **negative** — the
+0.0% in the table undercounts the real cost.
+
+Its explicit `--lossless` mode (no CCR, format-native compaction only) gave **0% on all four
+files** — content forwarded byte-identical to the corpus input, verified directly, not
+inferred from the reported percentage. Re-tested with the optional `[ml,code]` extras
+installed (`torch`, `transformers`, `tree-sitter`) to check whether an unhealthy `kompress`
+backend (`/readyz` still reports it unhealthy) explains the 0%: it doesn't — same 0% on all
+four files with the ML backend nominally available. The lossless path is 0% on this corpus
+independent of the ML backend, not a missing-dependency artifact.
 
 **Read the table honestly, not as a sweep:** on `gh_commits`, headroom's *lossy* number is
 larger than terse's *lossless* one — that is a real result, not spun away. On the other
@@ -171,16 +183,15 @@ three files terse's unconditionally-lossless number wins outright even against h
 lossy mode. The honest framing is the trade, not a single winner: headroom can go further
 by deleting data recoverably (or not, with `--no-ccr`); terse never deletes anything.
 
-The terse column here was **re-measured 2026-08-04**; headroom's was not. `gh_issues` moved
-32.7% → 38.8% under union-schema tabularize (#202) and so crossed above headroom's 33.1%,
-which is why this paragraph now names one file where it used to name two. The comparison is
-therefore terse-at-2026-08-04 against headroom-at-2026-07-30 — fine for the direction of the
-trade, not for a tight margin. Re-running headroom means standing its proxy back up (see the
-method note above).
+The terse column was re-measured 2026-08-04 (#207); headroom's was independently re-run
+2026-08-05 (#215) and reproduced its 2026-07-30 numbers exactly — both sides of this table
+are now current, not just directionally comparable. `gh_issues` moved 32.7% → 38.8% under
+union-schema tabularize (#202) and so crossed above headroom's unchanged 33.1%, which is why
+this paragraph names one file where it used to name two.
 
 | Tool | What it is (verified) | Comparable? |
 |---|---|---|
-| **headroom** (`headroom-ai`, v0.33.0) | LLM-API proxy compressing `tool_result` blocks in live Anthropic/OpenAI traffic. Its only active mechanism on this corpus is **CCR row-dropping** (lossy, recoverable via a `retrieve`-tool round-trip against a cache) or `--no-ccr` (lossy, unrecoverable); its `--lossless` mode measured **0%** here. Measured 2026-07-30 on real proxied traffic: 0%–46.6%, see table above. | Partially — same lossy/lossless split as before, but re-measured on its actual integration point (an LLM message proxy) rather than a removed standalone function. |
+| **headroom** (`headroom-ai`, v0.34.0) | LLM-API proxy compressing `tool_result` blocks in live Anthropic/OpenAI traffic. Its only active mechanism on this corpus is **CCR offloading** — rows or large strings, lossy, recoverable via a `retrieve`-tool round-trip against a cache — or `--no-ccr` (lossy, unrecoverable); its `--lossless` mode measured **0%** here. Measured 2026-08-05 on real proxied traffic: 0%–46.6%, see table above (reproduces the 2026-07-30 v0.33.0 run exactly). | Partially — same lossy/lossless split as before, but re-measured on its actual integration point (an LLM message proxy) rather than a removed standalone function. |
 | **LLMLingua-2** (Microsoft) | Lossy prompt token-classifier. Fed JSON it strips syntax (`{`,`}`,`:`,`"`) as low-information and emits **invalid, unparseable JSON**; truncates past 512 tokens. ~50% on both prose and JSON. | No — different axis (prompts, not tool output), lossy, corrupts structure. |
 | **Atlassian mcp-compressor** | Primarily lossless schema/description compression at connect time — **complementary and stackable** with terse (`terse proxy -- mcp-compressor -- <server>`). An opt-in `--toonify` flag also reformats results into TOON (off by default; no diffing/policy/state). | Adjacent, not competing. |
 | **Anthropic / OpenAI context editing** | Native, server-side, **lossy** history-pruning; no local artifact to run keylessly. | Different mechanism (drops old results server-side). |
