@@ -1276,11 +1276,15 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
 def _corpus_size(capture_dir: str | None) -> int:
     """Payload count in a capture dir, 0 for absent/unreadable. Counts filenames rather
     than loading envelopes: this runs on every install and must not pay corpus-parse cost
-    (nor fail an install because one payload is malformed)."""
+    (nor fail an install because one payload is malformed). Skips `_`-prefixed filenames
+    (e.g. `scripts/bench/mcp_servers/mcp_probe.py`'s `_calls.json` sidecar) without
+    opening them — a real capture envelope is never written under that name, so the
+    filter stays free of the parse cost above."""
     if not capture_dir:
         return 0
     try:
-        return sum(1 for p in Path(capture_dir).glob("*.json") if p.is_file())
+        return sum(1 for p in Path(capture_dir).glob("*.json")
+                   if p.is_file() and not p.name.startswith("_"))
     except OSError:
         return 0
 

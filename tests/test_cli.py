@@ -11,7 +11,7 @@ import json
 import stat
 import sys
 
-from terse.cli import _redact_args, main
+from terse.cli import _corpus_size, _redact_args, main
 
 PAYLOAD = json.dumps([{"id": 1, "name": "alpha"}, {"id": 2, "name": "beta"}])
 
@@ -506,6 +506,21 @@ def test_stats_cmd_rejects_bad_since_window(tmp_path, capsys):
     rc = main(["stats", "--log", str(log), "--since", "fortnight"])
     assert rc == 2
     assert "bad --since window" in capsys.readouterr().err
+
+
+def test_corpus_size_skips_underscore_prefixed_sidecars(tmp_path):
+    # Real capture envelopes count...
+    _write(tmp_path, "read_graph__a1b2c3d4.json", PAYLOAD)
+    _write(tmp_path, "search_nodes__e5f6a7b8.json", PAYLOAD)
+    # ...but `_calls.json` (mcp_probe.py's argument sidecar, #138) is never a capture
+    # envelope and must not inflate the "already holds N payload(s)" install-time count.
+    _write(tmp_path, "_calls.json", json.dumps({"server_name": "memory", "calls": []}))
+    assert _corpus_size(str(tmp_path)) == 2
+
+
+def test_corpus_size_absent_or_unreadable_is_zero(tmp_path):
+    assert _corpus_size(None) == 0
+    assert _corpus_size(str(tmp_path / "does-not-exist")) == 0
 
 
 def test_redact_args_masks_two_arg_and_equals_form_secrets():
