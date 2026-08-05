@@ -9,6 +9,50 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Fixed
+- **`terse stats`'s primer liability no longer charges a lazily-primed server as if it
+  primed every turn.** This is the re-derivation #211 left as a follow-up, and until now the
+  report gave standalone installs a headline that was wrong in the direction that costs the
+  operator money.
+
+  There are two cadences and the old model had one. A multiproxy router still primes
+  eagerly, once, into its own merged `initialize.instructions`, which the client re-reads
+  every turn as `cache_read` — genuinely recurring. A standalone `terse proxy` entry has
+  been lazy since #211: its primer attaches to the first result carrying a terse wire form,
+  so it is paid **once per session** if that result comes and **not at all** if it never
+  does. Summing those into one `tok/turn` figure overstated a standalone install by the
+  whole session's turn count.
+
+  Worse than the headline was the advice under it. A never-called standalone entry was
+  listed as *"paying but never called here — pure cost until they handle a compressible
+  result"*, which is exactly inverted: those are the servers #211 made free. An operator
+  acting on that line would unwrap the servers costing them least. Those entries now appear
+  under `installed but not triggered this window, so costing nothing at all (#211)`, and a
+  server whose ledger label could not be recovered is reported as *unknown* rather than
+  being quietly filed as free — the same `None`-is-not-`0` discipline the rest of this
+  report already keeps.
+
+  The break-even table's `blocks/turn to break even` header was true of routers only, so it
+  overstated the bar for every standalone entry by the session's turn count. The header is
+  now `blocks to break even` beside a new `cadence` column that carries the unit
+  (`per-turn`, `once/session`, `once/session (unpaid)`, `once/session (?)`), because the
+  arithmetic is identical and only the unit differs.
+
+  `--json` shape: `per_turn_tokens` is **redefined** to the recurring (eagerly-primed)
+  entries only — a consumer comparing across versions will see it drop, and that drop is the
+  correction. New alongside it: `session_once_tokens`, `session_covered`, `free`,
+  `uncertain`, and a per-server `cadence`. `turns_covered` now settles the one-time charge
+  out of the same savings before the remainder buys turns, and a standalone-only install —
+  which has no recurring charge and previously got no bottom line at all — now gets a
+  per-session verdict. A sub-1.0 ratio prints the shortfall in tokens instead of rounding to
+  a `~0x` that reads as a measurement.
+
+  Not modelled, deliberately: a session whose every compressible result also carried
+  `structuredContent` never gets the lazy attach (the accepted gap at the attach guard), so
+  it was called and still paid nothing. The ledger cannot observe that, and discounting for
+  it would be the #144/#186/#188 defect family again. Over-billing by an unobservable
+  exception is the safe direction.
+
 ### Added
 - **`scripts/bench/mcp_servers/mcp_probe.py` now persists a probe's exact call arguments
   beside its corpus** (`<corpus_dir>/_calls.json`, #138 step 0). A saved §6 corpus dir
@@ -43,11 +87,11 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   later call — a known, narrow, accepted gap (comprehension degrades to the un-primed
   level for that traffic, not to broken output), not a silent one.
 
-  `terse stats`'s primer-liability figure is now a worst-case upper bound for a
-  standalone `terse proxy` entry (it still reflects the old always-eager cost, not the
-  new one-time cost) — still live and accurate for a multiproxy router entry, which is
-  unaffected by this change. Full re-derivation of what "liability" means for a one-time
-  charge is a follow-up.
+  `terse stats`'s primer-liability figure was left by this change as a worst-case upper
+  bound for a standalone `terse proxy` entry — reflecting the old always-eager cost rather
+  than the new one-time one — and stayed live and accurate for a multiproxy router entry.
+  That re-derivation has since landed: see the `Fixed` entry above, which splits the two
+  cadences and stops reporting the servers this change made free as "pure cost".
 
 - **A fourth fluency arm, `inline_ok`, measures #168's "lazy primer" proposal before it
   ships.** `run_payload`/`run_fluency` now also ask each question with the format primer

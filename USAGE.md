@@ -161,11 +161,24 @@ uv run terse install-mcp kb runecho codegraph --policy policy.json --multiproxy
 uv run terse uninstall-mcp --all          # restores all three originals
 ```
 
-Why bother: a standalone `terse proxy` per server injects its own format primer, which
-the client re-reads **every turn**, so cost scales with (servers x turns) while savings
-scale with (compressible calls). Measured, six servers: +23.1% raw input one-proxy-each,
-+0.0% behind one router. Wrapping a single server is the case that already wins (-14.0%);
-consolidating is what stops a fleet from losing.
+Why bother: one policy, one process, and one permission surface instead of N.
+
+The original reason was stronger and no longer applies, so it is worth being precise
+about. Before #211 a standalone `terse proxy` injected its format primer into every
+`initialize` reply and the client re-read it **every turn**, so cost scaled with
+(servers x turns) while savings scaled with (compressible calls) — measured at six
+servers, +23.1% raw input one-proxy-each. Consolidating was how a fleet stopped losing.
+The lazy primer (#211) removed that tax at the source: a standalone entry now attaches
+its primer once, to the first result carrying a terse wire form, and an idle server pays
+nothing at all. The same 1/3/6-server sweep re-run against it is flat — **-3.8% / -3.5%
+/ -3.5%** weighted — where it used to degrade from -9.2% to +17.4%.
+
+So consolidate for the operational reasons above, not to rescue a scaling loss. The
+router keeps one shared `union_primer`, which is a boolean OR over five fixed sections
+rather than a concatenation of N — bounded at 555 cl100k tokens whether it fronts 1 peer
+or 20 — but it still rides `initialize`, so unlike a standalone entry it is paid from the
+first turn whether or not any peer is ever called. `terse stats` reports the two cadences
+separately for exactly this reason.
 
 This rewrites permission entries — `mcp__kb__kb.read.search` becomes
 `mcp__terse__kb.read.search` — so run `--print` first and update your allowlist before
