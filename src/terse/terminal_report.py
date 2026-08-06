@@ -100,7 +100,15 @@ def build_terminal_report(rows: list[dict[str, Any]], color: bool | None = None)
     tier attribution — the three sections the markdown tables make hard to compare
     at a glance. Gate/coverage stay markdown-only (already glance-readable as text)."""
     shapes = sorted({r["shape"] for r in rows})
-    tools = sorted({r.get("tool", "?") for r in rows})
+    # `or "?"` on BOTH lines, and the same expression on each. They used to differ
+    # — `.get("tool", "?")` here, a bare `.get("tool")` in the filter below — which
+    # agreed on every input except a row whose `tool` key is ABSENT: the set
+    # substituted "?" and the filter compared None to it, so that row matched
+    # nothing and its tokens left this table while still counting in every other
+    # total on the page. A row with an explicit `"tool": None` was worse: the key
+    # exists, so `None` entered the set and `sorted()` raised TypeError on the
+    # whole report. `or` normalises absent, None and "" alike, once, in one place.
+    tools = sorted({r.get("tool") or "?" for r in rows})
 
     shape_items = []
     for shape in shapes:
@@ -110,7 +118,7 @@ def build_terminal_report(rows: list[dict[str, Any]], color: bool | None = None)
 
     tool_items = []
     for tool in tools:
-        sub = [r for r in rows if r.get("tool") == tool]
+        sub = [r for r in rows if (r.get("tool") or "?") == tool]
         raw, cmp_ = _sum(sub, "cl100k", "raw"), _sum(sub, "cl100k", "compressed")
         tool_items.append((tool, ((raw - cmp_) / raw * 100) if raw else 0.0))
     tool_items.sort(key=lambda kv: -kv[1])
