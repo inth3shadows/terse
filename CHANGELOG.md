@@ -9,6 +9,44 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Added
+- **`terse stats --json` is now pinned field by field.** USAGE calls it "the raw aggregate,
+  for scripts", which makes it a contract with people outside this repo — and it carried
+  **37 fields across four nested shapes** with exactly two assertions on any of them
+  (`total.blocks` and `total.raw_tokens`).
+
+  The cost showed up immediately: in one day the liability blob gained
+  `session_once_tokens`, `session_covered`, `free`, `uncertain` and a per-server `cadence`,
+  the tool rows gained `encoded`, and `per_turn_tokens` was **redefined** from "every
+  wrapped server" to "the recurring ones only". A consumer reading that key would have seen
+  the number drop with nothing failing anywhere; prose in this file was their only warning.
+
+  The manifests are deliberately exact rather than "at least these" — a removal or rename
+  is a break, and an addition is a decision worth making on purpose, so the failure message
+  says to update the manifest *and* note it here. Types are pinned alongside names (a
+  consumer reading `per_turn_tokens` as an int must not one day get a string), `bool` is
+  rejected where a count belongs (it is an `int` subclass and would be summed as 0/1), and
+  the whole thing is driven through `main(["stats", ...])` because the composition —
+  `cli` merging the ledger and the liability into one document — is part of the contract
+  that neither function alone can be asked about.
+
+  USAGE now also documents the two things a parser has to know: `null` is a real answer and
+  never means zero, and `primer_liability` itself can be `null` when the install could not
+  be sized.
+
+### Fixed
+- **A ledger record whose `decision` cannot be read no longer under-bills its primer.**
+  `aggregate` tolerates a record with no `decision` field, counting it as `"unknown"` — it
+  reached `blocks` but not `encoded`, so a server whose every readable block was unknown
+  landed in `free` and the report told the operator it "costs nothing at all". `encoded` is
+  now derived by excluding the two decisions that *prove* no terse marker shipped
+  (`passthrough`, `unchanged`) rather than by including the two that may have
+  (`compressed`, `diff`). Identical for any record terse has ever written —
+  `classify_decision` returns exactly one of the four, and 0 of 2,115 records in a live
+  ledger lack the field — so this only ever decides a hand-written or third-party line,
+  where over-billing is the safe direction and under-billing is the one `_cadence` argues
+  against.
+
 ### Changed
 - **A multiproxy `-32601` now says which peers missed the listing, instead of only "unknown
   tool".** This is the half of #178 that does not need the design #178 withdrew.

@@ -327,7 +327,17 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         # the other: a minify-only `compressed` block carries no marker either, so a
         # non-zero count does not prove the primer attached, but a zero count proves it
         # could not have.
-        if decision in (COMPRESSED, DIFF):
+        # Stated as "not one of the two decisions that PROVE no marker shipped", rather than
+        # as "one of the two that may have". They are the same test for any record terse
+        # wrote — `classify_decision` returns exactly one of the four — and they differ only
+        # on a record whose `decision` this function could not read, which `aggregate`
+        # tolerates as `"unknown"` a few lines up. Counting an unknown as encoded over-bills
+        # that server's primer; NOT counting it under-bills, and under-billing is the
+        # direction `_cadence` argues is unsafe (it moves a paying server into `free`, and
+        # the operator reads "costs nothing at all"). No record terse has ever written lacks
+        # the field — 0 of 2,115 in the live ledger — so this only ever decides a
+        # hand-written or third-party line, where the conservative answer is the right one.
+        if decision not in (PASSTHROUGH, UNCHANGED):
             row["encoded"] += 1
         row["raw_chars"] += raw_c
         row["out_chars"] += out_c

@@ -813,6 +813,20 @@ uv run terse stats --since 7d    # just the last week (30m / 24h / 7d / 1w forms
 uv run terse stats --json        # the raw aggregate, for scripts
 ```
 
+`--json` is a **contract**, not a debug dump: `tests/test_stats_json_contract.py` pins every
+field name and type at all four shapes (the top level, `total`, each `tools[]` row, each
+`versions[]` row, the `primer_liability` blob and each of its `servers[]` rows), so a
+rename or a removal fails CI rather than a consumer's script. Two things worth knowing
+before you parse it:
+
+- **`null` is a real answer and never means zero.** `blocks: null` on a liability row means
+  no ledger label was recoverable — *we never found the rows to ask* — which is a different
+  claim from `blocks: 0`, "installed and never called". Same for `turns_covered`,
+  `session_covered`, `saved_per_block` and `primer_tokens`.
+- **`primer_liability` itself can be `null`**, when the install could not be sized (a
+  malformed MCP config). The ledger half of the document is still complete and correct; the
+  reason is on stderr.
+
 The report shows total tokens saved, the decision mix (how often the cross-call diff
 actually fired), and a per-server/per-tool breakdown — with a `diff%` column (that
 tool's cross-call diff hit rate) so you can see *which* tools the diff tier is actually
