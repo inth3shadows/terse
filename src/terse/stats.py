@@ -314,10 +314,21 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             # Counted, never bucketed under a "None" key: a record written before the
             # field existed is an unknown writer, not a writer named None.
             total["unversioned"] += 1
-        row = tools.setdefault(key, {"blocks": 0, "tokenized": 0,
+        row = tools.setdefault(key, {"blocks": 0, "tokenized": 0, "encoded": 0,
                                      "raw_tokens": 0, "out_tokens": 0,
                                      "raw_chars": 0, "out_chars": 0, "diffs": 0})
         row["blocks"] += 1
+        # Blocks on which a terse WIRE FORM shipped, as opposed to blocks emitted at all.
+        # `unchanged` ran the codec and shipped the original; `passthrough` never ran it.
+        # Only these two decisions can put a `__terse_` marker on the wire — which is what
+        # the lazy primer attaches to (`proxy.py`'s attach guard), so `primer_liability`
+        # needs the distinction to tell a server that was merely CALLED from one whose
+        # primer could actually have fired. An UPPER bound in one direction and sound in
+        # the other: a minify-only `compressed` block carries no marker either, so a
+        # non-zero count does not prove the primer attached, but a zero count proves it
+        # could not have.
+        if decision in (COMPRESSED, DIFF):
+            row["encoded"] += 1
         row["raw_chars"] += raw_c
         row["out_chars"] += out_c
         if decision == DIFF:
@@ -510,18 +521,50 @@ _ONCE_UNKNOWN = "once/session (?)"
 _CADENCE_ABBR = {_PER_TURN: "/turn", _ONCE: "1x", _ONCE_FREE: "1x-", _ONCE_UNKNOWN: "1x?"}
 
 
-def _cadence(state: str | None, blocks: int | None) -> str:
+def _cadences_of(servers: list[dict[str, Any]]) -> set[str]:
+    """Which cadences an install actually has — the gate for every per-cadence line.
+
+    ONE function rather than a set comprehension at each call site, because the two sites
+    drifted: the prose gated on `s.get("cadence") or _PER_TURN` and the table's legend on a
+    bare `s.get("cadence")`. On a liability blob round-tripped through `--json` by a
+    pre-cadence terse — the exact backward-compat path both were written for — that set was
+    `{None}`, so the table suppressed the `/turn` legend and printed the standalone one
+    instead, directly under prose that had just declared the whole figure recurring.
+
+    `or _PER_TURN` is the honest default for a blob with no cadence at all: an older terse
+    measured the always-eager model, so per-turn is what its numbers mean."""
+    return {s.get("cadence") or _PER_TURN for s in servers}
+
+
+def _cadence(state: str | None, blocks: int | None, encoded: int | None) -> str:
     """How often this entry actually pays its primer, post-#211.
 
     `blocks` is the ledger's answer to "was it called", and its three-way None/0/N is load
     bearing here exactly as it is in `_break_even`: None means no label was recoverable, so
     we never found the rows to ask — NOT that the server was idle. Collapsing it to "never
-    called" would move an unknown into the `free` bucket and quietly under-report."""
+    called" would move an unknown into the `free` bucket and quietly under-report.
+
+    `encoded` is the sharper question, and "was it called" was the wrong one to bill on
+    (review finding). The lazy primer attaches to a result carrying a terse wire form, so a
+    standalone entry that was called a thousand times and never produced one — an
+    all-passthrough policy, non-JSON payloads, a shape the codec never wins on — paid
+    NOTHING, and billing it a full primer is the same mis-bucketing this split exists to
+    fix, just in the other direction. `blocks` counts every emitted block regardless of
+    decision, so it cannot see that; `encoded` counts only `compressed`/`diff`.
+
+    The inference is deliberately one-directional. `encoded == 0` PROVES the primer could
+    not have attached (no marker can ship without the codec emitting one). `encoded > 0`
+    does not prove it did — a minify-only `compressed` block carries no marker, and the
+    `structuredContent` gap at `proxy.py`'s attach guard can suppress the attach on results
+    that do. So a non-zero count bills, which stays the over-billing direction the module
+    already argues is the safe one."""
     if state in _PRIMES_EAGERLY:
         return _PER_TURN
     if blocks is None:
         return _ONCE_UNKNOWN
-    return _ONCE if blocks else _ONCE_FREE
+    # `encoded is None` is the hand-rolled/pre-counter agg: fall back to `blocks`, which is
+    # the OLD behaviour — coarser, and over-billing rather than under-billing.
+    return _ONCE if (blocks if encoded is None else encoded) else _ONCE_FREE
 
 
 def _break_even(primer_tokens: int | None, blocks: int | None,
@@ -650,6 +693,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
     # different row sets.
     saved_by_label: dict[str, int] = {}
     tokenized_by_label: dict[str, int] = {}
+    encoded_by_label: dict[str, int | None] = {}
     for trow in agg.get("tools", []):
         by_label[trow["server"]] = by_label.get(trow["server"], 0) + trow["blocks"]
         lbl = trow["server"]
@@ -663,6 +707,15 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         if tok is None:
             tok = trow["blocks"] if raw_t or out_t else 0
         tokenized_by_label[lbl] = tokenized_by_label.get(lbl, 0) + tok
+        # Left as None for the whole label if ANY contributing row predates the counter —
+        # not defaulted to 0, which would claim "this server never shipped a wire form" on
+        # the strength of a row that simply could not say. `_cadence` reads None as "fall
+        # back to `blocks`", the old coarser behaviour.
+        enc = trow.get("encoded")
+        if enc is None or encoded_by_label.get(lbl, 0) is None:
+            encoded_by_label[lbl] = None
+        else:
+            encoded_by_label[lbl] = (encoded_by_label.get(lbl) or 0) + enc
     servers: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in scan_rows:
@@ -698,9 +751,14 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # never found the rows to ask (review of #197).
         tokenized = (sum(tokenized_by_label.get(lbl, 0) for lbl in labels)
                      if labels else None)
+        # None if no label, or if any contributing label could not report — same
+        # unknown-is-not-zero discipline as `blocks`.
+        per_label_enc = [encoded_by_label.get(lbl) for lbl in labels]
+        encoded = (None if (not labels or any(e is None for e in per_label_enc))
+                   else sum(e or 0 for e in per_label_enc))
         servers.append({"server": name, "scope": row.get("scope"), "state": state,
                         "primer_tokens": tokens, "ledger_labels": labels, "blocks": blocks,
-                        "tokenized_blocks": tokenized, "cadence": _cadence(state, blocks),
+                        "tokenized_blocks": tokenized, "cadence": _cadence(state, blocks, encoded),
                         **_break_even(tokens, blocks, tokenized,
                                       sum(saved_by_label.get(lbl, 0) for lbl in labels))})
 
@@ -768,7 +826,7 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     # explain why, whereas an install with no lazy entry at all should not be told about a
     # cadence it does not have. A blob from an older terse has no `cadence` and gets the
     # recurring stanza only — which is exactly what it measured.
-    cadences = {s.get("cadence") or _PER_TURN for s in servers}
+    cadences = _cadences_of(servers)
     lines = ["", f"primer liability across {len(servers)} wrapped server(s) — NOT in the "
                  f"totals above:"]
     if _PER_TURN in cadences:
@@ -808,6 +866,14 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         # Rendered ALONGSIDE the recurring line, not instead of it, and never netted into
         # it: the two divide different things. And stated as a ceiling, because the window
         # spans an unknown number of sessions and each one paid this charge again.
+        #
+        # Both lines credit the SAME savings in full, which is a second reason each is only
+        # a ceiling and not a verdict (review finding). Not netting them is right — the
+        # units differ, see `turns_covered` — but silence about it let a mixed install read
+        # two individually-true lines as jointly true: at saved=600, per_turn=555, once=555
+        # they say "pays for ~1 turn" and "covers the one-time charge at most ~1x" while the
+        # real cost is 555*turns + 555 and the install is deeply negative. Said once, below,
+        # rather than hedged into both sentences.
         covered = liab["session_covered"]
         if covered >= 1:
             lines.append(f"  the same {saved:,} tok covers the {once:,} tok one-time charge "
@@ -818,6 +884,10 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
             lines.append(f"  NET NEGATIVE over this window: the {saved:,} tok saved does "
                          f"not cover the {once:,} tok one-time charge even once, and each "
                          f"session in the window paid it again.")
+    if turns is not None and liab.get("session_covered") is not None:
+        lines.append("  each line above credits the SAME savings against its own charge "
+                     "alone — a mixed install pays both,")
+        lines.append("  so clearing one of them is not clearing the pair.")
     if liab["idle"]:
         lines.append(f"  paying every turn but never called here: "
                      f"{', '.join(sorted(liab['idle']))} — pure cost until they handle a "
@@ -868,7 +938,13 @@ def _fmt_denominator(srv: dict[str, Any]) -> str:
     if blocks is None:
         return "–"
     if tok is not None and tok != blocks:
-        return f"{tok:,}/{blocks:,}"
+        # No thousands separators in the PAIR form. This cell is a ratio to be compared, not
+        # a magnitude to be read at a glance, and the separators cost four characters
+        # exactly where the cell is widest — the live ledger already renders `1,790/1,799`
+        # at 11, which was the whole column. Bare digits keep a million-block ledger inside
+        # the width below; the single-value form keeps its separators, where it is the
+        # magnitude that matters and the string is half as long.
+        return f"{tok}/{blocks}"
     return f"{blocks:,}"
 
 
@@ -885,9 +961,17 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
     # Widths are load-bearing twice over: four tests match right-aligned cells, and the row
     # has to stay inside 80 columns or the last cells fold onto the next line and the table
     # stops being one. Adding `cadence` at its full label width took the row to 104, so the
-    # cadence values are abbreviated (`_CADENCE_ABBR`) and `blocks` — which only ever holds
-    # `N` or `tokenized/N` — gives back the space it was never using.
-    lines = ["", f"  {'server':<18} {'primer':>6} {'blocks':>11} {'saved/block':>11} "
+    # cadence values are abbreviated (`_CADENCE_ABBR`) and `server` gives back space it was
+    # not using (the longest real name in the fleet this targets is `secret-broker`, 13).
+    #
+    # `blocks` was first narrowed to 11 on the reasoning that it only ever holds `N` or
+    # `tokenized/N` — but `_fmt_denominator` rendered the pair with thousands separators,
+    # and the LIVE ledger already produced `1,790/1,799`, exactly 11. One more order of
+    # magnitude would have overflowed and broken the 80-column guarantee this comment makes.
+    # 15 with bare digits in the pair form holds a million-block ledger; the sum below is
+    # 2 + 14+1 + 6+1 + 15+1 + 11+1 + 9+1 + 17 = 79, and `test_the_break_even_row_stays_
+    # inside_eighty_columns` fails if any of these change without the others.
+    lines = ["", f"  {'server':<14} {'primer':>6} {'blocks':>15} {'saved/block':>11} "
                  f"{'cadence':>9} {'to break even':>17}"]
     # Rateless rows sort last as a group rather than tying with a 0.0 rate: `or -1` treated
     # a break-even server (0.0, falsy) as worse than one actively LOSING tokens (-0.5,
@@ -897,17 +981,17 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
                                      s.get("saved_per_block") or 0.0)):
         per_block, calls = _fmt_break_even(srv)
         primer = "?" if srv["primer_tokens"] is None else f"{srv['primer_tokens']:,}"
-        name = srv["server"] if len(srv["server"]) <= 18 else srv["server"][:17] + "…"
+        name = srv["server"] if len(srv["server"]) <= 14 else srv["server"][:13] + "…"
         # `.get`, defaulted to a dash: an older `--json` blob has no cadence at all, and a
         # blank there is honest where guessing `per-turn` would re-assert the old defect.
         cadence = _CADENCE_ABBR.get(srv.get("cadence") or "", "–")
-        lines.append(f"  {name:<18} {primer:>6} {_fmt_denominator(srv):>11} "
+        lines.append(f"  {name:<14} {primer:>6} {_fmt_denominator(srv):>15} "
                      f"{per_block:>11} {cadence:>9} {calls:>17}")
     lines.append("  wrap a server when it clears its own row: below that rate the primer "
                  "costs more than the codec banks (#175).")
     # Each cadence explains itself only to an install that HAS it — the same reason the
     # prose above does not tell a router-only install about a one-time charge.
-    shown = {s.get("cadence") for s in servers}
+    shown = _cadences_of(servers)
     if _PER_TURN in shown:
         lines.append("  /turn = an eagerly-primed router: the break-even is blocks per "
                      "TURN, and it recurs.")
