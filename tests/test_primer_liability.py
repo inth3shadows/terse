@@ -530,3 +530,111 @@ def test_a_liability_blob_without_a_verdict_degrades_instead_of_raising(tmp_path
     from terse.stats import _fmt_break_even
 
     assert _fmt_break_even({"saved_per_block": 0.0, "blocks_to_break_even": None}) == ("0", "–")
+
+
+# --- review round 3 ------------------------------------------------------------------
+
+
+def test_a_pre_cadence_blob_gets_the_recurring_legend_not_the_standalone_one(tmp_path):
+    """The prose gated on `s.get("cadence") or _PER_TURN` and the table's legend on a bare
+    `s.get("cadence")`. On the backward-compat path both were written for — a blob from a
+    terse with no `cadence` at all — that set was `{None}`, so the table suppressed the
+    `/turn` legend and printed the standalone one instead, directly under prose declaring
+    the whole figure recurring. One helper now serves both."""
+    liab = primer_liability([_scan("terse", "router", "kb", _policy(tmp_path))],
+                            _agg(("kb", 10, 1_000, 400)))
+    legacy = dict(liab)
+    legacy["servers"] = [{k: v for k, v in s.items() if k != "cadence"}
+                         for s in liab["servers"]]
+    text = "\n".join(build_primer_section(legacy))
+    assert "/turn = an eagerly-primed router" in text
+    assert "1x = a lazily-primed standalone entry" not in text
+
+
+def test_the_break_even_row_stays_inside_eighty_columns(tmp_path):
+    """The `blocks` cell was narrowed to 11 on the reasoning that it only holds `N` or
+    `tokenized/N` — but the LIVE ledger already rendered `1,790/1,799`, exactly 11, and one
+    more order of magnitude would have overflowed and broken the 80-column guarantee the
+    table's own comment makes. Sized against a million-block ledger, with the separators
+    dropped from the pair form where the cell is widest."""
+    from terse.stats import aggregate
+
+    recs = [{"server": "kb", "tool": "t", "raw_chars": 10, "out_chars": 4,
+             "decision": "compressed"} for _ in range(7)]
+    recs += [{"server": "kb", "tool": "t", "raw_chars": 10, "out_chars": 4,
+              "decision": "compressed", "raw_tokens": 10, "out_tokens": 4}
+             for _ in range(3)]
+    agg = aggregate(recs)
+    # Blow the counts up to a million-block ledger without writing a million records.
+    agg["tools"][0].update(blocks=1_234_567, tokenized=1_000_000)
+    liab = primer_liability([_scan("a-very-long-server-name", "wrapped", "kb",
+                                   _policy(tmp_path))], agg)
+    rows = [ln for ln in build_primer_section(liab) if "1000000/1234567" in ln]
+    assert len(rows) == 1
+    assert max(len(ln) for ln in build_primer_section(liab)
+               if ln.startswith("  ") and "1000000/1234567" in ln) <= 80
+
+
+def test_a_called_server_that_never_shipped_a_wire_form_is_not_billed_a_primer(tmp_path):
+    """Review finding, and the same mis-bucketing this split exists to fix, in the other
+    direction. The lazy primer attaches to a result carrying a terse wire form, so an entry
+    called a thousand times that never produced one — all-passthrough policy, non-JSON
+    payloads, a shape the codec never wins on — paid NOTHING. `blocks` counts every emitted
+    block regardless of decision and cannot see that; `encoded` counts only
+    `compressed`/`diff`."""
+    from terse.stats import aggregate
+
+    agg = aggregate([{"server": "kb", "tool": "t", "raw_chars": 10, "out_chars": 10,
+                      "raw_tokens": 10, "out_tokens": 10, "decision": "passthrough"}
+                     for _ in range(20)])
+    assert agg["tools"][0]["blocks"] == 20 and agg["tools"][0]["encoded"] == 0
+    liab = primer_liability([_scan("kb", "wrapped", "kb", _policy(tmp_path))], agg)
+    assert liab["servers"][0]["cadence"] == "once/session (unpaid)"
+    assert liab["session_once_tokens"] == 0
+    assert liab["free"] == ["kb"]
+
+
+def test_one_encoded_block_is_enough_to_bill_it(tmp_path):
+    """The inference is deliberately one-directional. `encoded == 0` PROVES the primer could
+    not have attached; `encoded > 0` does not prove it did (a minify-only `compressed` block
+    carries no marker). So a non-zero count bills — the over-billing direction this module
+    already argues is the safe one."""
+    from terse.stats import aggregate
+
+    recs = [{"server": "kb", "tool": "t", "raw_chars": 10, "out_chars": 10,
+             "raw_tokens": 10, "out_tokens": 10, "decision": "passthrough"}
+            for _ in range(20)]
+    recs.append({"server": "kb", "tool": "t", "raw_chars": 10, "out_chars": 4,
+                 "raw_tokens": 10, "out_tokens": 4, "decision": "compressed"})
+    liab = primer_liability([_scan("kb", "wrapped", "kb", _policy(tmp_path))],
+                            aggregate(recs))
+    assert liab["servers"][0]["cadence"] == "once/session"
+    assert liab["session_once_tokens"] > 0
+
+
+def test_a_row_that_cannot_report_encoded_falls_back_to_the_old_coarser_behaviour(tmp_path):
+    """A hand-rolled agg, or one written before the counter existed, must not be read as
+    "this server never shipped a wire form" — that would report an install free on the
+    strength of a row that simply could not say. `_cadence` falls back to `blocks`."""
+    liab = primer_liability([_scan("kb", "wrapped", "kb", _policy(tmp_path))],
+                            _agg(("kb", 4, 400, 100)))   # `_agg` emits no `encoded`
+    assert "encoded" not in _agg(("kb", 4, 400, 100))["tools"][0]
+    assert liab["servers"][0]["cadence"] == "once/session"
+    assert liab["session_once_tokens"] > 0
+
+
+def test_a_mixed_install_is_told_the_two_lines_are_not_jointly_true(tmp_path):
+    """Review finding. Both lines credit the SAME savings in full against their own charge.
+    Not netting them is right (the units differ), but silence let a mixed install read two
+    individually-true lines as jointly true, while it pays `per_turn*turns + once`."""
+    pol = _policy(tmp_path)
+    liab = primer_liability([_scan("terse", "router", "kb", pol),
+                             _scan("rc", "wrapped", "runecho-mcp", pol)],
+                            _agg(("kb", 2, 10_000, 0), ("runecho-mcp", 2, 10_000, 0)))
+    text = "\n".join(build_primer_section(liab))
+    assert "credits the SAME savings against its own charge alone" in text
+    assert "clearing one of them is not clearing the pair" in text
+    # ...and a single-cadence install is not told about a pair it does not have.
+    solo = primer_liability([_scan("terse", "router", "kb", pol)],
+                            _agg(("kb", 2, 10_000, 0)))
+    assert "clearing the pair" not in "\n".join(build_primer_section(solo))
