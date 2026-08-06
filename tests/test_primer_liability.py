@@ -95,7 +95,7 @@ def test_a_called_standalone_entry_is_billed_once_per_session_not_per_turn(tmp_p
     assert liab["per_turn_tokens"] == 0
     assert liab["free"] == [] and liab["idle"] == []
     text = "\n".join(build_primer_section(liab))
-    assert "tok/session" in text and "once/session" in text
+    assert "tok/session" in text and f"{'1x':>9}" in text
 
 
 def test_the_two_cadences_are_reported_separately_and_never_added(tmp_path):
@@ -253,18 +253,35 @@ def test_a_standalone_only_install_still_gets_a_net_negative_verdict(tmp_path):
     assert "0x over" not in text
 
 
-def test_the_one_time_charge_is_settled_before_savings_buy_turns(tmp_path):
-    """A mixed install pays both out of the same savings pot, so the one-time charge comes
-    off the top and only the remainder buys turns of the recurring one. Reporting the full
-    savings against the router alone would overstate how far the window goes."""
+def test_the_one_time_charge_is_NOT_netted_out_of_the_recurring_ratio(tmp_path):
+    """Review of this change caught the first attempt doing exactly that. It looks prudent —
+    both charges come out of the same savings — but `session_once_tokens` is charged once per
+    SESSION while `saved_tokens` spans the whole window, and a window covers an unknown number
+    of sessions (a `terse proxy` is one process per session and `_primer_sent` re-arms at every
+    `initialize`). Subtracting one primer where K were paid under-bills by the session count,
+    and `sessions` is no more observable from this ledger than `turns` is — which is the very
+    reason there is no per-turn charge in it. Divide like against like, and state the
+    cross-cadence comparison as a bound instead."""
     pol = _policy(tmp_path)
     liab = primer_liability([_scan("terse", "router", "kb", pol),
                              _scan("rc", "wrapped", "runecho-mcp", pol)],
                             _agg(("kb", 2, 10_000, 0), ("runecho-mcp", 2, 10_000, 0)))
-    expected = ((liab["saved_tokens"] - liab["session_once_tokens"])
-                / liab["per_turn_tokens"])
-    assert liab["turns_covered"] == expected
-    assert liab["turns_covered"] < liab["saved_tokens"] / liab["per_turn_tokens"]
+    assert liab["session_once_tokens"] > 0            # there IS a one-time charge...
+    assert liab["turns_covered"] == liab["saved_tokens"] / liab["per_turn_tokens"]
+
+
+def test_the_one_time_coverage_is_labelled_a_ceiling_not_a_measurement(tmp_path):
+    """`saved / once` treats the whole window as ONE session, which is the most favourable
+    reading available. Said plainly it would over-credit terse by the session count — the
+    unsafe direction — so it is rendered as a ceiling, and alongside the recurring line rather
+    than instead of it."""
+    pol = _policy(tmp_path)
+    liab = primer_liability([_scan("terse", "router", "kb", pol),
+                             _scan("rc", "wrapped", "runecho-mcp", pol)],
+                            _agg(("kb", 2, 10_000, 0), ("runecho-mcp", 2, 10_000, 0)))
+    text = "\n".join(build_primer_section(liab))
+    assert "at most" in text and "more than one session" in text
+    assert "turn(s) of the recurring primer" in text   # both cadences reported, not one
 
 
 def test_a_router_only_install_is_not_told_about_a_charge_it_does_not_pay(tmp_path):
@@ -295,7 +312,7 @@ def test_a_liability_blob_from_a_pre_cadence_terse_still_renders(tmp_path):
                          for s in liab["servers"]]
     text = "\n".join(build_primer_section(legacy))
     assert "tok/turn" in text and "tok/session" not in text
-    assert f"{'–':>21}" in text          # cadence cell blank rather than guessed
+    assert f"{'–':>9}" in text           # cadence cell blank rather than guessed
 
 
 def test_the_liability_still_prints_when_the_ledger_is_empty(tmp_path):
@@ -328,7 +345,7 @@ def test_break_even_divides_this_servers_savings_by_its_own_primer(tmp_path):
     srv = liab["servers"][0]
     assert srv["saved_per_block"] == 60.0
     assert srv["blocks_to_break_even"] == srv["primer_tokens"] / 60.0
-    assert "blocks to break even" in "\n".join(build_primer_section(liab))
+    assert "to break even" in "\n".join(build_primer_section(liab))
 
 
 def test_a_server_that_never_breaks_even_says_so_instead_of_printing_a_huge_number(tmp_path):
@@ -344,7 +361,7 @@ def test_a_server_that_never_breaks_even_says_so_instead_of_printing_a_huge_numb
     assert srv["break_even_verdict"] == "never"
     # not merely `"never" in text` — the `never called` verdict also matches that, and so
     # does the surrounding prose. Match the right-aligned CELL (width 21).
-    assert f"{'never':>21}" in "\n".join(build_primer_section(liab))
+    assert f"{'never':>17}" in "\n".join(build_primer_section(liab))
 
 
 def test_an_untokenized_ledger_reports_no_token_data_not_a_zero_rate(tmp_path):
@@ -391,7 +408,7 @@ def test_the_table_is_suppressed_when_no_server_has_a_rate(tmp_path):
     liab = primer_liability([_scan("kb", "wrapped", "kb", _policy(tmp_path))], _agg())
     text = "\n".join(build_primer_section(liab))
     assert "primer liability" in text
-    assert "blocks to break even" not in text
+    assert "to break even" not in text
 
 
 def test_an_unreadable_policy_is_primer_unknown_not_never(tmp_path):
@@ -408,7 +425,7 @@ def test_an_unreadable_policy_is_primer_unknown_not_never(tmp_path):
     text = "\n".join(build_primer_section(liab))
     # The `never` that must be absent is the VERDICT CELL, not the word anywhere in the
     # section — the surrounding prose legitimately uses it.
-    assert "primer unknown" in text and f"{'never':>21}" not in text
+    assert "primer unknown" in text and f"{'never':>17}" not in text
 
 
 def test_the_rate_divides_by_TOKENIZED_blocks_not_by_every_block(tmp_path):
@@ -475,7 +492,7 @@ def test_the_denominator_column_is_labelled_blocks_because_that_is_what_it_count
     liab = primer_liability([_scan("kb", "wrapped", "kb", _policy(tmp_path))],
                             _agg(("kb", 30, 10_000, 4_000)))
     text = "\n".join(build_primer_section(liab))
-    assert "blocks to break even" in text and "calls/turn" not in text
+    assert "to break even" in text and "calls" not in text
     assert "saved/block" in text and "saved/call" not in text
     assert "a BLOCK is one emitted tool-result text block" in text
 
