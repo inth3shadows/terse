@@ -77,6 +77,24 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "servers": (list,),
 }
 
+# Per-shape overrides, because a name does not mean the same thing everywhere. `blocks` is a
+# counter initialized to 0 in `total` and in a tool row and can never be null there, while
+# on a liability row `null` is a real answer ("no ledger label was recoverable"). Sharing one
+# permissive entry across all three let a `blocks: null` regression through — the exact
+# unknown-is-not-zero confusion this module exists to police (found in review).
+#
+# Measured, because "it tightens the contract" is easy to assert and easy to be wrong about:
+# injecting `blocks: None` into every TOOL row fails one test that passes without the
+# override, so that entry is load-bearing. The `total` and `versions[]` entries are NOT —
+# `test_a_since_window_that_filters_everything_out...` asserts `total["blocks"] == 0` and
+# catches that regression by value either way. They stay because the contract should state
+# the truth uniformly, not because they are each independently catching something.
+SHAPE_TYPES: dict[str, dict[str, tuple[type | None, ...]]] = {
+    "total": {"blocks": (int,)},
+    "tools[]": {"blocks": (int,)},
+    "versions[]": {"blocks": (int,)},
+}
+
 _ADD_ON_PURPOSE = ("Fields here are a public contract (USAGE: \"the raw aggregate, for "
                    "scripts\"). If this addition/removal is intentional, update the "
                    "manifest AND note it in the CHANGELOG — a consumer's script has no "
@@ -122,9 +140,21 @@ def _rec(**kw):
     return {**base, **kw}
 
 
+def test_every_named_field_also_has_a_pinned_type():
+    """The docstring, the CHANGELOG and USAGE all promise "types are asserted alongside
+    names". `_check_types` skips any field missing from `TYPES`, so without this the next
+    person to add a field only has to touch the NAME manifest to go green and the type
+    promise silently stops applying to it (found in review — the same
+    tolerates-growth-silently failure this module's own docstring warns about)."""
+    named = TOTAL | TOOL_ROW | VERSION_ROW | LIABILITY | LIABILITY_SERVER
+    assert not named - set(TYPES), (
+        f"no type pinned for: {sorted(named - set(TYPES))}. {_ADD_ON_PURPOSE}")
+
+
 def _check_types(where: str, obj: dict) -> None:
+    overrides = SHAPE_TYPES.get(where, {})
     for key, value in obj.items():
-        allowed = TYPES.get(key)
+        allowed = overrides.get(key, TYPES.get(key))
         if allowed is None:
             continue
         # `bool` is an `int` subclass; a flag arriving where a count belongs would pass a
@@ -219,10 +249,10 @@ def test_primer_liability_is_null_rather_than_absent_when_it_cannot_be_sized(
     assert "could not size the primer liability" in captured.err
 
 
-def test_an_empty_window_still_emits_the_whole_shape(stats_json):
-    """A `--since` that filters everything out, or a fresh install, must not hand a script a
-    half-built document — the fields it reads have to exist so it can report zero rather
-    than crash on a KeyError."""
+def test_an_empty_install_still_emits_the_whole_shape(stats_json):
+    """A fresh install with nothing wrapped must not hand a script a half-built document —
+    the fields it reads have to exist so it can report zero rather than crash on a
+    KeyError."""
     out = stats_json([_rec(ts=1)], scan=[])
     assert set(out) == TOP_LEVEL, _ADD_ON_PURPOSE
     assert set(out["total"]) == TOTAL, _ADD_ON_PURPOSE
@@ -230,6 +260,33 @@ def test_an_empty_window_still_emits_the_whole_shape(stats_json):
     assert out["primer_liability"]["per_turn_tokens"] == 0
     assert out["primer_liability"]["turns_covered"] is None
     assert out["primer_liability"]["session_covered"] is None
+
+
+def test_a_since_window_that_filters_everything_out_still_emits_the_whole_shape(
+        tmp_path, capsys, monkeypatch):
+    """The case the test above claimed to cover and did not (found in review — it passed an
+    empty INSTALL against a non-empty ledger, which is a different thing). Zero surviving
+    records is the branch the human report short-circuits on (`build_stats_report` returns
+    early at `total["blocks"] == 0`), so it is exactly where a `--json` consumer is most
+    likely to be handed something truncated."""
+    import terse.install_mcp as install_mcp
+
+    log = tmp_path / "stats.jsonl"
+    append_stats(_rec(ts=1), log)                    # 1970, far outside any window
+    monkeypatch.setattr(install_mcp, "scan_scopes", lambda *a, **k: _scan_rows())
+    capsys.readouterr()
+    assert main(["stats", "--log", str(log), "--since", "1h", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["total"]["blocks"] == 0 and out["tools"] == []
+    assert set(out) == TOP_LEVEL, _ADD_ON_PURPOSE
+    assert set(out["total"]) == TOTAL, _ADD_ON_PURPOSE
+    _check_types("total", out["total"])
+    # The liability is sized from the INSTALL, not the ledger, so it is still fully present
+    # — that is the whole point of it, and a consumer must not see it vanish with the rows.
+    assert set(out["primer_liability"]) == LIABILITY, _ADD_ON_PURPOSE
+    for row in out["primer_liability"]["servers"]:
+        assert set(row) == LIABILITY_SERVER, _ADD_ON_PURPOSE
+        _check_types("primer_liability.servers[]", row)
 
 
 def test_the_encoded_fallback_holds_on_a_ledger_that_straddles_the_counter(stats_json):

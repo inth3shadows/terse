@@ -580,8 +580,10 @@ def test_a_called_server_that_never_shipped_a_wire_form_is_not_billed_a_primer(t
     direction. The lazy primer attaches to a result carrying a terse wire form, so an entry
     called a thousand times that never produced one — all-passthrough policy, non-JSON
     payloads, a shape the codec never wins on — paid NOTHING. `blocks` counts every emitted
-    block regardless of decision and cannot see that; `encoded` counts only
-    `compressed`/`diff`."""
+    block regardless of decision and cannot see that; `encoded` counts every block except
+    the `passthrough`/`unchanged` ones, so an unreadable `decision` still counts (see
+    `aggregate`). Evidence, not proof — `_cadence`'s docstring names the path where a
+    `passthrough` block attaches a primer anyway."""
     from terse.stats import aggregate
 
     agg = aggregate([{"server": "kb", "tool": "t", "raw_chars": 10, "out_chars": 10,
@@ -638,3 +640,48 @@ def test_a_mixed_install_is_told_the_two_lines_are_not_jointly_true(tmp_path):
     solo = primer_liability([_scan("terse", "router", "kb", pol)],
                             _agg(("kb", 2, 10_000, 0)))
     assert "clearing the pair" not in "\n".join(build_primer_section(solo))
+
+
+def test_a_passthrough_block_can_still_attach_a_primer__known_gap(tmp_path):
+    """The limit of the `encoded` heuristic, executable rather than asserted in a comment.
+
+    An earlier revision of `_cadence`'s docstring claimed `encoded == 0` PROVES the primer
+    never attached. It does not, and this is the counterexample (found in review, reproduced
+    here rather than taken on faith): the attach guard fires on `'"__terse_'` appearing
+    anywhere in the FINAL content, and that text can come from the DOWNSTREAM payload — a
+    code-search tool returning terse's own source, a doubly wrapped peer. The result
+    classifies as `passthrough`, so `encoded` stays 0 and the server is filed under `free`
+    with "costs nothing at all", when it did pay.
+
+    Pinned as a GAP, not as desired behaviour: the assertions below are what the code does
+    today, and the last one is the wrong answer. Closing it needs the ledger to record
+    whether the attach fired, which is a shape change and a separate decision."""
+    import json as _json
+
+    from terse.policy import Policy, Rule
+    from terse.proxy import Interceptor
+    from terse.stats import aggregate, classify_decision
+
+    pol = Policy(rules=[Rule("echo.*", ())])            # explicit passthrough, no tiers
+    inter = Interceptor(pol, server_name="probe")
+    payload = _json.dumps({"source": '{"__terse_table__":1,"n":1,"cols":["a"],"rows":[[1]]}'})
+    inter.note_request(_json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                    "params": {"name": "echo.thing"}}),
+                       tool_name="echo.thing")
+    out = inter.transform_response(_json.dumps(
+        {"jsonrpc": "2.0", "id": 1,
+         "result": {"content": [{"type": "text", "text": payload}]}}))
+
+    # The primer DID attach — an extra leading block, and the latch is set.
+    assert len(_json.loads(out)["result"]["content"]) == 2
+    assert inter._primer_sent is True
+    # ...and the ledger records the block as `passthrough`, so `encoded` cannot see it.
+    assert classify_decision(payload, payload, passthrough=True) == "passthrough"
+    agg = aggregate([{"server": "probe", "tool": "echo.thing", "raw_chars": len(payload),
+                      "out_chars": len(payload), "raw_tokens": 50, "out_tokens": 50,
+                      "decision": "passthrough"}])
+    assert agg["tools"][0]["encoded"] == 0
+    liab = primer_liability([_scan("probe", "wrapped", "probe", _policy(tmp_path))], agg)
+    # THE WRONG ANSWER, pinned so the day someone fixes it this test fails and says why.
+    assert liab["servers"][0]["cadence"] == "once/session (unpaid)"
+    assert liab["free"] == ["probe"]

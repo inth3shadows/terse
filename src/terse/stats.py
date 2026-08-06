@@ -327,16 +327,22 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         # the other: a minify-only `compressed` block carries no marker either, so a
         # non-zero count does not prove the primer attached, but a zero count proves it
         # could not have.
-        # Stated as "not one of the two decisions that PROVE no marker shipped", rather than
-        # as "one of the two that may have". They are the same test for any record terse
-        # wrote — `classify_decision` returns exactly one of the four — and they differ only
-        # on a record whose `decision` this function could not read, which `aggregate`
-        # tolerates as `"unknown"` a few lines up. Counting an unknown as encoded over-bills
-        # that server's primer; NOT counting it under-bills, and under-billing is the
-        # direction `_cadence` argues is unsafe (it moves a paying server into `free`, and
-        # the operator reads "costs nothing at all"). No record terse has ever written lacks
-        # the field — 0 of 2,115 in the live ledger — so this only ever decides a
+        # Stated as an EXCLUSION — "not one of the two decisions that rule a marker out" —
+        # rather than as "one of the two that may have shipped one". They are the same test
+        # for any record terse wrote (`classify_decision` returns exactly one of the four)
+        # and differ only on a record whose `decision` this function could not read, which
+        # `aggregate` tolerates as `"unknown"` a few lines up. Counting an unknown as encoded
+        # over-bills that server's primer; NOT counting it under-bills, and under-billing is
+        # the direction `_cadence` argues is unsafe (it moves a paying server into `free`,
+        # where the operator reads "costs nothing at all"). No record terse has ever written
+        # lacks the field — 0 of 2,115 in the live ledger — so this only ever decides a
         # hand-written or third-party line, where the conservative answer is the right one.
+        #
+        # NOT a proof that the excluded two shipped no marker: the lazy-primer attach fires
+        # on `'"__terse_'` anywhere in the final content, which can come from the DOWNSTREAM
+        # payload, so a `passthrough` result quoting a terse wire form attaches the primer
+        # while classifying as `passthrough`. `_cadence`'s docstring carries that caveat;
+        # this counter is evidence, not a demonstration.
         if decision not in (PASSTHROUGH, UNCHANGED):
             row["encoded"] += 1
         row["raw_chars"] += raw_c
@@ -560,14 +566,24 @@ def _cadence(state: str | None, blocks: int | None, encoded: int | None) -> str:
     all-passthrough policy, non-JSON payloads, a shape the codec never wins on — paid
     NOTHING, and billing it a full primer is the same mis-bucketing this split exists to
     fix, just in the other direction. `blocks` counts every emitted block regardless of
-    decision, so it cannot see that; `encoded` counts only `compressed`/`diff`.
+    decision, so it cannot see that; `encoded` counts every block EXCEPT the `passthrough`
+    and `unchanged` ones (so an unreadable `decision` counts — see `aggregate`, where the
+    predicate lives and why it is stated as an exclusion).
 
-    The inference is deliberately one-directional. `encoded == 0` PROVES the primer could
-    not have attached (no marker can ship without the codec emitting one). `encoded > 0`
-    does not prove it did — a minify-only `compressed` block carries no marker, and the
-    `structuredContent` gap at `proxy.py`'s attach guard can suppress the attach on results
-    that do. So a non-zero count bills, which stays the over-billing direction the module
-    already argues is the safe one."""
+    The inference is one-directional but NOT a proof, and an earlier revision of this
+    docstring overclaimed it (found in review). `encoded == 0` is strong evidence the primer
+    never attached, not a demonstration: the attach guard at `proxy.py` fires on
+    `'"__terse_'` appearing anywhere in the FINAL content, and that text can come from the
+    downstream payload rather than from the codec — a `passthrough` result that happens to
+    quote a terse wire form (a code-search tool returning terse's own source, a doubly
+    wrapped peer) attaches the primer while classifying as `passthrough`, so `encoded` stays
+    0 and this returns `_ONCE_FREE` for a server that did pay. That path is still open and
+    is the same under-billing class as the one this argument closes.
+
+    `encoded > 0` likewise does not prove the primer attached — a minify-only `compressed`
+    block carries no marker, and the `structuredContent` gap at the same guard can suppress
+    the attach on results that do. So a non-zero count bills, which stays the over-billing
+    direction the module argues is the safe one."""
     if state in _PRIMES_EAGERLY:
         return _PER_TURN
     if blocks is None:

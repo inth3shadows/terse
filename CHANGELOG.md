@@ -30,9 +30,9 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   `cli` merging the ledger and the liability into one document — is part of the contract
   that neither function alone can be asked about.
 
-  USAGE now also documents the two things a parser has to know: `null` is a real answer and
-  never means zero, and `primer_liability` itself can be `null` when the install could not
-  be sized.
+  USAGE now also documents the three things a parser has to know: `versions` is an object
+  keyed by version string rather than an array, `null` is a real answer and never means
+  zero, and `primer_liability` itself can be `null` when the install could not be sized.
 
 ### Fixed
 - **A ledger record whose `decision` cannot be read no longer under-bills its primer.**
@@ -46,6 +46,16 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   ledger lack the field — so this only ever decides a hand-written or third-party line,
   where over-billing is the safe direction and under-billing is the one `_cadence` argues
   against.
+
+  A related overclaim is corrected rather than shipped: `encoded == 0` was documented as
+  *proving* the primer never attached. It does not. The attach guard fires on `"__terse_`
+  appearing anywhere in the final content, and that text can come from the **downstream
+  payload** — a code-search tool returning terse's own source, a doubly wrapped peer — so a
+  `passthrough` result can attach a primer while classifying as `passthrough`, leaving
+  `encoded` at 0 and the server filed under `free`. Reproduced, and pinned as a known gap in
+  `test_primer_liability.py` with the wrong answer asserted, so the day it is fixed the test
+  fails and says why. Closing it needs the ledger to record whether the attach fired, which
+  is a shape change and a separate decision.
 
 ### Changed
 - **A multiproxy `-32601` now says which peers missed the listing, instead of only "unknown

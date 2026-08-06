@@ -814,10 +814,15 @@ uv run terse stats --json        # the raw aggregate, for scripts
 ```
 
 `--json` is a **contract**, not a debug dump: `tests/test_stats_json_contract.py` pins every
-field name and type at all four shapes (the top level, `total`, each `tools[]` row, each
-`versions[]` row, the `primer_liability` blob and each of its `servers[]` rows), so a
-rename or a removal fails CI rather than a consumer's script. Two things worth knowing
+field name and type at six shapes — the top level, `total`, each `tools[]` row, each value
+of the `versions` object, the `primer_liability` blob, and each of its `servers[]` rows — so
+a rename or a removal fails CI rather than a consumer's script. Three things worth knowing
 before you parse it:
+
+- **`versions` is an object, not an array**, keyed by the terse version string that wrote
+  those records (`{"0.17.1": {"blocks": …}}`). Iterating it directly gives you version
+  strings; iterate `.items()` or `.values()` for the rollups.
+
 
 - **`null` is a real answer and never means zero.** `blocks: null` on a liability row means
   no ledger label was recoverable — *we never found the rows to ask* — which is a different
