@@ -166,6 +166,35 @@ jobs:
           git tag "${NEW_TAG}" "${GITHUB_SHA}"
           git push origin "${NEW_TAG}"
 
+      # Graduate [Unreleased] -> [X.Y.Z] on main. AFTER the tag push on purpose: the tag is
+      # what publishes, so a hiccup here must never block or alter a release — it lands as a
+      # follow-up commit instead. That also means the tagged artifact does not contain its
+      # own section, which is exactly why the changelog test exempts the newest release.
+      #
+      # `chore(release):` is load-bearing: this push re-enters this workflow, and only
+      # feat/fix/perf/breaking subjects bump. `chore` derives bump=none, so the run exits
+      # "releasing nothing" instead of looping. `[skip ci]` keeps it from burning a run at
+      # all. Both belong to the same guarantee — do not change the prefix casually.
+      - name: Graduate the changelog
+        if: steps.decide.outputs.release == 'true'
+        env:
+          NEW_TAG: ${{ steps.decide.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/graduate_changelog.py "${NEW_TAG}" CHANGELOG.md
+          if git diff --quiet -- CHANGELOG.md; then
+            echo "nothing to graduate"; exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "chore(release): graduate the changelog for ${NEW_TAG} [skip ci]"
+          # Rebase onto whatever landed while this ran; a lost race is a warning, not a
+          # failed release — the version is already tagged and published by then.
+          git pull --rebase --quiet origin "${GITHUB_REF_NAME}" || true
+          git push origin "HEAD:${GITHUB_REF_NAME}" \
+            || echo "::warning::changelog graduation could not be pushed; do it by hand"
+
   release:
     needs: version
     if: needs.version.outputs.release == 'true'
