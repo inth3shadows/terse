@@ -468,11 +468,14 @@ def build_version_section(agg: dict[str, Any]) -> list[str]:
 # --- primer liability (#168) ----------------------------------------------------------
 #
 # The ledger charges terse for the payloads it compresses and never for the context it
-# adds, so `terse stats` can report a win in a session that was a net loss. The primer is
-# injected into each wrapped server's `initialize.instructions` and the client re-reads it
-# as `cache_read` EVERY turn, so its cost scales with (servers x turns) while the savings
-# scale with (compressible tool calls). Measured from outside terse: a 14.0% win at one
-# wrapped server, a 2.1% LOSS at three.
+# adds, so `terse stats` can report a win in a session that was a net loss. A primer that
+# rides `initialize.instructions` is re-read as `cache_read` EVERY turn, so its cost scales
+# with (servers x turns) while the savings scale with (compressible tool calls). Measured
+# from outside terse: a 14.0% win at one wrapped server, a 2.1% LOSS at three.
+#
+# #211 removed that scaling for standalone entries — the primer now attaches once, to the
+# first compressible result — so this section reports the two cadences separately and never
+# adds them. See `primer_liability`'s docstring for why summing them was the defect.
 #
 # What this deliberately does NOT do is charge a per-turn cost into the ledger. `turns` is
 # not observable: a `terse proxy` is a stdio process that sees one `initialize` per process
@@ -480,24 +483,61 @@ def build_version_section(agg: dict[str, Any]) -> list[str]:
 # MCP reports the client's turn count. Inventing one would be the same defect family as
 # #144/#186/#188 — a number describing something the code did not measure.
 #
-# So the output is a BREAK-EVEN statement instead: what one turn costs, what the window
-# banked, and how many turns of primer those savings cover. Same decision for the operator,
-# no fabricated denominator.
+# So the output is a BREAK-EVEN statement instead: what each cadence costs, what the window
+# banked, and how far those savings go against it. Same decision for the operator, no
+# fabricated denominator.
 
-# States whose entry runs its own `terse proxy`/`multiproxy` and therefore pays a primer at
-# `initialize`. "folded*" peers are stashed BEHIND a router — the router pays one union
-# primer for the fleet and the peers pay nothing, so counting them would double-charge.
+# States whose entry runs its own `terse proxy`/`multiproxy` and therefore pays a primer.
+# "folded*" peers are stashed BEHIND a router — the router pays one union primer for the
+# fleet and the peers pay nothing, so counting them would double-charge.
 _PAYS_PRIMER = ("wrapped", "wrapped-unstashed", "router", "router-ambiguous")
+
+# Of those, the states that still prime EAGERLY at `initialize.instructions`, which the
+# client re-reads every turn as `cache_read` — a recurring per-turn charge. Everything else
+# in `_PAYS_PRIMER` is a standalone `run_proxy` entry, lazy since #211: one attach, to the
+# first compressible result, and nothing at all if that result never comes.
+_PRIMES_EAGERLY = ("router", "router-ambiguous")
+
+# Per-server cadence labels. The whole point of splitting them is that `tok/turn` and
+# `tok/session` are different units and summing them was the defect (#211 follow-up).
+_PER_TURN = "per-turn"
+_ONCE = "once/session"
+_ONCE_FREE = "once/session (unpaid)"
+_ONCE_UNKNOWN = "once/session (?)"
+
+# The same four, short enough for a table cell that has to fit inside 80 columns alongside
+# five other. The prose labels stay the `--json` contract; these are render-only.
+_CADENCE_ABBR = {_PER_TURN: "/turn", _ONCE: "1x", _ONCE_FREE: "1x-", _ONCE_UNKNOWN: "1x?"}
+
+
+def _cadence(state: str | None, blocks: int | None) -> str:
+    """How often this entry actually pays its primer, post-#211.
+
+    `blocks` is the ledger's answer to "was it called", and its three-way None/0/N is load
+    bearing here exactly as it is in `_break_even`: None means no label was recoverable, so
+    we never found the rows to ask — NOT that the server was idle. Collapsing it to "never
+    called" would move an unknown into the `free` bucket and quietly under-report."""
+    if state in _PRIMES_EAGERLY:
+        return _PER_TURN
+    if blocks is None:
+        return _ONCE_UNKNOWN
+    return _ONCE if blocks else _ONCE_FREE
 
 
 def _break_even(primer_tokens: int | None, blocks: int | None,
                 tokenized: int | None, saved: int) -> dict[str, Any]:
-    """Per-server `saved/block` and `blocks/turn to break even` (#175).
+    """Per-server `saved/block` and `blocks to break even` (#175).
 
     The rule the positioning issue states — *wrap a server when its typical payload saves
     more than `primer x (turns per call)` tokens* — is only actionable if the operator can
     read both halves per server. #175 computed this table by hand from the ledger; this puts
     it in `terse stats`.
+
+    The arithmetic is `primer / saved_per_block` either way, but the UNIT the answer is in
+    depends on how often that primer is charged, so the caller pairs it with `_cadence`:
+    blocks per TURN for an eagerly-primed router, blocks once per SESSION for a lazily-primed
+    standalone entry (#211). Same number, two very different bars — which is why the rendered
+    column header no longer hard-codes `/turn`.
 
     Stated per BLOCK, not per call, because a block is what the ledger counts: one record
     per emitted tool-result text block, which is >= 1 per call and moves with join behaviour
@@ -557,23 +597,38 @@ def _break_even(primer_tokens: int | None, blocks: int | None,
 
 
 def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> dict[str, Any]:
-    """Per-turn primer cost of the INSTALLED wrapped servers, against the window's savings.
+    """Primer cost of the INSTALLED wrapped servers, against the window's savings.
 
-    Installed, not ledger-derived, and that distinction is the whole point: a wrapped server
-    nobody called still ships its primer every turn and contributes zero ledger rows. Sizing
-    this from the ledger would hide exactly the worst case — the install that is pure cost.
+    Installed, not ledger-derived, and that distinction is the whole point: an eagerly-primed
+    router nobody called still ships its union primer every turn and contributes zero ledger
+    rows. Sizing this from the ledger would hide exactly the worst case — the install that is
+    pure cost. (The ledger is still what decides whether a LAZILY-primed entry was billed at
+    all; see below. Installed sizes it, the ledger says who owes it.)
 
-    NOTE (#168 phase 2, lazy primer): the "every turn" premise above is now only true for
-    `state in ("router", "router-ambiguous")` — a multiproxy router still primes eagerly at
-    `initialize` via `union_primer`, unchanged. A standalone `state in ("wrapped",
-    "wrapped-unstashed")` entry (`run_proxy`, `lazy_primer=True` by default) now pays its
-    primer ONCE per session, on its first compressible result, not every turn. This
-    function's `per_turn_tokens`/`tok/turn` figures are therefore a WORST-CASE UPPER BOUND
-    for wrapped/wrapped-unstashed entries (what they would have cost under the old
-    always-eager behavior) and still an accurate live figure for router/router-ambiguous
-    entries. The table/computation below is unchanged; only this framing note and the
-    rendered caveat in `build_primer_section` reflect it — fully re-deriving what "turns
-    covered" should mean for a one-time-not-recurring cost is a follow-up, not this fix.
+    TWO CADENCES, never summed (#211 follow-up). Before the lazy primer every entry here
+    paid at `initialize` and `per_turn_tokens` was one honest total. It no longer is:
+
+      router / router-ambiguous   still prime EAGERLY, one `union_primer` in the router's
+                                  own merged `initialize.instructions`, re-read every turn
+                                  as `cache_read`. RECURRING — `per_turn_tokens`.
+      wrapped / wrapped-unstashed lazy since #211: the primer attaches to the FIRST result
+                                  carrying a terse wire form. Paid ONCE per session if that
+                                  result comes, and NOT AT ALL if it never does.
+
+    Adding those two into one `tok/turn` headline overstated a standalone install by the
+    session's whole turn count, and — worse — the `idle` line then accused a never-called
+    standalone server of being "pure cost" when #211 is precisely what made it free. That
+    inverted advice (unwrap the servers that cost nothing) is why this is split rather than
+    footnoted; the previous fix only added a "treat as worst-case" caveat, and a bound that
+    is structurally zero is not a bound.
+
+    "Called" is read from the ledger, so a standalone server is billed its one-time primer
+    when it produced ANY block this window. That is an upper bound in one narrow direction:
+    a session whose every compressible result also carried `structuredContent` never gets
+    the attach (the accepted gap at `proxy.py`'s lazy-attach guard), so it was called and
+    still paid nothing. The ledger cannot distinguish that, and inventing a discount for it
+    would be the #144/#186/#188 defect family again — a number describing something the
+    code did not measure. Over-billing by an unobservable exception is the safe direction.
 
     Each server is sized from ITS OWN policy via `build_primer`, not from a shared constant:
     the primer is assembled per-server from policy-gated sections, so a `minify`-only or
@@ -645,24 +700,56 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
                      if labels else None)
         servers.append({"server": name, "scope": row.get("scope"), "state": state,
                         "primer_tokens": tokens, "ledger_labels": labels, "blocks": blocks,
-                        "tokenized_blocks": tokenized,
+                        "tokenized_blocks": tokenized, "cadence": _cadence(state, blocks),
                         **_break_even(tokens, blocks, tokenized,
                                       sum(saved_by_label.get(lbl, 0) for lbl in labels))})
 
-    per_turn = sum(s["primer_tokens"] or 0 for s in servers)
+    # Each server lands in exactly one bucket, and only two of them are money.
+    per_turn = sum(s["primer_tokens"] or 0 for s in servers if s["cadence"] == _PER_TURN)
+    once = sum(s["primer_tokens"] or 0 for s in servers if s["cadence"] == _ONCE)
     unresolved = sum(1 for s in servers if s["primer_tokens"] is None)
     total = agg.get("total") or {}
     saved = (total.get("raw_tokens") or 0) - (total.get("out_tokens") or 0)
     return {
         "servers": servers,
+        # REDEFINED by the #211 follow-up: recurring (eager-priming) entries only. It used
+        # to sum every wrapped server, which is why a standalone install's headline used to
+        # be large and wrong. A `--json` consumer comparing across versions will see this
+        # drop; that drop IS the correction, not a regression.
         "per_turn_tokens": per_turn,
+        "session_once_tokens": once,
         "unresolved": unresolved,
-        # Servers that pay every turn and banked nothing in this window — pure cost.
-        "idle": [s["server"] for s in servers if s["blocks"] == 0 and s["primer_tokens"]],
+        # Pays every turn and banked nothing this window — pure cost. Now routers ONLY: a
+        # never-called standalone entry is the `free` list below, not this one.
+        "idle": [s["server"] for s in servers
+                 if s["cadence"] == _PER_TURN and s["blocks"] == 0 and s["primer_tokens"]],
+        # Installed, lazy, not triggered this window — costs nothing at all. Reported
+        # because it is the thing #211 bought, and because the old code billed exactly these
+        # servers as pure cost. Guarded on a non-zero primer for the same reason `idle` is:
+        # a default-deny server is free because it emits nothing, which is a different fact
+        # and already has its own `no primer` verdict in the table.
+        "free": [s["server"] for s in servers
+                 if s["cadence"] == _ONCE_FREE and s["primer_tokens"]],
+        # Lazy, but no ledger label was recoverable, so we cannot say whether the attach
+        # ever fired. Neither total counts it — same discipline as `unresolved`.
+        "uncertain": [s["server"] for s in servers if s["cadence"] == _ONCE_UNKNOWN],
         "saved_tokens": saved,
-        # None, not 0 or infinity: with no primer to pay there is nothing to break even on,
-        # and rendering "inf turns" would read as a measurement.
+        # NOT `(saved - once) / per_turn`. `once` is charged per SESSION and `saved` is the
+        # whole window, which spans an unknown number of sessions — a `terse proxy` is one
+        # process per session and `Interceptor._primer_sent` re-arms at every `initialize`.
+        # Netting a per-session charge out of a multi-session pot subtracts one primer where
+        # K were paid, and `sessions` is no more observable from this ledger than `turns` is
+        # (the same reason there is no per-turn charge in it at all). So the recurring figure
+        # is left dividing like against like. None, not 0 or infinity, with nothing recurring
+        # to pay: rendering "inf turns" would read as a measurement.
         "turns_covered": (saved / per_turn) if per_turn else None,
+        # An UPPER bound, and labelled as one wherever it is rendered: this treats the whole
+        # window as a single session, which is the most favourable reading available. A
+        # window covering K sessions paid K one-time primers, so the true coverage is this
+        # over K. Kept as a bound rather than dropped because it is still decisive in one
+        # direction — if even the best case does not clear 1.0, the install is genuinely
+        # net negative and no session count can rescue it.
+        "session_covered": (saved / once) if once else None,
     }
 
 
@@ -671,27 +758,73 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     per_turn, servers = liab["per_turn_tokens"], liab["servers"]
     if not servers:
         return []
-    lines = ["", f"primer liability: {per_turn:,} tok/turn across {len(servers)} wrapped "
-                 f"server(s) — NOT in the totals above."]
-    lines.append("  a multiproxy router still re-reads its `initialize.instructions` every "
-                 "turn as cache_read, so that")
-    lines.append("  part of this figure is live. A standalone `terse proxy` entry now pays "
-                 "its primer ONCE per session")
-    lines.append("  (#168 phase 2) — for those, treat this as a WORST-CASE figure, not a "
-                 "live per-turn cost.")
+    # `.get` on every key added by the #211 follow-up: `build_stats_report` also renders a
+    # liability blob handed back through `--json` by an older terse, which carries none of
+    # them. Degrade to the recurring half rather than raising — a report is never
+    # load-bearing (#197).
+    once = liab.get("session_once_tokens") or 0
+    # Which stanzas apply is read from the SERVERS, not from the totals: an install whose
+    # lazy entries were all uncalled has `once == 0` and still needs the one-time stanza to
+    # explain why, whereas an install with no lazy entry at all should not be told about a
+    # cadence it does not have. A blob from an older terse has no `cadence` and gets the
+    # recurring stanza only — which is exactly what it measured.
+    cadences = {s.get("cadence") or _PER_TURN for s in servers}
+    lines = ["", f"primer liability across {len(servers)} wrapped server(s) — NOT in the "
+                 f"totals above:"]
+    if _PER_TURN in cadences:
+        lines.append(f"  recurring  {per_turn:,} tok/turn — a multiproxy router primes "
+                     f"eagerly at `initialize`, and the")
+        lines.append("             client re-reads those instructions every turn as "
+                     "cache_read.")
+    if cadences - {_PER_TURN}:
+        lines.append(f"  one-time   {once:,} tok/session — a standalone `terse proxy` "
+                     f"attaches its primer to the")
+        lines.append("             first compressible result and not again (#211). Only "
+                     "servers that were")
+        lines.append("             actually called are billed here.")
+    if len(cadences) > 1 and _PER_TURN in cadences:
+        lines.append("  the two figures are different units and are deliberately not "
+                     "summed.")
     if liab["unresolved"]:
         lines.append(f"  {liab['unresolved']} server(s) have an unreadable policy and are "
-                     f"NOT counted — treat the figure as a lower bound.")
+                     f"NOT counted — treat both figures as lower bounds.")
+    if liab.get("uncertain"):
+        lines.append(f"  no ledger label, so it is unknown whether the lazy primer ever "
+                     f"attached: {', '.join(sorted(liab['uncertain']))}")
+    saved = liab["saved_tokens"]
     turns = liab["turns_covered"]
     if turns is not None:
-        lines.append(f"  the {liab['saved_tokens']:,} tok saved in this window pays for "
-                     f"~{turns:,.0f} turn(s) of primer.")
-        if turns < 1:
-            lines.append("  NET NEGATIVE over this window: the primer costs more per turn "
-                         "than the codec banked in total.")
+        # Below 1.0 the ratio is not the interesting number — the shortfall is. `~0.4 turns`
+        # and `~0x over` both round to a `0` that reads as a measured zero, the same
+        # print-as-zero hole `_fmt_rate` closed in review of #197.
+        if turns >= 1:
+            lines.append(f"  the {saved:,} tok saved in this window pays for ~{turns:,.0f} "
+                         f"turn(s) of the recurring primer.")
+        else:
+            lines.append(f"  NET NEGATIVE over this window: the {saved:,} tok saved does "
+                         f"not cover even a single turn of the {per_turn:,} tok recurring "
+                         f"primer.")
+    if liab.get("session_covered") is not None:
+        # Rendered ALONGSIDE the recurring line, not instead of it, and never netted into
+        # it: the two divide different things. And stated as a ceiling, because the window
+        # spans an unknown number of sessions and each one paid this charge again.
+        covered = liab["session_covered"]
+        if covered >= 1:
+            lines.append(f"  the same {saved:,} tok covers the {once:,} tok one-time charge "
+                         f"at most ~{covered:,.0f}x — fewer if this")
+            lines.append("  window spans more than one session, which it usually does; "
+                         "each of them paid that charge again.")
+        else:
+            lines.append(f"  NET NEGATIVE over this window: the {saved:,} tok saved does "
+                         f"not cover the {once:,} tok one-time charge even once, and each "
+                         f"session in the window paid it again.")
     if liab["idle"]:
-        lines.append(f"  paying but never called here: {', '.join(sorted(liab['idle']))} "
-                     f"— pure cost until they handle a compressible result.")
+        lines.append(f"  paying every turn but never called here: "
+                     f"{', '.join(sorted(liab['idle']))} — pure cost until they handle a "
+                     f"compressible result.")
+    if liab.get("free"):
+        lines.append(f"  installed but not triggered this window, so costing nothing at "
+                     f"all (#211): {', '.join(sorted(liab['free']))}")
     lines += _build_break_even_table(servers)
     return lines
 
@@ -740,7 +873,7 @@ def _fmt_denominator(srv: dict[str, Any]) -> str:
 
 
 def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
-    """Per-server `saved/block` and the blocks-per-turn that pays for that server's primer.
+    """Per-server `saved/block` and the block count that pays for that server's primer.
 
     Gated on whether any server was CALLED in this window, not on whether any produced a
     rate. An install where nothing was called renders a table of dashes that says nothing
@@ -749,8 +882,13 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
     exactly the row that sends the operator to fix it."""
     if not any(s.get("blocks") for s in servers):
         return []
-    lines = ["", f"  {'server':<18} {'primer':>7} {'blocks':>19} {'saved/block':>11} "
-                 f"{'blocks/turn to break even':>26}"]
+    # Widths are load-bearing twice over: four tests match right-aligned cells, and the row
+    # has to stay inside 80 columns or the last cells fold onto the next line and the table
+    # stops being one. Adding `cadence` at its full label width took the row to 104, so the
+    # cadence values are abbreviated (`_CADENCE_ABBR`) and `blocks` — which only ever holds
+    # `N` or `tokenized/N` — gives back the space it was never using.
+    lines = ["", f"  {'server':<18} {'primer':>6} {'blocks':>11} {'saved/block':>11} "
+                 f"{'cadence':>9} {'to break even':>17}"]
     # Rateless rows sort last as a group rather than tying with a 0.0 rate: `or -1` treated
     # a break-even server (0.0, falsy) as worse than one actively LOSING tokens (-0.5,
     # truthy), inverting the two rows an operator most needs ordered (review of #197).
@@ -760,10 +898,25 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
         per_block, calls = _fmt_break_even(srv)
         primer = "?" if srv["primer_tokens"] is None else f"{srv['primer_tokens']:,}"
         name = srv["server"] if len(srv["server"]) <= 18 else srv["server"][:17] + "…"
-        lines.append(f"  {name:<18} {primer:>7} {_fmt_denominator(srv):>19} "
-                     f"{per_block:>11} {calls:>26}")
+        # `.get`, defaulted to a dash: an older `--json` blob has no cadence at all, and a
+        # blank there is honest where guessing `per-turn` would re-assert the old defect.
+        cadence = _CADENCE_ABBR.get(srv.get("cadence") or "", "–")
+        lines.append(f"  {name:<18} {primer:>6} {_fmt_denominator(srv):>11} "
+                     f"{per_block:>11} {cadence:>9} {calls:>17}")
     lines.append("  wrap a server when it clears its own row: below that rate the primer "
                  "costs more than the codec banks (#175).")
+    # Each cadence explains itself only to an install that HAS it — the same reason the
+    # prose above does not tell a router-only install about a one-time charge.
+    shown = {s.get("cadence") for s in servers}
+    if _PER_TURN in shown:
+        lines.append("  /turn = an eagerly-primed router: the break-even is blocks per "
+                     "TURN, and it recurs.")
+    if shown - {_PER_TURN}:
+        lines.append("  1x = a lazily-primed standalone entry (#211): the break-even is "
+                     "blocks ONCE PER SESSION, a far lower bar.")
+        if _ONCE_FREE in shown or _ONCE_UNKNOWN in shown:
+            lines.append("  1x? = called-ness unknown (no ledger label); 1x- = installed "
+                         "but not triggered, so unpaid.")
     lines.append("  a BLOCK is one emitted tool-result text block — >=1 per call, so this "
                  "is a conservative bar (#141).")
     return lines

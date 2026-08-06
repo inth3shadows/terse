@@ -47,7 +47,11 @@ per-peer primers — so it is O(1) in peer count, not O(N):
 | tail | 8 |
 | **full (all sections gated on)** | **555** |
 
-555 cl100k tokens is the hard ceiling, paid once at `initialize`, regardless of
+555 cl100k tokens is the hard ceiling, sent once at `initialize` — and then
+re-read every turn as `cache_read`, so unlike a standalone entry's lazy primer
+it is a RECURRING charge, paid from the first turn whether or not any peer is
+ever called. That is why `terse stats` reports it under a separate cadence from
+the standalone one, and never sums the two. The ceiling holds regardless of
 whether 1 or 20 peers sit behind the router — the opposite shape of the standalone
 case #211 fixed, where N wrapped servers meant N separate primers riding N
 `initialize` replies, scaling linearly with server count. A pre-#211 A/B run at 6
