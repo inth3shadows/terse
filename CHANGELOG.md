@@ -10,6 +10,51 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Fixed
+- **The launch path baked into every wrapped MCP config was never executed by any test.**
+  `install_mcp` writes `[sys.executable, "-m", "terse"]` as the command for every wrapped
+  entry, so `python -m terse` is *the* production entrypoint — and `src/terse/__main__.py`
+  sat at 0% coverage. The existing tests assert the config **string**
+  (`entry["args"] == ["-m", "terse", "proxy", ...]`) and never run it.
+
+  Demonstrated rather than asserted: breaking the import inside `__main__.py` leaves
+  `python -m terse` raising `ImportError` on every wrapped server on every user's machine
+  while **all 1,287 other tests pass**. Four tests now run the launcher's *own* return value
+  as a subprocess — not a hand-written copy of the argv, so a test cannot keep passing after
+  the launcher changes to something that does not run — and pin that the CLI's exit code
+  survives to the shell (a wrapped entry that always exits 0 hides a failed proxy from the
+  client supervising it), that the console script and `-m terse` agree, and that the
+  absolute interpreter path is preserved.
+
+  Note: `__main__.py` still reports 0% coverage, because the tests spawn a subprocess and
+  `coverage` does not instrument it. The line is now tested; the number does not move.
+
+  Review caught the first cut of these tests being **vacuous under `$TERSE_MCP_CMD`**: that
+  documented override makes `terse_invocation()` return the operator's console script, so
+  with it set the tests passed even with `__main__.py`'s import broken — the subprocess
+  never touched `__main__.py`. An autouse fixture now clears it for every test in the file
+  rather than leaving each one to remember. The console-script comparison also used
+  `shutil.which("terse")`, which finds *a* terse rather than the one belonging to this
+  interpreter, and failed on a machine with a global install; it now resolves the script
+  beside `sys.executable`.
+
+- **`.gitleaksignore` fingerprints had rotted, so the local secret gate reported three
+  false positives on every full-history scan.** gitleaks emits a different fingerprint per
+  scan mode — `file:rule:line` for `--staged` (the pre-commit gate), `commit:file:rule:line`
+  for a full-history `gitleaks git` — and an entry in one format is silently inert in the
+  other. Only the staged-mode entry existed. Each of the three findings was verified by
+  reading the line at its commit before suppressing: all are fixtures for the argv/header
+  **redactor's own tests**, asserting a fake credential scrubs to `***`, so the "secret" is
+  the input to the scrubber under test. A scanner that cries wolf on every run trains its
+  reader to ignore it, which is the one thing a secret scanner cannot afford.
+
+  Review then caught the staged-mode entry being rotted too, in **both** directions: it
+  pointed at line 193, which today is an ordinary policy fixture with no secret, so the
+  pre-commit gate still false-positived on any edit to the real fixtures *and* carried a
+  standing blind spot where a genuine credential landing at that line would pass silently.
+  Both formats are now re-derived from live runs, with the re-derivation command recorded
+  in the file, since line-numbered fingerprints will rot again.
+
+### Fixed
 - **A corpus row with no `tool` key silently left the per-tool tables — and one with
   `"tool": None` crashed the report outright.** Found by a logic sweep, not by a diff.
 
