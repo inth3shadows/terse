@@ -81,8 +81,12 @@ _BARE_WINDOW = 60
 # prose can split the same phrase at any point. The `#` strip is Python-only: in markdown a
 # line-leading `#` is a heading, and folding it away would glue a heading onto the previous
 # paragraph and invent adjacency the reader never sees.
-_JOIN_MD = re.compile(r"\n[ \t]*")
-_JOIN_PY = re.compile(r"\n[ \t]*#?[ \t]*")
+# A BLANK line is a paragraph break, and folding it away would put the end of one paragraph
+# within `_BARE`'s 60-character proximity window of the start of the next — synthesising an
+# adjacency the reader never sees. Only single breaks (a hard wrap inside one paragraph) are
+# collapsed; a blank line stays a newline, which no pattern here spans.
+_JOIN_MD = re.compile(r"\n(?![ \t]*\n)[ \t]*")
+_JOIN_PY = re.compile(r"\n(?![ \t]*(?:#[ \t]*)?\n)[ \t]*#?[ \t]*")
 
 # "the diff paragraph is 190 of 555 cl100k tokens" — a section against the total, in one
 # sentence. Checked as a PAIR as well as individually, because the individual check would
@@ -160,8 +164,11 @@ def test_every_published_primer_size_is_a_size_the_primer_actually_has():
         for line, published in _mentions(doc):
             assert published in live, (
                 f"{doc}:{line} publishes {published:,} as a primer size, but the live "
-                f"primer's sizes are {sorted(live)} (full-gate total {FULL}). A primer "
-                f"paragraph was edited without the prose following it.")
+                f"primer's sizes are {sorted(live)} (full-gate total {FULL}). Either a "
+                f"primer paragraph was edited without the prose following it, or this is "
+                f"a non-primer figure that happens to be measured in cl100k tokens — "
+                f"BENCHMARKS.md already has one of those, which is why it is not COVERED. "
+                f"If a covered file gains one, narrow the pattern rather than the claim.")
 
 
 def test_a_section_quoted_against_the_total_is_the_smaller_of_the_two():
