@@ -198,10 +198,12 @@ def build_primer(pol: policy_mod.Policy, server: str | None = None) -> str:
     `tiers: ()` with diffing therefore dead and no field drop) — before #168 such a server
     paid a full primer to explain forms it is structurally forbidden from producing.
 
-    That is a property of the POLICY, not of any particular server: under both
-    `policy.example.json` and the live fleet policy, `secret-broker` reaches the default
-    tiers and pays 248, and `server_never_lossy` (#199) only suppresses the dropped-field
-    paragraph. The default-deny shape this returns "" for has to be written deliberately.
+    That is a property of the POLICY, not of any particular server: `secret-broker` pays
+    248 under both shipped policies, though by different routes — an explicit
+    `secret-broker.secret.list_credentials` carve-out sitting ahead of `secret-broker.*`
+    in the live policy, and `defaults` in `policy.example.json`, which has no
+    secret-broker rule at all. `server_never_lossy` (#199) only suppresses the
+    dropped-field paragraph. The default-deny shape this returns "" for is deliberate.
 
     `minify` alone is deliberately NOT a reason to emit a primer: minified JSON is just
     JSON, carries no terse marker, and needs no explanation.

@@ -441,7 +441,7 @@ by the next patch (PyPI versions cannot be re-uploaded).
   if a real workload needs it.
 - **Cross-call diffing is built and OPT-IN (`proxy --diff` / policy
   `"diff": true`).** Default-off since #170: the tier is correct, but its primer
-  paragraph is 47% of the primer and the live ledger shows a 0.38% hit rate.
+  paragraph is 34% of the primer (190 of 555) and the live ledger shows a 0.38% hit rate.
  The probe shows 91% overlap between successive
   same-tool calls; the proxy emits a lossless delta against the prior result (keyed row
   diff for record arrays, shallow key diff for objects) instead of the full payload. It

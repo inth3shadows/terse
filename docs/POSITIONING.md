@@ -52,8 +52,11 @@ recurring charge.
 **The question is per server, not per install.** Each wrapped server attaches its
 own primer, once per session, so a six-server fleet pays six of them. What #211
 removed was the *turns* factor, not the *servers* factor — standalone cost went
-from `servers x turns` to `servers x 1`. Only the router is O(1) in peer count,
-which is the actual argument for consolidating one.
+from `servers x turns` to `servers x 1`. Only the router is O(1) in peer count — but
+it pays that O(1) primer EVERY TURN rather than once per session, so at any real turn
+count a router is the more expensive shape, not the cheaper one. Consolidate for the
+operational reasons (one policy, one process, one permission surface), not to save
+tokens; `USAGE.md` and `install-mcp --multiproxy` say the same.
 
 For a router/multiproxy setup wrapping several servers behind one shared primer, the
 break-even arithmetic is different in *kind*, not degree. The router's
@@ -140,8 +143,9 @@ has a drop rule of its own. `codegraph` carries the example policy's only
 drop-to-retrieve rule. `kb` sits *after* it in the walk and so inherits the
 64-token dropped-field paragraph at 312, while dropping nothing itself; `runecho`
 sits *before* it and pays 248; `secret-broker` is structurally never-lossy (#199),
-which suppresses the dropped-field paragraph specifically — its tiers, and so the
-remaining 248, still come from its own rules. Both the live policy and
+which suppresses the dropped-field paragraph specifically — the remaining 248 comes
+from whatever grants its tiers, which is a carve-out rule in the live policy and
+`defaults` in the example policy, where it matches no rule at all. Both the live policy and
 `policy.example.json` produce exactly these values.
 
 Mean 73 tokens saved per call across the whole ledger (154,101 saved / 2,101

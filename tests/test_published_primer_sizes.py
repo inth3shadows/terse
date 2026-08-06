@@ -83,6 +83,20 @@ INSTALLED = {count_cl100k(build_primer(default_policy()))} | {
     for s in ("runecho", "kb", "codegraph", "secret-broker", "gh", None)
 } - {0}
 
+# Every size the assembly can actually produce — all 32 gate combinations. A ROUTER's
+# union_primer is a boolean OR over the five gates, so any of these is reachable in prose
+# about routers: POSITIONING publishes 438 (diff on, embedded/dropped off) for exactly that
+# case. 438 is a true live size that `INSTALLED` does not contain, and it slipped the sweep
+# only because the sentence says "it pays 438" with no `tokens` after it — one wording
+# normalisation away from failing on a correct number. Membership is the weak claim here
+# anyway; the specific pins (summands, ceiling, threshold, priced) carry the weight.
+REACHABLE = {
+    count_cl100k(_assemble_primer(table=bool(m & 1), dictionary=bool(m & 2),
+                                  embedded=bool(m & 4), diff=bool(m & 8),
+                                  dropped=bool(m & 16)))
+    for m in range(32)
+} - {0}
+
 COVERED = ("README.md", "USAGE.md", "docs/POSITIONING.md", "src/terse/policy.py")
 
 # Three shapes the prose actually uses. The first two carry their own unit and are
@@ -181,7 +195,7 @@ def test_positioning_publishes_the_live_section_breakdown():
 
 
 def test_every_published_primer_size_is_a_size_the_primer_actually_has():
-    live = {count_cl100k(s) for s in SECTIONS.values()} | {FULL} | INSTALLED
+    live = {count_cl100k(s) for s in SECTIONS.values()} | {FULL} | INSTALLED | REACHABLE
     for doc in COVERED:
         for line, published in _mentions(doc):
             assert published in live, (
@@ -269,7 +283,11 @@ def test_positioning_publishes_the_default_primer_as_its_own_summands():
     # The rule restates the bar in round numbers ("can't clear ~250") two lines from the
     # pinned sentence. Left unchecked, editing that alone back to ~550 re-publishes
     # 555-as-threshold — #224's exact failure mode — with every other assertion green.
-    for rounded in re.finditer(r"clear ~(\d[\d,]*)", flat):
+    rounds = list(re.finditer(r"clear ~(\d[\d,]*)", flat))
+    assert rounds, ("POSITIONING no longer restates the bar as `clear ~N`. Without a "
+                    "non-vacuity check this loop passes on zero matches, leaving the "
+                    "rounded restatement — the easiest place to re-publish 555 — unpinned.")
+    for rounded in rounds:
         assert _num(rounded.group(1)) == round(total, -1), (
             f"POSITIONING rounds the wrap bar to ~{rounded.group(1)}; the primer it must "
             f"round is {total} (~{round(total, -1)})")
