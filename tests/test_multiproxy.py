@@ -1782,3 +1782,186 @@ def test_load_multi_config_rejects_an_empty_cwd(tmp_path):
     cfg = _write_config(tmp_path, [{"name": "p", "command": ["true"], "cwd": ""}])
     with pytest.raises(ValueError, match="must not be empty"):
         load_multi_config(str(cfg))
+
+
+# --- partial-listing diagnosis (#178, the half that does not need retention) -------------
+#
+# #178 withdrew route RETENTION after three review rounds found 11 defects, every one in the
+# retention and ordering machinery. It left two gaps open, and closed with the design advice
+# these tests encode: *prefer a design where the table is derived, not accumulated*, and
+# *decide the semantics of "the peer did not answer" up front — an explicit JSON-RPC error,
+# an empty list, a malformed result and a true timeout are four different things.*
+#
+# So: no route is ever carried forward. What is carried is a DIAGNOSIS of the listing that
+# produced the current table, installed with it under the same seq guard and dying with it,
+# feeding error text only. It cannot resurrect a tool, because it is never consulted to
+# resolve one.
+
+
+def _silent_after(router, parts):
+    from terse.multiproxy import _PendingBroadcast
+    router._merge_tools_list(_PendingBroadcast(
+        kind="tools/list", client_id=9, seq=1, remaining=set(), parts=parts))
+    return router._tool_state[2]
+
+
+def test_the_four_ways_a_peer_contributes_nothing_are_four_different_answers():
+    """Conflating any of them is where #178's round-3 defect came from, so they stay four
+    values and never collapse to a boolean. `no reply` is a peer the broadcast completed
+    without; `error` is a live peer refusing the method; `empty` is a peer exercising its
+    right to export nothing; `malformed` is a reply whose `result.tools` is not a list."""
+    for parts, expected in (
+        ({}, [("a", "no reply"), ("b", "no reply")]),
+        ({0: {"error": {"code": -32601}}, 1: {"result": {"tools": [{"name": "x"}]}}},
+         [("a", "error")]),
+        ({0: {"result": {"tools": []}}, 1: {"result": {"tools": [{"name": "x"}]}}},
+         [("a", "empty")]),
+        ({0: {"result": {"tools": "nope"}}, 1: {"result": {"tools": [{"name": "x"}]}}},
+         [("a", "malformed")]),
+        # A non-empty list of unusable entries is `empty`, not `malformed`: from the
+        # client's side it is indistinguishable from exporting nothing, and `malformed`
+        # would accuse a peer that answered perfectly well.
+        ({0: {"result": {"tools": [{"no_name": 1}]}}, 1: {"result": {"tools": [{"name": "x"}]}}},
+         [("a", "empty")]),
+    ):
+        _, _, _, _, router = _two_peer_router()
+        try:
+            assert list(_silent_after(router, parts)) == expected, parts
+        finally:
+            router.close_senders()
+
+
+def test_the_unknown_tool_error_names_the_peers_that_missed_the_listing():
+    """#178 gap 1: a non-conformant client holding names from an earlier listing gets -32601
+    for a tool whose peer is ALIVE and merely was slow, and the bare message reads as "no
+    such tool ever". The peer is still not routable — nothing is carried forward — but the
+    client is now told which peers were absent and to re-read `tools/list`."""
+    _, _, _, out, router = _two_peer_router()
+    try:
+        _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
+        # peer b now misses the listing entirely; its tool leaves the table
+        _silent_after(router, {0: {"result": {"tools": [{"name": "only_a"}]}}})
+        assert set(router.tool_route) == {"only_a"}          # NOT retained
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+             "params": {"name": "only_b"}}))
+    finally:
+        router.close_senders()
+    err = [m for m in _lines(out) if m.get("id") == 7][0]["error"]
+    assert err["code"] == -32601
+    assert "b (no reply)" in err["message"]
+    assert "re-read tools/list" in err["message"]
+
+
+def test_a_complete_listing_adds_no_suffix_to_the_unknown_tool_error():
+    """A permanent suffix would be noise on the common case, and would imply a partial
+    listing where there was none — the error would then mislead in the other direction."""
+    _, _, _, out, router = _two_peer_router()
+    try:
+        _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
+        assert router._tool_state[2] == ()
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+             "params": {"name": "nope"}}))
+    finally:
+        router.close_senders()
+    err = [m for m in _lines(out) if m.get("id") == 7][0]["error"]
+    assert "contributed no tools" not in err["message"]
+    assert "re-read tools/list" not in err["message"]
+
+
+def test_a_listing_refused_as_stale_does_not_install_its_diagnosis_either():
+    """The diagnosis rides inside `_tool_state` precisely so it cannot outlive or precede
+    the table it describes. Installing it outside the seq guard would report peers missing
+    from a listing that was never installed — the accumulated-state failure mode #178
+    withdrew, reintroduced through the back door."""
+    from terse.multiproxy import _PendingBroadcast
+    _, _, _, out, router = _two_peer_router()
+    try:
+        # newer, complete listing installs first
+        router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=10, seq=2, remaining=set(),
+            parts={0: {"result": {"tools": [{"name": "a1"}]}},
+                   1: {"result": {"tools": [{"name": "b1"}]}}}))
+        assert router._tool_state[2] == ()
+        # an older partial listing times out afterwards and is refused
+        router._merge_tools_list(_PendingBroadcast(
+            kind="tools/list", client_id=9, seq=1, remaining={1},
+            parts={0: {"result": {"tools": [{"name": "a1"}]}}}))
+        assert router._tool_state == (2, router._tool_state[1], ())
+        assert set(router.tool_route) == {"a1", "b1"}
+    finally:
+        router.close_senders()
+
+
+def test_only_the_reasons_nothing_else_reports_are_warned_about(capsys):
+    """`no reply` is already named by `_timeout_broadcast` — a broadcast completes on
+    arrival or on timeout, so that is the only way to be absent — and `empty` is not a
+    fault. Warning on either would train a reader to ignore the line that matters."""
+    _, _, _, _, router = _two_peer_router()
+    try:
+        _silent_after(router, {0: {"error": {"code": -32601}},
+                               1: {"result": {"tools": []}}})
+    finally:
+        router.close_senders()
+    warn = capsys.readouterr().err
+    assert "'a' (error)" in warn
+    assert "'b'" not in warn                       # empty is not a fault
+
+
+def test_the_diagnosis_never_resolves_a_call(capsys):
+    """The whole safety argument: it feeds error text and nothing else. A peer named in the
+    diagnosis is exactly as unroutable as it would be without it — this is what makes the
+    design derived rather than accumulated."""
+    t0, t1, _, out, router = _two_peer_router()
+    try:
+        _list_tools(router, out, [[{"name": "only_a"}], [{"name": "only_b"}]])
+        _silent_after(router, {0: {"result": {"tools": [{"name": "only_a"}]}}})
+        before = len(_peer_calls(t1))
+        for nm in ("only_b", "b__only_b"):
+            router.route_client_line(json.dumps(
+                {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                 "params": {"name": nm}}))
+        assert len(_peer_calls(t1)) == before      # nothing dispatched to the absent peer
+    finally:
+        router.close_senders()
+
+
+def test_a_peer_that_exports_nothing_does_not_taint_every_unknown_tool_error():
+    """Review finding. A prompts-only or resources-only peer is `empty` on EVERY listing, so
+    including it would append "re-read tools/list" to every unknown-tool error this install
+    ever produces — advice that can never change anything, and which contradicts the promise
+    that a complete listing says nothing extra. Only reasons a re-read might actually fix
+    reach the client; `empty` still appears in the diagnosis itself, it just isn't
+    actionable."""
+    _, _, _, out, router = _two_peer_router()
+    try:
+        _silent_after(router, {0: {"result": {"tools": [{"name": "only_a"}]}},
+                               1: {"result": {"tools": []}}})
+        assert router._tool_state[2] == (("b", "empty"),)     # still diagnosed...
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+             "params": {"name": "nope"}}))
+    finally:
+        router.close_senders()
+    msg = [m for m in _lines(out) if m.get("id") == 9][0]["error"]["message"]
+    assert "re-read tools/list" not in msg                    # ...but not surfaced
+    assert "empty" not in msg
+
+
+def test_an_empty_peer_does_not_mask_a_real_one_in_the_same_listing():
+    """The filter drops `empty` from the client-facing list, not the whole suffix — a
+    listing where one peer exports nothing and another errored must still tell the client
+    about the one a re-read could fix."""
+    _, _, _, out, router = _two_peer_router()
+    try:
+        _silent_after(router, {0: {"result": {"tools": []}},
+                               1: {"error": {"code": -32601}}})
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+             "params": {"name": "nope"}}))
+    finally:
+        router.close_senders()
+    msg = [m for m in _lines(out) if m.get("id") == 9][0]["error"]["message"]
+    assert "b (error)" in msg and "a (empty)" not in msg
+    assert "re-read tools/list" in msg

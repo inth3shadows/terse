@@ -9,6 +9,53 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Changed
+- **A multiproxy `-32601` now says which peers missed the listing, instead of only "unknown
+  tool".** This is the half of #178 that does not need the design #178 withdrew.
+
+  When a peer misses a `tools/list` broadcast, its tools are absent from the merged listing
+  and a call to one is a clean `-32601` — correct, and indistinguishable from "no such tool
+  ever". A non-conformant client holding names from an earlier listing therefore got a
+  message that pointed at the wrong problem, for a tool whose peer was alive and merely
+  slow. The error now names the peers that contributed nothing to the listing behind the
+  current table, why, and to re-read `tools/list`. On a complete listing it says nothing
+  extra: a permanent suffix would be noise on the common case and would imply a partial
+  listing where there was none.
+
+  **No route is carried forward.** #178 withdrew route *retention* after three review rounds
+  found 11 defects, every one in the retention and ordering machinery rather than in the
+  naming rule it protected, and closed with the advice that a revisit should *prefer a
+  design where the table is derived, not accumulated*. So what is stored is a diagnosis of
+  the listing that produced the current table — installed inside `_tool_state` under the
+  same lock and the same seq guard as the route itself, replaced wholesale with it, and
+  never consulted to resolve a name. A peer named in it is exactly as unroutable as before;
+  a listing refused as stale installs neither its table nor its diagnosis.
+
+  #178's other closing requirement was to decide up front what "the peer did not answer"
+  means, since conflating those cases is where its round-3 defect came from. There are four
+  and they stay four: `no reply` (absent from the broadcast — already named on stderr by the
+  timeout path), `error` (a live peer refusing the method), `empty` (a peer exercising its
+  right to export nothing — not a fault, so not warned about), and `malformed` (a reply
+  whose `result.tools` is not a list). A non-empty list of entries with no usable `name` is
+  `empty`, not `malformed`: from the client's side it is indistinguishable from exporting
+  nothing, and `malformed` would accuse a peer that answered perfectly well.
+
+  Only reasons a re-read might actually fix reach the client: a peer that legitimately
+  exports zero tools is `empty` on every listing, so surfacing it would append "re-read
+  tools/list" to every unknown-tool error the install ever produces. It stays in the
+  diagnosis; it just isn't actionable.
+
+  `error` and `malformed` also now warn on stderr at merge time, which nothing did before —
+  only the timeout path warned, so a peer that *answered* with a refusal disappeared from
+  the listing in total silence. `prompts/list` deliberately carries no diagnosis (most MCP
+  servers answer it with `-32601`, so "contributed nothing" is the norm there rather than a
+  signal) but keeps the same tuple shape, so the two surfaces cannot drift into different
+  unpackings.
+
+  Still open in #178, and untouched here: collision naming is computed per listing, so two
+  peers exporting the same tool name can see it re-qualify between listings. That needs an
+  actual cross-peer collision, which is empty on the fleets this feature targets.
+
 ### Fixed
 - **Four review findings against the primer-cadence split (#222).**
 
