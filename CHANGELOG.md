@@ -9,7 +9,12 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+_Nothing yet — `main` is released as [0.22.2](https://github.com/inth3shadows/terse/releases)._
+
+## [0.22.2] - 2026-08-06
+
 ### Fixed
+
 - **The launch path baked into every wrapped MCP config was never executed by any test.**
   `install_mcp` writes `[sys.executable, "-m", "terse"]` as the command for every wrapped
   entry, so `python -m terse` is *the* production entrypoint — and `src/terse/__main__.py`
@@ -54,32 +59,10 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   Both formats are now re-derived from live runs, with the re-derivation command recorded
   in the file, since line-numbered fingerprints will rot again.
 
-### Fixed
-- **A corpus row with no `tool` key silently left the per-tool tables — and one with
-  `"tool": None` crashed the report outright.** Found by a logic sweep, not by a diff.
-
-  All three report surfaces (`report.py` markdown, `html_report.py`, `terminal_report.py`)
-  built their tool list with `r.get("tool", "?")` and then filtered rows with
-  `r.get("tool") == tool`. The two expressions agree on every input except one: a row where
-  the key is **absent**. The set substitutes `"?"`; the filter compares `None` against it and
-  matches nothing. The row's tokens vanish from the per-tool table while still counting in
-  every other total on the page, and a phantom `?` row prints at 0/0/n-a. Executed: two rows
-  of 1,000 and 5,000 raw tokens render a per-tool table summing to **1,000 of 6,000** — a 5x
-  under-report with no error anywhere.
-
-  A row carrying an explicit `"tool": None` fails differently and worse. The key exists, so
-  `None` enters the set and `sorted()` raises `TypeError: '<' not supported between 'str'
-  and 'NoneType'`: the whole report dies rather than mis-reporting. That second failure is
-  why the fix normalises with `or "?"` on both lines rather than giving the filter a
-  matching default — `or` covers absent, `None` and `""` in one expression.
-
-  Not reachable from the CLI today: `measure_corpus` sets `tool` unconditionally and
-  `_cmd_measure`/`_cmd_verify` are the only production callers, so no published number was
-  ever wrong. These are public functions taking rows as an argument, though, and the `"?"`
-  default is itself evidence that someone expected the key to be missable — the code
-  intended to handle the case and handled it by dropping data.
+## [0.22.1] - 2026-08-06
 
 ### Added
+
 - **`terse stats --json` is now pinned field by field.** USAGE calls it "the raw aggregate,
   for scripts", which makes it a contract with people outside this repo — and it carried
   **37 fields across four nested shapes** with exactly two assertions on any of them
@@ -105,6 +88,31 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   zero, and `primer_liability` itself can be `null` when the install could not be sized.
 
 ### Fixed
+
+- **A corpus row with no `tool` key silently left the per-tool tables — and one with
+  `"tool": None` crashed the report outright.** Found by a logic sweep, not by a diff.
+
+  All three report surfaces (`report.py` markdown, `html_report.py`, `terminal_report.py`)
+  built their tool list with `r.get("tool", "?")` and then filtered rows with
+  `r.get("tool") == tool`. The two expressions agree on every input except one: a row where
+  the key is **absent**. The set substitutes `"?"`; the filter compares `None` against it and
+  matches nothing. The row's tokens vanish from the per-tool table while still counting in
+  every other total on the page, and a phantom `?` row prints at 0/0/n-a. Executed: two rows
+  of 1,000 and 5,000 raw tokens render a per-tool table summing to **1,000 of 6,000** — a 5x
+  under-report with no error anywhere.
+
+  A row carrying an explicit `"tool": None` fails differently and worse. The key exists, so
+  `None` enters the set and `sorted()` raises `TypeError: '<' not supported between 'str'
+  and 'NoneType'`: the whole report dies rather than mis-reporting. That second failure is
+  why the fix normalises with `or "?"` on both lines rather than giving the filter a
+  matching default — `or` covers absent, `None` and `""` in one expression.
+
+  Not reachable from the CLI today: `measure_corpus` sets `tool` unconditionally and
+  `_cmd_measure`/`_cmd_verify` are the only production callers, so no published number was
+  ever wrong. These are public functions taking rows as an argument, though, and the `"?"`
+  default is itself evidence that someone expected the key to be missable — the code
+  intended to handle the case and handled it by dropping data.
+
 - **A ledger record whose `decision` cannot be read no longer under-bills its primer.**
   `aggregate` tolerates a record with no `decision` field, counting it as `"unknown"` — it
   reached `blocks` but not `encoded`, so a server whose every readable block was unknown
@@ -127,7 +135,10 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   fails and says why. Closing it needs the ledger to record whether the attach fired, which
   is a shape change and a separate decision.
 
+## [0.22.0] - 2026-08-05
+
 ### Changed
+
 - **A multiproxy `-32601` now says which peers missed the listing, instead of only "unknown
   tool".** This is the half of #178 that does not need the design #178 withdrew.
 
@@ -174,7 +185,10 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   peers exporting the same tool name can see it re-qualify between listings. That needs an
   actual cross-peer collision, which is empty on the fleets this feature targets.
 
+## [0.21.6] - 2026-08-05
+
 ### Fixed
+
 - **Four review findings against the primer-cadence split (#222).**
 
   - **A pre-cadence `--json` blob got the wrong legend.** The prose gated its per-cadence
@@ -207,6 +221,10 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
     `per_turn x turns + once` could see "pays for ~1 turn" beside "covers the one-time
     charge at most ~1x" and read itself as break-even. Said once, explicitly, when both
     cadences are present.
+
+## [0.21.5] - 2026-08-05
+
+### Fixed
 
 - **`terse stats`'s primer liability no longer charges a lazily-primed server as if it
   primed every turn.** This is the re-derivation #211 left as a follow-up, and until now the
@@ -251,7 +269,42 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   it would be the #144/#186/#188 defect family again. Over-billing by an unobservable
   exception is the safe direction.
 
+## [0.21.4] - 2026-08-05
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Fixed
+
+- fix(docs): correct lazy-primer economics and undated ledger in POSITIONING.md (#220)
+
+### Changed
+
+- docs: positioning doc + resolve router primer economics (#219)
+- chore: gitignore serena-mcp's stray project index (#218)
+
+## [0.21.3] - 2026-08-05
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Fixed
+
+- fix: close the corrupt-sidecar-warning gap and the run_capture.sh TOCTOU; share the sidecar predicate (#217)
+
+## [0.21.2] - 2026-08-05
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Fixed
+
+- fix: harden the _calls.json sidecar write and close the same directory-perms bug at its second call site (#216)
+
+## [0.21.1] - 2026-08-05
+
 ### Added
+
 - **`scripts/bench/mcp_servers/mcp_probe.py` now persists a probe's exact call arguments
   beside its corpus** (`<corpus_dir>/_calls.json`, #138 step 0). A saved §6 corpus dir
   previously carried no record of what it was called with — `{tool, shape, bytes, sha,
@@ -261,52 +314,8 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   a capture envelope; `toon_column.py`'s envelope glob now skips it by name instead of
   falling through to its (still-correct, just noisier) generic SKIP path.
 
-- **Lazy primer (#168 phase 2): the format primer no longer rides on every `initialize`
-  reply, paid every turn for the life of the connection.** It now attaches to the first
-  `tools/call` result that actually carries a terse wire form — once per session, as a
-  new leading content block ahead of the compressed data — instead of costing
-  `servers x turns` of cached context regardless of whether a wrapped server is ever
-  called. A session that never touches a wrapped tool now pays zero primer bytes; a
-  session with real tool use pays it once. This is the runtime implementation of the fix
-  the `inline_ok` fluency arm (below, #210) measured safe before it shipped.
-
-  `lazy_primer=True` is the new `Interceptor`/`run_proxy` default (not a CLI flag —
-  ships the same way #204's union-schema tabularize did). Multiproxy peers are
-  explicitly excluded (`_build_peers` passes `lazy_primer=False`): the router already
-  primes eagerly, once, via `union_primer` at its own merged `initialize` — a peer going
-  lazy too would just attach a second, redundant explanation on top of that.
-
-  A result carrying `structuredContent` never gets the lazy-attach treatment, even when
-  a terse marker landed there: measured (`scripts/probe/structured_content/`) that
-  Claude Code discards the text block entirely whenever `structuredContent` is present,
-  so a primer block sitting next to it would be silently thrown away. The proxy waits
-  for a text-only compressible result instead. A session whose *every* wrapped-tool call
-  happens to carry `structuredContent` under a rewriting-eligible client never finds that
-  later call — a known, narrow, accepted gap (comprehension degrades to the un-primed
-  level for that traffic, not to broken output), not a silent one.
-
-  `terse stats`'s primer-liability figure was left by this change as a worst-case upper
-  bound for a standalone `terse proxy` entry — reflecting the old always-eager cost rather
-  than the new one-time one — and stayed live and accurate for a multiproxy router entry.
-  That re-derivation has since landed: see the `Fixed` entry above, which splits the two
-  cadences and stops reporting the servers this change made free as "pure cost".
-
-- **A fourth fluency arm, `inline_ok`, measures #168's "lazy primer" proposal before it
-  ships.** `run_payload`/`run_fluency` now also ask each question with the format primer
-  riding inline in the user message (no system prompt at all) — the exact delivery mode a
-  primer attached to the first compressed result would use, instead of `initialize`'s
-  `instructions` field. `build_fluency_report` renders it as a `terse+inline` column,
-  falling back to `n/a` (never `0%`) for older result files that predate the arm.
-
-  Measured against two live models over the synthetic stress corpus
-  (`scripts/gen_stress_corpus.py`): `glm-5.2` scored raw 100% / terse 96% / terse+primer
-  100% / **terse+inline 100%**; `deepseek-v4-flash` scored raw 100% / terse 92% /
-  terse+primer 96% / **terse+inline 100%** — inline delivery matched or beat the
-  system-level primer on both. Answers the open question #168 left explicitly blocking a
-  lazy-primer implementation: comprehension does not depend on the primer riding in the
-  system slot.
-
 ### Fixed
+
 - **§6 re-measured against the merge of #202, and a genuinely cold, argument-recording
   round settled the two-round-old memory/serena discrepancy (#138 phase 2).** Fresh probes
   of all 10 servers plus the repo-size sweep, using the new `_calls.json` sidecar so this
@@ -350,6 +359,63 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   shape, though the original round's unrecorded arguments mean this isn't provable, only
   plausible. TOON still wins the smallest, most uniform rows, same as before.
 
+## [0.21.0] - 2026-08-04
+
+### Added
+
+- **Lazy primer (#168 phase 2): the format primer no longer rides on every `initialize`
+  reply, paid every turn for the life of the connection.** It now attaches to the first
+  `tools/call` result that actually carries a terse wire form — once per session, as a
+  new leading content block ahead of the compressed data — instead of costing
+  `servers x turns` of cached context regardless of whether a wrapped server is ever
+  called. A session that never touches a wrapped tool now pays zero primer bytes; a
+  session with real tool use pays it once. This is the runtime implementation of the fix
+  the `inline_ok` fluency arm (below, #210) measured safe before it shipped.
+
+  `lazy_primer=True` is the new `Interceptor`/`run_proxy` default (not a CLI flag —
+  ships the same way #204's union-schema tabularize did). Multiproxy peers are
+  explicitly excluded (`_build_peers` passes `lazy_primer=False`): the router already
+  primes eagerly, once, via `union_primer` at its own merged `initialize` — a peer going
+  lazy too would just attach a second, redundant explanation on top of that.
+
+  A result carrying `structuredContent` never gets the lazy-attach treatment, even when
+  a terse marker landed there: measured (`scripts/probe/structured_content/`) that
+  Claude Code discards the text block entirely whenever `structuredContent` is present,
+  so a primer block sitting next to it would be silently thrown away. The proxy waits
+  for a text-only compressible result instead. A session whose *every* wrapped-tool call
+  happens to carry `structuredContent` under a rewriting-eligible client never finds that
+  later call — a known, narrow, accepted gap (comprehension degrades to the un-primed
+  level for that traffic, not to broken output), not a silent one.
+
+  `terse stats`'s primer-liability figure was left by this change as a worst-case upper
+  bound for a standalone `terse proxy` entry — reflecting the old always-eager cost rather
+  than the new one-time one — and stayed live and accurate for a multiproxy router entry.
+  That re-derivation has since landed: see the `Fixed` entry above, which splits the two
+  cadences and stops reporting the servers this change made free as "pure cost".
+
+## [0.20.0] - 2026-08-04
+
+### Added
+
+- **A fourth fluency arm, `inline_ok`, measures #168's "lazy primer" proposal before it
+  ships.** `run_payload`/`run_fluency` now also ask each question with the format primer
+  riding inline in the user message (no system prompt at all) — the exact delivery mode a
+  primer attached to the first compressed result would use, instead of `initialize`'s
+  `instructions` field. `build_fluency_report` renders it as a `terse+inline` column,
+  falling back to `n/a` (never `0%`) for older result files that predate the arm.
+
+  Measured against two live models over the synthetic stress corpus
+  (`scripts/gen_stress_corpus.py`): `glm-5.2` scored raw 100% / terse 96% / terse+primer
+  100% / **terse+inline 100%**; `deepseek-v4-flash` scored raw 100% / terse 92% /
+  terse+primer 96% / **terse+inline 100%** — inline delivery matched or beat the
+  system-level primer on both. Answers the open question #168 left explicitly blocking a
+  lazy-primer implementation: comprehension does not depend on the primer riding in the
+  system slot.
+
+## [0.19.1] - 2026-08-04
+
+### Fixed
+
 - **The shape classifier was narrower than the codec, so the measurement stack under-fired
   on union-schema traffic (#204).** `capture._find_record_list` still used the strict
   identical-keyset rule after #202 widened what the tabularizer folds. A payload where two
@@ -391,6 +457,7 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   only ever sees non-uniform child lists, so a structure payload whose keys run `sym` before
   `path` now enumerates `sym` where it enumerated `path`. Same information, different
   question — the alternative was leaving the flat path picking columns alphabetically.
+
 - **README and BENCHMARKS published the pre-#202 numbers, and nothing was checking (#206).**
   Union-schema tabularize moved the bench corpus and both documents went on claiming the old
   figures. §1: weighted total **58.3% → 59.1%**, `gh_issues` **32.7% → 38.8%** — every other
@@ -434,70 +501,11 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   documents instead. Verified by mutation — 10 hand-built regressions (stale cell in each
   section, wrong raw count, wrong record count, deleted row, 0.1pp drift, one document updated
   without the other) and all 10 fail the suite.
-- **Three `policy.py` soundness gaps the #198 review parked as one issue (#199).**
-  1. `_glob_covers_server` decided cover by string equality against three literal forms
-     while `select` matches by `fnmatch`, so a server literally named `kb[1]` counted
-     `kb[1].*` as covering — `[1]` is a character class and that rule matches none of its
-     tools. Cover is now proved structurally: the whole-world glob, or a metacharacter-free
-     literal prefix no longer than `{server}.` followed by `*`. Deliberately NOT a probe
-     against a representative name (`fnmatch(f"{server}.x", glob)`): that is unsound the
-     other way, calling `kb.?` and `kb.*x` covering because both match the literal `kb.x`
-     while matching no real tool — which terminates `has_drop`'s walk early and drops the
-     dropped-field paragraph **and** the `terse.retrieve` tool from a server that still
-     reaches the drop rule, leaving the model an unretrievable `__terse_dropped__`. Refusing
-     an unproven cover is the safe direction: the walk continues and the caller
-     over-approximates, which is already `reachable_tiers`' contract.
-  2. `_match_candidates`' reported gap — that a peer-qualified `gh__gh.api.items` leaves a
-     server-scoped `gh.*` rule with nothing to match, because candidate[0] keeps the `__` —
-     **was investigated and is not a bug; no change shipped.** `select` also tries the BARE
-     candidate `gh.api.items`, which `gh.*` fnmatches, so the rule was never missing
-     (verified across `gh__gh.api.items`, `gh__gh.rate_limit`, `mcp__gh.search`). The
-     proposed fix was actively harmful: candidate order is major over rule order, so
-     synthesizing `gh.gh.rate_limit` at position 0 lets `gh.*` win one candidate *before* a
-     specific rule can match the bare name. On terse's own `policy.example.json` that turned
-     `{"tool": "*.rate_limit", "tiers": []}` — an explicit passthrough — into `gh.*` with
-     `result[].body` truncation (2,125 bytes lossless became 626 with the body cut), and
-     turned USAGE.md's documented `{"tiers": [], "capture": false}` recipe for keeping a
-     credential tool's output off disk into a rule with `capture: true`, making the payload
-     eligible for the `--capture-dir` corpus and the `--debug-log` replay trace. The guard
-     is unchanged and now carries that measurement; a regression test pins that a specific
-     passthrough rule keeps its `tiers: ()`, its `capture: false` and its empty field map.
-  3. `has_drop` ignored `server_never_lossy`. A server that structurally forbids every drop
-     still paid the 64-token dropped-field paragraph and advertised a `terse.retrieve` it
-     could never mint a handle for.
-- **`has_drop` was the last primer gate ignoring the server (#168).** The other four
-  (`emits_table`/`emits_dict`/`emits_embedded`/`emits_diff`) all take a server name and walk
-  rules the way `select` does; `has_drop` scanned every rule in the file unconditionally. Peers
-  commonly share ONE policy file, so it effectively answered *"does this file contain a drop
-  rule"* — and a server whose own rule totally covers it, and can therefore never reach the drop
-  rule at all, still paid the 64-token dropped-field paragraph **and** advertised a
-  `terse.retrieve` tool it could never mint a handle for.
 
-  Measured on this operator's live policy: **192 tok/turn** across six separately-wrapped
-  servers (`secret-broker`, `gh`, `runecho` each 212 -> 148; `codegraph`, `kb`, `shot-mcp`
-  unchanged because they genuinely reach the drop rule). That is the six-separate-proxies
-  configuration #168 measured at **+23.1% RAW**. A single `multiproxy` router is **unchanged at
-  212** — one peer that can drop is enough for the union primer, since the client sees one
-  server and cannot be told per-peer. On an install that is one router plus a standalone
-  proxy launched without `--server-name` (`server=None` -> whole-file scan, unchanged), the
-  realized saving is **0 tok/turn**; 192 is the fan-out configuration, not a number anyone
-  banks by upgrading.
-
-  Answering `terse.retrieve` is deliberately left **ungated** while advertising it is gated:
-  answer >= advertise, matching `multiproxy`. A retrieve call reaching a server this build
-  believes cannot drop is the symptom of the `_glob_covers_server` cases in #199, and
-  forwarding it downstream would turn one wasted paragraph into an unredeemable handle plus
-  a `-32601` from a server that never had the tool.
-
-  The narrowing taken is only the sound one, the same `reachable_tiers` uses: terminate the
-  walk at a rule that totally covers the server, because `select` returns the first match.
-  A rule whose glob merely *looks* scoped elsewhere still counts — `_match_candidates`' second
-  candidate is the tool's own unqualified name. Pinned by an under-inclusion invariant test
-  (`select` drops for a server => `has_drop(server)` is True), because the failure directions
-  are not symmetric: a surplus paragraph costs tokens, a missing retrieve tool costs a handle
-  nobody can redeem.
+## [0.19.0] - 2026-08-04
 
 ### Added
+
 - **Union-schema tabularize — non-uniform record arrays now fold.** `_uniform_dict_list`
   required an identical key set across every row, so `runecho structure` (where `import`/
   `export` rows lack the `line` that `class`/`function` rows carry) fell straight through
@@ -553,6 +561,91 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   the same commit as the codec leaves no clean before/after. The comments that claimed the
   two could "never drift" have been corrected to describe the gap.
 
+## [0.18.1] - 2026-08-04
+
+### Fixed
+
+- **Three `policy.py` soundness gaps the #198 review parked as one issue (#199).**
+  1. `_glob_covers_server` decided cover by string equality against three literal forms
+     while `select` matches by `fnmatch`, so a server literally named `kb[1]` counted
+     `kb[1].*` as covering — `[1]` is a character class and that rule matches none of its
+     tools. Cover is now proved structurally: the whole-world glob, or a metacharacter-free
+     literal prefix no longer than `{server}.` followed by `*`. Deliberately NOT a probe
+     against a representative name (`fnmatch(f"{server}.x", glob)`): that is unsound the
+     other way, calling `kb.?` and `kb.*x` covering because both match the literal `kb.x`
+     while matching no real tool — which terminates `has_drop`'s walk early and drops the
+     dropped-field paragraph **and** the `terse.retrieve` tool from a server that still
+     reaches the drop rule, leaving the model an unretrievable `__terse_dropped__`. Refusing
+     an unproven cover is the safe direction: the walk continues and the caller
+     over-approximates, which is already `reachable_tiers`' contract.
+  2. `_match_candidates`' reported gap — that a peer-qualified `gh__gh.api.items` leaves a
+     server-scoped `gh.*` rule with nothing to match, because candidate[0] keeps the `__` —
+     **was investigated and is not a bug; no change shipped.** `select` also tries the BARE
+     candidate `gh.api.items`, which `gh.*` fnmatches, so the rule was never missing
+     (verified across `gh__gh.api.items`, `gh__gh.rate_limit`, `mcp__gh.search`). The
+     proposed fix was actively harmful: candidate order is major over rule order, so
+     synthesizing `gh.gh.rate_limit` at position 0 lets `gh.*` win one candidate *before* a
+     specific rule can match the bare name. On terse's own `policy.example.json` that turned
+     `{"tool": "*.rate_limit", "tiers": []}` — an explicit passthrough — into `gh.*` with
+     `result[].body` truncation (2,125 bytes lossless became 626 with the body cut), and
+     turned USAGE.md's documented `{"tiers": [], "capture": false}` recipe for keeping a
+     credential tool's output off disk into a rule with `capture: true`, making the payload
+     eligible for the `--capture-dir` corpus and the `--debug-log` replay trace. The guard
+     is unchanged and now carries that measurement; a regression test pins that a specific
+     passthrough rule keeps its `tiers: ()`, its `capture: false` and its empty field map.
+  3. `has_drop` ignored `server_never_lossy`. A server that structurally forbids every drop
+     still paid the 64-token dropped-field paragraph and advertised a `terse.retrieve` it
+     could never mint a handle for.
+
+## [0.18.0] - 2026-07-31
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Added
+
+- feat(stats): stamp the writing version and canonicalize tool identity (#200)
+
+## [0.17.1] - 2026-07-31
+
+### Fixed
+
+- **`has_drop` was the last primer gate ignoring the server (#168).** The other four
+  (`emits_table`/`emits_dict`/`emits_embedded`/`emits_diff`) all take a server name and walk
+  rules the way `select` does; `has_drop` scanned every rule in the file unconditionally. Peers
+  commonly share ONE policy file, so it effectively answered *"does this file contain a drop
+  rule"* — and a server whose own rule totally covers it, and can therefore never reach the drop
+  rule at all, still paid the 64-token dropped-field paragraph **and** advertised a
+  `terse.retrieve` tool it could never mint a handle for.
+
+  Measured on this operator's live policy: **192 tok/turn** across six separately-wrapped
+  servers (`secret-broker`, `gh`, `runecho` each 212 -> 148; `codegraph`, `kb`, `shot-mcp`
+  unchanged because they genuinely reach the drop rule). That is the six-separate-proxies
+  configuration #168 measured at **+23.1% RAW**. A single `multiproxy` router is **unchanged at
+  212** — one peer that can drop is enough for the union primer, since the client sees one
+  server and cannot be told per-peer. On an install that is one router plus a standalone
+  proxy launched without `--server-name` (`server=None` -> whole-file scan, unchanged), the
+  realized saving is **0 tok/turn**; 192 is the fan-out configuration, not a number anyone
+  banks by upgrading.
+
+  Answering `terse.retrieve` is deliberately left **ungated** while advertising it is gated:
+  answer >= advertise, matching `multiproxy`. A retrieve call reaching a server this build
+  believes cannot drop is the symptom of the `_glob_covers_server` cases in #199, and
+  forwarding it downstream would turn one wasted paragraph into an unredeemable handle plus
+  a `-32601` from a server that never had the tool.
+
+  The narrowing taken is only the sound one, the same `reachable_tiers` uses: terminate the
+  walk at a rule that totally covers the server, because `select` returns the first match.
+  A rule whose glob merely *looks* scoped elsewhere still counts — `_match_candidates`' second
+  candidate is the tool's own unqualified name. Pinned by an under-inclusion invariant test
+  (`select` drops for a server => `has_drop(server)` is True), because the failure directions
+  are not symmetric: a surplus paragraph costs tokens, a missing retrieve tool costs a handle
+  nobody can redeem.
+
+## [0.17.0] - 2026-07-31
+
+### Added
+
 - **Per-server break-even in `terse stats` (#175).** The primer-liability block gained a
   per-server table: `primer`, `blocks`, `saved/block`, and `blocks/turn to break even`. #175
   established the rule — *wrap a server when its typical payload saves more than
@@ -586,6 +679,49 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   it changed. A router's rate pools every peer it fronts, matching the single union primer
   it actually pays.
 
+## [0.16.2] - 2026-07-31
+
+### Fixed
+
+- **`mcp-status` labelled every router row's diff before the peers policy resolved (#191).**
+  A router entry carries `--config`, never `--policy`, so `policy` was still `None` when the
+  diff label was computed and `_peers_policy` only ran eight lines later. Every `router` /
+  `router-ambiguous` row therefore printed `default (off)` even when the shared peers policy
+  set `"diff": true` — the proxy diffs, status said it does not. Same label-vs-reality
+  divergence as #181, in the one branch #188/#190 didn't reach. A fleet whose peers carry
+  *different* policy paths now reports the answer they agree on (`policy (on)`) rather than
+  the dataclass default, and `peers (mixed)` only when they genuinely disagree.
+
+- **`install-mcp --diff` help text claimed diffing was already the default.** #170 reverted
+  #75's default-on, so the flag's own help sent operators to omit the one flag that turns
+  diffing on — the same divergence one layer up, in the text.
+
+## [0.16.1] - 2026-07-31
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Fixed
+
+- fix(codec): give the lossless gate a NaN-aware equality (#187) (#195)
+
+## [0.16.0] - 2026-07-30
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Added
+
+- feat(docker): Dockerfile + demo downstream so the Glama listing builds (#194)
+
+### Changed
+
+- docs: add the Glama MCP server score badge to the README
+
+## [0.15.0] - 2026-07-30
+
+### Added
+
 - **`terse stats` now shows what the primer costs (#168).** The ledger charges terse for the
   payloads it compresses and never for the context it adds, so `terse stats` could report a
   win in a session that was a net loss — measured from outside terse as a **14.0% win at one
@@ -610,191 +746,29 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   the router's own name tests rules like `kb.*` against the router and over-reports. A server
   whose policy cannot be read is excluded and the total is labelled a lower bound, rather
   than substituting the built-in default and overstating.
-- **`policy generate` / `autotune` can now recommend the `embedded` tier.** It shipped
-  opt-in but invisible to the generator, so nothing would ever turn it on and an operator
-  had to hand-edit a policy — which #144 is the standing proof goes stale, since nothing
-  re-derives a hand-authored tier decision after a codec change lands under it. `measure`
-  now reports `embedded` as its own marginal step (exactly like `dictionary`), and the
-  generator adds the tier per tool when that margin clears the threshold: a double-encoding
-  tool scores `41.0% saved (embedded +41.0%)` and gains it, an ordinary record tool scores
-  `+0.0%` and is not offered it — nor charged its primer paragraph. `tier_total` counts the
-  embedded step deliberately: a tool whose body is one JSON string saves ~0% under the other
-  tiers, so scoring it without `embedded` would mark it passthrough and permanently hide the
-  very tool the tier exists for.
-- **New `embedded` tier: compress JSON the server delivered as a STRING.** `minify`,
-  `tabularize` and `dictionary` all walk parsed structure, so a body returned double-encoded
-  (`{"response_text": json.dumps(body)}`) is a leaf none of them can reach. Measured on
-  identical data: **41.9% saved as a real record array, 0.0% inside a string** — and #143
-  measured ~21.6% of one fleet's tokens sitting at 0.0% from exactly that one return
-  convention, across seven tools. Adding `"embedded"` to a rule's `tiers` folds such a string
-  into `{"__terse_json__":1,"f":F,"v":...}`, after which the other tiers apply inside `v`
-  normally; the reference double-encoded payload goes **0.0% → 41.4%**.
 
-  **It fires only when it can rebuild the original string byte-for-byte.** `f` names the
-  serialization that reproduces it, chosen from a fixed registry (`json.dumps` defaults,
-  minified, `indent=2`, `indent=4`, each with/without `ensure_ascii`); when none match, terse
-  leaves the string alone. That bar is deliberately stricter than "parses to the same data",
-  because `json.dumps(json.loads(s))` is not `s`: duplicate keys collapse to the last one and
-  `1.50`/`1.5e0` renormalize to `1.5`. Both decline here rather than decode to bytes the
-  server never sent — the guarantee terse sells is byte-faithfulness, not equivalent JSON.
-  Also declines an embedded doc carrying a `__terse_*` key, one past the depth cap, and any
-  occurrence where the envelope would not pay for itself (a per-occurrence size guard, since
-  the whole-payload guard cannot see one small document growing inside a payload that shrank).
-
-  **Opt-in, and `VALID_TIERS` is now distinct from `DEFAULT_TIERS`** so widening the valid set
-  cannot silently switch a tier on for policy files already on disk. Each documented form
-  costs a primer paragraph the client re-reads every turn (#168), and #170 is the precedent
-  for what that costs when a tier rarely fires — so this one is charged only to policies that
-  enable it (53 tok), and `policy generate`/`autotune` can enable it per tool on measured
-  evidence. Verified: 10 mutations of the codec's guards each caught by the new suite, 0
-  losslessness failures and 0 token regressions across the committed corpus plus every
-  payload re-wrapped double-encoded in all five serializations.
-- **`install-mcp --multiproxy` folds a fleet into ONE proxy (#179).** This is the step
-  that banks #168's measured win: six standalone proxies cost +23.1% raw input against an
-  unwrapped control, the same six behind one router cost +0.0%, because each standalone
-  proxy injects its own primer that the client re-reads every turn — cost scales with
-  (servers x turns) while savings scale with (compressible calls). The named entries are
-  replaced by a single `terse proxy --config` entry (`--router-name`, default `terse`)
-  plus a peers file next to the config. **The stash stays 1:1**, so `uninstall-mcp --all`
-  restores every original byte-for-byte with no special case, and uninstalling ONE peer
-  detaches it from the peers file while the router keeps serving the rest (the router
-  entry is removed once its last peer leaves). An already-wrapped entry is reduced to the
-  downstream it wraps before being folded in, so a proxy is never nested inside the
-  router even when its stash lives under another scope. `--print` reports the permission
-  rewrite: consolidating N servers changes the `mcp__<server>__` segment for every
-  wrapped tool, and the tool segment changes too for any name two or more peers export —
-  the latter needs live tool names, so it is flagged rather than guessed. It also
-  **warns that the switch WIDENS permissions**: N per-server grants collapse onto one
-  `mcp__terse` segment, so a whole-server grant now reaches every peer. Re-running is
-  **additive** (folding one more server in keeps the fleet instead of evicting it), the
-  peers file is namespaced per scope (a local-scope fleet can't overwrite the user-scope
-  one), and every runtime flag a single-server wrap takes — `--capture-dir`, `--diff` /
-  `--no-diff`, `--no-stats`, `--no-join-blocks`, `--never-lossy` — applies to the router
-  too instead of being silently dropped.
-- **A multiproxy peer's `env`/`cwd` are honored at LAUNCH (#179).** The peers file
-  recorded them and the router ignored them: `DownstreamSpec` had no such fields and
-  `StdioTransport` called `Popen` without `env=`/`cwd=`, so a folded server lost a pinned
-  `PATH` (codegraph's node@22) and any `env`-borne credential started unauthenticated.
-  `env` is MERGED over the router's own environment, never a replacement — a bare mapping
-  would launch the child with no `PATH` or `HOME` at all. Setting either on a `url` peer
-  is now a config error rather than a silent no-op.
-- **A peer's `env` values are coerced to strings on the way into the peers file (#179).**
-  An MCP client's own spawn coerces, so `{"PORT": 3000}` is a working config entry and a
-  plain wrap preserves it — but the router parses the peers file, and one non-string value
-  there took down the WHOLE fleet at launch, on an install that had reported success.
-  `load_multi_config` coerces scalars too; containers and null stay hard errors, and an
-  empty `cwd` is rejected rather than surfacing as `[Errno 2] ... : ''`.
-- **Config-destroying edges around the router entry closed (#179).** The router entry is
-  written over rather than stashed, so `--multiproxy` now REFUSES a router name already
-  held by an unrelated live server (`terse` is the default name — this needed no unusual
-  flag to destroy a third party's entry with nothing to restore from). A `--router-name`
-  change now MOVES the router instead of leaving a second one on the same peers file —
-  two such entries launch every peer twice, and make the config uncleanable by terse,
-  since ambiguous detection returns None. Folding a wrapped-but-unstashed entry stashes
-  the unnested DOWNSTREAM, not the wrapper, so `uninstall` no longer reports
-  `restored: True` while writing a proxy line back. Re-running plain `install-mcp` on an
-  already-folded server — or on the router itself — is refused instead of running that
-  downstream twice or nesting a proxy inside a proxy. A router name belonging to a FOLDED
-  peer is refused too (a folded peer has no live entry, so a liveness check could not see
-  it, and a later `uninstall` wrote that peer's original over the router, stranding the
-  rest of the fleet while reporting success), as is folding the router into its own peers
-  file (a router that spawns a router, unbounded, at the next client restart). A rename
-  carries the router's hand-edited keys — an `env.PATH` pin is the base environment every
-  peer inherits. A peer leaves the fleet only when its live entry is BACK, never because
-  its stash entry drifted: the peers file is then the last record of how to launch it.
-  Runtime-flag inheritance is all-or-nothing, so `--no-stats`/`--capture-dir` (which have
-  no inverse flag) can still be cleared, and the result reports the flags actually baked
-  in rather than only those named on the command line.
-- **`--multiproxy` writes recovery data before the destructive write (#179).** The three
-  files (stash, peers, client config) are each written atomically but not atomically
-  together, and folding DELETES a peer's live entry rather than rewriting it the way a
-  plain wrap does. Config-first left a window — one SIGKILL, OOM, or full disk wide — where
-  the live entry was already gone while the stash still described the previous state: the
-  original existed nowhere terse looks, so status reported nothing missing and
-  `uninstall --all` never mentioned the server. Only the timestamped config backup held it,
-  which no recovery path reads. The config is now written last. Also: a duplicated argument
-  (`install-mcp kb kb --multiproxy`) no longer folds the same peer twice, and folding a
-  terse router that fronts a DIFFERENT peers file is refused rather than nesting a proxy
-  inside a proxy (a router has `--config` and no `--`, so `_unnest` passed it through
-  verbatim).
-- **Every bad multiproxy state is now recoverable and reported (#179).** `uninstall-mcp
-  --all` restores a folded peer whose stash entry drifted away, rebuilding it from the
-  peers file (reported as a PARTIAL restore — the peers file records launch fields only);
-  it removes a stranded router whenever no peers remain, including when the peers file was
-  simply deleted, which no longer reads as "no multiproxy involved". A corrupt peers file
-  is reported with its path instead of tracebacking out of `mcp-status` (whose contract
-  says it never raises) and blocking every other command with a message naming no file.
-  Two entries fronting one peers file are NAMED rather than guessed through — the peers
-  file is left in place, status says `router-ambiguous`, and the old `--router-name` advice
-  (which added a third router and poisoned detection permanently) is gone. The peers
-  filename now always carries a hash tail: `local:/home/e/a/b` and `local:/home/e/a-b`
-  slugified identically, so two repos shared one fleet and one repo's router launched the
-  other's servers. Folding a server whose `env` is malformed fails with a message naming
-  it instead of an `AttributeError`, and a peers record that cannot launch anything is no
-  longer "restored" as `{"url": null}`.
-- **`mcp-status` understands a folded fleet (#179).** A healthy multiproxy install used
-  to read as drift in both directions — every peer as `orphaned-stash`, the router as
-  `wrapped-unstashed` ("original command unrecoverable"). New states: `router` (with
-  `wraps=` listing its fleet) and `folded` (naming the router it sits behind).
-  `uninstall-mcp` also no longer mistakes an unrelated server whose own CLI takes a
-  `--config` flag for the router.
-
-### Changed
-- **BREAKING (multiproxy): tool and prompt names are now qualified only on a genuine
-  cross-peer collision (#168).** `terse proxy --config peers.json` used to rename *every*
-  tool to `{peer}__{tool}` — `kb.read.search` surfaced to a client as
-  `mcp__terse__kb__kb.read.search`. An allowlist written against the unwrapped servers
-  stopped matching, which is the sole reason multiproxy was never shippable, even though
-  it is the only thing that erases the multi-server primer cost (measured: six standalone
-  proxies cost +23.1% raw input against an unwrapped control; the same six behind one
-  multiproxy cost +0.0%). A name exported by exactly one peer is now advertised
-  **verbatim**, so a
-  fleet with distinct tool names is a drop-in. Only a name two or more peers both export
-  is qualified, on both sides. `terse.retrieve` is reserved, so a peer exporting it is
-  qualified rather than shadowing the router's own. Routing consults the advertised-name
-  table first — a tool whose own name contains `__` is no longer misread as a peer prefix
-  — with the `{peer}__` split kept ONLY until the first listing installs, after which an
-  unadvertised name is a clean -32601 rather than a speculative dispatch. Ledger
-  and capture bookkeeping still record the **peer-qualified** name, so per-server corpus
-  attribution is unchanged. The routing table is exactly what the most recent `tools/list`
-  advertised — a peer missing from a listing is missing from the client's tool list too, so
-  calling it is a clean -32601 (carrying routes forward across a missed listing was tried
-  and withdrawn; see #178). A listing that completes late by timeout is answered but not
-  installed, so it cannot clobber a newer one. Migration: if you had allowlisted
-  `{peer}__{tool}` names, switch them to the bare names now advertised by `tools/list`.
-- **Releases are now zero-touch.** `release.yml` runs on every push to `main`, derives the
-  next version from the Conventional-Commit types since the last tag (`feat` → minor,
-  `fix`/`perf` → patch, breaking → minor while 0.x; docs/chore/test/ci release nothing),
-  creates the tag, and builds → GitHub Release → PyPI (Trusted Publishing) in one run after
-  re-running the suite against the tagged tree. No manual tag, version bump, or changelog
-  graduation. Manual overrides stay: push a `vX.Y.Z` tag, or the Actions Run-workflow button
-  with a forced bump. Reuses the one `release.yml` publisher identity, so PyPI needs no
-  reconfiguration. See TECHNICAL.md → Releasing.
-- **`terse report` coverage and `measure` rows now name a tool the way the policy does
-  (#158).** `capture.coverage` keyed `by_tool` on the bare `env["tool"]`, so a server-tagged
-  corpus reported `structure` while `policy generate` on the same corpus authored
-  `runecho.structure` — an operator cross-checking a rule against its coverage count had to
-  know the two named one tool. Both `coverage` and `measure`'s per-row labels now use
-  `qualified_tool(env)` (`qualify(bare, server)`), the runtime lookup name. A legacy
-  envelope with no server qualifies to its bare name, unchanged.
-- **`probes.server_of_tool` reads the envelope's `server` instead of guessing it (#158).**
-  Since #156 the envelope records `server` straight from the wrap, so it is now returned
-  verbatim; the hand-maintained `_RUNECHO_TOOLS` name heuristic is the fallback for legacy
-  envelopes only. The point is that the hardcoded list — which silently went stale every
-  time runecho gained a tool — is off the primary path.
+## [0.14.3] - 2026-07-30
 
 ### Fixed
-- **`mcp-status` labelled every router row's diff before the peers policy resolved (#191).**
-  A router entry carries `--config`, never `--policy`, so `policy` was still `None` when the
-  diff label was computed and `_peers_policy` only ran eight lines later. Every `router` /
-  `router-ambiguous` row therefore printed `default (off)` even when the shared peers policy
-  set `"diff": true` — the proxy diffs, status said it does not. Same label-vs-reality
-  divergence as #181, in the one branch #188/#190 didn't reach. A fleet whose peers carry
-  *different* policy paths now reports the answer they agree on (`policy (on)`) rather than
-  the dataclass default, and `peers (mixed)` only when they genuinely disagree.
-- **`install-mcp --diff` help text claimed diffing was already the default.** #170 reverted
-  #75's default-on, so the flag's own help sent operators to omit the one flag that turns
-  diffing on — the same divergence one layer up, in the text.
+
+- **`mcp-status` resolved a RELATIVE `--policy` path against the scanner's own cwd (#188).**
+  `_default_diff_label` read the file and reported its `diff` setting, but a relative path
+  resolves against the MCP *launcher's* cwd — which a status scan cannot know, which is
+  exactly why the `policy_missing` check two lines away already skipped relative paths. So
+  the label could confidently report the setting of whatever `policy.json` happened to sit in
+  the scanner's directory. It now reports `policy (relative path — unknown)`.
+
+  Falling through to the dataclass default (`default (off)`) was the first fix and was
+  rejected in review: the file *does* state a value, the scanner simply cannot reach it, so
+  naming the built-in default is the same label-vs-reality divergence #181 exists to kill —
+  just pointing the other way, and with nothing to warn the reader that the value is a guess.
+  An unreachable value is now reported as unreachable. (`do_install` always writes an
+  absolute `--policy`, so only a hand-edited entry reaches this branch.)
+
+## [0.14.2] - 2026-07-30
+
+### Fixed
+
 - **`embedded` re-defaulted `tabularize` inside the fold, leaking an undocumented marker
   (adversarial review of #183).** Folding a string opens a new structural walk, and
   `_embed_json_string` called `compress_structure(parsed, embedded=True)` without forwarding
@@ -804,6 +778,7 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   either way, but it is precisely the failure `reachable_tiers` exists to prevent. Unreachable
   via `policy generate` (which always pairs the two tiers) and untested because every test in
   the suite paired them too; both gaps now closed.
+
 - **`measure` gated a different pipeline than the one it scored — in both functions, and the
   first fix over-reached (#186, completed by #188).** `embedded`/`tier_total` are computed
   from `compress_with(..., embedded=True)`, but the round-trip gate ran the default
@@ -846,19 +821,7 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
     *"INVALID — 1/1 payloads FAILED the round-trip gate"*, listing the same sha twice, and a
     CI job gating on `embedded_gate.ok` could not tell an opt-in-tier defect from total codec
     failure.
-- **`mcp-status` resolved a RELATIVE `--policy` path against the scanner's own cwd (#188).**
-  `_default_diff_label` read the file and reported its `diff` setting, but a relative path
-  resolves against the MCP *launcher's* cwd — which a status scan cannot know, which is
-  exactly why the `policy_missing` check two lines away already skipped relative paths. So
-  the label could confidently report the setting of whatever `policy.json` happened to sit in
-  the scanner's directory. It now reports `policy (relative path — unknown)`.
 
-  Falling through to the dataclass default (`default (off)`) was the first fix and was
-  rejected in review: the file *does* state a value, the scanner simply cannot reach it, so
-  naming the built-in default is the same label-vs-reality divergence #181 exists to kill —
-  just pointing the other way, and with nothing to warn the reader that the value is a guess.
-  An unreachable value is now reported as unreachable. (`do_install` always writes an
-  absolute `--policy`, so only a hand-edited entry reaches this branch.)
 - **`_default_diff_label` now survives a pathologically deep policy file** (`RecursionError`
   joins the caught set — it is the *only* `json.loads`-on-file site that catches it; an
   earlier draft of this entry claimed it "matches every other" such site, which is false:
@@ -869,6 +832,11 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   runtime, and reporting `policy (on)` is correct. A review flagged the truthiness as a bug;
   tightening it to `is True` would have made the label print "off" while the proxy diffs —
   reintroducing the label-vs-reality divergence #181 was filed to kill.
+
+## [0.14.1] - 2026-07-30
+
+### Fixed
+
 - **`mcp-status` reported `diff=default` when the default is OFF, and the docs said the
   opposite (#181).** #170 flipped cross-call diffing off, but three signals still pointed the
   other way, and together they produced a repeatable misdiagnosis: a real session saw
@@ -883,6 +851,58 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   the real cause is policy) is corrected. **README and USAGE both still claimed diffing was
   "on by default"** — the strongest of the misleading signals, now corrected with the measured
   reason it is off (primer 190/402 tokens re-read every turn vs a 0.38% hit rate).
+
+## [0.14.0] - 2026-07-30
+
+### Added
+
+- **`policy generate` / `autotune` can now recommend the `embedded` tier.** It shipped
+  opt-in but invisible to the generator, so nothing would ever turn it on and an operator
+  had to hand-edit a policy — which #144 is the standing proof goes stale, since nothing
+  re-derives a hand-authored tier decision after a codec change lands under it. `measure`
+  now reports `embedded` as its own marginal step (exactly like `dictionary`), and the
+  generator adds the tier per tool when that margin clears the threshold: a double-encoding
+  tool scores `41.0% saved (embedded +41.0%)` and gains it, an ordinary record tool scores
+  `+0.0%` and is not offered it — nor charged its primer paragraph. `tier_total` counts the
+  embedded step deliberately: a tool whose body is one JSON string saves ~0% under the other
+  tiers, so scoring it without `embedded` would mark it passthrough and permanently hide the
+  very tool the tier exists for.
+
+## [0.13.0] - 2026-07-30
+
+### Added
+
+- **New `embedded` tier: compress JSON the server delivered as a STRING.** `minify`,
+  `tabularize` and `dictionary` all walk parsed structure, so a body returned double-encoded
+  (`{"response_text": json.dumps(body)}`) is a leaf none of them can reach. Measured on
+  identical data: **41.9% saved as a real record array, 0.0% inside a string** — and #143
+  measured ~21.6% of one fleet's tokens sitting at 0.0% from exactly that one return
+  convention, across seven tools. Adding `"embedded"` to a rule's `tiers` folds such a string
+  into `{"__terse_json__":1,"f":F,"v":...}`, after which the other tiers apply inside `v`
+  normally; the reference double-encoded payload goes **0.0% → 41.4%**.
+
+  **It fires only when it can rebuild the original string byte-for-byte.** `f` names the
+  serialization that reproduces it, chosen from a fixed registry (`json.dumps` defaults,
+  minified, `indent=2`, `indent=4`, each with/without `ensure_ascii`); when none match, terse
+  leaves the string alone. That bar is deliberately stricter than "parses to the same data",
+  because `json.dumps(json.loads(s))` is not `s`: duplicate keys collapse to the last one and
+  `1.50`/`1.5e0` renormalize to `1.5`. Both decline here rather than decode to bytes the
+  server never sent — the guarantee terse sells is byte-faithfulness, not equivalent JSON.
+  Also declines an embedded doc carrying a `__terse_*` key, one past the depth cap, and any
+  occurrence where the envelope would not pay for itself (a per-occurrence size guard, since
+  the whole-payload guard cannot see one small document growing inside a payload that shrank).
+
+  **Opt-in, and `VALID_TIERS` is now distinct from `DEFAULT_TIERS`** so widening the valid set
+  cannot silently switch a tier on for policy files already on disk. Each documented form
+  costs a primer paragraph the client re-reads every turn (#168), and #170 is the precedent
+  for what that costs when a tier rarely fires — so this one is charged only to policies that
+  enable it (53 tok), and `policy generate`/`autotune` can enable it per tool on measured
+  evidence. Verified: 10 mutations of the codec's guards each caught by the new suite, 0
+  losslessness failures and 0 token regressions across the committed corpus plus every
+  payload re-wrapped double-encoded in all five serializations.
+
+### Fixed
+
 - **`policy.example.json` disabled `dictionary` on `kb.*` from a measurement that predates
   the #116 multi-block join (#144).** The original call (+2.6% total, not worth the tier)
   was made before that join gave `dictionary` a multi-block record array to fold into.
@@ -891,6 +911,335 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   `["minify", "tabularize", "dictionary"]`. The underlying `policy autotune` generator was
   never stale — it re-derives the marginal-savings threshold from fresh measurements every
   run — only this hand-authored example had gone stale after a codec change landed under it.
+
+## [0.12.0] - 2026-07-29
+
+### Added
+
+- **`install-mcp --multiproxy` folds a fleet into ONE proxy (#179).** This is the step
+  that banks #168's measured win: six standalone proxies cost +23.1% raw input against an
+  unwrapped control, the same six behind one router cost +0.0%, because each standalone
+  proxy injects its own primer that the client re-reads every turn — cost scales with
+  (servers x turns) while savings scale with (compressible calls). The named entries are
+  replaced by a single `terse proxy --config` entry (`--router-name`, default `terse`)
+  plus a peers file next to the config. **The stash stays 1:1**, so `uninstall-mcp --all`
+  restores every original byte-for-byte with no special case, and uninstalling ONE peer
+  detaches it from the peers file while the router keeps serving the rest (the router
+  entry is removed once its last peer leaves). An already-wrapped entry is reduced to the
+  downstream it wraps before being folded in, so a proxy is never nested inside the
+  router even when its stash lives under another scope. `--print` reports the permission
+  rewrite: consolidating N servers changes the `mcp__<server>__` segment for every
+  wrapped tool, and the tool segment changes too for any name two or more peers export —
+  the latter needs live tool names, so it is flagged rather than guessed. It also
+  **warns that the switch WIDENS permissions**: N per-server grants collapse onto one
+  `mcp__terse` segment, so a whole-server grant now reaches every peer. Re-running is
+  **additive** (folding one more server in keeps the fleet instead of evicting it), the
+  peers file is namespaced per scope (a local-scope fleet can't overwrite the user-scope
+  one), and every runtime flag a single-server wrap takes — `--capture-dir`, `--diff` /
+  `--no-diff`, `--no-stats`, `--no-join-blocks`, `--never-lossy` — applies to the router
+  too instead of being silently dropped.
+
+- **A multiproxy peer's `env`/`cwd` are honored at LAUNCH (#179).** The peers file
+  recorded them and the router ignored them: `DownstreamSpec` had no such fields and
+  `StdioTransport` called `Popen` without `env=`/`cwd=`, so a folded server lost a pinned
+  `PATH` (codegraph's node@22) and any `env`-borne credential started unauthenticated.
+  `env` is MERGED over the router's own environment, never a replacement — a bare mapping
+  would launch the child with no `PATH` or `HOME` at all. Setting either on a `url` peer
+  is now a config error rather than a silent no-op.
+
+- **A peer's `env` values are coerced to strings on the way into the peers file (#179).**
+  An MCP client's own spawn coerces, so `{"PORT": 3000}` is a working config entry and a
+  plain wrap preserves it — but the router parses the peers file, and one non-string value
+  there took down the WHOLE fleet at launch, on an install that had reported success.
+  `load_multi_config` coerces scalars too; containers and null stay hard errors, and an
+  empty `cwd` is rejected rather than surfacing as `[Errno 2] ... : ''`.
+
+- **Config-destroying edges around the router entry closed (#179).** The router entry is
+  written over rather than stashed, so `--multiproxy` now REFUSES a router name already
+  held by an unrelated live server (`terse` is the default name — this needed no unusual
+  flag to destroy a third party's entry with nothing to restore from). A `--router-name`
+  change now MOVES the router instead of leaving a second one on the same peers file —
+  two such entries launch every peer twice, and make the config uncleanable by terse,
+  since ambiguous detection returns None. Folding a wrapped-but-unstashed entry stashes
+  the unnested DOWNSTREAM, not the wrapper, so `uninstall` no longer reports
+  `restored: True` while writing a proxy line back. Re-running plain `install-mcp` on an
+  already-folded server — or on the router itself — is refused instead of running that
+  downstream twice or nesting a proxy inside a proxy. A router name belonging to a FOLDED
+  peer is refused too (a folded peer has no live entry, so a liveness check could not see
+  it, and a later `uninstall` wrote that peer's original over the router, stranding the
+  rest of the fleet while reporting success), as is folding the router into its own peers
+  file (a router that spawns a router, unbounded, at the next client restart). A rename
+  carries the router's hand-edited keys — an `env.PATH` pin is the base environment every
+  peer inherits. A peer leaves the fleet only when its live entry is BACK, never because
+  its stash entry drifted: the peers file is then the last record of how to launch it.
+  Runtime-flag inheritance is all-or-nothing, so `--no-stats`/`--capture-dir` (which have
+  no inverse flag) can still be cleared, and the result reports the flags actually baked
+  in rather than only those named on the command line.
+
+- **`--multiproxy` writes recovery data before the destructive write (#179).** The three
+  files (stash, peers, client config) are each written atomically but not atomically
+  together, and folding DELETES a peer's live entry rather than rewriting it the way a
+  plain wrap does. Config-first left a window — one SIGKILL, OOM, or full disk wide — where
+  the live entry was already gone while the stash still described the previous state: the
+  original existed nowhere terse looks, so status reported nothing missing and
+  `uninstall --all` never mentioned the server. Only the timestamped config backup held it,
+  which no recovery path reads. The config is now written last. Also: a duplicated argument
+  (`install-mcp kb kb --multiproxy`) no longer folds the same peer twice, and folding a
+  terse router that fronts a DIFFERENT peers file is refused rather than nesting a proxy
+  inside a proxy (a router has `--config` and no `--`, so `_unnest` passed it through
+  verbatim).
+
+- **Every bad multiproxy state is now recoverable and reported (#179).** `uninstall-mcp
+  --all` restores a folded peer whose stash entry drifted away, rebuilding it from the
+  peers file (reported as a PARTIAL restore — the peers file records launch fields only);
+  it removes a stranded router whenever no peers remain, including when the peers file was
+  simply deleted, which no longer reads as "no multiproxy involved". A corrupt peers file
+  is reported with its path instead of tracebacking out of `mcp-status` (whose contract
+  says it never raises) and blocking every other command with a message naming no file.
+  Two entries fronting one peers file are NAMED rather than guessed through — the peers
+  file is left in place, status says `router-ambiguous`, and the old `--router-name` advice
+  (which added a third router and poisoned detection permanently) is gone. The peers
+  filename now always carries a hash tail: `local:/home/e/a/b` and `local:/home/e/a-b`
+  slugified identically, so two repos shared one fleet and one repo's router launched the
+  other's servers. Folding a server whose `env` is malformed fails with a message naming
+  it instead of an `AttributeError`, and a peers record that cannot launch anything is no
+  longer "restored" as `{"url": null}`.
+
+- **`mcp-status` understands a folded fleet (#179).** A healthy multiproxy install used
+  to read as drift in both directions — every peer as `orphaned-stash`, the router as
+  `wrapped-unstashed` ("original command unrecoverable"). New states: `router` (with
+  `wraps=` listing its fleet) and `folded` (naming the router it sits behind).
+  `uninstall-mcp` also no longer mistakes an unrelated server whose own CLI takes a
+  `--config` flag for the router.
+
+## [0.11.0] - 2026-07-29
+
+### Changed
+
+- **BREAKING (multiproxy): tool and prompt names are now qualified only on a genuine
+  cross-peer collision (#168).** `terse proxy --config peers.json` used to rename *every*
+  tool to `{peer}__{tool}` — `kb.read.search` surfaced to a client as
+  `mcp__terse__kb__kb.read.search`. An allowlist written against the unwrapped servers
+  stopped matching, which is the sole reason multiproxy was never shippable, even though
+  it is the only thing that erases the multi-server primer cost (measured: six standalone
+  proxies cost +23.1% raw input against an unwrapped control; the same six behind one
+  multiproxy cost +0.0%). A name exported by exactly one peer is now advertised
+  **verbatim**, so a
+  fleet with distinct tool names is a drop-in. Only a name two or more peers both export
+  is qualified, on both sides. `terse.retrieve` is reserved, so a peer exporting it is
+  qualified rather than shadowing the router's own. Routing consults the advertised-name
+  table first — a tool whose own name contains `__` is no longer misread as a peer prefix
+  — with the `{peer}__` split kept ONLY until the first listing installs, after which an
+  unadvertised name is a clean -32601 rather than a speculative dispatch. Ledger
+  and capture bookkeeping still record the **peer-qualified** name, so per-server corpus
+  attribution is unchanged. The routing table is exactly what the most recent `tools/list`
+  advertised — a peer missing from a listing is missing from the client's tool list too, so
+  calling it is a clean -32601 (carrying routes forward across a missed listing was tried
+  and withdrawn; see #178). A listing that completes late by timeout is answered but not
+  installed, so it cannot clobber a newer one. Migration: if you had allowlisted
+  `{peer}__{tool}` names, switch them to the bare names now advertised by `tools/list`.
+
+## [0.10.0] - 2026-07-28
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Added
+
+- feat(policy): autotune reads the savings ledger, and install-mcp points at it (#136) (#176)
+
+## [0.9.0] - 2026-07-28
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Added
+
+- feat(bench): multi-run arms with modal-turn outlier control (ab_session) (#174)
+
+## [0.8.1] - 2026-07-28
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Fixed
+
+- fix(install-mcp): classify wrapped-ness from the config, not stash membership (#172) (#173)
+
+## [0.8.0] - 2026-07-28
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Added
+
+- feat(policy)!: flip `diff` to default-off — its primer paragraph costs ~900-2,700x what the tier saves (#170) (#171)
+
+## [0.7.0] - 2026-07-28
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Added
+
+- feat(proxy): assemble the primer per-policy so a server documents only what it can emit (#168) (#169)
+
+## [0.6.0] - 2026-07-24
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Added
+
+- feat: bare `terse policy autotune` resolves --policy/--corpus from the install-mcp wiring (#136) (#167)
+
+## [0.5.2] - 2026-07-24
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Fixed
+
+- fix: ledger counts BLOCKS, not "results" — rename the mislabelled field (#141 part 2) (#166)
+
+## [0.5.1] - 2026-07-24
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Fixed
+
+- fix: partial multi-block join — fold the record run, keep the rest per-block (#140) (#165)
+
+## [0.5.0] - 2026-07-24
+
+### Added
+
+- **The corpus is bounded per tool (`MAX_SAMPLES_PER_TOOL`, default 200).** `capture.py`
+  was the only disk sink with no retention — `stats.py` rotates at 10 MB and `history.py`
+  at 5 MB, but envelopes accumulated forever. Since envelopes hold *raw* tool payloads
+  (credentials, PII, private source), unbounded retention widened the blast radius of any
+  later disk compromise as much as it risked disk exhaustion. The cap is per tool, not
+  global: every consumer (measure, probes, `policy generate`/`autotune`) reasons per tool,
+  so a global byte cap would let one chatty tool evict the only samples a quiet one ever
+  produced and silently narrow what a generated policy can see. Eviction is oldest-first
+  by mtime. `capture_payload(..., max_per_tool=None)` restores unlimited retention for a
+  deliberate one-shot corpus build.
+
+- **Coverage instrumentation** (`pytest-cov`, `[tool.coverage.*]`). The suite had no
+  coverage number at all; the first measured run is **89% branch coverage** over
+  `src/terse`. Reported, not gated — `--cov` is opt-in per run so the default `pytest`
+  stays fast, and no threshold is set until the baseline has been looked at.
+
+- **`terse policy autotune` — re-tune an EXISTING policy instead of overwriting it (#136).**
+  `policy generate` authors from nothing and is *total*: run it on a deployed policy and it
+  silently drops every decision the corpus cannot see. It already warned about that for
+  `capture: false`; the same was true of `never_lossy_servers`, any `structured` override,
+  hand-written active `fields`, any rule for a tool the corpus never saw, and rule ORDER
+  (first match wins). `autotune` merges instead, split by what a corpus can possibly know:
+  **the corpus decides `tiers`** (including removing one — the motivating case is a stale
+  tier decision that predates a codec change), **the operator owns everything else**. It
+  prints a per-rule diff, names what it deliberately did not regenerate, and writes
+  **nothing** without `--apply`. New rules are inserted before any existing glob that would
+  shadow them, since a `kb.read.search` rule appended after `kb.*` is dead on arrival.
+  A new rule **inherits the operator-owned keys of whatever rule it displaces** — inserting
+  it ahead of a broader rule must not quietly hand that tool `capture: true` or
+  `structured: "auto"` — and a rule whose `tiers: []` is suppressing a lossy `$text.*`
+  selector keeps `tiers: []`, because turning them on would ACTIVATE that selector and this
+  merge is documented as lossless. Warns before applying a tier *downgrade*: the corpus is
+  a sample (idempotent by sha, and empty for a `capture: false` tool), so a removal should
+  be cross-checked against `terse stats`, which counts every call.
+
+- **`"structured": "compress"` — compress `structuredContent` too (#128).** New per-rule
+  policy knob. MCP 2025-06-18 lets a tool return a typed `structuredContent` field beside
+  a text block that mirrors it; terse compressed only the block. Measured against `claude`
+  2.1.218 with a read-only proxy, the client forwards the **typed field** to the model and
+  discards the block entirely — so on such a tool terse was delivering ~0% however good
+  the ledger looked. With the knob on, the same fixture measures **61.2%** of the model's
+  real context (2,596 → 1,008 chars), captured end to end rather than inferred.
+  Affected servers are not exotic: filesystem (14/14 tools), memory (9/9) and kb (27/27)
+  all declare an `outputSchema`.
+  Codec only, no diff. See the `structured: "auto"` entry under **Changed** for how the
+  default now decides this per connected client.
+
+- **`"structured": "replace"` — drop the redundant text mirror (#128), and the measurement
+  saying you probably shouldn't.** Compresses the typed field *and* deletes the text block
+  that duplicates it. Measured on the reference fixture: context cost goes 2,596 → 1,008
+  chars under `"compress"` and **1,008 → 1,008** under `"replace"` — no change, because
+  Claude Code had already discarded the block. What it removes is stdio bytes, not context.
+  Shipped as an explicit opt-in that `"auto"` never selects, because it is correct for a
+  client that forwards *both* fields (which `"compress"` can leave holding a cross-call
+  diff in the block contradicting a full envelope in the typed field); no such client has
+  been measured. Five independently-tested guards must all hold before a block is dropped
+  — explicit `"replace"`, non-empty `tiers`, not an `isError`, exactly one text block, and
+  that block's parsed JSON **equal** to `structuredContent`. Whether the tool declared an
+  `outputSchema` is deliberately *not* a guard: the new `noschema` probe shows the client
+  reads the typed field from a tool that declares none.
+
+- **Cross-block join (`join_blocks`, ON by default) — #116.** When every text content
+  block of a tool result is a JSON object, the proxy now joins them into one record array
+  before compressing, so `tabularize`/`dictionary` fold across records *and* the whole
+  result becomes eligible for the cross-call diff tier. Several MCP servers return one
+  record per block, a shape that was 71% of terse's own live traffic and could reach
+  neither cross-record folding nor diffing (the diff path only ran for single-block
+  results). Measured on a realistic 80-record `kb.read.list_principles` payload: per-block
+  +9.6% → joined codec +24.9%, and a near-identical repeat call collapses ~6900 tokens to
+  ~100 via a diff. Lossy field rules resolve **per block, before the join**, so a path
+  authored against one record's shape is unaffected. Opt out with `proxy --no-join-blocks`
+  / `install-mcp --no-join-blocks` or a policy-file `"join_blocks": false`.
+
+### Changed
+
+- **Releases are now zero-touch.** `release.yml` runs on every push to `main`, derives the
+  next version from the Conventional-Commit types since the last tag (`feat` → minor,
+  `fix`/`perf` → patch, breaking → minor while 0.x; docs/chore/test/ci release nothing),
+  creates the tag, and builds → GitHub Release → PyPI (Trusted Publishing) in one run after
+  re-running the suite against the tagged tree. No manual tag, version bump, or changelog
+  graduation. Manual overrides stay: push a `vX.Y.Z` tag, or the Actions Run-workflow button
+  with a forced bump. Reuses the one `release.yml` publisher identity, so PyPI needs no
+  reconfiguration. See TECHNICAL.md → Releasing.
+
+- **`terse report` coverage and `measure` rows now name a tool the way the policy does
+  (#158).** `capture.coverage` keyed `by_tool` on the bare `env["tool"]`, so a server-tagged
+  corpus reported `structure` while `policy generate` on the same corpus authored
+  `runecho.structure` — an operator cross-checking a rule against its coverage count had to
+  know the two named one tool. Both `coverage` and `measure`'s per-row labels now use
+  `qualified_tool(env)` (`qualify(bare, server)`), the runtime lookup name. A legacy
+  envelope with no server qualifies to its bare name, unchanged.
+
+- **`probes.server_of_tool` reads the envelope's `server` instead of guessing it (#158).**
+  Since #156 the envelope records `server` straight from the wrap, so it is now returned
+  verbatim; the hand-maintained `_RUNECHO_TOOLS` name heuristic is the fallback for legacy
+  envelopes only. The point is that the hardcoded list — which silently went stale every
+  time runecho gained a tool — is off the primary path.
+
+- **`structured` now defaults to `"auto"`, which decides per connected client (#128).**
+  This **changes default wire behavior for Claude Code users**: `structuredContent` will
+  carry a terse envelope where it previously carried the server's own object. That is the
+  intended effect — with the previous `"leave"` default terse was a measured no-op on
+  filesystem, memory and kb — but it is a real behavior change, stated here rather than
+  buried under Added.
+  The `"leave"` default shipped alongside the knob rested on "terse cannot detect which
+  client it sits behind." That was wrong: the MCP `initialize` request carries
+  `params.clientInfo`, a name the client *declares*, and the proxy proxies that request.
+  `"auto"` compresses the typed field only for clients measured not to validate it
+  (`policy.STRUCTURED_SAFE_CLIENTS`, currently `claude-code`, evidenced by the `badtype`
+  and `enveloped` probes) and **fails closed** for an unlisted client, a client that omits
+  `clientInfo`, and a library caller that never handshakes. Explicit `"compress"`/`"leave"`
+  still win. Measured with a stock policy — no `structured` key anywhere — the fixture's
+  context cost drops 2,596 → 1,008 chars (61.2%) against `claude-code`, and is untouched
+  against anything else.
+
+- **A joined result changes the content-block count the client sees (N → 1).** This is the
+  first time terse changes anything but block *text*. The MCP spec (2025-06-18) puts no
+  meaning on block count — blocks carry no index a payload can reference — and non-text
+  blocks (image/audio/resource) keep their positions. The savings ledger's blanket
+  `multiblock` reason is replaced by reasons that name why a join did or didn't fire
+  (`multiblock_non_json` / `_heterogeneous` / `_marker` / `_depth` / `_passthrough` /
+  `_off`, plus a `reanchor` reason when a join↔single shape flip forces a full).
+
+### Fixed
+
 - **The savings ledger charged `structuredContent` at its COMPRESSED size on the raw side,
   understating the real wire saving by ~15 points (#141, part 1).** Since #134 the typed
   field can itself be compressed (`"structured": "compress"/"replace"`), but `_emit_stats`
@@ -906,6 +1255,7 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   `policy generate` and the #136 autotune loop, so a skewed per-tool saving produced a
   skewed policy. *(#141 part 2 — `terse stats` counts BLOCKS but labels them "results" — is
   tracked separately; it's a wider naming change.)*
+
 - **The lossless codec could emit MORE tokens than the server sent, silently (#154).** On a
   record set too small to amortize the `__terse_table__` header — a 2-row `list_*`, a
   filtered query, a shrunk result — `tabularize` produced a form larger than the raw
@@ -917,6 +1267,7 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   ships. Compared on the tokenizer, since a shorter byte string can tokenize longer. Zero
   occurrences on the live corpus (0 of 624) — a latent hole closed before it bit, and the
   `text_alias_ceiling` tripwire now reads zero by construction rather than by luck.
+
 - **A generated rule name carrying a glob metacharacter governed more than its own tool
   (#157).** `policy generate`/`autotune` author `"match": {"tool": name}`, and
   `Policy.select` reads `match.tool` as an fnmatch glob (hand-authored rules use `gh.*`,
@@ -929,6 +1280,7 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   all keep reading the one stored string, so the escaped form is both a correct pattern
   and a stable merge key. Neither name is attacker-controlled in any supported deployment,
   so this was a robustness gap, not a vulnerability.
+
 - **A capture/audit/stats sink that HUNG — rather than raised — froze every later tool
   call on the connection.** The sinks were invoked inside `transform_response`'s
   `_local_lock`, and the fail-open `try/except` around them only ever caught a sink that
@@ -942,23 +1294,6 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   `test_blocking_sink_does_not_stall_a_concurrent_note_request`, which times out against
   the old code.
 
-### Added
-- **The corpus is bounded per tool (`MAX_SAMPLES_PER_TOOL`, default 200).** `capture.py`
-  was the only disk sink with no retention — `stats.py` rotates at 10 MB and `history.py`
-  at 5 MB, but envelopes accumulated forever. Since envelopes hold *raw* tool payloads
-  (credentials, PII, private source), unbounded retention widened the blast radius of any
-  later disk compromise as much as it risked disk exhaustion. The cap is per tool, not
-  global: every consumer (measure, probes, `policy generate`/`autotune`) reasons per tool,
-  so a global byte cap would let one chatty tool evict the only samples a quiet one ever
-  produced and silently narrow what a generated policy can see. Eviction is oldest-first
-  by mtime. `capture_payload(..., max_per_tool=None)` restores unlimited retention for a
-  deliberate one-shot corpus build.
-- **Coverage instrumentation** (`pytest-cov`, `[tool.coverage.*]`). The suite had no
-  coverage number at all; the first measured run is **89% branch coverage** over
-  `src/terse`. Reported, not gated — `--cov` is opt-in per run so the default `pytest`
-  stays fast, and no threshold is set until the baseline has been looked at.
-
-### Fixed
 - **The capture envelope recorded neither which result nor which server a payload came
   from, so autotune had to guess both (#148, #152).** Two defects, one absent pair of
   fields, now written by the proxy (`server`, `result_id`) and read at tune time:
@@ -1000,6 +1335,7 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   two calls at once. Result ids are scoped by proxy process *and* by handshake generation,
   because a reconnecting client restarts its JSON-RPC ids at 1. `terse capture` gained
   `--server` for the hand-captured case.
+
 - **`policy generate` scored payloads per-BLOCK, so every multi-block tool was
   under-measured (#147).** The proxy compresses a multi-block result as one joined record
   array (#116); the generator scored each captured block alone. For a server that returns
@@ -1007,6 +1343,7 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   real kb traffic, `changelog` is 23.3% per-block and **48.4% joined**. Payloads are now
   grouped back into results (by capture-time proximity) and each result is scored the way
   the proxy would, falling back to per-block exactly where `apply_joined` would refuse.
+
 - **One non-JSON payload no longer disqualifies a whole tool (#147).** A single
   `Error executing tool …` text block among a tool's records forced `passthrough` for all
   of it. The premise was wrong — `policy.apply` passes a non-JSON payload through untouched
@@ -1017,53 +1354,6 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   saved while its raw tokens stay in the denominator, so it falls below the threshold on
   its own (`codegraph_explore`, 61/61 non-JSON, scores 0.0%).
 
-### Added
-- **`terse policy autotune` — re-tune an EXISTING policy instead of overwriting it (#136).**
-  `policy generate` authors from nothing and is *total*: run it on a deployed policy and it
-  silently drops every decision the corpus cannot see. It already warned about that for
-  `capture: false`; the same was true of `never_lossy_servers`, any `structured` override,
-  hand-written active `fields`, any rule for a tool the corpus never saw, and rule ORDER
-  (first match wins). `autotune` merges instead, split by what a corpus can possibly know:
-  **the corpus decides `tiers`** (including removing one — the motivating case is a stale
-  tier decision that predates a codec change), **the operator owns everything else**. It
-  prints a per-rule diff, names what it deliberately did not regenerate, and writes
-  **nothing** without `--apply`. New rules are inserted before any existing glob that would
-  shadow them, since a `kb.read.search` rule appended after `kb.*` is dead on arrival.
-  A new rule **inherits the operator-owned keys of whatever rule it displaces** — inserting
-  it ahead of a broader rule must not quietly hand that tool `capture: true` or
-  `structured: "auto"` — and a rule whose `tiers: []` is suppressing a lossy `$text.*`
-  selector keeps `tiers: []`, because turning them on would ACTIVATE that selector and this
-  merge is documented as lossless. Warns before applying a tier *downgrade*: the corpus is
-  a sample (idempotent by sha, and empty for a `capture: false` tool), so a removal should
-  be cross-checked against `terse stats`, which counts every call.
-
-### Added
-- **`"structured": "compress"` — compress `structuredContent` too (#128).** New per-rule
-  policy knob. MCP 2025-06-18 lets a tool return a typed `structuredContent` field beside
-  a text block that mirrors it; terse compressed only the block. Measured against `claude`
-  2.1.218 with a read-only proxy, the client forwards the **typed field** to the model and
-  discards the block entirely — so on such a tool terse was delivering ~0% however good
-  the ledger looked. With the knob on, the same fixture measures **61.2%** of the model's
-  real context (2,596 → 1,008 chars), captured end to end rather than inferred.
-  Affected servers are not exotic: filesystem (14/14 tools), memory (9/9) and kb (27/27)
-  all declare an `outputSchema`.
-  Codec only, no diff. See the `structured: "auto"` entry under **Changed** for how the
-  default now decides this per connected client.
-- **`"structured": "replace"` — drop the redundant text mirror (#128), and the measurement
-  saying you probably shouldn't.** Compresses the typed field *and* deletes the text block
-  that duplicates it. Measured on the reference fixture: context cost goes 2,596 → 1,008
-  chars under `"compress"` and **1,008 → 1,008** under `"replace"` — no change, because
-  Claude Code had already discarded the block. What it removes is stdio bytes, not context.
-  Shipped as an explicit opt-in that `"auto"` never selects, because it is correct for a
-  client that forwards *both* fields (which `"compress"` can leave holding a cross-call
-  diff in the block contradicting a full envelope in the typed field); no such client has
-  been measured. Five independently-tested guards must all hold before a block is dropped
-  — explicit `"replace"`, non-empty `tiers`, not an `isError`, exactly one text block, and
-  that block's parsed JSON **equal** to `structuredContent`. Whether the tool declared an
-  `outputSchema` is deliberately *not* a guard: the new `noschema` probe shows the client
-  reads the typed field from a tool that declares none.
-
-### Fixed
 - **The savings ledger no longer reports a saving terse did not deliver (#128).** terse
   compresses a result's text block but leaves `structuredContent` untouched, and the
   ledger counted only the block — so a tool emitting both was credited with the block's
@@ -1076,6 +1366,7 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   as 0. Measured against a live client, the honest figure may be lower still: see
   `scripts/probe/structured_content/`, which found that `claude` 2.1.218 reads
   `structuredContent` and discards the compressed block entirely.
+
 - **A broken capture/stats/audit sink now says so, instead of failing silently.** The
   callbacks handed to the `Interceptor` caught their own exceptions behind a `--debug`
   gate, so the `try/except → _warn_sink` around them never saw one and `_warn_sink`'s
@@ -1089,6 +1380,7 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   what the client receives — it is now merely *audible*: once per sink kind, and under
   `multiproxy` (where the `Interceptor` and its bookkeeping are per-peer) once per
   peer, so a dead shared sink is attributed to each downstream that hit it.
+
 - **A server-initiated request no longer silently disables compression for an in-flight
   call.** A server→client request (`roots/list`, `sampling/createMessage`,
   `elicitation/create`) carries a `method` alongside an id, and JSON-RPC gives each
@@ -1101,44 +1393,6 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   server request consumed `init_id`, so the real reply never received the terse primer.
   Method-bearing messages are now forwarded untouched, using the same predicate
   `multiproxy` already applied one layer up.
-
-### Added
-- **Cross-block join (`join_blocks`, ON by default) — #116.** When every text content
-  block of a tool result is a JSON object, the proxy now joins them into one record array
-  before compressing, so `tabularize`/`dictionary` fold across records *and* the whole
-  result becomes eligible for the cross-call diff tier. Several MCP servers return one
-  record per block, a shape that was 71% of terse's own live traffic and could reach
-  neither cross-record folding nor diffing (the diff path only ran for single-block
-  results). Measured on a realistic 80-record `kb.read.list_principles` payload: per-block
-  +9.6% → joined codec +24.9%, and a near-identical repeat call collapses ~6900 tokens to
-  ~100 via a diff. Lossy field rules resolve **per block, before the join**, so a path
-  authored against one record's shape is unaffected. Opt out with `proxy --no-join-blocks`
-  / `install-mcp --no-join-blocks` or a policy-file `"join_blocks": false`.
-
-### Changed
-- **`structured` now defaults to `"auto"`, which decides per connected client (#128).**
-  This **changes default wire behavior for Claude Code users**: `structuredContent` will
-  carry a terse envelope where it previously carried the server's own object. That is the
-  intended effect — with the previous `"leave"` default terse was a measured no-op on
-  filesystem, memory and kb — but it is a real behavior change, stated here rather than
-  buried under Added.
-  The `"leave"` default shipped alongside the knob rested on "terse cannot detect which
-  client it sits behind." That was wrong: the MCP `initialize` request carries
-  `params.clientInfo`, a name the client *declares*, and the proxy proxies that request.
-  `"auto"` compresses the typed field only for clients measured not to validate it
-  (`policy.STRUCTURED_SAFE_CLIENTS`, currently `claude-code`, evidenced by the `badtype`
-  and `enveloped` probes) and **fails closed** for an unlisted client, a client that omits
-  `clientInfo`, and a library caller that never handshakes. Explicit `"compress"`/`"leave"`
-  still win. Measured with a stock policy — no `structured` key anywhere — the fixture's
-  context cost drops 2,596 → 1,008 chars (61.2%) against `claude-code`, and is untouched
-  against anything else.
-- **A joined result changes the content-block count the client sees (N → 1).** This is the
-  first time terse changes anything but block *text*. The MCP spec (2025-06-18) puts no
-  meaning on block count — blocks carry no index a payload can reference — and non-text
-  blocks (image/audio/resource) keep their positions. The savings ledger's blanket
-  `multiblock` reason is replaced by reasons that name why a join did or didn't fire
-  (`multiblock_non_json` / `_heterogeneous` / `_marker` / `_depth` / `_passthrough` /
-  `_off`, plus a `reanchor` reason when a join↔single shape flip forces a full).
 
 ## [0.4.1] - 2026-07-21
 
@@ -1248,3 +1502,83 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   counts are absent (was rendering as all-zeros); an empty `--since` window now
   reports the window rather than "nothing ever recorded"; added a per-tool
   cross-call diff hit-rate (`diff%`) column. (#96)
+
+## [0.1.0] - 2026-07-17
+
+_Reconstructed from the commit log — this release shipped without a hand-written
+entry. The lines below are the commit subjects verbatim, not a summary._
+
+### Added
+
+- feat: fluency --bars terminal forest plot (#56)
+- feat: terminal-bar mode for measure/verify (#51 fast-follow) (#54)
+- feat: charted HTML report mode for measure/verify (#52)
+- feat: policy generate auto-detects drop-to-retrieve candidates (#47) (#48)
+- feat: Tier-1 lossy drop-to-retrieve (#10) (#45)
+- feat: content-defined-chunking diff for non-JSON tool output (#44)
+- feat(policy): `terse policy generate` — auto-author a lossless policy from a corpus (#24) (#40)
+- feat(proxy): fail-fast on non-stdio downstream + document stdio-only wiring (#19) (#39)
+- feat(proxy): --debug-log replay trace of raw→decision→emitted (#23) (#38)
+- feat(install-mcp): --capture-dir passthrough for live-traffic measurement (#36)
+- feat(proxy): --capture-dir to tee live tool results into a corpus (#32) (#34)
+- feat: VERIFY.md + terse verify (self-contained verification report) (#29)
+- feat: install-mcp / uninstall-mcp — Claude Code integration installer (#27)
+
+### Fixed
+
+- fix: address code-review findings on HTTP/SSE transport + multi-peer fan-out (#57)
+- fix: restrict fluency-pack permissions and redact secrets in install-mcp output (#50)
+- fix: restrict fluency-pack permissions and redact secrets in install-mcp output (#49)
+- fix: close TOCTOU chmod window, harden capture.py, dedupe report.py, split lint job (#43)
+- fix(proxy): reliability — reap orphaned child, bound pending map, guard diff desync (#33)
+
+### Changed
+
+- release: tag-based versioning (hatch-vcs) + GitHub Release CI (#88)
+- version: single-source from __init__.py + add `terse --version` (#87)
+- policy: per-rule "capture": false — never persist a tool's payloads (#85) (#86)
+- policy: make server-scoped rules match servers that don't self-prefix (#83) (#84)
+- live savings ledger + terse stats: payload-free per-result records, default-on (#82)
+- docs: drop stale Phase-0/spike framing, acknowledge TOON as prior art (#81)
+- codec hot-path fix (#79) + fluency package split (#78) (#80)
+- audit fixes: checked types + curated lint; install-mcp drift guard; strict policy keys; transport credential guard (#77)
+- flip cross-call diffing to default-on; add --no-diff opt-outs (#76)
+- diff drift soak: mechanical long-chain pytest + fluency --diff-soak depth eval (#75)
+- install-mcp: opt-in --diff wiring; docs: diff fluency is now validated (#74)
+- fluency: cover nested-record tools (structure) so proxy --diff is validated (#71) (#72)
+- chore: remove all Anthropic API integration (never used) (#73)
+- security: fix the three remaining red-team lows (#70)
+- security: restrict downstream URL schemes to http/https; prune config backups (#69)
+- #64 Phase 2: broadcast/merge resources|prompts|ping + route reads (#68)
+- #64: measurement infra — capture-order replay + probe value-overlap gate (#67)
+- Add terse probe --cross-server: #64 Phase 0 cross-peer redundancy gate (#65)
+- Add terse fluency --text-diff-eval: behavioral gate for text-diff codec (#63)
+- Add test coverage for _secure_io restricted-permission helpers (#62)
+- add measure --history: track token savings across runs, not just one snapshot (#61)
+- add mcp-status: read-only enumeration of terse-wrapped servers across all scopes (#60)
+- install-mcp: support project (.mcp.json) and local (nested projects.<path>) scope (#59)
+- HTTP/SSE transport, multi-peer fan-out, and drop-to-retrieve eval (#5, #10) (#55)
+- chore: harden install-mcp backups, dedupe report verdict math, add CLI/lint gate (#42)
+- chore: add .runechoguardignore to silence a runecho-guard false positive (#41)
+- ci: run pytest on push + PR across Python 3.11-3.13
+- policy: guard reserved-marker collisions (#6)
+- proxy: keyframe diff-anchoring + recursive record-list detection (#15)
+- proxy: inject one-time terse/diff format primer via initialize.instructions (#13) (#14)
+- Cross-call diffing, multi-trial fluency, and Tier-1 truncate (#12)
+- fluency: validate object-valued aliases (the #4 follow-up) + fix unhashable-legend bug
+- transforms: whole-subtree aliasing (Tier 0.5) — fold repeated objects, not just strings
+- fluency: harden scoring from the code-review pass
+- fluency: measure whether a model reads the compressed form as well as raw JSON
+- tier0: row-count hint in table header — close the enumeration recall gap
+- docs: document the MCP proxy (README/TECHNICAL/USAGE)
+- proxy: MCP stdio middleware — compress downstream tool results per policy
+- docs: README + TECHNICAL + USAGE (/docs gate before first push)
+- policy: selective per-tool compression shell + `terse compress`
+- validate: cross-tokenizer invariance check (cl100k vs o200k) — keyless ground truth
+- cleanup: drop stray runecho .ai/ index dirs, gitignore them
+- report: per-tool savings table + fix trailing-newline shape misclassification
+- tier0: nested key folding — hoist uniform-dict columns into a shared subcols header
+- tier0.5: lossless dictionary coder — fold repeated string values via inline legend
+- probe: value-redundancy + cross-call-overlap ceiling probes (Tier 0.5 go/no-go)
+- measure: corpus capture + per-tier/per-bucket token measurement
+- scaffold: terse Phase-0 spike — lossless Tier-0 spine + round-trip gate
