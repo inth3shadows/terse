@@ -438,9 +438,19 @@ class Router:
         # with the POST-install seq, missing the lookup AND suppressing the fallback, so a
         # tool that is both advertised and routable answers -32601 — precisely when the
         # first tools/list lands, which is when a real client sends its first tools/call.
+        # The third element is the DIAGNOSIS: which configured peers contributed nothing to
+        # the listing this table was built from, and why (`_silent_peers`). It rides inside
+        # the same tuple for the same reason `seq` does — it describes this table, it is
+        # installed and replaced atomically with it under the same seq guard, and it dies
+        # with it. That is the "derived, not accumulated" shape terse#178 asks for: nothing
+        # here outlives the listing that produced it, so none of the read-modify-write that
+        # sank retention is reintroduced. It informs ERROR TEXT only and never a routing
+        # decision — the table is still exactly what the most recent listing advertised.
         self._route_lock = Lock()
-        self._tool_state: tuple[int, dict[str, tuple[int, str]]] = (-1, {})
-        self._prompt_state: tuple[int, dict[str, tuple[int, str]]] = (-1, {})
+        self._tool_state: tuple[int, dict[str, tuple[int, str]],
+                                tuple[tuple[str, str], ...]] = (-1, {}, ())
+        self._prompt_state: tuple[int, dict[str, tuple[int, str]],
+                                  tuple[tuple[str, str], ...]] = (-1, {}, ())
         # What the installed table advertises, so a listing refused as stale can be
         # answered with names that are actually routable rather than its own stale view.
         # Stored as a COPY: the caller appends RETRIEVE_TOOL_DEF to its own list after the
@@ -575,7 +585,7 @@ class Router:
                 self._write_client(reply)
             return
 
-        seq, route = self._tool_state          # ONE load — see __init__
+        seq, route, silent = self._tool_state  # ONE load — see __init__
         target = self._resolve(name, route, seq >= 0)
         if target is not None:
             idx, bare = target
@@ -600,13 +610,27 @@ class Router:
         # Not advertised and not a resolvable peer prefix — a legible JSON-RPC error,
         # not a crash or a silent hang, so the client sees exactly why the call went
         # nowhere.
+        #
+        # `silent` is the half terse#178 left open: a non-conformant client holding names
+        # from an earlier listing gets -32601 for a tool whose peer is ALIVE and merely
+        # missed a broadcast, and the bare message reads as "no such tool ever". Naming the
+        # peers that contributed nothing to the listing behind this table turns that into an
+        # actionable one — re-read `tools/list` — without carrying a single route forward.
+        # Appended only when non-empty: on a complete listing this says nothing, and a
+        # permanent suffix would be noise on the common case.
         if mid is not None:
+            detail = ""
+            if silent:
+                detail = ("; peer(s) "
+                          + ", ".join(f"{n} ({w})" for n, w in silent)
+                          + " contributed no tools to the listing this table was built "
+                            "from, so their tools are absent from it — re-read tools/list")
             self._write_client(json.dumps(
                 {"jsonrpc": "2.0", "id": mid, "error": {
                     "code": -32601,
                     "message": f"terse-multiproxy: unknown tool {name!r} (expected a "
                               f"name from tools/list, or '<peer>{PREFIX_SEP}<tool>' for "
-                              f"one of: {', '.join(self.by_name)})"}},
+                              f"one of: {', '.join(self.by_name)}){detail}"}},
                 separators=(",", ":"), ensure_ascii=False))
 
     @property
@@ -673,7 +697,7 @@ class Router:
         params = msg.get("params") or {}
         name = params.get("name")
         mid = msg.get("id")
-        seq, route = self._prompt_state        # ONE load — see __init__
+        seq, route, _ = self._prompt_state     # ONE load — see __init__
         target = self._resolve(name, route, seq >= 0)
         if target is not None:
             idx, bare = target
@@ -1014,6 +1038,9 @@ class Router:
         contributes nothing. The routing table is exactly what this listing advertised
         (see `_merge_tools_list`), so there is no "did it answer?" distinction to draw
         here — a peer missing from a listing is missing from the client's tool list too.
+        `_silent_peers` draws that distinction alongside, for the error text only; keeping
+        it out of THIS function is the point, because the moment it reaches routing it is
+        the retention design terse#178 withdrew.
         """
         out: list[tuple[int, dict]] = []
         for i in range(len(self.peers)):
@@ -1025,6 +1052,52 @@ class Router:
                 if isinstance(it, dict) and isinstance(it.get("name"), str):
                     out.append((i, it))
         return out
+
+    def _silent_peers(self, pb: _PendingBroadcast,
+                      key: str) -> tuple[tuple[str, str], ...]:
+        """(peer name, why) for every configured peer that contributed no `key` entries.
+
+        terse#178's closing advice is explicit: *decide the semantics of "the peer did not
+        answer" up front — an explicit JSON-RPC error, an empty list, a malformed result and
+        a true timeout are four different things, and conflating any of them is where round
+        3's defect came from.* So they are four values here, distinguished at the one place
+        that can still see the reply, and never collapsed to a boolean:
+
+          no reply   absent from `pb.parts` — the broadcast completed without it, which
+                     means `_timeout_broadcast` force-completed. Already on stderr.
+          error      answered, with a JSON-RPC error. A live peer refusing the method is a
+                     different operational problem from a dead one.
+          empty      answered with a well-formed EMPTY list. Not a fault at all — a peer is
+                     allowed to export nothing — so it is reported without a warning.
+          malformed  answered with something that is not a list under `result[key]`.
+
+        This is diagnosis, not routing. `_collect_named` remains the only input to the
+        table, and a peer named here is genuinely absent from the client's tool list — the
+        point is to say WHY, where today a `-32601` says only "unknown tool" and reads as
+        "no such tool ever" for a tool whose peer is alive and merely was slow.
+        """
+        out: list[tuple[str, str]] = []
+        for i in range(len(self.peers)):
+            part = pb.parts.get(i)
+            if part is None:
+                why = "no reply"
+            elif "error" in part:
+                why = "error"
+            else:
+                result = part.get("result")
+                items = result.get(key) if isinstance(result, dict) else None
+                if not isinstance(items, list):
+                    why = "malformed"
+                elif not any(isinstance(it, dict) and isinstance(it.get("name"), str)
+                             for it in items):
+                    # Also covers a non-empty list of unusable entries: from the client's
+                    # side that is indistinguishable from exporting nothing, and calling it
+                    # `malformed` would accuse a peer that answered perfectly well.
+                    why = "empty"
+                else:
+                    continue
+            out.append((self.peers[i].name, why))
+        return tuple(out)
 
     def _expose_names(self, owned: list[tuple[int, dict]],
                       reserved: tuple[str, ...] = ()) -> tuple[list[dict], dict]:
@@ -1128,10 +1201,24 @@ class Router:
         advertises its own retrieve is a policy detail the client can't see."""
         tools, table = self._expose_names(self._collect_named(pb, "tools"),
                                           reserved=(lossy_mod.RETRIEVE_TOOL,))
+        silent = self._silent_peers(pb, "tools")
         with self._route_lock:
             if pb.seq >= self._tool_state[0]:
-                self._tool_state = (pb.seq, table)
+                self._tool_state = (pb.seq, table, silent)
                 self._tool_entries = list(tools)   # COPY — see __init__
+                # Warn only for the reasons nothing else warns about. A `no reply` peer was
+                # already named by `_timeout_broadcast` (a broadcast completes on arrival or
+                # on timeout, so that is the only way to be absent), and `empty` is a peer
+                # exercising its right to export nothing. Warning inside the seq guard, not
+                # before it, so a listing refused as stale does not report peers that are
+                # missing from a table which was never installed.
+                notable = [(n, w) for n, w in silent if w in ("error", "malformed")]
+                if notable:
+                    sys.stderr.write(
+                        "[terse-multiproxy] tools/list: "
+                        + ", ".join(f"{n!r} ({w})" for n, w in notable)
+                        + " contributed no tools — their tools are absent from this "
+                          "listing and not routable until the next one\n")
             else:
                 # Refused as stale — but this client is still owed a reply, and answering
                 # from THIS listing would advertise names the installed table does not
@@ -1207,7 +1294,13 @@ class Router:
         prompts, table = self._expose_names(self._collect_named(pb, "prompts"))
         with self._route_lock:
             if pb.seq >= self._prompt_state[0]:
-                self._prompt_state = (pb.seq, table)
+                # Third element is always `()` here, deliberately. Prompts keep the same
+                # tuple SHAPE as tools so the two cannot drift into different unpackings,
+                # but carry no diagnosis: most MCP servers answer `prompts/list` with
+                # -32601 (see `_route_prompt_get`), so "this peer contributed no prompts"
+                # is the norm rather than a signal, and reporting it would train a reader
+                # to ignore the line that matters on the tools side.
+                self._prompt_state = (pb.seq, table, ())
                 self._prompt_entries = list(prompts)   # COPY — see __init__
             else:
                 prompts = list(self._prompt_entries)   # see _merge_tools_list
