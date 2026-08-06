@@ -380,8 +380,13 @@ and Gemini 2.5 Flash match raw-JSON accuracy on the compressed form (100% paired
 37% token saving (`terse fluency`; see TECHNICAL.md). Whole-subtree aliasing (folding
 repeated objects, not just strings) is built. Cross-call diffing is a lossless tier
 that is **off by default** (#170) — not for lack of confidence, but on cost: its primer
-paragraph is 190 of 555 cl100k tokens, re-read every turn per wrapped server, against a
-measured 0.38% hit rate, so the explanation cost ~900–2,700x what the tier saved. Its full
+paragraph adds 190 cl100k tokens to that server's primer — the largest single section —
+attached once per session to each wrapped server that emits a terse form
+(#211), against a measured 0.38% hit rate. The tier banked 5,052 tokens over 13.3 days,
+which roughly 27 primer attaches erase — about two a day across that window, which an
+active fleet passes immediately. That is the standalone cadence; behind a router the
+same paragraph rides `initialize` and is re-read every turn, which only widens the gap.
+Its full
 validation program did pass: pair fluency
 (`fluency --diff`, 4-model panel 100%), the nested-record surface (`structure`: diff
 100% vs full-terse 94%), and long-chain drift soaked from both sides — mechanically

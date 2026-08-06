@@ -425,8 +425,10 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
         # `diff_off` on every block is the single most misread line in this report: it looks
         # like a missing feature, and a reader who then finds no `diff` key in their policy
         # concludes diffing was never wired up (#181). It is implemented and deliberately
-        # off (#170 — the primer paragraph cost ~900-2,700x what the tier saved at a 0.38%
-        # hit rate). Say so where the question is actually asked, not only in the dataclass.
+        # off (#170 — the 190-token primer paragraph outweighed what the tier saved at a
+        # 0.38% hit rate; the ~900-2,700x once quoted here was computed against the pre-#211
+        # per-turn charge, see `policy.py`). Say so where the question is actually asked,
+        # not only in the dataclass.
         if diff_reasons.get("diff_off") and len(diff_reasons) == 1:
             lines.append("  (diff_off = cross-call diffing is OFF by default since #170 — "
                          "measured cost > saving; enable per server with `--diff`)")

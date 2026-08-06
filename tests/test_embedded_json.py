@@ -242,8 +242,8 @@ def test_policy_runs_the_tier_only_when_the_rule_lists_it():
 
 
 def test_the_primer_paragraph_is_charged_only_to_a_policy_that_can_emit_the_form():
-    """#170's lesson: a primer paragraph is re-read every turn, so a form a server cannot
-    produce must not be documented to it."""
+    """#170's lesson: a primer paragraph enlarges that server's primer, so a form a server
+    cannot produce must not be documented to it."""
     from terse.proxy import PRIMER_EMBEDDED, build_primer
     plain = P.Policy(rules=[P.Rule("*", ("minify", "tabularize", "dictionary"))])
     opted = P.Policy(rules=[P.Rule("*", ("minify", "tabularize", "embedded"))])
@@ -299,7 +299,7 @@ def test_generate_recommends_the_tier_for_a_tool_that_double_encodes():
 
 def test_generate_withholds_the_tier_from_an_ordinary_record_tool():
     """It must not be added everywhere: a tool with no embedded JSON gains nothing and would
-    pay a primer paragraph every turn for a form it can never emit."""
+    pay for a primer paragraph describing a form it can never emit."""
     from terse.policy_gen import generate_policy
     raw = json.dumps({"results": _records(20)})
     _doc, rows = generate_policy(_envs("gh.list_items", raw))

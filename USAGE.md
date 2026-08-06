@@ -669,9 +669,9 @@ byte-faithfulness, and a tier that quietly relaxed that to "equivalent JSON" wou
 selling something else.
 
 It is **opt-in**, like every tier that costs a primer paragraph: a form the client is told
-about is re-read every turn (#168), so a server that never double-encodes should not pay for
-the explanation. `policy generate` / `policy autotune` will add it where the measurement
-justifies it.
+about enlarges that server's primer (#168), so a server that never double-encodes should
+not pay for the explanation. `policy generate` / `policy autotune` will add it where the
+measurement justifies it.
 
 ### Compressing `structuredContent` (`"structured": "compress"`)
 
@@ -953,11 +953,18 @@ the full payload — big in agent loops that call the same tool repeatedly (~91%
 It is stateful and **OFF by default** — opt in with `--diff` (or `"diff": true` in a policy).
 Its validation program passed (pair fluency, nested-record coverage, drift soak; see
 TECHNICAL.md), so the default is a *cost* decision, not a confidence one: the primer
-paragraph explaining the diff format is 190 of 555 cl100k tokens and the client re-reads it
-every turn, per wrapped server, against a measured **0.38% hit rate** (7 diffs in 1,828
-blocks over 13.3 days). At that rate the explanation cost ~900–2,700x what the tier saved,
-so #170 flipped it off. Turn it on for a workload that genuinely re-calls the same tool with
-the same arguments — `terse stats` shows your own hit rate under `diff reasons`:
+paragraph explaining the diff format adds 190 cl100k tokens to that server's primer — the
+largest single section — attached once per session to each wrapped server that emits
+a terse form (#211), against a measured **0.38% hit rate** (7 diffs in 1,828 blocks over
+13.3 days, banking 5,052 tokens). Those 5,052 tokens are erased by about 27 primer
+attaches: roughly two session-server pairs a day across the whole 13.3-day window, which
+an active fleet passes immediately. That is the standalone cadence; behind a router the
+paragraph rides `initialize` and is re-read every turn, which only widens the gap. So
+#170 flipped it off. The ~900–2,700x multiplier
+this paragraph used to quote was the same comparison against the pre-#211 per-turn charge;
+#211 shrank the cost side by the session turn count and left the verdict intact. Turn it
+on for a workload that genuinely re-calls the same tool with the same arguments —
+`terse stats` shows your own hit rate under `diff reasons`:
 
 ```
 # nothing to enable — a plain proxy diffs. Opt OUT per proxy:

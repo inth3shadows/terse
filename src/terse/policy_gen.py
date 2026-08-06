@@ -19,7 +19,7 @@ round-trip-gated Tier-0/0.5 tiers, never a lossy mode):
     3. otherwise  ["minify","tabularize"] (+ "dictionary" and/or "embedded", each iff its
        own MARGINAL saving clears the threshold — mirrors the hand-authored example
        dropping dictionary on `kb.*`). Both are opt-in for the same reason: each costs a
-       primer paragraph the client re-reads every turn (#168/#170), so it is enabled only
+       primer paragraph on that server's primer (#168/#170), so it is enabled only
        where measurement shows it pays. `embedded` is what makes a tool that ships its
        body as a JSON string compressible at all (0.0% -> ~41% on the reference shape).
 
@@ -723,7 +723,7 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
     else:
         parts = [f"dictionary +{dict_pct:.1f}% below threshold — dropped"]
     # Same marginal test as `dictionary`, and for the same reason: `embedded` costs a primer
-    # paragraph the client re-reads every turn (#168/#170), so it is added only where the
+    # paragraph on that server's primer (#168/#170), so it is added only where the
     # measurement says the tool actually ships JSON inside a string. On every other tool the
     # marginal saving is exactly 0 and this is silently skipped.
     # An embedded-gate failure drops the tier on its own evidence, ahead of the threshold
