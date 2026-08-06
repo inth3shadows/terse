@@ -41,19 +41,33 @@ def text() -> str:
     return CHANGELOG.read_text(encoding="utf-8")
 
 
-def test_every_release_tag_has_a_changelog_section(text):
+def test_every_release_but_the_newest_has_a_changelog_section(text):
     """The rule the file's own header states. A tag is a published PyPI release (hatch-vcs
-    cuts from tags), so a tag without a section is a shipped change nobody can look up."""
+    cuts from tags), so a tag without a section is a shipped change nobody can look up.
+
+    THE NEWEST TAG IS EXEMPT, and that is a consequence of how this repo releases, not a
+    softening. `release.yml` fires on every push to `main`: it decides the version, runs the
+    test gate, and only THEN pushes the tag. So the release a merge produces cannot exist
+    while that merge's own CI runs — demanding a section for it would turn the NEXT PR red
+    over a tag that did not exist when its code was written.
+
+    Verified rather than assumed: v0.22.0, v0.22.1 and v0.22.2 are each tagged at one of the
+    last three merges to `main`.
+
+    One release of grace, then. It still catches the drift this file exists for — against
+    the pre-backfill CHANGELOG it flags 25 releases — and the exemption expires as soon as
+    another release lands, because the undocumented one is no longer newest."""
     tags = _tags()
     if not tags:
         pytest.skip("no release tags in this checkout (shallow clone or fresh fork)")
     documented = set(_SECTION.findall(text))
-    missing = [t for t in tags if t.lstrip("v") not in documented]
+    newest = max(tags, key=lambda t: tuple(int(x) for x in t.lstrip("v").split(".")))
+    missing = [t for t in tags if t != newest and t.lstrip("v") not in documented]
     assert not missing, (
         f"{len(missing)} release(s) have no CHANGELOG section: {missing}\n"
-        "Add one before/with the tag — the header promises an entry moves out of "
-        "[Unreleased] when its tag is pushed, and a user on that version has no other "
-        "way to find out what changed.")
+        f"(the newest, {newest}, is exempt — see this test's docstring.)\n"
+        "Add one — the header promises an entry moves out of [Unreleased] when its tag is "
+        "pushed, and a user on that version has no other way to find out what changed.")
 
 
 def test_unreleased_does_not_describe_work_that_already_shipped():
