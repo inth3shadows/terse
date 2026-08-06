@@ -283,7 +283,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         liability = primer_liability(scan_scopes(), agg)
     except Exception as e:  # noqa: BLE001
         print(f"stats: could not size the primer liability ({e}) — ledger totals below "
-              f"EXCLUDE the per-turn primer cost", file=sys.stderr)
+              f"EXCLUDE the primer cost, recurring and one-time alike", file=sys.stderr)
         liability = None
     if args.json:
         print(json.dumps({**agg, "primer_liability": liability}, indent=2))

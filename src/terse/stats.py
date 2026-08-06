@@ -505,6 +505,10 @@ _ONCE = "once/session"
 _ONCE_FREE = "once/session (unpaid)"
 _ONCE_UNKNOWN = "once/session (?)"
 
+# The same four, short enough for a table cell that has to fit inside 80 columns alongside
+# five other. The prose labels stay the `--json` contract; these are render-only.
+_CADENCE_ABBR = {_PER_TURN: "/turn", _ONCE: "1x", _ONCE_FREE: "1x-", _ONCE_UNKNOWN: "1x?"}
+
 
 def _cadence(state: str | None, blocks: int | None) -> str:
     """How often this entry actually pays its primer, post-#211.
@@ -730,12 +734,21 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # ever fired. Neither total counts it — same discipline as `unresolved`.
         "uncertain": [s["server"] for s in servers if s["cadence"] == _ONCE_UNKNOWN],
         "saved_tokens": saved,
-        # The one-time charge comes out of the SAME savings pot, so it is settled first and
-        # only the remainder buys turns. None, not 0 or infinity, with nothing recurring to
-        # pay: rendering "inf turns" would read as a measurement.
-        "turns_covered": ((saved - once) / per_turn) if per_turn else None,
-        # The verdict for a standalone-only install, which has no recurring charge at all
-        # and would otherwise get no bottom line. None when nothing is billed once.
+        # NOT `(saved - once) / per_turn`. `once` is charged per SESSION and `saved` is the
+        # whole window, which spans an unknown number of sessions — a `terse proxy` is one
+        # process per session and `Interceptor._primer_sent` re-arms at every `initialize`.
+        # Netting a per-session charge out of a multi-session pot subtracts one primer where
+        # K were paid, and `sessions` is no more observable from this ledger than `turns` is
+        # (the same reason there is no per-turn charge in it at all). So the recurring figure
+        # is left dividing like against like. None, not 0 or infinity, with nothing recurring
+        # to pay: rendering "inf turns" would read as a measurement.
+        "turns_covered": (saved / per_turn) if per_turn else None,
+        # An UPPER bound, and labelled as one wherever it is rendered: this treats the whole
+        # window as a single session, which is the most favourable reading available. A
+        # window covering K sessions paid K one-time primers, so the true coverage is this
+        # over K. Kept as a bound rather than dropped because it is still decisive in one
+        # direction — if even the best case does not clear 1.0, the install is genuinely
+        # net negative and no session count can rescue it.
         "session_covered": (saved / once) if once else None,
     }
 
@@ -784,32 +797,27 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         # Below 1.0 the ratio is not the interesting number — the shortfall is. `~0.4 turns`
         # and `~0x over` both round to a `0` that reads as a measured zero, the same
         # print-as-zero hole `_fmt_rate` closed in review of #197.
-        # The one-time clause only appears when there IS one. A router-only install — and a
-        # liability blob from a pre-cadence terse, which is rendered through this same path —
-        # has `once == 0`, and telling it that its savings "settle the one-time charge"
-        # invents a charge it does not pay.
-        settles = "settles the one-time charge and " if once else ""
         if turns >= 1:
-            lines.append(f"  the {saved:,} tok saved in this window {settles}pays for "
-                         f"~{turns:,.0f} turn(s) of the recurring primer.")
-        elif once:
-            lines.append(f"  NET NEGATIVE over this window: the {saved:,} tok saved does "
-                         f"not cover the {once:,} tok one-time charge plus even a single "
-                         f"turn of the {per_turn:,} tok recurring one.")
+            lines.append(f"  the {saved:,} tok saved in this window pays for ~{turns:,.0f} "
+                         f"turn(s) of the recurring primer.")
         else:
             lines.append(f"  NET NEGATIVE over this window: the {saved:,} tok saved does "
                          f"not cover even a single turn of the {per_turn:,} tok recurring "
                          f"primer.")
-    elif liab.get("session_covered") is not None:
-        # No recurring charge at all — the standalone-only install, which is now the common
-        # shape. It still deserves a bottom line, just a per-session one.
+    if liab.get("session_covered") is not None:
+        # Rendered ALONGSIDE the recurring line, not instead of it, and never netted into
+        # it: the two divide different things. And stated as a ceiling, because the window
+        # spans an unknown number of sessions and each one paid this charge again.
         covered = liab["session_covered"]
         if covered >= 1:
-            lines.append(f"  the {saved:,} tok saved in this window covers the one-time "
-                         f"charge ~{covered:,.0f}x over.")
+            lines.append(f"  the same {saved:,} tok covers the {once:,} tok one-time charge "
+                         f"at most ~{covered:,.0f}x — fewer if this")
+            lines.append("  window spans more than one session, which it usually does; "
+                         "each of them paid that charge again.")
         else:
             lines.append(f"  NET NEGATIVE over this window: the {saved:,} tok saved does "
-                         f"not cover the {once:,} tok one-time charge.")
+                         f"not cover the {once:,} tok one-time charge even once, and each "
+                         f"session in the window paid it again.")
     if liab["idle"]:
         lines.append(f"  paying every turn but never called here: "
                      f"{', '.join(sorted(liab['idle']))} — pure cost until they handle a "
@@ -874,8 +882,13 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
     exactly the row that sends the operator to fix it."""
     if not any(s.get("blocks") for s in servers):
         return []
-    lines = ["", f"  {'server':<18} {'primer':>7} {'blocks':>19} {'saved/block':>11} "
-                 f"{'cadence':>21} {'blocks to break even':>21}"]
+    # Widths are load-bearing twice over: four tests match right-aligned cells, and the row
+    # has to stay inside 80 columns or the last cells fold onto the next line and the table
+    # stops being one. Adding `cadence` at its full label width took the row to 104, so the
+    # cadence values are abbreviated (`_CADENCE_ABBR`) and `blocks` — which only ever holds
+    # `N` or `tokenized/N` — gives back the space it was never using.
+    lines = ["", f"  {'server':<18} {'primer':>6} {'blocks':>11} {'saved/block':>11} "
+                 f"{'cadence':>9} {'to break even':>17}"]
     # Rateless rows sort last as a group rather than tying with a 0.0 rate: `or -1` treated
     # a break-even server (0.0, falsy) as worse than one actively LOSING tokens (-0.5,
     # truthy), inverting the two rows an operator most needs ordered (review of #197).
@@ -887,14 +900,23 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
         name = srv["server"] if len(srv["server"]) <= 18 else srv["server"][:17] + "…"
         # `.get`, defaulted to a dash: an older `--json` blob has no cadence at all, and a
         # blank there is honest where guessing `per-turn` would re-assert the old defect.
-        lines.append(f"  {name:<18} {primer:>7} {_fmt_denominator(srv):>19} "
-                     f"{per_block:>11} {srv.get('cadence') or '–':>21} {calls:>21}")
+        cadence = _CADENCE_ABBR.get(srv.get("cadence") or "", "–")
+        lines.append(f"  {name:<18} {primer:>6} {_fmt_denominator(srv):>11} "
+                     f"{per_block:>11} {cadence:>9} {calls:>17}")
     lines.append("  wrap a server when it clears its own row: below that rate the primer "
                  "costs more than the codec banks (#175).")
-    lines.append("  read the break-even against the CADENCE column — it is blocks per TURN "
-                 "for an eagerly-primed router,")
-    lines.append("  and blocks ONCE PER SESSION for a lazily-primed standalone entry "
-                 "(#211), a far lower bar.")
+    # Each cadence explains itself only to an install that HAS it — the same reason the
+    # prose above does not tell a router-only install about a one-time charge.
+    shown = {s.get("cadence") for s in servers}
+    if _PER_TURN in shown:
+        lines.append("  /turn = an eagerly-primed router: the break-even is blocks per "
+                     "TURN, and it recurs.")
+    if shown - {_PER_TURN}:
+        lines.append("  1x = a lazily-primed standalone entry (#211): the break-even is "
+                     "blocks ONCE PER SESSION, a far lower bar.")
+        if _ONCE_FREE in shown or _ONCE_UNKNOWN in shown:
+            lines.append("  1x? = called-ness unknown (no ledger label); 1x- = installed "
+                         "but not triggered, so unpaid.")
     lines.append("  a BLOCK is one emitted tool-result text block — >=1 per call, so this "
                  "is a conservative bar (#141).")
     return lines
