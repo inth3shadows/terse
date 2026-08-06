@@ -105,9 +105,11 @@ def _args_key(arguments: Any) -> str:
 # at initialize time — so a server explains only what it can actually put on the wire.
 #
 # Measured cost of the whole primer, cl100k: header 41, table 155, dict 44, diff 190,
-# embedded 53, dropped 64, tail 8 = 555. Paid per wrapped server, re-read every turn as
-# cache_read. That is why terse measured a 14.0% win at one wrapped server and a loss at
-# three.
+# embedded 53, dropped 64, tail 8 = 555 with every gate on. A default policy emits head +
+# table + dict + tail = 248, since `diff` is off (#170) and embedded/dropped are per-rule.
+# Paid per wrapped server, ONCE per session since #211 — it was re-read every turn as
+# cache_read before that, which is why terse measured a 14.0% win at one wrapped server
+# and a loss at three. A router still pays the per-turn cadence; see `stats.py`.
 #
 # `table` went 55 -> 155, and this is the section to attack first if #168's per-server tax
 # reopens. Two things drove it:
@@ -121,8 +123,9 @@ def _args_key(arguments: Any) -> str:
 #     all three). A cheaper encoding exists (one
 #     ABSENT_MARKER in EVERY absent cell, no `absent_cols`/`sentinel_cols` arrays: 87 tokens
 #     total, also 100% on the same probe), traded away because it costs more on the wire at
-#     scale (31.8% vs 33.5% saved on a 200-record table) — the primer is paid once per turn,
-#     the wire per payload.
+#     scale (31.8% vs 33.5% saved on a 200-record table) — the primer is paid once per
+#     session (per turn for a router), the wire per payload. The trade only got better
+#     for standalone entries when #211 made the primer lazy.
 #   * `subcols` (+26), which the codec has emitted since nested key folding shipped and this
 #     paragraph never named. Found by making the coupling a test rather than a promise: the
 #     guard derives the required vocabulary from a real emission, so a header key added to
@@ -192,9 +195,15 @@ def build_primer(pol: policy_mod.Policy, server: str | None = None) -> str:
     """The primer for a server governed by `pol` — only the wire forms it can emit (#168).
 
     Returns "" when the policy can emit no compressed form at all (every reachable rule is
-    `tiers: ()` with diffing therefore dead and no field drop). secret-broker's
-    default-deny policy is exactly that case, and today it pays 555 tokens per turn to
-    explain forms it is structurally forbidden from producing.
+    `tiers: ()` with diffing therefore dead and no field drop) — before #168 such a server
+    paid a full primer to explain forms it is structurally forbidden from producing.
+
+    That is a property of the POLICY, not of any particular server: `secret-broker` pays
+    248 under both shipped policies, though by different routes — an explicit
+    `secret-broker.secret.list_credentials` carve-out sitting ahead of `secret-broker.*`
+    in the live policy, and `defaults` in `policy.example.json`, which has no
+    secret-broker rule at all. `server_never_lossy` (#199) only suppresses the
+    dropped-field paragraph. The default-deny shape this returns "" for is deliberate.
 
     `minify` alone is deliberately NOT a reason to emit a primer: minified JSON is just
     JSON, carries no terse marker, and needs no explanation.

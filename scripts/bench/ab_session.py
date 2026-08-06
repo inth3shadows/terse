@@ -5,9 +5,12 @@ terse's own ledger (`terse stats`) cannot settle whether terse is a net win. Thr
 costs are structurally outside its accounting:
 
   1. It counts in cl100k (tiktoken), not Claude's tokenizer (see src/terse/tokenize.py).
-  2. It never charges itself for TERSE_PRIMER — 402 cl100k tokens prepended to each
-     wrapped server's `instructions` (src/terse/proxy.py) — plus one `terse_retrieve`
-     tool definition per server. That is fixed system-prompt weight on EVERY request.
+  2. It never charges itself for the primer — up to 555 cl100k tokens with every gate on,
+     248 for a default policy (src/terse/proxy.py) — plus one `terse_retrieve` tool
+     definition per server. Since #211 a standalone wrapped server attaches that lazily,
+     once per session; a ROUTER still rides `initialize.instructions` and carries it as
+     fixed system-prompt weight on every request. (This harness predates #211 and its
+     measured tables below are all of the pre-#211 eager architecture.)
   3. It cannot see rebound: `terse.retrieve` round-trips, or the model re-reading a
      file because a dropped field mattered.
 
@@ -50,7 +53,7 @@ behavior.
 terse WINS at one wrapped server and LOSES from two upward, and MORE CALLS DID NOT SAVE
 IT: 4 calls and 16 calls both land net-negative at three servers. Each standalone
 `terse proxy` injects its own TERSE_PRIMER into that server's MCP `instructions`, and the
-client re-reads all of them every turn as cache_read, so cost scales with
+client re-read all of them every turn as cache_read, as it did then, so cost scaled with
 (servers x turns). #170 cut the primer 402 -> 212 tokens and moved 3 servers from +2.1%
 to +1.4% — real, but not enough to change the sign.
 

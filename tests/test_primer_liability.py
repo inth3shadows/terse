@@ -338,7 +338,8 @@ def test_the_liability_is_absent_rather_than_zero_when_nothing_is_wrapped():
 
 def test_break_even_divides_this_servers_savings_by_its_own_primer(tmp_path):
     """The headline number: 600 tok banked over 10 blocks is 60/call, so a primer of P
-    tokens is repaid by P/60 calls in every turn it is charged."""
+    tokens is repaid by P/60 calls. This fixture is a `wrapped` (standalone) entry, so the
+    cadence is once/session — the break-even is reached once, not re-earned per turn."""
     pol = _policy(tmp_path)
     liab = primer_liability([_scan("kb", "wrapped", "kb", pol)],
                             _agg(("kb", 10, 1_000, 400)))

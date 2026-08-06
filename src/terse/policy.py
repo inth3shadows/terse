@@ -34,8 +34,8 @@ VALID_TIERS = ("minify", "tabularize", "dictionary", "embedded")
 
 # What `defaults.tiers` means when a policy file omits it. Deliberately NOT `VALID_TIERS`:
 # `embedded` is opt-in, so widening the valid set must not silently switch a new tier on for
-# every policy file already on disk. Each costs a primer paragraph the client re-reads every
-# turn (#168), and #170 is the precedent for what that costs when the tier rarely fires —
+# every policy file already on disk. Each costs a primer paragraph on that server's primer
+# (#168), and #170 is the precedent for what that costs when the tier rarely fires —
 # so a tier joins this tuple on measured evidence (`policy generate`), never by default.
 DEFAULT_TIERS = ("minify", "tabularize", "dictionary")
 LOSSY_MODES = ("truncate", "drop-to-retrieve")  # implemented; summarize is still deferred
@@ -168,12 +168,19 @@ class Policy:
     # holds. What it did not measure is net token value, because the primer was not yet
     # known to be the dominant cost term.
     #
-    # It is: the primer paragraph explaining the diff envelopes is 190 of 555 cl100k
-    # tokens (47%, the largest section) and is re-read every turn per wrapped server. The
-    # live all-time ledger over 13.3 days: 7 diff emissions in 1,828 blocks (0.38%),
-    # saving 5,052 tokens, against 24,252 assistant turns in the same window — 912x the
-    # saving at one wrapped server, 2,736x at three. Even discounting for cache reads
-    # (~0.1x) and for turns without terse attached, no correction closes that gap.
+    # It is: the primer paragraph explaining the diff envelopes adds 190 cl100k tokens to
+    # that server's primer (the largest single section), attached once per session to
+    # each wrapped server that emits a terse form. The live all-time ledger over 13.3 days:
+    # 7 diff emissions in 1,828 blocks (0.38%), saving 5,052 tokens. At 190 tokens per
+    # attach that saving is gone after ~27 session-server pairs — about two a day across
+    # the whole fleet over that window, which an active install passes immediately.
+    #
+    # This was originally computed against the pre-#211 per-turn charge (190 x 24,252
+    # turns / 5,052 = 912x at one wrapped server, 2,736x at three). #211 made the primer
+    # lazy and once-per-session, which shrank the cost side by the session turn count and
+    # did not come close to changing the verdict. The restatement above is deliberately in
+    # attaches rather than a multiplier: turning it back into one needs a session count,
+    # which a stdio proxy cannot observe (see `stats.py` on the #144/#186/#188 family).
     #
     # The dominant refusal is `multiblock` (444 vs 7 emissions): most real results arrive
     # as several content blocks. If #140's partial multi-block join converts those into

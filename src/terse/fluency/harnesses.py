@@ -52,11 +52,12 @@ def run_payload(obj: Any, raw_text: str, answerer: Answerer,
     booleans. At trials=1 a count is 0 or 1 — truthy/falsy exactly like the old bool —
     so every existing aggregation keeps working unchanged.
 
-    `inline_ok` is the fourth arm and exists to decide #168's lazy primer. Today the primer
-    ships in `initialize.instructions` and the client re-reads it EVERY turn as cache_read,
-    which is why terse measures a 14.0% win at one wrapped server and a loss at three. The
-    proposed fix attaches it to the FIRST COMPRESSED RESULT instead — paid once per session,
-    not once per turn.
+    `inline_ok` is the fourth arm and exists to decide #168's lazy primer. As measured, the
+    primer shipped in `initialize.instructions` and the client re-read it EVERY turn as
+    cache_read, which is why terse measured a 14.0% win at one wrapped server and a loss at
+    three. The fix — shipped in #211 for standalone entries, and still not applied to a
+    router — attaches it to the FIRST COMPRESSED RESULT instead: paid once per session, not
+    once per turn.
 
     `proxy.py` records a measurement that a *system-level* primer beat an inline per-result
     note, but that compared the primer against a short note, not against the same primer

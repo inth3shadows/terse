@@ -23,13 +23,40 @@ terse's cost and its payoff are charged on different clocks:
 
 Break-even at one wrapped server is therefore a ONE-TIME question, not a per-turn
 one: does this server's typical call save more tokens than the primer it will
-attach to costs? The full-gate primer ceiling — every section on, matching the
-router table below — is **555 cl100k tokens** (a server whose policy can't emit
-every wire form pays less). A single call that saves more than 555 tokens repays
-the entire session's primer cost by itself; every call after that — and every call
-in a session where the server is never invoked at all — costs nothing further
-toward the primer. There is no recurring ratio to maintain, because #211 removed
-the recurring charge.
+attach to costs? A policy with no rules at all pays **248 cl100k tokens** — head
+41 + table 155 + dict 44 + tail 8 — because `diff` is off by default (#170) and
+`embedded` / `dropped` are gated per server. Add the 64-token dropped-field
+paragraph and it is **312**.
+
+Which of the two a given server pays is decided by `Policy.has_drop`, and the
+answer is not "does this server have a drop rule of its own". That gate is
+deliberately conservative (#168/#199): under a policy that contains **any**
+drop-to-retrieve rule — `policy.example.json` and the live fleet policy both do —
+a server pays 312 unless an earlier rule covers it or it is structurally
+never-lossy — 312 is the fallthrough, and 248 is what requires an earlier covering
+rule or never-lossy status. That is the opposite of what "carries a drop rule" would
+suggest: `kb` has no drop rule of its own and pays 312, while `gh` pays 248 because
+`gh.*` terminates the walk first. `terse stats` prints the real figure for each wrapped
+server; do not infer it from the rules by eye.
+
+The 555 in the router table below is the all-gates-on ceiling: reachable for a
+router whose peers collectively enable every gate, not for a standalone entry
+under a default policy.
+
+A single call that saves more than that server's own primer repays the entire
+session's primer cost by itself; every call after that — and every call in a
+session where the server is never invoked at all — costs nothing further toward
+the primer. There is no recurring ratio to maintain, because #211 removed the
+recurring charge.
+
+**The question is per server, not per install.** Each wrapped server attaches its
+own primer, once per session, so a six-server fleet pays six of them. What #211
+removed was the *turns* factor, not the *servers* factor — standalone cost went
+from `servers x turns` to `servers x 1`. Only the router is O(1) in peer count — but
+it pays that O(1) primer EVERY TURN rather than once per session, so at any real turn
+count a router is the more expensive shape, not the cheaper one. Consolidate for the
+operational reasons (one policy, one process, one permission surface), not to save
+tokens; `USAGE.md` and `install-mcp --multiproxy` say the same.
 
 For a router/multiproxy setup wrapping several servers behind one shared primer, the
 break-even arithmetic is different in *kind*, not degree. The router's
@@ -50,8 +77,12 @@ per-peer primers — so it is O(1) in peer count, not O(N):
 555 cl100k tokens is the hard ceiling, sent once at `initialize` — and then
 re-read every turn as `cache_read`, so unlike a standalone entry's lazy primer
 it is a RECURRING charge, paid from the first turn whether or not any peer is
-ever called. That is why `terse stats` reports it under a separate cadence from
-the standalone one, and never sums the two. The ceiling holds regardless of
+ever called. The diff paragraph alone is 190 of 555 cl100k tokens, so a router at
+that ceiling spends 34% of a recurring charge explaining one wire form — which is
+the shape of the cost #170 weighed. A router that enables diffing and nothing else
+does not sit at the ceiling: it pays 438, of which the same paragraph is 43%. That is why
+`terse stats` reports it under a separate cadence from the standalone one, and never
+sums the two. The ceiling holds regardless of
 whether 1 or 20 peers sit behind the router — the opposite shape of the standalone
 case #211 fixed, where N wrapped servers meant N separate primers riding N
 `initialize` replies, scaling linearly with server count. A pre-#211 A/B run at 6
@@ -66,21 +97,26 @@ Measured from `scripts/bench/corpus/` (real GitHub REST payloads) via
 `uv run scripts/bench/benchmark.py`, current codec — identical to `BENCHMARKS.md`
 §1:
 
-| payload | raw tok | saved | saved% | calls to clear the one-time 555-tok primer |
+| payload | raw tok | saved | saved% | calls to clear the one-time 248-tok primer |
 |---|--:|--:|--:|--:|
-| gh_pulls | 151,165 | 114,979 | 76.1% | 0.005 |
-| gh_workflow_runs | 76,032 | 61,090 | 80.3% | 0.009 |
-| gh_issues | 48,032 | 18,629 | 38.8% | 0.030 |
-| gh_commits | 69,652 | 18,444 | 26.5% | 0.030 |
-| gh_dir_listing | 6,736 | 2,114 | 31.4% | 0.263 |
-| gh_commits_flat | 10,886 | 258 | 2.4% | 2.151 |
-| gh_labels | 632 | 96 | 15.2% | 5.781 |
-| gh_rate_limit | 357 | 48 | 13.4% | 11.563 |
+| gh_pulls | 151,165 | 114,979 | 76.1% | 0.002 |
+| gh_workflow_runs | 76,032 | 61,090 | 80.3% | 0.004 |
+| gh_issues | 48,032 | 18,629 | 38.8% | 0.013 |
+| gh_commits | 69,652 | 18,444 | 26.5% | 0.013 |
+| gh_dir_listing | 6,736 | 2,114 | 31.4% | 0.117 |
+| gh_commits_flat | 10,886 | 258 | 2.4% | 0.961 |
+| gh_labels | 632 | 96 | 15.2% | 2.583 |
+| gh_rate_limit | 357 | 48 | 13.4% | 5.167 |
 | gh_repo_single | 1,652 | 0 | 0.0% | never (lossless, nothing to compress) |
 | **weighted** | **365,144** | **215,658** | **59.1%** | |
 
+This table prices the primer at 248 — what a rules-free policy pays, and what `gh`
+pays under `policy.example.json` because `gh.*` sits ahead of that policy's drop
+rule and ends the walk. A server whose walk instead reaches the dropped-field
+paragraph pays 312, which raises every figure in the last column by 26%.
+
 Mean 23,962 tokens saved per call. A single `gh_pulls` call alone saves 114,979
-tokens — 207x the entire one-time 555-token primer — so it clears the whole
+tokens — 464x the entire one-time 248-token primer — so it clears the whole
 session's primer cost by itself; every call before or after that, on this server
 or in any session where it's never invoked, adds nothing further to the primer
 side of the ledger.
@@ -90,17 +126,27 @@ side of the ledger.
 From the live proxy ledger (2,101 blocks, spans 2026-07-15 to 2026-08-05, snapshot
 2026-08-05 — `terse stats`), same codec:
 
-| tool | calls | saved/call | calls to clear the one-time 555-tok primer |
-|---|--:|--:|--:|
-| secret.list_credentials | 10 | 2,080 | 0.267 |
-| kb.read.list_nodes | 11 | 1,690 | 0.328 |
-| codegraph_explore | 11 | 1,589 | 0.349 |
-| runecho structure (large) | 6 | 898 | 0.618 |
-| kb.read.get | 62 | 80 | 6.92 |
-| kb.read.list_principles | 823 | 56 | 9.90 |
-| kb.read.search | 216 | 38 | 14.46 |
-| runecho structure (small) | 209 | 6 | 87.1 |
-| secret.* proxy ops | 59 | 0 | never |
+| tool | calls | saved/call | its server's primer | calls to clear it |
+|---|--:|--:|--:|--:|
+| secret.list_credentials | 10 | 2,080 | 248 | 0.119 |
+| kb.read.list_nodes | 11 | 1,690 | 312 | 0.185 |
+| codegraph_explore | 11 | 1,589 | 312 | 0.196 |
+| runecho structure (large) | 6 | 898 | 248 | 0.276 |
+| kb.read.get | 62 | 80 | 312 | 3.90 |
+| kb.read.list_principles | 823 | 56 | 312 | 5.57 |
+| kb.read.search | 216 | 38 | 312 | 8.21 |
+| runecho structure (small) | 209 | 6 | 248 | 41.3 |
+| secret.* proxy ops | 59 | 0 | 248 | never |
+
+The primer column is per server, and rule ORDER decides it — not whether a server
+has a drop rule of its own. `codegraph` carries the example policy's only
+drop-to-retrieve rule. `kb` sits *after* it in the walk and so inherits the
+64-token dropped-field paragraph at 312, while dropping nothing itself; `runecho`
+sits *before* it and pays 248; `secret-broker` is structurally never-lossy (#199),
+which suppresses the dropped-field paragraph specifically — the remaining 248 comes
+from whatever grants its tiers, which is a carve-out rule in the live policy and
+`defaults` in the example policy, where it matches no rule at all. Both the live policy and
+`policy.example.json` produce exactly these values.
 
 Mean 73 tokens saved per call across the whole ledger (154,101 saved / 2,101
 blocks) — three orders of magnitude below the public corpus (23,962). The
@@ -119,14 +165,17 @@ big-payload tool.
 > A server that already projects its fields is not a terse candidate, no matter
 > how often it is called.
 
-Concretely: **wrap a server when its typical session-lifetime savings clear the
-one-time 555-token primer ceiling.** That can be a single big call (`gh_pulls`
-clears it 207x over on its own) or many small ones accumulating across a session
-(`kb.read.list_principles` needs about 10 calls). Once cleared, every further
-call — in that session or any other session where the server never gets invoked
-at all — costs nothing more toward the primer. Do not wrap a server whose
-realistic session savings can't clear 555; that bar is now paid once, not every
-turn.
+Concretely: **wrap a server when its typical session-lifetime savings clear its
+own one-time primer — 248 tokens, or 312 where the dropped-field paragraph is
+reachable for it.** That can be a single big call (`gh_pulls` clears it 464x over
+on its own) or many small ones accumulating across a session
+(`kb.read.list_principles` needs about 6). Once cleared, every further call — in
+that session or any other session where the server never gets invoked at all —
+costs nothing more toward the primer. Do not wrap a server whose realistic session
+savings can't clear ~250; that bar is paid once per session, not every turn, and
+each wrapped server carries its own. Read the exact figure off `terse stats`
+rather than inferring it from the policy rules — as the 248/312 split above shows,
+rule order decides it and the answer is easy to get wrong by eye.
 
 ## codegraph — a third category, not an average
 

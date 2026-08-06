@@ -1,8 +1,17 @@
 """Every primer token count published in prose must be a size the live primer actually has.
 
-The primer's size is quoted in eleven places across README, USAGE, POSITIONING and
+The primer's size is quoted in a dozen places across README, USAGE, POSITIONING and
 `policy.py` — as the full-gate ceiling (555), as the diff paragraph's share of it
-(190 of 555), and as the dropped-field paragraph (64). None of it was checked by anything.
+(190 of 555), as the dropped-field paragraph (64), and since #224 as the primer a real
+install pays (248, or 312 where the dropped-field paragraph is reachable — which is NOT
+the same as "this server has a drop rule", see `Policy.has_drop`). None of it was checked
+by anything.
+
+Two claims are pinned here, at different strengths, and the gap between them is #224:
+membership (any published size must be A live size) is what the sweep can check
+everywhere, but a published *decision threshold* gets the narrower claim that it must be
+a size a real install actually pays. 555 satisfies the first and fails the second, which
+is exactly how it survived as the published wrap/don't-wrap bar.
 
 It has already moved once: #202 took `PRIMER_TABLE` from 55 to 155 cl100k tokens and the
 whole primer from 402 to 555, and every one of those prose sites had to be found and
@@ -36,6 +45,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from terse.policy import default_policy, load_policy
 from terse.proxy import (
     PRIMER_DICT,
     PRIMER_DIFF,
@@ -45,6 +55,7 @@ from terse.proxy import (
     PRIMER_TABLE,
     PRIMER_TAIL,
     _assemble_primer,
+    build_primer,
 )
 from terse.tokenize import count_cl100k
 
@@ -60,6 +71,31 @@ SECTIONS = {"head": PRIMER_HEAD, "table": PRIMER_TABLE, "dict": PRIMER_DICT,
 # joiner or separator between sections would make the sum a different number from the truth.
 FULL = count_cl100k(_assemble_primer(table=True, dictionary=True, diff=True, dropped=True,
                                      embedded=True))
+
+# Sizes a real install actually PAYS, as against sizes the primer can be made to have.
+# The distinction is #224: 555 is a live size, so the membership sweep below passed on it
+# for months while it was published as the wrap/don't-wrap bar — and no standalone entry
+# under a default policy ever pays 555, because `diff` is off (#170) and embedded/dropped
+# are per-rule. A number an operator ACTS on has to clear the higher bar.
+_EXAMPLE = load_policy(str(REPO / "policy.example.json"))
+INSTALLED = {count_cl100k(build_primer(default_policy()))} | {
+    count_cl100k(build_primer(_EXAMPLE, s))
+    for s in ("runecho", "kb", "codegraph", "secret-broker", "gh", None)
+} - {0}
+
+# Every size the assembly can actually produce — all 32 gate combinations. A ROUTER's
+# union_primer is a boolean OR over the five gates, so any of these is reachable in prose
+# about routers: POSITIONING publishes 438 (diff on, embedded/dropped off) for exactly that
+# case. 438 is a true live size that `INSTALLED` does not contain, and it slipped the sweep
+# only because the sentence says "it pays 438" with no `tokens` after it — one wording
+# normalisation away from failing on a correct number. Membership is the weak claim here
+# anyway; the specific pins (summands, ceiling, threshold, priced) carry the weight.
+REACHABLE = {
+    count_cl100k(_assemble_primer(table=bool(m & 1), dictionary=bool(m & 2),
+                                  embedded=bool(m & 4), diff=bool(m & 8),
+                                  dropped=bool(m & 16)))
+    for m in range(32)
+} - {0}
 
 COVERED = ("README.md", "USAGE.md", "docs/POSITIONING.md", "src/terse/policy.py")
 
@@ -159,7 +195,7 @@ def test_positioning_publishes_the_live_section_breakdown():
 
 
 def test_every_published_primer_size_is_a_size_the_primer_actually_has():
-    live = {count_cl100k(s) for s in SECTIONS.values()} | {FULL}
+    live = {count_cl100k(s) for s in SECTIONS.values()} | {FULL} | INSTALLED | REACHABLE
     for doc in COVERED:
         for line, published in _mentions(doc):
             assert published in live, (
@@ -169,6 +205,105 @@ def test_every_published_primer_size_is_a_size_the_primer_actually_has():
                 f"a non-primer figure that happens to be measured in cl100k tokens — "
                 f"BENCHMARKS.md already has one of those, which is why it is not COVERED. "
                 f"If a covered file gains one, narrow the pattern rather than the claim.")
+
+
+def test_the_published_wrap_threshold_is_a_primer_a_real_install_pays():
+    """#224. The membership sweep above is satisfied by any live size, and 555 is one — so
+    it passed for months while POSITIONING published 555 as the wrap/don't-wrap bar and a
+    default install paid 248. A threshold is the one primer figure a reader ACTS on, in the
+    direction that loses savings (unwrap a server that was in fact paying), so it gets the
+    narrower claim: it must be a primer some real install actually pays, not merely one the
+    assembly can be made to produce.
+
+    Pinned against the rule's own sentence rather than a bare number sweep, because the
+    defect was never a wrong arithmetic result — 555 was correct as a ceiling. It was a
+    correct number doing a job it did not fit."""
+    flat, _ = _flat("docs/POSITIONING.md")
+    m = re.search(r"one-time primer\D{0,4}(\d[\d,]*) tokens, or (\d[\d,]*) where the "
+                  r"dropped-field paragraph is reachable", flat)
+    assert m, ("POSITIONING's wrap rule no longer states its threshold in the pinned form. "
+               "If the wording changed, update this regex — do not delete the assertion; "
+               "an unpinned threshold is what #224 was.")
+    default_bar, drop_bar = _num(m.group(1)), _num(m.group(2))
+    assert default_bar == count_cl100k(build_primer(default_policy())), (
+        f"POSITIONING publishes {default_bar} as the default wrap threshold; a default "
+        f"policy's primer is {count_cl100k(build_primer(default_policy()))}")
+    # Structural, NOT `build_primer(_EXAMPLE, "kb")`. kb carries no drop rule of its own —
+    # it pays 312 only because `codegraph.*` precedes `kb.*` in the example policy and
+    # `has_drop`'s walk is deliberately conservative. Pinning the pair to kb would make a
+    # benign reordering of policy.example.json fail this test with a message blaming
+    # POSITIONING, and would re-publish the "server carries a drop rule" story that was
+    # wrong in the first place. The claim that actually holds is the arithmetic one.
+    # Against the real assembly, NOT `default_bar + count_cl100k(PRIMER_DROPPED)`. cl100k
+    # counting is not additive across concatenation in general — that sum happens to hold
+    # only because of where the current section boundaries fall. Asserting the sum would
+    # fail, blaming POSITIONING, the day a section's leading token merges with a preceding
+    # suffix. What ships is the assembly, so that is what the doc is checked against.
+    with_dropped = count_cl100k(_assemble_primer(table=True, dictionary=True, diff=False,
+                                                 dropped=True))
+    assert drop_bar == with_dropped, (
+        f"POSITIONING publishes {drop_bar} as the with-dropped-paragraph threshold; the "
+        f"default primer plus the dropped-field paragraph assembles to {with_dropped}")
+    assert {default_bar, drop_bar} <= INSTALLED, (
+        f"a published threshold must be a primer some real install pays; INSTALLED is "
+        f"{sorted(INSTALLED)}")
+    assert FULL not in (default_bar, drop_bar), (
+        "the wrap threshold is the all-gates ceiling again — that is #224 verbatim")
+
+
+def test_positioning_publishes_the_default_primer_as_its_own_summands():
+    """Membership cannot separate 248 from 312 — both are live installed sizes, so either
+    can be swapped for the other anywhere in a covered file and every other check here
+    still passes. POSITIONING happens to publish the addition itself ("head 41 + table 155
+    + dict 44 + tail 8"), which makes the total checkable against its own stated parts
+    rather than against a set. That closes the one substitution the sweep is blind to."""
+    flat, _ = _flat("docs/POSITIONING.md")
+    m = re.search(r"pays \*\*(\d[\d,]*) cl100k tokens\*\* — head (\d+) \+ table (\d+) "
+                  r"\+ dict (\d+) \+ tail (\d+)", flat)
+    assert m, "POSITIONING no longer publishes the default primer as a sum of its sections"
+    total, parts = _num(m.group(1)), [int(g) for g in m.groups()[1:]]
+    assert sum(parts) == total, (
+        f"POSITIONING publishes {total} as the default primer but its own summands "
+        f"{parts} add to {sum(parts)}")
+    for name, published in zip(("head", "table", "dict", "tail"), parts, strict=True):
+        assert published == count_cl100k(SECTIONS[name]), (
+            f"POSITIONING publishes {published} for the `{name}` section; it is "
+            f"{count_cl100k(SECTIONS[name])}")
+    assert total == count_cl100k(build_primer(default_policy()))
+    # Every "one-time N-token primer" phrase prices that same standalone primer — the table
+    # header and the 464x sentence both do. Without this, swapping either one to 312 left
+    # them disagreeing with each other AND with the sum above, and every check still passed,
+    # because 248 and 312 are both live installed sizes.
+    priced = [_num(x.group(1))
+              for x in re.finditer(r"one-time (\d[\d,]*)-tok(?:en)? primer", flat)]
+    assert priced, "POSITIONING no longer prices the one-time primer anywhere"
+    assert all(p == total for p in priced), (
+        f"POSITIONING prices the one-time primer at {sorted(set(priced))} in different "
+        f"places; its own summands make it {total}")
+    # The rule restates the bar in round numbers ("can't clear ~250") two lines from the
+    # pinned sentence. Left unchecked, editing that alone back to ~550 re-publishes
+    # 555-as-threshold — #224's exact failure mode — with every other assertion green.
+    rounds = list(re.finditer(r"clear ~(\d[\d,]*)", flat))
+    assert rounds, ("POSITIONING no longer restates the bar as `clear ~N`. Without a "
+                    "non-vacuity check this loop passes on zero matches, leaving the "
+                    "rounded restatement — the easiest place to re-publish 555 — unpinned.")
+    for rounded in rounds:
+        assert _num(rounded.group(1)) == round(total, -1), (
+            f"POSITIONING rounds the wrap bar to ~{rounded.group(1)}; the primer it must "
+            f"round is {total} (~{round(total, -1)})")
+
+
+def test_positionings_router_ceiling_is_the_full_gate_total():
+    """The membership sweep cannot catch a ceiling swapped for another live size: with 248
+    and 312 now legitimately published, rewriting "555 cl100k tokens is the hard ceiling"
+    to say 312 passes membership while inverting the router's whole argument. The ceiling
+    is a specific claim about a specific number, so it gets a specific assertion."""
+    flat, _ = _flat("docs/POSITIONING.md")
+    m = re.search(r"(\d[\d,]*) cl100k tokens is the hard ceiling", flat)
+    assert m, "POSITIONING's router section lost its stated hard ceiling"
+    assert _num(m.group(1)) == FULL, (
+        f"POSITIONING calls {_num(m.group(1)):,} the router's hard ceiling; the full-gate "
+        f"primer is {FULL}")
 
 
 def test_a_section_quoted_against_the_total_is_the_smaller_of_the_two():
@@ -196,4 +331,11 @@ def test_the_sweep_actually_finds_the_prose_it_claims_to_cover():
     per_file = {doc: len(_mentions(doc)) for doc in COVERED}
     assert all(per_file.values()), f"no primer size found in: {[d for d, n in per_file.items() if not n]}"
     assert sum(per_file.values()) >= 10, per_file
-    assert sum(1 for doc in COVERED for _ in _PAIR.finditer(_flat(doc)[0])) >= 3
+    # Was >= 3, which #224's follow-up had to lower deliberately rather than route around.
+    # The three `190 of 555` sites this counted were README, USAGE and `policy.py`, and all
+    # three were describing a STANDALONE server's primer as 555 — the same defect #224 was
+    # filed for. Fixing them emptied the pool, so a floor of 3 would have been a tripwire
+    # that fires when you fix the bug. The one remaining pair is POSITIONING's ROUTER
+    # section, where quoting a section against 555 is correct, and one live pair is all
+    # `test_a_section_quoted_against_the_total...` needs to be non-vacuous.
+    assert sum(1 for doc in COVERED for _ in _PAIR.finditer(_flat(doc)[0])) >= 1

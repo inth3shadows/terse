@@ -315,8 +315,9 @@ def test_diff_reason_splits_same_vs_different_args_when_delta_loses():
 
 def test_diff_off_by_default_and_policy_true_enables():
     # Policy.diff defaults OFF since #170: the tier is correct (its #72/#75 validation
-    # still holds) but its 190-token primer paragraph cost ~900-5,500x what the tier
-    # saved at a 0.38% production hit rate. A plain policy therefore does NOT diff …
+    # still holds) but its 190-token primer paragraph outweighed what the tier saved at a
+    # 0.38% production hit rate: 5,052 tokens banked over the measurement window, erased by
+    # ~27 primer attaches. A plain policy therefore does NOT diff …
     inter = Interceptor(DIFF)
     prev, curr = _records(40), _records(40, change=5)
     _emit(inter, 1, "gh.api.items", prev)
@@ -2330,8 +2331,10 @@ def test_minify_only_policy_emits_no_primer_at_all():
 
 
 def test_deny_everything_policy_emits_no_primer():
-    """secret-broker's default-deny shape: no tiers, no diff, no drop. Today it pays the
-    full 555-token primer to describe forms it is structurally forbidden from producing."""
+    """A default-deny shape — no tiers, no diff, no drop — emits no primer at all. Before
+    #168 it paid a full primer to describe forms it is structurally forbidden from
+    producing. This is a property of the POLICY: `secret-broker` under the shipped example
+    and live policies is NOT this shape and pays 248."""
     from terse.proxy import build_primer
     assert build_primer(_pol((), diff=False)) == ""
 

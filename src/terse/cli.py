@@ -1719,8 +1719,9 @@ def main(argv: list[str] | None = None) -> int:
                          "`terse measure`/`verify` (opt-in; never affects forwarding)")
     im.add_argument("--diff", action="store_true",
                     help="bake an explicit `--diff` into the wrapped entry. Diffing is OFF "
-                         "by default (#170 reverted #75's default-on: the primer costs "
-                         "every turn, the diff tier hit ~1 call in 250), so this is what "
+                         "by default (#170 reverted #75's default-on: the primer paragraph "
+                         "costs 190 tokens, the diff tier hit ~1 call in 250), so this is "
+                         "what "
                          "turns it on for a server whose policy file does not")
     im.add_argument("--no-diff", action="store_true",
                     help="bake `--no-diff` into the wrapped entry: this server gets "
@@ -1738,9 +1739,11 @@ def main(argv: list[str] | None = None) -> int:
                          "default — payload-free, read by `terse stats`)")
     im.add_argument("--multiproxy", action="store_true",
                     help="fold the named servers into ONE terse proxy fronting them all "
-                         "(writes a peers file next to the config). This is what banks "
-                         "#168's win: each standalone proxy injects its own primer, "
-                         "re-read every turn, so cost scales with servers x turns. "
+                         "(writes a peers file next to the config): one policy, one "
+                         "process, one permission surface. Consolidate for those reasons, "
+                         "NOT to escape a token tax — #211 made the standalone primer "
+                         "lazy and once-per-session, while the router's shared primer "
+                         "rides `initialize` and IS re-read every turn. "
                          "REWRITES PERMISSION ENTRIES — see --print.")
     im.add_argument("--router-name", default="terse", metavar="NAME",
                     help="name of the single merged server entry (default: terse)")
