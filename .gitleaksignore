@@ -1,2 +1,18 @@
 # False positives only — verify before adding (fake test fixture data, not a real secret).
+#
+# TWO fingerprint formats, because gitleaks emits different ones per scan mode and this
+# file needs to cover both:
+#   file:rule:line               `gitleaks git --staged` (the pre-commit gate)
+#   commit:file:rule:line        `gitleaks git` over full history
+# An entry in one format is silently inert in the other mode. The history entries below
+# were missing, so a full-history scan reported 3 unsuppressed findings on every run —
+# which trains a reader to ignore the tool's output, the one thing a secret scanner
+# cannot afford.
 tests/test_cli.py:generic-api-key:193
+
+# Fixtures for the argv/header REDACTOR's own tests — each asserts that a fake credential
+# is scrubbed to `***`, so the "secret" is the input to the scrubber under test.
+# Verified 2026-08-06 by reading each line at its commit before adding.
+211531880a77999297a570863af6f695ab4a1d31:tests/test_cli.py:generic-api-key:150
+211531880a77999297a570863af6f695ab4a1d31:tests/test_cli.py:generic-api-key:153
+04b862e44edd3ffba4a252c8c5ae0e886220ebba:tests/test_cli.py:generic-api-key:264
