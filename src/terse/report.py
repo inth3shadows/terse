@@ -608,7 +608,15 @@ def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
     # --- Per-tool savings (the proxy decision is per-tool, not per-shape) ---
     # Shape buckets can hide a deep-nested win next to a true no-op (e.g. runecho's
     # nested symbol lists vs a single compact object both land in 'compact-json').
-    tools = sorted({r.get("tool", "?") for r in rows})
+    # `or "?"` on BOTH lines, and the same expression on each. They used to differ
+    # — `.get("tool", "?")` here, a bare `.get("tool")` in the filter below — which
+    # agreed on every input except a row whose `tool` key is ABSENT: the set
+    # substituted "?" and the filter compared None to it, so that row matched
+    # nothing and its tokens left this table while still counting in every other
+    # total on the page. A row with an explicit `"tool": None` was worse: the key
+    # exists, so `None` entered the set and `sorted()` raised TypeError on the
+    # whole report. `or` normalises absent, None and "" alike, once, in one place.
+    tools = sorted({r.get("tool") or "?" for r in rows})
     out += [
         "## Tier-0 savings by tool (cl100k)",
         "",
@@ -619,7 +627,7 @@ def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
     ]
     tool_rows = []
     for tool in tools:
-        sub = [r for r in rows if r.get("tool") == tool]
+        sub = [r for r in rows if (r.get("tool") or "?") == tool]
         raw = _sum(sub, "cl100k", "raw")
         cmp_ = _sum(sub, "cl100k", "compressed")
         shape = sub[0]["shape"] if sub else "?"

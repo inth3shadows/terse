@@ -9,6 +9,31 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+### Fixed
+- **A corpus row with no `tool` key silently left the per-tool tables — and one with
+  `"tool": None` crashed the report outright.** Found by a logic sweep, not by a diff.
+
+  All three report surfaces (`report.py` markdown, `html_report.py`, `terminal_report.py`)
+  built their tool list with `r.get("tool", "?")` and then filtered rows with
+  `r.get("tool") == tool`. The two expressions agree on every input except one: a row where
+  the key is **absent**. The set substitutes `"?"`; the filter compares `None` against it and
+  matches nothing. The row's tokens vanish from the per-tool table while still counting in
+  every other total on the page, and a phantom `?` row prints at 0/0/n-a. Executed: two rows
+  of 1,000 and 5,000 raw tokens render a per-tool table summing to **1,000 of 6,000** — a 5x
+  under-report with no error anywhere.
+
+  A row carrying an explicit `"tool": None` fails differently and worse. The key exists, so
+  `None` enters the set and `sorted()` raises `TypeError: '<' not supported between 'str'
+  and 'NoneType'`: the whole report dies rather than mis-reporting. That second failure is
+  why the fix normalises with `or "?"` on both lines rather than giving the filter a
+  matching default — `or` covers absent, `None` and `""` in one expression.
+
+  Not reachable from the CLI today: `measure_corpus` sets `tool` unconditionally and
+  `_cmd_measure`/`_cmd_verify` are the only production callers, so no published number was
+  ever wrong. These are public functions taking rows as an argument, though, and the `"?"`
+  default is itself evidence that someone expected the key to be missable — the code
+  intended to handle the case and handled it by dropping data.
+
 ### Added
 - **`terse stats --json` is now pinned field by field.** USAGE calls it "the raw aggregate,
   for scripts", which makes it a contract with people outside this repo — and it carried
