@@ -10,6 +10,39 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 ## [Unreleased]
 
 ### Fixed
+- **Four review findings against the primer-cadence split (#222).**
+
+  - **A pre-cadence `--json` blob got the wrong legend.** The prose gated its per-cadence
+    lines on `cadence or "per-turn"` and the break-even table's legend on a bare `cadence`,
+    so on the exact backward-compat path both were written for — a liability blob from a
+    terse that records no cadence — the table suppressed the `/turn` legend and printed the
+    standalone one instead, directly under prose declaring the whole figure recurring. Two
+    spellings of one default is how they drifted; there is now one helper.
+  - **The `blocks` column could overflow its width.** It was narrowed to 11 on the
+    reasoning that it only ever holds `N` or `tokenized/N` — but the pair form carried
+    thousands separators and the live ledger already rendered `1,790/1,799`, exactly 11.
+    One more order of magnitude would have broken the 80-column guarantee the table's own
+    comment makes. The pair form drops its separators (it is a ratio to compare, not a
+    magnitude to read) and the column is sized against a million-block ledger, pinned by a
+    test that fails if any width changes without the others.
+  - **A server called but never compressed was billed a primer it could not have paid.**
+    The lazy primer attaches to a result carrying a terse wire form, so a standalone entry
+    called a thousand times that never produced one — an all-passthrough policy, non-JSON
+    payloads, a shape the codec never wins on — paid nothing. `blocks` counts every emitted
+    block regardless of decision and cannot see that, which is the same mis-bucketing the
+    split exists to fix, in the other direction. `aggregate` now also counts `encoded`
+    blocks (`compressed`/`diff` only), and the inference is one-directional by design:
+    `encoded == 0` proves the primer could not have attached, while `encoded > 0` does not
+    prove it did (a minify-only `compressed` block carries no marker), so a non-zero count
+    still bills — the over-billing direction this module argues is the safe one. A row that
+    cannot report the counter falls back to `blocks`, the old coarser behaviour.
+  - **A mixed install could read two true lines as jointly true.** The recurring and
+    one-time lines each credit the same savings in full against their own charge. Not
+    netting them is right — the units differ — but silence about it meant an install paying
+    `per_turn x turns + once` could see "pays for ~1 turn" beside "covers the one-time
+    charge at most ~1x" and read itself as break-even. Said once, explicitly, when both
+    cadences are present.
+
 - **`terse stats`'s primer liability no longer charges a lazily-primed server as if it
   primed every turn.** This is the re-derivation #211 left as a follow-up, and until now the
   report gave standalone installs a headline that was wrong in the direction that costs the
