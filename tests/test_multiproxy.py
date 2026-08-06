@@ -1925,3 +1925,43 @@ def test_the_diagnosis_never_resolves_a_call(capsys):
         assert len(_peer_calls(t1)) == before      # nothing dispatched to the absent peer
     finally:
         router.close_senders()
+
+
+def test_a_peer_that_exports_nothing_does_not_taint_every_unknown_tool_error():
+    """Review finding. A prompts-only or resources-only peer is `empty` on EVERY listing, so
+    including it would append "re-read tools/list" to every unknown-tool error this install
+    ever produces — advice that can never change anything, and which contradicts the promise
+    that a complete listing says nothing extra. Only reasons a re-read might actually fix
+    reach the client; `empty` still appears in the diagnosis itself, it just isn't
+    actionable."""
+    _, _, _, out, router = _two_peer_router()
+    try:
+        _silent_after(router, {0: {"result": {"tools": [{"name": "only_a"}]}},
+                               1: {"result": {"tools": []}}})
+        assert router._tool_state[2] == (("b", "empty"),)     # still diagnosed...
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+             "params": {"name": "nope"}}))
+    finally:
+        router.close_senders()
+    msg = [m for m in _lines(out) if m.get("id") == 9][0]["error"]["message"]
+    assert "re-read tools/list" not in msg                    # ...but not surfaced
+    assert "empty" not in msg
+
+
+def test_an_empty_peer_does_not_mask_a_real_one_in_the_same_listing():
+    """The filter drops `empty` from the client-facing list, not the whole suffix — a
+    listing where one peer exports nothing and another errored must still tell the client
+    about the one a re-read could fix."""
+    _, _, _, out, router = _two_peer_router()
+    try:
+        _silent_after(router, {0: {"result": {"tools": []}},
+                               1: {"error": {"code": -32601}}})
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+             "params": {"name": "nope"}}))
+    finally:
+        router.close_senders()
+    msg = [m for m in _lines(out) if m.get("id") == 9][0]["error"]["message"]
+    assert "b (error)" in msg and "a (empty)" not in msg
+    assert "re-read tools/list" in msg

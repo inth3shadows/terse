@@ -40,6 +40,11 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   `empty`, not `malformed`: from the client's side it is indistinguishable from exporting
   nothing, and `malformed` would accuse a peer that answered perfectly well.
 
+  Only reasons a re-read might actually fix reach the client: a peer that legitimately
+  exports zero tools is `empty` on every listing, so surfacing it would append "re-read
+  tools/list" to every unknown-tool error the install ever produces. It stays in the
+  diagnosis; it just isn't actionable.
+
   `error` and `malformed` also now warn on stderr at merge time, which nothing did before —
   only the timeout path warned, so a peer that *answered* with a refusal disappeared from
   the listing in total silence. `prompts/list` deliberately carries no diagnosis (most MCP

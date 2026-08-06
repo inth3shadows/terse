@@ -618,11 +618,17 @@ class Router:
         # actionable one — re-read `tools/list` — without carrying a single route forward.
         # Appended only when non-empty: on a complete listing this says nothing, and a
         # permanent suffix would be noise on the common case.
+        # `empty` is excluded, matching the stderr filter at the merge. A peer that
+        # legitimately exports zero tools — a prompts-only or resources-only server, common
+        # in a fleet — is `empty` on EVERY listing, so including it would append "re-read
+        # tools/list" to every unknown-tool error this install ever produces, advice that
+        # can never change anything. Only the reasons a re-read might actually fix qualify.
         if mid is not None:
+            actionable = [(n, w) for n, w in silent if w != "empty"]
             detail = ""
-            if silent:
+            if actionable:
                 detail = ("; peer(s) "
-                          + ", ".join(f"{n} ({w})" for n, w in silent)
+                          + ", ".join(f"{n} ({w})" for n, w in actionable)
                           + " contributed no tools to the listing this table was built "
                             "from, so their tools are absent from it — re-read tools/list")
             self._write_client(json.dumps(
