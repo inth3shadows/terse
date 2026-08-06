@@ -8,7 +8,17 @@
 # were missing, so a full-history scan reported 3 unsuppressed findings on every run —
 # which trains a reader to ignore the tool's output, the one thing a secret scanner
 # cannot afford.
-tests/test_cli.py:generic-api-key:193
+# Staged-mode entries, re-derived from a live `gitleaks dir` run against the current tree.
+# The single entry that used to sit here pointed at line 193, which today is an ordinary
+# policy fixture with no secret in it (found in review). That was rotted in BOTH directions:
+# the pre-commit gate still false-positived on any edit to the real fixtures below, and a
+# genuine credential landing at line 193 would have been suppressed silently.
+#
+# These are line-numbered and WILL rot again when tests/test_cli.py shifts. Re-derive with:
+#   gitleaks dir . --report-format json --report-path /tmp/gl.json   (then read Fingerprint)
+tests/test_cli.py:generic-api-key:528
+tests/test_cli.py:generic-api-key:531
+tests/test_cli.py:generic-api-key:542
 
 # Fixtures for the argv/header REDACTOR's own tests — each asserts that a fake credential
 # is scrubbed to `***`, so the "secret" is the input to the scrubber under test.

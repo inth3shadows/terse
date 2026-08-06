@@ -28,6 +28,15 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   Note: `__main__.py` still reports 0% coverage, because the tests spawn a subprocess and
   `coverage` does not instrument it. The line is now tested; the number does not move.
 
+  Review caught the first cut of these tests being **vacuous under `$TERSE_MCP_CMD`**: that
+  documented override makes `terse_invocation()` return the operator's console script, so
+  with it set the tests passed even with `__main__.py`'s import broken — the subprocess
+  never touched `__main__.py`. An autouse fixture now clears it for every test in the file
+  rather than leaving each one to remember. The console-script comparison also used
+  `shutil.which("terse")`, which finds *a* terse rather than the one belonging to this
+  interpreter, and failed on a machine with a global install; it now resolves the script
+  beside `sys.executable`.
+
 - **`.gitleaksignore` fingerprints had rotted, so the local secret gate reported three
   false positives on every full-history scan.** gitleaks emits a different fingerprint per
   scan mode — `file:rule:line` for `--staged` (the pre-commit gate), `commit:file:rule:line`
@@ -37,6 +46,13 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
   **redactor's own tests**, asserting a fake credential scrubs to `***`, so the "secret" is
   the input to the scrubber under test. A scanner that cries wolf on every run trains its
   reader to ignore it, which is the one thing a secret scanner cannot afford.
+
+  Review then caught the staged-mode entry being rotted too, in **both** directions: it
+  pointed at line 193, which today is an ordinary policy fixture with no secret, so the
+  pre-commit gate still false-positived on any edit to the real fixtures *and* carried a
+  standing blind spot where a genuine credential landing at that line would pass silently.
+  Both formats are now re-derived from live runs, with the re-derivation command recorded
+  in the file, since line-numbered fingerprints will rot again.
 
 ### Fixed
 - **A corpus row with no `tool` key silently left the per-tool tables — and one with

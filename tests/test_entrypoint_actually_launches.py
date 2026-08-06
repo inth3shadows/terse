@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
+
+import pytest
 
 from terse.install_mcp import terse_invocation
 
@@ -27,6 +30,19 @@ from terse.install_mcp import terse_invocation
 def _run(argv: list[str], *extra: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run([*argv, *extra], capture_output=True, text=True, timeout=120,
                           check=False)
+
+
+@pytest.fixture(autouse=True)
+def _default_launcher(monkeypatch):
+    """Clear `$TERSE_MCP_CMD` for EVERY test in this file.
+
+    Found in review, and it defeated the file's whole purpose: `terse_invocation()` honours
+    that documented override and returns the operator's console script instead of
+    `[sys.executable, "-m", "terse"]`. With the variable set, tests 1 and 2 passed even with
+    `__main__.py`'s import broken — the subprocess never touched `__main__.py` at all, so
+    the exact regression this file exists to catch was invisible. Only the last test cleared
+    it; autouse makes that the default rather than something each test must remember."""
+    monkeypatch.delenv("TERSE_MCP_CMD", raising=False)
 
 
 def test_the_launcher_install_mcp_writes_actually_starts_terse():
@@ -52,6 +68,10 @@ def test_the_module_entrypoint_reports_the_cli_exit_code():
     assert bad.returncode == 2, (
         f"expected the CLI's exit 2 to propagate through `-m terse`, got "
         f"{bad.returncode}\nstderr: {bad.stderr}")
+    # The MESSAGE too, not just the integer (found in review): argparse also exits 2 on an
+    # unknown flag, so renaming `--log` would leave this green while proving nothing about
+    # the documented no-ledger branch it is meant to exercise.
+    assert "no ledger" in bad.stderr, bad.stderr
 
 
 def test_the_console_script_entrypoint_agrees_with_the_module_one():
@@ -62,14 +82,16 @@ def test_the_console_script_entrypoint_agrees_with_the_module_one():
     Skipped rather than failed when the console script is absent: a bare `pytest` against a
     source checkout that was never installed has no `terse` on PATH, and that is a property
     of the environment, not a defect in the code."""
-    import shutil
-
-    import pytest
-
-    if shutil.which("terse") is None:
-        pytest.skip("no `terse` console script on PATH (source checkout, not installed)")
+    # `shutil.which` was wrong (found in review): it finds *a* terse, not the one belonging
+    # to this interpreter. On a machine with a global uv-tool terse installed, a plain
+    # `./.venv/bin/pytest` compared the venv module against that unrelated install and
+    # FAILED on two legitimately different versions — the same cry-wolf failure this branch
+    # fixes in the secret gate. Resolve the script that ships beside `sys.executable`.
+    script_path = Path(sys.executable).parent / "terse"
+    if not script_path.exists():
+        pytest.skip(f"no console script at {script_path} (source checkout, not installed)")
     module = _run(terse_invocation(), "--version")
-    script = _run(["terse"], "--version")
+    script = _run([str(script_path)], "--version")
     assert script.returncode == module.returncode == 0
     assert script.stdout.strip() == module.stdout.strip(), (
         "the console script and `-m terse` report different versions — one of them is "
