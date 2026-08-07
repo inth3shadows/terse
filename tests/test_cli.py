@@ -799,6 +799,28 @@ def test_autotune_resolves_policy_and_corpus_from_install_wiring(tmp_path, monke
     assert pol.read_bytes() == before
 
 
+def test_autotune_resolves_from_project_scope_wiring_with_no_user_scope_server(
+        tmp_path, monkeypatch, capsys):
+    # #167's exact gap: `install-mcp` (or a hand-edited `.mcp.json`) wrapped a server at
+    # PROJECT scope only, nothing at user scope. Before this fix, bare `policy autotune`
+    # read only `config_path()` and reported "no terse-wrapped servers found" even though
+    # one was sitting right there in `.mcp.json`.
+    pol, corpus = _autotune_setup(tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG", str(tmp_path / "no-such-user-config.json"))
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+    (proj_dir / ".mcp.json").write_text(json.dumps({"mcpServers": {"gh": {
+        "command": "/usr/bin/python",
+        "args": ["-m", "terse", "proxy", "--policy", str(pol),
+                 "--capture-dir", str(corpus), "--", "gh-mcp"]}}}), encoding="utf-8")
+    monkeypatch.chdir(proj_dir)
+    rc = main(["policy", "autotune"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"resolved from install-mcp wiring: --policy {pol}" in out
+    assert str(corpus) in out
+
+
 def test_autotune_refuses_when_wiring_has_no_terse_servers(tmp_path, monkeypatch, capsys):
     cfg = tmp_path / "claude.json"
     cfg.write_text(json.dumps({"mcpServers": {"plain": {"command": "node", "args": ["s.js"]}}}),
