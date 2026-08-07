@@ -346,21 +346,19 @@ def _print_corpus_identity_note(envelopes: list, out=None) -> None:
 
 def _installed_autotune_defaults() -> tuple[str | None, str | None, str | None, set[str]]:
     """`(policy, corpus, note, ambiguous)` for a bare `terse policy autotune`, resolved from
-    the user-scope `install-mcp` wiring in the Claude config (#136). `policy`/`corpus` are
-    set only when the wrapped servers agree on exactly ONE value; `note` explains any
-    ambiguity or absence; `ambiguous` names which of `{"policy","corpus"}` had MORE than one
-    distinct value wired (so the caller can refuse rather than fall back on a NEEDED one).
-    Never raises — a resolution failure just leaves the flags to the operator, so the
-    convenience can never break the explicit path."""
-    from .install_mcp import config_path, discover_wrapped_opts
-    try:
-        cfg = config_path()
-        config = _json.loads(cfg.read_text(encoding="utf-8")) if cfg.exists() else {}
-    except (OSError, ValueError):
-        return None, None, "could not read the Claude config to resolve defaults", set()
-    wrapped = discover_wrapped_opts(config)
+    the `install-mcp` wiring across all three scopes — user, project, local (#136, #167).
+    `policy`/`corpus` are set only when the wrapped servers agree on exactly ONE value;
+    `note` explains any ambiguity or absence; `ambiguous` names which of
+    `{"policy","corpus"}` had MORE than one distinct value wired (so the caller can refuse
+    rather than fall back on a NEEDED one). Never raises — `discover_wrapped_opts_all_scopes`
+    itself treats a corrupt/unreadable config in any one scope as no wrapped servers THERE
+    rather than propagating, so a resolution failure just leaves the flags to the operator
+    without a broken file in an unrelated scope masking a working one."""
+    from .install_mcp import discover_wrapped_opts_all_scopes
+    wrapped = discover_wrapped_opts_all_scopes()
     if not wrapped:
-        return None, None, "no terse-wrapped servers found in the Claude config", set()
+        return (None, None,
+                "no terse-wrapped servers found in the user, project, or local scope", set())
     policies = sorted({w["policy"] for w in wrapped if w.get("policy")})
     corpora = sorted({w["capture_dir"] for w in wrapped if w.get("capture_dir")})
     notes, ambiguous = [], set()

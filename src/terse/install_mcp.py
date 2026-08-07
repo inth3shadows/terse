@@ -766,6 +766,47 @@ def discover_wrapped_opts(config: dict) -> list[dict[str, str]]:
     return out
 
 
+def discover_wrapped_opts_all_scopes(*, cfg: Path | None = None, file: str | None = None,
+                                     repo_path: str | None = None) -> list[dict[str, str]]:
+    """`discover_wrapped_opts`, across all three scopes — same target resolution as
+    `scan_scopes` (user, project, local), so a bare `terse policy autotune` sees
+    project- and local-scope wrapped servers, not just user-scope ones (#167 left this
+    as a follow-up: the autotune wiring resolver only ever read `config_path()`, so an
+    install wrapped entirely at project or local scope reported "no terse-wrapped
+    servers found" and fell through to requiring explicit `--policy`/`--corpus`, even
+    though the entries were right there in `.mcp.json` / the local `projects` block).
+    Order-preserving (user, then project, then local); local scope is silently omitted
+    when it doesn't resolve (not a git repo, no --repo-path), matching `scan_scopes`.
+    Read-only, never raises: a corrupt/unreadable file in ONE scope is skipped (treated
+    as no wrapped servers there), not allowed to blind resolution of the other two — user
+    and local scope share the exact same physical file by default (`resolve_target`'s
+    `cfg or config_path()`), so letting a broken `.mcp.json` (project) abort the whole
+    call would cost a WORKING `~/.claude.json` (user/local) resolution too, and the
+    reverse. That physical file is also read and parsed only once, not once per scope
+    that happens to point at it."""
+    targets = [resolve_target("user", cfg=cfg), resolve_target("project", file=file)]
+    try:
+        targets.append(resolve_target("local", cfg=cfg, repo_path=repo_path))
+    except ValueError:
+        pass  # no local scope here (not a git repo, no --repo-path) — same as scan_scopes
+    out: list[dict[str, str]] = []
+    loaded: dict[Path, dict] = {}
+    for target in targets:
+        if target.cfg not in loaded:
+            try:
+                loaded[target.cfg] = _load_json(target.cfg)
+            except (OSError, ValueError):
+                loaded[target.cfg] = {}
+        # `_read_servers_root` returns the node THAT HOLDS `mcpServers` (itself, for
+        # user/project scope's server_path=(); the per-repo block, for local) — the same
+        # shape `discover_wrapped_opts` already unwraps via `config.get("mcpServers")`.
+        # Re-wrapping it as `{"mcpServers": node}` here would nest it one level too deep
+        # and silently discover nothing (caught by this function's own new tests).
+        node = _read_servers_root(loaded[target.cfg], target.server_path)
+        out += discover_wrapped_opts(node)
+    return out
+
+
 # ------------------------------------------------------------------ IO helpers
 def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}

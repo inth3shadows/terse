@@ -9,7 +9,22 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
-_Nothing yet — `main` is released as [0.22.2](https://github.com/inth3shadows/terse/releases)._
+### Fixed
+
+- **A bare `terse policy autotune` only ever resolved wiring from user-scope
+  `~/.claude.json`, so a project- or local-scope-only install reported "no terse-wrapped
+  servers found" and fell through to requiring explicit `--policy`/`--corpus`.** Flagged
+  as a follow-up in #167, which closed the loop for the common (user-scope) case only.
+  `discover_wrapped_opts_all_scopes` now scans the same three scopes `mcp-status` already
+  does — user, project, local — mirroring `scan_scopes`'s target resolution so the two
+  commands agree on where a wrapped server can live.
+
+  Review caught two follow-on defects in the first cut: a corrupt/unreadable config file
+  in ANY one scope aborted resolution for all three (a broken project-scope `.mcp.json`
+  could mask perfectly good user-scope wiring), and user/local scope's shared physical
+  `~/.claude.json` was read and parsed twice per invocation. Both fixed — a per-scope
+  failure is now absorbed as "no wrapped servers there" rather than propagated, and the
+  physical file is loaded once and reused across the scopes that point at it.
 
 ## [0.22.2] - 2026-08-06
 

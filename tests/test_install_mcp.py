@@ -947,6 +947,98 @@ def test_discover_wrapped_opts_empty_without_mcpservers():
     assert im.discover_wrapped_opts({"mcpServers": "not-a-dict"}) == []
 
 
+# --- #167 follow-up: bare autotune's wiring resolver only ever read user scope ---
+
+def test_discover_wrapped_opts_all_scopes_merges_user_project_local(tmp_path, monkeypatch):
+    # Same three-scope layout as test_scan_scopes_includes_project_and_local_when_present:
+    # user+local share ~/.claude.json, project is a separate .mcp.json beside cwd.
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+
+    cfg = home_dir / ".claude.json"
+    cfg.write_text(json.dumps({
+        "mcpServers": {"u": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", "--policy", "/user.json", "--", "u-mcp"]}},
+        "projects": {"/repo/root": {"mcpServers": {"l": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", "--policy", "/local.json", "--", "l-mcp"]}}}},
+    }))
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+
+    mcp_json = proj_dir / ".mcp.json"
+    mcp_json.write_text(json.dumps({"mcpServers": {"p": {"command": "/abs/python", "args": [
+        "-m", "terse", "proxy", "--policy", "/proj.json", "--", "p-mcp"]}}}))
+    monkeypatch.chdir(proj_dir)
+
+    opts = im.discover_wrapped_opts_all_scopes(repo_path="/repo/root")
+    assert {o["server"]: o["policy"] for o in opts} == {
+        "u": "/user.json", "p": "/proj.json", "l": "/local.json"}
+
+
+def test_discover_wrapped_opts_all_scopes_finds_project_only_install(tmp_path, monkeypatch):
+    # #167's exact gap: an install wrapped ENTIRELY at project scope, nothing at user
+    # scope. The pre-fix resolver read only config_path() and reported this as if no
+    # terse-wrapped server existed anywhere.
+    monkeypatch.setattr(im, "config_path", lambda: tmp_path / "empty-user.json")  # no file
+    mcp_json = tmp_path / ".mcp.json"
+    mcp_json.write_text(json.dumps({"mcpServers": {"p": {"command": "/abs/python", "args": [
+        "-m", "terse", "proxy", "--policy", "/proj.json", "--capture-dir", "/c",
+        "--", "p-mcp"]}}}))
+    monkeypatch.chdir(tmp_path)
+
+    assert im.discover_wrapped_opts_all_scopes() == [
+        {"server": "p", "policy": "/proj.json", "capture_dir": "/c"}]
+
+
+def test_discover_wrapped_opts_all_scopes_omits_local_when_not_a_git_repo(tmp_path, monkeypatch):
+    # No --repo-path and cwd isn't a git repo -> local scope is silently skipped, matching
+    # scan_scopes, not raised through to the bare-autotune caller.
+    monkeypatch.setattr(im, "config_path", lambda: tmp_path / "empty-user.json")
+    monkeypatch.chdir(tmp_path)
+    assert im.discover_wrapped_opts_all_scopes() == []
+
+
+def test_discover_wrapped_opts_all_scopes_corrupt_scope_does_not_blind_the_others(
+        tmp_path, monkeypatch):
+    # Review finding: a broken .mcp.json (project scope) must not hide perfectly good
+    # wiring sitting in ~/.claude.json (user scope) — a single scope's corruption is
+    # this function's problem to absorb, not the caller's.
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {"u": {"command": "/abs/python", "args": [
+        "-m", "terse", "proxy", "--policy", "/user.json", "--", "u-mcp"]}}}))
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+    (tmp_path / ".mcp.json").write_text("{not valid json,,,")
+    monkeypatch.chdir(tmp_path)
+
+    assert im.discover_wrapped_opts_all_scopes() == [
+        {"server": "u", "policy": "/user.json"}]
+
+
+def test_discover_wrapped_opts_all_scopes_reads_the_shared_file_once(tmp_path, monkeypatch):
+    # Review finding: user and local scope default to the SAME physical ~/.claude.json —
+    # each must contribute its own servers, but the file itself is one read, not two.
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({
+        "mcpServers": {"u": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", "--policy", "/user.json", "--", "u-mcp"]}},
+        "projects": {"/repo/root": {"mcpServers": {"l": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", "--policy", "/local.json", "--", "l-mcp"]}}}},
+    }))
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+    monkeypatch.chdir(tmp_path)  # no .mcp.json here -> project scope contributes nothing
+
+    calls = []
+    real_load_json = im._load_json
+    monkeypatch.setattr(im, "_load_json",
+                        lambda p: (calls.append(p), real_load_json(p))[1])
+
+    opts = im.discover_wrapped_opts_all_scopes(repo_path="/repo/root")
+    assert {o["server"]: o["policy"] for o in opts} == {
+        "u": "/user.json", "l": "/local.json"}
+    assert calls.count(cfg) == 1                            # shared file read exactly once
+
+
 def test_parse_proxy_opts_detects_uvx_and_uv_tool_run_launchers():
     # $TERSE_MCP_CMD='uvx terse' / 'uv tool run terse' bake `terse` as a bare arg token,
     # not `-m terse` — these must still be recognized or their policy silently drops out
