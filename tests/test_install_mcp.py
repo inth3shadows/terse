@@ -999,6 +999,46 @@ def test_discover_wrapped_opts_all_scopes_omits_local_when_not_a_git_repo(tmp_pa
     assert im.discover_wrapped_opts_all_scopes() == []
 
 
+def test_discover_wrapped_opts_all_scopes_corrupt_scope_does_not_blind_the_others(
+        tmp_path, monkeypatch):
+    # Review finding: a broken .mcp.json (project scope) must not hide perfectly good
+    # wiring sitting in ~/.claude.json (user scope) — a single scope's corruption is
+    # this function's problem to absorb, not the caller's.
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {"u": {"command": "/abs/python", "args": [
+        "-m", "terse", "proxy", "--policy", "/user.json", "--", "u-mcp"]}}}))
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+    (tmp_path / ".mcp.json").write_text("{not valid json,,,")
+    monkeypatch.chdir(tmp_path)
+
+    assert im.discover_wrapped_opts_all_scopes() == [
+        {"server": "u", "policy": "/user.json"}]
+
+
+def test_discover_wrapped_opts_all_scopes_reads_the_shared_file_once(tmp_path, monkeypatch):
+    # Review finding: user and local scope default to the SAME physical ~/.claude.json —
+    # each must contribute its own servers, but the file itself is one read, not two.
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({
+        "mcpServers": {"u": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", "--policy", "/user.json", "--", "u-mcp"]}},
+        "projects": {"/repo/root": {"mcpServers": {"l": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", "--policy", "/local.json", "--", "l-mcp"]}}}},
+    }))
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+    monkeypatch.chdir(tmp_path)  # no .mcp.json here -> project scope contributes nothing
+
+    calls = []
+    real_load_json = im._load_json
+    monkeypatch.setattr(im, "_load_json",
+                        lambda p: (calls.append(p), real_load_json(p))[1])
+
+    opts = im.discover_wrapped_opts_all_scopes(repo_path="/repo/root")
+    assert {o["server"]: o["policy"] for o in opts} == {
+        "u": "/user.json", "l": "/local.json"}
+    assert calls.count(cfg) == 1                            # shared file read exactly once
+
+
 def test_parse_proxy_opts_detects_uvx_and_uv_tool_run_launchers():
     # $TERSE_MCP_CMD='uvx terse' / 'uv tool run terse' bake `terse` as a bare arg token,
     # not `-m terse` — these must still be recognized or their policy silently drops out

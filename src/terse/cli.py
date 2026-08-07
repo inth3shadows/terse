@@ -350,13 +350,12 @@ def _installed_autotune_defaults() -> tuple[str | None, str | None, str | None, 
     `policy`/`corpus` are set only when the wrapped servers agree on exactly ONE value;
     `note` explains any ambiguity or absence; `ambiguous` names which of
     `{"policy","corpus"}` had MORE than one distinct value wired (so the caller can refuse
-    rather than fall back on a NEEDED one). Never raises — a resolution failure just leaves
-    the flags to the operator, so the convenience can never break the explicit path."""
+    rather than fall back on a NEEDED one). Never raises — `discover_wrapped_opts_all_scopes`
+    itself treats a corrupt/unreadable config in any one scope as no wrapped servers THERE
+    rather than propagating, so a resolution failure just leaves the flags to the operator
+    without a broken file in an unrelated scope masking a working one."""
     from .install_mcp import discover_wrapped_opts_all_scopes
-    try:
-        wrapped = discover_wrapped_opts_all_scopes()
-    except (OSError, ValueError):
-        return None, None, "could not read the Claude config to resolve defaults", set()
+    wrapped = discover_wrapped_opts_all_scopes()
     if not wrapped:
         return (None, None,
                 "no terse-wrapped servers found in the user, project, or local scope", set())
