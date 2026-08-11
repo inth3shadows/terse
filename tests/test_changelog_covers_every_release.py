@@ -24,6 +24,9 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 CHANGELOG = REPO / "CHANGELOG.md"
+# Repo-relative on purpose: it is pasted into a failure message for a human to run from the
+# repo root, so an absolute path from whatever checkout CI used would be noise.
+GRADUATE_SCRIPT = "scripts/release/graduate_changelog.py"
 _SECTION = re.compile(r"^## \[(\d+\.\d+\.\d+)\]", re.M)
 
 
@@ -122,11 +125,25 @@ def test_unreleased_does_not_describe_work_that_already_shipped():
         containing = _git("tag", "--contains", sha, "--sort=creatordate").split()
         if containing:
             shipped.setdefault(containing[0], lines[lineno - 1].strip()[:70])
+    # The fix is one command, so print the command rather than a description of it. Whoever
+    # trips this is usually not the person who cut the release — they opened the next PR and
+    # inherited a red test about work that is not theirs — so making them go find the script
+    # is the avoidable part of the friction. Graduation is deliberately manual (see
+    # `.github/workflows/release.yml`'s header: every automated path was tried or ruled out),
+    # which makes the message the only place this hint can live.
+    # Guarded, not bare `sorted(shipped)[0]`: on the PASSING path `shipped` is empty, and an
+    # unguarded index turns every green run into an IndexError. An assert's message is only
+    # evaluated when it fires, but this line is not the message.
+    oldest = sorted(shipped)[0] if shipped else None
     assert not shipped, (
         "[Unreleased] describes work that is already released:\n  "
         + "\n  ".join(f"{tag}: {snippet}" for tag, snippet in sorted(shipped.items()))
         + "\nMove these into their versioned sections — the header promises an entry "
-          "leaves [Unreleased] when its tag is pushed.")
+          "leaves [Unreleased] when its tag is pushed. Run:\n"
+          f"    python3 {GRADUATE_SCRIPT} {oldest} CHANGELOG.md"
+        + ("\nThen re-run: more than one release is pending, and the script graduates "
+           "the whole [Unreleased] body under ONE version per invocation."
+           if len(shipped) > 1 else ""))
 
 
 def test_sections_are_ordered_newest_first_and_unique(text):
@@ -157,3 +174,14 @@ def test_every_section_carries_the_release_date_git_records(text):
         if actual and actual != date:
             wrong.append(f"{ver}: section says {date}, tag says {actual}")
     assert not wrong, "release dates disagree with their tags:\n  " + "\n  ".join(wrong)
+
+
+def test_the_graduation_hint_points_at_a_script_that_exists():
+    # The failure message above tells a human to run GRADUATE_SCRIPT. If that script is ever
+    # moved or renamed, the hint keeps printing confidently and sends them to a path that is
+    # not there — worse than the bare message it replaced, and invisible until someone
+    # actually trips the (rare, release-gated) assertion. Pin it here instead, where it runs
+    # every time.
+    assert (REPO / GRADUATE_SCRIPT).is_file(), (
+        f"{GRADUATE_SCRIPT} does not exist, but the graduation failure message tells "
+        "people to run it")
