@@ -318,6 +318,31 @@ def test_load_example_policy_validates(tmp_path):
     assert p.select("ci.api.rate_limit").tiers == ()
 
 
+def test_example_policy_guards_secret_broker_crown_jewels():
+    # A fresh install that copies policy.example.json verbatim must not be exposed to
+    # either of the two things that would let a credential leak: (1) any tool other than
+    # list_credentials must be tiers:[]/capture:false, since #85's whole point is that a
+    # FUTURE secret-broker tool that returns a value inherits zero retention automatically,
+    # not by an operator remembering to add a rule; (2) the deny-all rule's safety depends
+    # on --server-name reaching Policy.select, so it must declare require_server_name (#243)
+    # rather than silently going unreachable if that flag is ever dropped.
+    import pathlib
+    example = pathlib.Path(__file__).resolve().parents[1] / "policy.example.json"
+    p = load_policy(example)
+
+    listed = p.select("secret.list_credentials", server="secret-broker")
+    assert listed.tiers == ("minify", "tabularize", "dictionary")
+    assert listed.capture is False
+
+    for tool in ("secret.reveal_credential", "secret.inject_env", "secret.call_gemini",
+                "secret.anything_not_yet_written"):
+        r = p.select(tool, server="secret-broker")
+        assert r.tiers == () and r.capture is False, tool
+
+    denyall = p.select("secret.reveal_credential", server="secret-broker")
+    assert denyall.require_server_name is True
+
+
 def test_invalid_tier_rejected(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps({"version": 1, "policies": [{"match": {"tool": "*"}, "tiers": ["bogus"]}]}))
