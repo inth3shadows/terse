@@ -24,7 +24,19 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 CHANGELOG = REPO / "CHANGELOG.md"
+# Repo-relative on purpose: it is pasted into a failure message for a human to run from the
+# repo root, so an absolute path from whatever checkout CI used would be noise.
+GRADUATE_SCRIPT = "scripts/release/graduate_changelog.py"
 _SECTION = re.compile(r"^## \[(\d+\.\d+\.\d+)\]", re.M)
+
+
+def _ver(tag: str) -> tuple[int, ...]:
+    """Sort key for a `vX.Y.Z` tag. NEVER order tags as strings: this repo is past v0.10,
+    so lexicographic puts `v0.24.1` ahead of `v0.3.1` and `v0.9.0`. Named once here because
+    getting it wrong is silent — the message still renders, it just names the wrong
+    release, and every section is already backfilled so the script exits 0 with "already
+    has a section" and the human is left following advice that does nothing."""
+    return tuple(int(x) for x in tag.lstrip("v").split("."))
 
 
 def _git(*args: str) -> str:
@@ -122,11 +134,33 @@ def test_unreleased_does_not_describe_work_that_already_shipped():
         containing = _git("tag", "--contains", sha, "--sort=creatordate").split()
         if containing:
             shipped.setdefault(containing[0], lines[lineno - 1].strip()[:70])
+    # The fix is one command, so print the command rather than a description of it. Whoever
+    # trips this is usually not the person who cut the release — they opened the next PR and
+    # inherited a red test about work that is not theirs — so making them go find the script
+    # is the avoidable part of the friction. Graduation is deliberately manual (see
+    # `.github/workflows/release.yml`'s header: every automated path was tried or ruled out),
+    # which makes the message the only place this hint can live.
+    # Guarded, not bare indexing: on the PASSING path `shipped` is empty, and an unguarded
+    # index turns every green run into an IndexError. An assert's message is only evaluated
+    # when it fires, but this line is not the message.
+    oldest = min(shipped, key=_ver) if shipped else None
+    # The single-release case is the only one the script can finish by itself, so it is the
+    # only one that gets a command. With two or more pending, `graduate_changelog.py` would
+    # move the ENTIRE [Unreleased] body — the newer release's entries, and any genuinely
+    # unreleased ones — under the oldest tag, then exit 0 on a second run with "holds no
+    # entries". This test would go green on the empty section and never flag the misfiling.
+    # So say what actually has to happen instead of implying a loop that silently corrupts.
+    if len(shipped) > 1:
+        fix = ("\nSplit [Unreleased] by release BY HAND first — the script graduates the "
+               f"whole body under ONE version per run, so pointing it at {oldest} would "
+               "file the newer releases' entries there too.")
+    else:
+        fix = f"\nRun:\n    python3 {GRADUATE_SCRIPT} {oldest} CHANGELOG.md"
     assert not shipped, (
         "[Unreleased] describes work that is already released:\n  "
-        + "\n  ".join(f"{tag}: {snippet}" for tag, snippet in sorted(shipped.items()))
+        + "\n  ".join(f"{tag}: {shipped[tag]}" for tag in sorted(shipped, key=_ver))
         + "\nMove these into their versioned sections — the header promises an entry "
-          "leaves [Unreleased] when its tag is pushed.")
+          "leaves [Unreleased] when its tag is pushed." + fix)
 
 
 def test_sections_are_ordered_newest_first_and_unique(text):
@@ -157,3 +191,29 @@ def test_every_section_carries_the_release_date_git_records(text):
         if actual and actual != date:
             wrong.append(f"{ver}: section says {date}, tag says {actual}")
     assert not wrong, "release dates disagree with their tags:\n  " + "\n  ".join(wrong)
+
+
+def test_the_graduation_hint_points_at_a_script_that_exists():
+    # The failure message above tells a human to run GRADUATE_SCRIPT. If that script is ever
+    # moved or renamed, the hint keeps printing confidently and sends them to a path that is
+    # not there — worse than the bare message it replaced, and invisible until someone
+    # actually trips the (rare, release-gated) assertion. Pin it here instead, where it runs
+    # every time.
+    assert (REPO / GRADUATE_SCRIPT).is_file(), (
+        f"{GRADUATE_SCRIPT} does not exist, but the graduation failure message tells "
+        "people to run it")
+
+
+def test_the_hint_names_the_OLDEST_pending_release_not_the_lexicographic_first():
+    # The bug this pins shipped once and CI stayed green, because the guard above checked
+    # that the script exists and nothing checked WHICH TAG it is handed. `sorted()` on tag
+    # strings puts v0.24.1 ahead of v0.3.1 once a repo passes v0.10 — and since every
+    # release here is already backfilled, the script would exit 0 with "already has a
+    # section", so the hint reads authoritative and does nothing.
+    assert min({"v0.24.1", "v0.3.1", "v0.9.0"}, key=_ver) == "v0.3.1"
+    assert sorted(["v0.24.1", "v0.3.1", "v0.9.0"], key=_ver) == \
+        ["v0.3.1", "v0.9.0", "v0.24.1"]
+    # and the real tag namespace must parse — a tag shape _ver cannot read would raise
+    # inside the failure path, replacing the message with a ValueError
+    for tag in _tags():
+        assert len(_ver(tag)) == 3, tag
