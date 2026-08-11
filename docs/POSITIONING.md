@@ -2,11 +2,18 @@
 
 terse has never stated this plainly, and a full measurement session showed why it
 needs to: the same codec measures **59.1%** on public GitHub API payloads
-(`BENCHMARKS.md` §1, re-measured 2026-08-04) and **6.8%** on this operator's own
-personal MCP fleet. Both numbers are
+(`BENCHMARKS.md` §1, re-measured 2026-08-04) and **15.1%** on this operator's own
+personal MCP fleet, all-time (`terse stats`, 2,357 blocks, snapshot 2026-08-11 —
+re-run the command for a current figure, this one will drift). Both numbers are
 correct — they are the same tool measured on two different shapes of input. Quoted
 without the shape attached, either one misrepresents what terse does. This doc is
 that attachment.
+
+The personal-fleet figure moves with call composition, not just time: a handful of
+large, multi-block calls routed through the multiproxy fleet dominate the token
+total and pull the blended number up from what a typical single small call sees.
+Re-run `terse stats` on your own ledger rather than trusting this snapshot once
+your fleet's mix has changed (new servers wrapped, a router added, etc.).
 
 ## The economic model, stated once
 
@@ -123,19 +130,18 @@ side of the ledger.
 
 ## Where it does not — pre-projected personal servers
 
-From the live proxy ledger (2,101 blocks, spans 2026-07-15 to 2026-08-05, snapshot
-2026-08-05 — `terse stats`), same codec:
+From the live proxy ledger (2,357 blocks, spans 2026-07-15 to 2026-08-11, snapshot
+2026-08-11 — `terse stats`), same codec:
 
 | tool | calls | saved/call | its server's primer | calls to clear it |
 |---|--:|--:|--:|--:|
+| kb.read.list_nodes | 27 | 3,351 | 312 | 0.093 |
+| codegraph_explore | 72 | 2,797 | 312 | 0.112 |
 | secret.list_credentials | 10 | 2,080 | 248 | 0.119 |
-| kb.read.list_nodes | 11 | 1,690 | 312 | 0.185 |
-| codegraph_explore | 11 | 1,589 | 312 | 0.196 |
-| runecho structure (large) | 6 | 898 | 248 | 0.276 |
-| kb.read.get | 62 | 80 | 312 | 3.90 |
-| kb.read.list_principles | 823 | 56 | 312 | 5.57 |
-| kb.read.search | 216 | 38 | 312 | 8.21 |
-| runecho structure (small) | 209 | 6 | 248 | 41.3 |
+| kb.read.list_principles | 875 | 358 | 312 | 0.872 |
+| kb.read.get | 100 | 67 | 312 | 4.63 |
+| kb.read.search | 251 | 47 | 312 | 6.71 |
+| runecho structure | 229 | 29 | 248 | 8.45 |
 | secret.* proxy ops | 59 | 0 | 248 | never |
 
 The primer column is per server, and rule ORDER decides it — not whether a server
@@ -148,14 +154,26 @@ from whatever grants its tiers, which is a carve-out rule in the live policy and
 `defaults` in the example policy, where it matches no rule at all. Both the live policy and
 `policy.example.json` produce exactly these values.
 
-Mean 73 tokens saved per call across the whole ledger (154,101 saved / 2,101
-blocks) — three orders of magnitude below the public corpus (23,962). The
-highest-*volume* tools here are also the *worst* compressors: 823 calls to
-`kb.read.list_principles` bank 56 tokens each, while `codegraph_explore` — called
-only 11 times — banks nearly 30x that per call. The live policy already says why
-for kb: "already field-projected + high-cardinality content." These servers
-pre-optimize their own output before terse ever sees it, so there is nothing
-structural left to remove.
+Mean 301 tokens saved per call across the whole ledger (710,314 saved / 2,357
+blocks) — roughly two orders of magnitude below the public corpus (23,962), not
+three; that gap narrowed as the fleet's call mix shifted toward bigger calls.
+
+The relationship between call volume and compression quality used to be uniformly
+inverse here — the more a tool was called, the worse it compressed. That has
+broken for `kb.read.list_principles` specifically: at 875 calls it is now the
+single most-called tool in the ledger, and it no longer compresses worst —
+currently 358 tokens/call, ahead of both `kb.read.get` (67/call, 100 calls) and
+`kb.read.search` (47/call, 251 calls), which remain the pattern's clearest
+holdouts. The live policy's stated reason for `kb` overall — "already
+field-projected + high-cardinality content" — is still true for `kb.read.get` and
+`kb.read.search`; it has not stopped being a real constraint for those two. What
+changed for `list_principles` is call shape: a growing share of its raw tokens now
+arrive as large, multi-block calls routed through multiproxy (`BENCHMARKS.md` §5
+has the breakdown), and the codec's tabularize tier folds that shape far better
+than the small single-record calls this section originally measured. **This is a
+composition effect, not evidence the codec learned to compress prose better** — a
+one-shot `terse compress` on an isolated captured payload for this tool still
+lands close to the original 3% (see `BENCHMARKS.md` §5).
 
 ## The rule
 
@@ -168,8 +186,11 @@ big-payload tool.
 Concretely: **wrap a server when its typical session-lifetime savings clear its
 own one-time primer — 248 tokens, or 312 where the dropped-field paragraph is
 reachable for it.** That can be a single big call (`gh_pulls` clears it 464x over
-on its own) or many small ones accumulating across a session
-(`kb.read.list_principles` needs about 6). Once cleared, every further call — in
+on its own) or accumulate across a session — on the current ledger,
+`kb.read.list_principles` clears its own primer in under one call on average
+(0.87), a genuine change from an earlier snapshot where it took about 6; see the
+composition caveat above before reading that as the tool having gotten "better."
+Once cleared, every further call — in
 that session or any other session where the server never gets invoked at all —
 costs nothing more toward the primer. Do not wrap a server whose realistic session
 savings can't clear ~250; that bar is paid once per session, not every turn, and

@@ -206,18 +206,23 @@ savings ledger (sizes + decisions only, never content). Unlike those, a stranger
 reproduce *these* numbers (they're one person's traffic); the point is the opposite — here is
 what an honest production figure looks like, and the one command that gives you *yours*.
 
-**Headline (measured 2026-07-22, `terse stats`, ledger spans 7 days):**
+**Headline (measured 2026-08-11, `terse stats`, all-time, ledger spans 2026-07-15 to
+2026-08-11):**
 
 ```
-1,526 results   470,609 -> 427,378 tok   9.2% blended
+2,357 blocks   4,701,499 -> 3,991,185 tok   15.1% blended
 ```
 
-That 9.2% is honest and *incomplete*, for two reasons — and both are the point of this section.
+That 15.1% is honest and *incomplete*, for three reasons now — the two below plus a
+third this section didn't have when it was first written.
 
-**1. This ledger straddles the #116 transition.** Most of its records predate cross-block
-joining (the `multiblock` diff-reason bucket is still 345 of them), so it mostly reflects the
-old per-block path. `terse stats` on post-#116 traffic reads higher for repeat-heavy loops
-(below). The number is *composition*, not a constant — which is why we publish a range.
+**1. This ledger spans multiple codec changes, not one fixed codec.** An all-time ledger from
+2026-07-15 to 2026-08-11 straddles #116 (cross-block join), #202 (union-schema tabularize),
+and structured-content compression going live for `claude-code` sessions — each shipped
+mid-window, so early and late records in the same ledger were produced by measurably
+different pipelines. `terse stats --since 7d` / `--since 14d` read higher than the all-time
+figure for exactly this reason. The number is *composition*, not a constant — which is why we
+publish a range.
 
 **2. Savings track payload shape.** Which tools you call sets the mix. Measured on the real
 captured records (production policy, deduplicated to one call's worth per tool):
@@ -227,13 +232,24 @@ captured records (production policy, deduplicated to one call's worth per tool):
 | wide, low-cardinality | `kb.read.changelog` | 21% → **38%** | ~99% |
 | | `kb.read.recent_rejections` | 17% → **33%** | ~99% |
 | | `kb.read.for_repo` | 15% → **24%** | ~98% |
-| prose-heavy records | `kb.read.list_principles` | 3% → 3% *(hard ceiling)* | **~99.9%** |
+| prose-heavy records | `kb.read.list_principles` | 3% → 3% | **~99.9%** |
 | | `kb.read.get` | 2% → 2% | ~99.9% |
 | already-projected small | `kb.read.query_stats` | 41% → 41% | — |
 | tiny status objects | *(policy `tiers:[]`)* | 0% → 0% *(correct — already minimal)* | — |
 
-The prose ceiling is structural, exactly as predicted: long unique text in
-`principle`/`rationale`/`evidence` has nothing to fold, and no tier combination changes that.
+That per-block-vs-joined comparison is real and reproducible — re-run 2026-08-11 against 141
+freshly captured `kb.read.list_principles` payloads (`terse measure --corpus`) and it lands at
+3.5%, matching this table almost exactly. **But the earlier claim that nothing could move this
+number was wrong, and the live ledger is the counter-evidence.** `kb.read.list_principles` reads **15.1%** blended
+in production today (875 blocks, 2,067,745 → 1,754,482 tokens, `terse stats`) — five times this
+table's figure. The gap is not a third tier reaching the prose; it is call-shape composition,
+same as reason 1 above, concentrated: 59 of those 875 blocks are large calls routed through
+`multiproxy`, each spanning many joined content blocks, and those 59 alone carry 88% of the
+tool's raw tokens. A handful of big, well-shaped calls can outweigh hundreds of small
+prose-ceiling ones in a token-weighted average — which means **"ceiling" was the wrong word for
+what this table measures.** It correctly bounds one shape (a single small record, isolated) and
+says nothing about a tool's real production number, which depends on how large and how joined
+its actual calls are. See `docs/POSITIONING.md` for the current production breakdown.
 
 **What #116 actually changed here.** The codec fold (per-block → joined) helps the wide
 low-cardinality tools and does ~nothing for prose. The real lever is the **diff tier**, which

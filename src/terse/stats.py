@@ -67,6 +67,19 @@ def server_label(cmd: list[str]) -> str:
     return Path(target).name or target
 
 
+def resolve_ledger_identity(server_name: str | None, cmd: list[str]) -> str:
+    """The identity a ledger record for this server is written under: `server_name` (the
+    MCP config's own name for it) when the caller knows it, else a guess from the command
+    basename (`server_label`) — which misreads a launcher-wrapped server (kb behind
+    secret-broker's `sb-run` labels itself "sb-run") — #83.
+
+    The ONE fallback rule terse uses for this identity. `proxy.py`'s live write path and
+    `install_mcp.py`'s `mcp-status` drift detector both call this rather than each
+    re-deriving `server_name or server_label(...)` — a review round caught the two copies
+    diverging in principle (not yet in practice) before this existed."""
+    return server_name or server_label(cmd)
+
+
 def _ledger_version() -> str:
     """The terse that wrote this record, resolved once per process.
 

@@ -1392,6 +1392,15 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
                 if r.get("launcher_missing"):
                     print(f"  {'':<20} launcher={r.get('launcher')} (MISSING) "
                           f"— this entry cannot start; re-run install-mcp")
+                # A hand-edited entry with no baked --server-name writes ledger records
+                # under a GUESSED identity that can silently split from another install
+                # of the same logical server (#152 bakes it automatically; a missing one
+                # here means this entry wasn't created that way).
+                if r.get("ledger_identity_explicit") is False:
+                    print(f"  {'':<20} no --server-name baked in — ledger records this "
+                          f"as {r['ledger_identity']!r}, which may not match another "
+                          f"install of the same server; re-run install-mcp or add "
+                          f"--server-name to fix it")
     return 0
 
 

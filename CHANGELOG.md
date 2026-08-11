@@ -15,6 +15,32 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **`docs/POSITIONING.md` and `BENCHMARKS.md` §5 published stale and falsified personal-fleet
+  numbers.** The personal-fleet savings figure was two conflicting numbers across the two docs
+  (6.8% vs 9.2%, both dated snapshots from early August); republished as one live figure
+  (15.1% blended, `terse stats`, 2026-08-11). Retracted `BENCHMARKS.md`'s "prose-heavy records
+  ... hard ceiling ... no tier combination changes that" and `POSITIONING.md`'s "nothing
+  structural left to remove" — both false as of the day they were re-measured:
+  `kb.read.list_principles` reads 15.1% blended in production, driven by large multi-block
+  calls routed through multiproxy dominating the token-weighted average (a composition effect,
+  not the codec learning to compress prose — a fresh Tier-0-only measurement on the same tool
+  still lands at 3.5%, close to the original figure). New
+  `tests/test_published_ledger_ceiling_claims.py` pins the retracted phrasing from ever coming
+  back.
+- **`mcp-status` couldn't see a real ledger-identity split.** A wrapped entry launched by hand
+  (not via `install-mcp`, which always bakes `--server-name` per #152) writes ledger records
+  under a GUESSED identity — the downstream command's basename — which silently diverges from
+  another install of the same logical server launched under a different command name. Found
+  live: `runecho` and `runecho-mcp` were two ledger identities for one server. `mcp-status` now
+  flags a wrapped entry with no explicit `--server-name`. The identity rule itself
+  (`server_name or server_label(cmd)`) is now `stats.resolve_ledger_identity`, called from both
+  `proxy.py`'s live write path and `mcp-status`'s detector — a review round caught the two
+  independently re-deriving the same fallback, which would have let them silently diverge.
+
+## [0.23.1] - 2026-08-11
+
+### Fixed
+
 - **PyPI publishing was silently broken since v0.23.0.** Hatchling now defaults to
   `Metadata-Version: 2.5`; the pinned `gh-action-pypi-publish@v1.14.0` bundles a twine
   that predates upstream support for it, so every publish failed with `InvalidDistribution:

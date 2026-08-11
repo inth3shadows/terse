@@ -1758,13 +1758,9 @@ def run_proxy(
 
     stats = None
     if stats_log is not None:
-        from .stats import build_stats_writer, server_label
+        from .stats import build_stats_writer, resolve_ledger_identity
 
-        # `server_name` (the MCP config's own name for this server) is the truthful
-        # identity when the caller knows it; `server_label(cmd)` is the fallback guess
-        # from the command basename, which misreads a launcher-wrapped server (kb behind
-        # secret-broker's `sb-run` labels itself "sb-run") — #83.
-        label = server_name or server_label(cmd)
+        label = resolve_ledger_identity(server_name, cmd)
         stats = build_stats_writer(stats_log, label)
 
     inter = Interceptor(pol, debug=debug, capture=capture, audit=audit, stats=stats,
