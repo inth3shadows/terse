@@ -13,6 +13,17 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Fixed
+
+- **PyPI publishing was silently broken since v0.23.0.** Hatchling now defaults to
+  `Metadata-Version: 2.5`; the pinned `gh-action-pypi-publish@v1.14.0` bundles a twine
+  that predates upstream support for it, so every publish failed with `InvalidDistribution:
+  Invalid distribution metadata: '2.5' is not a valid metadata version`. v0.23.0 tagged and
+  GitHub-released correctly but never reached PyPI. Bumped the pin to v1.14.2, whose release
+  notes name 2.5 upload support as the headline fix (twine bumped to v7 internally).
+
+## [0.23.0] - 2026-08-11
+
 ### Added
 
 - **`terse stats --recommend` — one wrap/don't-wrap verdict per installed entry.** #175 stated

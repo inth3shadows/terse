@@ -247,5 +247,12 @@ jobs:
           path: dist/
       # Trusted Publishing is automatic (no `with:` creds); PEP 740 attestations default on;
       # uploads everything in dist/ (packages-dir defaults to dist/).
+      #
+      # PINNED PAST v1.14.0 ON PURPOSE: hatchling now defaults to `Metadata-Version: 2.5`,
+      # and v1.14.0's bundled twine predates upstream's support for it, so every publish
+      # failed with `InvalidDistribution: Invalid distribution metadata: '2.5' is not a
+      # valid metadata version` (v0.23.0's release, 2026-08-11 — tagged and GitHub-released,
+      # never reached PyPI). v1.14.2 bumped its internal twine to v7, whose release notes
+      # name 2.5 upload support as the headline fix. Do not roll this back below v1.14.2.
       - name: Publish to PyPI (Trusted Publishing + attestations)
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
