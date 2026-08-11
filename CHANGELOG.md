@@ -9,6 +9,10 @@ Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.22.3] - 2026-08-06
+
 ### Fixed
 
 - **A bare `terse policy autotune` only ever resolved wiring from user-scope
