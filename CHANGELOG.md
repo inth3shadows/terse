@@ -30,6 +30,37 @@ fails that pull request until the section has moved.
   `YYYY-MM-DD` third argument, then the tag's own commit date, and falls back to today only
   with a stderr warning naming `git fetch --tags` as the fix.
 
+### Documentation
+
+_Prose and one new test only — no runtime behaviour changed, and no default moved. Every
+correction below brings a document into line with code that already shipped._
+
+- **Seven prose sites still announced that cross-call diffing is on by default.** #170
+  flipped `Policy.diff` to `False` (2026-07-28) and updated the code, `USAGE.md` and
+  `BENCHMARKS.md`, but left "Default-on since its validation program completed" standing in
+  `README.md` (×3), `TECHNICAL.md` (×2) and a `USAGE.md` code block that told the reader
+  "nothing to enable — a plain proxy diffs" nine lines under a paragraph correctly saying
+  **OFF by default**. Two of the README sites sat four lines apart, one saying OPT-IN and
+  the next saying default-on. All now say what `src/terse/policy.py` says.
+- **`tests/test_published_diff_default.py` pins it.** The contradiction went unnoticed for
+  two weeks because nothing checked, so the durable artifact is a test rather than a note:
+  it sweeps `README`/`TECHNICAL`/`USAGE`/`BENCHMARKS`/`POSITIONING` for default-ON
+  assertions about the diff tier and fails while a default policy's `diff` is `False`. It
+  found the `USAGE.md` code block that the hand pass had missed.
+- **`README.md` pinned headroom at v0.32.0 in both competitor sections**; `BENCHMARKS.md`
+  re-measured v0.34.0 on 2026-08-05. Both now say v0.34.0.
+- **The README headline claimed "byte-faithful by default" without qualification.** The
+  lossless gate's own words are "byte-faithful **by value**" (`transforms.roundtrip_ok`),
+  which is `==` plus a NaN contract rather than equality of the re-serialized bytes. The
+  headline now reads "lossless by value". `values_equal` is unchanged — its docstring
+  forbids tightening it, and doing so would risk #187's NaN fix.
+- **`TECHNICAL.md` gained *The guarantee ladder*** — mechanical reconstruction →
+  model comprehension → task success → net economics, each rung naming the shipped artifact
+  that proves it (`roundtrip_ok`, `fluency`, `fluency --diff-soak`, `terse stats`
+  break-even). All four already existed and were documented separately; the ladder is an
+  index, not a new claim, and it makes #170 legible as a tier that cleared rungs 1–3 and
+  was still turned off for failing rung 4.
+
 ## [0.22.3] - 2026-08-06
 
 ### Fixed

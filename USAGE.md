@@ -967,9 +967,9 @@ on for a workload that genuinely re-calls the same tool with the same arguments 
 `terse stats` shows your own hit rate under `diff reasons`:
 
 ```
-# nothing to enable — a plain proxy diffs. Opt OUT per proxy:
-uv run terse proxy --no-diff -- uvx some-mcp-server
-# or per policy file: {"diff": false, ...}
+# nothing happens without opting in — a plain proxy does NOT diff. Opt IN per proxy:
+uv run terse proxy --diff -- uvx some-mcp-server
+# or per policy file: {"diff": true, ...}
 
 # multi-block results (one record per content block) are joined into one record array
 # before compressing — folds records across blocks AND makes the result diff-eligible

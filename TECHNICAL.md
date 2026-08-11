@@ -53,8 +53,66 @@ raw tool output (JSON text)
   that transform in isolation. The differentiated surface is the combination: an
   MCP-transport-agnostic proxy (no client/server changes required), cross-call
   diffing, a `drop-to-retrieve` lossy escape hatch, and a behavioral fluency gate
-  (`terse fluency`) that every diff/lossy tier had to pass before it shipped on by
-  default — none of the comparable formats or proxies bundle all of that.
+  (`terse fluency`) that every diff/lossy tier had to pass before it shipped at all —
+  none of the comparable formats or proxies bundle all of that.
+
+### The guarantee ladder
+
+"Lossless" is four separate claims, not one, and each is proved by a different artifact.
+They are not interchangeable — a lower rung passing says nothing about the rung above it,
+which is why every tier here ships with its own gate instead of one blanket assertion.
+Each rung is already documented in full somewhere below; this is the index, so a reader
+does not have to assemble the ladder from four documents.
+
+```
+  rung                     the claim                          proof artifact
+  ────────────────────────────────────────────────────────────────────────────────────
+  4. net economics         wrapping this server banks more    `terse stats` break-even
+                           than its own primer costs
+        ▲ not implied by 3
+  3. task success          a model stays as accurate over a   `terse fluency --diff-soak`
+                           CHAIN of diffs as over full ones
+        ▲ not implied by 2
+  2. model comprehension   a model READS the compressed       `terse fluency`
+                           form as accurately as the original
+        ▲ not implied by 1
+  1. mechanical            `decompress(compress(x))` is `x`   `transforms.roundtrip_ok`
+     reconstruction        again, by value
+```
+
+Read it upward. Rung 1 is a property of the bytes and is settled in CI for everyone; rung
+4 is a property of *your* traffic and can only be settled by your own ledger. Nothing
+above rung 1 is implied by rung 1 — that gap is the entire reason the behavioral evals
+exist, and #170 is the case in point: the diff tier cleared rungs 1–3 and was still turned
+off by default because it failed rung 4 at the measured hit rate.
+
+- **1 — mechanical reconstruction: `transforms.roundtrip_ok`.** See *Lossless gate is
+  non-negotiable* above and `transforms.py` under File Descriptions. Total and cheap, so
+  it runs as a parametrized battery over the whole corpus. Note its exact claim — the
+  gate is byte-faithful **by value** (`values_equal`), which is `==` plus a NaN contract,
+  not string equality of the re-serialized text. Where a lossy mode replaces this gate it
+  substitutes a *stronger* one for the affected span (`acceptable_loss`,
+  `droppable_loss`, `text_droppable_loss` — see Known Limitations); no mode simply drops
+  a rung.
+- **2 — model comprehension: `terse fluency`.** See *Proxy: the model must understand
+  terse's format* under Known Limitations (the eval lives in `src/terse/fluency/`; its
+  renderers are `report.py` / `html_report.py` / `terminal_report.py` under File
+  Descriptions). A round-trip gate proves the bytes reconstruct; it cannot prove a model
+  reads the reconstruction as well as it read the original, which is a separate,
+  live-model question.
+- **3 — task success: `terse fluency --diff-soak`.** See *Cross-call diffing is built and
+  OPT-IN* under Known Limitations. Single-hop comprehension does not imply comprehension
+  at chain depth, so this measures accuracy as a function of how many diffs deep the
+  chain is, against the keyframe bound; its mechanical twin is `tests/test_diff_soak.py`,
+  which asserts exact reconstruction hundreds of hops deep. `fluency --drop-eval` is the
+  same rung for the lossy path — a real 2-turn tool loop scored on whether the model
+  actually reaches for `terse.retrieve`. Honest scope: these are the strongest shipped
+  artifacts on this rung, not a general agentic-task benchmark.
+- **4 — net economics: `terse stats` break-even.** See `stats.py` under File Descriptions
+  (`_break_even`, `primer_liability`) and the break-even rule in `docs/POSITIONING.md`. A
+  tier can be perfectly lossless, perfectly legible, and still lose tokens on your traffic
+  — the primer is paid whether or not the tier ever fires. This is the only rung terse
+  cannot settle for you.
 
 ## File Descriptions
 
@@ -460,8 +518,9 @@ by the next patch (PyPI versions cannot be re-uploaded).
   diff for record arrays, shallow key diff for objects) instead of the full payload. It
   is stateful (per-tool last result), self-verifying (a diff is sent only when it
   provably reconstructs the result), and fail-open (full form whenever a diff doesn't
-  apply or isn't smaller — the dangling-reference fallback). It shipped opt-in until its
-  two model-side risks were measured, and flipped default-on when that program completed:
+  apply or isn't smaller — the dangling-reference fallback). Its two model-side risks were
+  both measured and cleared — the tier is correct; #170 returned it to opt-in on cost
+  grounds (above), not on a fidelity finding:
   (1) the round-trip gate proves the diff reconstructs but **not** that a model *reads*
   it as well as the full form — since PASSED by `terse fluency --diff` (4-model panel,
   incl. the nested-record surface, #72) and at chain depth by `fluency --diff-soak`
