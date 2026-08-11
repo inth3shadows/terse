@@ -13,6 +13,31 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Added
+
+- **The `multiproxy.py` / codec boundary is now enforced by a test rather than described in
+  prose** (`#237`). That issue recorded multiproxy as a second product — 1,525 lines of MCP
+  router, none of it compression — and ruled that new optimization logic must not land
+  there, but left open whether to enforce it or trust the convention, warning that "a test
+  that is wrong is worse than a convention that is read".
+
+  Both candidates it named were weighed against a real change (`#246`, which grew the file
+  by 109 lines). The **line-count ceiling was rejected**: that growth was routing logic,
+  exactly what belongs in a router, so a ceiling would have blocked correct work while
+  catching no boundary violation — it measures the proxy, not the property. The **import
+  assertion was kept**: the router may depend on `policy`/`stats`/`lossy` to *call* them,
+  but reaching for the codec is the signal `#237` says should move the decision out rather
+  than widen the file.
+
+  `tests/test_module_boundaries.py` parses imports by AST, not grep — `multiproxy.py` uses
+  the word "transform" throughout its prose, so a text search would fail on a comment and
+  get deleted as noisy, which is precisely how a wrong test earns less than the convention
+  it replaced. A second test guards the guard against passing vacuously, sweeping five
+  spellings a violation could arrive in; it caught the detector reducing
+  `from terse.transforms import compress` to `terse` and missing it.
+
+## [0.24.1] - 2026-08-11
+
 ### Fixed
 
 - **A collision seen once now keeps its tools/list name qualified when the rival peer goes
