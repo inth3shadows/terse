@@ -1281,7 +1281,7 @@ def test_exposed_names_are_unique_across_an_exhaustive_small_configuration_sweep
         checked = 0
         for combo in product(per_peer, repeat=len(peer_names)):
             owned = [(idx, {"name": t}) for idx, tools in enumerate(combo) for t in tools]
-            entries, route = router._expose_names(owned, reserved=(RETRIEVE_TOOL,))
+            entries, route, _ = router._expose_names(owned, reserved=(RETRIEVE_TOOL,))
             exposed = [e["name"] for e in entries]
             assert len(set(exposed)) == len(exposed), (combo, exposed)
             assert len(route) == len(exposed), (combo, exposed)
@@ -1329,6 +1329,146 @@ def test_a_reserved_name_contests_a_sibling_without_any_cross_peer_collision():
         names = [t["name"] for t in merged["result"]["tools"]]
         assert len(set(names)) == len(names), names
         assert names == [f"a__{RETRIEVE_TOOL}", f"a__a__{RETRIEVE_TOOL}"]
+    finally:
+        router.close_senders()
+
+
+def _merge_listing(router, seq, parts):
+    """Merge a tools/list at an explicit `seq` with an explicit per-peer `parts` map, so a
+    test can leave a peer OUT entirely (the shape a timed-out broadcast produces) instead of
+    handing it an empty reply, which is a different silent-reason. `_drive_broadcast` can't
+    do this: it hardcodes seq 0 and requires a reply from every peer."""
+    from terse.multiproxy import _PendingBroadcast
+    return router._merge_tools_list(_PendingBroadcast(
+        kind="tools/list", client_id=1, seq=seq, remaining=set(), parts=parts))
+
+
+def test_a_collision_seen_once_keeps_the_name_qualified_when_the_rival_goes_silent():
+    # terse#178's naming half. `search` flipping between `a__search` (both peers answered)
+    # and bare `search` (b missed the listing) hands a caching client a -32601 for whichever
+    # spelling it kept. Note the direction that #226's -32601 diagnosis CANNOT explain: on
+    # the listing where b RETURNS, no peer is silent, so that error names nobody.
+    _, _, _, out, router = _two_peer_router()
+    try:
+        # 1. both answer -> a genuine collision, both qualified, `search` ratcheted
+        assert [t["name"] for t in _merge_listing(
+            router, 0, {0: {"result": {"tools": [{"name": "search"}]}},
+                        1: {"result": {"tools": [{"name": "search"}]}}})["tools"]] \
+            == ["a__search", "b__search"]
+        assert router._contested_tools == {"search"}
+
+        # 2. b MISSES this listing entirely (a timeout leaves it out of `parts`). Before the
+        #    ratchet this exposed bare `search`; the whole point is that it no longer does.
+        assert [t["name"] for t in _merge_listing(
+            router, 1, {0: {"result": {"tools": [{"name": "search"}]}}})["tools"]] \
+            == ["a__search"]
+        assert router.tool_route == {"a__search": (0, "search")}
+        # and b's copy is NOT resurrected — names are carried forward, routes never are
+        assert "b__search" not in router.tool_route
+
+        # 3. b returns: unchanged again, so no listing in the sequence renamed anything
+        assert [t["name"] for t in _merge_listing(
+            router, 2, {0: {"result": {"tools": [{"name": "search"}]}},
+                        1: {"result": {"tools": [{"name": "search"}]}}})["tools"]] \
+            == ["a__search", "b__search"]
+    finally:
+        router.close_senders()
+
+
+def test_a_rival_silent_on_the_first_listing_still_flips_the_name():
+    # The ratchet's REMAINING limitation, pinned so it stays honest. It can only fire once a
+    # contest has been witnessed, so the reverse ordering of the test above is NOT closed:
+    # nothing had contested `search` when b was silent, so that listing exposes it bare and
+    # the listing where b returns re-qualifies it. Closing this needs knowledge of what a
+    # peer exports before it has ever answered, which the router has no source for.
+    #
+    # This test passing is not a bug — it is the documented boundary. If a future change
+    # closes it, this test SHOULD fail and be rewritten; that is the point of pinning it.
+    _, _, _, out, router = _two_peer_router()
+    try:
+        assert [t["name"] for t in _merge_listing(
+            router, 0, {0: {"result": {"tools": [{"name": "search"}]}}})["tools"]] \
+            == ["search"]
+        assert router._contested_tools == set()   # nothing witnessed yet, nothing to ratchet
+        assert [t["name"] for t in _merge_listing(
+            router, 1, {0: {"result": {"tools": [{"name": "search"}]}},
+                        1: {"result": {"tools": [{"name": "search"}]}}})["tools"]] \
+            == ["a__search", "b__search"]
+        # the bare name a client may have cached from listing 0 is now unroutable
+        assert "search" not in router.tool_route
+    finally:
+        router.close_senders()
+
+
+def test_a_reserved_only_qualification_never_enters_the_ratchet():
+    # The self-feeding hazard. `terse.retrieve` is qualified because it is RESERVED, not
+    # because two peers contested it. Ratcheting that would put it back in `reserved` next
+    # listing as if it had collided — and every reserved-qualified name after it — walking
+    # the router back to the unconditional prefixing #168 removed as its one unshippable
+    # defect. Only a genuine cross-peer contest may ratchet.
+    from terse.lossy import RETRIEVE_TOOL
+    _, _, _, out, router = _two_peer_router()
+    try:
+        merged = _merge_listing(
+            router, 0, {0: {"result": {"tools": [{"name": RETRIEVE_TOOL}]}},
+                        1: {"result": {"tools": [{"name": "other"}]}}})
+        assert [t["name"] for t in merged["tools"]] == [f"a__{RETRIEVE_TOOL}", "other"]
+        assert router._contested_tools == set()      # qualified, but never contested
+    finally:
+        router.close_senders()
+
+
+def test_a_peer_that_did_not_answer_can_never_contest_a_name():
+    # The R3 defect class, at its root: an `error`/`malformed`/`empty` peer contributes no
+    # entries, so it cannot collide with anything and cannot be "remembered" as owning a
+    # name. Checked for all three shapes at once — `a` exports `search` every time, and the
+    # ratchet must stay empty, so `search` is never force-qualified on b's behalf.
+    for part in ({"error": {"code": -32601, "message": "no"}},   # explicit JSON-RPC error
+                 {"result": {"tools": "not-a-list"}},            # malformed
+                 {"result": {"tools": []}}):                     # empty
+        _, _, _, out, router = _two_peer_router()
+        try:
+            merged = _merge_listing(
+                router, 0, {0: {"result": {"tools": [{"name": "search"}]}}, 1: part})
+            assert [t["name"] for t in merged["tools"]] == ["search"], part
+            assert router._contested_tools == set(), part
+        finally:
+            router.close_senders()
+
+
+def test_one_peer_listing_a_name_twice_does_not_ratchet_it():
+    # The ratchet counts DISTINCT PEERS, not occurrences. A single broken peer listing the
+    # same name twice is not a cross-peer contest: qualification cannot disambiguate it
+    # (both copies qualify to the same string and the second is dropped — see
+    # `test_an_unresolvable_duplicate_warns_without_debug`), so ratcheting it would let one
+    # malformed listing permanently re-spell that name for the peer that legitimately owns
+    # it. Caught by mutation: an occurrence COUNT passes every other test in this file.
+    _, _, _, out, router = _two_peer_router()
+    try:
+        merged = _merge_listing(router, 0, {0: {"result": {"tools": [{"name": "dup"},
+                                                                    {"name": "dup"}]}}})
+        assert [t["name"] for t in merged["tools"]] == ["a__dup"]   # dropped, as before
+        assert router._contested_tools == set()
+        # the next well-formed listing must still expose it BARE, not `a__dup`
+        assert [t["name"] for t in _merge_listing(
+            router, 1, {0: {"result": {"tools": [{"name": "dup"}]}}})["tools"]] == ["dup"]
+    finally:
+        router.close_senders()
+
+
+def test_a_stale_listing_still_ratchets_even_though_its_table_is_refused():
+    # The ratchet is deliberately NOT behind the seq guard. A superseded listing's TABLE is
+    # rightly discarded, but "these two peers both export `search`" is not falsified by
+    # arriving late — it stays true. Gating it would lose the fact for no safety gain.
+    _, _, _, out, router = _two_peer_router()
+    try:
+        _merge_listing(router, 5, {0: {"result": {"tools": [{"name": "only"}]}}})
+        assert set(router.tool_route) == {"only"}
+        # seq 2 < installed seq 5: refused for install, but its collision still counts
+        _merge_listing(router, 2, {0: {"result": {"tools": [{"name": "search"}]}},
+                                   1: {"result": {"tools": [{"name": "search"}]}}})
+        assert set(router.tool_route) == {"only"}    # table untouched by the stale listing
+        assert router._contested_tools == {"search"} # but the fact was kept
     finally:
         router.close_senders()
 
