@@ -755,8 +755,20 @@ def _recommend(srv: dict[str, Any]) -> dict[str, Any]:
     # 3. A non-positive rate against a real primer: no block volume earns it back, at any
     #    volume. This is the ONLY structural impossibility here, and it is what separates
     #    UNWRAP from TUNE.
+    #
+    #    Coverage is still well-defined here, and computed directly rather than via
+    #    `blocks_to_break_even` (which `_break_even` deliberately leaves `None` for this
+    #    branch -- "blocks needed to reach break-even" has no answer when no volume ever
+    #    gets there). But `break_even_coverage` is a DIFFERENT quantity -- "how much of the
+    #    primer this window's savings recovered" -- and that reduces to `entry_saved /
+    #    primer_tokens` same as every other branch, negative and all. Found in review:
+    #    an earlier cut returned `None` for a genuinely negative rate, which is
+    #    indistinguishable in `--json` from the `no primer` branch's TRULY undefined `None`
+    #    (division by zero) -- the exact "a None can't tell two accusations apart" failure
+    #    this module's own docstring warns against, just re-introduced one function up.
     if v == "never":
-        return out(UNWRAP, v, 0.0 if rate == 0 else None)
+        coverage = (rate * tok) / primer if rate is not None and tok is not None and primer else None
+        return out(UNWRAP, v, coverage)
 
     # 4/5. `no primer`: nothing to earn back "at any rate, positive or negative"
     #      (`_break_even`). Coverage is undefined -- `blocks_to_break_even` is 0.0 and the

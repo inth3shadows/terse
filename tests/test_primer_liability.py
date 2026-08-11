@@ -748,6 +748,33 @@ def test_a_non_positive_rate_reads_UNWRAP_at_any_block_volume(tmp_path):
     assert srv["break_even_verdict"] == "never"
     assert srv["verdict"] == "UNWRAP"
     assert srv["verdict_reason"] == "never"
+    assert srv["break_even_coverage"] == 0.0  # a zero rate is a REAL, computable ratio
+
+
+def test_a_genuinely_negative_rate_still_gets_a_real_coverage_number_not_None(tmp_path):
+    """Found in review of #238: `blocks_to_break_even` is `None` for `break_even_verdict ==
+    "never"` (`_break_even` leaves it undefined on purpose — "blocks needed to reach
+    break-even" has no answer when no volume ever gets there). An earlier cut of `_recommend`
+    read that `None` as "coverage is undefined too" for a negative rate, collapsing it to the
+    SAME `None` the truly-undefined `no primer` branch returns (division by zero there).
+
+    But `break_even_coverage` is a different quantity — `entry_saved / primer_tokens` — and
+    that reduces to a real, computable NEGATIVE number here, same as it does for every other
+    branch. Suppressing a real number to `None` is the mirror image of the `0` standing in
+    for a missing measurement that `_break_even`'s own docstring refuses to allow — a
+    `--json` consumer with two `None` coverages could not tell "this server made things worse"
+    from "terse could not measure this server" apart."""
+    # raw=100, out=150 -> saved=-50 over 10 tokenized blocks -> rate=-5.0/block, a genuine
+    # expansion (not a zero-savings server, which the test above already covers).
+    srv = _one(tmp_path, ("kb", 10, 100, 150))
+    assert srv["saved_per_block"] == -5.0
+    assert srv["break_even_verdict"] == "never"
+    assert srv["verdict"] == "UNWRAP"
+    primer = srv["primer_tokens"]
+    assert primer, "fixture must use a real primer, or this pins the wrong branch"
+    expected = (srv["saved_per_block"] * srv["tokenized_blocks"]) / primer
+    assert expected < 0
+    assert srv["break_even_coverage"] == pytest.approx(expected)
 
 
 def test_exactly_clearing_the_break_even_reads_KEEP_not_TUNE(tmp_path):
