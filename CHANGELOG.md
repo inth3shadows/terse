@@ -19,9 +19,17 @@ fails that pull request until the section has moved.
   silent** (`#178`). multiproxy computed collision naming from one listing alone, so if
   `gh` and `kb` both exported `search` and `kb` later missed a broadcast, gh's copy flipped
   from `gh__search` to bare `search` — and back again when `kb` returned. A client caching
-  either spelling got a `-32601` for the other. The `-32601` diagnosis added by `#226`
-  covers only one direction: on the listing where the rival *returns*, no peer is silent,
-  so that error named nobody.
+  either spelling got a `-32601` for the other.
+
+  **One ordering, not both.** The ratchet can only fire once a contest has been witnessed,
+  so `kb` answering and *then* going silent is closed, while `kb` being silent on the
+  *first* listing and then returning still flips the name — and that is the direction
+  `#226`'s `-32601` diagnosis cannot explain, since no peer is silent on the listing where
+  the rival returns. Closing it needs knowledge of what a peer exports before it has ever
+  answered, for which the router has no source short of the two options this issue already
+  rejected (carrying routes forward, or unconditional prefixing). The remaining gap is
+  pinned by `test_a_rival_silent_on_the_first_listing_still_flips_the_name` rather than
+  left as a claim in prose.
 
   Closed with a **contested-name ratchet** — a per-surface set of bare names seen exported
   by two or more distinct peers in one listing, fed into the next listing's existing
@@ -35,7 +43,14 @@ fails that pull request until the section has moved.
   intentionally not behind the seq guard — a superseded listing's *table* is discarded, but
   "these two peers both export `search`" is not falsified by arriving late.
 
-  Five new tests in `tests/test_multiproxy.py`, each mutation-verified to fail against the
+  Two limits stated rather than papered over: the ratchet is **never invalidated**, so a
+  peer that collides in exactly one listing keeps its rival qualified until the process
+  restarts (un-ratcheting would need to distinguish "the contest ended" from "the rival was
+  silent", which one listing cannot); and reading the ratchet is **not atomic with
+  installing a table**, so concurrent merges can still reproduce the flip for a single
+  self-healing listing. Both are narrowings, not proofs.
+
+  Six new tests in `tests/test_multiproxy.py`, each mutation-verified to fail against the
   specific defect it pins.
 
 ## [0.24.0] - 2026-08-11

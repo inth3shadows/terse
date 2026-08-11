@@ -1375,6 +1375,31 @@ def test_a_collision_seen_once_keeps_the_name_qualified_when_the_rival_goes_sile
         router.close_senders()
 
 
+def test_a_rival_silent_on_the_first_listing_still_flips_the_name():
+    # The ratchet's REMAINING limitation, pinned so it stays honest. It can only fire once a
+    # contest has been witnessed, so the reverse ordering of the test above is NOT closed:
+    # nothing had contested `search` when b was silent, so that listing exposes it bare and
+    # the listing where b returns re-qualifies it. Closing this needs knowledge of what a
+    # peer exports before it has ever answered, which the router has no source for.
+    #
+    # This test passing is not a bug — it is the documented boundary. If a future change
+    # closes it, this test SHOULD fail and be rewritten; that is the point of pinning it.
+    _, _, _, out, router = _two_peer_router()
+    try:
+        assert [t["name"] for t in _merge_listing(
+            router, 0, {0: {"result": {"tools": [{"name": "search"}]}}})["tools"]] \
+            == ["search"]
+        assert router._contested_tools == set()   # nothing witnessed yet, nothing to ratchet
+        assert [t["name"] for t in _merge_listing(
+            router, 1, {0: {"result": {"tools": [{"name": "search"}]}},
+                        1: {"result": {"tools": [{"name": "search"}]}}})["tools"]] \
+            == ["a__search", "b__search"]
+        # the bare name a client may have cached from listing 0 is now unroutable
+        assert "search" not in router.tool_route
+    finally:
+        router.close_senders()
+
+
 def test_a_reserved_only_qualification_never_enters_the_ratchet():
     # The self-feeding hazard. `terse.retrieve` is qualified because it is RESERVED, not
     # because two peers contested it. Ratcheting that would put it back in `reserved` next

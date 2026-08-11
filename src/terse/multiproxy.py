@@ -475,9 +475,29 @@ class Router:
         # BEFORE the seq check, so sharing the lock would tie ratchet updates to installed
         # listings only — no safety gain, and it adds a lock-ordering edge between the
         # peer-reader and Timer threads. Updates are a commutative union, so racing writers
-        # converge whatever the interleaving; the lock guards only the set's own structure,
-        # never an ordering. Unbounded in principle, bounded in practice by the distinct
-        # names the fleet exports — a closed set, not client-controlled, so no eviction.
+        # converge on the same SET whatever the interleaving; the lock guards only the set's
+        # own structure, never an ordering.
+        #
+        # What that commutativity does NOT buy is atomicity between reading the set and
+        # installing a table. Both run outside `_route_lock`, and merges run concurrently
+        # (peer-reader threads and the Timer thread, multiple broadcasts in flight under
+        # distinct client ids). So a merge can read the snapshot as empty, a second merge
+        # can commit a contest, and the first can then install a bare name at the higher
+        # seq — reproducing for one listing exactly the flip this ratchet removes. Left
+        # unclosed on purpose: serializing the read with the install is the lock-ordering
+        # edge above, and the outcome is a self-healing single-listing regression to the
+        # PREVIOUS behavior, never a corrupt table or a misroute. It is a narrowing, not a
+        # proof.
+        #
+        # NEVER INVALIDATED, only added to. If a peer exports a colliding name in exactly
+        # one listing and never again, its rival stays qualified for the process lifetime,
+        # which costs the allowlist stability #168 bought until a restart. That is a
+        # deliberate trade against the alternative — un-ratcheting on a listing that merely
+        # LOOKS uncontested is the read-modify-write over shared state that sank #178's
+        # retention design, since "the contest ended" and "the rival was silent" are
+        # indistinguishable from one listing. Growth needs no eviction for a separate
+        # reason: the set is bounded by the distinct names the fleet exports, a closed set
+        # that is not client-controlled.
         self._contested_lock = Lock()
         self._contested_tools: set[str] = set()
         self._contested_prompts: set[str] = set()
@@ -1147,9 +1167,25 @@ class Router:
         exposed bare as `search` that listing and re-qualified to `gh__search` the next —
         a client caching either name got a -32601 for the other. `reserved` now also
         carries the caller's contested-name ratchet, which is what makes the name stable
-        across the gap. Note the failure ran in BOTH directions, and the -32601 diagnosis
-        added by #226 only covers one: on the listing where the rival RETURNS, no peer is
-        silent, so that error carried no explanation at all.
+        across the gap.
+
+        REMAINING LIMITATION — the ratchet can only fire once a contest has been WITNESSED,
+        so it closes one ordering and not the other:
+
+          - `kb` answers, then goes silent  -> CLOSED. `search` is already ratcheted, so it
+            stays `gh__search` across the gap.
+          - `kb` silent on the FIRST listing, then returns -> STILL FLIPS. Nothing had
+            contested `search` yet, so that listing exposes it bare, and the listing where
+            `kb` returns re-qualifies it. A client that cached the bare name gets a -32601,
+            and #226's diagnosis cannot explain that one: on the listing where the rival
+            RETURNS, no peer is silent, so the error names nobody.
+
+        Closing the second ordering needs knowledge of what a peer exports BEFORE it has
+        ever answered, which the router has no source for — the only candidates are
+        carrying routes forward (withdrawn, below) or unconditional prefixing (#168's
+        defect). Pinned by
+        `test_a_rival_silent_on_the_first_listing_still_flips_the_name`, so the gap is
+        executable rather than a claim in prose.
 
         What is deliberately NOT done is carrying ROUTES forward from peers that did not
         answer — tried and withdrawn (terse#178) after it turned every listing into a
