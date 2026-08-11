@@ -343,6 +343,25 @@ def test_example_policy_guards_secret_broker_crown_jewels():
     assert denyall.require_server_name is True
 
 
+def test_example_policy_opts_exa_search_into_tiers_without_widening_the_deny_all():
+    # #143: exa_search earned its own rule (measured safe + measured real, see the rule's
+    # _comment) ahead of the crown-jewel deny-all. Pin both directions: the carve-out must
+    # actually fire for exa_search, and it must not accidentally widen the deny-all glob so
+    # some OTHER tool starts matching it too (e.g. a future "secret-broker.secret.exa_search2"
+    # or a typo'd glob that's broader than intended).
+    import pathlib
+    example = pathlib.Path(__file__).resolve().parents[1] / "policy.example.json"
+    p = load_policy(example)
+
+    exa = p.select("secret.exa_search", server="secret-broker")
+    assert exa.tiers == ("minify", "tabularize", "dictionary")
+    assert exa.capture is False
+
+    for tool in ("secret.reveal_credential", "secret.inject_env", "secret.list_credentials2"):
+        r = p.select(tool, server="secret-broker")
+        assert r.tiers == () and r.capture is False, tool
+
+
 def test_invalid_tier_rejected(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps({"version": 1, "policies": [{"match": {"tool": "*"}, "tiers": ["bogus"]}]}))
