@@ -28,6 +28,8 @@ fails that pull request until the section has moved.
   disk exactly as before. Every other `secret-broker.*` tool is unaffected by the
   default-deny rule.
 
+## [0.23.4] - 2026-08-11
+
 ### Fixed
 
 - **`policy.example.json` carried no `secret-broker` rules at all**, even though `#243`
