@@ -459,6 +459,28 @@ class Router:
         # tool name on the wire and an MCP protocol violation.
         self._tool_entries: list[dict] = []
         self._prompt_entries: list[dict] = []
+        # Bare names ever seen exported by two or more DISTINCT peers in one listing, per
+        # surface. Fed into the next listing's `reserved` so a name stays qualified even on
+        # a listing its rival missed — closing the naming half of terse#178, where `search`
+        # flipped between bare and `gh__search` depending on whether `kb` answered.
+        #
+        # This IS state outliving a listing, which #178's "derived, not accumulated" advice
+        # warns against — but it is a far narrower kind than the retention that was
+        # withdrawn. It holds no peer identity, no liveness and no route, so it cannot
+        # resurrect a tool, cannot keep an erroring peer's routes alive, and cannot erase a
+        # live peer: the three defect classes that sank that design. It means only "this
+        # string, once, collided", and it is never consulted to decide WHERE a call goes.
+        #
+        # Its own lock, deliberately NOT `_route_lock`. `_expose_names` runs during a merge
+        # BEFORE the seq check, so sharing the lock would tie ratchet updates to installed
+        # listings only — no safety gain, and it adds a lock-ordering edge between the
+        # peer-reader and Timer threads. Updates are a commutative union, so racing writers
+        # converge whatever the interleaving; the lock guards only the set's own structure,
+        # never an ordering. Unbounded in principle, bounded in practice by the distinct
+        # names the fleet exports — a closed set, not client-controlled, so no eviction.
+        self._contested_lock = Lock()
+        self._contested_tools: set[str] = set()
+        self._contested_prompts: set[str] = set()
 
         self._pending_lock = Lock()
         # keyed by broadcast SEQUENCE NUMBER, not client id — see _PendingBroadcast.
@@ -1106,7 +1128,8 @@ class Router:
         return tuple(out)
 
     def _expose_names(self, owned: list[tuple[int, dict]],
-                      reserved: tuple[str, ...] = ()) -> tuple[list[dict], dict]:
+                      reserved: tuple[str, ...] = ()
+                      ) -> tuple[list[dict], dict, set[str]]:
         """Name each entry for the client and build its routing table (#168).
 
         A bare name claimed by exactly ONE peer is exposed VERBATIM; only a name two or
@@ -1118,15 +1141,21 @@ class Router:
         `reserved` names are pre-claimed by the router itself, so a peer exporting one is
         forced to qualify rather than shadowing it.
 
-        KNOWN LIMITATION — naming is computed from THIS listing alone, so a collision
-        only one of whose peers answered is invisible: if `gh` and `kb` both export
-        `search` but `kb` misses the broadcast, gh's copy is exposed bare as `search` that
-        listing and re-qualified to `gh__search` the next. The precondition is a genuine
-        cross-peer collision, which is empty on the fleets this feature targets, AND a
-        peer missing a listing. Carrying names forward from peers that did not answer
-        would close it, and was tried and withdrawn (terse#178): it turns every listing
-        into a read-modify-write over shared state and produced more defects than the
-        naming rule it was protecting. If it comes back it needs its own review budget.
+        A collision seen ONCE stays qualified, even on later listings the rival peer
+        missed (terse#178). Naming was previously computed from one listing alone, so if
+        `gh` and `kb` both exported `search` and `kb` missed a broadcast, gh's copy was
+        exposed bare as `search` that listing and re-qualified to `gh__search` the next —
+        a client caching either name got a -32601 for the other. `reserved` now also
+        carries the caller's contested-name ratchet, which is what makes the name stable
+        across the gap. Note the failure ran in BOTH directions, and the -32601 diagnosis
+        added by #226 only covers one: on the listing where the rival RETURNS, no peer is
+        silent, so that error carried no explanation at all.
+
+        What is deliberately NOT done is carrying ROUTES forward from peers that did not
+        answer — tried and withdrawn (terse#178) after it turned every listing into a
+        read-modify-write over shared state and produced 11 defects across 3 review
+        rounds. The ratchet is names only; see `Router.__init__` for why that distinction
+        is what makes it safe.
 
         **Every entry's qualified form is reserved too, unconditionally.** Without that, a
         peer exporting a tool named literally `{otherpeer}__{tool}` is exposed verbatim
@@ -1138,7 +1167,10 @@ class Router:
         duplicate when the peers happened to be ordered one way and not the other.
         Reserving all of them is order-independent and needs no fixpoint.
 
-        Returns `(renamed_entries, {exposed: (peer_idx, bare)})`. At the fixpoint no two
+        Returns `(renamed_entries, {exposed: (peer_idx, bare)}, contested_bare_names)`.
+        The caller commits the third element to the ratchet for its own surface — this
+        function stays free of that state so it remains a pure function of its inputs and
+        can be tested one listing at a time. At the fixpoint no two
         exposed names can be equal unless a peer listed the SAME name twice — a
         bare-vs-bare clash qualifies both, a bare-vs-qualified clash contests the bare one
         into qualifying, and two equal qualified forms require equal (peer, name) pairs,
@@ -1166,6 +1198,27 @@ class Router:
         for b in bares:
             base[b] = base.get(b, 0) + 1
         qualified = [base[b] > 1 for b in bares]
+
+        # The ratchet's input: bare names two or more DISTINCT peers both export in THIS
+        # listing. Three deliberate exclusions, each of which would break something:
+        #
+        #  - a name qualified only because it is in `reserved` is NOT a contest. Counting it
+        #    would make the ratchet self-feeding — every reserved-qualified name would enter
+        #    the set, come back as `reserved` next listing, and re-qualify itself forever,
+        #    ending at the unconditional prefixing #168 removed as multiproxy's one
+        #    unshippable defect.
+        #  - "distinct peers", not a count of `bares`, so ONE peer listing the same name
+        #    twice (a broken peer — see `test_an_unresolvable_duplicate_warns_without_debug`)
+        #    cannot permanently poison that name. Qualification can't disambiguate that case
+        #    anyway; the duplicate is dropped, not renamed.
+        #  - the fixpoint's DERIVED qualifications are not fed in either, and do not need to
+        #    be: re-qualifying the bare collision on a later listing re-emits the same
+        #    qualified form, which drives the same fixpoint to the same derived result. The
+        #    depth-2 chain (`x`, `a__x`, `c__a__x`) stays stable from the bare seed alone.
+        by_bare: dict[str, set[int]] = {}
+        for (idx, _), b in zip(owned, bares, strict=True):
+            by_bare.setdefault(b, set()).add(idx)
+        contested = {b for b, idxs in by_bare.items() if len(idxs) > 1}
         while True:
             emitted = {q for q, isq in zip(quals, qualified, strict=True) if isq}
             newly = [i for i, b in enumerate(bares) if not qualified[i] and b in emitted]
@@ -1192,7 +1245,7 @@ class Router:
                 continue
             entries.append({**it, "name": exposed})
             route[exposed] = (idx, bares[i])
-        return entries, route
+        return entries, route, contested
 
     def _merge_tools_list(self, pb: _PendingBroadcast) -> dict:
         """Concat every peer's tools under collision-only `{peer}__` prefixes (#168 —
@@ -1205,8 +1258,20 @@ class Router:
         `RETRIEVE_TOOL` is reserved unconditionally, not just when `has_drop` — a peer
         exporting that name must be qualified either way, since whether the router also
         advertises its own retrieve is a policy detail the client can't see."""
-        tools, table = self._expose_names(self._collect_named(pb, "tools"),
-                                          reserved=(lossy_mod.RETRIEVE_TOOL,))
+        with self._contested_lock:
+            sticky = tuple(self._contested_tools)
+        tools, table, contested = self._expose_names(
+            self._collect_named(pb, "tools"),
+            reserved=(lossy_mod.RETRIEVE_TOOL, *sticky))
+        # Committed OUTSIDE the seq guard below, deliberately: a contested-name fact is not
+        # falsified by its listing being superseded. If two peers really did both export
+        # `search`, that stays true whether or not this listing's TABLE was the one
+        # installed. Gating it on `pb.seq` would drop information for no safety gain, and
+        # would put route-shaped reasoning next to a variable whose misuse is exactly how
+        # #178's round-3 defect (a stale install resurrecting a dropped tool) happened.
+        if contested:
+            with self._contested_lock:
+                self._contested_tools |= contested
         silent = self._silent_peers(pb, "tools")
         with self._route_lock:
             if pb.seq >= self._tool_state[0]:
@@ -1295,9 +1360,17 @@ class Router:
         about when a name is qualified would be a client-visible inconsistency, not an
         optimization. Pagination cursors are dropped, same as tools/list.
 
-        Prompt names share no namespace with `RETRIEVE_TOOL`, so nothing is reserved
-        here."""
-        prompts, table = self._expose_names(self._collect_named(pb, "prompts"))
+        Prompt names share no namespace with `RETRIEVE_TOOL`, so the only thing reserved
+        here is this surface's own contested-name ratchet — kept in a SEPARATE set from
+        the tools one for the same reason: the two namespaces are disjoint, and a name
+        contested among prompts must not force a same-named tool to qualify."""
+        with self._contested_lock:
+            sticky = tuple(self._contested_prompts)
+        prompts, table, contested = self._expose_names(
+            self._collect_named(pb, "prompts"), reserved=sticky)
+        if contested:
+            with self._contested_lock:
+                self._contested_prompts |= contested
         with self._route_lock:
             if pb.seq >= self._prompt_state[0]:
                 # Third element is always `()` here, deliberately. Prompts keep the same

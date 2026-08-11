@@ -13,6 +13,33 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A collision seen once now keeps its tools/list name qualified when the rival peer goes
+  silent** (`#178`). multiproxy computed collision naming from one listing alone, so if
+  `gh` and `kb` both exported `search` and `kb` later missed a broadcast, gh's copy flipped
+  from `gh__search` to bare `search` — and back again when `kb` returned. A client caching
+  either spelling got a `-32601` for the other. The `-32601` diagnosis added by `#226`
+  covers only one direction: on the listing where the rival *returns*, no peer is silent,
+  so that error named nobody.
+
+  Closed with a **contested-name ratchet** — a per-surface set of bare names seen exported
+  by two or more distinct peers in one listing, fed into the next listing's existing
+  `reserved` mechanism. Deliberately NOT the route retention withdrawn in `#178` after 11
+  defects across 3 review rounds: it holds no peer identity, no liveness and no routes, so
+  it cannot resurrect a tool, keep an erroring peer's routes alive, or erase a live peer.
+  A peer that answers `error`/`malformed`/`empty`/not-at-all contributes nothing and can
+  never contest a name; one peer listing a name twice does not ratchet it (distinct peers,
+  not occurrences); and a reserved-only qualification never enters the set, which would
+  otherwise self-feed back to the unconditional prefixing `#168` removed. The ratchet is
+  intentionally not behind the seq guard — a superseded listing's *table* is discarded, but
+  "these two peers both export `search`" is not falsified by arriving late.
+
+  Five new tests in `tests/test_multiproxy.py`, each mutation-verified to fail against the
+  specific defect it pins.
+
+## [0.24.0] - 2026-08-11
+
 ### Added
 
 - **`secret-broker.secret.exa_search` opted into compression tiers** (`#143`). The
