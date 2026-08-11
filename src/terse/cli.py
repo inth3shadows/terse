@@ -253,6 +253,7 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
 def _cmd_stats(args: argparse.Namespace) -> int:
     from .stats import (
         aggregate,
+        build_recommend_report,
         build_stats_report,
         default_stats_log,
         load_stats,
@@ -286,7 +287,14 @@ def _cmd_stats(args: argparse.Namespace) -> int:
               f"EXCLUDE the primer cost, recurring and one-time alike", file=sys.stderr)
         liability = None
     if args.json:
+        # `--recommend` is a HUMAN rendering mode. The verdict rides every liability row
+        # unconditionally, so `--json` is already the complete answer and gating a contract
+        # field on a flag would give `test_stats_json_contract` two shapes to pin instead of
+        # one. Said in the flag's own help text rather than silently ignored.
         print(json.dumps({**agg, "primer_liability": liability}, indent=2))
+    elif args.recommend:
+        print(build_recommend_report(agg, log_path=log_path, window=args.since,
+                                     liability=liability), end="")
     else:
         print(build_stats_report(agg, log_path=log_path, window=args.since,
                                  liability=liability), end="")
@@ -1634,6 +1642,10 @@ def main(argv: list[str] | None = None) -> int:
                          "(default: all recorded history)")
     st.add_argument("--json", action="store_true",
                     help="emit the aggregate as JSON instead of the text report")
+    st.add_argument("--recommend", action="store_true",
+                    help="print one wrap/don't-wrap verdict per installed entry "
+                         "(KEEP/TUNE/UNWRAP/INSUFFICIENT) instead of the ledger tables; the "
+                         "verdict is always present in --json regardless of this flag")
     st.set_defaults(func=_cmd_stats)
 
     f = sub.add_parser("fluency", help="does a model read the compressed form as "

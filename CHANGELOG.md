@@ -13,6 +13,28 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Added
+
+- **`terse stats --recommend` — one wrap/don't-wrap verdict per installed entry.** #175 stated
+  the rule ("wrap a server when its session-lifetime savings clear its own primer") and #197
+  put both halves of the arithmetic in `terse stats` as two numeric columns, leaving the
+  operator to do the comparison. The new mode rolls them into one word — `KEEP` / `TUNE` /
+  `UNWRAP` / `INSUFFICIENT` — beside the coverage ratio it was derived from, replacing the
+  ledger tables rather than appending to them (the default report's output is byte-identical).
+  No new arithmetic: every input is a field `_break_even` and `_cadence` already published, and
+  the 1.0 threshold is the one the report already draws when it prints `NET NEGATIVE`.
+- **Four new fields on every `primer_liability.servers[]` row in `--json`**, present regardless
+  of the `--recommend` flag so the contract has one shape rather than two: `verdict` and
+  `verdict_reason` (never null — there is always an answer, even if it is `INSUFFICIENT`),
+  `break_even_coverage` (`tokenized_blocks / blocks_to_break_even`, null wherever the ratio is
+  undefined — never a fabricated `0` or infinity), and `contributors`.
+- **A new nested `primer_liability.servers[].contributors[]` shape** — `label`, `blocks`,
+  `tokenized_blocks`, `saved_tokens`, `saved_per_block` — ranking each ledger label an entry
+  pools, by tokens saved. It deliberately carries **no** `primer_tokens`,
+  `blocks_to_break_even`, `break_even_verdict` or `verdict`: a router pays ONE union primer for
+  its whole fleet, so there is no honest per-peer break-even to publish, and the verdict stays
+  per installed entry. `tests/test_stats_json_contract.py` pins all of it as exact key sets.
+
 ### Changed
 
 - **`release.yml` no longer tries to graduate the changelog itself.** The step pushed a

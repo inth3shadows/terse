@@ -54,7 +54,19 @@ LIABILITY = {"servers", "per_turn_tokens", "session_once_tokens", "unresolved",
 
 LIABILITY_SERVER = {"server", "scope", "state", "primer_tokens", "ledger_labels",
                     "blocks", "tokenized_blocks", "cadence",
-                    "saved_per_block", "blocks_to_break_even", "break_even_verdict"}
+                    "saved_per_block", "blocks_to_break_even", "break_even_verdict",
+                    # #238: the wrap/don't-wrap rollup. `verdict` and `verdict_reason` are
+                    # never null — there is always an answer, even when it is INSUFFICIENT —
+                    # while `break_even_coverage` is null wherever the ratio is undefined,
+                    # never a fabricated 0 or infinity.
+                    "verdict", "verdict_reason", "break_even_coverage", "contributors"}
+
+# Deliberately verdict-INCAPABLE (#238): no `primer_tokens`, no `blocks_to_break_even`, no
+# `break_even_verdict`, no `verdict`. A peer has no primer to divide by -- the router pays one
+# shared union primer for the fleet -- so a per-peer KEEP/UNWRAP would need a field invented
+# for it. Pinned as an EXACT set so inventing one fails here first.
+LIABILITY_CONTRIBUTOR = {"label", "blocks", "tokenized_blocks", "saved_tokens",
+                         "saved_per_block"}
 
 # name -> the types a consumer may receive. `None` is listed explicitly wherever it is a
 # real answer, because this module's whole discipline is that unknown is not zero — a
@@ -75,6 +87,12 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "turns_covered": (float, int, type(None)),
     "session_covered": (float, int, type(None)),
     "servers": (list,),
+    "verdict": (str,), "verdict_reason": (str,),
+    "break_even_coverage": (float, int, type(None)),
+    # `saved_tokens` is NOT re-listed: the liability blob's own entry above already pins it
+    # to `(int,)`, and the contributor means the same thing by the same name — which is the
+    # case `TYPES` is shared for. Repeating it is a literal duplicate key (ruff F601).
+    "contributors": (list,), "label": (str,),
 }
 
 # Per-shape overrides, because a name does not mean the same thing everywhere. `blocks` is a
@@ -93,6 +111,10 @@ SHAPE_TYPES: dict[str, dict[str, tuple[type | None, ...]]] = {
     "total": {"blocks": (int,)},
     "tools[]": {"blocks": (int,)},
     "versions[]": {"blocks": (int,)},
+    # A contributor exists only BECAUSE a ledger label does, so neither counter can be the
+    # "we never found the rows to ask" null a liability row's `blocks` legitimately is.
+    "primer_liability.servers[].contributors[]": {"blocks": (int,),
+                                                 "tokenized_blocks": (int,)},
 }
 
 _ADD_ON_PURPOSE = ("Fields here are a public contract (USAGE: \"the raw aggregate, for "
@@ -146,7 +168,8 @@ def test_every_named_field_also_has_a_pinned_type():
     person to add a field only has to touch the NAME manifest to go green and the type
     promise silently stops applying to it (found in review — the same
     tolerates-growth-silently failure this module's own docstring warns about)."""
-    named = TOTAL | TOOL_ROW | VERSION_ROW | LIABILITY | LIABILITY_SERVER
+    named = (TOTAL | TOOL_ROW | VERSION_ROW | LIABILITY | LIABILITY_SERVER
+             | LIABILITY_CONTRIBUTOR)
     assert not named - set(TYPES), (
         f"no type pinned for: {sorted(named - set(TYPES))}. {_ADD_ON_PURPOSE}")
 
@@ -197,6 +220,40 @@ def test_the_liability_blob_is_exactly_these_keys(stats_json):
     for row in liab["servers"]:
         assert set(row) == LIABILITY_SERVER, _ADD_ON_PURPOSE
         _check_types("primer_liability.servers[]", row)
+        # The nested shape is part of the same wire contract and is pinned in the same
+        # place: a consumer walking `servers[].contributors[]` gets no separate warning
+        # if a key is added or renamed there.
+        for contributor in row["contributors"]:
+            assert set(contributor) == LIABILITY_CONTRIBUTOR, _ADD_ON_PURPOSE
+            _check_types("primer_liability.servers[].contributors[]", contributor)
+
+
+def test_a_contributor_row_carries_evidence_and_no_verdict_of_its_own(stats_json):
+    """The field-level guard against the inversion #238 names.
+
+    A router pays ONE union primer for the whole fleet, so the break-even question
+    (`saved / primer`) has no per-peer form — there is no per-peer primer to divide by.
+    Computing a verdict per peer would charge each of them the full shared primer and tell
+    the operator to unwrap peers that are collectively paying for themselves.
+
+    The shape is what prevents it: a contributor simply does not carry a primer, a
+    break-even, or a verdict, so re-deriving one would mean ADDING a field with no honest
+    per-peer value — a visible act, not an accident. Asserted by name rather than left to
+    the exact-set check alone, because the names are the point."""
+    out = stats_json([_rec()])
+    router = next(s for s in out["primer_liability"]["servers"] if s["server"] == "terse")
+    assert len(router["contributors"]) == 2, "the fixture router fronts kb and runecho"
+    for contributor in router["contributors"]:
+        assert set(contributor) == LIABILITY_CONTRIBUTOR, _ADD_ON_PURPOSE
+        for forbidden in ("verdict", "verdict_reason", "primer_tokens",
+                          "blocks_to_break_even", "break_even_verdict"):
+            assert forbidden not in contributor, (
+                f"a contributor must not carry `{forbidden}` — that is the per-peer verdict "
+                f"#238 exists to refuse")
+    # ...and the ranking is by savings, descending, so the top row answers "which peer is
+    # carrying this router?" without the consumer re-sorting.
+    saved = [c["saved_tokens"] for c in router["contributors"]]
+    assert saved == sorted(saved, reverse=True)
 
 
 def test_decisions_and_diff_reasons_are_string_keyed_counters(stats_json):
@@ -224,6 +281,12 @@ def test_an_unresolvable_row_returns_null_not_zero(stats_json):
     assert row["cadence"] == "once/session (?)"
     assert "mystery" in out["primer_liability"]["uncertain"]
     assert "mystery" not in out["primer_liability"]["free"]
+    # Same discipline for the #238 rollup: a row nobody could locate gets the word that
+    # says so, and a `coverage: 0` would be read by a consumer as a measured total loss.
+    assert row["verdict"] == "INSUFFICIENT"
+    assert row["verdict_reason"] == "no ledger label"
+    assert row["break_even_coverage"] is None
+    assert row["contributors"] == []
 
 
 def test_primer_liability_is_null_rather_than_absent_when_it_cannot_be_sized(
@@ -287,6 +350,9 @@ def test_a_since_window_that_filters_everything_out_still_emits_the_whole_shape(
     for row in out["primer_liability"]["servers"]:
         assert set(row) == LIABILITY_SERVER, _ADD_ON_PURPOSE
         _check_types("primer_liability.servers[]", row)
+        for contributor in row["contributors"]:
+            assert set(contributor) == LIABILITY_CONTRIBUTOR, _ADD_ON_PURPOSE
+            _check_types("primer_liability.servers[].contributors[]", contributor)
 
 
 def test_the_encoded_fallback_holds_on_a_ledger_that_straddles_the_counter(stats_json):
@@ -318,6 +384,10 @@ def test_the_whole_document_survives_a_json_round_trip(stats_json):
     assert json.loads(json.dumps(out)) == out
     for key in ("idle", "free", "uncertain"):
         assert isinstance(out["primer_liability"][key], list)
+    # `contributors` is built from a comprehension and then `sorted`, which is the exact
+    # shape named above — a list on the way out that compares unequal on the way back.
+    for row in out["primer_liability"]["servers"]:
+        assert isinstance(row["contributors"], list)
 
 
 def test_a_record_whose_decision_cannot_be_read_over_bills_rather_than_under_bills(

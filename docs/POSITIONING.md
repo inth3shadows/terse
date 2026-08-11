@@ -177,6 +177,12 @@ each wrapped server carries its own. Read the exact figure off `terse stats`
 rather than inferring it from the policy rules — as the 248/312 split above shows,
 rule order decides it and the answer is easy to get wrong by eye.
 
+This rule now has a machine rollup: `terse stats --recommend` prints the comparison
+above as one word per **installed entry** (`KEEP` / `TUNE` / `UNWRAP` /
+`INSUFFICIENT`) beside the coverage ratio it was derived from. Installed entry, not
+peer — a router pays one union primer for its whole fleet. No numbers here change;
+it is the same comparison, made once by the tool instead of by eye.
+
 ## codegraph — a third category, not an average
 
 `codegraph_explore` doesn't fit either table above cleanly, and averaging it into

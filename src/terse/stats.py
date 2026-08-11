@@ -538,6 +538,31 @@ _ONCE_UNKNOWN = "once/session (?)"
 # five other. The prose labels stay the `--json` contract; these are render-only.
 _CADENCE_ABBR = {_PER_TURN: "/turn", _ONCE: "1x", _ONCE_FREE: "1x-", _ONCE_UNKNOWN: "1x?"}
 
+# --- wrap/don't-wrap verdict (#238) ---------------------------------------------------
+#
+# A rollup, not a new measurement. Every input below is a field `_break_even` and `_cadence`
+# already publish, and the 1.0 threshold is the one `build_primer_section` already draws
+# (`turns_covered < 1` / `session_covered < 1` -> NET NEGATIVE). Nothing here is a number the
+# code did not previously compute -- that is the #238 contract.
+KEEP, TUNE, UNWRAP, INSUFFICIENT = "KEEP", "TUNE", "UNWRAP", "INSUFFICIENT"
+
+# `_break_even` reasons that describe MISSING DATA rather than a measured outcome. `never
+# called` is NOT here: it is a real measurement whose meaning depends on cadence (see
+# `_recommend`), which is the whole idle-router/free-standalone split (#211).
+_NO_DATA_REASONS = ("no ledger label", "no token data", "primer unknown")
+
+# Verdict reason vocabulary beyond the `_break_even` strings it passes through. Closed set --
+# `--json` consumers switch on these.
+_R_CLEARED = "cleared"                 # coverage >= 1 against its own primer
+_R_SHORT = "short of break-even"       # positive rate, coverage < 1
+_R_EXPANDING = "expanding"             # negative rate with no primer to offset it
+
+# Render order for the recommend table: what needs ACTION first. Deliberately different from
+# the break-even table, which sorts by rate — that one answers "which server is the best
+# codec fit", this one answers "what should I change today", and a KEEP row is the one thing
+# on the screen that needs nothing.
+_VERDICT_ORDER = {UNWRAP: 0, TUNE: 1, INSUFFICIENT: 2, KEEP: 3}
+
 
 def _cadences_of(servers: list[dict[str, Any]]) -> set[str]:
     """Which cadences an install actually has — the gate for every per-cadence line.
@@ -667,6 +692,133 @@ def _break_even(primer_tokens: int | None, blocks: int | None,
             "break_even_verdict": None}
 
 
+def _recommend(srv: dict[str, Any]) -> dict[str, Any]:
+    """One wrap/don't-wrap word per INSTALLED ENTRY, rolled up from fields already published
+    on `srv` -- no new arithmetic (#238).
+
+    Takes the whole row rather than scalars (unlike `_break_even`, just above) deliberately:
+    the verdict must be a pure function of what the break-even table PRINTS, so an operator
+    can re-derive it from the two columns in front of them. It is also why this reads
+    `break_even_verdict` rather than re-testing the conditions that produced it -- a second
+    copy of that precedence chain is a second thing to drift.
+
+    THE ENTRY, NOT THE PEER. `primer_liability` has already pooled a router's peers into one
+    row against ONE shared union primer. Computing this per peer would charge each peer the
+    full shared primer and tell the operator to unwrap peers that are collectively paying for
+    themselves -- the inversion `primer_liability`'s own docstring warns about, one level up.
+    `_PAYS_PRIMER` guarantees a `folded` peer never reaches here at all.
+
+    `break_even_coverage` is `tokenized_blocks / blocks_to_break_even`, which reduces
+    algebraically to `entry_saved / primer_tokens` -- the per-entry twin of `turns_covered`
+    and `session_covered`. TOKENIZED blocks, never `blocks`: `saved = rate * tokenized` is an
+    exact identity, and dividing by `blocks` would credit savings to blocks that were never
+    measured, manufacturing coverage out of an offline session.
+
+    The 1.0 threshold is not chosen here; it is inherited. `build_primer_section` already
+    prints NET NEGATIVE below 1.0 in both units and a neutral-positive sentence above it, so
+    thresholding anywhere else would make the summary word disagree with the paragraph it
+    summarizes. What 1.0 MEANS differs by cadence and both readings are optimistic bounds --
+    one turn for a router, one session for a lazy entry -- which is stated in the rendered
+    legend rather than corrected by a margin, because a margin would be a fabricated turn
+    count (the #144/#186/#188 family). The only thing that could turn either bound into a
+    measurement is a ledger-side session/turn marker, which is a ledger SHAPE change and a
+    separate decision -- deliberately not in #238.
+    """
+    v = srv.get("break_even_verdict")
+    rate = srv.get("saved_per_block")
+    tok = srv.get("tokenized_blocks")
+    need = srv.get("blocks_to_break_even")
+    cadence = srv.get("cadence")
+    primer = srv.get("primer_tokens")
+
+    def out(verdict, reason, coverage=None):
+        return {"verdict": verdict, "verdict_reason": reason,
+                "break_even_coverage": coverage}
+
+    # 1. Missing data is never an accusation. A verdict on any of these would be a verdict
+    #    about a missing FILE or a missing tokenizer -- the #197 review finding, one level up.
+    if v in _NO_DATA_REASONS:
+        return out(INSUFFICIENT, v)
+
+    # 2. `never called` is a MEASUREMENT, and what it measures depends on who pays for idling.
+    #    An eagerly-primed router ships its union primer every turn whether or not anyone
+    #    calls it, so zero calls is a complete measurement of a total loss -- exactly what
+    #    `idle` already reports as "pure cost". A lazily-primed standalone entry paid NOTHING
+    #    (#211, `free`), and "unwrap the servers costing you least" is the inversion the #211
+    #    follow-up exists to prevent. The truthy-primer guard mirrors `idle`'s own: a
+    #    default-deny router costs nothing to leave idle either.
+    if v == "never called":
+        if cadence == _PER_TURN and primer:
+            return out(UNWRAP, v)
+        return out(INSUFFICIENT, v)
+
+    # 3. A non-positive rate against a real primer: no block volume earns it back, at any
+    #    volume. This is the ONLY structural impossibility here, and it is what separates
+    #    UNWRAP from TUNE.
+    #
+    #    Coverage is still well-defined here, and computed directly rather than via
+    #    `blocks_to_break_even` (which `_break_even` deliberately leaves `None` for this
+    #    branch -- "blocks needed to reach break-even" has no answer when no volume ever
+    #    gets there). But `break_even_coverage` is a DIFFERENT quantity -- "how much of the
+    #    primer this window's savings recovered" -- and that reduces to `entry_saved /
+    #    primer_tokens` same as every other branch, negative and all. Found in review:
+    #    an earlier cut returned `None` for a genuinely negative rate, which is
+    #    indistinguishable in `--json` from the `no primer` branch's TRULY undefined `None`
+    #    (division by zero) -- the exact "a None can't tell two accusations apart" failure
+    #    this module's own docstring warns against, just re-introduced one function up.
+    if v == "never":
+        coverage = (rate * tok) / primer if rate is not None and tok is not None and primer else None
+        return out(UNWRAP, v, coverage)
+
+    # 4/5. `no primer`: nothing to earn back "at any rate, positive or negative"
+    #      (`_break_even`). Coverage is undefined -- `blocks_to_break_even` is 0.0 and the
+    #      division has no meaning -- so it is None, not a fabricated infinity.
+    #
+    #      One deliberate divergence from `_break_even`'s ordering, and it is not an
+    #      arithmetic change: `_break_even` short-circuits on `primer == 0` BEFORE testing the
+    #      rate, so a server with no primer that is actively EXPANDING payloads reports
+    #      `no primer`. The primer is free; the expansion is not. Reachable when a policy was
+    #      edited mid-window. Verdicting that KEEP would be the one flatly wrong word this
+    #      table can print, so the verdict layer -- which reads both fields -- says UNWRAP and
+    #      the reason string says why the two cells disagree.
+    if v == "no primer":
+        if rate is not None and rate < 0:
+            return out(UNWRAP, _R_EXPANDING)
+        return out(KEEP, v)
+
+    # 6. A real finite break-even. `v is None` here by `_break_even`'s construction, but the
+    #    guards are explicit rather than assumed: this function is also handed rows from a
+    #    `--json` blob written by an older terse (see `_fmt_verdict`), and a missing field
+    #    must degrade, never raise.
+    if not need or tok is None:
+        return out(INSUFFICIENT, v or "no token data")
+    coverage = tok / need
+    return (out(KEEP, _R_CLEARED, coverage) if tok >= need
+            else out(TUNE, _R_SHORT, coverage))
+
+
+def _contributors(labels: list[str], blocks_by: dict[str, int], saved_by: dict[str, int],
+                  tokenized_by: dict[str, int]) -> list[dict[str, Any]]:
+    """Per-ledger-label evidence UNDER an installed-entry verdict -- a ranking of who
+    contributes, never a verdict of its own (#238).
+
+    Deliberately verdict-INCAPABLE: no `primer_tokens`, no `blocks_to_break_even`, no
+    `break_even_verdict`, no `verdict`. The break-even question is `saved / primer`, and a
+    peer has no primer -- a router pays ONE union primer for the whole fleet. Anyone wanting
+    a per-peer KEEP/UNWRAP would have to ADD a field with no honest per-peer value, which is
+    a visible act rather than an accident. The absence is asserted by name in the contract
+    test, not just left implicit.
+    """
+    rows: list[dict[str, Any]] = []
+    for lbl in labels:
+        tok = tokenized_by.get(lbl, 0)
+        saved = saved_by.get(lbl, 0)
+        rows.append({"label": lbl, "blocks": blocks_by.get(lbl, 0),
+                     "tokenized_blocks": tok, "saved_tokens": saved,
+                     "saved_per_block": (saved / tok) if tok else None})
+    return sorted(rows, key=lambda r: r["saved_tokens"], reverse=True)
+
+
 def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> dict[str, Any]:
     """Primer cost of the INSTALLED wrapped servers, against the window's savings.
 
@@ -784,11 +936,19 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         per_label_enc = [encoded_by_label.get(lbl) for lbl in labels]
         encoded = (None if (not labels or any(e is None for e in per_label_enc))
                    else sum(e or 0 for e in per_label_enc))
-        servers.append({"server": name, "scope": row.get("scope"), "state": state,
-                        "primer_tokens": tokens, "ledger_labels": labels, "blocks": blocks,
-                        "tokenized_blocks": tokenized, "cadence": _cadence(state, blocks, encoded),
-                        **_break_even(tokens, blocks, tokenized,
-                                      sum(saved_by_label.get(lbl, 0) for lbl in labels))})
+        row_out: dict[str, Any] = {
+            "server": name, "scope": row.get("scope"), "state": state,
+            "primer_tokens": tokens, "ledger_labels": labels, "blocks": blocks,
+            "tokenized_blocks": tokenized, "cadence": _cadence(state, blocks, encoded),
+            **_break_even(tokens, blocks, tokenized,
+                          sum(saved_by_label.get(lbl, 0) for lbl in labels)),
+            "contributors": _contributors(labels, by_label, saved_by_label,
+                                          tokenized_by_label),
+        }
+        # Last, and from the finished row: the verdict is a rollup of the published fields,
+        # so it is computed from them rather than alongside them.
+        row_out.update(_recommend(row_out))
+        servers.append(row_out)
 
     # Each server lands in exactly one bucket, and only two of them are money.
     per_turn = sum(s["primer_tokens"] or 0 for s in servers if s["cadence"] == _PER_TURN)
@@ -956,6 +1116,22 @@ def _fmt_break_even(srv: dict[str, Any]) -> tuple[str, str]:
     return rate, f"{calls:,.2f}"
 
 
+def _fmt_verdict(srv: dict[str, Any]) -> tuple[str, str, str]:
+    """`(verdict, coverage, reason)` as text, for the recommend table.
+
+    Same degrade-don't-raise property as `_fmt_break_even` directly above, and for the same
+    reason: `build_primer_section` and `--json` are public, so a liability blob round-tripped
+    through a terse that predates #238 carries none of these keys. A report is never
+    load-bearing (#197) -- it dashes out.
+
+    Coverage reuses `_fmt_rate`, which already closed the print-as-zero hole: a 0.004 coverage
+    rendering as `0.00x` beside the word TUNE would read as a measured zero."""
+    verdict = srv.get("verdict") or "–"
+    cov = srv.get("break_even_coverage")
+    coverage = "–" if cov is None else _fmt_rate(cov) + "x"
+    return verdict, coverage, srv.get("verdict_reason") or "–"
+
+
 def _fmt_denominator(srv: dict[str, Any]) -> str:
     """The call count the rate was taken over.
 
@@ -1032,6 +1208,127 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
     lines.append("  a BLOCK is one emitted tool-result text block — >=1 per call, so this "
                  "is a conservative bar (#141).")
     return lines
+
+
+def build_recommend_section(liab: dict[str, Any]) -> list[str]:
+    """One verdict word per installed entry — the `--recommend` body (#238).
+
+    A SEPARATE block rather than a column on the break-even table, and that is forced rather
+    than preferred: the break-even row is already 79 of a pinned 80 columns (its own comment,
+    and `test_the_break_even_row_stays_inside_eighty_columns`), while `INSUFFICIENT` is 12
+    characters. Shrinking a neighbour to make room re-opens the overflow hole review closed
+    once already, when `blocks` was narrowed and the live ledger immediately produced an
+    11-character cell.
+
+    Empty when nothing pays a primer — the same contract as `build_primer_section`, and for
+    the same reason: absent and zero are different claims.
+
+    Every legend line is gated on being APPLICABLE, mirroring `_build_break_even_table`'s
+    `_cadences_of` discipline. An install with no TUNE row is not lectured about autotune,
+    and an install with no lazy entry is not told about a one-session reading it never gets.
+    """
+    servers = liab.get("servers") or []
+    if not servers:
+        return []
+    # 2 + 14+1 + 12+1 + 9+1 + 9+1 = 50 of fixed cells, plus the reason word — the longest in
+    # the closed vocabulary is `short of break-even` (19), so the widest row is 69. The slack
+    # is deliberate: this table's whole justification is that the break-even row had none.
+    lines = [f"  {'server':<14} {'verdict':<12} {'cadence':>9} {'coverage':>9} why"]
+    # Sorted by WHAT NEEDS ACTION, not by rate — deliberately different from the break-even
+    # table directly above it. That one ranks servers by how well the codec fits them; this
+    # one answers "what should I change today", and a KEEP row is the one line on the screen
+    # that needs nothing, so it sorts last. Ties break on ascending coverage (the thinnest
+    # margin first) and then on name, so the order is total and the output is deterministic.
+    for srv in sorted(servers, key=lambda s: (_VERDICT_ORDER.get(s.get("verdict"), 99),
+                                              s.get("break_even_coverage")
+                                              if s.get("break_even_coverage") is not None
+                                              else -1.0,
+                                              s.get("server") or "")):
+        verdict, coverage, why = _fmt_verdict(srv)
+        name = srv["server"] if len(srv["server"]) <= 14 else srv["server"][:13] + "…"
+        # `.get`, defaulted to a dash, exactly as the break-even table does: an older `--json`
+        # blob has no cadence and a blank is honest where guessing would re-assert the defect.
+        cadence = _CADENCE_ABBR.get(srv.get("cadence") or "", "–")
+        lines.append(f"  {name:<14} {verdict:<12} {cadence:>9} {coverage:>9} {why}")
+    verdicts = {s.get("verdict") for s in servers}
+    if KEEP in verdicts or UNWRAP in verdicts:
+        lines.append("  KEEP = cleared its own primer in this window. UNWRAP = no block "
+                     "volume ever will.")
+    if TUNE in verdicts:
+        # The wording is load-bearing and pinned by a test. TUNE is a REACHABILITY statement:
+        # terse modelled no policy change and structurally cannot — the ledger is payload-free
+        # by design, so re-encoding a real payload under a hypothetical gate is not something
+        # any amount of code in this module can do. Saying "a policy change would help" would
+        # be the #144/#186/#188 family again, so this points at the tool that actually answers
+        # the what-if instead of claiming the answer.
+        lines.append("  TUNE = arithmetically reachable, not a modelled improvement.")
+        lines.append("  terse has tested no policy change here — `terse policy autotune` is "
+                     "the command that does.")
+    if INSUFFICIENT in verdicts:
+        lines.append("  INSUFFICIENT = the ledger cannot answer yet (no label, no token "
+                     "data, unreadable policy, or not called).")
+    shown = _cadences_of(servers)
+    if _PER_TURN in shown:
+        lines.append("  coverage on a /turn row is against ONE turn's charge — a router "
+                     "pays it every turn, so compare it")
+        lines.append("  against your own turn count.")
+    if shown - {_PER_TURN}:
+        lines.append("  coverage on a 1x row treats the whole window as one session — the "
+                     "most favourable reading;")
+        lines.append("  every further session paid the charge again.")
+    # Contributors print ONLY where the pooling is otherwise invisible. A single-label entry's
+    # contributor list is a copy of its own row and says nothing; a router's is the answer to
+    # "which peer is carrying this?", which the entry-level verdict deliberately does not ask.
+    pooled = [s for s in servers if len(s.get("contributors") or []) >= 2]
+    if pooled:
+        lines.append("  a router's peers are pooled under its one shared primer — the "
+                     "verdict is per installed entry,")
+        lines.append("  never per peer (#238).")
+        for srv in pooled:
+            ranked = "; ".join(f"{c['label']} {c['saved_tokens']:,}"
+                               for c in srv["contributors"])
+            lines.append(f"    {srv['server']} pools, by tokens saved: {ranked}")
+    return lines
+
+
+def build_recommend_report(agg: dict[str, Any], *, log_path: str | Path,
+                           window: str | None = None,
+                           liability: dict[str, Any] | None = None) -> str:
+    """`terse stats --recommend` — the verdict screen, arithmetic one flag away.
+
+    The signature mirrors `build_stats_report` exactly, including the `agg` this renderer
+    never reads, so `_cmd_stats` swaps one call for the other rather than growing a second
+    argument-marshalling path that can drift from the first. The verdict is computed from the
+    LIABILITY blob alone; `agg` is already folded into it upstream (`primer_liability` takes
+    it) and re-reading it here would be a second, independently-drifting view of the same
+    numbers.
+
+    `--recommend` REPLACES the ledger tables rather than appending to them. Replacing leaves
+    the default report's bytes completely untouched, which is what keeps this change out of
+    the several negative text assertions `test_primer_liability.py` already makes.
+    """
+    scope = f"last {window}" if window else "all time"
+    lines = [f"terse recommend — {scope}  (ledger: {log_path})", ""]
+    if liability is None:
+        # Never an empty document, and never the WRONG refusal. The install could not be
+        # scanned at all (`_cmd_stats` has already named the cause on stderr), which is not
+        # the same claim as "nothing here is wrapped" — the same absent-vs-zero discipline
+        # the rest of this module keeps, one layer up in the renderer.
+        lines.append("no verdict: the install could not be sized, so there is no primer to "
+                     "weigh this window's")
+        lines.append("savings against (the reason is on stderr). `terse stats` still reports "
+                     "the ledger totals.")
+        return "\n".join(lines) + "\n"
+    section = build_recommend_section(liability)
+    if not section:
+        lines.append("no verdict: nothing in this install pays a primer, so there is nothing "
+                     "to weigh a window's")
+        lines.append("savings against. `terse stats` still reports the ledger totals.")
+        return "\n".join(lines) + "\n"
+    lines += section
+    lines.append("")
+    lines.append("run without --recommend for the arithmetic behind these words.")
+    return "\n".join(lines) + "\n"
 
 
 def build_stats_writer(stats_log: str | Path, server: str):
