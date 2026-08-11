@@ -338,9 +338,9 @@ uv run terse stats --since 7d # live savings from real proxy sessions (payload-f
 Reports are written under `reports/` (gitignored). The corpus under `corpus/` is
 gitignored because captured tool output may contain real data.
 
-## Releasing (automatic)
+## Releasing (automatic, with one manual follow-up)
 
-Releases are **zero-touch** — there is no manual tag, version bump, or changelog step.
+Publishing is **zero-touch** — there is no manual tag or version bump.
 `.github/workflows/release.yml` runs on every push to `main` and:
 
 1. Derives the next version from the Conventional-Commit types since the last tag —
@@ -351,6 +351,19 @@ Releases are **zero-touch** — there is no manual tag, version bump, or changel
 3. Builds the sdist+wheel, cuts a GitHub Release with auto-generated notes, and publishes
    `terse-mcp` to PyPI via Trusted Publishing (OIDC — no stored token), after re-running
    the full test suite against the tagged tree as a publish gate.
+
+The **one manual step** is the changelog: in the first pull request opened after a release,
+run
+
+```bash
+python3 scripts/release/graduate_changelog.py <tag> CHANGELOG.md
+```
+
+to move `[Unreleased]` into its versioned section. This is not automated because the
+workflow cannot push to protected `main` on a user-owned repo without a stored PAT (the
+header of `release.yml` carries the full reasoning). It is enforced, not remembered:
+`tests/test_changelog_covers_every_release.py::test_unreleased_does_not_describe_work_that_already_shipped`
+fails that pull request until the section moves.
 
 Two manual overrides remain: push a `vX.Y.Z` tag by hand (released verbatim), or use the
 Actions **Run workflow** button with a forced bump level. To require a human click before

@@ -5,9 +5,32 @@ All notable changes to terse are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases are cut from git tags (`vX.Y.Z`, via hatch-vcs) — an entry moves from
-`[Unreleased]` to a versioned section when its tag is pushed.
+`[Unreleased]` to a versioned section **in the first pull request after its tag is pushed**,
+by running `python3 scripts/release/graduate_changelog.py <tag> CHANGELOG.md` (a manual step;
+the workflow cannot push to protected `main`). Nobody has to remember:
+`tests/test_changelog_covers_every_release.py::test_unreleased_does_not_describe_work_that_already_shipped`
+fails that pull request until the section has moved.
 
 ## [Unreleased]
+
+### Changed
+
+- **`release.yml` no longer tries to graduate the changelog itself.** The step pushed a
+  `chore(release):` commit to protected `main` after every release and failed 44 out of 44
+  times, silently — the push was suffixed `|| echo "::warning::..."`, so a red step never
+  surfaced. It is unfixable with the built-in token: this is a user-owned repo, where Ruleset
+  bypass actors (org-only) do not exist, and a `GITHUB_TOKEN`-opened PR triggers no workflow
+  runs, so under `required_status_checks.strict=true` it would be permanently unmergeable.
+  Graduation is now an explicit manual step in the first PR after a release, enforced by the
+  existing CI-run-gated detection test rather than by a stored PAT.
+- **`graduate_changelog.py` dates a section from its tag instead of from the day it ran.**
+  Now that the script runs days after the tag rather than seconds, `date.today()` was
+  guaranteed to disagree with `git log -1 --format=%cs <tag>` — the exact comparison
+  `test_every_section_carries_the_release_date_git_records` makes. It now prefers an explicit
+  `YYYY-MM-DD` third argument, then the tag's own commit date, and falls back to today only
+  with a stderr warning naming `git fetch --tags` as the fix.
+
+## [0.22.3] - 2026-08-06
 
 ### Fixed
 
