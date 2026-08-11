@@ -7,8 +7,8 @@
 [![terse MCP server](https://glama.ai/mcp/servers/inth3shadows/terse/badges/score.svg)](https://glama.ai/mcp/servers/inth3shadows/terse)
 
 The **lossless-first** MCP compression proxy: it makes tool output smaller without
-ever changing what your agent reads — byte-faithful by default, lossy only where you
-explicitly opt in.
+ever changing what your agent reads — **lossless by value** by default (what decodes back
+out is the same JSON, value for value), lossy only where you explicitly opt in.
 
 terse reduces tokens two ways: one that carries the day-to-day value, and one that is
 harder for a competitor to copy. Keeping those straight is the whole positioning.
@@ -22,7 +22,7 @@ round-trip gate asserts `decompress(compress(x)) == x` over the whole corpus). T
 the guarantee most tools in this space decline to make: headroom's JSON path is lossless
 on uniform arrays but **falls back to dropping rows** on larger/irregular record sets,
 recoverable only via a `retrieve` round-trip against a cache that expires (verified,
-v0.32.0; default 30-min TTL); Anthropic/OpenAI context-editing **drops** old tool results
+v0.34.0; default 30-min TTL); Anthropic/OpenAI context-editing **drops** old tool results
 server-side. terse never silently mutates what the model sees — and "lossless" is the
 category, not the token count. In terse's own production ledger this codec is where
 essentially all the savings come from (see Status). Its one honest caveat: the
@@ -45,15 +45,16 @@ The cross-block join (below) removed that exclusion, and across every third-part
 benchmarked in BENCHMARKS §6 a repeated call now produces a delta. How often *your* loop
 repeats a call is still yours to measure (`terse stats`).
 When your loop *does* re-fetch mostly-unchanged results it compounds hard; when it
-doesn't, it costs nothing (lossless, and emitted only when smaller). Default-on since its
-validation program completed (see Status).
+doesn't, it costs nothing (lossless, and emitted only when smaller). OPT-IN, not the
+default, since #170: its validation program completed, but its primer paragraph costs
+more than the tier banks at the measured hit rate (see Status).
 
 Around those two sits the **bundle** that turns a byte filter into a control plane you
 don't want to rip out: MCP-native proxy packaging (transparent to any downstream
 server, no client-side reformatting), a **live savings ledger** (`terse stats`), a
 fluency-gated lossy escape hatch, and self-installing ops tooling (`install-mcp`,
 `mcp-status`) — each diff/lossy tier validated by a behavioral eval before it was ever
-turned on by default.
+shipped.
 
 It is **selective by design**. Measurement on real tool output showed the win is
 strongly per-tool (0–30%): large on record/symbol-shaped verbose output, near-zero
@@ -76,9 +77,9 @@ then (optionally) serves it through a per-tool policy that decides which tiers r
   repeatedly, the proxy emits a lossless delta against the prior result instead of
   the full payload (the 91%-overlap headroom). Self-describing, verified to reconstruct
   exactly, and emitted only when smaller — falls back to the full form otherwise.
-  Default-on since its validation program completed (fluency, nested-record coverage,
-  and the drift soak — see Status); opt out with `proxy --no-diff` / `install-mcp
-  --no-diff` or a policy-file `"diff": false`.
+  Its validation program completed (fluency, nested-record coverage, and the drift
+  soak — see Status), but the tier stays OFF by default since #170; opt in with
+  `proxy --diff` / `install-mcp --diff` or a policy-file `"diff": true`.
   Record-shaped JSON gets a row/key diff; non-JSON results (file reads, source excerpts,
   log tails) get a separate content-defined-chunking (CDC) diff — a rolling hash cuts
   chunk boundaries by content, not position, so an edit anywhere only perturbs the
@@ -339,7 +340,7 @@ positioning note at the top and Status).
 
 | Tool | Why not a like-for-like row |
 |---|---|
-| **headroom** (`headroom-ai`, headroomlabs-ai) | The closest *product* competitor and far more adopted (63.5k★, verified via the GitHub API 2026-07-31 — an earlier "~29–49k, unverified" figure here was stale). But its JSON compressor is a **deterministic Rust transform, not an ML model** (verified, v0.32.0): lossless on uniform arrays, yet **falling back to dropping rows** on larger/irregular record sets, recoverable only via a `retrieve` round-trip against a **time-boxed, backend-dependent cache** (default 30-min TTL; SQLite in the proxy path, in-memory if constructed directly — gone after expiry, eviction, or process exit). A separate, optional text/log compressor *is* ML (a keyless model download). Not comparable on a lossless token axis: terse's guarantee is unconditional — no cache, no TTL, no ML, no egress. (The `headroom` package on PyPI is a different, unrelated CLI.) |
+| **headroom** (`headroom-ai`, headroomlabs-ai) | The closest *product* competitor and far more adopted (63.5k★, verified via the GitHub API 2026-07-31 — an earlier "~29–49k, unverified" figure here was stale). But its JSON compressor is a **deterministic Rust transform, not an ML model** (verified, v0.34.0): lossless on uniform arrays, yet **falling back to dropping rows** on larger/irregular record sets, recoverable only via a `retrieve` round-trip against a **time-boxed, backend-dependent cache** (default 30-min TTL; SQLite in the proxy path, in-memory if constructed directly — gone after expiry, eviction, or process exit). A separate, optional text/log compressor *is* ML (a keyless model download). Not comparable on a lossless token axis: terse's guarantee is unconditional — no cache, no TTL, no ML, no egress. (The `headroom` package on PyPI is a different, unrelated CLI.) |
 | **LLMLingua-2** (Microsoft, 6.5k★) | Lossy prompt compression via a trained token-classifier; operates on **input prompts**, not structured tool output. Verified on a JSON payload it strips the syntax (`{`, `}`, `:`, `"`) as low-information and emits **invalid, unparseable JSON** (and silently truncates past its 512-token window). Different axis entirely. |
 | **Anthropic context editing** / OpenAI equivalents | **Native, server-side, lossy** history-pruning (drop oldest tool results past a threshold), no local artifact to run keylessly. This — not any third-party tool — is the real strategic overlap with terse for first-party API users. |
 | **Code Mode / code execution with MCP** (Cloudflare Agents SDK; Anthropic's pattern) | The strongest *architectural* alternative after native context editing, and a different mechanism rather than a competing encoder: the model writes code against a typed SDK and the code filters results, so the payload never enters context at all. Their claims, not reproduced here — Anthropic reports 150k→2k tokens on one workflow, Cloudflare ~81% vs direct tool calling. Not a like-for-like row because it is **lossy by selection** (a model-written filter decides which fields survive) and needs a code sandbox plus a scriptable API — not a drop-in for an arbitrary stdio server. Complementary in principle: code mode avoids the payload, terse compresses whatever still reaches the model. |
