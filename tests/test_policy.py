@@ -131,6 +131,53 @@ def test_capture_is_a_registered_rule_key(tmp_path):
     assert "capture" in _RULE_KEYS
 
 
+def test_require_server_name_defaults_false_and_parses_true(tmp_path):
+    p = tmp_path / "policy.json"
+    p.write_text(json.dumps({
+        "version": 1,
+        "policies": [
+            {"match": {"tool": "secret-broker.*"}, "tiers": [], "capture": False,
+             "require_server_name": True},
+            {"match": {"tool": "gh.*"}, "tiers": ["minify"]},
+        ],
+    }), encoding="utf-8")
+    pol = load_policy(p)
+    assert pol.select("secret-broker.reveal").require_server_name is True
+    assert pol.select("gh.items").require_server_name is False  # omitted -> default
+    assert Rule("x", ()).require_server_name is False           # dataclass default
+
+
+@pytest.mark.parametrize("bad", ["true", "yes", 0, 1, None, [], {}])
+def test_require_server_name_rejects_a_non_bool(tmp_path, bad):
+    # Same failure direction as `capture` (#85): a lax coercion of a truthy-looking
+    # non-bool would silently enable a check that then never actually blocks startup
+    # the way the operator who wrote `true` intended.
+    p = tmp_path / "policy.json"
+    p.write_text(json.dumps({"version": 1,
+                             "policies": [{"match": {"tool": "x.*"}, "tiers": [],
+                                           "require_server_name": bad}]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="'require_server_name' must be true or false"):
+        load_policy(p)
+
+
+def test_require_server_name_is_a_registered_rule_key():
+    from terse.policy import _RULE_KEYS
+    assert "require_server_name" in _RULE_KEYS
+
+
+def test_require_server_name_does_not_change_select_matching():
+    # The field gates proxy STARTUP (see test_proxy.py), not rule matching — `select()`
+    # itself must behave identically with or without it, on both the matched and the
+    # unmatched-fallback path.
+    with_flag = Policy(rules=[Rule("secret-broker.*", (), capture=False,
+                                   require_server_name=True)])
+    without_flag = Policy(rules=[Rule("secret-broker.*", (), capture=False)])
+    for server in (None, "secret-broker", "other"):
+        a = with_flag.select("secret.reveal", server=server)
+        b = without_flag.select("secret.reveal", server=server)
+        assert (a.tiers, a.capture) == (b.tiers, b.capture)
+
+
 def test_apply_passes_server_through_to_rule_selection():
     p = Policy(rules=[Rule(tool_glob="runecho.*", tiers=())])   # () = passthrough
     raw = json.dumps({"result": [{"id": 1, "k": "v"}, {"id": 2, "k": "v"}]})
