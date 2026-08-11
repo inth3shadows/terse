@@ -5,8 +5,7 @@ name: release
 #     Conventional-Commit types since the last tag (feat -> minor, fix/perf -> patch,
 #     a breaking `!`/`BREAKING CHANGE` -> minor while 0.x), creates and pushes that tag,
 #     then the same run builds, releases, and publishes. NOTHING is done by hand: no tag,
-#     no version bump, no changelog graduation. A commit with only docs/chore/test/ci/etc.
-#     types releases nothing.
+#     no version bump. A commit with only docs/chore/test/ci/etc. types releases nothing.
 #   * push a `vX.Y.Z` tag by hand — the override. `version` takes the tag as-is.
 #   * the Actions "Run workflow" button (workflow_dispatch) — same as a main push, with an
 #     optional forced bump.
@@ -16,6 +15,24 @@ name: release
 # whole point of "you don't have to do anything special". The tag is pushed with the
 # built-in GITHUB_TOKEN, whose pushes deliberately do NOT trigger another workflow run, so
 # the tag never re-fires this workflow: the push-to-main run does everything, once.
+#
+# CHANGELOG GRADUATION IS DELIBERATELY NOT AUTOMATED HERE — do not re-add it. This workflow
+# used to run `graduate_changelog.py` and push a `chore(release):` commit to `main` after the
+# tag; that push failed 44 out of 44 releases, silently, because branch protection rejects it
+# and the failure was swallowed by `|| echo "::warning::..."`. It cannot be fixed with the
+# built-in token: `inth3shadows/terse` is a USER-owned repo, and Ruleset bypass actors are
+# org-only, so nothing can exempt this workflow from protection. Opening a PR instead does not
+# help either — GITHUB_TOKEN-created PRs trigger no workflow runs (the same property this file
+# relies on above), so with `required_status_checks.strict=true` a bot PR gets zero check runs
+# and is permanently unmergeable. The only remaining path is a stored PAT or GitHub App with
+# bypass rights, which is not worth a standing credential + trust-boundary weakening on a
+# solo-maintainer repo. release-please and Changesets reach the same conclusion.
+#
+# The manual step, run in the FIRST pull request opened after a release:
+#     python3 scripts/release/graduate_changelog.py <tag> CHANGELOG.md
+# Nothing relies on anyone remembering: `tests/test_changelog_covers_every_release.py::
+# test_unreleased_does_not_describe_work_that_already_shipped` is CI-run-gated (git blame +
+# tag-contains), so the next PR after a release goes red until the section is graduated.
 #
 # The tag IS the version (hatch-vcs) — a build resolves to the tag, byte-for-byte. The
 # distribution name is `terse-mcp` (bare `terse` is taken on PyPI); it normalizes to
@@ -165,35 +182,6 @@ jobs:
           set -euo pipefail
           git tag "${NEW_TAG}" "${GITHUB_SHA}"
           git push origin "${NEW_TAG}"
-
-      # Graduate [Unreleased] -> [X.Y.Z] on main. AFTER the tag push on purpose: the tag is
-      # what publishes, so a hiccup here must never block or alter a release — it lands as a
-      # follow-up commit instead. That also means the tagged artifact does not contain its
-      # own section, which is exactly why the changelog test exempts the newest release.
-      #
-      # `chore(release):` is load-bearing: this push re-enters this workflow, and only
-      # feat/fix/perf/breaking subjects bump. `chore` derives bump=none, so the run exits
-      # "releasing nothing" instead of looping. `[skip ci]` keeps it from burning a run at
-      # all. Both belong to the same guarantee — do not change the prefix casually.
-      - name: Graduate the changelog
-        if: steps.decide.outputs.release == 'true'
-        env:
-          NEW_TAG: ${{ steps.decide.outputs.tag }}
-        run: |
-          set -euo pipefail
-          python3 scripts/release/graduate_changelog.py "${NEW_TAG}" CHANGELOG.md
-          if git diff --quiet -- CHANGELOG.md; then
-            echo "nothing to graduate"; exit 0
-          fi
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add CHANGELOG.md
-          git commit -m "chore(release): graduate the changelog for ${NEW_TAG} [skip ci]"
-          # Rebase onto whatever landed while this ran; a lost race is a warning, not a
-          # failed release — the version is already tagged and published by then.
-          git pull --rebase --quiet origin "${GITHUB_REF_NAME}" || true
-          git push origin "HEAD:${GITHUB_REF_NAME}" \
-            || echo "::warning::changelog graduation could not be pushed; do it by hand"
 
   release:
     needs: version
