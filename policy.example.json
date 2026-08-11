@@ -7,13 +7,19 @@
   },
   "policies": [
     {
-      "_comment": "secret-broker, rule 1 of 2 — the ONE tool measured safe AND worth compressing: list_credentials returns ~70 uniform records (metadata only, never values — verified by a live leak check) and compresses 45.5% (3521->1918 cl100k), the best in the fleet. 'capture': false still applies: compress it, never persist it. Requires proxy --server-name secret-broker, since the tools are named secret.* and would not otherwise match a secret-broker.* glob (#83).",
+      "_comment": "secret-broker, rule 1 of 3 — the ONE tool measured safe AND worth compressing: list_credentials returns ~70 uniform records (metadata only, never values — verified by a live leak check) and compresses 45.5% (3521->1918 cl100k), the best in the fleet. 'capture': false still applies: compress it, never persist it. Requires proxy --server-name secret-broker, since the tools are named secret.* and would not otherwise match a secret-broker.* glob (#83).",
       "match": { "tool": "secret-broker.secret.list_credentials" },
       "tiers": ["minify", "tabularize", "dictionary"],
       "capture": false
     },
     {
-      "_comment": "secret-broker, rule 2 of 2 — DEFAULT-DENY for the crown-jewel server. Everything else gets tiers:[] (no compression, and critically no in-memory diff base) + capture:false (never on disk, neither corpus nor debug-log, #85). This is deliberately fail-SAFE rather than specific-deny: reveal_credential returns a plaintext value by design and inject_env returns subprocess stdout that may echo one, but more importantly a FUTURE secret-broker tool that returns a value inherits zero retention automatically instead of silently getting compressed. The payload-free ledger still counts every tool here, so opting one in later is a measurement, not a guess. require_server_name:true makes the proxy refuse to start without --server-name secret-broker, rather than silently letting this rule go unreachable (its glob needs the qualified candidate, same reason as rule 1's comment) and falling through to the permissive default (#243).",
+      "_comment": "secret-broker, rule 2 of 3 — exa_search: verified safe (public web-search results, no credential in the payload — the safety case #143 already made) and verified real, not the original synthetic 59% guess: two live measurements against the post-#52/PR#53 parsed shape came back 1.0% (n=3 results) and 2.6% (n=10), blended down by 'highlights' free-text excerpts (69% of tokens, 0.0% compressible); the result metadata alone (id/title/url/author/date) hits 8.5%. Below the fleet's headline numbers but real, safe, and free — capture:false keeps it off disk regardless (#143).",
+      "match": { "tool": "secret-broker.secret.exa_search" },
+      "tiers": ["minify", "tabularize", "dictionary"],
+      "capture": false
+    },
+    {
+      "_comment": "secret-broker, rule 3 of 3 — DEFAULT-DENY for the crown-jewel server. Everything else gets tiers:[] (no compression, and critically no in-memory diff base) + capture:false (never on disk, neither corpus nor debug-log, #85). This is deliberately fail-SAFE rather than specific-deny: reveal_credential returns a plaintext value by design and inject_env returns subprocess stdout that may echo one, but more importantly a FUTURE secret-broker tool that returns a value inherits zero retention automatically instead of silently getting compressed. The payload-free ledger still counts every tool here, so opting one in later is a measurement, not a guess. require_server_name:true makes the proxy refuse to start without --server-name secret-broker, rather than silently letting this rule go unreachable (its glob needs the qualified candidate, same reason as rule 1's comment) and falling through to the permissive default (#243).",
       "match": { "tool": "secret-broker.*" },
       "tiers": [],
       "capture": false,

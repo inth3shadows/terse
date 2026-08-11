@@ -13,6 +13,23 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Added
+
+- **`secret-broker.secret.exa_search` opted into compression tiers** (`#143`). The
+  server's default-deny stance held it at `tiers:[]` pending evidence a carve-out was
+  worth it — the original synthetic estimate (~59%, from `#52`'s "body arrives as a
+  string, not real JSON" theory) turned out wrong once `secret-broker` PR #53 shipped
+  the parsed shape: two live measurements against the real payload came back 1.0%
+  (`n=3` results) and 2.6% (`n=10`), dragged down by `highlights` free-text excerpts
+  (69% of tokens, 0.0% compressible — `tabularize`/`dictionary` win on repeated
+  structure, not unique prose). The result metadata alone (id/title/url/author/date)
+  hits 8.5%. Small but real, safe (public web-search results, no credential in the
+  payload — verified by `#143`'s leak check), and free: `capture:false` keeps it off
+  disk exactly as before. Every other `secret-broker.*` tool is unaffected by the
+  default-deny rule.
+
+## [0.23.4] - 2026-08-11
+
 ### Fixed
 
 - **`policy.example.json` carried no `secret-broker` rules at all**, even though `#243`
