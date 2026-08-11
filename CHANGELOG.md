@@ -15,6 +15,20 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **`policy.example.json` carried no `secret-broker` rules at all**, even though `#243`
+  added the `require_server_name` field specifically to protect a rule shaped like this
+  server's. A fresh install that copied the example verbatim (or wrapped `secret-broker`
+  before ever authoring a custom policy) got zero protection —
+  `secret.reveal_credential` would compress and persist under the unmatched-tool
+  default. Ported the two rules from the operator's live policy: `list_credentials`
+  (metadata-only, compresses 45.5%) gets full tiers, everything else is
+  `tiers:[]`/`capture:false`/`require_server_name:true`. Pinned by
+  `test_example_policy_guards_secret_broker_crown_jewels`.
+
+## [0.23.3] - 2026-08-11
+
+### Fixed
+
 - **`Policy.select` failed OPEN, not closed, when `--server-name` was omitted.** A
   server-scoped deny-all rule (e.g. `secret-broker.*` — the crown-jewel default-deny
   rule guarding `secret.reveal_credential`) is only reachable via the server-qualified
