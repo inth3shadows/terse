@@ -342,6 +342,31 @@ def test_mcp_status_cmd_flags_a_launcher_that_no_longer_resolves(tmp_path, monke
     assert row["launcher_missing"] is True
 
 
+def test_mcp_status_cmd_flags_a_hand_edited_entry_missing_server_name(
+        tmp_path, monkeypatch, capsys):
+    # install-mcp always bakes --server-name (#152), so this only ever fires on a
+    # hand-edited entry -- which is exactly the case a real fleet hit: two installs of
+    # the same logical server, launched via different downstream command names, neither
+    # baking --server-name, silently writing the ledger under two different identities.
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "runecho": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", "--policy", "/p.json", "--", "runecho-mcp"]},
+    }}), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["mcp-status"]) == 0
+    out = capsys.readouterr().out
+    assert "no --server-name baked in" in out
+    assert "'runecho-mcp'" in out
+
+    assert main(["mcp-status", "--json"]) == 0
+    row = next(r for r in json.loads(capsys.readouterr().out) if r["server"] == "runecho")
+    assert row["ledger_identity"] == "runecho-mcp"
+    assert row["ledger_identity_explicit"] is False
+
+
 def test_mcp_status_cmd_flags_a_missing_policy_file(tmp_path, monkeypatch, capsys):
     # A wrapped server whose policy file was deleted/moved after install would fail to
     # start (the proxy raises on load), but the flat status line showed it as normal.

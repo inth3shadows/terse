@@ -631,12 +631,45 @@ def test_scan_scopes_surfaces_wraps_diff_stats_and_missing_policy(tmp_path, monk
     assert cg["wraps"] == "codegraph-mcp serve"
     assert cg["diff"] == "off" and cg["stats"] is False
     assert cg["policy_missing"] is True
+    # codegraph bakes --server-name -> its ledger identity is explicit, not guessed.
+    assert cg["ledger_identity"] == "codegraph"
+    assert cg["ledger_identity_explicit"] is True
     ru = by["runecho"]
     assert ru["wraps"] == "runecho-mcp"
     # Resolved, not merely named: a bare "default" read as "on" and convinced a reader
     # diffing was unimplemented (#181). The label states the value it actually inherits.
     assert ru["diff"] == "default (off)" and ru["stats"] is True
     assert ru["policy_missing"] is False
+    # runecho has no --server-name -> the ledger identity is a GUESS from the downstream
+    # command's basename (`server_label`), and that guess is flagged as such.
+    assert ru["ledger_identity"] == "runecho-mcp"
+    assert ru["ledger_identity_explicit"] is False
+
+
+def test_scan_scopes_flags_server_name_drift_between_two_installs_of_the_same_server(
+        tmp_path, monkeypatch):
+    """The real-world case this detector exists for: the same logical server wrapped
+    twice with two different downstream command names, neither carrying --server-name.
+    Each writes ledger records under a different guessed identity -- `mcp-status` has
+    the data to say so and, before this, silently didn't."""
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "runecho-a": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", "--", "runecho"]},
+        "runecho-b": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", "--", "runecho-mcp"]},
+    }}))
+    im.stash_path(cfg).write_text(json.dumps({"user": {
+        "runecho-a": {"command": "runecho", "args": []},
+        "runecho-b": {"command": "runecho-mcp", "args": []}}}))
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+    monkeypatch.chdir(tmp_path)
+
+    by = {r["server"]: r for r in im.scan_scopes() if r["scope"] == "user"}
+    assert by["runecho-a"]["ledger_identity"] == "runecho"
+    assert by["runecho-b"]["ledger_identity"] == "runecho-mcp"
+    assert by["runecho-a"]["ledger_identity_explicit"] is False
+    assert by["runecho-b"]["ledger_identity_explicit"] is False
 
 
 def test_scan_scopes_never_flags_a_relative_policy_as_missing(tmp_path, monkeypatch):
@@ -663,6 +696,7 @@ def test_scan_scopes_wrapped_only_fields_are_none_for_non_wrapped(tmp_path, monk
     assert row["state"] == "unwrapped"
     assert row["wraps"] is None and row["diff"] is None and row["stats"] is None
     assert row["policy_missing"] is False
+    assert row["ledger_identity"] is None and row["ledger_identity_explicit"] is None
 
 
 def test_scan_scopes_never_raises_when_local_scope_unresolvable(tmp_path, monkeypatch):

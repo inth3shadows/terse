@@ -48,6 +48,7 @@ from pathlib import Path
 
 from . import policy as policy_mod
 from ._secure_io import write_restricted
+from .stats import resolve_ledger_identity
 
 STASH_NAME = ".terse-mcp-stash.json"
 PEERS_STEM = ".terse-peers"
@@ -1309,6 +1310,7 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
                     # point is to surface real drift, not manufacture noise).
                     if os.path.isabs(policy) and not os.path.exists(policy):
                         policy_missing = True
+            downstream: list[str] = []
             if "--" in args:
                 downstream = args[args.index("--") + 1:]
                 if downstream:
@@ -1331,6 +1333,24 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
             diff = ("off" if "--no-diff" in args
                     else "on" if "--diff" in args else default_label)
             stats_on = "--no-stats" not in args
+        ledger_identity = None
+        ledger_identity_explicit = None
+        if state in ("wrapped", "wrapped-unstashed") and downstream:
+            # `resolve_ledger_identity` is the SAME rule `proxy.py`'s live write path
+            # uses, imported rather than re-derived — a review round caught this and
+            # `proxy.py`'s copy diverging in principle before this existed. A standalone
+            # entry with no baked `--server-name` writes ledger records under a GUESSED
+            # identity (the downstream command's basename), which splits from any other
+            # install of the SAME logical server that guesses differently — e.g. a
+            # hand-written entry launching `runecho-mcp` next to an `install-mcp`-managed
+            # one launching the same server as `runecho`. `install-mcp` always bakes
+            # `--server-name` (#152); a missing one here means a hand-edited entry, which
+            # is exactly the case this can't catch any other way (#237's boundary keeps
+            # this a detector, not a proxy behavior change — nothing here alters routing).
+            opts = parse_proxy_opts(servers[name]) or {}
+            explicit_name = opts.get("server_name")
+            ledger_identity = resolve_ledger_identity(explicit_name, downstream)
+            ledger_identity_explicit = explicit_name is not None
         if state in ("router", "router-ambiguous"):
             # A router has no `--` downstream and no single `--policy`: what it fronts is
             # the peers file's list, and each peer carries its own policy there.
@@ -1347,7 +1367,9 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
                                                         "folded-and-live") else None),
                     # An unreadable peers file is reported, not raised: every route out of
                     # that state ran through code that used to traceback on it.
-                    "peers_error": peers_err})
+                    "peers_error": peers_err,
+                    "ledger_identity": ledger_identity,
+                    "ledger_identity_explicit": ledger_identity_explicit})
     return rows
 
 
