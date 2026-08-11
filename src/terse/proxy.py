@@ -1732,6 +1732,8 @@ def run_proxy(
     `server_name` is this downstream's name in the MCP config. It makes a server-scoped
     policy rule (`runecho.*`) match a server whose tools aren't self-prefixed, and labels
     the stats ledger with the real server identity instead of the command basename (#83).
+    If the policy marks any rule `require_server_name`, omitting it is refused outright
+    rather than silently falling through to a less restrictive rule.
 
     `lazy_primer` (#168 phase 2), default True, is the CLI's real default and not exposed
     as a flag — passed through from here only so a test that isn't about primer behavior
@@ -1753,6 +1755,28 @@ def run_proxy(
     if transport_err is not None:
         sys.stderr.write(f"[terse-proxy] {transport_err}\n")
         return 2
+
+    # Fail fast, before a single tool is proxied, rather than fail open on the first
+    # call to a tool a `require_server_name` rule was meant to guard. Without
+    # `server_name`, `Policy._match_candidates` never synthesizes the server-qualified
+    # candidate such a rule needs to ever match — the rule goes silently unreachable and
+    # the tool falls through to the unmatched-tool default instead (full tiers,
+    # `capture=True`). Refusing to start is the loud failure that gap should have had.
+    #
+    # `not server_name`, not `is None`: `_match_candidates` gates the same candidate on
+    # `if server` (falsy), so `--server-name ""` is already just as unreachable there as
+    # omitting the flag entirely — an `is None` check here would let an empty string
+    # slip past this refusal into the exact silent-fallback gap it exists to close.
+    if not server_name:
+        needs_name = sorted({r.tool_glob for r in pol.rules if r.require_server_name})
+        if needs_name:
+            sys.stderr.write(
+                "[terse-proxy] refusing to start: policy rule(s) "
+                f"{needs_name} set \"require_server_name\": true, but no --server-name "
+                "was given. Without it these rules can never match and the tools they "
+                "guard fall through to the policy's permissive default. Pass "
+                "--server-name <name>.\n")
+            return 2
 
     capture, audit = _build_capture_and_audit(capture_dir, debug_log, _new_session_id())
 

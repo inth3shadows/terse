@@ -954,6 +954,55 @@ def test_run_proxy_rejects_empty_downstream_without_launching():
     assert cout.getvalue() == ""        # nothing launched, nothing forwarded
 
 
+def test_run_proxy_refuses_to_start_without_a_required_server_name(capsys):
+    # The gap this closes: a server-scoped `require_server_name` rule needs
+    # `_match_candidates` to synthesize the qualified candidate to ever match, which
+    # only happens when `server` is truthy. Without this guard, omitting --server-name
+    # would silently make the rule unreachable and fall through to the permissive
+    # unmatched-tool default instead of refusing outright.
+    pol = Policy(rules=[Rule("secret-broker.*", (), capture=False,
+                             require_server_name=True)])
+    cin, cout = io.StringIO('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'), io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], pol, stdin=cin, stdout=cout)
+    assert rc == 2
+    assert cout.getvalue() == ""        # nothing launched, nothing forwarded
+    err = capsys.readouterr().err
+    assert "require_server_name" in err and "secret-broker.*" in err
+
+
+def test_run_proxy_refuses_to_start_with_an_empty_server_name(capsys):
+    # `Policy._match_candidates` gates the qualified candidate on `if server` (falsy),
+    # so `--server-name ""` is exactly as unreachable there as omitting the flag. An
+    # `is None` check here would let that empty string slip past this refusal into the
+    # same silent-fallback gap the guard exists to close (review-caught).
+    pol = Policy(rules=[Rule("secret-broker.*", (), capture=False,
+                             require_server_name=True)])
+    cin, cout = io.StringIO('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'), io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], pol, stdin=cin, stdout=cout, server_name="")
+    assert rc == 2
+    assert cout.getvalue() == ""
+
+
+def test_run_proxy_starts_normally_when_the_required_server_name_is_given():
+    pol = Policy(rules=[Rule("secret-broker.*", (), capture=False,
+                             require_server_name=True)])
+    cin, cout = io.StringIO('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'), io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], pol, stdin=cin, stdout=cout,
+                   server_name="secret-broker", lazy_primer=False)
+    assert rc == 0
+    assert cout.getvalue() != ""        # the fake server actually ran and replied
+
+
+def test_run_proxy_is_unaffected_by_missing_server_name_when_no_rule_requires_it():
+    # Regression guard: FULL has no `require_server_name` rule, so the existing,
+    # long-standing "server_name is optional" behavior must be completely unchanged.
+    cin, cout = io.StringIO('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'), io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=cin, stdout=cout,
+                   lazy_primer=False)
+    assert rc == 0
+    assert cout.getvalue() != ""
+
+
 def test_run_proxy_reports_unlaunchable_command_cleanly():
     # a command that cannot be exec'd must surface as a clean exit code, not a traceback
     cin, cout = io.StringIO(""), io.StringIO()

@@ -101,6 +101,28 @@ class Rule:
     # returns a plaintext value by design) safe to wrap by construction rather than by
     # discipline. Default True = exactly the pre-#85 behavior.
     capture: bool = True
+    # `"require_server_name": true` — refuse to start the proxy at all if `--server-name`
+    # was not given. Closes a fail-OPEN gap: a server-scoped rule like this one (glob
+    # `secret-broker.*`) is only reachable via the candidate `_match_candidates` inserts
+    # when `server` is truthy — omit `--server-name` and the candidate is never
+    # synthesized, the rule never matches, and the tool falls through to
+    # `Policy.select`'s unmatched-tool fallback, whose `capture` is the dataclass
+    # default `True`. A credential-returning tool guarded ONLY by a server-scoped
+    # deny-all rule is therefore safe by a CLI flag being present, not by the policy —
+    # exactly the "discipline, not construction" failure #85 (`capture`, above) exists
+    # to close for the disk-write case. This closes it for the "rule never reached" case.
+    #
+    # Deliberately a per-rule, author-declared flag rather than something inferred from
+    # the glob shape: a glob like `secret-broker.*` needs server-qualification to ever
+    # match (its tools are literally named `secret.*`, never self-prefixed), but a glob
+    # like `kb.*` does NOT — `kb`'s tools self-prefix (`kb.read.list_principles` matches
+    # `kb.*` on the bare candidate alone). No syntactic rule tells these apart; only the
+    # policy author, who knows the server's real tool names, does. `_match_candidates`'s
+    # `bare.startswith(f"{server}.")` skip-check (below) already carries a comment on
+    # exactly this ambiguity from #199 — same reason a heuristic here would eventually
+    # be wrong in one direction or the other. Default False = every existing policy is
+    # unaffected until its author opts a specific rule in.
+    require_server_name: bool = False
     # `"structured": "compress"` — also run this tool's `structuredContent` through the
     # codec, replacing the typed field with a terse envelope (#128).
     #
@@ -447,16 +469,17 @@ def _coerce_tiers(raw: Any, where: str) -> tuple[str, ...]:
     return tuple(raw)
 
 
-def _coerce_capture(raw: Any, where: str) -> bool:
-    """Strictly a real bool — a mistyped `"capture": "false"` must NOT become True (#85).
+def _coerce_strict_bool(raw: Any, where: str, key: str) -> bool:
+    """Strictly a real bool — a mistyped `"capture": "false"` must NOT become True (#85),
+    and the same holds for `require_server_name`.
 
     Deliberately stricter than the `bool(...)` coercion the non-security knobs use:
-    `capture` is the switch that keeps a credential-returning tool's payload off disk,
-    and every wrong-typed value in Python is TRUTHY (`bool("false") is True`), so a lax
-    coercion would silently turn the guard back ON — the one direction a typo must never
-    fail in. Fail loudly instead, at load, before a single payload is proxied."""
+    both fields are safety switches, and every wrong-typed value in Python is TRUTHY
+    (`bool("false") is True`), so a lax coercion would silently turn the guard back ON —
+    the one direction a typo must never fail in. Fail loudly instead, at load, before a
+    single payload is proxied."""
     if not isinstance(raw, bool):
-        raise ValueError(f"{where}: 'capture' must be true or false, got "
+        raise ValueError(f"{where}: {key!r} must be true or false, got "
                          f"{type(raw).__name__} {raw!r}")
     return raw
 
@@ -516,7 +539,8 @@ def _coerce_structured(raw: Any, where: str) -> str:
 _TOP_KEYS = frozenset({"version", "defaults", "policies", "diff", "diff_keyframe_interval",
                        "join_blocks", "never_lossy_servers"})
 _DEFAULTS_KEYS = frozenset({"tiers"})
-_RULE_KEYS = frozenset({"match", "tiers", "fields", "capture", "structured"})
+_RULE_KEYS = frozenset({"match", "tiers", "fields", "capture", "require_server_name",
+                        "structured"})
 _MATCH_KEYS = frozenset({"tool"})
 
 
@@ -548,7 +572,11 @@ def load_policy(path: str | Path) -> Policy:
         glob = match.get("tool", "*")
         rules.append(Rule(tool_glob=glob, tiers=_coerce_tiers(r.get("tiers", []), f"policies[{i}]"),
                           fields=r.get("fields", {}),
-                          capture=_coerce_capture(r.get("capture", True), f"policies[{i}]"),
+                          capture=_coerce_strict_bool(r.get("capture", True),
+                                                      f"policies[{i}]", "capture"),
+                          require_server_name=_coerce_strict_bool(
+                              r.get("require_server_name", False),
+                              f"policies[{i}]", "require_server_name"),
                           structured=_coerce_structured(r.get("structured", "auto"),
                                                         f"policies[{i}]")))
     return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", False)),

@@ -15,6 +15,29 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **`Policy.select` failed OPEN, not closed, when `--server-name` was omitted.** A
+  server-scoped deny-all rule (e.g. `secret-broker.*` — the crown-jewel default-deny
+  rule guarding `secret.reveal_credential`) is only reachable via the server-qualified
+  match candidate `_match_candidates` synthesizes, and that synthesis only happens when
+  `server` is truthy. Drop `--server-name` — a hand-edited config, a future refactor,
+  anything outside the normal `install-mcp` path (which always bakes it) — and such a
+  rule silently goes unreachable: the credential-returning tool falls through to
+  `Policy.select`'s unmatched-tool default, whose `capture` is the dataclass default
+  `True`. Fixed with a new opt-in, per-rule `"require_server_name": true` field —
+  declarative, matching the existing `capture` pattern (#85), not a heuristic: a fully
+  general static detector can't tell a server-scoped glob (`secret-broker.*`, whose
+  tools never self-prefix) from a same-server namespaced one (`kb.*`, whose tools do)
+  from the glob string alone. `run_proxy` now refuses to start (clear stderr, exit 2)
+  rather than silently degrading, whenever a loaded policy marks a rule
+  `require_server_name` and no `--server-name` was given. Applied to the operator's own
+  live policy (`~/.config/terse/policy.json`, outside this repo) — `policy.example.json`
+  carries no `secret-broker` rule at all, so this change alone does not protect a
+  fresh install that copies the example; that's the scope of a planned follow-up.
+
+## [0.23.2] - 2026-08-11
+
+### Fixed
+
 - **`docs/POSITIONING.md` and `BENCHMARKS.md` §5 published stale and falsified personal-fleet
   numbers.** The personal-fleet savings figure was two conflicting numbers across the two docs
   (6.8% vs 9.2%, both dated snapshots from early August); republished as one live figure
