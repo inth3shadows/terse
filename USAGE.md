@@ -810,14 +810,25 @@ one prior generation kept), and a write failure can never affect a tool call.
 ```bash
 uv run terse stats               # all recorded history
 uv run terse stats --since 7d    # just the last week (30m / 24h / 7d / 1w forms)
+uv run terse stats --recommend   # one wrap/don't-wrap verdict per installed entry
 uv run terse stats --json        # the raw aggregate, for scripts
 ```
 
+`--recommend` rolls the break-even table's two numeric columns into one word per installed
+entry — `KEEP` (cleared its own primer this window), `TUNE` (arithmetically reachable, just
+short of the bar), `UNWRAP` (no block volume ever clears it), `INSUFFICIENT` (the ledger
+cannot answer yet) — printed beside the coverage ratio it came from. It **replaces** the
+ledger tables rather than adding to them; drop the flag for the arithmetic behind the words.
+`TUNE` is a reachability statement and nothing more: terse models no policy change here (the
+ledger is payload-free by design, so it structurally cannot) — `terse policy autotune` is the
+command that answers the what-if. The verdict is in `--json` either way, so a script never
+needs both flags.
+
 `--json` is a **contract**, not a debug dump: `tests/test_stats_json_contract.py` pins every
-field name and type at six shapes — the top level, `total`, each `tools[]` row, each value
-of the `versions` object, the `primer_liability` blob, and each of its `servers[]` rows — so
-a rename or a removal fails CI rather than a consumer's script. Three things worth knowing
-before you parse it:
+field name and type at seven shapes — the top level, `total`, each `tools[]` row, each value
+of the `versions` object, the `primer_liability` blob, each of its `servers[]` rows, and each
+of those rows' `contributors[]` — so a rename or a removal fails CI rather than a consumer's
+script. Four things worth knowing before you parse it:
 
 - **`versions` is an object, not an array**, keyed by the terse version string that wrote
   those records (`{"0.17.1": {"blocks": …}}`). Iterating it directly gives you version
@@ -831,6 +842,13 @@ before you parse it:
 - **`primer_liability` itself can be `null`**, when the install could not be sized (a
   malformed MCP config). The ledger half of the document is still complete and correct; the
   reason is on stderr.
+- **The `verdict` is per installed entry, never per peer.** A multiproxy router pays ONE
+  union primer for its whole fleet, so `primer_liability.servers[]` already pools its peers
+  into a single row and the verdict is computed against that pool. The per-peer breakdown is
+  in `contributors[]`, which carries evidence (blocks, tokens saved, rate) and deliberately
+  no primer, break-even or verdict of its own — there is no honest per-peer primer to divide
+  by, and charging each peer the full shared one would recommend unwrapping peers that are
+  collectively paying for themselves.
 
 The report shows total tokens saved, the decision mix (how often the cross-call diff
 actually fired), and a per-server/per-tool breakdown — with a `diff%` column (that

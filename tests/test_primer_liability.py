@@ -22,7 +22,14 @@ from __future__ import annotations
 
 import json
 
-from terse.stats import build_primer_section, build_stats_report, primer_liability
+import pytest
+
+from terse.stats import (
+    build_primer_section,
+    build_recommend_section,
+    build_stats_report,
+    primer_liability,
+)
 
 
 def _policy(tmp_path, name="p.json", tool="kb.*", tiers=("minify", "tabularize")):
@@ -686,3 +693,338 @@ def test_a_passthrough_block_can_still_attach_a_primer__known_gap(tmp_path):
     # THE WRONG ANSWER, pinned so the day someone fixes it this test fails and says why.
     assert liab["servers"][0]["cadence"] == "once/session (unpaid)"
     assert liab["free"] == ["probe"]
+
+
+# --- wrap/don't-wrap verdict (#238) ---------------------------------------------------
+#
+# #175 stated the rule and #197 put both halves of the arithmetic in `terse stats` as two
+# numeric columns, leaving the operator to do the comparison. These pin the rollup: one word
+# per INSTALLED ENTRY, computed from the fields already published, thresholded exactly where
+# `build_primer_section` already prints NET NEGATIVE.
+
+
+def _one(tmp_path, *rows, state="wrapped", policy=None, wraps=None, server="kb"):
+    """One installed entry against a hand-built agg, returned as its liability ROW.
+
+    A helper rather than four lines repeated seventeen times, because every test below is
+    about the VERDICT and none of them is about the scan/agg plumbing that produces it."""
+    pol = policy if policy is not None else _policy(tmp_path)
+    liab = primer_liability([_scan(server, state, server if wraps is None else wraps, pol)],
+                            _agg(*rows))
+    return liab["servers"][0]
+
+
+def test_a_server_that_cleared_its_primer_this_window_reads_KEEP(tmp_path):
+    """The happy path, and the shape the whole verdict exists to name in one word: a
+    positive rate that carried `tokenized_blocks` past `blocks_to_break_even`. Before this
+    the operator read two numeric columns and did the comparison themselves."""
+    srv = _one(tmp_path, ("kb", 10, 10_000, 1_000))
+    assert srv["break_even_verdict"] is None          # a real, finite break-even...
+    assert srv["tokenized_blocks"] > srv["blocks_to_break_even"]
+    assert srv["verdict"] == "KEEP"
+    assert srv["verdict_reason"] == "cleared"
+    assert srv["break_even_coverage"] > 1
+
+
+def test_a_server_short_of_its_break_even_reads_TUNE_rather_than_UNWRAP(tmp_path):
+    """The shortfall here is a VOLUME gap, not a structural one: the rate is positive, so
+    more blocks at today's rate do clear the primer. `UNWRAP` would tell an operator to
+    throw away a server that is one busy session from paying for itself — the same
+    over-pessimism that argued for unwrapping a paying server in review of #197."""
+    srv = _one(tmp_path, ("kb", 1, 110, 100))         # 10 tok saved against a ~248 primer
+    assert srv["saved_per_block"] > 0                  # ...reachable, just not reached
+    assert srv["tokenized_blocks"] < srv["blocks_to_break_even"]
+    assert srv["verdict"] == "TUNE"
+    assert srv["verdict_reason"] == "short of break-even"
+    assert 0 < srv["break_even_coverage"] < 1
+
+
+def test_a_non_positive_rate_reads_UNWRAP_at_any_block_volume(tmp_path):
+    """`break_even_verdict == "never"` is the ONLY structural impossibility in this table —
+    no block volume earns this primer back, which is exactly what separates `UNWRAP` from
+    `TUNE`. The block count is deliberately large: volume is not the missing ingredient."""
+    srv = _one(tmp_path, ("kb", 5_000, 100_000, 100_000))
+    assert srv["blocks"] == 5_000 and srv["saved_per_block"] == 0.0
+    assert srv["break_even_verdict"] == "never"
+    assert srv["verdict"] == "UNWRAP"
+    assert srv["verdict_reason"] == "never"
+
+
+def test_exactly_clearing_the_break_even_reads_KEEP_not_TUNE(tmp_path):
+    """The boundary at `tokenized_blocks == blocks_to_break_even`. A `>` where the code has
+    `>=` would file a server that EXACTLY paid for itself as needing a tune, and the issue's
+    own framing is "break-even already cleared".
+
+    The fixture is constructed so the equality is exact rather than approximately true: the
+    primer is read back from a probe run and then banked verbatim over a single block, so
+    `rate == primer` and `blocks_to_break_even == primer / primer == 1.0` with no rounding
+    anywhere in the chain."""
+    pol = _policy(tmp_path)
+    primer = _one(tmp_path, policy=pol)["primer_tokens"]
+    assert primer > 0
+    srv = _one(tmp_path, ("kb", 1, primer + 100, 100), policy=pol)
+    assert srv["tokenized_blocks"] == srv["blocks_to_break_even"] == 1
+    assert srv["verdict"] == "KEEP"
+    assert srv["verdict_reason"] == "cleared"
+    assert srv["break_even_coverage"] == 1.0
+
+
+def test_every_break_even_reason_that_names_missing_data_reads_INSUFFICIENT(tmp_path):
+    """A `KEEP` or an `UNWRAP` on any of these would be a verdict about a missing FILE or a
+    missing tokenizer rather than about the server — the #197 review finding, one level up.
+    `never called` is deliberately NOT in this family: it is a real measurement, and the test
+    below splits it on cadence."""
+    cases = {
+        # no label to look the ledger rows up by — we never found the rows to ask.
+        "no ledger label": _one(tmp_path, ("kb", 4, 400, 100), wraps=""),
+        # called, but every matching row was recorded without tiktoken.
+        "no token data": _one(tmp_path, ("kb", 7, 0, 0)),
+        # a real rate, but the bar it has to clear is unreadable.
+        "primer unknown": _one(tmp_path, ("b", 5, 5_000, 2_000), server="b",
+                               policy=str(tmp_path / "gone.json")),
+    }
+    for reason, srv in cases.items():
+        assert srv["break_even_verdict"] == reason, reason
+        assert srv["verdict"] == "INSUFFICIENT", reason
+        assert srv["verdict_reason"] == reason, reason
+        # Never a fabricated 0: a consumer would read that as a measured total loss.
+        assert srv["break_even_coverage"] is None, reason
+
+
+def test_an_idle_ROUTER_reads_UNWRAP_while_an_idle_STANDALONE_entry_reads_INSUFFICIENT(
+        tmp_path):
+    """THE CADENCE SPLIT. Both rows carry `break_even_verdict == "never called"` and they get
+    different verdicts, because who pays for idling differs.
+
+    An eagerly-primed router ships its union primer every turn whether or not anybody calls
+    it, so zero calls is not missing data — it is a COMPLETE measurement of a total loss, and
+    `primer_liability` already reports exactly that as `idle`, "pure cost".
+
+    A lazily-primed standalone entry paid NOTHING (#211, `free`, "costing nothing at all"),
+    and "unwrap the servers costing you least" is the precise inversion the #211 follow-up
+    exists to prevent. Flattening these two to one verdict re-introduces it."""
+    pol = _policy(tmp_path)
+    router = _one(tmp_path, state="router", server="terse", wraps="kb", policy=pol)
+    standalone = _one(tmp_path, policy=pol)
+    assert router["break_even_verdict"] == standalone["break_even_verdict"] == "never called"
+    assert router["primer_tokens"] > 0 and standalone["primer_tokens"] > 0
+    assert router["cadence"] == "per-turn"
+    assert router["verdict"] == "UNWRAP" and router["verdict_reason"] == "never called"
+    assert standalone["cadence"] == "once/session (unpaid)"
+    assert standalone["verdict"] == "INSUFFICIENT"
+    assert standalone["verdict_reason"] == "never called"
+
+
+def test_an_idle_router_with_no_primer_to_pay_is_not_condemned(tmp_path):
+    """Mirrors `idle`'s own truthy-`primer_tokens` guard: a default-deny router emits no
+    compressed form, so it ships no primer and costs nothing to leave idle. Condemning it
+    would be condemning a server for a charge it does not pay."""
+    deny = _policy(tmp_path, name="deny238.json", tool="*", tiers=())
+    srv = _one(tmp_path, state="router", server="terse", wraps="kb", policy=deny)
+    assert srv["primer_tokens"] == 0 and srv["cadence"] == "per-turn"
+    assert srv["break_even_verdict"] == "never called"
+    assert srv["verdict"] == "INSUFFICIENT"
+
+
+def test_a_zero_primer_server_that_still_saves_tokens_reads_KEEP(tmp_path):
+    """`no primer` means there is nothing to earn back "at any rate, positive or negative"
+    (`_break_even`), so there is no case for unwrapping it. The coverage must stay None:
+    `blocks_to_break_even` is 0.0 and the ratio is undefined, so an infinity or a 0 there
+    would both be fabrications."""
+    deny = _policy(tmp_path, name="deny238b.json", tool="*", tiers=())
+    srv = _one(tmp_path, ("kb", 2, 100, 90), policy=deny)
+    assert srv["primer_tokens"] == 0 and srv["blocks_to_break_even"] == 0.0
+    assert srv["break_even_verdict"] == "no primer"
+    assert srv["verdict"] == "KEEP"
+    assert srv["verdict_reason"] == "no primer"      # "no reason to unwrap", not "profitable"
+    assert srv["break_even_coverage"] is None
+
+
+def test_a_zero_primer_server_that_is_EXPANDING_payloads_still_reads_UNWRAP(tmp_path):
+    """The one deliberate divergence from `_break_even`'s ordering, and it is a rendering
+    decision rather than an arithmetic change.
+
+    `_break_even` short-circuits on `primer == 0` BEFORE it tests the rate, so a server with
+    a free primer that is actively making payloads LARGER still reports `no primer`. The
+    primer is free; the expansion is not, and `KEEP` there is the one flatly wrong word this
+    table can print. Pins that the verdict layer reads BOTH published fields rather than
+    trusting the break-even string alone."""
+    deny = _policy(tmp_path, name="deny238c.json", tool="*", tiers=())
+    srv = _one(tmp_path, ("kb", 2, 100, 110), policy=deny)
+    assert srv["break_even_verdict"] == "no primer"   # ...what the arithmetic layer says
+    assert srv["saved_per_block"] < 0                 # ...and the fact it stepped over
+    assert srv["verdict"] == "UNWRAP"
+    assert srv["verdict_reason"] == "expanding"
+
+
+def test_a_router_gets_ONE_verdict_for_the_whole_fleet_and_its_peers_get_none(tmp_path):
+    """THE PER-ENTRY REQUIREMENT, BUILT AS A TRAP.
+
+    A router pays ONE union primer for the whole fleet. A per-peer verdict would charge each
+    peer that full shared primer and then tell the operator to unwrap peers that are
+    collectively paying for themselves — the inversion `primer_liability`'s docstring warns
+    about, one level up.
+
+    The fixture is sized so it actually discriminates rather than passing by luck: each peer
+    banks ~0.45 of the shared primer, so every peer taken alone is short of it while the pool
+    clears it comfortably. A per-peer implementation therefore produces three TUNEs and the
+    assertions below fail loudly. Both directions are asserted, so the fixture cannot rot
+    into one that would pass either way."""
+    pol = _policy(tmp_path, name="all238.json", tool="*")
+    peers = ("codegraph", "kb", "runecho")
+    rows = [_scan("terse", "router", ", ".join(peers), pol)]
+    primer = primer_liability(rows, _agg())["servers"][0]["primer_tokens"]
+    share = int(primer * 0.45)
+    assert 0 < share < primer
+    liab = primer_liability(rows, _agg(*((p, 2, share + 100, 100) for p in peers)))
+
+    # (a) exactly one verdict row, on the installed entry, and it clears.
+    assert [s["server"] for s in liab["servers"]] == ["terse"]
+    row = liab["servers"][0]
+    assert row["verdict"] == "KEEP" and row["break_even_coverage"] >= 1
+
+    # (b) the peers carry evidence and nothing that could become a verdict.
+    assert [c["label"] for c in row["contributors"]] == sorted(peers)
+    for c in row["contributors"]:
+        for forbidden in ("verdict", "verdict_reason", "break_even_coverage",
+                          "primer_tokens", "blocks_to_break_even", "break_even_verdict"):
+            assert forbidden not in c, forbidden
+
+    # (c) the fixture discriminates: each peer ALONE is short of the shared primer, so a
+    #     per-peer verdict would print three TUNEs where the truth is one KEEP.
+    for c in row["contributors"]:
+        assert c["saved_tokens"] / primer < 1, "fixture no longer traps a per-peer verdict"
+    assert sum(c["saved_tokens"] for c in row["contributors"]) / primer >= 1
+
+
+def test_a_folded_peer_never_receives_a_verdict_because_it_pays_no_primer(tmp_path):
+    """The other half of the double-charge guard, and the strongest of the three: `_PAYS_PRIMER`
+    filters `folded` peers out BEFORE a row is ever built, so there is structurally nothing to
+    attach a verdict to. Extends the `test_folded_peers_do_not_double_charge_behind_their_router`
+    fixture — same install, now asserting the verdict surface as well as the cost one."""
+    pol = _policy(tmp_path, name="folded238.json", tool="*")
+    peers = ("codegraph", "kb", "runecho")
+    rows = [_scan("terse", "router", ", ".join(peers), pol),
+            *[_scan(p, "folded", "", pol) for p in peers]]
+    liab = primer_liability(rows, _agg(*((p, 4, 4_000, 1_000) for p in peers)))
+    assert [s["server"] for s in liab["servers"]] == ["terse"]
+    assert liab["servers"][0]["verdict"] == "KEEP"
+    # And the peers appear only as evidence under it — never as rows with words of their own.
+    assert [c["label"] for c in liab["servers"][0]["contributors"]] == sorted(peers)
+    text = "\n".join(build_recommend_section(liab))
+    for peer in peers:
+        assert f"  {peer:<14} " not in text
+
+
+def test_the_coverage_counts_only_the_blocks_the_rate_was_measured_over(tmp_path):
+    """`saved = rate x tokenized` is an exact identity, so `tokenized` is the only honest
+    numerator. Dividing by `blocks` would credit savings to blocks that were never measured —
+    manufacturing coverage out of an offline session — and this fixture is sized so that
+    error would flip the verdict rather than merely nudge a ratio: 10 measured blocks out of
+    100 means a `blocks` numerator reads 10x high, turning a genuine TUNE into a KEEP."""
+    from terse.stats import aggregate
+
+    pol = _policy(tmp_path)
+    primer = _one(tmp_path, policy=pol)["primer_tokens"]
+    saved = primer // 2                                    # coverage 0.5 -> TUNE
+    recs = [{"server": "kb", "tool": "t", "raw_chars": 10, "out_chars": 4}
+            for _ in range(90)]                            # recorded without tiktoken
+    recs += [{"server": "kb", "tool": "t", "raw_chars": 10, "out_chars": 4,
+              "raw_tokens": saved + 100, "out_tokens": 100} for _ in range(1)]
+    recs += [{"server": "kb", "tool": "t", "raw_chars": 10, "out_chars": 4,
+              "raw_tokens": 100, "out_tokens": 100} for _ in range(9)]
+    agg = aggregate(recs)
+    assert agg["tools"][0]["blocks"] == 100 and agg["tools"][0]["tokenized"] == 10
+
+    srv = primer_liability([_scan("kb", "wrapped", "kb", pol)], agg)["servers"][0]
+    assert srv["blocks"] == 100 and srv["tokenized_blocks"] == 10
+    assert srv["break_even_coverage"] == pytest.approx(saved / primer)
+    assert srv["verdict"] == "TUNE"
+    # The error this pins, stated as the number it would have produced: 10x, and over the bar.
+    assert srv["blocks"] / srv["blocks_to_break_even"] > 1
+
+
+def test_a_liability_blob_from_a_pre_verdict_terse_degrades_to_a_dash_instead_of_raising(
+        tmp_path):
+    """`build_recommend_section` is public and `--json` emits this exact dict, so a blob
+    round-tripped through a terse that predates #238 carries none of the four new keys. It
+    must render, not raise — a report is never load-bearing (#197). Mirrors
+    `test_a_liability_blob_without_a_verdict_degrades_instead_of_raising` one layer up."""
+    from terse.stats import _fmt_verdict
+
+    liab = primer_liability([_scan("terse", "router", "kb", _policy(tmp_path))],
+                            _agg(("kb", 10, 10_000, 1_000)))
+    legacy = dict(liab)
+    legacy["servers"] = [{k: v for k, v in s.items()
+                          if k not in ("verdict", "verdict_reason", "break_even_coverage",
+                                       "contributors")}
+                         for s in liab["servers"]]
+    text = "\n".join(build_recommend_section(legacy))
+    assert f"  {'terse':<14} {'–':<12}" in text        # the verdict cell, dashed out
+    assert _fmt_verdict({}) == ("–", "–", "–")
+
+
+def test_the_TUNE_legend_points_at_autotune_rather_than_claiming_a_change_was_modelled(
+        tmp_path):
+    """`TUNE` is a REACHABILITY statement and nothing more. terse modelled no policy change
+    and structurally cannot — the ledger is payload-free by design, so re-encoding a real
+    payload under a hypothetical gate is not something any code in `stats.py` can do.
+
+    Wording that implies terse tested a change would be the #144/#186/#188 defect family: a
+    claim about something the code never did. The failure mode is a future edit quietly
+    upgrading the sentence, which is why the wording itself is pinned."""
+    srv_row = _one(tmp_path, ("kb", 1, 110, 100))
+    assert srv_row["verdict"] == "TUNE"
+    liab = primer_liability([_scan("kb", "wrapped", "kb", _policy(tmp_path))],
+                            _agg(("kb", 1, 110, 100)))
+    text = "\n".join(build_recommend_section(liab))
+    assert "terse policy autotune" in text
+    assert "terse has tested no policy change here" in text
+    assert "would" not in text and "will improve" not in text
+
+
+def test_the_recommend_row_stays_inside_eighty_columns(tmp_path):
+    """The same discipline as `test_the_break_even_row_stays_inside_eighty_columns`, and the
+    reason this table exists at all: `INSUFFICIENT` is 12 characters and the break-even row
+    was already 79 of its 80, so the verdict could not be a column there.
+
+    Sized against every extreme at once — an over-long server name, the longest verdict word,
+    the longest reason string in the closed vocabulary, and a million-fold coverage."""
+    pol = _policy(tmp_path, name="wide238.json", tool="*")
+    liab = primer_liability(
+        [_scan("a-very-long-server-name", "wrapped", "unlabelled", pol),
+         _scan("short", "wrapped", "short", pol),
+         _scan("massive", "wrapped", "massive", pol)],
+        _agg(("short", 1, 110, 100), ("massive", 1_000_000, 10_000_000, 0)))
+    lines = build_recommend_section(liab)
+    rows = lines[1:1 + len(liab["servers"])]
+    assert len(rows) == 3
+    assert "INSUFFICIENT" in "\n".join(rows)
+    assert "short of break-even" in "\n".join(rows)
+    assert max(len(ln) for ln in rows) <= 80, rows
+
+
+def test_the_recommend_section_is_empty_when_nothing_pays_a_primer():
+    """Absent and zero are different claims — the same reason `build_primer_section` returns
+    `[]` rather than a table of dashes. There is no verdict to give about an install with no
+    wrapped entry in it."""
+    assert build_recommend_section(primer_liability([], _agg())) == []
+
+
+def test_the_verdicts_sort_by_what_needs_action_not_by_rate(tmp_path):
+    """Deliberately a DIFFERENT order from the break-even table directly above it, which
+    sorts by rate. That table answers "which server is the best codec fit"; this one answers
+    "what should I change today", so the row needing nothing (`KEEP`) sorts last and the one
+    that can never pay for itself (`UNWRAP`) sorts first. Sorting this by rate would bury the
+    only row an operator has to act on underneath the ones that are already fine."""
+    pol = _policy(tmp_path, name="sort238.json", tool="*")
+    liab = primer_liability(
+        [_scan("keeper", "wrapped", "keeper", pol),
+         _scan("nolabel", "wrapped", "", pol),
+         _scan("shortfall", "wrapped", "shortfall", pol),
+         _scan("loser", "wrapped", "loser", pol)],
+        _agg(("keeper", 10, 10_000, 1_000), ("shortfall", 1, 110, 100),
+             ("loser", 20, 1_000, 1_000)))
+    rows = build_recommend_section(liab)[1:1 + len(liab["servers"])]
+    assert [ln.split()[0] for ln in rows] == ["loser", "shortfall", "nolabel", "keeper"]
+    assert [ln.split()[1] for ln in rows] == ["UNWRAP", "TUNE", "INSUFFICIENT", "KEEP"]

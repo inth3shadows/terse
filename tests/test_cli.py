@@ -494,6 +494,120 @@ def test_stats_cmd_json_output(tmp_path, capsys):
     assert agg["total"]["blocks"] == 1 and agg["total"]["raw_tokens"] == 100
 
 
+def _recommend_install(monkeypatch, tmp_path):
+    """A fixed install for the `--recommend` tests.
+
+    `scan_scopes` reads the REAL user config, so without this the verdict half of the output
+    — the entire point of the mode — would vary by machine. The one pre-existing stats test
+    has that dependency; these do not inherit it."""
+    import terse.install_mcp as install_mcp
+
+    pol = tmp_path / "pol.json"
+    pol.write_text(json.dumps({"version": 1,
+                               "policies": [{"match": {"tool": "*"},
+                                             "tiers": ["minify", "tabularize"]}]}),
+                   encoding="utf-8")
+    monkeypatch.setattr(install_mcp, "scan_scopes",
+                        lambda *a, **k: [{"scope": "user", "server": "kb",
+                                          "state": "wrapped", "wraps": "kb-server",
+                                          "policy": str(pol)}])
+
+
+def _recommend_ledger(tmp_path, ts):
+    from terse.stats import append_stats
+
+    log = tmp_path / "stats.jsonl"
+    for _ in range(10):
+        append_stats({"ts": ts, "server": "kb-server", "tool": "t",
+                      "decision": "compressed", "raw_chars": 4_000, "out_chars": 400,
+                      "raw_tokens": 1_000, "out_tokens": 100}, log)
+    return log
+
+
+def test_stats_recommend_prints_one_verdict_per_installed_entry_and_no_ledger_table(
+        tmp_path, capsys, monkeypatch):
+    """The mode REPLACES the ledger tables rather than appending to them, which is what keeps
+    the default report's bytes untouched (and every `not in text` assertion in
+    `test_primer_liability.py` valid). One word per installed entry, arithmetic one flag
+    away."""
+    import time
+
+    _recommend_install(monkeypatch, tmp_path)
+    log = _recommend_ledger(tmp_path, int(time.time()))
+    capsys.readouterr()
+    assert main(["stats", "--log", str(log), "--recommend"]) == 0
+    out = capsys.readouterr().out
+    assert "terse recommend" in out
+    assert "KEEP" in out and "  kb " in out
+    # ...and the arithmetic the verdict rolls up is NOT also on the screen.
+    assert "saved/block" not in out and "to break even" not in out
+    assert "primer liability across" not in out
+    assert "run without --recommend for the arithmetic" in out
+
+
+def test_stats_recommend_composes_with_since_and_log(tmp_path, capsys, monkeypatch):
+    """A verdict over 7d and a verdict over all time are different verdicts, so the window
+    has to be both honoured and NAMED — the same composition `build_stats_report` already
+    has. Here the same install reads KEEP over all time and INSUFFICIENT once the window
+    excludes every record it was judged on."""
+    _recommend_install(monkeypatch, tmp_path)
+    log = _recommend_ledger(tmp_path, 1)          # 1970, outside any window
+    capsys.readouterr()
+    assert main(["stats", "--log", str(log), "--recommend"]) == 0
+    all_time = capsys.readouterr().out
+    assert "all time" in all_time and "KEEP" in all_time
+
+    assert main(["stats", "--log", str(log), "--since", "1h", "--recommend"]) == 0
+    windowed = capsys.readouterr().out
+    assert "last 1h" in windowed
+    assert "INSUFFICIENT" in windowed and "KEEP" not in windowed
+
+
+def test_stats_recommend_with_json_emits_the_full_document_unchanged(
+        tmp_path, capsys, monkeypatch):
+    """`--json` wins, and it loses nothing by doing so: the verdict rides every liability row
+    unconditionally. Gating a contract field on a flag would give `test_stats_json_contract`
+    two shapes to pin instead of one, and would force a consumer to know which of two
+    renderers to ask for a field that is present either way."""
+    import time
+
+    _recommend_install(monkeypatch, tmp_path)
+    log = _recommend_ledger(tmp_path, int(time.time()))
+    capsys.readouterr()
+    assert main(["stats", "--log", str(log), "--json"]) == 0
+    plain = json.loads(capsys.readouterr().out)
+    assert main(["stats", "--log", str(log), "--json", "--recommend"]) == 0
+    with_flag_out = capsys.readouterr().out
+    assert json.loads(with_flag_out) == plain          # byte-for-byte the same document
+    assert "terse recommend" not in with_flag_out      # the human renderer never ran
+    row = plain["primer_liability"]["servers"][0]
+    assert row["verdict"] == "KEEP" and row["verdict_reason"] == "cleared"
+
+
+def test_stats_recommend_says_it_could_not_size_the_install_rather_than_that_nothing_is_wrapped(
+        tmp_path, capsys, monkeypatch):
+    """The two absences that reach the empty-report path are different claims, and only one
+    of them is an all-clear. A malformed MCP config means terse could not look; "nothing in
+    this install pays a primer" would tell the operator there is nothing to look AT — the
+    same absent-vs-zero confusion `primer_liability` keeps everywhere else, one layer up in
+    the renderer."""
+    import time
+
+    import terse.install_mcp as install_mcp
+
+    def boom(*a, **k):
+        raise RuntimeError("malformed config")
+
+    log = _recommend_ledger(tmp_path, int(time.time()))
+    monkeypatch.setattr(install_mcp, "scan_scopes", boom)
+    capsys.readouterr()
+    assert main(["stats", "--log", str(log), "--recommend"]) == 0
+    captured = capsys.readouterr()
+    assert "could not size the primer liability" in captured.err
+    assert "the install could not be sized" in captured.out
+    assert "nothing in this install pays a primer" not in captured.out
+
+
 def test_stats_cmd_missing_ledger_is_a_clean_error(tmp_path, capsys):
     rc = main(["stats", "--log", str(tmp_path / "absent.jsonl")])
     assert rc == 2
