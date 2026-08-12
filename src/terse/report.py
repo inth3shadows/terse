@@ -1055,16 +1055,41 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
                    and int(r["terse_ok"]) < r.get("trials", 1))
         rec = sum(1 for r in rows if int(r["terse_ok"]) < r.get("trials", 1)
                   and int(r["primer_ok"]) == r.get("trials", 1))
+        # Transport failures (#263): calls that never reached the model. Distinct from a
+        # wrong answer, and NOT the same test as the raw==0 control below — a partial
+        # rate limit lets some calls through, so it depresses every arm's accuracy while
+        # leaving `raw` non-zero, and the control never fires. That is the case that
+        # silently publishes a comprehension number for a backend that was half down.
+        fails = sum(int(r.get("fails", 0)) for r in rows)
         summary[model] = {"n": n, "raw": racc, "raw_se": rse,
-                          "terse": tacc, "terse_se": tse, "primer": pacc, "primer_se": pse}
+                          "terse": tacc, "terse_se": tse, "primer": pacc, "primer_se": pse,
+                          "fails": fails}
         if has_inline:
             summary[model].update({"inline": iacc, "inline_se": ise})
         inline_cell = (f"{iacc:.0%} ±{_ci(ise) * 100:.0f}" if has_inline else "n/a")
-        out.append(
-            f"| `{model}` | {n} | {racc:.0%} ±{_ci(rse) * 100:.0f} | {tacc:.0%} ±{_ci(tse) * 100:.0f} "
-            f"| {pacc:.0%} ±{_ci(pse) * 100:.0f} | {inline_cell} | {regr} | {rec} |"
-        )
+        if fails:
+            # No percentages at all for a model that did not answer. A number here would
+            # be read as comprehension no matter how it is footnoted — the same reason the
+            # inline arm renders `n/a` rather than 0%, and the same unknown-is-not-zero
+            # rule the ledger applies to untokenized records.
+            out.append(f"| `{model}` | {n} | n/a | n/a | n/a | n/a | n/a | n/a |")
+        else:
+            out.append(
+                f"| `{model}` | {n} | {racc:.0%} ±{_ci(rse) * 100:.0f} "
+                f"| {tacc:.0%} ±{_ci(tse) * 100:.0f} "
+                f"| {pacc:.0%} ±{_ci(pse) * 100:.0f} | {inline_cell} | {regr} | {rec} |"
+            )
     out.append("")
+    unreachable = {m: s["fails"] for m, s in summary.items() if s.get("fails")}
+    if unreachable:
+        out += [
+            "**Not measured** — these models had calls that never reached the backend "
+            "(connection error, rate limit, bad model id), so no accuracy is published "
+            "for them: "
+            + ", ".join(f"`{m}` ({f} failed call(s))" for m, f in sorted(unreachable.items()))
+            + ". A failed call is not a wrong answer; re-run once the backend is reachable.",
+            "",
+        ]
 
     # --- per-transform breakdown (terse form, pooled across models) ---
     by_tf: dict[str, list[dict]] = {}
@@ -1092,11 +1117,19 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     # Raw JSON is the control: a model that can't read RAW (0%) is a backend/config
     # failure (bad model id, refusals), not a terse-comprehension result — exclude it
     # from the gate, but say so, so a broken run can't masquerade as a verdict.
-    broken = [m for m, s in summary.items() if s["raw"] == 0]
-    gated = {m: s for m, s in summary.items() if s["raw"] > 0}
+    broken = [m for m, s in summary.items() if s["raw"] == 0 and not s.get("fails")]
+    # Excluded for the same reason, by a different and EARLIER signal: the raw==0 control
+    # only catches a TOTAL failure, and only once it has already been scored as if the
+    # model answered wrongly. A counted transport failure catches the partial case too,
+    # which is the one that reaches a plausible-looking verdict (#263).
+    unmeasured = [m for m, s in summary.items() if s.get("fails")]
+    gated = {m: s for m, s in summary.items() if s["raw"] > 0 and not s.get("fails")}
     if broken:
         out.append(f"- Excluded (raw control failed — backend/config error, not comprehension): "
                    f"{', '.join(f'`{m}`' for m in broken)}.")
+    if unmeasured:
+        out.append(f"- Excluded (calls never reached the backend — not measured): "
+                   f"{', '.join(f'`{m}`' for m in unmeasured)}.")
     # best terse-side form per model, carrying its own SE for the gap's confidence interval.
     # gap CI: raw and the best form are over the same questions (not independent), so
     # √(se_raw²+se_best²) is a conservative over-estimate of the gap's SE — the honest
@@ -1121,5 +1154,12 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
             out.append("- Comprehension regresses beyond tolerance — the proxy's in-place rewrite "
                        "is not safe to ship as-is for the worst model; prefer the primer or restrict "
                        "the policy to the transforms that held.")
+    elif not gated:
+        # Every model was excluded, so there is nothing to gate on. Say so loudly: silence
+        # here is how a run that measured NOTHING gets read as a run that found nothing
+        # wrong (#263). Absence of a regression is not evidence of comprehension.
+        out.append("- **NO VERDICT — nothing was measured.** Every model was excluded above, "
+                   "so this run says nothing about comprehension either way. Fix the "
+                   "backend(s) and re-run before drawing any conclusion from it.")
     out.append("")
     return "\n".join(out)

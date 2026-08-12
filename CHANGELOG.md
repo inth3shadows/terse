@@ -13,6 +13,36 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A transport failure in the fluency eval no longer scores as a wrong answer** (`#263`).
+  `_safe_ask` returned `""` on any exception and `score` counted that as incorrect, so an
+  unreachable model reported ~0% accuracy — indistinguishable in the report from a model
+  that genuinely could not read terse's compressed form. Because the verdict gates on the
+  **worst** model, a single rate-limited backend did not dilute a panel, it decided it: a
+  live `gemini-3.6-flash` rate limit would have returned FAIL for the whole no-primer
+  question (`#249`) on a run that measured nothing, after 66 minutes and zero output.
+
+  `_safe_ask` now returns `None` — distinct from every real reply, including an empty one —
+  and `_ask_n` returns `(correct, transport_failures)`, counting a failure separately and
+  never scoring it. A call that never happened is not a wrong answer.
+
+  The report already excluded a model whose raw control was exactly 0%. That guard catches
+  a **total** outage only, and only after scoring it as if the model had answered; it does
+  not catch a **partial** rate limit, which leaves `raw` non-zero while depressing every arm
+  — the case that reaches a plausible-looking verdict. A model with any failed call now
+  publishes **no accuracy at all** (`n/a`, never a footnoted 0%) and is excluded from the
+  gate, and a run in which every model failed states `NO VERDICT — nothing was measured`
+  rather than falling silent, because silence is how a run that measured nothing gets read
+  as a run that found nothing wrong.
+
+  Secondary hazard closed with it: `""` could *match* a question whose expected answer was
+  empty, scoring a total failure as **correct**. `questions.py` excludes such questions
+  defensively for exactly that reason; those exclusions are now belt-and-braces rather than
+  load-bearing.
+
+## [0.25.0] - 2026-08-11
+
 ### Added
 
 - **A `drop-to-retrieve` rule's COST is now recorded and reported, not just its saving**
