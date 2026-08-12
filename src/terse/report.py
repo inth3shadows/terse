@@ -960,9 +960,13 @@ def build_diff_soak_report(results: dict) -> str:
         # The soak-specific signal on top of the overall gate: the worst model's gap
         # at the DEEPEST depth, since a clean average can hide a depth-correlated slide.
         deep = depths[-1] if depths else 0
+        # `unmeasured` applies here too. Gating only the overall gap above left this
+        # depth-specific signal computing off withheld models, so a down backend still
+        # decided the drift conclusion — the same defect, one paragraph further down the
+        # same function. Found by the invariance test, not by review.
         deep_rows = {m: r for m, r in
                      ((m, [x for x in rs if x["depth"] == deep])
-                      for m, rs in results.items()) if r}
+                      for m, rs in results.items() if m not in unmeasured) if r}
         deep_gaps = {}
         for m, rs in deep_rows.items():
             facc, fse = _form_stats(rs, "terse_ok")

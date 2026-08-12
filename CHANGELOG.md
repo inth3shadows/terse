@@ -86,6 +86,16 @@ fails that pull request until the section has moved.
   artifact most likely to be screenshotted and quoted, and so the last place a false pass
   should survive. It now renders `NO VERDICT` and names the models it dropped.
 
+  Those were one defect wearing five coats — the gate was added a renderer at a time, and
+  each renderer that still lacked it published the verdict the others had just withdrawn.
+  `diff_gap_rows` asserted its agreement with the markdown *in a docstring*, which is how
+  the split opened without a test going red. The rule is now pinned as an invariance —
+  **an unmeasured model must not change any renderer's verdict** — checked across the
+  fluency markdown, the diff markdown, the soak markdown, both terminal forest plots and
+  the HTML banner from one fixture. It catches all seven gate sites, including the
+  soak's deepest-depth drift signal, which was found by writing the invariance test and
+  not by review.
+
 ## [0.25.0] - 2026-08-11
 
 ### Added

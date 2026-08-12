@@ -13,6 +13,8 @@ case that reaches a plausible-looking verdict. These tests pin both.
 
 from __future__ import annotations
 
+import re
+
 from terse.fluency.harnesses import _ask_n, _safe_ask, run_payload
 from terse.fluency.scoring import score
 from terse.report import (
@@ -433,3 +435,145 @@ def test_unmeasured_discovers_arms_instead_of_hardcoding_the_payload_ones():
     assert row["fails"] / row["attempts"] < UNMEASURED_FAIL_SHARE, \
         "premise: the share trigger must NOT fire, or this pins the wrong mechanism"
     assert _unmeasured([row]) is True, "a fully-lost arm must be caught by name discovery"
+
+
+# --- the invariant, not its symptoms ---------------------------------------------
+#
+# Findings 3, 4 and 6 of the #264 review were one defect wearing four coats: the gate
+# was added to a renderer at a time, and each renderer that still lacked it kept
+# publishing the verdict the others had just withdrawn. `diff_gap_rows` even asserted
+# its agreement with the markdown IN A DOCSTRING, which is how the split opened without
+# a single test going red.
+#
+# The three tests above pin three symptoms. This pins the rule they are instances of,
+# so a FOURTH renderer — or a fifth arm, or a future re-plumb — cannot reintroduce the
+# same defect somewhere nobody thought to write a symptom test for.
+
+def _gate_signature(text: str) -> str:
+    """The lines of a verdict that state its OUTCOME, dropping the ones that merely name
+    what was excluded. Two runs with the same measured models must produce the same
+    signature no matter how many unmeasured models were also present."""
+    verdict = text.split("## Verdict")[1] if "## Verdict" in text else text
+    return "\n".join(
+        ln for ln in verdict.splitlines()
+        if ln.strip()
+        and "Excluded (" not in ln
+        and "Not measured" not in ln
+    )
+
+
+# The unmeasured model must be able to MOVE a verdict if it is not excluded, or this
+# whole test proves nothing. A fully-dead backend cannot: it scores 0% on both arms, so
+# its gap is exactly 0 — identical to a healthy 100%/100% model — and `_worst_case_gap`
+# keeps the incumbent on a tie. The first version of this fixture was fully dead and
+# caught 1 of 6 ungated renderers.
+#
+# So the unmeasured model here is a PARTIAL outage whose surviving calls answered badly:
+# over the 20% share bar (so it is withheld) while leaving a large negative gap behind
+# (so failing to withhold it flips every verdict from PASS to FAIL). That is also the
+# realistic shape — a rate limit lets some calls through.
+
+def _diff_rows(*, degraded: bool):
+    """Diff-harness row shape. `degraded` = 25% of calls lost, survivors wrong."""
+    if not degraded:
+        return [{"qid": f"q{i}", "qtype": "count", "transform": "table", "trials": 2,
+                 "terse_ok": 2, "terse_trials": 2, "diff_ok": 2, "diff_trials": 2,
+                 "fails": 0, "attempts": 4} for i in range(4)]
+    return [{"qid": f"q{i}", "qtype": "count", "transform": "table", "trials": 2,
+             "terse_ok": 2, "terse_trials": 2,      # control survived, looks fine
+             "diff_ok": 0, "diff_trials": 1,        # one diff call lost, the other wrong
+             "fails": 1, "attempts": 4} for i in range(4)]
+
+
+def _payload_rows(*, degraded: bool):
+    """Payload-harness row shape (raw/terse/primer/inline), same construction."""
+    if not degraded:
+        return [_row() for _ in range(4)]
+    return [_row(raw_ok=2, raw_trials=2, terse_ok=0, terse_trials=1,
+                 primer_ok=0, primer_trials=1, inline_ok=0, inline_trials=1,
+                 trials=2, fails=2, attempts=8) for _ in range(4)]
+
+
+def test_an_unmeasured_model_changes_no_renderers_verdict():
+    """THE rule. Adding a backend that never answered must not move any verdict, in any
+    renderer, in either direction.
+
+    Stated as an invariance rather than a per-renderer string assertion on purpose: it
+    holds for renderers that do not exist yet, and it fails loudly for a renderer that
+    forgets the gate without anyone having to predict which one that will be. An
+    ungated renderer makes the dead model the worst case, so its verdict flips — which
+    is exactly what this compares."""
+    from terse.html_report import build_html_diff_report
+    from terse.report import build_diff_report, build_diff_soak_report
+    from terse.terminal_report import (
+        build_terminal_diff_report,
+        build_terminal_fluency_report,
+    )
+
+    def banner(html: str) -> str:
+        return "".join(re.findall(r'<div class="banner[^"]*"[^>]*>.*?</div>', html, re.S))
+
+    def plot(text: str) -> str:
+        return text.split("\n  (excluded")[0]
+
+    # A soak row is a diff row plus `depth`.
+    def soak(rows):
+        return [{**r, "depth": 1} for r in rows]
+
+    good_d, dead_d = _diff_rows(degraded=False), _diff_rows(degraded=True)
+    good_p, dead_p = _payload_rows(degraded=False), _payload_rows(degraded=True)
+    # Premise checks: without these the fixture could silently stop pinning anything.
+    assert _unmeasured(dead_d) and _unmeasured(dead_p), "the model must be withheld"
+    assert not _unmeasured(good_d) and not _unmeasured(good_p), "the control must not be"
+
+    d_alone, d_both = {"good": good_d}, {"good": good_d, "dead": dead_d}
+    p_alone, p_both = {"good": good_p}, {"good": good_p, "dead": dead_p}
+    s_alone = {"good": soak(good_d)}
+    s_both = {"good": soak(good_d), "dead": soak(dead_d)}
+
+    # Rendered eagerly rather than through a table of callables: every verdict below is
+    # a plain (label, measured-only, measured-plus-unmeasured) triple.
+    cases = [
+        ("diff markdown",
+         _gate_signature(build_diff_report(d_alone)),
+         _gate_signature(build_diff_report(d_both))),
+        ("soak markdown",
+         _gate_signature(build_diff_soak_report(s_alone)),
+         _gate_signature(build_diff_soak_report(s_both))),
+        ("fluency markdown",
+         _gate_signature(build_fluency_report(p_alone, [])),
+         _gate_signature(build_fluency_report(p_both, []))),
+        ("diff forest plot",
+         plot(build_terminal_diff_report(d_alone, color=False)),
+         plot(build_terminal_diff_report(d_both, color=False))),
+        ("fluency forest plot",
+         plot(build_terminal_fluency_report(p_alone, color=False)),
+         plot(build_terminal_fluency_report(p_both, color=False))),
+        ("html diff report",
+         banner(build_html_diff_report(d_alone)),
+         banner(build_html_diff_report(d_both))),
+    ]
+
+    for name, baseline, with_dead in cases:
+        assert baseline.strip(), f"{name}: baseline verdict is empty — this would pin nothing"
+        assert with_dead == baseline, (
+            f"{name} changed its verdict because an UNMEASURED model was added — "
+            f"it is scoring calls that never happened"
+        )
+
+
+def test_the_renderers_agree_on_which_models_were_dropped():
+    """The other half: a renderer must not silently omit an excluded model either.
+    Dropping it from the chart without saying so turns a broken run into a clean-looking
+    one — the same failure as publishing it, arrived at from the opposite direction."""
+    from terse.html_report import build_html_diff_report
+    from terse.report import build_diff_report
+    from terse.terminal_report import build_terminal_diff_report
+
+    results = {"good": _diff_rows(degraded=False),
+               "dead": _diff_rows(degraded=True)}
+    for name, text in (("markdown", build_diff_report(results)),
+                       ("terminal", build_terminal_diff_report(results, color=False)),
+                       ("html", build_html_diff_report(results))):
+        assert "dead" in text, f"{name} dropped the excluded model without naming it"
+        assert "good" in text, f"{name} lost the measured model"
