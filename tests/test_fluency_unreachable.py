@@ -385,6 +385,30 @@ def test_the_soak_report_cannot_pass_off_a_dead_backend():
     assert "calls lost" in text
 
 
+def test_the_html_report_cannot_render_a_green_PASS_banner_for_a_dead_backend():
+    """`build_html_diff_report` builds its OWN gap rows rather than calling
+    `diff_gap_rows`, so gating the markdown and the terminal chart left it untouched: a
+    fully-down backend still rendered `<div class="banner good">✓ PASS`.
+
+    This is the artifact people screenshot and paste into an issue. It is the last place
+    a false pass should survive, not the first place to forget."""
+    from terse.fluency.harnesses import run_diff_payload
+    from terse.html_report import build_html_diff_report
+
+    def dead(system, user):
+        raise ConnectionError("503")
+
+    a = [{"id": i, "x": "a"} for i in range(4)]
+    b = [{"id": i, "x": "b"} for i in range(4)]
+    rows = run_diff_payload(a, b, dead, "t", 2)
+    assert rows, "no rows generated — this would pin nothing"
+    html = build_html_diff_report({"gemini-dead": rows})
+    assert "banner good" not in html, "a dead backend must never render a green PASS"
+    assert "✓ PASS" not in html
+    assert "NO VERDICT — nothing was measured" in html
+    assert "gemini-dead" in html and "Not measured" in html
+
+
 def test_unmeasured_discovers_arms_instead_of_hardcoding_the_payload_ones():
     """The arm list was `("raw", "terse", "primer", "inline")` — the payload harness's
     arms. The diff harnesses emit `terse`/`diff`, so a fully-lost `diff` arm was invisible

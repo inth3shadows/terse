@@ -80,7 +80,11 @@ fails that pull request until the section has moved.
   `(gap_rows, excluded)` like `fluency_gap_rows` and names what it dropped.
   `build_diff_soak_report` is gated too: a down backend scored 0% on both arms at every
   depth, which is a gap of exactly 0 reading **PASS**, beneath a by-depth table showing a
-  flat, reassuring no-drift line drawn entirely from calls that never happened.
+  flat, reassuring no-drift line drawn entirely from calls that never happened. And
+  `build_html_diff_report`, which builds its own gap rows rather than calling
+  `diff_gap_rows`, rendered a green `✓ PASS` banner off the same dead backend — the
+  artifact most likely to be screenshotted and quoted, and so the last place a false pass
+  should survive. It now renders `NO VERDICT` and names the models it dropped.
 
 ## [0.25.0] - 2026-08-11
 

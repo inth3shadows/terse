@@ -20,7 +20,7 @@ import html as _html
 from collections.abc import Sequence
 from typing import Any
 
-from .report import _ci, _form_stats, _pct, _sum, _worst_case_gap
+from .report import _ci, _form_stats, _pct, _sum, _unmeasured, _worst_case_gap
 
 # --- palette (dataviz skill reference instance) ---------------------------------
 
@@ -467,9 +467,18 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
     """HTML counterpart to report.build_diff_report / build_fluency_report's gap
     section: a forest plot of per-model accuracy with 95% CI, gated on the worst model."""
     plot_rows, gap_rows = [], {}
+    excluded: list[str] = []
     for model, rows in results.items():
         n = len(rows)
         if not n:
+            continue
+        # Same transport-failure gate as the markdown and terminal renderers (#264).
+        # Without it a fully-down backend scored 0% on both arms — a gap of exactly 0 —
+        # and this page rendered a green "✓ PASS" banner off calls that never happened.
+        # A green banner is the single most quoted artifact of a run; it is the last
+        # place a false pass should survive.
+        if _unmeasured(rows):
+            excluded.append(model)
             continue
         facc, fse = _form_stats(rows, "terse_ok" if "terse_ok" in rows[0] else "diff_ok")
         cacc, cse = facc, fse
@@ -492,6 +501,16 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
                         f'worst-case model <code>{_esc(worst.model)}</code>: {form_label} '
                         f'{worst.form_acc:.0%} vs {control_label} {worst.control_acc:.0%} '
                         f'(gap {worst.gap:+.0%} ±{worst.gap_ci * 100:.0f}pt)</div>')
+    else:
+        # Nothing survived the gate. Never render this neutral or absent: an empty verdict
+        # card on a page titled "comprehension gap" reads as "no gap found".
+        verdict_html = ('<div class="banner critical">NO VERDICT — nothing was measured. '
+                        'No model returned enough calls to score, so this run says nothing '
+                        'either way.</div>')
+    if excluded:
+        verdict_html += ('<p>Not measured — calls never reached the backend for: '
+                         + ", ".join(f"<code>{_esc(m)}</code>" for m in excluded)
+                         + ". A failed call is not a wrong answer.</p>")
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">

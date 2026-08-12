@@ -222,8 +222,11 @@ def _flat_record_questions(obj: Any) -> list[Question]:
     if not isinstance(obj, dict) or has_terse_marker(obj):
         return []
     # int/float lookups are unambiguous; strings must be short, non-empty scalars —
-    # an empty expected would be indistinguishable from _safe_ask's empty-string
-    # error return (same exclusion the text-diff questions apply).
+    # an empty expected USED TO be indistinguishable from _safe_ask's empty-string error
+    # return (same exclusion the text-diff questions apply). Since #263 `_safe_ask`
+    # returns None and a failure never reaches `score` at all, so this exclusion is now
+    # belt-and-braces rather than load-bearing. Kept because an empty expected is a weak
+    # question on its own merits, not only because it once aliased the failure sentinel.
     lookable = {
         k: v for k, v in obj.items()
         if (isinstance(v, (int, float)) and not isinstance(v, bool))
@@ -346,10 +349,12 @@ def gen_questions(obj: Any) -> list[Question]:
 def _text_diff_questions_from_lines(curr: str) -> list[Question]:
     """The anchor questions given curr's lines — assumes the caller already confirmed a
     lossless text diff applies. An empty target line is excluded from the "last-line"/
-    "mid-line" lookup questions: an empty `expected` would be indistinguishable from
+    "mid-line" lookup questions: an empty `expected` used to be indistinguishable from
     `_safe_ask`'s empty-string return on a total answerer failure (a transport error
-    scoring as a correct answer), so those questions are simply not asked when the
-    anchor line would be empty."""
+    scoring as a CORRECT answer), so those questions are simply not asked when the anchor
+    line would be empty. Since #263 `_safe_ask` returns None and a failure never reaches
+    `score`, making this belt-and-braces rather than load-bearing — kept because an empty
+    expected is a weak question regardless of what the failure sentinel happens to be."""
     lines = curr.splitlines()
     questions = [
         Question(qid="line-count", qtype="count", transform="text-diff",

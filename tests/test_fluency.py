@@ -493,8 +493,10 @@ def test_gen_text_diff_questions_empty_when_no_diff_applies():
 
 
 def test_gen_text_diff_questions_omits_last_line_when_blank():
-    # A blank final line would give expected="", indistinguishable from _safe_ask's
-    # empty-string return on a total answerer failure — so it must not be asked.
+    # A blank final line would give expected="", which used to be indistinguishable from
+    # _safe_ask's empty-string return on a total answerer failure — so it must not be
+    # asked. Since #263 that return is None and never reaches `score`, so this pins a
+    # belt-and-braces exclusion, not the load-bearing guard it originally was.
     curr = TEXT_PREV + "\n\n"
     qs = {q.qid: q for q in fluency.gen_text_diff_questions(TEXT_PREV, curr, tool="demo")}
     assert "last-line" not in qs
