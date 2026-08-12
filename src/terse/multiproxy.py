@@ -81,7 +81,7 @@ from .proxy import (
     pump,
     union_primer,
 )
-from .stats import build_stats_writer
+from .stats import build_retrieve_writer, build_stats_writer
 from .transport import Transport, build_transport
 
 # Tool-name prefix separator — defined in policy.py (not here) so Policy.select can
@@ -1458,7 +1458,9 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                  debug: bool, capture: Callable[[str, str], None] | None,
                  audit: Callable[[dict], None] | None,
                  store: OrderedDict[str, Any], store_lock: Lock,
-                 dropped_bytes: list[int], diff_override: bool | None = None,
+                 dropped_bytes: list[int],
+                 origins: dict[str, tuple[str, str, str]] | None = None,
+                 diff_override: bool | None = None,
                  diff_keyframe_override: int | None = None,
                  join_blocks_override: bool | None = None,
                  stats_log: str | None = None) -> list[Peer]:
@@ -1491,14 +1493,18 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
             # grouping key meaningful without parsing prefixes back out).
             stats = (build_stats_writer(stats_log, spec.name)
                      if stats_log is not None else None)
+            stats_retrieve = (build_retrieve_writer(stats_log, spec.name)
+                              if stats_log is not None else None)
             # lazy_primer=False: the router already primes eagerly, once, via
             # `union_primer` in `_merge_initialize` (#168) — a peer going lazy too would
             # attach its OWN primer on its own first compression, on top of that, a
             # redundant (not wrong, just wasteful) double explanation. Peer behavior is
             # deliberately unchanged by #168 phase 2; see that plan's Scope section.
             inter = Interceptor(pol, debug=debug, capture=capture, audit=audit,
-                                stats=stats, server_name=spec.name, store=store,
+                                stats=stats, stats_retrieve=stats_retrieve,
+                                server_name=spec.name, store=store,
                                 store_lock=store_lock, dropped_bytes=dropped_bytes,
+                                origins=origins, ledger_label=spec.name,
                                 log_prefix="[terse-multiproxy]", lazy_primer=False)
             transport = build_transport(spec.target, headers=spec.headers or None,
                                         env=spec.env, cwd=spec.cwd)
@@ -1558,11 +1564,16 @@ def run_multi_proxy(
     store: OrderedDict[str, Any] = OrderedDict()
     store_lock = Lock()
     dropped_bytes: list[int] = [0]
+    # Shared for the same reason `store` is: any peer's Interceptor may answer a
+    # terse.retrieve for a handle another peer dropped, and a private map would lose the
+    # attribution exactly on the fleet shape that has a lossy-by-default rule (#251).
+    origins: dict[str, tuple[str, str, str]] = {}
 
     try:
         peers = _build_peers(specs, default_policy, debug=debug, capture=capture,
                              audit=audit, store=store, store_lock=store_lock,
-                             dropped_bytes=dropped_bytes, diff_override=diff_override,
+                             dropped_bytes=dropped_bytes, origins=origins,
+                             diff_override=diff_override,
                              diff_keyframe_override=diff_keyframe_override,
                              join_blocks_override=join_blocks_override,
                              stats_log=stats_log)

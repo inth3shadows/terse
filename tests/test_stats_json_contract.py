@@ -35,7 +35,12 @@ from terse.stats import append_stats
 
 # --- the contract ---------------------------------------------------------------------
 
-TOP_LEVEL = {"total", "decisions", "diff_reasons", "tools", "versions", "primer_liability"}
+# `retrieves` added on purpose (#251): the COST side of a drop-to-retrieve rule, which the
+# aggregate previously could not express at all. Always present — an empty list when no
+# retrieve was recorded — so a consumer can read it unconditionally rather than branching on
+# whether this build has the key.
+TOP_LEVEL = {"total", "decisions", "diff_reasons", "tools", "versions", "retrieves",
+             "primer_liability"}
 
 TOTAL = {"blocks", "raw_chars", "out_chars", "raw_tokens", "out_tokens",
          "untokenized", "unversioned"}
@@ -47,6 +52,14 @@ TOOL_ROW = {"server", "tool", "blocks", "tokenized", "encoded", "diffs",
             "raw_chars", "out_chars", "raw_tokens", "out_tokens"}
 
 VERSION_ROW = {"blocks", "tokenized", "raw_tokens", "out_tokens"}
+
+# One row per (server, tool, rule path) that a `terse.retrieve` was billed to (#251).
+# `path` is the policy rule that dropped the value, and is `""` — never absent — when the
+# handle carried no attribution, so a consumer never has to distinguish missing from
+# unattributed. `misses` is kept separate from `calls` because a miss is the one outcome
+# that spent a model call and returned nothing.
+RETRIEVE_ROW = {"server", "tool", "path", "calls", "hits", "misses", "bytes", "tokens",
+                "untokenized"}
 
 LIABILITY = {"servers", "per_turn_tokens", "session_once_tokens", "unresolved",
              "idle", "free", "uncertain", "saved_tokens", "turns_covered",
@@ -93,6 +106,10 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     # to `(int,)`, and the contributor means the same thing by the same name — which is the
     # case `TYPES` is shared for. Repeating it is a literal duplicate key (ruff F601).
     "contributors": (list,), "label": (str,),
+    # #251 retrieve rows. All plain counters — a retrieve either happened or it did not,
+    # so unlike a liability row there is no "we could not ask" null anywhere here.
+    "path": (str,), "calls": (int,), "hits": (int,), "misses": (int,), "bytes": (int,),
+    "tokens": (int,),
 }
 
 # Per-shape overrides, because a name does not mean the same thing everywhere. `blocks` is a
@@ -168,7 +185,7 @@ def test_every_named_field_also_has_a_pinned_type():
     person to add a field only has to touch the NAME manifest to go green and the type
     promise silently stops applying to it (found in review — the same
     tolerates-growth-silently failure this module's own docstring warns about)."""
-    named = (TOTAL | TOOL_ROW | VERSION_ROW | LIABILITY | LIABILITY_SERVER
+    named = (TOTAL | TOOL_ROW | VERSION_ROW | RETRIEVE_ROW | LIABILITY | LIABILITY_SERVER
              | LIABILITY_CONTRIBUTOR)
     assert not named - set(TYPES), (
         f"no type pinned for: {sorted(named - set(TYPES))}. {_ADD_ON_PURPOSE}")
@@ -201,6 +218,39 @@ def test_the_total_and_tool_rows_are_exactly_these_keys(stats_json):
         assert set(row) == TOOL_ROW, _ADD_ON_PURPOSE
         _check_types("tools[]", row)
     _check_types("total", out["total"])
+
+
+def test_the_retrieve_rows_are_exactly_these_keys(stats_json):
+    """A drop rule's cost row (#251). Driven through `main(["stats", ...])` like every
+    other shape here, so the CLI's composition is covered, not just `aggregate`'s."""
+    from terse.stats import build_retrieve_record
+    out = stats_json([_rec(),
+                      build_retrieve_record("kb", "codegraph_explore",
+                                            "$text.code_blocks", hit=True, payload="x" * 40)])
+    assert out["retrieves"], "a retrieve record must produce a retrieve row"
+    for row in out["retrieves"]:
+        assert set(row) == RETRIEVE_ROW, _ADD_ON_PURPOSE
+        _check_types("retrieves[]", row)
+
+
+def test_a_retrieve_row_never_inflates_the_block_or_savings_totals(stats_json):
+    """The contract's load-bearing separation: a retrieve is not a compressed block. If it
+    ever lands in `total`/`tools`, every published savings percentage silently changes.
+
+    Asserted inside ONE run rather than by diffing two: the fixture appends to a single
+    ledger path, so a second `stats_json(...)` call re-reads the first call's records and
+    the comparison would be against an already-polluted baseline."""
+    from terse.stats import build_retrieve_record
+    out = stats_json([_rec(),
+                      build_retrieve_record("kb-server", "kb.read.search", "$.p",
+                                            hit=True, payload="y" * 900)])
+    # Exactly the one result record — the 900-byte retrieve beside it contributed nothing.
+    assert out["total"]["blocks"] == 1
+    assert out["total"]["raw_chars"] == 400 and out["total"]["out_chars"] == 40
+    assert [r["blocks"] for r in out["tools"]] == [1]
+    assert sum(r["raw_chars"] for r in out["tools"]) == 400
+    # ...while the cost itself is not lost — it is recorded on its own axis.
+    assert out["retrieves"][0]["bytes"] == 900
 
 
 def test_the_version_rows_are_exactly_these_keys(stats_json):

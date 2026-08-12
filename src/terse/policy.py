@@ -592,10 +592,17 @@ class Applied:
     tiers: tuple[str, ...]
     skipped: bool
     warnings: list[str]
+    # `handle -> (tool, path)` for every drop COMMITTED by this call — empty unless a
+    # drop-to-retrieve rule actually fired and passed its recoverability gate. The proxy
+    # keeps it so a later `terse.retrieve` can be billed back to the rule that caused the
+    # drop (#251); nothing else reads it, and it holds no payload content. Defaulted so
+    # every existing `Applied(...)` construction and test fake stays valid.
+    drop_origins: dict[str, tuple[str, str]] = field(default_factory=dict)
 
 
 def _apply_text_drops(raw: str, tool: str, rule: Rule, warnings: list[str],
-                      drop_sink: Any, never_lossy: bool) -> str:
+                      drop_sink: Any, never_lossy: bool,
+                      drop_origins: dict[str, tuple[str, str]] | None = None) -> str:
     """Tier-1 lossy (drop-to-retrieve) over a NON-JSON payload, addressed by span.
 
     Same staged-then-committed contract as the JSON drop path: handles reach the session
@@ -608,8 +615,12 @@ def _apply_text_drops(raw: str, tool: str, rule: Rule, warnings: list[str],
         warnings.append("lossy: drop-to-retrieve needs the proxy store; left lossless")
         return raw
     staging: dict[str, Any] = {}
+    # Staged alongside the values and published only on the same commit, so a gate failure
+    # leaves no provenance behind either — orphan attribution would bill a retrieve to a
+    # rule whose drop never reached the store.
+    staged_origins: dict[str, tuple[str, str]] = {}
     try:
-        cand = lossy_mod.apply_text_drops(raw, rule, tool, staging.__setitem__)
+        cand = lossy_mod.apply_text_drops(raw, rule, tool, staging.__setitem__, staged_origins)
     except Exception as exc:  # noqa: BLE001 — fail closed to the lossless text
         warnings.append(f"lossy step skipped: {exc} (kept lossless)")
         return raw
@@ -620,6 +631,8 @@ def _apply_text_drops(raw: str, tool: str, rule: Rule, warnings: list[str],
         return raw
     for handle, value in staging.items():
         drop_sink(handle, value)  # commit only once recoverability is proven
+    if drop_origins is not None:
+        drop_origins.update(staged_origins)
     warnings.append("lossy: dropped text span(s) to retrieve handle(s) — "
                     "output is NOT lossless")
     return cand
@@ -650,7 +663,8 @@ def _lossy_warnings(rule: Rule) -> list[str]:
 
 
 def _lossy_stage(obj: Any, rule: Rule, *, tool: str, never_lossy: bool,
-                 drop_sink: Any, warnings: list[str]) -> Any:
+                 drop_sink: Any, warnings: list[str],
+                 drop_origins: dict[str, tuple[str, str]] | None = None) -> Any:
     """Tier-1 lossy transforms (truncate, then drop-to-retrieve) over one already-parsed
     JSON object, fail-closed: any unresolved path or failed acceptable/droppable-loss gate
     keeps the fully-lossless object. Returns the (possibly reduced) object; appends any
@@ -681,11 +695,16 @@ def _lossy_stage(obj: Any, rule: Rule, *, tool: str, never_lossy: bool,
             warnings.append("lossy: drop-to-retrieve needs the proxy store; left lossless")
         else:
             staging: dict[str, Any] = {}
+            # Same staged-then-committed contract as the values (see `_apply_text_drops`).
+            staged_origins: dict[str, tuple[str, str]] = {}
             try:
-                cand = lossy_mod.apply_drops(data, rule, tool, staging.__setitem__)
+                cand = lossy_mod.apply_drops(data, rule, tool, staging.__setitem__,
+                                             staged_origins)
                 if cand != data and lossy_mod.droppable_loss(data, cand, rule, staging.__getitem__):
                     for handle, value in staging.items():
                         drop_sink(handle, value)  # commit only once recoverability is proven
+                    if drop_origins is not None:
+                        drop_origins.update(staged_origins)
                     data = cand
                     warnings.append("lossy: dropped marked field(s) to retrieve handle(s) — "
                                     "output is NOT lossless")
@@ -778,9 +797,12 @@ def apply(raw: str, tool: str, policy: Policy,
         # field (`$text.code_blocks`) — same opt-in, same fail-closed contract, same
         # handle/retrieve protocol. Still `skipped=True`: no JSON tier ran, and the proxy
         # relies on that flag to reset its JSON diff state for a non-JSON result.
-        text = _apply_text_drops(raw, tool, rule, warnings, drop_sink, never_lossy)
+        text_origins: dict[str, tuple[str, str]] = {}
+        text = _apply_text_drops(raw, tool, rule, warnings, drop_sink, never_lossy,
+                                 text_origins)
         return Applied(text=text, tool=tool, tiers=(), skipped=True,
-                       warnings=warnings + ["payload is not JSON; passed through"])
+                       warnings=warnings + ["payload is not JSON; passed through"],
+                       drop_origins=text_origins)
 
     # Depth guard (#79): the transforms recurse without a depth argument, so a payload
     # nested past the codec-wide cap is screened out here — same passthrough contract
@@ -802,10 +824,12 @@ def apply(raw: str, tool: str, policy: Policy,
     # Tier-1 lossy (truncate then drop) is fail-closed; the always-on Tier-0/0.5 codec
     # then runs with its own verify-before-emit gate. Both stages are extracted so the
     # multi-block join path (`apply_joined`) reuses the exact same logic (#116).
+    drop_origins: dict[str, tuple[str, str]] = {}
     data = _lossy_stage(obj, rule, tool=tool, never_lossy=never_lossy,
-                        drop_sink=drop_sink, warnings=warnings)
+                        drop_sink=drop_sink, warnings=warnings, drop_origins=drop_origins)
     text, tiers = _lossless_stage(data, rule, warnings)
-    return Applied(text=text, tool=tool, tiers=tiers, skipped=False, warnings=warnings)
+    return Applied(text=text, tool=tool, tiers=tiers, skipped=False, warnings=warnings,
+                   drop_origins=drop_origins)
 
 
 # Reasons `apply_joined` returns when it declines to join, recorded in the ledger (the
@@ -873,8 +897,14 @@ def apply_joined(raws: list[str], tool: str, policy: Policy,
     if "minify" not in rule.tiers:
         warnings.append("'minify' implied by serialization; added")
 
+    # One origins map across every block: handles are content-addressed over (tool, path,
+    # bytes), so two blocks dropping the identical span under the same rule collapse to one
+    # handle and one store slot — and therefore to one attribution, which is correct.
+    drop_origins: dict[str, tuple[str, str]] = {}
     data = [_lossy_stage(o, rule, tool=tool, never_lossy=never_lossy,
-                         drop_sink=drop_sink, warnings=warnings) for o in objs]
+                         drop_sink=drop_sink, warnings=warnings,
+                         drop_origins=drop_origins) for o in objs]
     text, tiers = _lossless_stage(data, rule, warnings)
-    return (Applied(text=text, tool=tool, tiers=tiers, skipped=False, warnings=warnings),
+    return (Applied(text=text, tool=tool, tiers=tiers, skipped=False, warnings=warnings,
+                    drop_origins=drop_origins),
             objs, "")

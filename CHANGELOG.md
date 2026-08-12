@@ -15,6 +15,38 @@ fails that pull request until the section has moved.
 
 ### Added
 
+- **A `drop-to-retrieve` rule's COST is now recorded and reported, not just its saving**
+  (`#251`). `answer_retrieve` has served the synthetic `terse.retrieve` tool since `#10`,
+  but `stats.py` contained no reference to it — so the ledger measured only the tokens a
+  dropped field never spent, and never the extra tool call the model spent fetching that
+  field back. A rule dropping a field the model *always* needs was indistinguishable in the
+  data from one dropping a field it never needs, which made every lossy rule look better
+  than it was. On a demo ledger the gap is stark: a tool reading 96.4% saved in the per-tool
+  table while its drop rule cost 5,628 tokens in round-trips.
+
+  Attribution rides back on `policy.Applied.drop_origins` (`handle -> (tool, rule path)`)
+  rather than through a widened `drop_sink`: the staged sink is `dict.__setitem__`, which
+  takes exactly two arguments. Origins are staged with the values and published on the
+  **same commit**, so a failed recoverability gate leaves no orphan attribution — and the
+  map is shared across multiproxy peers exactly where the drop store is, because any peer
+  may answer a retrieve for a handle another peer dropped.
+
+  The ledger `server` label is captured at **drop** time and travels in the shared origins
+  map, because under multiproxy `_route_call` answers every retrieve through `peers[0]` —
+  so the answering Interceptor is almost never the dropping one, and billing the answerer
+  filed a `kb` rule's cost under `gh`, where it does not join with that tool's own result
+  rows. A miss is unattributable by construction (the origin is discarded with the value)
+  and the report says so rather than implying a rule can be named. The cost table honours
+  the same tokens-or-chars fallback as the savings table above it.
+
+  **`terse stats --json` gains a top-level `retrieves` key** — one row per
+  `(server, tool, rule path)` with `calls` / `hits` / `misses` / `bytes` / `tokens` /
+  `untokenized`. Always present (an empty list when nothing was recorded) so a consumer can
+  read it unconditionally. A retrieve row is deliberately **never** folded into `total` or
+  `tools`: it carries no `raw_chars`/`out_chars`, and `aggregate` skips it on an explicit
+  `event` marker as well, so it cannot be miscounted as a compressed block and silently
+  move the published savings percentage. Both guards are pinned by tests.
+
 - **The `multiproxy.py` / codec boundary is now enforced by a test rather than described in
   prose** (`#237`). That issue recorded multiproxy as a second product — 1,525 lines of MCP
   router, none of it compression — and ruled that new optimization logic must not land

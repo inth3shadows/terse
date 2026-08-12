@@ -280,6 +280,9 @@ class Interceptor:
                  store: OrderedDict[str, Any] | None = None,
                  store_lock: Lock | None = None,
                  dropped_bytes: list[int] | None = None,
+                 origins: dict[str, tuple[str, str, str]] | None = None,
+                 stats_retrieve: Callable[[str, str, str, bool, str], None] | None = None,
+                 ledger_label: str | None = None,
                  log_prefix: str = "[terse-proxy]",
                  lazy_primer: bool = True):
         self.policy = pol
@@ -377,6 +380,24 @@ class Interceptor:
         # the dict it's tracking. Default (None) is behavior-preserving: a fresh private
         # box, exactly equivalent to a private int.
         self._dropped_bytes_box: list[int] = dropped_bytes if dropped_bytes is not None else [0]
+        # `handle -> (tool, rule path)` for everything in `self.dropped` (#251). SHARED
+        # whenever `store` is, and for the same reason: under multiproxy any peer's
+        # Interceptor may be the one that answers a `terse.retrieve` for a handle a
+        # DIFFERENT peer dropped, so a private origins map would lose the attribution on
+        # exactly the fleet shape that has a lossy-by-default rule. Guarded by
+        # `_store_lock` alongside the dict it mirrors, and evicted in lockstep with it.
+        self._drop_origin: dict[str, tuple[str, str, str]] = (origins if origins is not None
+                                                              else {})
+        # The ledger `server` label THIS Interceptor's drops should be billed to. Stored
+        # into `_drop_origin` at drop time rather than read at retrieve time, because under
+        # multiproxy the router answers EVERY terse.retrieve through `peers[0]` (see
+        # `_route_call`) — so the answering Interceptor is almost never the one that
+        # dropped the value, and its own label would mislabel the row. Falls back to
+        # `server_name`; `run_proxy` passes the resolved ledger identity, which can differ.
+        self._ledger_label = ledger_label or server_name or ""
+        # Optional payload-FREE ledger callback for a retrieve round-trip:
+        # (server, tool, path, hit, payload). Same fail-open contract as `stats`.
+        self.stats_retrieve = stats_retrieve
         self.init_id: Any = None        # id of the initialize request, to prime its reply
         # `clientInfo.name` from the handshake, when the client declared one (#128). Drives
         # `"structured": "auto"`; None until an initialize is seen, and None means "leave".
@@ -487,6 +508,10 @@ class Interceptor:
                 with self._store_lock:
                     self.dropped.clear()
                     self._dropped_bytes_box[0] = 0
+                    # Cleared with the store, for the same reason the store is: every
+                    # handle the model still holds became unresolvable at the reconnect,
+                    # so its attribution describes a drop that can no longer be retrieved.
+                    self._drop_origin.clear()
                 # The client's DECLARED identity, straight off the handshake. This is
                 # what lets `"structured": "auto"` compress the typed `structuredContent`
                 # field only for clients measured not to validate it (#128) — an observed
@@ -887,6 +912,7 @@ class Interceptor:
             applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put,
                                        server=self.server_name,
                                        force_lossless=force_lossless)
+            self._note_drop_origins(applied)
         except Exception as exc:  # noqa: BLE001 — fail-open is the whole point
             if self.debug:
                 sys.stderr.write(f"[terse-proxy] {tool}: passthrough on error: {exc}\n")
@@ -1015,6 +1041,7 @@ class Interceptor:
             applied, curr, refuse = policy_mod.apply_joined(
                 raws, tool, self.policy, drop_sink=self._drop_put,
                 server=self.server_name, force_lossless=force_lossless)
+            self._note_drop_origins(applied)
         except Exception as exc:  # noqa: BLE001 — fail-open is the whole point
             if self.debug:
                 sys.stderr.write(f"[terse-proxy] {tool}: join passthrough on error: {exc}\n")
@@ -1088,6 +1115,7 @@ class Interceptor:
                     applied, curr, _refuse = policy_mod.apply_joined(
                         raws, tool, self.policy, drop_sink=self._drop_put,
                         server=self.server_name, force_lossless=force_lossless)
+                    self._note_drop_origins(applied)
                 except Exception as exc:  # noqa: BLE001 — fail-open per run
                     if self.debug:
                         sys.stderr.write(f"[terse-proxy] {tool}: partial-join run "
@@ -1236,6 +1264,7 @@ class Interceptor:
             applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put,
                                        server=self.server_name,
                                        force_lossless=force_lossless)
+            self._note_drop_origins(applied)
             if self.debug and not applied.skipped and applied.text != text:
                 sys.stderr.write(
                     f"[terse-proxy] {tool}: {len(text)}->{len(applied.text)} bytes "
@@ -1396,8 +1425,37 @@ class Interceptor:
             self._dropped_bytes_box[0] += size
             while self.dropped and (len(self.dropped) > self.DROPPED_MAX
                                     or self._dropped_bytes_box[0] > self.DROPPED_MAX_BYTES):
-                _, evicted = self.dropped.popitem(last=False)
+                evicted_handle, evicted = self.dropped.popitem(last=False)
                 self._dropped_bytes_box[0] -= len(lossy_mod._serialize(evicted))
+                # Evict the attribution with the value, never after it. A handle left
+                # behind here would still be content-addressed over (tool, path, bytes),
+                # so it could only ever be re-created with the SAME origin — but the map
+                # would grow without bound alongside a store that is explicitly capped.
+                self._drop_origin.pop(evicted_handle, None)
+
+    def _note_drop_origins(self, applied: Any) -> None:
+        """Record `handle -> (server, tool, rule path)` for the drops an `apply`/`apply_joined`
+        call actually COMMITTED (#251), so a later `terse.retrieve` is billed to the rule —
+        and to the peer — that caused it.
+
+        The server label is captured HERE, at drop time, not read at retrieve time: under
+        multiproxy `_route_call` answers every retrieve through `peers[0]`, so the answering
+        Interceptor is almost never the dropping one and its label would name the wrong peer.
+
+        Reads provenance off the returned `Applied` rather than through `drop_sink`: the
+        staged sink is `dict.__setitem__`, which cannot take extra arguments, and widening
+        the sink protocol would have broken every 2-arg test fake. `getattr` with a default
+        keeps this tolerant of an `Applied`-shaped object from an older caller or a fake."""
+        origins = getattr(applied, "drop_origins", None)
+        if not origins:
+            return
+        with self._store_lock:
+            for handle, (otool, opath) in origins.items():
+                # Only attribute what actually reached the store. A drop whose value was
+                # evicted between commit and here has nothing to retrieve, and recording it
+                # would inflate the rule's drop count against retrieves that cannot happen.
+                if handle in self.dropped:
+                    self._drop_origin[handle] = (self._ledger_label, otool, opath)
 
     def _inject_retrieve_tool(self, msg: dict) -> str | None:
         """If `msg` is a tools/list result, append the synthetic terse.retrieve tool so the
@@ -1450,9 +1508,18 @@ class Interceptor:
             if hit:
                 self.dropped.move_to_end(handle)  # a read refreshes recency
                 value = self.dropped[handle]
+            # Read the attribution under the SAME lock acquisition that read the value:
+            # taken separately, an interleaved eviction between the two could drop the
+            # origin and bill this retrieve to `unknown` even though it hit.
+            origin = self._drop_origin.get(handle)
         if hit:
-            result: dict = {"content": [{"type": "text", "text": lossy_mod._serialize(value)}]}
+            # Serialized ONCE and reused for the ledger's size measurement below: the drop
+            # store is capped at 8 MiB, so a large field would otherwise pay a full second
+            # JSON encode purely to take a `len()`.
+            served = lossy_mod._serialize(value)
+            result: dict = {"content": [{"type": "text", "text": served}]}
         else:
+            served = ""
             result = {"content": [{"type": "text",
                                    "text": (f"terse: dropped-field handle {handle!r} is no "
                                             "longer available (evicted, or the session "
@@ -1462,6 +1529,21 @@ class Interceptor:
         if self.debug:
             sys.stderr.write(f"[terse-proxy] answered {lossy_mod.RETRIEVE_TOOL} "
                              f"handle={handle!r} hit={hit}\n")
+        # The drop rule's COST, billed to the rule that caused it (#251). Fail-open like
+        # every other side-effect sink: a ledger problem must never turn a served retrieve
+        # into a failed one, because the value is already resolved at this point.
+        if self.stats_retrieve is not None:
+            # A miss is ALWAYS unattributed by construction: `_drop_origin` is popped in
+            # lockstep with eviction and cleared with the store, so every path that makes
+            # `hit` false has already discarded the origin. Billed to this proxy's own
+            # label rather than dropped — the call was spent either way, and hiding it
+            # would under-count the cost side.
+            oserver, otool, opath = origin if origin is not None else (
+                self._ledger_label, lossy_mod.RETRIEVE_TOOL, "")
+            try:
+                self.stats_retrieve(oserver, otool, opath, hit, served)
+            except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
+                self._warn_sink("stats", otool, exc)
         return json.dumps({"jsonrpc": "2.0", "id": mid, "result": result},
                           separators=(",", ":"), ensure_ascii=False)
 
@@ -1781,13 +1863,23 @@ def run_proxy(
     capture, audit = _build_capture_and_audit(capture_dir, debug_log, _new_session_id())
 
     stats = None
+    stats_retrieve = None
+    ledger_label = None
     if stats_log is not None:
-        from .stats import build_stats_writer, resolve_ledger_identity
+        from .stats import (
+            build_retrieve_writer,
+            build_stats_writer,
+            resolve_ledger_identity,
+        )
 
-        label = resolve_ledger_identity(server_name, cmd)
+        label = ledger_label = resolve_ledger_identity(server_name, cmd)
         stats = build_stats_writer(stats_log, label)
+        # Same ledger identity as the result writer, so a drop rule's saving and its
+        # retrieve cost group under one `server` key (#251).
+        stats_retrieve = build_retrieve_writer(stats_log, label)
 
     inter = Interceptor(pol, debug=debug, capture=capture, audit=audit, stats=stats,
+                        stats_retrieve=stats_retrieve, ledger_label=ledger_label,
                         server_name=server_name, lazy_primer=lazy_primer)
 
     try:
