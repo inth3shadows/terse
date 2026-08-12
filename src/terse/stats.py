@@ -222,7 +222,15 @@ def build_retrieve_record(server: str, tool: str, path: str, *,
     `build_record` measures `raw`, the rule's `path` is policy text the operator wrote, and
     the value itself never reaches the file. `hit=False` is a handle that had been evicted
     or predates a reconnect — it cost the model a call and returned nothing, which is the
-    worst cell in the table and has to be visible.
+    worst outcome there is and has to stay visible.
+
+    A miss is **unattributable by construction**, and the report says so rather than
+    implying otherwise: `_drop_origin` is popped in lockstep with eviction and cleared with
+    the store, so every path that produces `hit=False` has already discarded the origin. A
+    real miss therefore always lands on the `(unattributed)` row, never beside a rule. This
+    function still accepts a `path` with `hit=False` because it is a pure record builder and
+    pinning that combination is how the field's independence is tested — but the proxy
+    cannot produce it.
 
     Deliberately carries NO `raw_chars`/`out_chars`. `aggregate` skips any row lacking
     both (`"not a ledger record"`), so a retrieve can never be counted as a compressed
@@ -544,14 +552,14 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
                      f"{_hit_rate(row['diffs'], row['blocks']):>5} "
                      f"{raw_n:>10,} {out_n:>10,} "
                      f"{_pct_saved(raw_n, out_n):>6}")
-    lines += build_retrieve_section(agg)
+    lines += build_retrieve_section(agg, use_tokens)
     lines += build_version_section(agg)
     if liability:
         lines += build_primer_section(liability)
     return "\n".join(lines) + "\n"
 
 
-def build_retrieve_section(agg: dict[str, Any]) -> list[str]:
+def build_retrieve_section(agg: dict[str, Any], use_tokens: bool = True) -> list[str]:
     """What each `drop-to-retrieve` rule COST — the other half of the lossy ledger (#251).
 
     Rendered, not merely carried in `--json`, for the same reason the version section is:
@@ -566,23 +574,32 @@ def build_retrieve_section(agg: dict[str, Any]) -> list[str]:
     rows = agg.get("retrieves") or []
     if not rows:
         return []
+    # Mirror the per-tool table's unit choice (`use_tokens`): on a tiktoken-less ledger the
+    # token column is all zeros, and rendering only that turned the entire cost table into
+    # a wall of nothing while the byte counts sitting right there were known. Same fallback,
+    # same reason — a cost the operator cannot read is a cost they will not act on.
+    cost_col = "tok" if use_tokens else "chr"
     out = ["", "drop-to-retrieve cost — round-trips the model spent fetching dropped values back:",
            f"{'server':<18} {'tool':<28} {'rule path':<22} {'calls':>6} "
-           f"{'miss':>5} {'tok':>9}"]
+           f"{'miss':>5} {cost_col:>9}"]
     for r in rows:
-        # An empty path means the handle predated the attribution, or was stored directly:
-        # billed, never hidden, but named as unknown rather than guessed at.
+        # An empty path is a MISS (the origin is always gone by then — see
+        # `build_retrieve_record`), or a handle stored without provenance: billed, never
+        # hidden, but named as unknown rather than guessed at.
         path = r["path"] or "(unattributed)"
+        cost = r["tokens"] if use_tokens else r["bytes"]
         out.append(f"{r['server'][:18]:<18} {r['tool'][:28]:<28} {path[:22]:<22} "
-                   f"{r['calls']:>6} {r['misses']:>5} {r['tokens']:>9,}")
+                   f"{r['calls']:>6} {r['misses']:>5} {cost:>9,}")
     misses = sum(r["misses"] for r in rows)
     if misses:
-        # The worst cell in the table: the model spent a whole call and got nothing back,
-        # so this is pure cost with no recovered value on the other side.
+        # The worst outcome there is: the model spent a whole call and got nothing back,
+        # so this is pure cost with no recovered value on the other side. Always on the
+        # `(unattributed)` row — a miss cannot name the rule it came from.
         out.append(f"  ({misses} miss(es) — handle evicted or the session reconnected; "
-                   "the call was spent and returned nothing)")
+                   "the call was spent and returned nothing. A miss cannot be attributed "
+                   "to a rule: the origin is discarded with the value.)")
     untok = sum(r["untokenized"] for r in rows)
-    if untok:
+    if untok and use_tokens:
         out.append(f"  ({untok} retrieve(s) uncounted — tiktoken unavailable when recorded)")
     return out
 
@@ -1477,9 +1494,15 @@ def build_retrieve_writer(stats_log: str | Path, server: str):
     closure: a retrieve is not a result, shares none of the result record's size fields,
     and rides a different code path (`answer_retrieve`, which never forwards downstream).
     Widening the result writer would have put a rarely-taken branch on the hot path for
-    every compressed block. Wired at the same two sites, so the two stay in lockstep."""
-    def retrieve(tool: str, path: str, hit: bool, payload: str) -> None:
-        append_stats(build_retrieve_record(server, tool, path, hit=hit, payload=payload),
+    every compressed block. Wired at the same two sites, so the two stay in lockstep.
+
+    `server` here is only the DEFAULT. The caller passes the label captured at drop time,
+    because under multiproxy the router answers every retrieve through `peers[0]`
+    (`_route_call`) — so this closure's own label names the answering peer, which is
+    almost never the peer whose rule dropped the value."""
+    def retrieve(origin_server: str, tool: str, path: str, hit: bool, payload: str) -> None:
+        append_stats(build_retrieve_record(origin_server or server, tool, path,
+                                           hit=hit, payload=payload),
                      stats_log)
 
     return retrieve

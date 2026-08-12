@@ -31,6 +31,14 @@ fails that pull request until the section has moved.
   map is shared across multiproxy peers exactly where the drop store is, because any peer
   may answer a retrieve for a handle another peer dropped.
 
+  The ledger `server` label is captured at **drop** time and travels in the shared origins
+  map, because under multiproxy `_route_call` answers every retrieve through `peers[0]` —
+  so the answering Interceptor is almost never the dropping one, and billing the answerer
+  filed a `kb` rule's cost under `gh`, where it does not join with that tool's own result
+  rows. A miss is unattributable by construction (the origin is discarded with the value)
+  and the report says so rather than implying a rule can be named. The cost table honours
+  the same tokens-or-chars fallback as the savings table above it.
+
   **`terse stats --json` gains a top-level `retrieves` key** — one row per
   `(server, tool, rule path)` with `calls` / `hits` / `misses` / `bytes` / `tokens` /
   `untokenized`. Always present (an empty list when nothing was recorded) so a consumer can

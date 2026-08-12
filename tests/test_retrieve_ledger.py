@@ -31,8 +31,8 @@ def _recorder():
     """Capture what the retrieve writer would have appended, without touching disk."""
     rows: list[tuple] = []
 
-    def rec(tool, path, hit, payload):
-        rows.append((tool, path, hit, payload))
+    def rec(server, tool, path, hit, payload):
+        rows.append((server, tool, path, hit, payload))
 
     return rows, rec
 
@@ -103,6 +103,28 @@ def test_the_report_prints_the_cost_beside_the_rule_that_caused_it():
     assert "z" * 20 not in text              # ...and still no payload
 
 
+def test_the_cost_table_falls_back_to_chars_exactly_as_the_savings_table_does():
+    """On a tiktoken-less ledger the token column is all zeros. The per-tool table above
+    already switches to chars for precisely that reason; rendering only tokens here turned
+    the whole cost table into a wall of nothing while the byte counts sat right there,
+    known. A cost the operator cannot read is a cost they will not act on."""
+    from terse.stats import build_retrieve_section
+    agg = aggregate([build_retrieve_record("kb", "codegraph_explore", "$text.code_blocks",
+                                           hit=True, payload="z" * 900)])
+    # Simulate the tiktoken-less ledger: sizes known, tokens not.
+    agg["retrieves"][0]["tokens"] = 0
+    agg["retrieves"][0]["untokenized"] = 1
+
+    as_chars = "\n".join(build_retrieve_section(agg, use_tokens=False))
+    assert "chr" in as_chars and "900" in as_chars
+    # The tiktoken footnote belongs only to the token rendering — under the char fallback
+    # nothing is uncounted, so printing it would contradict the column beside it.
+    assert "uncounted" not in as_chars
+
+    as_tokens = "\n".join(build_retrieve_section(agg, use_tokens=True))
+    assert "tok" in as_tokens and "uncounted" in as_tokens
+
+
 def test_the_report_section_is_absent_rather_than_empty_when_nothing_was_recorded():
     """An empty section would read as "your drop rules cost nothing" — a claim a ledger
     written before this feature (or an install with no drop rule) cannot make."""
@@ -137,7 +159,7 @@ def test_a_json_retrieve_is_billed_to_the_rule_that_dropped_the_field():
     handle = _drop_a_field(inter)
     assert inter.answer_retrieve(_retrieve_call(1, handle)) is not None
     assert len(rows) == 1
-    tool, path, hit, payload = rows[0]
+    _srv, tool, path, hit, payload = rows[0]
     assert (tool, path, hit) == ("gh.api.list", "result[].body", True)
     assert payload == "B" * 400          # the cost measured is the real returned value
 
@@ -153,7 +175,7 @@ def test_a_text_retrieve_is_billed_to_its_text_selector():
     assert "__terse_dropped__" in out
     handle = json.loads(out.split("\n")[1])["__terse_dropped__"]
     assert inter.answer_retrieve(_retrieve_call(2, handle)) is not None
-    assert [(t, p, h) for t, p, h, _ in rows] == [
+    assert [(t, p, h) for _s, t, p, h, _ in rows] == [
         ("codegraph_explore", "$text.code_blocks", True)]
 
 
@@ -165,8 +187,8 @@ def test_an_unattributed_handle_still_records_rather_than_vanishing():
     inter = Interceptor(DROP, stats_retrieve=rec)
     inter._drop_put("orphan", "value")
     inter.answer_retrieve(_retrieve_call(3, "orphan"))
-    assert len(rows) == 1 and rows[0][2] is True
-    assert rows[0][1] == ""             # empty path == "attribution unknown"
+    assert len(rows) == 1 and rows[0][3] is True
+    assert rows[0][2] == ""             # empty path == "attribution unknown"
 
 
 def test_a_miss_is_recorded_through_the_proxy_path_too():
@@ -174,7 +196,7 @@ def test_a_miss_is_recorded_through_the_proxy_path_too():
     inter = Interceptor(DROP, stats_retrieve=rec)
     reply = json.loads(inter.answer_retrieve(_retrieve_call(4, "never-existed")))
     assert reply["result"]["isError"] is True
-    assert len(rows) == 1 and rows[0][2] is False and rows[0][3] == ""
+    assert len(rows) == 1 and rows[0][3] is False and rows[0][4] == ""
 
 
 # --- the staged/commit contract, and store lifecycle ---
@@ -252,31 +274,54 @@ def test_a_reconnect_clears_attribution_with_the_store():
     assert inter.dropped == {} and inter._drop_origin == {}
 
 
-def test_attribution_is_shared_across_multiproxy_peers():
-    """Under multiproxy any peer's Interceptor may answer a retrieve for a handle a
-    DIFFERENT peer dropped (the store is shared). The origins map is shared for the same
-    reason — a private one would lose attribution on exactly the fleet shape that has a
-    lossy-by-default rule."""
+def test_a_retrieve_is_billed_to_the_peer_that_dropped_it_not_the_one_that_answers():
+    """Under multiproxy the router answers EVERY `terse.retrieve` through `peers[0]`
+    (`_route_call`), so the answering Interceptor is almost never the one that dropped the
+    value — and only `peers[0]`'s writer is ever invoked.
+
+    That made the `server` column name the wrong peer: a `kb` rule's cost was filed under
+    `gh`, where it does not join with that tool's own result rows and points an operator at
+    the wrong peer. Caught in review; the earlier version of this test invoked peer B's
+    writer DIRECTLY, a call production never makes, so it passed throughout.
+
+    The label is therefore captured at DROP time and travels in the shared origins map."""
     from collections import OrderedDict
     from threading import Lock
 
     store: OrderedDict = OrderedDict()
     lock, boxed, origins = Lock(), [0], {}
+    rows_first, rec_first = _recorder()
+    # peers[0] — the one the router always routes retrieves through. Its own writer is
+    # bound to ITS label, which is exactly the mislabeling this pins.
+    peer_first = Interceptor(DROP, store=store, store_lock=lock, dropped_bytes=boxed,
+                             origins=origins, stats_retrieve=rec_first,
+                             ledger_label="gh")
+    peer_other = Interceptor(DROP, store=store, store_lock=lock, dropped_bytes=boxed,
+                             origins=origins, ledger_label="kb")
+    handle = _drop_a_field(peer_other)
+    # Exactly how `_route_call` does it: peers[0] answers a handle another peer dropped.
+    assert peer_first.answer_retrieve(_retrieve_call(7, handle)) is not None
+    assert len(rows_first) == 1
+    server, tool, path, hit, _payload = rows_first[0]
+    assert server == "kb", "billed to the answering peer instead of the dropping one"
+    assert (tool, path, hit) == ("gh.api.list", "result[].body", True)
+
+
+def test_an_unattributed_retrieve_falls_back_to_the_answering_proxys_own_label():
+    """A handle with no provenance still has to be billed somewhere. There is no better
+    answer available than the proxy that served it, and dropping the row entirely would
+    under-count the cost side."""
     rows, rec = _recorder()
-    peer_a = Interceptor(DROP, store=store, store_lock=lock, dropped_bytes=boxed,
-                         origins=origins)
-    peer_b = Interceptor(DROP, store=store, store_lock=lock, dropped_bytes=boxed,
-                         origins=origins, stats_retrieve=rec)
-    handle = _drop_a_field(peer_a)
-    # peer B answers for a handle peer A dropped, and still knows whose rule it was.
-    assert peer_b.answer_retrieve(_retrieve_call(7, handle)) is not None
-    assert [(t, p) for t, p, _, _ in rows] == [("gh.api.list", "result[].body")]
+    inter = Interceptor(DROP, stats_retrieve=rec, ledger_label="gh")
+    inter._drop_put("orphan", "value")
+    inter.answer_retrieve(_retrieve_call(11, "orphan"))
+    assert rows[0][0] == "gh" and rows[0][2] == ""
 
 
 def test_a_broken_ledger_never_breaks_a_served_retrieve():
     """Stats is never load-bearing: the value is already resolved when the row is written,
     so a ledger failure must not turn a good retrieve into an error reply."""
-    def exploding(tool, path, hit, payload):
+    def exploding(server, tool, path, hit, payload):
         raise OSError("disk full")
 
     inter = Interceptor(DROP, stats_retrieve=exploding)
