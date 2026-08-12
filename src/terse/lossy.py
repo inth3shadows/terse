@@ -264,14 +264,24 @@ def _handle(tool: str, path: str, serialized: str) -> str:
 
 
 def _drop(value: Any, tool: str, path: str, min_len: int,
-          sink: Callable[[str, Any], None]) -> Any:
+          sink: Callable[[str, Any], None],
+          origin: dict[str, tuple[str, str]] | None = None) -> Any:
     """Persist `value` via `sink` and return the inline handle marker — unless its
-    serialized form is under `min_len`, in which case it stays put (not worth a round-trip)."""
+    serialized form is under `min_len`, in which case it stays put (not worth a round-trip).
+
+    `origin`, when given, records `handle -> (tool, path)`. The handle is a one-way digest
+    OF that pair, so provenance cannot be recovered from it later — capturing it here is the
+    only chance. It exists so a retrieve can be billed back to the rule that caused the drop
+    (#251): without it the ledger can only say a retrieve happened, not which rule to retune.
+    Kept as a separate out-param rather than a wider `sink` signature because the staged
+    sink is `dict.__setitem__`, which takes exactly two arguments."""
     serialized = _serialize(value)
     if len(serialized) < min_len:
         return value
     handle = _handle(tool, path, serialized)
     sink(handle, value)
+    if origin is not None:
+        origin[handle] = (tool, path)
     return drop_marker(handle, len(serialized))
 
 
@@ -299,15 +309,19 @@ def _drop_specs(rule: Any) -> list[tuple[str, dict]]:
             and p not in crit and not is_text_path(p)]
 
 
-def apply_drops(obj: Any, rule: Any, tool: str, sink: Callable[[str, Any], None]) -> Any:
+def apply_drops(obj: Any, rule: Any, tool: str, sink: Callable[[str, Any], None],
+                origin: dict[str, tuple[str, str]] | None = None) -> Any:
     """Replace every drop-marked, non-critical field of `obj` with a handle marker,
     persisting each original via `sink(handle, value)`. Returns a new structure; critical
-    fields are never touched. Raises PathError if a path doesn't resolve (caller falls back)."""
+    fields are never touched. Raises PathError if a path doesn't resolve (caller falls back).
+
+    `origin` is the optional `handle -> (tool, path)` provenance map described on `_drop`."""
     out = obj
     for path, spec in _drop_specs(rule):
         min_len = int(spec.get("min", DEFAULT_DROP_MIN))
         out = _apply_at(out, _parse_path(path),
-                        partial(_drop, tool=tool, path=path, min_len=min_len, sink=sink))
+                        partial(_drop, tool=tool, path=path, min_len=min_len, sink=sink,
+                                origin=origin))
     return out
 
 
@@ -394,10 +408,15 @@ def fenced_spans(text: str) -> list[tuple[int, int]]:
 
 
 def apply_text_drops(text: str, rule: Any, tool: str,
-                     sink: Callable[[str, Any], None]) -> str:
+                     sink: Callable[[str, Any], None],
+                     origin: dict[str, tuple[str, str]] | None = None) -> str:
     """Replace every drop-marked text span of `text` with a one-line handle marker,
     persisting each original span verbatim via `sink(handle, span)`. Returns the new text
-    (unchanged when nothing qualifies). Spans under the size floor are left in place."""
+    (unchanged when nothing qualifies). Spans under the size floor are left in place.
+
+    `origin` is the optional `handle -> (tool, path)` provenance map described on `_drop`.
+    This is the path the fleet's only lossy-by-default rule takes (`$text.code_blocks`), so
+    it is the one that actually needs the attribution."""
     out = text
     for path, spec in _text_drop_specs(rule):
         min_len = int(spec.get("min", DEFAULT_TEXT_DROP_MIN))
@@ -411,6 +430,8 @@ def apply_text_drops(text: str, rule: Any, tool: str,
                 continue
             handle = _handle(tool, path, span)
             sink(handle, span)
+            if origin is not None:
+                origin[handle] = (tool, path)
             marker = json.dumps(drop_marker(handle, len(span)),
                                 separators=(",", ":"), ensure_ascii=False)
             # Keep the span's own trailing newline so the surrounding prose's line
