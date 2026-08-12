@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.25.1] - 2026-08-12
+
 ### Fixed
 
 - **A transport failure in the fluency eval no longer scores as a wrong answer** (`#263`).
