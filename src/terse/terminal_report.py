@@ -208,15 +208,21 @@ def build_terminal_diff_report(results: dict, form_label: str = "diff-form",
                                 control_label: str = "full-terse",
                                 color: bool | None = None) -> str:
     """Terminal counterpart to report.build_diff_report's verdict section — a forest
-    plot of per-model accuracy with 95% CI, gated on the worst model."""
-    gap_rows = diff_gap_rows(results)
+    plot of per-model accuracy with 95% CI, gated on the worst model. Models whose calls
+    never reached the backend are excluded and named, same as the markdown: a FAIL bar
+    for a model the markdown just declined to score is the same false verdict in a
+    louder renderer (#264)."""
+    gap_rows, excluded = diff_gap_rows(results)
     plot_rows = []
     for model, (facc, fse, cacc, cse) in gap_rows.items():
         gap = facc - cacc
         passed = gap >= -_GAP_TOLERANCE - 1e-9
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
                            "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
-    return forest_bar_lines(plot_rows, form_label, control_label, color=color)
+    text = forest_bar_lines(plot_rows, form_label, control_label, color=color)
+    if excluded:
+        text += f"\n  (excluded — calls never reached the backend: {', '.join(excluded)})"
+    return text
 
 
 def build_terminal_fluency_report(results: dict, color: bool | None = None) -> str:

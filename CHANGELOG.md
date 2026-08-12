@@ -41,6 +41,47 @@ fails that pull request until the section has moved.
   defensively for exactly that reason; those exclusions are now belt-and-braces rather than
   load-bearing.
 
+  A failed call is removed from **its arm's denominator** (`<form>_trials`, which
+  `_form_stats` already preferred) rather than voiding the model, so a handful of transient
+  429s no longer depress an accuracy at all; a model is withheld only when an arm has zero
+  completed trials or more than `UNMEASURED_FAIL_SHARE` (20%) of its calls were lost. The
+  earlier any-failure rule would have discarded an otherwise-complete multi-hour run — the
+  same outcome as the bug, by a different route. Models that lost some calls but stayed
+  under the bar are listed as *partially degraded* with `fails/attempts`.
+
+  The exclusion now also covers `fluency_gap_rows`, which feeds the **terminal forest
+  plot**: `cli` prints it directly below the markdown, so a dead backend previously showed
+  `n/a` in the table and "not measured" in the verdict while the chart beneath plotted its
+  gap as a red FAIL bar. The per-transform table likewise stops pooling withheld models'
+  rows — that table is what a reader uses to decide "restrict the policy to the transforms
+  that held".
+
+  Verified against a live outage rather than only in tests: with `gemini-3.5-flash`
+  returning 503, the old code named it the worst-case model and printed **PASS** ("terse's
+  compressed form preserves comprehension within tolerance") off a backend that was down —
+  a false *pass*. The same run now reports `104/104 calls lost` and `NO VERDICT`.
+
+  The same gate now covers the **`proxy --diff` ship gate** (`build_diff_report` /
+  `build_text_diff_report`), which had no control of any kind — not even the `raw == 0`
+  one the payload report already had. A backend that was entirely down scored 0% on both
+  arms, so the gap was exactly 0 and the verdict read *"safe to enable `proxy --diff`"*.
+  A false **pass** on a ship gate is worse than the false fail this issue was filed about:
+  a false fail blocks someone and gets re-run, while a false pass agrees with whoever ran
+  it and is never checked again. The diff harnesses now emit the `attempts` counter the
+  gate divides by, `_unmeasured` discovers arm names from the rows instead of hardcoding
+  the payload harness's four, and a run with nothing left to score prints `NO VERDICT`
+  rather than an empty verdict section.
+
+  The gate reaches every renderer of those rows, not just the first one fixed. Gating the
+  diff markdown alone re-created the split it was meant to close: `diff_gap_rows` — whose
+  docstring promises "a chart's gap can never read differently than `build_diff_report`'s"
+  — kept drawing a FAIL bar for a model the markdown had just declined to score, in the
+  forest plot `cli` prints directly beneath it, for all three diff paths. It now returns
+  `(gap_rows, excluded)` like `fluency_gap_rows` and names what it dropped.
+  `build_diff_soak_report` is gated too: a down backend scored 0% on both arms at every
+  depth, which is a gap of exactly 0 reading **PASS**, beneath a by-depth table showing a
+  flat, reassuring no-drift line drawn entirely from calls that never happened.
+
 ## [0.25.0] - 2026-08-11
 
 ### Added
