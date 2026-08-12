@@ -428,14 +428,17 @@ def test_diff_gap_rows_matches_build_diff_report_verdict():
 
     rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
              "trials": 1, "terse_ok": 1, "diff_ok": 1 if i < 8 else 0} for i in range(10)]
-    gap_rows = diff_gap_rows({"m": rows})
+    gap_rows, excluded = diff_gap_rows({"m": rows})
     facc, _, cacc, _ = gap_rows["m"]
     assert facc == 0.8 and cacc == 1.0
+    # Rows predating the failure counters carry no `fails`/`attempts`, so the #264 gate
+    # must treat them as measured — otherwise every stored result file goes dark.
+    assert excluded == []
 
 
 def test_diff_gap_rows_skips_empty_models():
     from terse.report import diff_gap_rows
-    assert diff_gap_rows({"empty": []}) == {}
+    assert diff_gap_rows({"empty": []}) == ({}, [])
 
 
 def test_fluency_gap_rows_best_of_terse_or_primer_vs_raw():
@@ -490,8 +493,10 @@ def test_gen_text_diff_questions_empty_when_no_diff_applies():
 
 
 def test_gen_text_diff_questions_omits_last_line_when_blank():
-    # A blank final line would give expected="", indistinguishable from _safe_ask's
-    # empty-string return on a total answerer failure — so it must not be asked.
+    # A blank final line would give expected="", which used to be indistinguishable from
+    # _safe_ask's empty-string return on a total answerer failure — so it must not be
+    # asked. Since #263 that return is None and never reaches `score`, so this pins a
+    # belt-and-braces exclusion, not the load-bearing guard it originally was.
     curr = TEXT_PREV + "\n\n"
     qs = {q.qid: q for q in fluency.gen_text_diff_questions(TEXT_PREV, curr, tool="demo")}
     assert "last-line" not in qs

@@ -394,7 +394,9 @@ def _miss_text(handle: Any) -> str:
 def _safe_call(answerer: ToolAnswerer, messages: list[dict]) -> Turn:
     """Call the model, but never let one failed call abort a long multi-model run — a
     transport error / rate limit / refusal scores as "didn't answer, didn't retrieve",
-    not a crash. Mirrors fluency._safe_ask's fail-open contract.
+    not a crash. Mirrors fluency._safe_ask's fail-open contract — including, since #263,
+    its insistence that a failure stay DISTINGUISHABLE from a real answer: `_safe_ask`
+    returns None where this returns `error=True`.
 
     The failure is RECORDED, not just absorbed: an unreachable model produces exactly the
     same row as a model that declined to call retrieve (0% recall), so a harness fault

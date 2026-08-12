@@ -13,6 +13,91 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A transport failure in the fluency eval no longer scores as a wrong answer** (`#263`).
+  `_safe_ask` returned `""` on any exception and `score` counted that as incorrect, so an
+  unreachable model reported ~0% accuracy — indistinguishable in the report from a model
+  that genuinely could not read terse's compressed form. Because the verdict gates on the
+  **worst** model, a single rate-limited backend did not dilute a panel, it decided it: a
+  live `gemini-3.6-flash` rate limit would have returned FAIL for the whole no-primer
+  question (`#249`) on a run that measured nothing, after 66 minutes and zero output.
+
+  `_safe_ask` now returns `None` — distinct from every real reply, including an empty one —
+  and `_ask_n` returns `(correct, transport_failures)`, counting a failure separately and
+  never scoring it. A call that never happened is not a wrong answer.
+
+  The report already excluded a model whose raw control was exactly 0%. That guard catches
+  a **total** outage only, and only after scoring it as if the model had answered; it does
+  not catch a **partial** rate limit, which leaves `raw` non-zero while depressing every arm
+  — the case that reaches a plausible-looking verdict. A model with any failed call now
+  publishes **no accuracy at all** (`n/a`, never a footnoted 0%) and is excluded from the
+  gate, and a run in which every model failed states `NO VERDICT — nothing was measured`
+  rather than falling silent, because silence is how a run that measured nothing gets read
+  as a run that found nothing wrong.
+
+  Secondary hazard closed with it: `""` could *match* a question whose expected answer was
+  empty, scoring a total failure as **correct**. `questions.py` excludes such questions
+  defensively for exactly that reason; those exclusions are now belt-and-braces rather than
+  load-bearing.
+
+  A failed call is removed from **its arm's denominator** (`<form>_trials`, which
+  `_form_stats` already preferred) rather than voiding the model, so a handful of transient
+  429s no longer depress an accuracy at all; a model is withheld only when an arm has zero
+  completed trials or more than `UNMEASURED_FAIL_SHARE` (20%) of its calls were lost. The
+  earlier any-failure rule would have discarded an otherwise-complete multi-hour run — the
+  same outcome as the bug, by a different route. Models that lost some calls but stayed
+  under the bar are listed as *partially degraded* with `fails/attempts`.
+
+  The exclusion now also covers `fluency_gap_rows`, which feeds the **terminal forest
+  plot**: `cli` prints it directly below the markdown, so a dead backend previously showed
+  `n/a` in the table and "not measured" in the verdict while the chart beneath plotted its
+  gap as a red FAIL bar. The per-transform table likewise stops pooling withheld models'
+  rows — that table is what a reader uses to decide "restrict the policy to the transforms
+  that held".
+
+  Verified against a live outage rather than only in tests: with `gemini-3.5-flash`
+  returning 503, the old code named it the worst-case model and printed **PASS** ("terse's
+  compressed form preserves comprehension within tolerance") off a backend that was down —
+  a false *pass*. The same run now reports `104/104 calls lost` and `NO VERDICT`.
+
+  The same gate now covers the **`proxy --diff` ship gate** (`build_diff_report` /
+  `build_text_diff_report`), which had no control of any kind — not even the `raw == 0`
+  one the payload report already had. A backend that was entirely down scored 0% on both
+  arms, so the gap was exactly 0 and the verdict read *"safe to enable `proxy --diff`"*.
+  A false **pass** on a ship gate is worse than the false fail this issue was filed about:
+  a false fail blocks someone and gets re-run, while a false pass agrees with whoever ran
+  it and is never checked again. The diff harnesses now emit the `attempts` counter the
+  gate divides by, `_unmeasured` discovers arm names from the rows instead of hardcoding
+  the payload harness's four, and a run with nothing left to score prints `NO VERDICT`
+  rather than an empty verdict section.
+
+  The gate reaches every renderer of those rows, not just the first one fixed. Gating the
+  diff markdown alone re-created the split it was meant to close: `diff_gap_rows` — whose
+  docstring promises "a chart's gap can never read differently than `build_diff_report`'s"
+  — kept drawing a FAIL bar for a model the markdown had just declined to score, in the
+  forest plot `cli` prints directly beneath it, for all three diff paths. It now returns
+  `(gap_rows, excluded)` like `fluency_gap_rows` and names what it dropped.
+  `build_diff_soak_report` is gated too: a down backend scored 0% on both arms at every
+  depth, which is a gap of exactly 0 reading **PASS**, beneath a by-depth table showing a
+  flat, reassuring no-drift line drawn entirely from calls that never happened. And
+  `build_html_diff_report`, which builds its own gap rows rather than calling
+  `diff_gap_rows`, rendered a green `✓ PASS` banner off the same dead backend — the
+  artifact most likely to be screenshotted and quoted, and so the last place a false pass
+  should survive. It now renders `NO VERDICT` and names the models it dropped.
+
+  Those were one defect wearing five coats — the gate was added a renderer at a time, and
+  each renderer that still lacked it published the verdict the others had just withdrawn.
+  `diff_gap_rows` asserted its agreement with the markdown *in a docstring*, which is how
+  the split opened without a test going red. The rule is now pinned as an invariance —
+  **an unmeasured model must not change any renderer's verdict** — checked across the
+  fluency markdown, the diff markdown, the soak markdown, both terminal forest plots and
+  the HTML banner from one fixture. It catches all seven gate sites, including the
+  soak's deepest-depth drift signal, which was found by writing the invariance test and
+  not by review.
+
+## [0.25.0] - 2026-08-11
+
 ### Added
 
 - **A `drop-to-retrieve` rule's COST is now recorded and reported, not just its saving**

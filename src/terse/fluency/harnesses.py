@@ -25,22 +25,47 @@ def _user_prompt(prompt: str, instruction: str, data: str) -> str:
     return f"{prompt}\n{instruction}\n\nDATA:\n{data}"
 
 
-def _safe_ask(answerer: Answerer, system: str, user: str) -> str:
-    """Call the model, but never let one failed call abort a long multi-model run —
-    a transport error / rate limit / refusal scores as a wrong answer, not a crash."""
+def _safe_ask(answerer: Answerer, system: str, user: str) -> str | None:
+    """Call the model, but never let one failed call abort a long multi-model run.
+
+    Returns **None** on a transport failure (connection error, rate limit, bad model id) —
+    deliberately distinct from a real reply, including an empty one. This used to return
+    `""`, which `score` then counted as a WRONG ANSWER, so an unreachable model reported
+    ~0% accuracy and was indistinguishable in the report from a model that genuinely could
+    not read terse's compressed form (#263). Because `run_fluency`'s verdict gates on the
+    WORST model, a single rate-limited backend did not merely dilute a panel — it decided
+    it. A live `gemini-3.6-flash` rate limit would have returned FAIL for the whole
+    no-primer question (#249) on a result that measured nothing.
+
+    A second, quieter hazard goes with it: `""` could MATCH a question whose expected
+    answer was empty, scoring a total failure as correct. `questions.py` excludes such
+    questions defensively for exactly that reason; with None those exclusions become
+    belt-and-braces rather than load-bearing."""
     try:
         return answerer(system, user)
     except Exception:
-        return ""
+        return None
 
 
 def _ask_n(answerer: Answerer, system: str, user: str,
-           qtype: str, expected: Any, trials: int) -> int:
-    """Ask the same question `trials` times; return how many replies scored correct
-    (0..trials). Repeating at temperature 0 is not redundant — it surfaces the
-    provider-side nondeterminism (batching / MoE routing) behind the ~5pt run-to-run
-    accuracy wobble the report's binomial bound quantifies."""
-    return sum(score(qtype, expected, _safe_ask(answerer, system, user)) for _ in range(trials))
+           qtype: str, expected: Any, trials: int) -> tuple[int, int]:
+    """Ask the same question `trials` times; return `(correct, transport_failures)`.
+
+    Repeating at temperature 0 is not redundant — it surfaces the provider-side
+    nondeterminism (batching / MoE routing) behind the ~5pt run-to-run accuracy wobble the
+    report's binomial bound quantifies.
+
+    A transport failure is counted SEPARATELY and never scored. It is not a wrong answer:
+    the model was never asked. Callers carry the count into the row so the report can
+    decline to publish an accuracy for a backend that did not answer (#263)."""
+    ok = fails = 0
+    for _ in range(trials):
+        reply = _safe_ask(answerer, system, user)
+        if reply is None:
+            fails += 1
+            continue
+        ok += score(qtype, expected, reply)
+    return ok, fails
 
 
 def run_payload(obj: Any, raw_text: str, answerer: Answerer,
@@ -73,14 +98,29 @@ def run_payload(obj: Any, raw_text: str, answerer: Answerer,
         # The primer PREFIXES the result body, which is where a lazy primer would put it:
         # the proxy owns the result text and nothing else.
         inline_u = _user_prompt(q.prompt, q.instruction, f"{primer}\n\n{terse_text}")
+        raw_ok, raw_fail = _ask_n(answerer, "", raw_u, q.qtype, q.expected, trials)
+        terse_ok, terse_fail = _ask_n(answerer, "", terse_u, q.qtype, q.expected, trials)
+        primer_ok, primer_fail = _ask_n(answerer, primer, terse_u, q.qtype, q.expected, trials)
+        # No system message: the whole point is that the model was never told anything
+        # at initialize time.
+        inline_ok, inline_fail = _ask_n(answerer, "", inline_u, q.qtype, q.expected, trials)
         out.append({
             "qid": q.qid, "qtype": q.qtype, "transform": q.transform, "trials": trials,
-            "raw_ok": _ask_n(answerer, "", raw_u, q.qtype, q.expected, trials),
-            "terse_ok": _ask_n(answerer, "", terse_u, q.qtype, q.expected, trials),
-            "primer_ok": _ask_n(answerer, primer, terse_u, q.qtype, q.expected, trials),
-            # No system message: the whole point is that the model was never told anything
-            # at initialize time.
-            "inline_ok": _ask_n(answerer, "", inline_u, q.qtype, q.expected, trials),
+            "raw_ok": raw_ok, "terse_ok": terse_ok,
+            "primer_ok": primer_ok, "inline_ok": inline_ok,
+            # Per-arm DENOMINATORS excluding the calls that never happened (#263).
+            # `_form_stats` already prefers a per-form `<form>_trials` over the shared
+            # `trials`, so a transport failure is removed from the denominator rather than
+            # scored as a miss. This is what keeps a handful of transient 429s from
+            # depressing an otherwise-complete run: the accuracy stays over the calls that
+            # actually returned, instead of being diluted by calls that never left.
+            "raw_trials": trials - raw_fail,
+            "terse_trials": trials - terse_fail,
+            "primer_trials": trials - primer_fail,
+            "inline_trials": trials - inline_fail,
+            # Kept for reporting: how degraded this run was, and out of how much.
+            "fails": raw_fail + terse_fail + primer_fail + inline_fail,
+            "attempts": trials * 4,
         })
     return out
 
@@ -139,10 +179,18 @@ def run_diff_payload(prev_obj: Any, curr_obj: Any, answerer: Answerer,
     for q in questions:
         full_u = _user_prompt(q.prompt, q.instruction, curr_terse)
         diff_u = _user_prompt(q.prompt, q.instruction, diff_data)
+        _t_ok, _t_f = _ask_n(answerer, "", full_u, q.qtype, q.expected, trials)
+        _d_ok, _d_f = _ask_n(answerer, "", diff_u, q.qtype, q.expected, trials)
+        # Failed calls leave the denominator, exactly as in `run_payload`: the
+        # defect #263 names applies to every harness, not only the primer one.
+        _t_tr, _d_tr = trials - _t_f, trials - _d_f
         out.append({
             "qid": q.qid, "qtype": q.qtype, "transform": q.transform, "trials": trials,
-            "terse_ok": _ask_n(answerer, "", full_u, q.qtype, q.expected, trials),
-            "diff_ok": _ask_n(answerer, "", diff_u, q.qtype, q.expected, trials),
+            "terse_ok": _t_ok, "terse_trials": _t_tr,
+            "diff_ok": _d_ok, "diff_trials": _d_tr,
+            # `attempts` is what `_unmeasured` divides by; without it the report reads the
+            # row as predating the counters and publishes a verdict regardless (#264).
+            "fails": _t_f + _d_f, "attempts": trials * 2,
         })
     return out
 
@@ -291,11 +339,19 @@ def run_chain_payload(objs: list, answerer: Answerer, tool: str = "",
     for q in questions:
         full_u = _user_prompt(q.prompt, q.instruction, curr_terse)
         chain_u = _user_prompt(q.prompt, q.instruction, chain_data)
+        _t_ok, _t_f = _ask_n(answerer, "", full_u, q.qtype, q.expected, trials)
+        _d_ok, _d_f = _ask_n(answerer, "", chain_u, q.qtype, q.expected, trials)
+        # Failed calls leave the denominator, exactly as in `run_payload`: the
+        # defect #263 names applies to every harness, not only the primer one.
+        _t_tr, _d_tr = trials - _t_f, trials - _d_f
         out.append({
             "qid": q.qid, "qtype": q.qtype, "transform": q.transform, "trials": trials,
             "depth": len(wires),
-            "terse_ok": _ask_n(answerer, "", full_u, q.qtype, q.expected, trials),
-            "diff_ok": _ask_n(answerer, "", chain_u, q.qtype, q.expected, trials),
+            "terse_ok": _t_ok, "terse_trials": _t_tr,
+            "diff_ok": _d_ok, "diff_trials": _d_tr,
+            # `attempts` is what `_unmeasured` divides by; without it the report reads the
+            # row as predating the counters and publishes a verdict regardless (#264).
+            "fails": _t_f + _d_f, "attempts": trials * 2,
         })
     return out
 
@@ -355,10 +411,18 @@ def run_text_diff_payload(prev: str, curr: str, answerer: Answerer,
     for q in questions:
         full_u = _user_prompt(q.prompt, q.instruction, curr)
         diff_u = _user_prompt(q.prompt, q.instruction, diff_data)
+        _t_ok, _t_f = _ask_n(answerer, "", full_u, q.qtype, q.expected, trials)
+        _d_ok, _d_f = _ask_n(answerer, "", diff_u, q.qtype, q.expected, trials)
+        # Failed calls leave the denominator, exactly as in `run_payload`: the
+        # defect #263 names applies to every harness, not only the primer one.
+        _t_tr, _d_tr = trials - _t_f, trials - _d_f
         out.append({
             "qid": q.qid, "qtype": q.qtype, "transform": q.transform, "trials": trials,
-            "terse_ok": _ask_n(answerer, "", full_u, q.qtype, q.expected, trials),
-            "diff_ok": _ask_n(answerer, "", diff_u, q.qtype, q.expected, trials),
+            "terse_ok": _t_ok, "terse_trials": _t_tr,
+            "diff_ok": _d_ok, "diff_trials": _d_tr,
+            # `attempts` is what `_unmeasured` divides by; without it the report reads the
+            # row as predating the counters and publishes a verdict regardless (#264).
+            "fails": _t_f + _d_f, "attempts": trials * 2,
         })
     return out
 

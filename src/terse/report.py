@@ -52,6 +52,44 @@ def _ci(se: float) -> float:
     return 1.96 * se
 
 
+# Share of a model's calls that may fail before its numbers stop meaning anything (#263).
+# NOT zero: a failed call is already excluded from its arm's denominator (see the
+# `<form>_trials` keys `run_payload` emits), so a handful of transient 429s no longer
+# depress an accuracy at all — voiding a whole model for one of them would discard an
+# otherwise-complete multi-hour run, which is its own kind of wrong answer. What a
+# threshold still has to catch is the backend that was substantially down, where the
+# surviving sample is small and self-selected rather than merely smaller.
+UNMEASURED_FAIL_SHARE = 0.20
+
+
+def _unmeasured(rows: list[dict]) -> bool:
+    """True when transport failures make this model's numbers untrustworthy.
+
+    Two independent triggers, because they fail differently:
+      1. any arm with ZERO completed trials — that arm cannot be computed at all, and
+         `_form_stats` would report it as a flat 0.0 indistinguishable from real failure;
+      2. more than `UNMEASURED_FAIL_SHARE` of calls lost — the sample that survived is
+         both small and selected by which calls happened to get through.
+    """
+    if not rows:
+        return False
+    attempts = sum(int(r.get("attempts", 0)) for r in rows)
+    fails = sum(int(r.get("fails", 0)) for r in rows)
+    if not attempts:
+        # Rows predating the counters (older result files) carry neither key. Absent is
+        # not zero-failures, but it is also not evidence of failure — treat as measured,
+        # exactly as this report did before the counters existed.
+        return False
+    # Arms are DISCOVERED from the rows, not hardcoded. The payload harness emits
+    # raw/terse/primer/inline; the diff harnesses emit terse/diff. A fixed list would
+    # silently skip every arm it did not name — which is how the diff-side report kept
+    # publishing a verdict off a dead backend after the payload side stopped.
+    for key in sorted({k for r in rows for k in r if k.endswith("_trials")}):
+        if sum(int(r.get(key, 0)) for r in rows) == 0:
+            return True
+    return fails / attempts > UNMEASURED_FAIL_SHARE
+
+
 class GapVerdict(NamedTuple):
     model: str
     gap: float
@@ -91,29 +129,52 @@ def _format_worst_case_line(verdict: GapVerdict, tol: float, form_label: str, co
             f"at {tol:.0%} tolerance.")
 
 
-def diff_gap_rows(results: dict) -> dict[str, tuple[float, float, float, float]]:
+def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, float]],
+                                          list[str]]:
     """(form=diff_ok, control=terse_ok) gap-row tuples per model — the same shape
     `_worst_case_gap` and the bar-chart renderers (html/terminal) consume, computed
-    once here so a chart's gap can never read differently than build_diff_report's."""
+    once here so a chart's gap can never read differently than build_diff_report's.
+    Returns (gap_rows, excluded_model_names), mirroring `fluency_gap_rows`.
+
+    "Can never read differently" only holds if this applies the SAME exclusions the
+    markdown does. It did not: when `_build_diff_style_report` gained the transport-
+    failure gate (#264), a dead backend rendered `n/a` in the table and `NO VERDICT` in
+    the markdown while the forest plot printed directly beneath it still drew a FAIL bar
+    off the same rows. `cli` prints both together for all three diff paths (`--diff`,
+    `--diff-soak`, `--text-diff-eval`), and the chart is what a reader sees first."""
     out: dict[str, tuple[float, float, float, float]] = {}
+    excluded: list[str] = []
     for model, rows in results.items():
         if not rows:
+            continue
+        if _unmeasured(rows):
+            excluded.append(model)
             continue
         facc, fse = _form_stats(rows, "diff_ok")
         cacc, cse = _form_stats(rows, "terse_ok")
         out[model] = (facc, fse, cacc, cse)
-    return out
+    return out, excluded
 
 
 def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, float]], list[str]]:
     """(form=best of terse/primer, control=raw) gap-row tuples per model, for the bar-
     chart renderers. Excludes any model whose raw control failed (0% — a backend/config
-    error, not a comprehension result), matching build_fluency_report's gate. Returns
-    (gap_rows, excluded_model_names)."""
+    error, not a comprehension result) AND any model too degraded by transport failures to
+    measure, matching `build_fluency_report`'s gate. Returns (gap_rows, excluded_names).
+
+    The second exclusion is not decoration. `cli` prints the markdown report and the
+    terminal forest plot together, and this function feeds only the plot: without it a
+    rate-limited model rendered `n/a` in the table and "not measured" in the verdict while
+    the chart immediately below plotted its depressed gap as a red FAIL bar — the exact
+    false verdict #263 exists to kill, surviving in the renderer the reader looks at
+    first."""
     out: dict[str, tuple[float, float, float, float]] = {}
     broken: list[str] = []
     for model, rows in results.items():
         if not rows:
+            continue
+        if _unmeasured(rows):
+            broken.append(model)
             continue
         racc, rse = _form_stats(rows, "raw_ok")
         if racc == 0:
@@ -713,9 +774,20 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         "|---|---|---|---|---|",
     ]
     gap_rows: dict[str, tuple[float, float, float, float]] = {}
+    unmeasured: dict[str, tuple[int, int]] = {}
     for model, rows in results.items():
         n = len(rows)
         if not n:
+            continue
+        # Same gate as build_fluency_report (#263/#264). This report had NO control of any
+        # kind — not even the raw==0 one — so a backend that was entirely down scored 0%
+        # on both arms, produced a gap of exactly 0, and printed "safe to enable
+        # `proxy --diff`". A false PASS on a ship gate is strictly worse than the false
+        # FAIL #263 was filed about: nobody re-checks a result that agrees with them.
+        if _unmeasured(rows):
+            unmeasured[model] = (sum(int(r.get("fails", 0)) for r in rows),
+                                 sum(int(r.get("attempts", 0)) for r in rows))
+            out.append(f"| `{model}` | {n} | n/a | n/a | n/a |")
             continue
         facc, fse = _form_stats(rows, "terse_ok")
         dacc, dse = _form_stats(rows, "diff_ok")
@@ -725,6 +797,15 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         out.append(f"| `{model}` | {n} | {facc:.0%} ±{_ci(fse) * 100:.0f} "
                    f"| {dacc:.0%} ±{_ci(dse) * 100:.0f} | {regr} |")
     out.append("")
+    if unmeasured:
+        out += [
+            "**Not measured** — too many calls never reached the backend (connection "
+            "error, rate limit, bad model id), so no accuracy is published for: "
+            + ", ".join(f"`{m}` ({f}/{a} calls lost)"
+                        for m, (f, a) in sorted(unmeasured.items()))
+            + ". A failed call is not a wrong answer; re-run once the backend is reachable.",
+            "",
+        ]
 
     out += ["## Verdict", ""]
     worst = _worst_case_gap(gap_rows)
@@ -736,6 +817,12 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         else:
             out.append("- The diff form regresses comprehension beyond tolerance — keep "
                        "`proxy --diff` off, or restrict it to tools whose diffs stay legible.")
+    else:
+        # Nothing survived the gate. Say so instead of falling silent — this verdict is
+        # read as a go/no-go on `proxy --diff`, and an empty one reads as "no objection".
+        out.append("- **NO VERDICT — nothing was measured.** No model returned enough "
+                   "calls to score, so this run says nothing about the diff form either "
+                   "way. Fix the backend(s) and re-run before enabling `proxy --diff`.")
     out.append("")
     return "\n".join(out)
 
@@ -820,10 +907,18 @@ def build_diff_soak_report(results: dict) -> str:
         "| Model | depth | q | full-terse | chain | gap |",
         "|---|---|---|---|---|---|",
     ]
+    # Same transport-failure gate as the other two diff reports (#264). Without it a
+    # backend that was down scores 0% on both arms at every depth, which is a gap of
+    # exactly 0 and reads as PASS — and the by-depth table shows a flat, reassuring
+    # no-drift line drawn entirely from calls that never happened.
+    unmeasured = {m: rows for m, rows in results.items() if rows and _unmeasured(rows)}
     for model, rows in results.items():
         for depth in depths:
             drows = [r for r in rows if r["depth"] == depth]
             if not drows:
+                continue
+            if model in unmeasured:
+                out.append(f"| `{model}` | {depth} | {len(drows)} | n/a | n/a | n/a |")
                 continue
             facc, fse = _form_stats(drows, "terse_ok")
             dacc, dse = _form_stats(drows, "diff_ok")
@@ -831,10 +926,21 @@ def build_diff_soak_report(results: dict) -> str:
                        f"| {facc:.0%} ±{_ci(fse) * 100:.0f} "
                        f"| {dacc:.0%} ±{_ci(dse) * 100:.0f} | {dacc - facc:+.0%} |")
     out.append("")
+    if unmeasured:
+        out += [
+            "**Not measured** — too many calls never reached the backend, so no accuracy "
+            "is published for: "
+            + ", ".join(
+                f"`{m}` ({sum(int(r.get('fails', 0)) for r in rs)}/"
+                f"{sum(int(r.get('attempts', 0)) for r in rs)} calls lost)"
+                for m, rs in sorted(unmeasured.items()))
+            + ". A failed call is not a wrong answer; re-run once the backend is reachable.",
+            "",
+        ]
 
     gap_rows: dict[str, tuple[float, float, float, float]] = {}
     for model, rows in results.items():
-        if not rows:
+        if not rows or model in unmeasured:
             continue
         facc, fse = _form_stats(rows, "terse_ok")
         dacc, dse = _form_stats(rows, "diff_ok")
@@ -842,15 +948,25 @@ def build_diff_soak_report(results: dict) -> str:
 
     out += ["## Verdict", ""]
     worst = _worst_case_gap(gap_rows)
+    if not worst:
+        # Nothing survived the gate. An empty verdict on a drift soak reads as "no drift
+        # found", which is the opposite of "nothing was looked at".
+        out.append("- **NO VERDICT — nothing was measured.** No model returned enough "
+                   "calls to score, so this run says nothing about diff-chain drift "
+                   "either way. Fix the backend(s) and re-run.")
     if worst:
         out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "chain-form",
                                            "full-terse"))
         # The soak-specific signal on top of the overall gate: the worst model's gap
         # at the DEEPEST depth, since a clean average can hide a depth-correlated slide.
         deep = depths[-1] if depths else 0
+        # `unmeasured` applies here too. Gating only the overall gap above left this
+        # depth-specific signal computing off withheld models, so a down backend still
+        # decided the drift conclusion — the same defect, one paragraph further down the
+        # same function. Found by the invariance test, not by review.
         deep_rows = {m: r for m, r in
                      ((m, [x for x in rs if x["depth"] == deep])
-                      for m, rs in results.items()) if r}
+                      for m, rs in results.items() if m not in unmeasured) if r}
         deep_gaps = {}
         for m, rs in deep_rows.items():
             facc, fse = _form_stats(rs, "terse_ok")
@@ -1055,20 +1171,68 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
                    and int(r["terse_ok"]) < r.get("trials", 1))
         rec = sum(1 for r in rows if int(r["terse_ok"]) < r.get("trials", 1)
                   and int(r["primer_ok"]) == r.get("trials", 1))
+        # Transport failures (#263): calls that never reached the model. Distinct from a
+        # wrong answer, and NOT the same test as the raw==0 control below — a partial
+        # rate limit lets some calls through, so it depresses every arm's accuracy while
+        # leaving `raw` non-zero, and the control never fires. That is the case that
+        # silently publishes a comprehension number for a backend that was half down.
+        fails = sum(int(r.get("fails", 0)) for r in rows)
+        attempts = sum(int(r.get("attempts", 0)) for r in rows)
+        unmeasured = _unmeasured(rows)
         summary[model] = {"n": n, "raw": racc, "raw_se": rse,
-                          "terse": tacc, "terse_se": tse, "primer": pacc, "primer_se": pse}
+                          "terse": tacc, "terse_se": tse, "primer": pacc, "primer_se": pse,
+                          "fails": fails, "attempts": attempts, "unmeasured": unmeasured}
         if has_inline:
             summary[model].update({"inline": iacc, "inline_se": ise})
         inline_cell = (f"{iacc:.0%} ±{_ci(ise) * 100:.0f}" if has_inline else "n/a")
-        out.append(
-            f"| `{model}` | {n} | {racc:.0%} ±{_ci(rse) * 100:.0f} | {tacc:.0%} ±{_ci(tse) * 100:.0f} "
-            f"| {pacc:.0%} ±{_ci(pse) * 100:.0f} | {inline_cell} | {regr} | {rec} |"
-        )
+        if unmeasured:
+            # No percentages at all for a model that did not answer. A number here would
+            # be read as comprehension no matter how it is footnoted — the same reason the
+            # inline arm renders `n/a` rather than 0%, and the same unknown-is-not-zero
+            # rule the ledger applies to untokenized records.
+            out.append(f"| `{model}` | {n} | n/a | n/a | n/a | n/a | n/a | n/a |")
+        else:
+            out.append(
+                f"| `{model}` | {n} | {racc:.0%} ±{_ci(rse) * 100:.0f} "
+                f"| {tacc:.0%} ±{_ci(tse) * 100:.0f} "
+                f"| {pacc:.0%} ±{_ci(pse) * 100:.0f} | {inline_cell} | {regr} | {rec} |"
+            )
     out.append("")
+    unreachable = {m: s for m, s in summary.items() if s.get("unmeasured")}
+    if unreachable:
+        out += [
+            "**Not measured** — too many calls never reached the backend (connection "
+            "error, rate limit, bad model id), so no accuracy is published for: "
+            + ", ".join(f"`{m}` ({s['fails']}/{s['attempts']} calls lost)"
+                        for m, s in sorted(unreachable.items()))
+            + ". A failed call is not a wrong answer; re-run once the backend is reachable.",
+            "",
+        ]
+    # A model that lost SOME calls but stayed under the bar still publishes numbers — say
+    # so, because those percentages are over a smaller denominator than the run intended
+    # and a reader comparing across models deserves to know which ones were degraded.
+    degraded = {m: s for m, s in summary.items()
+                if s.get("fails") and not s.get("unmeasured")}
+    if degraded:
+        out += [
+            "Partially degraded (failed calls excluded from their arm's denominator, "
+            "not scored as wrong): "
+            + ", ".join(f"`{m}` ({s['fails']}/{s['attempts']})"
+                        for m, s in sorted(degraded.items()))
+            + ".",
+            "",
+        ]
 
     # --- per-transform breakdown (terse form, pooled across models) ---
     by_tf: dict[str, list[dict]] = {}
-    for rows in results.values():
+    for model, rows in results.items():
+        # Skip the models whose per-model numbers were withheld. Publishing them here,
+        # pooled and unannotated, would reprint the same corrupt counts the table above
+        # just refused to show — and this is the table a reader uses to decide "restrict
+        # the policy to the transforms that held", so a depressed row here becomes a
+        # policy change made on a backend outage.
+        if summary.get(model, {}).get("unmeasured"):
+            continue
         for r in rows:
             by_tf.setdefault(r["transform"], []).append(r)
     if by_tf:
@@ -1092,11 +1256,19 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     # Raw JSON is the control: a model that can't read RAW (0%) is a backend/config
     # failure (bad model id, refusals), not a terse-comprehension result — exclude it
     # from the gate, but say so, so a broken run can't masquerade as a verdict.
-    broken = [m for m, s in summary.items() if s["raw"] == 0]
-    gated = {m: s for m, s in summary.items() if s["raw"] > 0}
+    broken = [m for m, s in summary.items() if s["raw"] == 0 and not s.get("unmeasured")]
+    # Excluded for the same reason, by a different and EARLIER signal: the raw==0 control
+    # only catches a TOTAL failure, and only once it has already been scored as if the
+    # model answered wrongly. A counted transport failure catches the partial case too,
+    # which is the one that reaches a plausible-looking verdict (#263).
+    unmeasured_models = [m for m, s in summary.items() if s.get("unmeasured")]
+    gated = {m: s for m, s in summary.items() if s["raw"] > 0 and not s.get("unmeasured")}
     if broken:
         out.append(f"- Excluded (raw control failed — backend/config error, not comprehension): "
                    f"{', '.join(f'`{m}`' for m in broken)}.")
+    if unmeasured_models:
+        out.append(f"- Excluded (calls never reached the backend — not measured): "
+                   f"{', '.join(f'`{m}`' for m in unmeasured_models)}.")
     # best terse-side form per model, carrying its own SE for the gap's confidence interval.
     # gap CI: raw and the best form are over the same questions (not independent), so
     # √(se_raw²+se_best²) is a conservative over-estimate of the gap's SE — the honest
@@ -1121,5 +1293,19 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
             out.append("- Comprehension regresses beyond tolerance — the proxy's in-place rewrite "
                        "is not safe to ship as-is for the worst model; prefer the primer or restrict "
                        "the policy to the transforms that held.")
+    elif not gated:
+        # Nothing to gate on. Say so loudly: silence here is how a run that measured
+        # NOTHING gets read as a run that found nothing wrong (#263). Absence of a
+        # regression is not evidence of comprehension.
+        #
+        # Two different causes, named separately — claiming models were "excluded above"
+        # when the exclusion lists are empty (every model simply produced zero rows, e.g.
+        # a corpus that generated no questions) sends the reader hunting for a backend
+        # failure that never happened.
+        why = ("Every model was excluded above" if (broken or unmeasured_models)
+               else "No model produced any scored rows (did the corpus generate questions?)")
+        out.append(f"- **NO VERDICT — nothing was measured.** {why}, so this run says "
+                   "nothing about comprehension either way. Fix that and re-run before "
+                   "drawing any conclusion from it.")
     out.append("")
     return "\n".join(out)
