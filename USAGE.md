@@ -234,7 +234,8 @@ uv run terse uninstall-mcp --all          # every terse-managed server
 ```
 
 `install-mcp` rewrites each named `mcpServers` entry so its command becomes
-`<python> -m terse proxy --policy <policy> -- <the original command>`, preserving
+`<terse> proxy --policy <policy> -- <the original command>` — see *Which terse a
+wrapped entry launches* below for what `<terse>` resolves to — preserving
 the entry's `env`/`cwd`/etc. The original is saved verbatim in a sidecar stash
 (`.terse-mcp-stash.json` next to the config), so `uninstall-mcp` restores it
 byte-for-byte. It's **idempotent** (re-running re-wraps from the stashed original
@@ -266,35 +267,59 @@ This matters most when the edit is what makes the *downstream* server work at al
 (a Node-version `env.PATH` pin for a server that crashes on the system's default
 runtime, say): kept on the wrapped copy alone, it vanishes the moment you uninstall.
 
-#### After upgrading terse, re-check `mcp-status` (`$TERSE_MCP_CMD`)
+#### Which terse a wrapped entry launches (`$TERSE_MCP_CMD`)
 
-A wrapped entry launches terse as `<absolute interpreter> -m terse`, and that
-interpreter path is captured at install time. That's the default because it does not
-depend on `terse` being on the MCP launcher's `PATH` — an MCP client does not
-necessarily start your shell's environment. The cost is that the path is only as
-stable as the install behind it. An isolated-tool install (`uv tool`, `pipx`) puts its
-interpreter in a **versioned** venv, so an upgrade — or a rename of the distribution —
-can move it and leave every wrapped server at once pointing at an interpreter that no
-longer exists. They then fail *silently*: the server just shows up with no tools.
+`install-mcp` picks a launcher at install time, in this order. Everything it picks
+by itself is an **absolute path**, because an MCP client does not necessarily start
+your shell's environment and a bare `terse` would resolve unpredictably or not at all;
+only `$TERSE_MCP_CMD` can override that, and only deliberately.
 
-If your installer provides a stable console script, point wrapped entries at that
-instead. `$TERSE_MCP_CMD` (whitespace-split) overrides what `install-mcp` bakes in:
+1. `$TERSE_MCP_CMD`, if set (see below).
+2. The `terse` console script on your `PATH`, as long as it is **not inside the
+   virtualenv running `install-mcp`**, sits in an absolute `PATH` entry, and answers
+   `--version` as terse — normally `~/.local/bin/terse`, the script both
+   `uv tool install terse-mcp` and `pipx install terse-mcp` provide. A candidate that
+   fails any of those (a `pyenv`/`asdf` shim that resolves at launch time, an unrelated
+   tool of the same name) is skipped rather than baked in, and tier 3 is used instead.
+   `install-mcp` always prints the `launcher:` it settled on, so check that line if you
+   expected tier 2 and did not get it.
+3. Failing that, `<absolute interpreter> -m terse` — the interpreter running
+   `install-mcp`. This is the right answer only when terse is installed nowhere but
+   that venv, i.e. a source checkout.
+
+Tier 2 exists because a wrapped entry has to keep working for weeks, and tier 3's
+interpreter path is only as stable as the venv behind it. Run `install-mcp` with `uv
+run` from a throwaway git worktree and tier 3 would capture *that worktree's*
+`.venv/bin/python3`; the config keeps working until the worktree is removed, and then
+every wrapped server at once fails **silently** — the servers just show up with no
+tools, days after the install-mcp run that caused it. An isolated-tool install
+(`uv tool`, `pipx`) has a milder version of the same exposure, since its interpreter
+lives in a versioned venv that an upgrade or a distribution rename can move.
+
+Note the consequence of tier 2: running `install-mcp` from a terse *checkout* wires
+your MCP servers to your **installed** terse, not the checkout. That is what you want
+almost always. To wire a development build in on purpose, name it explicitly:
 
 ```
-TERSE_MCP_CMD='~/.local/bin/terse' uv run terse install-mcp runecho \
+TERSE_MCP_CMD="$PWD/.venv/bin/terse" uv run terse install-mcp runecho \
   --policy policy.example.json --print     # confirm the command, then drop --print
 ```
 
-`~/.local/bin/terse` is the console script installed by both `uv tool install
-terse-mcp` and `pipx install terse-mcp`, and it survives upgrades that move the venv.
-A leading `~` is expanded for you (a wrapped entry is spawned without a shell, so a
-literal tilde would never resolve), and a path that does not exist is **rejected at
-install time** rather than written into the config — the same treatment `--policy`
-already gets. A bare name like `terse` is passed through untouched, since it resolves
-against the launcher's `PATH`, which the installer cannot know.
+`install-mcp` also warns when the launcher it picked reports a **different version**
+than the terse writing the entries — a checkout emits flags in its own grammar, and a
+launcher older than those flags exits 2 the moment your client spawns it, which the
+client shows only as a server with no tools. A dirty working tree is not counted as a
+difference (hatch-vcs stamps it with a build date), so the warning stays meaningful.
 
-After any terse upgrade, `terse mcp-status` flags an entry whose launcher stopped
-resolving:
+`$TERSE_MCP_CMD` is whitespace-split and always wins. A leading `~` is expanded for
+you (a wrapped entry is spawned without a shell, so a literal tilde would never
+resolve), and a path that does not exist is **rejected at install time** rather than
+written into the config — the same treatment `--policy` already gets. A bare name like
+`terse` is passed through untouched, since it resolves against the launcher's `PATH`,
+which the installer cannot know.
+
+Whichever tier supplied it, `terse mcp-status` flags an entry whose launcher stopped
+resolving, so it is worth a look after any terse upgrade:
 
 ```
   runecho              wrapped  policy=/home/you/.config/terse/policy.json

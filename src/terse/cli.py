@@ -1251,6 +1251,18 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
               "— run `tools/list` per peer to\n  enumerate them rather than trusting a "
               "guess.")
     print(f"config: {res['config']}  scope: {res['scope']}  policy: {res['policy']}")
+    # Which terse got baked in is a decision install-mcp makes FOR you (#275), and the
+    # `after:` line above truncates at 100 chars, so it is not reliably visible there.
+    # Say it plainly — it is also the one thing a pyenv/asdf shim user needs to see to
+    # know they should pin $TERSE_MCP_CMD instead.
+    if res.get("launcher"):
+        print(f"launcher: {res['launcher']}")
+    if res.get("launcher_skew"):
+        print(f"  WARNING: that launcher reports terse {res['launcher_skew']}, but these "
+              f"entries were written by terse {_terse_version()}. A launcher older than "
+              f"the flags\n  baked above exits 2 at startup, which the MCP client shows "
+              f"only as a server with no tools. Upgrade it, or pick one explicitly with "
+              f"$TERSE_MCP_CMD.")
     if res.get("capture_dir"):
         print(f"capture: raw tool results → {res['capture_dir']}")
     if res.get("diff") is True:

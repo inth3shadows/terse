@@ -1,8 +1,11 @@
 """The launch path baked into every wrapped MCP config must actually launch.
 
-`install_mcp` writes `[sys.executable, "-m", "terse"]` as the command for every wrapped
-entry (`terse_invocation`), so `python -m terse` is THE production entrypoint — if it fails,
-every wrapped server on every user's machine fails to start.
+`terse_invocation` picks the command for every wrapped entry, so whatever it returns is THE
+production entrypoint — if it fails, every wrapped server on every user's machine fails to
+start. Since #275 that is normally an installed `terse` console script, with
+`[sys.executable, "-m", "terse"]` as the fallback when terse is installed nowhere but the
+venv running install-mcp. Both tiers are executed here; neither is allowed to be a string
+this file merely asserts.
 
 `src/terse/__main__.py` had **0% coverage**. The existing tests assert the config *string*
 (`entry["args"] == ["-m", "terse", "proxy", ...]`) and never execute it, which is false
@@ -18,6 +21,7 @@ both, not a comment asking people to remember.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -32,17 +36,12 @@ def _run(argv: list[str], *extra: str) -> subprocess.CompletedProcess[str]:
                           check=False)
 
 
-@pytest.fixture(autouse=True)
-def _default_launcher(monkeypatch):
-    """Clear `$TERSE_MCP_CMD` for EVERY test in this file.
-
-    Found in review, and it defeated the file's whole purpose: `terse_invocation()` honours
-    that documented override and returns the operator's console script instead of
-    `[sys.executable, "-m", "terse"]`. With the variable set, tests 1 and 2 passed even with
-    `__main__.py`'s import broken — the subprocess never touched `__main__.py` at all, so
-    the exact regression this file exists to catch was invisible. Only the last test cleared
-    it; autouse makes that the default rather than something each test must remember."""
-    monkeypatch.delenv("TERSE_MCP_CMD", raising=False)
+# `conftest._isolate_launcher_selection` pins `$PATH`/`$TERSE_MCP_CMD` for every test in
+# the suite, which is what keeps the tests below on THIS checkout's interpreter instead of
+# a globally installed terse at some other version. Both inputs matter and both have
+# already made this file vacuous once: with `$TERSE_MCP_CMD` set, the first two tests
+# passed with `__main__.py`'s import broken, because the subprocess never reached
+# `__main__.py` at all.
 
 
 def test_the_launcher_install_mcp_writes_actually_starts_terse():
@@ -98,16 +97,37 @@ def test_the_console_script_entrypoint_agrees_with_the_module_one():
         "resolving to a different install")
 
 
-def test_the_entrypoint_uses_this_interpreter_not_whatever_is_on_path(monkeypatch):
-    """`terse_invocation` returns an ABSOLUTE interpreter path on purpose: a wrapped entry is
-    launched by an MCP client whose PATH is not the operator's shell PATH, so `terse` or
-    `python` by bare name resolves unpredictably (or not at all). Pinned because the
-    absolute path is the whole reason `-m terse` is used instead of the console script."""
-    # $TERSE_MCP_CMD deliberately overrides this (documented, for versioned-venv installs),
-    # so clear it: the assertion is about the DEFAULT branch, and inheriting the operator's
-    # environment would make the test pass or fail on their shell rather than on the code.
-    monkeypatch.delenv("TERSE_MCP_CMD", raising=False)
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shim script")
+@pytest.mark.parametrize("tier", ["console-script", "interpreter"])
+def test_the_entrypoint_is_absolute_and_runs_whichever_tier_supplies_it(
+        tmp_path, monkeypatch, tier):
+    """A wrapped entry is launched by an MCP client whose PATH is not the operator's shell
+    PATH, so `terse` or `python` by bare name resolves unpredictably (or not at all).
+    Absoluteness is the invariant; which tier of `terse_invocation` supplies it is not.
+
+    This asserted `argv[0] == sys.executable` before #275 — stricter than the reason its
+    own docstring gave. An absolute console-script path satisfies "never resolved off PATH
+    at launch time" just as well, and is now preferred, because `sys.executable` under
+    `uv run` is a worktree venv that gets deleted. Matching the assertion to the stated
+    rationale lets it cover BOTH tiers, which pinning one exact string could not — and
+    tier 2 is the one that now ships, so leaving it unexecuted would mean every test in
+    this file verifies only the fallback.
+
+    The console script is a real shim onto THIS checkout rather than the installed terse,
+    for the same reason the shared PATH guard exists: a test that runs an install nobody
+    is editing reports on the wrong code."""
+    if tier == "console-script":
+        script = tmp_path / "bin" / "terse"
+        script.parent.mkdir(parents=True)
+        script.write_text(f'#!/bin/sh\nexec "{sys.executable}" -m terse "$@"\n',
+                          encoding="utf-8")
+        script.chmod(0o755)
+        monkeypatch.setenv("PATH", str(script.parent))  # outside sys.prefix -> tier 2
     argv = terse_invocation()
-    assert argv[0] == sys.executable
-    assert argv[0].startswith("/") or ":" in argv[0], f"not an absolute path: {argv[0]!r}"
-    assert argv[1:] == ["-m", "terse"]
+    assert argv == ([str(script)] if tier == "console-script"
+                    else [sys.executable, "-m", "terse"])
+    assert Path(argv[0]).is_absolute(), f"not an absolute path: {argv[0]!r}"
+
+    proc = _run(argv, "--version")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().startswith("terse ")

@@ -13,7 +13,115 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **`install-mcp` no longer bakes a launcher that dies with the venv that installed it**
+  (`#275`). `terse_invocation` returned `[sys.executable, "-m", "terse"]` — whatever
+  interpreter happened to run the install. Invoked with `uv run` from a throwaway git
+  worktree, that is `<worktree>/.venv/bin/python3`, so every wrapped MCP server was wired
+  to a directory deleted at the end of that session. The config keeps working until then,
+  which is what makes it dangerous: the servers fail **silently** days later, showing up
+  with no tools, far from the `install-mcp` run that caused it. An isolated-tool install
+  (`uv tool`, `pipx`) has the milder version of the same exposure — a versioned venv an
+  upgrade can move.
+
+  A second tier now sits between the `$TERSE_MCP_CMD` override and that fallback: the
+  first `terse` console script on `PATH` that does **not** live under `sys.prefix`. One
+  rule covers every layout — in a worktree it skips the ephemeral venv (which `uv run`
+  puts *first* on `PATH`) and finds `~/.local/bin/terse`; on an installed uv tool it takes
+  that script directly; in a checkout where terse was never installed, nothing qualifies
+  and the interpreter form ships unchanged. Preferred over hardcoding `~/.local/bin`
+  because it covers pipx, Homebrew and system-pip the same way.
+
+  Directories are **resolved** before the `sys.prefix` test and the selected script is
+  **not**, which is the whole subtlety: `~/.local/bin/terse` is a symlink *into* the uv
+  tool venv — on an installed terse, that IS `sys.prefix` — so resolving the script would
+  reject the one stable launcher being looked for, while its parent `~/.local/bin` is an
+  ordinary directory whose resolution costs nothing and closes the spellings a literal
+  comparison misses (`<wt>/../<wt>/.venv/bin`, or a venv reached through a symlinked
+  parent), each of which would otherwise select the ephemeral script and reproduce the bug
+  with the fix in place. Relative `PATH` entries (`.`, `bin`, the empty string) are
+  skipped rather than absolutized, since they mean the *installer's* cwd — the same class
+  of path-that-outlives-nothing. And the venv's directories are dropped from the search
+  path rather than the first hit being checked and rejected: `shutil.which` stops at its
+  first match, which under `uv run` is exactly the ephemeral script.
+
+  Tier 2 selects by NAME off `PATH`, a weaker claim than tier 3's — it can find a shim, or
+  an unrelated tool of the same name — so the candidate is now **proven with one
+  `--version` call** and rejected in favour of tier 3 if it does not answer as terse.
+  `install-mcp` also prints the launcher it chose, because the `after:` line truncates at
+  100 chars and a long policy path pushes the launcher off the end of it.
+
+  It **warns when that launcher reports a different version than the terse writing the
+  config**: a checkout emits argv in its own grammar, and every flag this repo has added to
+  `proxy` (`--server-name`, `--config`, `--no-join-blocks`) makes an older installed terse
+  exit 2 at spawn — which the client shows only as a server with no tools. Observed while
+  building this, on an editable install that had drifted to `0.23.3` behind a `0.25.2.dev`
+  checkout (since upgraded, so that particular reading no longer reproduces).
+
+  Only hatch-vcs's dirty-tree date stamp is normalised away before comparing, so an
+  editable install does not warn against a dirty checkout of the same commit. Comparing
+  PEP 440 *public* versions instead was the first attempt and is too coarse: hatch-vcs
+  stamps every commit at the same distance from a tag as `0.25.2.dev1`, so a branch that
+  adds a `proxy` flag and the tool built from `main` agree on the public version and differ
+  only in `+g<hash>` — exactly the case the warning exists for. The hash stays in.
+
+  Probing costs **one** subprocess per install, not two (the result is memoized; both the
+  selection and the skew check need it), with a 10s timeout — a launcher that hangs used to
+  stall a `--print` that changes nothing for a full minute.
+
+  The probe cannot abort an install. `subprocess.run(text=True)` decodes strictly and the
+  resulting `UnicodeDecodeError` is a `ValueError` — neither of the exceptions the probe
+  catches — so it escaped to the CLI's `except (FileNotFoundError, ValueError)` and exited
+  2. A single stray localized binary named `terse` anywhere earlier on `PATH` blocked every
+  `install-mcp` run, `--print` included, with a message that named no launcher at all.
+  Output is now read as bytes and decoded with `errors="replace"`; an unproven launcher
+  falls back to tier 3, which is the whole contract.
+
+  Consequence worth knowing: running `install-mcp` from a terse checkout now wires MCP to
+  the **installed** terse, not the checkout. Config written by `install-mcp` has to outlive
+  the process that wrote it by weeks, so an ephemeral path is never the right artifact; a
+  development build is wired in deliberately with `$TERSE_MCP_CMD`, which still wins over
+  everything. `USAGE.md` documents the three tiers in place of the old "after upgrading,
+  re-check `mcp-status`" workaround this removes the need for.
+
+### Fixed (found reviewing the above, same area)
+
+- **A Windows console-script entry was invisible to every terse-managed check.**
+  `_looks_like_terse_launcher` matched `Path(cmd).name == "terse"`, but `shutil.which`
+  returns `...\Scripts\terse.exe` on Windows — never the extension-less name — so with
+  tier 2 above, every entry `install-mcp` writes there would have failed the predicate the
+  whole managed-server layer keys off. `_detect_routers` would find no router, so a second
+  `--multiproxy` install would refuse the router name it wrote itself, and
+  `uninstall-mcp --all` would unlink the peers file while leaving the router entry pointing
+  at it — verbatim the state that code exists to prevent. `parse_proxy_opts` would return
+  None, so `policy autotune` would report no wrapped servers on a fully wrapped config.
+  Before tier 2 the bare `terse` token in `-m terse` carried the match, which is why this
+  surfaced only alongside it; CI is ubuntu-only, so a test holds it now.
+
+  Matching is by a separator- and `.exe`-tolerant basename rather than `Path`, because a
+  config is JSON that may have been written on the other OS — a `PosixPath` reads
+  `C:\Users\me\Scripts\terse.exe` as one long filename, so the obvious spelling would
+  silently stop recognising Windows entries anywhere else.
+
+### Changed
+
+- **Test isolation: `$PATH` and `$TERSE_MCP_CMD` are now pinned suite-wide**
+  (`tests/conftest.py`). Only ~15 of the ~45 `do_install` call sites monkeypatch
+  `terse_invocation`, so after the change above the rest asserted against whichever argv
+  *shape* the developer's machine produced — one element on a box with a global
+  `~/.local/bin/terse`, three in CI. That is precisely how the Windows defect above stayed
+  invisible: the shape that breaks detection is the shape CI never produces. Only the
+  `PATH` entries that actually provide a `terse` are dropped, so `git` stays reachable for
+  the tests that shell out to it.
+
+  `test_the_entrypoint_uses_this_interpreter_not_whatever_is_on_path` asserted
+  `argv[0] == sys.executable`, which was stricter than the rationale its own docstring
+  gave — an absolute console-script path satisfies "never resolved off `PATH` at launch
+  time" equally well. It now asserts absoluteness across **both** tiers and *executes*
+  both, since tier 2 is what ships and no test ran one; the console script under test is a
+  shim onto this checkout, not the installed terse, for the same reason the `PATH` guard
+  exists.
 
 ## [0.25.1] - 2026-08-12
 
