@@ -354,6 +354,8 @@ full tiers, kb drops dictionary, `*.rate_limit` skipped).
 - `TERSE_MCP_CMD` — overrides the launcher command `install-mcp` wraps a downstream
   server with (whitespace-split; for unusual installs, e.g. pointing at a non-default
   `terse` binary). Must be an absolute path — spawned via `execve`, no shell to expand `~`.
+  Unset, `install-mcp` prefers the `terse` console script on `PATH` from outside its own
+  virtualenv and falls back to `<interpreter> -m terse` (`terse_invocation`, #275).
 - `XDG_STATE_HOME` — overrides where `terse stats` persists its ledger
   (`$XDG_STATE_HOME/terse/stats.jsonl`, fallback `~/.local/state`).
 - `NO_COLOR` — when set, disables ANSI color in terminal reports (`terminal_report.py`).

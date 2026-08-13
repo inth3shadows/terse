@@ -3,11 +3,14 @@
 Rewrites the `mcpServers` entries of a Claude Code config so a named server's
 command becomes, for a stdio server:
 
-    <python> -m terse proxy --policy <policy> -- <original command + args>
+    <terse> proxy --policy <policy> -- <original command + args>
 
 or, for an HTTP/SSE server (`url` + optional `headers`, #5):
 
-    <python> -m terse proxy --policy <policy> --header k=v ... -- <original url>
+    <terse> proxy --policy <policy> --header k=v ... -- <original url>
+
+where `<terse>` is an absolute launcher chosen by `terse_invocation` — see there for
+why it is a console script rather than this process's interpreter.
 
 Claude Code has three MCP scopes (#58), each backed by a different location:
   - user    — top-level `mcpServers` in `~/.claude.json` (default; #27's original
@@ -36,10 +39,12 @@ testable without touching the filesystem; the `do_*` helpers add IO + backup.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -163,12 +168,118 @@ def _servers_root(config: dict, server_path: tuple[str, ...]) -> dict:
     return node
 
 
+def stable_console_script() -> str | None:
+    """The absolute path of a `terse` console script that will outlive THIS process's
+    virtualenv, or None if the only one is inside it (or there is none at all).
+
+    `install-mcp` writes config that has to keep working for weeks, so a launcher tied
+    to the interpreter that happened to run the install is never the right artifact
+    (#275). Run via `uv run` from a claudew worktree, `sys.executable` is
+    `<worktree>/.venv/bin/python3` — a directory deleted when the session ends. The
+    config keeps working until then, so every wrapped MCP server dies days later with
+    nothing pointing back at the cause.
+
+    One rule covers every layout: take the first `terse` on PATH that does not live
+    under `sys.prefix`. In a worktree that skips the ephemeral venv (which `uv run` puts
+    FIRST on PATH) and finds the installed one; on an installed uv tool it takes
+    `~/.local/bin/terse` directly; in a checkout where terse was never installed nothing
+    qualifies and the caller keeps the interpreter form. Preferred over hardcoding
+    `~/.local/bin` because it covers pipx, Homebrew and system-pip layouts too.
+
+    The venv's directories are dropped from the search path rather than the first hit
+    being checked and rejected: `uv run` puts `<venv>/bin` FIRST, so a plain
+    `shutil.which("terse")` returns the ephemeral script and stops — never reaching the
+    installed one further down PATH. Filtering makes the search continue.
+
+    DIRECTORIES are resolved before the `sys.prefix` test, but the script that comes back
+    is NOT. The asymmetry is the whole subtlety: `~/.local/bin/terse` is a symlink into
+    the uv tool venv — which on an installed terse IS `sys.prefix` — so resolving the
+    script would reject the one stable launcher this function exists to find. Its parent
+    `~/.local/bin` is an ordinary directory, so resolving *that* costs nothing and closes
+    the spellings a literal comparison misses (`<wt>/../<wt>/.venv/bin`, or a PATH entry
+    reaching the venv through a symlinked parent), each of which would otherwise select
+    the ephemeral script and silently reproduce #275."""
+    prefix = Path(sys.prefix).resolve()
+
+    def offers_a_stable_install(entry: str) -> bool:
+        # A relative entry (including the empty string, and `.`) means the cwd of
+        # whoever ran install-mcp — the one directory guaranteed not to mean the same
+        # thing when the MCP client later spawns the entry from somewhere else.
+        if not entry or not os.path.isabs(entry):
+            return False
+        try:
+            return not Path(entry).resolve().is_relative_to(prefix)
+        except OSError:  # unreadable or cyclic symlink on the way to a PATH entry
+            return False
+
+    dirs = [e for e in os.environ.get("PATH", os.defpath).split(os.pathsep)
+            if offers_a_stable_install(e)]
+    if not dirs:
+        return None
+    found = shutil.which("terse", path=os.pathsep.join(dirs))
+    if not found:
+        return None
+    script = Path(found)
+    # `shutil.which` prepends the cwd on Windows even when `path=` is passed explicitly
+    # (NeedCurrentDirectoryForExePath, on by default), so a hit can come from a directory
+    # we never offered — including the very venv bin the filter above just removed, when
+    # install-mcp is run from inside it. Accept only what we asked for.
+    if script.parent not in {Path(d) for d in dirs}:
+        return None
+    return str(script) if console_script_version(str(script)) else None
+
+
+@functools.lru_cache(maxsize=8)
+def console_script_version(launcher: str) -> str | None:
+    """The version `launcher --version` reports, or None if it does not run or does not
+    identify itself as terse.
+
+    Tier 2 selects by NAME off `PATH`, which is a weaker claim than tier 3's: `sys
+    .executable -m terse` runs the code that is asking, while a `terse` on `PATH` is
+    whatever an installer, a shim, or an unrelated project put there. Baking an unusable
+    launcher fails the way this whole area fails — silently, at MCP client startup, with
+    the server showing up and simply having no tools — so it is worth one subprocess at
+    install time to find out. A launcher that does not answer is not rejected as broken,
+    it is merely not *proven*; the caller falls back to tier 3, which is what shipped
+    before #275.
+
+    Memoized because `stable_console_script` and `launcher_skew` both need this and were
+    each spawning it — two processes per install, and a launcher that hangs cost 2x the
+    timeout of silent stall on a `--print` that changes nothing. `install-mcp` is a
+    one-shot CLI, so a launcher cannot change underneath a single run; tests clear the
+    cache in `conftest`."""
+    try:
+        proc = subprocess.run([launcher, "--version"], capture_output=True, timeout=10,
+                              check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # Decoded permissively, and NOT with `text=True`: that decodes strictly, and the
+    # resulting UnicodeDecodeError is a ValueError, which is neither of the exceptions
+    # above. It escaped all the way to cli's `except (FileNotFoundError, ValueError)` and
+    # exited 2 — so an unrelated localized binary named `terse`, earlier on PATH, blocked
+    # every install-mcp run including --print, with a message naming no launcher at all.
+    # This function's contract is that an unproven launcher is not fatal, only unproven.
+    stdout = proc.stdout.decode("utf-8", errors="replace")
+    if proc.returncode != 0:
+        return None
+    # `terse --version` is argparse's `%(prog)s <version>` (see `cli.build_parser`).
+    head, _, tail = stdout.strip().partition(" ")
+    return tail.strip() or None if head == "terse" else None
+
+
 def terse_invocation() -> list[str]:
-    """How a wrapped entry should launch terse. Absolute interpreter + `-m terse`
-    so it does not depend on `terse` being on the MCP launcher's PATH. Overridable
-    via $TERSE_MCP_CMD (whitespace-split) for unusual installs — e.g. pointing at
-    the `terse` console script, whose path survives upgrades that move a versioned
-    `uv tool`/`pipx` venv out from under the baked interpreter.
+    """How a wrapped entry should launch terse, as an absolute path — a wrapped entry is
+    spawned by an MCP client whose PATH is not the operator's shell PATH, so a bare name
+    resolves unpredictably or not at all.
+
+    Three tiers, most explicit first:
+      1. $TERSE_MCP_CMD (whitespace-split) — the operator's override, for installs the
+         search below cannot see.
+      2. A `terse` console script outside this process's venv — see
+         `stable_console_script` for why anything derived from `sys.executable` is the
+         wrong artifact to bake into config (#275).
+      3. `sys.executable -m terse` — correct only when terse is not installed anywhere
+         but this venv, i.e. a source checkout.
 
     The override's argv[0] is `expanduser`ed: a wrapped entry is spawned from JSON
     via execve, with no shell to expand `~`, so a quoted `TERSE_MCP_CMD='~/bin/terse'`
@@ -176,6 +287,8 @@ def terse_invocation() -> list[str]:
     what makes the documented override behave the same quoted or bare."""
     override = os.environ.get("TERSE_MCP_CMD")
     if not override:
+        if (script := stable_console_script()) is not None:
+            return [script]
         # No check needed on this branch: `sys.executable` is the interpreter currently
         # running, so it exists by construction. Only the override can name something
         # that doesn't.
@@ -188,6 +301,43 @@ def terse_invocation() -> list[str]:
             f"$TERSE_MCP_CMD launcher not found: {bad}. Wrapped entries are spawned "
             f"directly (no shell), so this path must exist as written.")
     return parts
+
+
+def launcher_skew(terse_cmd: list[str]) -> str | None:
+    """The version the launcher about to be baked in reports, when it differs from the
+    terse doing the baking — else None.
+
+    Tier 2 deliberately prefers the INSTALLED terse over the one running `install-mcp`
+    (#275), which is what a config outliving this process needs. The cost is that a
+    checkout can hand its own argv grammar to an older binary: every flag this repo has
+    added to `proxy` (`--server-name`, `--config`, `--no-join-blocks`) makes an older terse
+    exit 2 the moment the MCP client spawns it — invisibly, as a server with no tools.
+    That is not an error here, because the installed terse IS the intended target, but it
+    is the operator's call, so it gets said out loud rather than discovered later.
+
+    Only a single-token launcher is a console script we can ask. `<python> -m terse` runs
+    this very interpreter (no skew possible), and a multi-token override like `uvx terse`
+    resolves at launch, not now.
+
+    Only hatch-vcs's dirty-tree date is normalised away before comparing. An editable
+    `uv tool install` stamps `0.25.2.dev1+gbcaa1404c`, and a checkout of that SAME commit
+    with an unclean tree stamps `0.25.2.dev1+gbcaa1404c.d20260813` — comparing raw strings
+    warned on every install run from a development tree, and a warning that cries wolf on
+    the maintainer's normal workflow is one nobody reads by the time a genuinely behind
+    launcher shows up, which is the only case it exists for.
+
+    Comparing the PEP 440 *public* version instead (everything before `+`) was the first
+    attempt and is too coarse: hatch-vcs stamps every commit at the same distance from a
+    tag as `0.25.2.dev1`, so a branch that adds a `proxy` flag and the editable tool on
+    `main` agree on the public version and differ only in `+g<hash>` — precisely the case
+    this exists to catch. The git hash has to stay in the comparison."""
+    if len(terse_cmd) != 1:
+        return None
+    from . import __version__
+    reported = console_script_version(terse_cmd[0])
+    if not reported or _DIRTY_DATE.sub("", reported) == _DIRTY_DATE.sub("", __version__):
+        return None
+    return reported
 
 
 def launcher_missing(terse_cmd: list[str]) -> str | None:
@@ -698,6 +848,34 @@ def is_managed(stash: dict, server: str) -> bool:
     return server in stash
 
 
+# `.com`/`.bat`/`.cmd` are resolved by `shutil.which` from PATHEXT exactly as `.exe` is,
+# dirs outer and extensions inner — so a Chocolatey-style `terse.cmd` earlier on PATH than
+# the real `terse.exe` is what gets baked in. Stripping only `.exe` left that case failing
+# the terse-managed predicate, which is the same blast radius the `.exe` fix closed.
+_WINDOWS_EXEC_SUFFIXES = frozenset({".exe", ".com", ".bat", ".cmd"})
+# hatch-vcs appends `.dYYYYMMDD` to the local segment when the working tree is dirty.
+_DIRTY_DATE = re.compile(r"\.d\d{8}(?=$|\+)")
+
+
+def _launcher_basename(cmd: str) -> str:
+    """The final component of `cmd`, lowercased, tolerating either path separator and
+    dropping a Windows `.exe` suffix.
+
+    Not `Path(cmd).stem`. A config is JSON and may have been written by the other OS, and
+    a `PosixPath` reads `C:\\Users\\me\\Scripts\\terse.exe` as one long filename — so the
+    obvious spelling silently stops recognising Windows entries when run anywhere else.
+    The `.exe` half matters because since #275 the default launcher IS the console script,
+    which `shutil.which` resolves to `terse.exe` on Windows: matching the bare name there
+    would make every entry this installer writes invisible to `_detect_routers` (a second
+    `--multiproxy` install then refuses the router name it wrote itself, and
+    `uninstall-mcp --all` deletes the peers file while leaving the router pointing at it)
+    and to `parse_proxy_opts` (autotune reports no wrapped servers at all). Nothing caught
+    it because CI is ubuntu-only, and tier 3's `-m terse` argument carried the match."""
+    base = cmd.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    stem, dot, ext = base.rpartition(".")
+    return stem if dot and f".{ext}" in _WINDOWS_EXEC_SUFFIXES else base
+
+
 def _looks_like_terse_launcher(entry: dict) -> bool:
     """True if `entry` launches via terse. Covers every form `terse_invocation` /
     `$TERSE_MCP_CMD` can emit: the console script `terse` as `command`, `python -m terse`,
@@ -707,7 +885,7 @@ def _looks_like_terse_launcher(entry: dict) -> bool:
     detection; a false positive is caught anyway by `parse_proxy_opts` requiring a `proxy`
     subcommand."""
     cmd = entry.get("command")
-    if isinstance(cmd, str) and Path(cmd).name == "terse":
+    if isinstance(cmd, str) and _launcher_basename(cmd) == "terse":
         return True
     args = entry.get("args")
     return isinstance(args, list) and "terse" in args
@@ -990,7 +1168,8 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
     result = {"config": str(target.cfg), "scope": scope, "policy": policy_abs,
               "available": available, "changes": changes, "dry_run": dry_run,
               "backup": None, "capture_dir": capture_abs, "diff": diff,
-              "no_stats": no_stats, "never_lossy_added": []}
+              "no_stats": no_stats, "never_lossy_added": [],
+              "launcher": " ".join(terse_cmd), "launcher_skew": launcher_skew(terse_cmd)}
     if not dry_run and changes:
         result["backup"] = str(_backup(target.cfg))
         _write_json(target.cfg, config, trailing_newline=had_nl)
@@ -1135,6 +1314,7 @@ def _install_multiproxy(target, config: dict, full_stash: dict, stash: dict, nod
               "backup": None, "capture_dir": effective["capture_dir"],
               "diff": effective["diff"], "no_stats": effective["no_stats"],
               "never_lossy_added": [], "multiproxy": True, "router": router,
+              "launcher": " ".join(terse_cmd), "launcher_skew": launcher_skew(terse_cmd),
               "router_entry": node["mcpServers"][router], "peers_file": peers_file,
               "peers": peers_doc, "fleet": fleet,
               # The permission rewrite covers the WHOLE fleet, not just this run's

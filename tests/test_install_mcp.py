@@ -846,8 +846,180 @@ def test_do_install_never_lossy_bakes_into_policy(tmp_path, monkeypatch):
 # how the tilde bug below survived: a wrapped entry is spawned from JSON via execve
 # with no shell, so an unexpanded `~` writes a command that can never resolve — and
 # the failure is silent (the client just can't start the server).
-def test_terse_invocation_defaults_to_the_running_interpreter(monkeypatch):
+def _script(path: Path, reports: str | None = "terse 9.9.9") -> Path:
+    """A launcher `shutil.which` will accept AND `console_script_version` will vouch for:
+    present, executable, and answering `--version` the way terse does. `reports=None`
+    makes one that runs but is not terse — a shim, or an unrelated tool of the same name."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = f'echo "{reports}"\n' if reports is not None else "echo not-terse\n"
+    path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_terse_invocation_prefers_a_console_script_outside_this_venv(tmp_path, monkeypatch):
+    """The #275 invariant: never bake a launcher that dies with this process's venv.
+
+    `sys.executable` is whatever interpreter ran install-mcp. Run via `uv run` from a
+    throwaway worktree that is `<worktree>/.venv/bin/python3`, and the config keeps
+    working right up until the worktree is cleaned up — days later, with every wrapped
+    MCP server dead and nothing pointing back at the install-mcp run that caused it.
+
+    The venv is FIRST on PATH here on purpose: that is what `uv run` does, so a plain
+    `shutil.which("terse")` would return the ephemeral one and this test would be
+    vacuous. Rejecting anything under `sys.prefix` is the whole mechanism."""
+    venv = tmp_path / "worktree" / ".venv"
+    _script(venv / "bin" / "terse")
+    stable = _script(tmp_path / "home" / ".local" / "bin" / "terse")
+
     monkeypatch.delenv("TERSE_MCP_CMD", raising=False)
+    monkeypatch.setattr(sys, "prefix", str(venv))
+    monkeypatch.setenv("PATH", os.pathsep.join([str(venv / "bin"), str(stable.parent)]))
+
+    assert im.terse_invocation() == [str(stable)]
+
+
+def test_terse_invocation_keeps_a_console_script_that_symlinks_into_this_venv(
+        tmp_path, monkeypatch):
+    """`~/.local/bin/terse` is a SYMLINK into the uv tool venv — which, on an installed
+    terse, is exactly `sys.prefix`. Resolving the path before the `sys.prefix` test would
+    therefore reject the one stable launcher we are trying to select, and silently fall
+    back to the interpreter form on every normal install. The comparison is on the
+    literal path, and this pins that."""
+    prefix = tmp_path / "uvtools" / "terse-mcp"
+    real = _script(prefix / "bin" / "terse")
+    stable = tmp_path / "home" / ".local" / "bin" / "terse"
+    stable.parent.mkdir(parents=True)
+    stable.symlink_to(real)
+
+    monkeypatch.delenv("TERSE_MCP_CMD", raising=False)
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+    monkeypatch.setenv("PATH", str(stable.parent))
+
+    assert im.terse_invocation() == [str(stable)]
+
+
+def test_terse_invocation_resolves_path_dirs_before_judging_them(tmp_path, monkeypatch):
+    """The other half of the asymmetry above: DIRECTORIES are resolved, scripts are not.
+
+    A PATH entry can reach this venv by a spelling that shares no prefix with
+    `sys.prefix` — through `..`, or through a symlinked parent. A literal comparison
+    keeps it, tier 2 then selects the venv's own ephemeral script, and #275 reproduces
+    silently with the fix in place. Resolving the directory costs nothing, because the
+    symlink that must survive is on the script, not on `~/.local/bin`."""
+    venv = tmp_path / "worktree" / ".venv"
+    _script(venv / "bin" / "terse")
+    monkeypatch.delenv("TERSE_MCP_CMD", raising=False)
+    monkeypatch.setattr(sys, "prefix", str(venv))
+
+    (tmp_path / "link").symlink_to(tmp_path / "worktree", target_is_directory=True)
+    for spelling in (tmp_path / "worktree" / ".." / "worktree" / ".venv" / "bin",
+                     tmp_path / "link" / ".venv" / "bin"):
+        monkeypatch.setenv("PATH", str(spelling))
+        assert im.terse_invocation() == [sys.executable, "-m", "terse"], spelling
+
+
+def test_terse_invocation_ignores_a_relative_path_entry(tmp_path, monkeypatch):
+    """`.`, `bin` and the empty string all mean the cwd of whoever ran install-mcp — the
+    one directory guaranteed not to mean the same thing when the MCP client spawns the
+    entry later. Absolutizing one against install-time cwd freezes that cwd into the
+    config forever, which is the same class of defect #275 exists to remove."""
+    _script(tmp_path / "terse")
+    monkeypatch.delenv("TERSE_MCP_CMD", raising=False)
+    monkeypatch.chdir(tmp_path)
+    for spelling in (".", "", "sub/../."):
+        monkeypatch.setenv("PATH", spelling)
+        assert im.terse_invocation() == [sys.executable, "-m", "terse"], repr(spelling)
+
+
+def test_terse_invocation_rejects_a_launcher_that_is_not_terse(tmp_path, monkeypatch):
+    """Tier 2 selects by NAME off PATH, so it can find a shim, or an unrelated tool that
+    happens to be called `terse`. Baking one fails the way this whole area fails —
+    silently, at client startup, as a server with no tools — so it is proven with one
+    `--version` call and falls back to the interpreter form when it cannot be."""
+    monkeypatch.delenv("TERSE_MCP_CMD", raising=False)
+    impostor = _script(tmp_path / "impostor" / "terse", reports=None)
+    # Prints a PERFECTLY GOOD version line and then fails. Found in review: the first cut
+    # printed nothing, so it was rejected by the name parse and the returncode branch was
+    # never the reason — deleting that branch left the suite green.
+    broken = _script(tmp_path / "broken" / "terse", reports="terse 1.0")
+    broken.write_text('#!/bin/sh\necho "terse 1.0"\nexit 3\n', encoding="utf-8")
+    for stub in (impostor, broken):
+        monkeypatch.setenv("PATH", str(stub.parent))
+        assert im.terse_invocation() == [sys.executable, "-m", "terse"], stub
+
+
+def test_terse_invocation_survives_a_launcher_that_answers_in_non_utf8(tmp_path, monkeypatch):
+    """Probing the candidate must never be able to ABORT the install.
+
+    `subprocess.run(text=True)` decodes strictly, and the resulting UnicodeDecodeError is
+    a ValueError — neither of the exceptions `console_script_version` catches. It escaped
+    to cli's `except (FileNotFoundError, ValueError)` and exited 2, so one stray localized
+    binary named `terse`, anywhere earlier on PATH, blocked every `install-mcp` run —
+    `--print` included — with a message that named no launcher at all.
+
+    The verdict is not the point here (this stub does identify itself as terse, so it is
+    accepted); not raising is."""
+    mojibake = tmp_path / "bin" / "terse"
+    mojibake.parent.mkdir(parents=True)
+    mojibake.write_bytes(b'#!/bin/sh\nprintf "terse \xff1.0\\n"\n')
+    mojibake.chmod(0o755)
+    monkeypatch.delenv("TERSE_MCP_CMD", raising=False)
+    monkeypatch.setenv("PATH", str(mojibake.parent))
+
+    assert im.terse_invocation() == [str(mojibake)]  # decoded, not exploded
+
+
+def test_launcher_skew_reports_an_installed_terse_older_than_this_one(tmp_path, monkeypatch):
+    """A checkout writes argv in ITS OWN grammar and now hands it to the installed terse.
+    Every flag this repo has added to `proxy` would make an older one exit 2 at spawn, so
+    the mismatch is disclosed at install time rather than found days later."""
+    from terse import __version__
+    monkeypatch.delenv("TERSE_MCP_CMD", raising=False)
+    old = _script(tmp_path / "bin" / "terse", reports="terse 0.23.3")
+    assert im.launcher_skew([str(old)]) == "0.23.3"
+    # Same version = nothing to say, and the interpreter form cannot skew from itself.
+    same = _script(tmp_path / "same" / "terse", reports=f"terse {__version__}")
+    assert im.launcher_skew([str(same)]) is None
+    assert im.launcher_skew([sys.executable, "-m", "terse"]) is None
+
+
+def test_launcher_skew_ignores_a_differing_pep440_local_segment(tmp_path, monkeypatch):
+    """Caught by running the feature, not by a test: an editable `uv tool install` from
+    the main worktree stamps `0.25.2.dev1+gbcaa1404c`, while a checkout of that same
+    commit with a dirty tree stamps `0.25.2.dev1+gbcaa1404c.d20260813`. Comparing the full
+    string warned on every install from a development tree — and a warning that cries wolf
+    on the maintainer's normal workflow is one nobody reads by the time a genuinely
+    behind launcher shows up, which is the only case it exists for.
+
+    Everything after `+` is build provenance (commit, build date). It cannot change which
+    flags `proxy` accepts, which is the entire thing this warning is about."""
+    monkeypatch.delenv("TERSE_MCP_CMD", raising=False)
+    monkeypatch.setattr("terse.__version__", "0.25.2.dev1+gbcaa1404c.d20260813")
+    same_commit = _script(tmp_path / "a" / "terse", reports="terse 0.25.2.dev1+gbcaa1404c")
+    assert im.launcher_skew([str(same_commit)]) is None
+    # ...but a real public-version difference is still reported, local segment or not.
+    behind = _script(tmp_path / "b" / "terse", reports="terse 0.23.3+gdeadbee")
+    assert im.launcher_skew([str(behind)]) == "0.23.3+gdeadbee"
+    # The case that rules out the coarser fix of comparing only the public version:
+    # hatch-vcs stamps EVERY commit one past a tag as `0.25.2.dev1`, so a branch that adds
+    # a `proxy` flag and the editable tool built from `main` agree on the public version
+    # and differ only in `+g<hash>` — exactly the skew this warning exists to catch. The
+    # hash has to stay in the comparison; only the dirty-tree date comes out.
+    other_commit = _script(tmp_path / "c" / "terse", reports="terse 0.25.2.dev1+gdeadbee1")
+    assert im.launcher_skew([str(other_commit)]) == "0.25.2.dev1+gdeadbee1"
+
+
+def test_terse_invocation_falls_back_to_the_running_interpreter(monkeypatch):
+    """A source checkout with terse never installed has no console script outside its
+    own venv. That is the one case where the interpreter form is still right, and it is
+    what shipped before #275 — so the fallback is unchanged, not merely tolerated.
+
+    PATH is emptied rather than left alone: on a dev box `~/.local/bin/terse` IS on PATH
+    and outside the checkout's venv, so inheriting the operator's environment would make
+    this pass or fail on their shell instead of on the code."""
+    monkeypatch.delenv("TERSE_MCP_CMD", raising=False)
+    monkeypatch.setenv("PATH", "")
     assert im.terse_invocation() == [sys.executable, "-m", "terse"]
 
 
@@ -883,6 +1055,35 @@ def test_terse_mcp_cmd_override_allows_a_bare_name(monkeypatch):
     # here — so it is passed through rather than false-flagged as missing.
     monkeypatch.setenv("TERSE_MCP_CMD", "terse")
     assert im.terse_invocation() == ["terse"]
+
+
+def test_a_windows_console_script_entry_is_recognized_as_terse_managed():
+    """On Windows `shutil.which("terse")` returns `...\\Scripts\\terse.exe` — never the
+    extension-less name — so since #275 that is the `command` install-mcp writes there,
+    with `args` starting at `proxy`. Matching `Path(cmd).name` missed it, and the bare
+    `terse` token that used to carry the match lived in tier 3's `-m terse`, which is
+    gone from a tier-2 entry.
+
+    Everything downstream keys off this predicate, so the miss is not cosmetic:
+    `_detect_routers` returns nothing, a second `--multiproxy` install then rejects the
+    router name it wrote itself, and `uninstall-mcp --all` unlinks the peers file while
+    leaving the router entry pointing at it. CI is ubuntu-only, so only a test can hold
+    this — a Windows path is a value here, not an environment."""
+    win = {"command": r"C:\Users\me\AppData\Roaming\Python\Scripts\terse.exe",
+           "args": ["proxy", "--policy", "p.json", "--server-name", "kb", "--", "kb-mcp"]}
+    assert im._looks_like_terse_launcher(win)
+    assert im.parse_proxy_opts(win) == {"policy": "p.json", "server_name": "kb"}
+    # `.cmd`/`.bat`/`.com` are resolved from PATHEXT exactly as `.exe` is — a
+    # Chocolatey-style shim earlier on PATH than the real `terse.exe` is what gets baked
+    # in — so stripping only `.exe` left the same servers-invisible blast radius open.
+    for ext in (".cmd", ".bat", ".com", ""):
+        assert im._looks_like_terse_launcher({"command": rf"C:\Scripts\terse{ext}",
+                                              "args": ["proxy"]}), ext
+    # Still not fooled by a different tool whose name merely starts with terse, and a
+    # non-executable suffix is NOT stripped.
+    for cmd in (r"C:\bin\terse-mcp.exe", "/usr/bin/myterse", "/opt/x/terse.py",
+                r"C:\bin\terse.exe.bak"):
+        assert not im._looks_like_terse_launcher({"command": cmd, "args": ["proxy"]}), cmd
 
 
 def test_do_install_refuses_a_bad_override_before_touching_the_config(tmp_path, monkeypatch):
@@ -1962,3 +2163,49 @@ def test_stats_does_not_explain_diff_off_when_diffing_is_actually_working():
     from terse.stats import build_stats_report
     out = build_stats_report(_agg_with({"diff_off": 3, "emitted": 1}), log_path="/x/s.jsonl")
     assert "OFF by default since #170" not in out
+
+
+def _install_and_capture(tmp_path, monkeypatch, launcher, *, multiproxy=False):
+    """A real `do_install` whose chosen launcher is `launcher`, run through the CLI so the
+    printed output is exercised too."""
+    from terse import cli
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})))
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"version": 1, "policies": []}))
+    monkeypatch.delenv("TERSE_MCP_CMD", raising=False)
+    monkeypatch.setenv("PATH", str(launcher.parent))
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    argv = ["install-mcp", "runecho", "--policy", str(policy), "--print"]
+    if multiproxy:
+        argv += ["--multiproxy", "--router-name", "terse"]
+    return cli.main(argv)
+
+
+@pytest.mark.parametrize("multiproxy", [False, True])
+def test_install_discloses_the_launcher_it_chose_for_you(tmp_path, monkeypatch, capsys,
+                                                         multiproxy):
+    """Which terse gets baked in is a decision install-mcp makes FOR the operator, and
+    `_short_cmd` truncates the `after:` line at 100 chars — long policy paths push the
+    launcher off the end of it. It is also the only signal a pyenv/asdf shim user gets
+    that they should pin `$TERSE_MCP_CMD` instead.
+
+    Found in review: `launcher`/`launcher_skew` were computed but nothing asserted they
+    reached the result dict or the printed output, so four separate mutations (blanking
+    either key in either of the two result dicts, or deleting the print block from cli)
+    left the whole suite green. Both install paths build their own result dict, hence the
+    parametrization — the multiproxy one is easy to update alone and forget."""
+    launcher = _script(tmp_path / "bin" / "terse")
+    assert _install_and_capture(tmp_path, monkeypatch, launcher, multiproxy=multiproxy) == 0
+    assert f"launcher: {launcher}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("multiproxy", [False, True])
+def test_install_warns_when_the_chosen_launcher_is_a_different_terse(tmp_path, monkeypatch,
+                                                                     capsys, multiproxy):
+    """The flags written above are this terse's grammar; an older launcher exits 2 the
+    moment the client spawns it, which shows up only as a server with no tools."""
+    launcher = _script(tmp_path / "bin" / "terse", reports="terse 0.0.1")
+    assert _install_and_capture(tmp_path, monkeypatch, launcher, multiproxy=multiproxy) == 0
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "0.0.1" in out, out
