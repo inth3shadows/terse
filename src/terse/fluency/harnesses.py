@@ -43,16 +43,25 @@ def _safe_ask(answerer: Answerer, system: str, user: str) -> str | None:
     exclusions become belt-and-braces rather than load-bearing.
 
     Blank replies are normalised to None HERE, not only in `openai_answerer`, because this
-    is the choke point every harness funnels through. Putting the invariant in one adapter
-    left the package holding two contracts — a future `Answerer`, or the `pack.py` replay
-    path, would reopen `#268` with no test failing. "The model produced nothing" and "the
-    call did not happen" are the same fact to every consumer downstream: unanswered, so
-    counted and never scored."""
+    is the choke point every LIVE harness funnels through; putting the invariant in one
+    adapter left the package holding two contracts, so a future `Answerer` would reopen
+    `#268` with no test failing. "The model produced nothing" and "the call did not happen"
+    are the same fact to every consumer downstream: unanswered, so counted and never scored.
+
+    This does NOT cover `pack.py`'s replay path, which scores stored replies through
+    `_score_form` without ever calling an answerer — a pack whose stored reply is empty is
+    still scored as a wrong answer there. Out of scope for `#268` (the issue is about a live
+    backend), and called out rather than left for someone to assume otherwise from the word
+    "choke point"; see the follow-up issue."""
     try:
         reply = answerer(system, user)
+        # Inside the try, not after it. A user-supplied answerer is the documented
+        # extension point, and one returning a non-str made `.strip()` raise
+        # AttributeError straight past this function — aborting the long multi-model run
+        # its first line promises to protect. Now it is just another unanswered call.
+        return None if reply is None or not str(reply).strip() else reply
     except Exception:
         return None
-    return None if reply is None or not reply.strip() else reply
 
 
 def _ask_n(answerer: Answerer, system: str, user: str,

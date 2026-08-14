@@ -61,8 +61,25 @@ fails that pull request until the section has moved.
   — 20% overall, and the comparison is strictly `>` — and still publish. Measured: a real
   `-40% FAIL` rendered as `+0% PASS`, printing *"safe to enable `proxy --diff`"* for a model
   that produced no content on 16 of 40 diff calls. Strictly worse than the bug being fixed,
-  and reached *through* the fix. `_unmeasured` now also fires when any single arm loses more
-  than `UNMEASURED_FAIL_SHARE` of its own calls.
+  and reached *through* the fix.
+
+  The first attempt at this — a per-arm loss **threshold** — was itself wrong, and a third
+  review pass caught it: it raises the bar without closing the hole. The violation is of
+  **pairing**, not magnitude. Scoring is paired (`harnesses`' module docstring calls that
+  load-bearing: the same questions, same order, to every arm), and `_form_stats` divides
+  each arm by its own `<form>_trials` — so dropping an unanswered call re-bases that arm
+  onto a *different question set*. Question difficulty varies far more than trial noise, so
+  losing the hard questions from one arm flatters it at **any** share. Measured with the
+  threshold in place: a model losing exactly one of five question types sits at 20.0%, on
+  the boundary the comparison is strictly `>` against, and a real `-20% FAIL` still
+  published as PASS.
+
+  Fixed where the arms are compared instead: `paired_rows` drops any row both arms did not
+  complete, from both, and `unpaired` declines to publish when too little of the question
+  set survives — `>=`, because on a ship gate the measured boundary case belongs on the
+  refusing side. The threshold is gone; keeping it would also have voided otherwise-complete
+  runs over an arm no verdict consumes (`run_payload`'s `inline` arm carries the longest
+  prompt of the four, so it truncates first, and it gates nothing).
 
 - **Report verdicts no longer misattribute the cause.** "Too many calls never reached the
   backend … re-run once the backend is reachable" is the wrong remedy for a token-budget
@@ -79,6 +96,18 @@ fails that pull request until the section has moved.
   than three copies of a string, since fixing one and leaving the others is exactly how it
   drifted. (The first cut of that test grepped the module source and failed on a docstring
   quoting the old phrase to explain the change — pinning prose, not behaviour.)
+
+- **`_safe_ask` can no longer abort the run it exists to protect.** The `#268`
+  normalisation was first written *after* the `except`, so a user-supplied answerer — the
+  module's documented extension point — returning a non-`str` made `.strip()` raise
+  `AttributeError` straight past the handler, killing a long multi-model run on one bad
+  call. Normalisation moved inside the `try`.
+
+  Its docstring also claimed the placement covered `pack.py`'s replay path. It does not:
+  `score_pack` scores stored replies through `_score_form` without ever calling an answerer,
+  so an empty stored reply is still scored as a wrong answer there. Out of scope for `#268`
+  (a live-backend defect) — now stated rather than left to be assumed from the words "choke
+  point", and filed as a follow-up.
 
 - **The same defect in `dropeval`, found while fixing the above.** `openai_tool_answerer`
   had the identical `content or ""`, and it lands in the same place: `_run_question` feeds

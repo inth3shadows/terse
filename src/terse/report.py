@@ -17,6 +17,53 @@ from typing import Any, NamedTuple
 _GAP_TOLERANCE = 0.05  # shared pass/fail tolerance for both worst-case verdict gates below
 
 
+def paired_rows(rows: list[dict[str, Any]], *forms: str) -> list[dict[str, Any]]:
+    """The subset of `rows` on which every one of `forms` completed ALL of its trials.
+
+    Scoring is PAIRED — `harnesses`' module docstring calls that load-bearing: the same
+    questions, in the same order, put to every arm. `_form_stats` divides each arm by its
+    OWN `<form>_trials`, so dropping an unanswered call from one arm silently re-bases that
+    arm onto a DIFFERENT question set, and the "gap" stops comparing like with like.
+
+    That is the real defect behind #268's near-miss, and a per-arm loss THRESHOLD does not
+    close it — it only raises the bar. Measured: a model answering the control perfectly and
+    returning no content on every `deref` question (the longest prompt, so the first to hit
+    a token-budget stop) loses exactly 1 of 5 question types. That is 20.0% of the arm — on
+    the threshold, and the comparison is strictly `>` — so the gate stayed quiet while a
+    real **-20% FAIL** rendered as **PASS / "safe to enable `proxy --diff`"**. Question
+    difficulty varies far more than trial-to-trial noise, so losing the HARD questions from
+    one arm flatters it without bound, at any share.
+
+    Excluding the row from BOTH arms restores the pairing. Coarser than dropping the
+    individual trial — the row counts say how many trials survived, not WHICH — so a row is
+    comparable only when both arms answered every trial of it."""
+    keys = [f[:-3] + "_trials" if f.endswith("_ok") else f for f in forms]
+    out = []
+    for r in rows:
+        t = int(r.get("trials", 1))
+        if all(int(r.get(k, t)) == t for k in keys):
+            out.append(r)
+    return out
+
+
+def unpaired(rows: list[dict[str, Any]], *forms: str) -> bool:
+    """True when too much of the question set is missing from one side to compare at all.
+
+    `paired_rows` makes the surviving gap honest; it cannot make it REPRESENTATIVE. Drop
+    the questions one arm could not complete and what is left is both smaller and selected
+    — and selected by difficulty, since the calls a token-budget stop kills are the ones
+    with the longest prompts. So the gap sites need both: pair what remains, and decline to
+    publish when too little does.
+
+    `>=`, where the pooled `_unmeasured` share uses `>`. The boundary is not hypothetical
+    here: one question type out of five is exactly 20.0%, and that is the measured case in
+    which a real -20% FAIL published as PASS. On a ship gate the boundary belongs on the
+    refusing side."""
+    if not rows:
+        return False
+    return (len(rows) - len(paired_rows(rows, *forms))) / len(rows) >= UNMEASURED_FAIL_SHARE
+
+
 def _form_stats(rows: list[dict[str, Any]], form: str) -> tuple[float, float]:
     """(accuracy, standard_error) for one form over rows carrying success COUNTS.
 
@@ -65,29 +112,23 @@ UNMEASURED_FAIL_SHARE = 0.20
 def _unmeasured(rows: list[dict]) -> bool:
     """True when transport failures make this model's numbers untrustworthy.
 
-    Three independent triggers, because they fail differently:
+    Two independent triggers, because they fail differently:
       1. any arm with ZERO completed trials — that arm cannot be computed at all, and
          `_form_stats` would report it as a flat 0.0 indistinguishable from real failure;
-      2. any SINGLE arm losing more than `UNMEASURED_FAIL_SHARE` of its OWN calls;
-      3. more than `UNMEASURED_FAIL_SHARE` of calls lost overall — the sample that
+      2. more than `UNMEASURED_FAIL_SHARE` of calls lost overall — the sample that
          survived is both small and selected by which calls happened to get through.
 
-    Trigger 2 exists because the pooled share (3) assumes losses are spread evenly across
-    arms, and the failure that motivated `#268` is not: a model whose reasoning eats its
-    token budget fails as a function of PROMPT LENGTH, and the diff arm's prompt is
-    strictly longer than its control's (`PREVIOUS RESULT: … UPDATE: …` versus the
-    compressed payload alone). So the arm under test is systematically the arm that
-    returns nothing, and every lost call is removed from that arm's own denominator by
-    `_form_stats`. Pooled, a diff arm could lose 40% of its calls — 20% overall, and the
-    comparison is strictly `>` — and still publish: measured, that rendered a real
-    `-40% FAIL` as `+0% PASS`, printing "safe to enable `proxy --diff`" for a model that
-    produced no content on 16 of 40 diff calls.
-
-    That is the same class of false verdict `#263`/`#268` are about, arrived at from the
-    other side: excluding a non-answer is only the safe direction when the exclusions are
-    UNCORRELATED with the arm being measured. When they correlate, exclusion silently
-    selects for the calls the harder arm happened to survive.
-    """
+    A per-arm SHARE trigger briefly lived here too, as the answer to #268's near-miss
+    (losses that correlate with prompt length hit the longer arm hardest, so excluding them
+    per-arm flattered it). Review showed a threshold is the wrong instrument: it raises the
+    bar without closing the hole — a model losing exactly one of five question types sits
+    at 20.0%, on the boundary, and still published a real -20% FAIL as PASS. The violation
+    is of PAIRING, not of magnitude, so it is fixed where the arms are compared:
+    `paired_rows` drops any row both arms did not complete, from both. Keeping the
+    threshold as well would have voided otherwise-complete runs over an arm no verdict
+    consumes — `run_payload`'s `inline` arm carries the longest prompt of the four and so
+    truncates first, and it gates nothing.
+        """
     if not rows:
         return False
     attempts = sum(int(r.get("attempts", 0)) for r in rows)
@@ -104,13 +145,6 @@ def _unmeasured(rows: list[dict]) -> bool:
     for key in sorted({k for r in rows for k in r if k.endswith("_trials")}):
         completed = sum(int(r.get(key, 0)) for r in rows)
         if completed == 0:
-            return True
-        # Per-arm share. `<form>_trials` is what SURVIVED for this arm; every row that
-        # carries the key attempted its full `trials` for it, so the difference is what
-        # this arm alone lost. Rows predating the counters carry no `trials` either, and
-        # are skipped by the same reasoning the `attempts` guard above uses.
-        attempted = sum(int(r.get("trials", 0)) for r in rows if key in r)
-        if attempted and (attempted - completed) / attempted > UNMEASURED_FAIL_SHARE:
             return True
     return fails / attempts > UNMEASURED_FAIL_SHARE
 
@@ -172,11 +206,13 @@ def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, f
     for model, rows in results.items():
         if not rows:
             continue
-        if _unmeasured(rows):
+        if _unmeasured(rows) or unpaired(rows, "diff_ok", "terse_ok"):
             excluded.append(model)
             continue
-        facc, fse = _form_stats(rows, "diff_ok")
-        cacc, cse = _form_stats(rows, "terse_ok")
+        # Paired: a row either arm failed to complete is comparable for neither.
+        pr = paired_rows(rows, "diff_ok", "terse_ok")
+        facc, fse = _form_stats(pr, "diff_ok")
+        cacc, cse = _form_stats(pr, "terse_ok")
         out[model] = (facc, fse, cacc, cse)
     return out, excluded
 
@@ -809,13 +845,16 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         # on both arms, produced a gap of exactly 0, and printed "safe to enable
         # `proxy --diff`". A false PASS on a ship gate is strictly worse than the false
         # FAIL #263 was filed about: nobody re-checks a result that agrees with them.
-        if _unmeasured(rows):
+        # Same rule the forest plot applies (`diff_gap_rows`), or the chart printed
+        # beneath this table draws a bar for a model the table just declined to score.
+        if _unmeasured(rows) or unpaired(rows, "terse_ok", "diff_ok"):
             unmeasured[model] = (sum(int(r.get("fails", 0)) for r in rows),
                                  sum(int(r.get("attempts", 0)) for r in rows))
             out.append(f"| `{model}` | {n} | n/a | n/a | n/a |")
             continue
-        facc, fse = _form_stats(rows, "terse_ok")
-        dacc, dse = _form_stats(rows, "diff_ok")
+        pr = paired_rows(rows, "terse_ok", "diff_ok")
+        facc, fse = _form_stats(pr, "terse_ok")
+        dacc, dse = _form_stats(pr, "diff_ok")
         regr = sum(1 for r in rows if int(r["terse_ok"]) == r.get("trials", 1)
                    and int(r["diff_ok"]) < r.get("trials", 1))
         gap_rows[model] = (dacc, dse, facc, fse)  # form=diff, control=control_label
@@ -940,7 +979,8 @@ def build_diff_soak_report(results: dict) -> str:
     # backend that was down scores 0% on both arms at every depth, which is a gap of
     # exactly 0 and reads as PASS — and the by-depth table shows a flat, reassuring
     # no-drift line drawn entirely from calls that never happened.
-    unmeasured = {m: rows for m, rows in results.items() if rows and _unmeasured(rows)}
+    unmeasured = {m: rows for m, rows in results.items()
+                  if rows and (_unmeasured(rows) or unpaired(rows, "terse_ok", "diff_ok"))}
     for model, rows in results.items():
         for depth in depths:
             drows = [r for r in rows if r["depth"] == depth]
@@ -974,8 +1014,9 @@ def build_diff_soak_report(results: dict) -> str:
     for model, rows in results.items():
         if not rows or model in unmeasured:
             continue
-        facc, fse = _form_stats(rows, "terse_ok")
-        dacc, dse = _form_stats(rows, "diff_ok")
+        pr = paired_rows(rows, "terse_ok", "diff_ok")
+        facc, fse = _form_stats(pr, "terse_ok")
+        dacc, dse = _form_stats(pr, "diff_ok")
         gap_rows[model] = (dacc, dse, facc, fse)
 
     out += ["## Verdict", ""]
