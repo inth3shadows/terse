@@ -158,6 +158,23 @@ def _nested_record_group(obj: Any) -> tuple[str, list[dict], list[str]] | None:
     return None
 
 
+def _answerable(expected: Any) -> bool:
+    """False for an expected answer that is empty or whitespace-only.
+
+    Such a question is UNFALSIFIABLE: `score("lookup", "", "")` is True, so a model that
+    answers nothing at all scores CORRECT on it. `_flat_record_questions` has excluded
+    empties since #263 for exactly that reason; the table and nested lookup paths did not,
+    and `_pick_target_col`'s fallback happily returns a column whose every value is `""`
+    (found in review of #268).
+
+    That also makes it the premise `answerers.openai_answerer` rests on when it treats a
+    blank reply as a non-answer rather than scoring it. Rather than weaken that decision to
+    fit the exception, the exception is removed: a question no wrong answer can fail is not
+    measuring comprehension in the first place."""
+    return not (expected is None
+                or (isinstance(expected, str) and not expected.strip()))
+
+
 def _nested_questions(obj: Any) -> list[Question]:
     """Questions for structure-shaped payloads (dict-map of records with non-uniform child
     lists) that `gen_questions`' uniform path can't reach — count/enumerate/lookup over the
@@ -191,7 +208,8 @@ def _nested_questions(obj: Any) -> list[Question]:
     # (common in structure: `kind` and even overloaded `name` repeat within a file).
     idcol = _pick_id_col(records, cols)
     if idcol is not None:
-        tgt = next((c for c in cols if c != idcol), None)
+        tgt = next((c for c in cols if c != idcol and _answerable(records[n // 2][c])),
+                   None)
         if tgt is not None:
             ri = n // 2  # idcol is unique, so any index gives an unambiguous prompt
             qs.append(Question(
@@ -221,16 +239,16 @@ def _flat_record_questions(obj: Any) -> list[Question]:
     fluency-local (the codec/tabularizer rules are untouched)."""
     if not isinstance(obj, dict) or has_terse_marker(obj):
         return []
-    # int/float lookups are unambiguous; strings must be short, non-empty scalars —
-    # an empty expected USED TO be indistinguishable from _safe_ask's empty-string error
-    # return (same exclusion the text-diff questions apply). Since #263 `_safe_ask`
-    # returns None and a failure never reaches `score` at all, so this exclusion is now
-    # belt-and-braces rather than load-bearing. Kept because an empty expected is a weak
-    # question on its own merits, not only because it once aliased the failure sentinel.
+    # int/float lookups are unambiguous; strings must be short, answerable scalars — a
+    # length check alone (`0 < len(v) <= 60`) still passed a whitespace-only string, which
+    # `_answerable` rejects but a bare length check does not. Load-bearing for `pack.py`'s
+    # replay path, which scores a stored reply directly and never goes through
+    # `_safe_ask`'s None-normalisation at all: a missing/blank external reply to an
+    # unguarded whitespace-only question would score CORRECT.
     lookable = {
         k: v for k, v in obj.items()
         if (isinstance(v, (int, float)) and not isinstance(v, bool))
-        or (isinstance(v, str) and 0 < len(v) <= 60)
+        or (isinstance(v, str) and 0 < len(v) <= 60 and _answerable(v))
     }
     if len(lookable) < 3:
         return []
@@ -302,13 +320,15 @@ def gen_questions(obj: Any) -> list[Question]:
                        if isinstance(records[i][tgt], str) and records[i][tgt] in aliased), n // 2)
             expected = records[ri][tgt]
             transform = "table+dict" if isinstance(expected, str) and expected in aliased else "table"
-            qs.append(Question(
-                "lookup", "lookup", transform,
-                f"For the record whose {idcol!r} is {json.dumps(records[ri][idcol], ensure_ascii=False)}, "
-                f"what is the value of {tgt!r}?",
-                "Reply with only the value, with no quotes and no extra words.",
-                expected,
-            ))
+            if _answerable(expected):
+                qs.append(Question(
+                    "lookup", "lookup", transform,
+                    f"For the record whose {idcol!r} is "
+                    f"{json.dumps(records[ri][idcol], ensure_ascii=False)}, "
+                    f"what is the value of {tgt!r}?",
+                    "Reply with only the value, with no quotes and no extra words.",
+                    expected,
+                ))
         # enumerate — under-enumeration of wide tables was terse's measured recall gap.
         qs.append(Question(
             "enumerate", "enumerate", "table",
