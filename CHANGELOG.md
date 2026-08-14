@@ -15,6 +15,32 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **A model that returns HTTP 200 with no content is scored as unanswered, not wrong**
+  (`#268`). `#264` gated every fluency/diff report on TRANSPORT failures — the exceptions
+  `_safe_ask` turns into `None`. A backend returning `content: null` (or an empty/blank
+  string) raises nothing: it flowed through `openai_answerer`'s `content or ""` as a real
+  reply of `""`, was scored wrong, and was invisible to `_unmeasured`. Observed live:
+  `gemini-3.6-flash` returning null when reasoning consumed the token budget.
+
+  No-content is now normalised to `None` at `_safe_ask`, the choke point every live harness
+  funnels through, and in `openai_answerer` and `dropeval.openai_tool_answerer` directly (the
+  same `content or ""` bug, one layer down, on the drop-eval side). `_answerable` now
+  excludes empty-expected-answer questions on every generation path, not just the
+  flat-record one — `score("lookup", "", "")` is `True`, so a blank reply could otherwise
+  score as *correct*. All four verdict renderers (markdown, HTML, terminal, the
+  excluded-model line) now say a call "went unanswered" instead of "never reached the
+  backend," which prescribed the wrong remedy for a token-budget stop.
+
+  Scoped to detection only. Whether a run should also protect against losses that are
+  *correlated* with one arm (e.g. the diff arm's longer prompt failing more often than its
+  control's) is an open design question, tracked separately in `#280` rather than folded in
+  here — a reactive per-site patch for that already went through two review passes without
+  closing the class.
+
+## [0.25.2] - 2026-08-13
+
+### Fixed
+
 - **`install-mcp` no longer bakes a launcher that dies with the venv that installed it**
   (`#275`). `terse_invocation` returned `[sys.executable, "-m", "terse"]` — whatever
   interpreter happened to run the install. Invoked with `uv run` from a throwaway git

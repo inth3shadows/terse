@@ -39,25 +39,41 @@ def _safe_ask(answerer: Answerer, system: str, user: str) -> str | None:
 
     A second, quieter hazard goes with it: `""` could MATCH a question whose expected
     answer was empty, scoring a total failure as correct. `questions.py` excludes such
-    questions defensively for exactly that reason; with None those exclusions become
-    belt-and-braces rather than load-bearing."""
+    questions on every generation path via `_answerable` for exactly that reason; with
+    None those exclusions become belt-and-braces rather than load-bearing.
+
+    Blank replies are normalised to None HERE, not only in `openai_answerer`, because this
+    is the choke point every harness funnels through. Putting the invariant in one adapter
+    left the package holding two contracts — a future `Answerer`, or the `pack.py` replay
+    path, would reopen `#268` with no test failing. "The model produced nothing" and "the
+    call did not happen" are the same fact to every consumer downstream: unanswered, so
+    counted and never scored."""
     try:
-        return answerer(system, user)
+        reply = answerer(system, user)
     except Exception:
         return None
+    return None if reply is None or not reply.strip() else reply
 
 
 def _ask_n(answerer: Answerer, system: str, user: str,
            qtype: str, expected: Any, trials: int) -> tuple[int, int]:
-    """Ask the same question `trials` times; return `(correct, transport_failures)`.
+    """Ask the same question `trials` times; return `(correct, unanswered)`.
 
     Repeating at temperature 0 is not redundant — it surfaces the provider-side
     nondeterminism (batching / MoE routing) behind the ~5pt run-to-run accuracy wobble the
     report's binomial bound quantifies.
 
-    A transport failure is counted SEPARATELY and never scored. It is not a wrong answer:
-    the model was never asked. Callers carry the count into the row so the report can
-    decline to publish an accuracy for a backend that did not answer (#263)."""
+    An unanswered call is counted SEPARATELY and never scored. It is not a wrong answer:
+    either the model was never reached at all (transport failure, #263), or it was reached
+    but produced no content (#268). Callers carry the count into the row so the report can
+    decline to publish an accuracy for a backend that did not answer.
+
+    Note what the count does NOT do on its own: `_form_stats` removes these from that arm's
+    denominator, which is only safe while the losses are uncorrelated with the arm. #268's
+    live cause is a token-budget stop that scales with prompt length, so the diff arm —
+    whose prompt is strictly longer than its control's — is systematically the one that
+    loses calls; this module makes no attempt to protect against that correlation. See
+    issue #280 for the open design question."""
     ok = fails = 0
     for _ in range(trials):
         reply = _safe_ask(answerer, system, user)
