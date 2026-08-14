@@ -158,6 +158,23 @@ def _nested_record_group(obj: Any) -> tuple[str, list[dict], list[str]] | None:
     return None
 
 
+def _answerable(expected: Any) -> bool:
+    """False for an expected answer that is empty or whitespace-only.
+
+    Such a question is UNFALSIFIABLE: `score("lookup", "", "")` is True, so a model that
+    answers nothing at all scores CORRECT on it. `_flat_record_questions` has excluded
+    empties since #263 for exactly that reason; the table and nested lookup paths did not,
+    and `_pick_target_col`'s fallback happily returns a column whose every value is `""`
+    (found in review of #268).
+
+    That also makes it the premise `answerers.openai_answerer` rests on when it treats a
+    blank reply as a non-answer rather than scoring it. Rather than weaken that decision to
+    fit the exception, the exception is removed: a question no wrong answer can fail is not
+    measuring comprehension in the first place."""
+    return not (expected is None
+                or (isinstance(expected, str) and not expected.strip()))
+
+
 def _nested_questions(obj: Any) -> list[Question]:
     """Questions for structure-shaped payloads (dict-map of records with non-uniform child
     lists) that `gen_questions`' uniform path can't reach — count/enumerate/lookup over the
@@ -191,7 +208,8 @@ def _nested_questions(obj: Any) -> list[Question]:
     # (common in structure: `kind` and even overloaded `name` repeat within a file).
     idcol = _pick_id_col(records, cols)
     if idcol is not None:
-        tgt = next((c for c in cols if c != idcol), None)
+        tgt = next((c for c in cols if c != idcol and _answerable(records[n // 2][c])),
+                   None)
         if tgt is not None:
             ri = n // 2  # idcol is unique, so any index gives an unambiguous prompt
             qs.append(Question(
@@ -302,6 +320,9 @@ def gen_questions(obj: Any) -> list[Question]:
                        if isinstance(records[i][tgt], str) and records[i][tgt] in aliased), n // 2)
             expected = records[ri][tgt]
             transform = "table+dict" if isinstance(expected, str) and expected in aliased else "table"
+        # `ri` is chosen for dict-coding and need not be the row a column-level check
+        # looked at, so the guard is on the value actually being asked about.
+        if tgt is not None and _answerable(expected):
             qs.append(Question(
                 "lookup", "lookup", transform,
                 f"For the record whose {idcol!r} is {json.dumps(records[ri][idcol], ensure_ascii=False)}, "

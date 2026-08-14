@@ -15,6 +15,94 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **A model that produces no content is no longer scored as a wrong answer** (`#268`).
+  `#264` established that a call which never happened must not be scored, and gated every
+  report on it — but that gate keys on *transport* failures, the exceptions `_safe_ask`
+  turns into `None`. A backend returning HTTP 200 with `content: null` raises nothing. It
+  flowed through `openai_answerer`'s `content or ""` as a real reply of `""`, was scored
+  (wrong), and was **invisible to `_unmeasured`**.
+
+  When it happens across the board every arm reads 0%, the gap between them is exactly 0,
+  and the diff report prints **PASS** — a model that answered nothing green-lighting the
+  `proxy --diff` default flip. Same false-verdict class as `#263`, reached by a route
+  `#264`'s gate cannot see. Not hypothetical: `gemini-3.6-flash` returned null content on a
+  live call when reasoning consumed the token budget.
+
+  `openai_answerer` now returns `None` for null, absent, or blank content, so no-content
+  joins the existing failure channel and is counted rather than scored. The blank case is a
+  deliberate decision, not an accident of the check: an empty reply can never be *correct*,
+  so scoring it wrong would charge terse for a backend quirk, while counting it as a
+  non-answer lets the report decline to publish. `Answerer` is therefore
+  `(str, str) -> str | None`, and the normalisation lives in `_safe_ask` — the choke point
+  every harness funnels through — not in one adapter, which had left the package holding two
+  contradictory contracts.
+
+  **That justification was false when first written, and review caught it.** It claimed
+  `questions.py` excludes empty expected answers; only the flat-record path did. The table
+  and nested lookup paths would happily target a column whose every value is `""`. Rather
+  than weaken the decision to fit the exception, the exception is gone — `_answerable` now
+  excludes them on every path. Such a question was never measurable anyway:
+  `score("lookup", "", "")` is **True**, so a model that answered *nothing* scored
+  **correct** on it.
+
+  Each occurrence prints the model and its `finish_reason` to stderr, because that is the
+  actionable half — `length` means raise `max_tokens`, `content_filter` means the payload
+  tripped a filter, and neither calls for the same fix as "the backend was unreachable".
+
+- **`_unmeasured` gained a per-arm trigger — the fix above opened this, and review caught
+  it before merge** (`#268`). Excluding a non-answer from its arm's own denominator is safe
+  only while the losses are *uncorrelated with the arm being measured*, and `#268`'s live
+  cause is not: reasoning eating the token budget scales with **prompt length**, and the diff
+  arm's prompt is strictly longer than its control's (`PREVIOUS RESULT: … UPDATE: …` versus
+  the compressed payload alone). The arm under test is systematically the arm that returns
+  nothing.
+
+  The gate keyed only on the **pooled** share, so a diff arm could lose 40% of its own calls
+  — 20% overall, and the comparison is strictly `>` — and still publish. Measured: a real
+  `-40% FAIL` rendered as `+0% PASS`, printing *"safe to enable `proxy --diff`"* for a model
+  that produced no content on 16 of 40 diff calls. Strictly worse than the bug being fixed,
+  and reached *through* the fix. `_unmeasured` now also fires when any single arm loses more
+  than `UNMEASURED_FAIL_SHARE` of its own calls.
+
+- **Report verdicts no longer misattribute the cause.** "Too many calls never reached the
+  backend … re-run once the backend is reachable" is the wrong remedy for a token-budget
+  stop: the call reached the backend fine. The durable artifact — the text a reader pastes
+  into an issue — now says calls "went unanswered" and points at the stderr `finish_reason`,
+  since `length` means raise `max_tokens` and `content_filter` means a tripped filter.
+  `Turn.error` and `_ask_n`'s contract are re-documented to match.
+
+  All **four** places, not just the markdown verdict: the excluded-model list, the HTML
+  verdict card and the terminal forest plot said "never reached the backend" while the
+  markdown beside them said "went unanswered", so one run described one exclusion two ways
+  depending on output format — a reader comparing them concludes they are two different
+  problems. Pinned by an invariant over the *rendered output* of all three renderers rather
+  than three copies of a string, since fixing one and leaving the others is exactly how it
+  drifted. (The first cut of that test grepped the module source and failed on a docstring
+  quoting the old phrase to explain the change — pinning prose, not behaviour.)
+
+- **The same defect in `dropeval`, found while fixing the above.** `openai_tool_answerer`
+  had the identical `content or ""`, and it lands in the same place: `_run_question` feeds
+  the text straight to `fluency.score`, so a null-content reply scored as a wrong answer
+  while `Turn.error` stayed `False`. It is now recorded as an error.
+
+  It is still **scored as a miss**, deliberately, and the operator message says so rather
+  than claiming an exclusion that does not happen — the first cut claimed one, which review
+  also caught. On this side, scoring a non-answer as a miss is the conservative direction: it
+  can only under-sell enabling a lossy drop tier, never over-sell it. Excluding here would be
+  the same trap as the per-arm entry above. That matters
+  specifically because drop-eval is what a drop-to-retrieve verdict rests on, and `#269`
+  already has to see past a missing control arm — an unscored confound underneath it makes
+  that table unreadable.
+
+  Narrowly conditioned on **no text AND no tool calls**: an empty `text` accompanied by a
+  tool call is a normal retrieve turn, which `Turn.text`'s own comment documents. Flagging
+  those would mark every *correct* drop-to-retrieve run as an error, so a mutation
+  asserting the over-eager version is pinned alongside the fix.
+
+## [0.25.2] - 2026-08-13
+
+### Fixed
+
 - **`install-mcp` no longer bakes a launcher that dies with the venv that installed it**
   (`#275`). `terse_invocation` returned `[sys.executable, "-m", "terse"]` — whatever
   interpreter happened to run the install. Invoked with `uv run` from a throwaway git

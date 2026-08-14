@@ -508,9 +508,14 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
                         'No model returned enough calls to score, so this run says nothing '
                         'either way.</div>')
     if excluded:
-        verdict_html += ('<p>Not measured — calls never reached the backend for: '
+        # Same wording as the markdown and the terminal renderer on purpose: one
+        # condition described three ways is how a reader concludes they are three
+        # different problems. "Unanswered" also covers the #268 case the old phrasing
+        # actively mis-stated — a backend that WAS reached and returned no content.
+        verdict_html += ('<p>Not measured — calls went unanswered for: '
                          + ", ".join(f"<code>{_esc(m)}</code>" for m in excluded)
-                         + ". A failed call is not a wrong answer.</p>")
+                         + ". An unanswered call is not a wrong answer; check stderr for a "
+                           "<code>returned no content</code> line.</p>")
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">

@@ -209,9 +209,10 @@ def build_terminal_diff_report(results: dict, form_label: str = "diff-form",
                                 color: bool | None = None) -> str:
     """Terminal counterpart to report.build_diff_report's verdict section — a forest
     plot of per-model accuracy with 95% CI, gated on the worst model. Models whose calls
-    never reached the backend are excluded and named, same as the markdown: a FAIL bar
-    for a model the markdown just declined to score is the same false verdict in a
-    louder renderer (#264)."""
+    went unanswered are excluded and named, same as the markdown: a FAIL bar for a model
+    the markdown just declined to score is the same false verdict in a louder renderer
+    (#264). "Unanswered" rather than "never reached the backend" because since #268 it
+    also covers a backend that answered with no content at all."""
     gap_rows, excluded = diff_gap_rows(results)
     plot_rows = []
     for model, (facc, fse, cacc, cse) in gap_rows.items():
@@ -221,7 +222,7 @@ def build_terminal_diff_report(results: dict, form_label: str = "diff-form",
                            "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
     text = forest_bar_lines(plot_rows, form_label, control_label, color=color)
     if excluded:
-        text += f"\n  (excluded — calls never reached the backend: {', '.join(excluded)})"
+        text += f"\n  (excluded — calls went unanswered: {', '.join(excluded)})"
     return text
 
 

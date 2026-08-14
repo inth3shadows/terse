@@ -65,11 +65,28 @@ UNMEASURED_FAIL_SHARE = 0.20
 def _unmeasured(rows: list[dict]) -> bool:
     """True when transport failures make this model's numbers untrustworthy.
 
-    Two independent triggers, because they fail differently:
+    Three independent triggers, because they fail differently:
       1. any arm with ZERO completed trials — that arm cannot be computed at all, and
          `_form_stats` would report it as a flat 0.0 indistinguishable from real failure;
-      2. more than `UNMEASURED_FAIL_SHARE` of calls lost — the sample that survived is
-         both small and selected by which calls happened to get through.
+      2. any SINGLE arm losing more than `UNMEASURED_FAIL_SHARE` of its OWN calls;
+      3. more than `UNMEASURED_FAIL_SHARE` of calls lost overall — the sample that
+         survived is both small and selected by which calls happened to get through.
+
+    Trigger 2 exists because the pooled share (3) assumes losses are spread evenly across
+    arms, and the failure that motivated `#268` is not: a model whose reasoning eats its
+    token budget fails as a function of PROMPT LENGTH, and the diff arm's prompt is
+    strictly longer than its control's (`PREVIOUS RESULT: … UPDATE: …` versus the
+    compressed payload alone). So the arm under test is systematically the arm that
+    returns nothing, and every lost call is removed from that arm's own denominator by
+    `_form_stats`. Pooled, a diff arm could lose 40% of its calls — 20% overall, and the
+    comparison is strictly `>` — and still publish: measured, that rendered a real
+    `-40% FAIL` as `+0% PASS`, printing "safe to enable `proxy --diff`" for a model that
+    produced no content on 16 of 40 diff calls.
+
+    That is the same class of false verdict `#263`/`#268` are about, arrived at from the
+    other side: excluding a non-answer is only the safe direction when the exclusions are
+    UNCORRELATED with the arm being measured. When they correlate, exclusion silently
+    selects for the calls the harder arm happened to survive.
     """
     if not rows:
         return False
@@ -85,7 +102,15 @@ def _unmeasured(rows: list[dict]) -> bool:
     # silently skip every arm it did not name — which is how the diff-side report kept
     # publishing a verdict off a dead backend after the payload side stopped.
     for key in sorted({k for r in rows for k in r if k.endswith("_trials")}):
-        if sum(int(r.get(key, 0)) for r in rows) == 0:
+        completed = sum(int(r.get(key, 0)) for r in rows)
+        if completed == 0:
+            return True
+        # Per-arm share. `<form>_trials` is what SURVIVED for this arm; every row that
+        # carries the key attempted its full `trials` for it, so the difference is what
+        # this arm alone lost. Rows predating the counters carry no `trials` either, and
+        # are skipped by the same reasoning the `attempts` guard above uses.
+        attempted = sum(int(r.get("trials", 0)) for r in rows if key in r)
+        if attempted and (attempted - completed) / attempted > UNMEASURED_FAIL_SHARE:
             return True
     return fails / attempts > UNMEASURED_FAIL_SHARE
 
@@ -799,11 +824,15 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
     out.append("")
     if unmeasured:
         out += [
-            "**Not measured** — too many calls never reached the backend (connection "
-            "error, rate limit, bad model id), so no accuracy is published for: "
+            "**Not measured** — too many calls went unanswered (connection error, rate "
+            "limit, bad model id, or the model returning no content), so no accuracy "
+            "is published for: "
             + ", ".join(f"`{m}` ({f}/{a} calls lost)"
                         for m, (f, a) in sorted(unmeasured.items()))
-            + ". A failed call is not a wrong answer; re-run once the backend is reachable.",
+            + ". An unanswered call is not a wrong answer. Check stderr for a "
+              "`returned no content` line naming a `finish_reason` — `length` means "
+              "raise max_tokens, `content_filter` means the payload tripped a filter; "
+              "otherwise re-run once the backend is reachable.",
             "",
         ]
 
@@ -928,13 +957,16 @@ def build_diff_soak_report(results: dict) -> str:
     out.append("")
     if unmeasured:
         out += [
-            "**Not measured** — too many calls never reached the backend, so no accuracy "
+            "**Not measured** — too many calls went unanswered, so no accuracy "
             "is published for: "
             + ", ".join(
                 f"`{m}` ({sum(int(r.get('fails', 0)) for r in rs)}/"
                 f"{sum(int(r.get('attempts', 0)) for r in rs)} calls lost)"
                 for m, rs in sorted(unmeasured.items()))
-            + ". A failed call is not a wrong answer; re-run once the backend is reachable.",
+            + ". An unanswered call is not a wrong answer. Check stderr for a "
+              "`returned no content` line naming a `finish_reason` — `length` means "
+              "raise max_tokens, `content_filter` means the payload tripped a filter; "
+              "otherwise re-run once the backend is reachable.",
             "",
         ]
 
@@ -1201,11 +1233,15 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     unreachable = {m: s for m, s in summary.items() if s.get("unmeasured")}
     if unreachable:
         out += [
-            "**Not measured** — too many calls never reached the backend (connection "
-            "error, rate limit, bad model id), so no accuracy is published for: "
+            "**Not measured** — too many calls went unanswered (connection error, rate "
+            "limit, bad model id, or the model returning no content), so no accuracy "
+            "is published for: "
             + ", ".join(f"`{m}` ({s['fails']}/{s['attempts']} calls lost)"
                         for m, s in sorted(unreachable.items()))
-            + ". A failed call is not a wrong answer; re-run once the backend is reachable.",
+            + ". An unanswered call is not a wrong answer. Check stderr for a "
+              "`returned no content` line naming a `finish_reason` — `length` means "
+              "raise max_tokens, `content_filter` means the payload tripped a filter; "
+              "otherwise re-run once the backend is reachable.",
             "",
         ]
     # A model that lost SOME calls but stayed under the bar still publishes numbers — say
@@ -1259,15 +1295,16 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     broken = [m for m, s in summary.items() if s["raw"] == 0 and not s.get("unmeasured")]
     # Excluded for the same reason, by a different and EARLIER signal: the raw==0 control
     # only catches a TOTAL failure, and only once it has already been scored as if the
-    # model answered wrongly. A counted transport failure catches the partial case too,
-    # which is the one that reaches a plausible-looking verdict (#263).
+    # model answered wrongly. A counted unanswered call catches the partial case too, which
+    # is the one that reaches a plausible-looking verdict (#263) — including, since #268,
+    # a model that WAS reached and produced no content.
     unmeasured_models = [m for m, s in summary.items() if s.get("unmeasured")]
     gated = {m: s for m, s in summary.items() if s["raw"] > 0 and not s.get("unmeasured")}
     if broken:
         out.append(f"- Excluded (raw control failed — backend/config error, not comprehension): "
                    f"{', '.join(f'`{m}`' for m in broken)}.")
     if unmeasured_models:
-        out.append(f"- Excluded (calls never reached the backend — not measured): "
+        out.append(f"- Excluded (calls went unanswered — not measured): "
                    f"{', '.join(f'`{m}`' for m in unmeasured_models)}.")
     # best terse-side form per model, carrying its own SE for the gap's confidence interval.
     # gap CI: raw and the best form are over the same questions (not independent), so

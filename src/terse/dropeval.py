@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import urllib.request
 from collections import Counter
 from collections.abc import Callable
@@ -58,9 +59,11 @@ class ToolCall:
 class Turn:
     text: str                              # final assistant text ("" if it only called a tool)
     tool_calls: list[ToolCall] = field(default_factory=list)  # empty if answered directly
-    # True when the call never reached the model (transport error, 4xx, rate limit). Scored
-    # rows carry the count so a run that failed to ASK cannot be read as a model that failed
-    # to ANSWER — the two are indistinguishable in the accuracy columns alone.
+    # True when the turn produced no usable answer: the call never reached the model
+    # (transport error, 4xx, rate limit), OR it returned 200 with no content and no tool
+    # call (#268 — a token-budget or safety-filter stop, not a comprehension failure).
+    # Scored rows carry the count so a run that failed to ASK cannot be read as a model
+    # that failed to ANSWER — the two are indistinguishable in the accuracy columns alone.
     error: bool = False
 
 
@@ -634,6 +637,35 @@ def openai_tool_answerer(base_url: str, api_key: str, model: str, tools: list[di
             name = fn.get("name", "")
             calls.append(ToolCall(call_id=tc.get("id", ""), name=mcp_name.get(name, name),
                                   arguments=arguments))
-        return Turn(text=msg.get("content") or "", tool_calls=calls)
+        # `content or ""` collapsed "the model produced NO content" into "it answered,
+        # with nothing" — the same erasure #268 fixes in `fluency.answerers`. Here it left
+        # `error` False, so a 200 carrying `content: null` was indistinguishable from a
+        # model that read the payload and answered wrongly; #269 already has to see past a
+        # missing control arm, and an unrecorded confound underneath makes that table
+        # unreadable.
+        #
+        # DELIBERATELY NOT excluded from the accuracy denominators, unlike the fluency
+        # side. `_run_question` still scores this turn as a miss, and that is the
+        # conservative direction HERE: a non-answer counted as a miss makes the drop rule
+        # look WORSE, so it can only under-sell enabling a lossy tier, never over-sell it.
+        # Excluding would be the dangerous direction — see `report._unmeasured`, where
+        # per-arm exclusion of prompt-length-correlated failures turned a real FAIL into a
+        # PASS. `errors` carries the count, and the >=50% inconclusive gate catches the
+        # gross case.
+        #
+        # Empty text WITH tool calls is normal and must not be flagged — that is a turn
+        # that called `terse.retrieve` instead of answering, which `Turn.text`'s own
+        # comment documents. Only "no text AND no calls" is a non-answer.
+        text = msg.get("content")
+        no_content = (text is None or not text.strip()) and not calls
+        if no_content:
+            # finish_reason is the actionable half — `length` means raise max_tokens,
+            # `content_filter` means the payload tripped a filter. Neither is "unreachable",
+            # which is the other thing `error=True` means.
+            print(f"terse dropeval: {model} returned no content and called no tool "
+                  f"(finish_reason={data['choices'][0].get('finish_reason')!r}) — "
+                  f"counted in `errors`; the accuracy columns still score it as a miss",
+                  file=sys.stderr)
+        return Turn(text=text or "", tool_calls=calls, error=no_content)
 
     return ask
