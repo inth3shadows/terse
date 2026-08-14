@@ -50,9 +50,15 @@ def _safe_ask(answerer: Answerer, system: str, user: str) -> str | None:
     counted and never scored."""
     try:
         reply = answerer(system, user)
+        # NOT `_answerable(reply)`: that predicate treats any non-None, non-blank-string
+        # value as answerable (an int `expected` is legitimate there), so it would let a
+        # contract-violating non-str reply through unchanged instead of catching it here.
+        # `.strip()` is deliberately called on a value that might not have it — the
+        # resulting AttributeError is what turns "answerer returned garbage" into "treat
+        # it as unanswered," inside this try.
+        return None if reply is None or not reply.strip() else reply
     except Exception:
         return None
-    return None if reply is None or not reply.strip() else reply
 
 
 def _ask_n(answerer: Answerer, system: str, user: str,

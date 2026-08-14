@@ -74,6 +74,17 @@ def test_real_content_still_comes_back_unchanged(monkeypatch):
     assert ask("", "q") == "6"
 
 
+def test_a_non_string_reply_does_not_abort_the_panel_run():
+    """`_safe_ask`'s first promise is that one bad call never aborts a long multi-model
+    run. Blank-normalisation used to run AFTER the try/except that wraps `answerer(...)`,
+    so a user-supplied answerer — the module's documented extension point — returning a
+    non-str value made `.strip()` raise `AttributeError` straight past the handler."""
+    from terse.fluency.harnesses import _safe_ask
+    assert _safe_ask(lambda s, u: 0, "", "q") is None
+    assert _safe_ask(lambda s, u: [], "", "q") is None
+    assert _safe_ask(lambda s, u: "6", "", "q") == "6"
+
+
 def test_a_no_content_model_cannot_green_light_a_verdict(monkeypatch):
     """The end-to-end defect, as reported: an answerer that produces nothing used to
     yield fails=0, so `_unmeasured` stayed False and the report published 0% vs 0% as a
@@ -177,6 +188,22 @@ def test_an_unanswerable_question_is_never_generated():
         for q in gen_questions(payload):
             assert q.expected != "" and str(q.expected).strip() != "", \
                 f"unfalsifiable question generated: {q.qtype} expects {q.expected!r}"
+
+
+def test_a_whitespace_only_flat_record_field_is_never_targeted():
+    """The fourth generation path `_answerable` is documented to cover but a length check
+    alone (`0 < len(v) <= 60`) does not: a single-space string has length 1, so it passed
+    the pre-existing filter untouched and could still be picked as a lookup target.
+
+    Load-bearing here in a way the live harness masks: `_safe_ask` normalises a blank
+    LIVE reply to None before it ever reaches `score`, but `pack.py`'s replay path scores a
+    stored reply directly with no such gate — a missing/blank external reply to an
+    unguarded whitespace-only question would score CORRECT there."""
+    from terse.fluency.questions import gen_questions
+    qs = gen_questions({"note": " ", "id": 3, "num": 7, "other": "hello"})
+    for q in qs:
+        assert q.expected != "" and str(q.expected).strip() != "", \
+            f"unfalsifiable question generated: {q.qtype} expects {q.expected!r}"
 
 
 def test_every_renderer_describes_an_unanswered_call_the_same_way():

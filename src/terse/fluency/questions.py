@@ -239,16 +239,16 @@ def _flat_record_questions(obj: Any) -> list[Question]:
     fluency-local (the codec/tabularizer rules are untouched)."""
     if not isinstance(obj, dict) or has_terse_marker(obj):
         return []
-    # int/float lookups are unambiguous; strings must be short, non-empty scalars —
-    # an empty expected USED TO be indistinguishable from _safe_ask's empty-string error
-    # return (same exclusion the text-diff questions apply). Since #263 `_safe_ask`
-    # returns None and a failure never reaches `score` at all, so this exclusion is now
-    # belt-and-braces rather than load-bearing. Kept because an empty expected is a weak
-    # question on its own merits, not only because it once aliased the failure sentinel.
+    # int/float lookups are unambiguous; strings must be short, answerable scalars — a
+    # length check alone (`0 < len(v) <= 60`) still passed a whitespace-only string, which
+    # `_answerable` rejects but a bare length check does not. Load-bearing for `pack.py`'s
+    # replay path, which scores a stored reply directly and never goes through
+    # `_safe_ask`'s None-normalisation at all: a missing/blank external reply to an
+    # unguarded whitespace-only question would score CORRECT.
     lookable = {
         k: v for k, v in obj.items()
         if (isinstance(v, (int, float)) and not isinstance(v, bool))
-        or (isinstance(v, str) and 0 < len(v) <= 60)
+        or (isinstance(v, str) and 0 < len(v) <= 60 and _answerable(v))
     }
     if len(lookable) < 3:
         return []
@@ -320,16 +320,15 @@ def gen_questions(obj: Any) -> list[Question]:
                        if isinstance(records[i][tgt], str) and records[i][tgt] in aliased), n // 2)
             expected = records[ri][tgt]
             transform = "table+dict" if isinstance(expected, str) and expected in aliased else "table"
-        # `ri` is chosen for dict-coding and need not be the row a column-level check
-        # looked at, so the guard is on the value actually being asked about.
-        if tgt is not None and _answerable(expected):
-            qs.append(Question(
-                "lookup", "lookup", transform,
-                f"For the record whose {idcol!r} is {json.dumps(records[ri][idcol], ensure_ascii=False)}, "
-                f"what is the value of {tgt!r}?",
-                "Reply with only the value, with no quotes and no extra words.",
-                expected,
-            ))
+            if _answerable(expected):
+                qs.append(Question(
+                    "lookup", "lookup", transform,
+                    f"For the record whose {idcol!r} is "
+                    f"{json.dumps(records[ri][idcol], ensure_ascii=False)}, "
+                    f"what is the value of {tgt!r}?",
+                    "Reply with only the value, with no quotes and no extra words.",
+                    expected,
+                ))
         # enumerate — under-enumeration of wide tables was terse's measured recall gap.
         qs.append(Question(
             "enumerate", "enumerate", "table",
