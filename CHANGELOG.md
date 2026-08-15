@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.25.4] - 2026-08-15
+
 ### Fixed
 
 - **A loss that correlates with the arm under test can no longer publish a PASS** (`#280`).
