@@ -513,9 +513,9 @@ def _payload_rows(*, degraded: bool):
 def _depth_unpaired_rows(depth: int = 1):
     """A model the per-MODEL gate lets through, withheld only by the per-DEPTH one (#280).
 
-    3 of 10 questions lost by the diff arm: 15% of calls, under `UNMEASURED_FAIL_SHARE`, so
-    `_unmeasured` stays quiet — but 30% of the question set, over `UNPAIRED_QUESTION_SHARE`,
-    so the arms cannot be compared. Without this shape the invariance test never exercises
+    3 of 10 questions lost by the diff arm and none by its control: 15% of calls, under
+    `UNMEASURED_FAIL_SHARE`, so `_unmeasured` stays quiet — but a 30% one-sided loss, over
+    `UNPAIRED_ASYMMETRY_SHARE`, so the arms cannot be compared. Without this shape the invariance test never exercises
     the by-depth table at all: its `dead` fixture is caught per-model, which renders those
     rows `n/a` for a reason that has nothing to do with the per-depth gate.
     """

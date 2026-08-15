@@ -54,23 +54,39 @@ def _ci(se: float) -> float:
     return 1.96 * se
 
 
-# Share of the QUESTION SET that may go uncomparable before a gap stops being publishable.
+# How ONE-SIDED the pairing losses may be before a gap stops being publishable.
 #
-# Deliberately NOT `UNMEASURED_FAIL_SHARE`, though both are 0.20 today. They count
-# different things and would be tuned against different evidence: that one is a share of
-# CALLS (how much of the backend traffic failed), this one is a share of QUESTIONS (how
-# much of the exam the two arms cannot both sit). Sharing the constant made the reports
-# describe an unpaired exclusion as "too many calls went unanswered" while printing a call
-# count that refuted it.
+# The refusal measures asymmetry, not volume, because asymmetry is the thing that causes
+# the harm. `paired_rows` already removes the BIAS outright — after pairing, both arms sit
+# the identical exam whatever fraction was dropped. What is left to guard against is the
+# survivors being SELECTED, and the mechanism that selects them is loss correlated with the
+# arm under test: a token-budget stop kills the longest prompt first, and the form arm's
+# prompt is strictly longer than its control's. That loss is one-sided by construction.
 #
-# Calibrated on the measured #268 case: one wholly-lost question type of five is exactly
-# 20.0%. Note this bar is reached sooner than the call share it used to borrow — pairing is
-# all-or-nothing per row (the counters say how MANY trials survived, not WHICH), so a
-# single lost trial voids a whole question. At `--trials 3` that means ~1.7% of calls can
-# void 20% of the question set. That is the honest cost of pairing, not a bug in it, but it
-# is a policy bar on top of the bias fix: `paired_rows` alone already removes the bias, and
-# this decides when what survives is too small and too selected to publish.
-UNPAIRED_QUESTION_SHARE = 0.20
+# A volume bar cannot tell those apart. It counted a run where both arms flaked equally the
+# same as one where only the arm under test truncated — so uncorrelated 429 background
+# voided runs it had no reason to. Simulated over 200 runs x 20 questions at 4 arms, a 1%
+# per-call failure rate withheld 13% of models under the volume rule, 2% withheld 44%, and
+# 5% withheld 98%, while `_unmeasured` never fired at any of them. That is the regime the
+# tool actually runs in, and a gate that refuses most healthy runs gets raised or removed
+# rather than trusted.
+#
+# Calibration is unchanged where it was actually measured. The #268 case — a model
+# answering its control perfectly and returning no content on every `deref` question, the
+# longest prompt — is maximally one-sided: the form arm loses one question type of five and
+# the control loses none, which is 20.0% asymmetry, so it still refuses. `>=`, because that
+# boundary IS the measured case and on a ship gate the boundary belongs on the refusing
+# side.
+#
+# Direction matters and only one direction is dangerous. If the CONTROL lost more
+# questions, the surviving exam is selected against the control, which understates the form
+# — a false FAIL, the safe error. Only a form-side excess is counted.
+UNPAIRED_ASYMMETRY_SHARE = 0.20
+
+# The backstop asymmetry cannot provide: losses can be perfectly symmetric and still gut
+# the exam, and a gap measured on the handful of easy questions that survived generalises
+# to nothing. Deliberately loose — this is "the exam is mostly gone", not a tuning knob.
+UNPAIRED_VOLUME_SHARE = 0.50
 
 
 def paired_rows(rows: list[dict[str, Any]], *forms: str) -> list[dict[str, Any]]:
@@ -120,22 +136,66 @@ def paired_rows(rows: list[dict[str, Any]], *forms: str) -> list[dict[str, Any]]
     return out
 
 
-def unpaired(rows: list[dict[str, Any]], *forms: str) -> bool:
-    """True when too much of the question set is missing from one side to compare at all.
+def _short_rows(rows: list[dict[str, Any]], form: str) -> set[int]:
+    """Indices of rows where `form` did not complete every trial it attempted.
 
-    `paired_rows` makes the surviving gap honest; it cannot make it REPRESENTATIVE. Drop
-    the questions one arm could not complete and what is left is both smaller and selected
-    — and selected by difficulty, since the calls a token-budget stop kills are the ones
-    with the longest prompts. So the gap sites need both: pair what remains, and decline to
-    publish when too little does.
+    Rows with no `attempts` counter are never short: their uneven per-form counts are a
+    `score_pack` collection choice, not a loss (see `paired_rows`)."""
+    key = form[:-3] + "_trials" if form.endswith("_ok") else form
+    out = set()
+    for i, r in enumerate(rows):
+        t = int(r.get("trials", 1))
+        if "attempts" in r and int(r.get(key, t)) != t:
+            out.add(i)
+    return out
 
-    `>=`, where the pooled `_unmeasured` share uses `>`. The boundary is not hypothetical
-    here: one question type out of five is exactly 20.0%, and that is the measured case in
-    which a real -20% FAIL published as PASS. On a ship gate the boundary belongs on the
-    refusing side."""
+
+def loss_asymmetry(rows: list[dict[str, Any]], forms: list[str], control: str) -> float:
+    """How one-sidedly the pairing losses fall on a FORM arm rather than on the control.
+
+    For each form separately: (questions this form lost and the control did not) minus
+    (questions the control lost and this form did not), over the question count. The worst
+    form wins, because the verdict gates on the worst arm.
+
+    Per form separately, not "any form", on purpose: the payload family has two gated forms
+    against one control, so an `any` test would give the form side two chances to be short
+    against the control's one and read symmetric flake as a one-sided loss.
+
+    FLOORED AT ZERO. A control-side excess biases against the form and so understates it —
+    a false FAIL, the safe error on a ship gate — and no caller refuses on it, so it is
+    reported as "no form-side asymmetry" rather than as a negative number that a future
+    caller might compare with `abs()` and start refusing the harmless direction."""
+    if not rows:
+        return 0.0
+    c_short = _short_rows(rows, control)
+    worst = 0.0
+    for f in forms:
+        f_short = _short_rows(rows, f)
+        excess = len(f_short - c_short) - len(c_short - f_short)
+        worst = max(worst, excess / len(rows))
+    return worst
+
+
+def unpaired(rows: list[dict[str, Any]], forms: list[str], control: str) -> bool:
+    """True when the surviving question set is too SELECTED, or too small, to compare on.
+
+    `paired_rows` makes the surviving gap honest — after pairing both arms sit the identical
+    exam — but it cannot make that exam REPRESENTATIVE. Two different ways it stops being:
+
+      1. the losses are one-sided (`loss_asymmetry`), which is the #268 signature and the
+         mechanism that actually selects the survivors by difficulty;
+      2. the exam is mostly gone (`UNPAIRED_VOLUME_SHARE`), where even symmetric loss
+         leaves a gap measured on whichever handful of questions happened to survive.
+
+    Trigger 1 replaced a plain volume bar, which could not tell a run where both arms flaked
+    equally from one where only the arm under test truncated — see `UNPAIRED_ASYMMETRY_SHARE`
+    for the measured cost of that confusion."""
     if not rows:
         return False
-    return (len(rows) - len(paired_rows(rows, *forms))) / len(rows) >= UNPAIRED_QUESTION_SHARE
+    if loss_asymmetry(rows, forms, control) >= UNPAIRED_ASYMMETRY_SHARE:
+        return True
+    dropped = len(rows) - len(paired_rows(rows, *forms, control))
+    return dropped / len(rows) >= UNPAIRED_VOLUME_SHARE
 
 
 # Share of a model's calls that may fail before its numbers stop meaning anything (#263).
@@ -233,7 +293,7 @@ def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
         return ArmGap(0.0, 0.0, 0.0, 0.0, [], "empty")
     if _unmeasured(rows):
         return ArmGap(0.0, 0.0, 0.0, 0.0, [], "unmeasured")
-    if unpaired(rows, *gating, control):
+    if unpaired(rows, gating, control):
         return ArmGap(0.0, 0.0, 0.0, 0.0, [], "unpaired")
     pr = paired_rows(rows, *gating, control)
     arms = {f: _form_stats(pr, f) for f in (*gating, control, *display)}
@@ -343,10 +403,13 @@ def _not_measured_lines(withheld: dict[str, tuple[str | None, int, int]]) -> lis
             "selected to publish a gap for: "
             + ", ".join(f"`{m}`" for m in unpair)
             + f". A question is comparable only when every arm answered all of its trials, "
-              f"so one lost trial withholds the whole question; past "
-              f"{UNPAIRED_QUESTION_SHARE:.0%} of the question set this declines to publish "
-              f"rather than compare two different exams (#280). Re-run at a lower "
-              f"`--trials`, or once the backend stops truncating.")
+              f"so one lost trial withholds the whole question. What triggers this is the "
+              f"losses falling ONE-SIDEDLY on an arm under test — past "
+              f"{UNPAIRED_ASYMMETRY_SHARE:.0%} of the question set lost by a form arm and "
+              f"not by its control, the survivors are selected by difficulty rather than "
+              f"merely fewer, and the two arms are no longer sitting the same exam (#280). "
+              f"Even losses do not trigger it; re-run at a lower `--trials`, or once the "
+              f"backend stops truncating the longer arm.")
     out.append("")
     return out
 

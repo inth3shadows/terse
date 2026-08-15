@@ -49,12 +49,28 @@ fails that pull request until the section has moved.
   no `attempts` counter comes from `score_pack`, where uneven per-form trial counts are a
   documented collection mode (#91) rather than a failure — `score_pack` never calls a
   backend, so it has no transport to lose calls to, and voiding those rows deleted a
-  working feature. And the `unpaired` refusal now has its own constant,
-  `UNPAIRED_QUESTION_SHARE`: it is a share of QUESTIONS, while `UNMEASURED_FAIL_SHARE` is a
-  share of CALLS, and borrowing the latter made reports describe an unpaired exclusion as
-  "too many calls went unanswered" while printing a call count that refuted it. Withheld
-  models are now split into **Not measured** (transport) and **Not compared** (unpaired),
-  which are different events and no longer share a sentence.
+  working feature. And withheld models are now split into **Not measured** (transport) and
+  **Not compared** (unpaired), which are different events and no longer share a sentence.
+
+  **The refusal measures asymmetry, not volume.** `paired_rows` removes the bias outright —
+  after pairing both arms sit the identical exam whatever fraction was dropped — so what is
+  left to guard against is the survivors being SELECTED, and the mechanism that selects them
+  is loss correlated with the arm under test. A volume bar cannot tell a run where both arms
+  flaked equally from one where only the longer-prompted arm truncated, and it charged the
+  first as if it were the second: simulated over 200 runs × 20 questions at 4 arms, a 1%
+  per-call failure rate withheld **13%** of models, 2% withheld **44%**, and 5% withheld
+  **98%**, while `_unmeasured` never fired at any of them. That is the regime the tool
+  actually runs in, and a gate that refuses most healthy runs gets raised or removed rather
+  than trusted. `UNPAIRED_ASYMMETRY_SHARE` counts questions a FORM arm lost that its control
+  did not, per form (an "any form short" test would give the payload family's two forms two
+  chances against one control and read symmetric flake as one-sided). Under the same
+  simulation the new gate withholds **0% / 2.8% / 25%**, and the measured #268 case — the
+  form arm losing one question type of five, the control losing none — is exactly 20.0%
+  asymmetry and still refuses, so the calibration is unchanged where it was actually taken.
+  Direction is deliberate: a control-side excess understates the form (a false FAIL, the
+  safe error) and does not refuse. `UNPAIRED_VOLUME_SHARE` (0.50) remains as a loose
+  backstop for the case asymmetry cannot see — losses can be perfectly even and still leave
+  too little exam to generalise from.
 
   Three further defects fixed in the same lines: the HTML banner's arm detection was a
   `rows[0]`-key heuristic with a silent always-green branch (a payload-shaped row set made
