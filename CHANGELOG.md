@@ -13,7 +13,52 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A loss that correlates with the arm under test can no longer publish a PASS** (`#280`).
+  When a model's unanswered calls track the arm being measured — a token-budget stop kills
+  the LONGEST prompt first, and the diff/terse arm's prompt is strictly longer than its
+  control's — `_form_stats` divided each arm by its OWN surviving trial count, scoring the
+  arm that lost the hard questions over an easier exam than its control. Measured: a real
+  **-20% FAIL** rendered as **-3% PASS**, printing "safe to enable `proxy --diff`".
+
+  This is the fourth pass at the same class of bug, and the first to treat it as
+  structural. `_form_stats(rows, form)` computes ONE arm, so every gap site called it twice
+  and subtracted — and nothing in that shape can enforce that the two arms answered the
+  same questions, because pairing is a property of the pair. Each previous pass wired
+  pairing into the sites it was looking at; the next site stayed writable by accident. The
+  third attempt's commit claimed "every diff-vs-control gap site", and reverting its
+  pairing at two of the three left the entire suite green.
+
+  So the shape is gone rather than the sites patched. `arm_gap` / `best_arm_gap` are now
+  the only way to turn a form and a control into comparable numbers: they gate
+  (`_unmeasured`, then a new `unpaired` refusal), pair the rows, and compute every arm over
+  that paired subset — numbers and gate arrive together, so a caller cannot take one
+  without the other. All six sites route through it: the diff markdown table, the HTML
+  banner, both terminal forest plots, the soak by-depth table and deepest-depth verdict,
+  and the fluency verdict. `build_fluency_report` also loses its duplicate copy of
+  `fluency_gap_rows`' best-of math.
+
+  Three further defects fixed in the same lines: the HTML banner's arm detection was a
+  `rows[0]`-key heuristic with a silent always-green branch (a payload-shaped row set made
+  control := form, so the gap was identically 0 and the banner unconditionally PASS); it
+  hardcoded a second `-0.05` instead of `_GAP_TOLERANCE`; and the `regressions` /
+  `primer recovers` columns counted over all rows, so a question one arm never answered
+  was reported as a wrong answer, contradicting the gap printed beside it.
+
+  Pinned two ways, because a shared code path and an unwired one produce identical green
+  suites. `tests/test_gap_gate_boundary.py` asserts by AST that `_form_stats` is called
+  only from a named allowlist, so a seventh gap site cannot skip the gate without editing
+  that list in a reviewable diff; it carries a known-violation sweep proving the detector
+  can fail. `tests/test_paired_gap_gate.py` pins each site by mutation — every one verified
+  red-on-revert — on a fixture built to sit UNDER both pre-existing gates (8.3% pooled
+  loss, 16.7% unpaired share, against a 20% bar), asserted in the test itself, since the
+  previous attempt's headline test passed unmodified against the un-fixed code precisely
+  because its fixture tripped the older pooled rule instead.
+
+  `_safe_ask`'s handling of a non-str reply is deliberately unchanged: on `main` the
+  `AttributeError` from calling `.strip()` inside the `try` is what converts "answerer
+  returned garbage" into "unanswered", and that is correct.
 
 ## [0.25.3] - 2026-08-14
 

@@ -462,11 +462,19 @@ def _gate_signature(text: str) -> str:
     what was excluded. Two runs with the same measured models must produce the same
     signature no matter how many unmeasured models were also present."""
     verdict = text.split("## Verdict")[1] if "## Verdict" in text else text
+    # The soak's by-depth table states an outcome too — a per-depth gap column — and it
+    # sits ABOVE `## Verdict`, so splitting there hid it from this rule entirely. That is
+    # where #280's F2 lived: a depth slice publishing +7% PASS on a real -10% FAIL, in a
+    # renderer the invariance test could not see. Rows for a withheld model render `n/a`,
+    # so they drop out of the signature the same way an "Excluded (" line does.
+    depth_rows = [ln for ln in text.splitlines()
+                  if ln.startswith("| `") and "n/a" not in ln and ln.count("|") == 7]
     return "\n".join(
-        ln for ln in verdict.splitlines()
-        if ln.strip()
-        and "Excluded (" not in ln
-        and "Not measured" not in ln
+        [ln for ln in verdict.splitlines()
+         if ln.strip()
+         and "Excluded (" not in ln
+         and "Not measured" not in ln]
+        + depth_rows
     )
 
 

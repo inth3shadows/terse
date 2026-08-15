@@ -10,8 +10,9 @@ Palette, mark specs, and chart-form choices follow the project's data-viz method
   - savings % is a polarity value (above/below zero) -> diverging blue/red bars
   - tier attribution is part-to-whole across 3 fixed series -> categorical stacked bars
   - fluesncy/diff comprehension is per-model magnitude -> point+whisker (forest) rows
-Reuses report.py's stats math (_form_stats / _worst_case_gap) rather than
-re-deriving it, so the verdict a reader sees here always matches the markdown report.
+Reuses report.py's stats math (arm_gap / _worst_case_gap) rather than re-deriving it, so
+the verdict a reader sees here always matches the markdown report. `arm_gap` specifically,
+not `_form_stats` twice: the gap gate lives inside it (#280).
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import html as _html
 from collections.abc import Sequence
 from typing import Any
 
-from .report import _ci, _form_stats, _pct, _sum, _unmeasured, _worst_case_gap
+from .report import _GAP_TOLERANCE, _ci, _pct, _sum, _worst_case_gap, arm_gap
 
 # --- palette (dataviz skill reference instance) ---------------------------------
 
@@ -477,20 +478,30 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
         # and this page rendered a green "✓ PASS" banner off calls that never happened.
         # A green banner is the single most quoted artifact of a run; it is the last
         # place a false pass should survive.
-        if _unmeasured(rows):
+        #
+        # Routed through `arm_gap` (#280) rather than two bare `_form_stats` calls, so the
+        # pairing gate the markdown and terminal renderers apply cannot be missing here —
+        # which is exactly what it was: this page printed a green +7% PASS on a run the
+        # markdown correctly failed at -10%.
+        #
+        # The old arm detection was a `rows[0]`-key heuristic with a silent always-green
+        # branch: a payload-shaped row carrying no `diff_ok` set control := form, making
+        # the gap identically 0 and the banner unconditionally PASS. A row set with no
+        # `diff_ok` is not a diff run and gets no verdict at all.
+        if "diff_ok" not in rows[0] or "terse_ok" not in rows[0]:
             excluded.append(model)
             continue
-        facc, fse = _form_stats(rows, "terse_ok" if "terse_ok" in rows[0] else "diff_ok")
-        cacc, cse = facc, fse
-        if "diff_ok" in rows[0] and "terse_ok" in rows[0]:
-            facc, fse = _form_stats(rows, "diff_ok")
-            cacc, cse = _form_stats(rows, "terse_ok")
-        gap_rows[model] = (facc, fse, cacc, cse)
+        g = arm_gap(rows, "diff_ok", "terse_ok")
+        if g.excluded:
+            excluded.append(model)
+            continue
+        gap_rows[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
 
     worst = _worst_case_gap(gap_rows)
     for model, (facc, fse, cacc, cse) in gap_rows.items():
         gap = facc - cacc
-        passed = gap >= -0.05 - 1e-9
+        # `_GAP_TOLERANCE`, not a second hardcoded 0.05 that has to be remembered.
+        passed = gap >= -_GAP_TOLERANCE - 1e-9
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
                            "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
 

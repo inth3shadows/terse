@@ -52,6 +52,59 @@ def _ci(se: float) -> float:
     return 1.96 * se
 
 
+def paired_rows(rows: list[dict[str, Any]], *forms: str) -> list[dict[str, Any]]:
+    """The subset of `rows` on which every one of `forms` completed ALL of its trials.
+
+    Scoring is PAIRED — `harnesses`' module docstring calls that load-bearing: the same
+    questions, in the same order, put to every arm. `_form_stats` divides each arm by its
+    OWN `<form>_trials`, so dropping an unanswered call from one arm silently re-bases that
+    arm onto a DIFFERENT question set, and the "gap" stops comparing like with like.
+
+    That is the real defect behind #268's near-miss, and a per-arm loss THRESHOLD does not
+    close it — it only raises the bar. Measured: a model answering the control perfectly and
+    returning no content on every `deref` question (the longest prompt, so the first to hit
+    a token-budget stop) loses exactly 1 of 5 question types. That is 20.0% of the arm — on
+    the threshold, and the comparison is strictly `>` — so the gate stayed quiet while a
+    real **-20% FAIL** rendered as **PASS / "safe to enable `proxy --diff`"**. Question
+    difficulty varies far more than trial-to-trial noise, so losing the HARD questions from
+    one arm flatters it without bound, at any share.
+
+    Excluding the row from BOTH arms restores the pairing. Coarser than dropping the
+    individual trial — the row counts say how many trials survived, not WHICH — so a row is
+    comparable only when both arms answered every trial of it.
+
+    Rows predating the per-form counters carry no `<form>_trials` key at all. `.get(k, t)`
+    reads those as fully paired, which is deliberate and load-bearing: `score_pack` packs
+    and every result file written before #263 look exactly like that, and treating an
+    absent counter as a loss would void them wholesale. Pinned by
+    `test_rows_without_per_form_counters_are_treated_as_fully_paired`."""
+    keys = [f[:-3] + "_trials" if f.endswith("_ok") else f for f in forms]
+    out = []
+    for r in rows:
+        t = int(r.get("trials", 1))
+        if all(int(r.get(k, t)) == t for k in keys):
+            out.append(r)
+    return out
+
+
+def unpaired(rows: list[dict[str, Any]], *forms: str) -> bool:
+    """True when too much of the question set is missing from one side to compare at all.
+
+    `paired_rows` makes the surviving gap honest; it cannot make it REPRESENTATIVE. Drop
+    the questions one arm could not complete and what is left is both smaller and selected
+    — and selected by difficulty, since the calls a token-budget stop kills are the ones
+    with the longest prompts. So the gap sites need both: pair what remains, and decline to
+    publish when too little does.
+
+    `>=`, where the pooled `_unmeasured` share uses `>`. The boundary is not hypothetical
+    here: one question type out of five is exactly 20.0%, and that is the measured case in
+    which a real -20% FAIL published as PASS. On a ship gate the boundary belongs on the
+    refusing side."""
+    if not rows:
+        return False
+    return (len(rows) - len(paired_rows(rows, *forms))) / len(rows) >= UNMEASURED_FAIL_SHARE
+
+
 # Share of a model's calls that may fail before its numbers stop meaning anything (#263).
 # NOT zero: a failed call is already excluded from its arm's denominator (see the
 # `<form>_trials` keys `run_payload` emits), so a handful of transient 429s no longer
@@ -88,6 +141,90 @@ def _unmeasured(rows: list[dict]) -> bool:
         if sum(int(r.get(key, 0)) for r in rows) == 0:
             return True
     return fails / attempts > UNMEASURED_FAIL_SHARE
+
+
+# Why a gap is never computed from two bare `_form_stats` calls again (#280).
+#
+# `_form_stats(rows, form)` computes ONE arm. Every gap site therefore called it twice and
+# subtracted, and nothing in that shape can enforce that the two arms answered the SAME
+# questions — pairing is a property of the pair, and `_form_stats` never sees a pair. That
+# is why the same false-PASS survived three fixes: each pass wired pairing into the sites
+# it was looking at, and the next site was still writable by accident. The third attempt's
+# own commit claimed "every diff-vs-control gap site"; reverting its pairing at two of the
+# three left the entire suite green.
+#
+# So the shape is removed rather than the sites patched. `arm_gap` is the only place a
+# form/control pair is turned into comparable numbers, and
+# `tests/test_gap_gate_boundary.py` asserts by AST that `_form_stats` is called from
+# nowhere else but an explicit allowlist. Adding a seventh gap site cannot skip the gate
+# silently; it has to edit that list, in a diff a reviewer sees.
+class ArmGap(NamedTuple):
+    """One model's form-vs-control numbers, or why it was withheld.
+
+    `excluded` is a REASON, not a bool: sites 1/2/3 each render withheld models in their
+    own prose, and `test_the_renderers_agree_on_which_models_were_dropped` pins that they
+    agree about WHICH models. Carrying the reason from the one place that decides it keeps
+    that true by construction rather than by three copies of the same condition."""
+    form_acc: float
+    form_se: float
+    control_acc: float
+    control_se: float
+    rows: list[dict[str, Any]]  # the PAIRED subset the numbers above were computed over
+    excluded: str | None
+    # Per-arm (accuracy, se) over that same paired subset, for the table columns beside the
+    # verdict. Carried here rather than left to callers so a report cannot print a column
+    # computed over a different question set than the gap printed next to it — which is the
+    # #280 defect in miniature, and would also put `_form_stats` back in every renderer.
+    arms: dict[str, tuple[float, float]] = {}
+
+
+def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
+         display: tuple[str, ...] = ()) -> ArmGap:
+    """Shared body of `arm_gap`/`best_arm_gap`. Gates, pairs, then computes every arm.
+
+    Order matters: `_unmeasured` first (the backend was down — nothing here is measurable),
+    then `unpaired` (it was up, but too little of the question set survived on one side to
+    compare), then pair and compute. A caller that wants the numbers must accept the gate,
+    because they arrive together.
+
+    `display` arms are computed over the paired subset but do NOT participate in pairing.
+    That is deliberate: `run_payload`'s `inline` arm carries the longest prompt of the four
+    and so truncates first under a token-budget stop, while gating nothing — pairing on it
+    would void otherwise-complete runs over an arm no verdict consumes."""
+    if not rows:
+        return ArmGap(0.0, 0.0, 0.0, 0.0, [], "empty")
+    if _unmeasured(rows):
+        return ArmGap(0.0, 0.0, 0.0, 0.0, [], "unmeasured")
+    if unpaired(rows, *gating, control):
+        return ArmGap(0.0, 0.0, 0.0, 0.0, [], "unpaired")
+    pr = paired_rows(rows, *gating, control)
+    arms = {f: _form_stats(pr, f) for f in (*gating, control, *display)}
+    cacc, cse = arms[control]
+    if control == "raw_ok" and cacc == 0:
+        # A raw control at exactly 0% is a backend/config error, not a comprehension
+        # result — every form would "beat" it. Kept here rather than at the call sites so
+        # the markdown verdict and the forest plot cannot disagree about it.
+        return ArmGap(0.0, 0.0, cacc, cse, pr, "broken control", arms)
+    best = max((arms[f] for f in gating), key=lambda s: s[0])
+    return ArmGap(best[0], best[1], cacc, cse, pr, None, arms)
+
+
+def arm_gap(rows: list[dict[str, Any]], form: str, control: str) -> ArmGap:
+    """`form` vs `control` over the rows BOTH arms completed, or an exclusion reason.
+
+    The single chokepoint for every diff-vs-control verdict in terse."""
+    return _gap(rows, [form], control)
+
+
+def best_arm_gap(rows: list[dict[str, Any]], forms: list[str], control: str,
+                 display: tuple[str, ...] = ()) -> ArmGap:
+    """`arm_gap` for the BEST of several forms against one control (the fluency shape).
+
+    Pairs across every named arm before picking a winner, not after: choosing the best arm
+    first and pairing second would let an arm win on a question set the others never
+    answered — the same defect one level up. `build_fluency_report` and `fluency_gap_rows`
+    both route here, which also collapses the duplicate copy of this math they carried."""
+    return _gap(rows, forms, control, display)
 
 
 class GapVerdict(NamedTuple):
@@ -147,12 +284,11 @@ def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, f
     for model, rows in results.items():
         if not rows:
             continue
-        if _unmeasured(rows):
+        g = arm_gap(rows, "diff_ok", "terse_ok")
+        if g.excluded:
             excluded.append(model)
             continue
-        facc, fse = _form_stats(rows, "diff_ok")
-        cacc, cse = _form_stats(rows, "terse_ok")
-        out[model] = (facc, fse, cacc, cse)
+        out[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
     return out, excluded
 
 
@@ -173,17 +309,11 @@ def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float
     for model, rows in results.items():
         if not rows:
             continue
-        if _unmeasured(rows):
+        g = best_arm_gap(rows, ["terse_ok", "primer_ok"], "raw_ok")
+        if g.excluded:
             broken.append(model)
             continue
-        racc, rse = _form_stats(rows, "raw_ok")
-        if racc == 0:
-            broken.append(model)
-            continue
-        tacc, tse = _form_stats(rows, "terse_ok")
-        pacc, pse = _form_stats(rows, "primer_ok")
-        best, best_se = (tacc, tse) if tacc >= pacc else (pacc, pse)
-        out[model] = (best, best_se, racc, rse)
+        out[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
     return out, broken
 
 
@@ -784,14 +914,21 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         # on both arms, produced a gap of exactly 0, and printed "safe to enable
         # `proxy --diff`". A false PASS on a ship gate is strictly worse than the false
         # FAIL #263 was filed about: nobody re-checks a result that agrees with them.
-        if _unmeasured(rows):
+        # Same rule the forest plot applies (`diff_gap_rows`), from the same function, or
+        # the chart printed beneath this table draws a bar for a model the table just
+        # declined to score.
+        g = arm_gap(rows, "diff_ok", "terse_ok")
+        if g.excluded:
             unmeasured[model] = (sum(int(r.get("fails", 0)) for r in rows),
                                  sum(int(r.get("attempts", 0)) for r in rows))
             out.append(f"| `{model}` | {n} | n/a | n/a | n/a |")
             continue
-        facc, fse = _form_stats(rows, "terse_ok")
-        dacc, dse = _form_stats(rows, "diff_ok")
-        regr = sum(1 for r in rows if int(r["terse_ok"]) == r.get("trials", 1)
+        facc, fse = g.control_acc, g.control_se
+        dacc, dse = g.form_acc, g.form_se
+        # Counted over the PAIRED subset, not `rows` (#280 F5): a row the diff arm never
+        # answered is not a regression, and counting it as one made the column contradict
+        # the gap printed beside it.
+        regr = sum(1 for r in g.rows if int(r["terse_ok"]) == r.get("trials", 1)
                    and int(r["diff_ok"]) < r.get("trials", 1))
         gap_rows[model] = (dacc, dse, facc, fse)  # form=diff, control=control_label
         out.append(f"| `{model}` | {n} | {facc:.0%} ±{_ci(fse) * 100:.0f} "
@@ -921,11 +1058,16 @@ def build_diff_soak_report(results: dict) -> str:
             drows = [r for r in rows if r["depth"] == depth]
             if not drows:
                 continue
-            if model in unmeasured:
+            # Per-DEPTH pairing, not just the per-model gate above: a depth slice is its
+            # own gap, and an arm that lost calls only at depth 5 was invisible to a gate
+            # computed over the whole model. This table sits outside `## Verdict`, so the
+            # invariance test's `_gate_signature` never saw it either (#280 F2).
+            dg = arm_gap(drows, "diff_ok", "terse_ok")
+            if model in unmeasured or dg.excluded:
                 out.append(f"| `{model}` | {depth} | {len(drows)} | n/a | n/a | n/a |")
                 continue
-            facc, fse = _form_stats(drows, "terse_ok")
-            dacc, dse = _form_stats(drows, "diff_ok")
+            facc, fse = dg.control_acc, dg.control_se
+            dacc, dse = dg.form_acc, dg.form_se
             out.append(f"| `{model}` | {depth} | {len(drows)} "
                        f"| {facc:.0%} ±{_ci(fse) * 100:.0f} "
                        f"| {dacc:.0%} ±{_ci(dse) * 100:.0f} | {dacc - facc:+.0%} |")
@@ -949,9 +1091,10 @@ def build_diff_soak_report(results: dict) -> str:
     for model, rows in results.items():
         if not rows or model in unmeasured:
             continue
-        facc, fse = _form_stats(rows, "terse_ok")
-        dacc, dse = _form_stats(rows, "diff_ok")
-        gap_rows[model] = (dacc, dse, facc, fse)
+        g = arm_gap(rows, "diff_ok", "terse_ok")
+        if g.excluded:
+            continue
+        gap_rows[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
 
     out += ["## Verdict", ""]
     worst = _worst_case_gap(gap_rows)
@@ -976,9 +1119,10 @@ def build_diff_soak_report(results: dict) -> str:
                       for m, rs in results.items() if m not in unmeasured) if r}
         deep_gaps = {}
         for m, rs in deep_rows.items():
-            facc, fse = _form_stats(rs, "terse_ok")
-            dacc, dse = _form_stats(rs, "diff_ok")
-            deep_gaps[m] = (dacc, dse, facc, fse)
+            dg = arm_gap(rs, "diff_ok", "terse_ok")
+            if dg.excluded:
+                continue
+            deep_gaps[m] = (dg.form_acc, dg.form_se, dg.control_acc, dg.control_se)
         deepest = _worst_case_gap(deep_gaps)
         if deepest:
             out.append(f"- At the deepest tested depth ({deep}): worst model "
@@ -995,6 +1139,43 @@ def build_diff_soak_report(results: dict) -> str:
                        "keep the keyframe interval at or below the deepest PASSING depth.")
     out.append("")
     return "\n".join(out)
+
+
+def _per_transform_table(results: dict, summary: dict[str, dict[str, float]]) -> list[str]:
+    """terse-form accuracy pooled by stressed transform, across models.
+
+    A DISPLAY table, not a gate: it pools one arm at a time and computes no form-vs-control
+    gap, which is why it is on `test_gap_gate_boundary`'s `_form_stats` allowlist. It lives
+    in its own function so that allowlist entry covers these two pooled columns and not the
+    whole of `build_fluency_report`, whose verdict must stay behind `best_arm_gap`."""
+    by_tf: dict[str, list[dict]] = {}
+    for model, rows in results.items():
+        # Skip the models whose per-model numbers were withheld. Publishing them here,
+        # pooled and unannotated, would reprint the same corrupt counts the table above
+        # just refused to show — and this is the table a reader uses to decide "restrict
+        # the policy to the transforms that held", so a depressed row here becomes a
+        # policy change made on a backend outage.
+        if summary.get(model, {}).get("unmeasured"):
+            continue
+        for r in rows:
+            by_tf.setdefault(r["transform"], []).append(r)
+    if not by_tf:
+        return []
+    out = [
+        "## terse-form accuracy by stressed transform",
+        "",
+        "Which transform, if any, costs comprehension. `table+dict` rows resolve a "
+        "`~N` alias; `table` rows map a column position to a value.",
+        "",
+        "| Transform | n | terse | terse+primer |",
+        "|---|---|---|---|",
+    ]
+    for tf, rs in sorted(by_tf.items()):
+        tacc, _ = _form_stats(rs, "terse_ok")
+        pacc, _ = _form_stats(rs, "primer_ok")
+        out.append(f"| {tf} | {len(rs)} | {tacc:.0%} | {pacc:.0%} |")
+    out.append("")
+    return out
 
 
 def build_dropeval_report(results: dict) -> str:
@@ -1158,13 +1339,11 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         "|---|---|---|---|---|---|---|---|",
     ]
     summary: dict[str, dict[str, float]] = {}
+    reasons: dict[str, str | None] = {}  # model -> `ArmGap.excluded`, for the verdict split
     for model, rows in results.items():
         n = len(rows)
         if not n:
             continue
-        racc, rse = _form_stats(rows, "raw_ok")
-        tacc, tse = _form_stats(rows, "terse_ok")
-        pacc, pse = _form_stats(rows, "primer_ok")
         # #168: the same primer delivered with the RESULT instead of at `initialize`. Absent
         # from older result files, which predate the arm — rendered as `n/a`, never as 0%,
         # which would read as "inline comprehension collapsed" rather than "not measured".
@@ -1173,10 +1352,21 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         # which indexes `r[form]` unconditionally — n/a is the correct degrade for a
         # partially-measured model, not a KeyError.
         has_inline = bool(rows) and all("inline_ok" in r for r in rows)
-        iacc, ise = _form_stats(rows, "inline_ok") if has_inline else (0.0, 0.0)
-        regr = sum(1 for r in rows if int(r["raw_ok"]) == r.get("trials", 1)
+        # One paired subset for the whole row: the columns and the gap are computed over
+        # the same questions, or the table argues against its own verdict (#280 F3).
+        # `inline` is display-only — see `_gap`.
+        g = best_arm_gap(rows, ["terse_ok", "primer_ok"], "raw_ok",
+                         ("inline_ok",) if has_inline else ())
+        racc, rse = g.arms.get("raw_ok", (0.0, 0.0))
+        tacc, tse = g.arms.get("terse_ok", (0.0, 0.0))
+        pacc, pse = g.arms.get("primer_ok", (0.0, 0.0))
+        iacc, ise = g.arms.get("inline_ok", (0.0, 0.0))
+        # Counted over the PAIRED subset (#280 F5): a question one arm never answered is
+        # neither a regression nor a primer recovery, and counting it as one made these
+        # columns disagree with the gap beside them.
+        regr = sum(1 for r in g.rows if int(r["raw_ok"]) == r.get("trials", 1)
                    and int(r["terse_ok"]) < r.get("trials", 1))
-        rec = sum(1 for r in rows if int(r["terse_ok"]) < r.get("trials", 1)
+        rec = sum(1 for r in g.rows if int(r["terse_ok"]) < r.get("trials", 1)
                   and int(r["primer_ok"]) == r.get("trials", 1))
         # Transport failures (#263): calls that never reached the model. Distinct from a
         # wrong answer, and NOT the same test as the raw==0 control below — a partial
@@ -1185,10 +1375,15 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         # silently publishes a comprehension number for a backend that was half down.
         fails = sum(int(r.get("fails", 0)) for r in rows)
         attempts = sum(int(r.get("attempts", 0)) for r in rows)
-        unmeasured = _unmeasured(rows)
+        # "unmeasured" now covers `unpaired` too — a run where the backend was up but one
+        # arm lost too much of the question set is equally unpublishable, and it reaches
+        # the reader through the same `n/a` row rather than a second vocabulary.
+        unmeasured = g.excluded in ("unmeasured", "unpaired")
+        reasons[model] = g.excluded
         summary[model] = {"n": n, "raw": racc, "raw_se": rse,
                           "terse": tacc, "terse_se": tse, "primer": pacc, "primer_se": pse,
-                          "fails": fails, "attempts": attempts, "unmeasured": unmeasured}
+                          "fails": fails, "attempts": attempts, "unmeasured": unmeasured,
+                          "gap_form": g.form_acc, "gap_form_se": g.form_se}
         if has_inline:
             summary[model].update({"inline": iacc, "inline_se": ise})
         inline_cell = (f"{iacc:.0%} ±{_ci(ise) * 100:.0f}" if has_inline else "n/a")
@@ -1234,47 +1429,21 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
             "",
         ]
 
-    # --- per-transform breakdown (terse form, pooled across models) ---
-    by_tf: dict[str, list[dict]] = {}
-    for model, rows in results.items():
-        # Skip the models whose per-model numbers were withheld. Publishing them here,
-        # pooled and unannotated, would reprint the same corrupt counts the table above
-        # just refused to show — and this is the table a reader uses to decide "restrict
-        # the policy to the transforms that held", so a depressed row here becomes a
-        # policy change made on a backend outage.
-        if summary.get(model, {}).get("unmeasured"):
-            continue
-        for r in rows:
-            by_tf.setdefault(r["transform"], []).append(r)
-    if by_tf:
-        out += [
-            "## terse-form accuracy by stressed transform",
-            "",
-            "Which transform, if any, costs comprehension. `table+dict` rows resolve a "
-            "`~N` alias; `table` rows map a column position to a value.",
-            "",
-            "| Transform | n | terse | terse+primer |",
-            "|---|---|---|---|",
-        ]
-        for tf, rs in sorted(by_tf.items()):
-            tacc, _ = _form_stats(rs, "terse_ok")
-            pacc, _ = _form_stats(rs, "primer_ok")
-            out.append(f"| {tf} | {len(rs)} | {tacc:.0%} | {pacc:.0%} |")
-        out.append("")
+    out += _per_transform_table(results, summary)
 
     # --- verdict: gate on the worst model ---
     out += ["## Verdict", ""]
     # Raw JSON is the control: a model that can't read RAW (0%) is a backend/config
     # failure (bad model id, refusals), not a terse-comprehension result — exclude it
     # from the gate, but say so, so a broken run can't masquerade as a verdict.
-    broken = [m for m, s in summary.items() if s["raw"] == 0 and not s.get("unmeasured")]
+    broken = [m for m, r in reasons.items() if r == "broken control"]
     # Excluded for the same reason, by a different and EARLIER signal: the raw==0 control
     # only catches a TOTAL failure, and only once it has already been scored as if the
     # model answered wrongly. A counted unanswered call catches the partial case too, which
     # is the one that reaches a plausible-looking verdict (#263) — including, since #268,
     # a model that WAS reached and produced no content.
     unmeasured_models = [m for m, s in summary.items() if s.get("unmeasured")]
-    gated = {m: s for m, s in summary.items() if s["raw"] > 0 and not s.get("unmeasured")}
+    gated = {m: s for m, s in summary.items() if reasons.get(m) is None}
     if broken:
         out.append(f"- Excluded (raw control failed — backend/config error, not comprehension): "
                    f"{', '.join(f'`{m}`' for m in broken)}.")
@@ -1285,11 +1454,11 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     # gap CI: raw and the best form are over the same questions (not independent), so
     # √(se_raw²+se_best²) is a conservative over-estimate of the gap's SE — the honest
     # direction for a bound that gates a ship decision.
-    gap_rows = {}
-    for model, s in gated.items():
-        best, best_se = (s["terse"], s["terse_se"]) if s["terse"] >= s["primer"] \
-            else (s["primer"], s["primer_se"])
-        gap_rows[model] = (best, best_se, s["raw"], s["raw_se"])
+    # Straight from `best_arm_gap`, which already picked the best arm over the paired
+    # subset. This used to re-derive the best-of math here, a second copy of
+    # `fluency_gap_rows`' body that could (and did) drift from it.
+    gap_rows = {m: (s["gap_form"], s["gap_form_se"], s["raw"], s["raw_se"])
+                for m, s in gated.items()}
     worst = _worst_case_gap(gap_rows)
     if worst:
         helps = sum(1 for s in gated.values() if s["primer"] > s["terse"] + 1e-9)
