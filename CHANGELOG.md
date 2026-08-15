@@ -64,18 +64,25 @@ fails that pull request until the section has moved.
   than trusted. `UNPAIRED_ASYMMETRY_SHARE` counts questions a FORM arm lost that its control
   did not, per form (an "any form short" test would give the payload family's two forms two
   chances against one control and read symmetric flake as one-sided). Under the same
-  simulation the new gate withholds **0% / 0% / 16%**, and the measured #268 case — the
-  form arm returning no content on every trial of one question type of five, the control
-  losing none — is exactly 20.0% asymmetry and still refuses, so the calibration is
-  unchanged where it was actually taken. The statistic counts **trials, not short rows**,
-  and accumulates the two directions **separately**: a binary per-row test let a total
-  one-sided loss cancel to zero as soon as the control hiccuped once on the same questions,
-  and subtracting the directions let three stray 429s on the control flip a correct refusal
-  into "safe to enable `proxy --diff`" — a gate that rewards a worse backend. It is also
-  **direction-blind**: which arm carries the longest prompt depends on the family (the form
-  in the diff family, the uncompressed `raw` control in the payload family), so refusing
-  only form-side excess was backwards for fluency, where dropping the biggest payloads is
-  precisely what flatters terse. `UNPAIRED_VOLUME_SHARE` (0.50) remains as a loose
+  simulation the new gate withholds **0.6% / 6.7% / 58%** — better at every rate, and the
+  5% case is a backend failing one call in twenty. The measured #268 case is exactly 20.0%
+  and still refuses, so the calibration is unchanged where it was actually taken.
+
+  Three properties the statistic needs, each of which cost a round to find. It is in
+  **questions, not trials**: `paired_rows` voids the whole question when any arm falls
+  short, so a one-trial clip and a total blackout do identical damage — dividing lost
+  trials by attempted trials diluted the gate by `--trials` until, at `--trials 3` and
+  above, it could never fire before the volume backstop and a form arm clipping one trial
+  on 9 of 20 questions published a real -45% regression as a PASS. Magnitudes decide which
+  arm a voided question is **attributed** to, so a total one-sided loss no longer cancels
+  to zero the moment the control hiccups once on the same questions. The two directions are
+  **tallied separately**, not subtracted, so unrelated control failures cannot buy back
+  tolerance for a form-side loss — subtracting them let three stray 429s flip a correct
+  refusal into "safe to enable `proxy --diff`", a gate that rewards a worse backend. And it
+  is **direction-blind**: which arm carries the longest prompt depends on the family (the
+  diff form in a `--diff` run, the uncompressed `raw` control in a fluency run), so
+  refusing only form-side excess was backwards for fluency, where dropping the biggest
+  payloads is precisely what flatters terse. `UNPAIRED_VOLUME_SHARE` (0.50) remains as a loose
   backstop for the case asymmetry cannot see — losses can be perfectly even and still leave
   too little exam to generalise from.
 
@@ -93,7 +100,7 @@ fails that pull request until the section has moved.
   proving the detector can fail, and a test enumerating what it is deliberately blind to
   (renamed imports, local rebinding, `getattr`, inline arithmetic) so the boundary is not
   read as a guarantee it cannot give. `tests/test_paired_gap_gate.py` pins each site by
-  mutation — 15 mutants, every one verified red-on-revert — on fixtures built to sit UNDER
+  mutation — every one verified red-on-revert — on fixtures built to sit UNDER
   both pre-existing gates (8.3% pooled loss, 16.7% unpaired share, against a 20% bar), with
   those margins asserted in the tests themselves, since the previous attempt's headline
   test passed unmodified against the un-fixed code precisely because its fixture tripped
