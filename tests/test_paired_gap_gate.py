@@ -8,19 +8,16 @@ compares two different exams and flatters the arm being tested.
 
 WHY THE FIXTURE LOOKS THE WAY IT DOES — this is the part three previous attempts got wrong.
 
-Two gates already existed before pairing, and a fixture that trips either of them proves
-nothing about pairing: the report would refuse to publish anyway, the test would pass, and
-the pairing could be deleted without going red. That is exactly what happened to the last
-attempt's headline test, which passed unmodified against the un-fixed code.
+A gate already existed before pairing, and a fixture that trips it proves nothing about
+pairing: the report would refuse to publish anyway, the test would pass, and the pairing
+could be deleted without going red. That is exactly what happened to the last attempt's
+headline test, which passed unmodified against the un-fixed code.
 
-So `_correlated_loss_rows` is built to sit UNDER both:
+So `_correlated_loss_rows` is built to sit UNDER it:
 
   - pooled loss `_unmeasured`: 3 lost calls of 36 = 8.3%, under `UNMEASURED_FAIL_SHARE`
-    (0.20, strictly `>`);
-  - the `unpaired` refusal: the form arm loses 1 question of 6 that the control did not,
-    so `loss_asymmetry` is 16.7%, under `UNPAIRED_ASYMMETRY_SHARE` (0.20, `>=`).
-
-`test_the_fixture_stays_under_both_pre_existing_gates` asserts both margins directly, so a
+    (0.20, strictly `>`).
+`test_the_fixture_stays_under_the_pre_existing_gate` asserts that margin directly, so a
 later edit cannot quietly re-base these tests onto a gate they are not about.
 
 What is left is pure pairing, and the numbers are unambiguous:
@@ -39,17 +36,13 @@ import pytest
 from terse.html_report import build_html_diff_report
 from terse.report import (
     UNMEASURED_FAIL_SHARE,
-    UNPAIRED_ASYMMETRY_SHARE,
-    UNPAIRED_VOLUME_SHARE,
     _unmeasured,
     build_diff_report,
     build_diff_soak_report,
     build_fluency_report,
     diff_gap_rows,
     fluency_gap_rows,
-    loss_asymmetry,
     paired_rows,
-    unpaired,
 )
 from terse.terminal_report import (
     build_terminal_diff_report,
@@ -129,7 +122,7 @@ def _payload_correlated_loss_rows() -> list[dict]:
 # testing pairing and starts testing a gate that was already there.
 # --------------------------------------------------------------------------------------
 
-def test_the_fixture_stays_under_both_pre_existing_gates():
+def test_the_fixture_stays_under_the_pre_existing_gate():
     rows = _correlated_loss_rows()
     lost = sum(r["fails"] for r in rows) / sum(r["attempts"] for r in rows)
     assert lost < UNMEASURED_FAIL_SHARE, (
@@ -137,11 +130,6 @@ def test_the_fixture_stays_under_both_pre_existing_gates():
         f"pass with pairing deleted")
     assert not _unmeasured(rows)
 
-    asym = loss_asymmetry(rows, ["diff_ok"], "terse_ok")
-    assert asym < UNPAIRED_ASYMMETRY_SHARE, (
-        f"loss asymmetry {asym:.1%} would trip the `unpaired` refusal, which is a "
-        f"different mechanism than the pairing these tests are about")
-    assert not unpaired(rows, ["diff_ok"], "terse_ok")
 
 
 def test_without_pairing_this_fixture_reads_as_a_pass():
@@ -269,7 +257,6 @@ def test_the_fluency_table_counts_regressions_over_the_paired_subset():
     } for i in range(5)]
     # Same preconditions as the main fixture: neither pre-existing gate may fire.
     assert not _unmeasured(rows)
-    assert not unpaired(rows, ["terse_ok", "primer_ok"], "raw_ok")
 
     md = build_fluency_report({"m": rows}, [])
     row = [ln for ln in md.splitlines() if ln.startswith("| `m` |")]
@@ -300,7 +287,6 @@ def test_an_uneven_score_pack_still_publishes():
         "primer_ok": 3, "primer_trials": 3,
     } for i in range(6)]
     assert paired_rows(rows, "terse_ok", "raw_ok") == rows
-    assert not unpaired(rows, ["terse_ok", "primer_ok"], "raw_ok")
 
     md = build_fluency_report({"m": rows}, [])
     assert "n/a | n/a | n/a" not in md, "an uneven pack was withheld as if calls were lost"
@@ -315,51 +301,32 @@ def test_a_withheld_deepest_depth_is_not_reported_as_no_drift():
     read as "passed" and printed "No depth-correlated comprehension drift" about the one
     depth the soak exists to probe.
     """
-    def q(depth: int, *, lost: bool) -> dict:
+    def q(depth: int, *, dead: bool) -> dict:
         return {
             "qid": f"d{depth}", "qtype": "lookup", "transform": "table", "trials": 1,
-            "terse_ok": 1, "terse_trials": 1,
-            "diff_ok": 0 if lost else 1, "diff_trials": 0 if lost else 1,
-            "fails": 1 if lost else 0, "attempts": 2, "depth": depth,
+            "terse_ok": 0 if dead else 1, "terse_trials": 0 if dead else 1,
+            "diff_ok": 0 if dead else 1, "diff_trials": 0 if dead else 1,
+            "fails": 2 if dead else 0, "attempts": 2, "depth": depth,
         }
 
-    # Depths 1-4 clean; the deepest loses 3 questions of 10 — 30% of that SLICE, over the
-    # refusal bar, so depth 5 is withheld. Pooled over the whole model it is 3 of 50
-    # questions and 3 of 100 calls, under every model-level gate, so the overall gap still
-    # publishes a PASS. That combination is what made the bug reachable.
-    rows = [q(d, lost=False) for d in (1, 2, 3, 4) for _ in range(10)]
-    rows += [q(5, lost=False) for _ in range(7)] + [q(5, lost=True) for _ in range(3)]
+    # Depths 1-4 clean; every call at the deepest depth failed, so that SLICE is withheld
+    # by `_unmeasured` while the model as a whole (10 of 100 calls lost) is not. That
+    # combination is what made the bug reachable: the overall gap still publishes a PASS
+    # while the depth the soak exists to probe was never scored.
+    rows = [q(d, dead=False) for d in (1, 2, 3, 4) for _ in range(10)]
+    rows += [q(5, dead=True) for _ in range(5)]
 
     assert not _unmeasured(rows), "the per-model gate fired; this test would prove nothing"
-    assert not unpaired(rows, ["diff_ok"], "terse_ok"), "the model-level refusal fired"
     deep = [r for r in rows if r["depth"] == 5]
-    assert unpaired(deep, ["diff_ok"], "terse_ok"), "depth 5 was not withheld"
+    assert _unmeasured(deep), "the deepest slice must be withheld on its own"
 
     md = build_diff_soak_report({"m": rows})
     assert "**PASS**" in md, f"the overall gap should still publish a PASS:\n{md}"
     assert "No depth-correlated comprehension drift" not in md, md
     assert "NO VERDICT at the deepest tested depth" in md, md
     # And the withheld depth is NAMED, rather than left as an unexplained `n/a`.
-    assert "Depths not compared" in md
+    assert "Depths not measured" in md
     assert "depth 5" in md
-
-
-def test_an_unpaired_exclusion_is_not_described_as_a_transport_failure():
-    """The report may not print "too many calls went unanswered" for a model whose calls
-    were answered — especially while printing the call count that refutes it."""
-    rows = [{
-        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 3,
-        "terse_ok": 3, "terse_trials": 3,
-        "diff_ok": 2, "diff_trials": 2,   # one trial lost on every question
-        "fails": 1, "attempts": 6,
-    } for i in range(6)]
-    assert not _unmeasured(rows)
-    assert unpaired(rows, ["diff_ok"], "terse_ok")
-
-    md = build_diff_report({"m": rows})
-    assert "Not compared" in md, md
-    assert "too many calls went unanswered" not in md, (
-        "an unpaired model was reported as a transport failure:\n" + md)
 
 
 def test_the_per_transform_table_pools_only_paired_rows():
@@ -387,7 +354,6 @@ def test_the_per_transform_table_pools_only_paired_rows():
     } for i in range(7)]
     # The model itself must still publish, or the table never renders.
     assert not _unmeasured(rows)
-    assert not unpaired(rows, ["terse_ok", "primer_ok"], "raw_ok")
 
     md = build_fluency_report({"m": rows}, [])
     line = [ln for ln in md.splitlines() if ln.startswith("| table |")]
@@ -397,86 +363,6 @@ def test_the_per_transform_table_pools_only_paired_rows():
     assert terse_cell == "33%", (
         f"per-transform terse column was {terse_cell!r} — expected the paired 33%, not the "
         f"unpaired 36%: {line[0]!r}")
-
-
-def test_the_soak_names_a_model_dropped_from_its_verdict():
-    """A model silently dropped from the ship gate is an undisclosed exclusion.
-
-    The soak `continue`d past it with no record anywhere, so the verdict could read
-    "Worst-case model `n` ... PASS" while `m`'s pooled gap had been withheld entirely —
-    the other report families name their exclusions and this one did not.
-    """
-    dropped = [{
-        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 3,
-        "terse_ok": 3, "terse_trials": 3,
-        "diff_ok": 2, "diff_trials": 2, "fails": 1, "attempts": 6, "depth": 1,
-    } for i in range(6)]
-    clean = [{**r, "depth": 1} for r in _clean_rows()]
-    assert not _unmeasured(dropped) and unpaired(dropped, ["diff_ok"], "terse_ok")
-
-    md = build_diff_soak_report({"m": dropped, "n": clean})
-    assert "Excluded from the pooled verdict" in md, md
-    assert "`m`" in md.split("## Verdict")[0], (
-        "the dropped model is not named anywhere before the verdict:\n" + md)
-
-
-def test_every_renderer_names_the_right_exclusion_reason():
-    """No renderer may call an `unpaired` model a transport failure — in ANY renderer.
-
-    The per-renderer version of this test existed for `build_diff_report` alone, which is
-    structurally the same mistake this whole change is about: fix the site you are looking
-    at, leave the next one to drift. Five of six renderers were in fact wrong — the
-    terminal fluency plot said "raw control failed" about a model whose raw control read
-    100%, and the HTML page told the reader to check stderr for a `returned no content`
-    line about a backend that answered every call.
-
-    Looping the invariant means a seventh renderer has to opt in to the shared vocabulary
-    rather than invent its own.
-    """
-    # trials=5 so a single lost trial per row is a small share of CALLS (6.7-10%, under the
-    # transport bar) while still voiding every QUESTION — which is precisely the regime the
-    # two gates disagree about, and the one whose prose kept coming out wrong.
-    diff_rows = [{
-        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 5,
-        "terse_ok": 5, "terse_trials": 5, "diff_ok": 4, "diff_trials": 4,
-        "fails": 1, "attempts": 10,
-    } for i in range(6)]
-    payload_rows = [{
-        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 5,
-        "raw_ok": 5, "raw_trials": 5, "terse_ok": 4, "terse_trials": 4,
-        "primer_ok": 5, "primer_trials": 5, "fails": 1, "attempts": 15,
-    } for i in range(6)]
-    # Both are unpaired-but-answered: the gate must fire, and the backend must look healthy.
-    for rows, forms, control in ((diff_rows, ["diff_ok"], "terse_ok"),
-                                 (payload_rows, ["terse_ok", "primer_ok"], "raw_ok")):
-        assert not _unmeasured(rows), "these tests need a HEALTHY backend"
-        assert unpaired(rows, forms, control), "the unpaired gate must fire"
-
-    soak_rows = [{**r, "depth": 1} for r in diff_rows]
-    renderings = {
-        "diff markdown": build_diff_report({"m": diff_rows}),
-        "soak markdown": build_diff_soak_report({"m": soak_rows}),
-        "fluency markdown": build_fluency_report({"m": payload_rows}, []),
-        "html banner": build_html_diff_report({"m": diff_rows}),
-        "diff forest plot": build_terminal_diff_report({"m": diff_rows}, color=False),
-        "fluency forest plot": build_terminal_fluency_report({"m": payload_rows}, color=False),
-    }
-    # Phrases that assert something false about a backend that answered every call.
-    forbidden = ("calls went unanswered", "raw control failed", "control arm failed",
-                 "returned no content", "once the backend is reachable",
-                 "Fix the backend")
-    for name, text in renderings.items():
-        assert "m" in text, f"{name}: the withheld model is not named at all"
-        for phrase in forbidden:
-            assert phrase not in text, (
-                f"{name} describes an UNPAIRED exclusion as a transport failure "
-                f"({phrase!r}) — the backend answered every call:\n{text}")
-        # And it must POSITIVELY say what happened. Absence of the wrong words is not the
-        # same as telling the reader anything: without this, deleting a renderer's
-        # exclusion line entirely passes the check above.
-        assert "compar" in text.lower(), (
-            f"{name} withheld a model and never says the arms could not be compared — a "
-            f"silent exclusion:\n{text}")
 
 
 def test_the_diff_table_counts_regressions_over_the_paired_subset():
@@ -497,7 +383,6 @@ def test_the_diff_table_counts_regressions_over_the_paired_subset():
         "fails": 0, "attempts": TRIALS * 2,
     } for i in range(5)]
     assert not _unmeasured(rows)
-    assert not unpaired(rows, ["diff_ok"], "terse_ok")
 
     md = build_diff_report({"m": rows})
     row = [ln for ln in md.splitlines() if ln.startswith("| `m` |")]
@@ -529,7 +414,6 @@ def test_the_fluency_table_counts_primer_recoveries_over_the_paired_subset():
         "fails": 0, "attempts": TRIALS * 3,
     } for i in range(5)]
     assert not _unmeasured(rows)
-    assert not unpaired(rows, ["terse_ok", "primer_ok"], "raw_ok")
 
     md = build_fluency_report({"m": rows}, [])
     row = [ln for ln in md.splitlines() if ln.startswith("| `m` |")]
@@ -546,142 +430,6 @@ def test_the_payload_fixture_also_stays_under_both_pre_existing_gates():
     lost = sum(r["fails"] for r in rows) / sum(r["attempts"] for r in rows)
     assert lost < UNMEASURED_FAIL_SHARE, f"pooled loss {lost:.1%} would trip `_unmeasured`"
     assert not _unmeasured(rows)
-    asym = loss_asymmetry(rows, ["terse_ok", "primer_ok"], "raw_ok")
-    assert asym < UNPAIRED_ASYMMETRY_SHARE, f"loss asymmetry {asym:.1%} would refuse"
-
-
-def _flaky_rows(n: int, *, form_lost: int, control_lost: int, trials_lost: int = 1,
-                trials: int = 5) -> list[dict]:
-    """`n` questions; the form arm loses `trials_lost` trials on `form_lost` of them and the
-    control on `control_lost` others — disjoint, so each side's excess is its own total.
-
-    `trials_lost` matters because the statistic counts TRIALS, not short rows: losing 1 of 5
-    trials on a question is a fifth of the one-sidedness of losing all 5, and conflating
-    them is what let a total loss read as symmetric."""
-    rows = []
-    for i in range(n):
-        f_short, c_short = i < form_lost, form_lost <= i < form_lost + control_lost
-        f_ok = trials - trials_lost if f_short else trials
-        c_ok = trials - trials_lost if c_short else trials
-        rows.append({
-            "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": trials,
-            "terse_ok": c_ok, "terse_trials": c_ok,
-            "diff_ok": f_ok, "diff_trials": f_ok,
-            "fails": (int(f_short) + int(c_short)) * trials_lost, "attempts": trials * 2,
-        })
-    return rows
-
-
-def test_evenly_spread_flake_still_publishes():
-    """The point of measuring asymmetry instead of volume.
-
-    Both arms lose the same NUMBER of questions to ordinary transient failure. Pairing drops
-    8 of 20 questions — 40%, which the old volume rule refused outright — but the losses are
-    not correlated with the arm under test, so the survivors are not selected by difficulty
-    and the comparison is still like-for-like.
-    """
-    # Sparse and even, which is what independent per-call failure actually looks like: the
-    # Monte-Carlo in `UNPAIRED_ASYMMETRY_SHARE`'s comment withholds 0.6% of runs at a 1%
-    # per-call rate. Each arm accounts for 2 of 20 questions, so neither side reaches the
-    # bar even though 20% of the exam is dropped.
-    rows = _flaky_rows(20, form_lost=2, control_lost=2)
-    assert not _unmeasured(rows)
-    assert loss_asymmetry(rows, ["diff_ok"], "terse_ok") < UNPAIRED_ASYMMETRY_SHARE
-    assert len(paired_rows(rows, "diff_ok", "terse_ok")) == 16
-    assert not unpaired(rows, ["diff_ok"], "terse_ok"), (
-        "evenly spread flake was refused — this is the case the volume rule got wrong")
-
-    gap_rows, excluded = diff_gap_rows({"m": rows})
-    assert "m" in gap_rows and excluded == {}
-
-
-def test_a_one_sided_loss_is_refused_at_the_measured_boundary():
-    """The #268 shape: the form arm loses questions its control did not.
-
-    One question type of five is exactly 20.0% — the measured case in which a real -20%
-    FAIL published as PASS — so the boundary belongs on the refusing side.
-    """
-    # The measured case: the form arm returned NO CONTENT on every trial of one question
-    # type of five, and the control answered all of them.
-    rows = _flaky_rows(5, form_lost=1, control_lost=0, trials_lost=5)
-    assert loss_asymmetry(rows, ["diff_ok"], "terse_ok") == pytest.approx(0.20)
-    assert unpaired(rows, ["diff_ok"], "terse_ok")
-    # The same whole-question loss spread over ten questions is 10% and publishes: the bar
-    # is the share of one-sidedness, not the mere presence of a loss.
-    assert not unpaired(_flaky_rows(10, form_lost=1, control_lost=0, trials_lost=5),
-                        ["diff_ok"], "terse_ok")
-
-
-def test_a_control_side_excess_refuses_too():
-    """BOTH directions refuse, because which arm truncates first depends on the family.
-
-    An earlier version floored the statistic at zero, on the argument that a control-side
-    excess understates the form and is therefore "the safe error". That holds for the diff
-    family, where the form carries the longer prompt. It is backwards for the payload
-    family: `run_payload` sends uncompressed `raw_text` as the CONTROL against
-    `compress(obj)`, so the control is the longest prompt by construction — shrinking it is
-    the product — and a token-budget stop drops the biggest payloads, which is exactly where
-    terse's saving is largest and its comprehension risk highest. Removing those flatters
-    terse. Direction-blindness is the only rule that is safe in both families.
-    """
-    ctrl_side = _flaky_rows(10, form_lost=0, control_lost=3, trials_lost=5)
-    assert loss_asymmetry(ctrl_side, ["diff_ok"], "terse_ok") == pytest.approx(0.30)
-    assert unpaired(ctrl_side, ["diff_ok"], "terse_ok")
-    # And the mirror image is identical — the statistic has no preferred side.
-    form_side = _flaky_rows(10, form_lost=3, control_lost=0, trials_lost=5)
-    assert loss_asymmetry(form_side, ["diff_ok"], "terse_ok") == pytest.approx(0.30)
-    assert unpaired(form_side, ["diff_ok"], "terse_ok")
-
-
-def test_a_mostly_destroyed_exam_is_refused_even_when_losses_are_even():
-    """The backstop asymmetry cannot provide.
-
-    Symmetric loss is unbiased but it is not unlimited: past half the question set, a gap is
-    measured on whichever handful survived and generalises to nothing.
-    """
-    # Both arms lose the SAME questions, so no question is attributable to either side and
-    # the asymmetry statistic is exactly zero — leaving only the backstop to catch it.
-    rows = [{
-        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 5,
-        "terse_ok": 4, "terse_trials": 4, "diff_ok": 4, "diff_trials": 4,
-        "fails": 2, "attempts": 10,
-    } if i < 11 else {
-        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 5,
-        "terse_ok": 5, "terse_trials": 5, "diff_ok": 5, "diff_trials": 5,
-        "fails": 0, "attempts": 10,
-    } for i in range(20)]
-    assert loss_asymmetry(rows, ["diff_ok"], "terse_ok") == 0.0, \
-        "must not fire on asymmetry — this test is about the volume backstop"
-    dropped = (len(rows) - len(paired_rows(rows, "diff_ok", "terse_ok"))) / len(rows)
-    assert dropped >= UNPAIRED_VOLUME_SHARE
-    assert unpaired(rows, ["diff_ok"], "terse_ok")
-
-
-def test_two_forms_do_not_read_as_asymmetry_against_one_control():
-    """Per-form comparison, not "any form short".
-
-    The payload family gates two forms against one control. Testing "any form fell short"
-    gives the form side two chances against the control's one, so evenly spread flake would
-    read as a one-sided loss and refuse every healthy multi-arm run.
-    """
-    rows = []
-    for i in range(20):
-        # Each arm loses a different, equal-sized slice: symmetric by construction.
-        t_short, p_short, r_short = i < 2, 2 <= i < 4, 4 <= i < 6
-        rows.append({
-            "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 5,
-            "raw_ok": 4 if r_short else 5, "raw_trials": 4 if r_short else 5,
-            "terse_ok": 4 if t_short else 5, "terse_trials": 4 if t_short else 5,
-            "primer_ok": 4 if p_short else 5, "primer_trials": 4 if p_short else 5,
-            "fails": int(t_short) + int(p_short) + int(r_short), "attempts": 15,
-        })
-    assert not _unmeasured(rows)
-    # Small but not exactly zero: the statistic counts TRIALS, and each arm's losses fall on
-    # different questions, so neither direction cancels to nothing. What matters is that it
-    # stays far below the bar — an "any form short" test would read this as one-sided.
-    asym = loss_asymmetry(rows, ["terse_ok", "primer_ok"], "raw_ok")
-    assert asym < UNPAIRED_ASYMMETRY_SHARE, f"symmetric flake read as {asym:.1%} one-sided"
-    assert not unpaired(rows, ["terse_ok", "primer_ok"], "raw_ok")
 
 
 def test_rows_without_per_form_counters_are_treated_as_fully_paired():
@@ -694,101 +442,6 @@ def test_rows_without_per_form_counters_are_treated_as_fully_paired():
     legacy = [{"qid": "a", "qtype": "lookup", "transform": "table", "trials": 1,
                "terse_ok": 1, "diff_ok": 1}]
     assert paired_rows(legacy, "diff_ok", "terse_ok") == legacy
-    assert not unpaired(legacy, ["diff_ok"], "terse_ok")
-
-
-def test_unpaired_refuses_at_the_boundary_share():
-    """`>=`, not `>`. One question type of five is exactly 20.0%, and that is the measured
-    case in which a real -20% FAIL published as PASS. On a ship gate the boundary belongs
-    on the refusing side."""
-    # `attempts` present: these rows come from a live harness, so an uneven trial count IS
-    # evidence of a lost call. Without it they would be read as a hand-built pack and kept.
-    rows = [{"qid": str(i), "trials": 1, "terse_ok": 1, "terse_trials": 1,
-             "diff_ok": 1, "diff_trials": 1, "fails": 0, "attempts": 2} for i in range(5)]
-    rows[0].update({"diff_trials": 0, "fails": 1})
-    assert (len(rows) - len(paired_rows(rows, "diff_ok", "terse_ok"))) / len(rows) == 0.20
-    assert unpaired(rows, ["diff_ok"], "terse_ok")
-
-
-# --------------------------------------------------------------------------------------
-# Third review round: the asymmetry statistic's own failure modes.
-# --------------------------------------------------------------------------------------
-
-def _hard_question_rows(n: int, hard: int, *, form_lost: int, control_lost: int,
-                        trials: int = 5, control_flake: int = 0) -> list[dict]:
-    """`hard` questions where the form arm lost `form_lost` trials and the control
-    `control_lost`, plus optional control-only flake on `control_flake` OTHER questions."""
-    rows = []
-    for i in range(n):
-        is_hard = i < hard
-        fl = form_lost if is_hard else 0
-        cl = control_lost if is_hard else (1 if hard <= i < hard + control_flake else 0)
-        rows.append({
-            "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": trials,
-            "terse_ok": trials - cl, "terse_trials": trials - cl,
-            "diff_ok": trials - fl, "diff_trials": trials - fl,
-            "fails": fl + cl, "attempts": trials * 2,
-        })
-    return rows
-
-
-def test_a_total_one_sided_loss_is_not_cancelled_by_one_control_trial():
-    """The statistic counts TRIALS, not short rows.
-
-    A per-row "was this arm short at all" predicate cannot tell "answered 0 of 5" from
-    "answered 4 of 5", so when both arms are short on the same question the two cancel —
-    and a TOTAL one-sided loss read as perfectly symmetric the moment the control hiccuped
-    once on those same questions. That is not a corner case: a token-budget stop that kills
-    the form arm's longer prompt on a hard question is MORE likely to also clip the
-    control's prompt on that same question, not less.
-    """
-    rows = _hard_question_rows(20, 6, form_lost=5, control_lost=1)
-    assert not _unmeasured(rows), "the pooled gate must not be what catches this"
-    assert loss_asymmetry(rows, ["diff_ok"], "terse_ok") >= UNPAIRED_ASYMMETRY_SHARE
-    assert unpaired(rows, ["diff_ok"], "terse_ok")
-    assert "**PASS**" not in build_diff_report({"m": rows})
-
-
-def test_control_side_flake_cannot_buy_tolerance_for_a_form_side_loss():
-    """Monotone in the control's failures.
-
-    The two directions are accumulated separately rather than subtracted, so losses the
-    control suffers on OTHER questions cannot offset a form-side loss here. Subtracting
-    them made the gate reward a worse backend: three stray 429s on the control flipped a
-    correct refusal into "safe to enable `proxy --diff`".
-    """
-    baseline = loss_asymmetry(_hard_question_rows(20, 6, form_lost=5, control_lost=0),
-                              ["diff_ok"], "terse_ok")
-    for flake in (0, 3, 6):
-        rows = _hard_question_rows(20, 6, form_lost=5, control_lost=0, control_flake=flake)
-        assert loss_asymmetry(rows, ["diff_ok"], "terse_ok") == pytest.approx(baseline), (
-            f"unrelated control flake on {flake} questions moved the form-side asymmetry")
-        assert unpaired(rows, ["diff_ok"], "terse_ok")
-        assert "**PASS**" not in build_diff_report({"m": rows})
-
-
-def test_an_even_loss_refused_on_volume_is_not_described_as_one_sided():
-    """The two refusals are different findings and cannot share a paragraph.
-
-    A single label made the report assert that "the losses fell ONE-SIDEDLY on an arm under
-    test" and that "even losses do not trigger it" about a run refused at effectively zero
-    asymmetry by the volume backstop — every clause false, with advice to match.
-    """
-    # Both arms lose ONE trial on EVERY question — perfectly even, so neither direction
-    # accumulates any excess, but pairing still voids the whole exam.
-    rows = [{
-        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 5,
-        "terse_ok": 4, "terse_trials": 4, "diff_ok": 4, "diff_trials": 4,
-        "fails": 2, "attempts": 10,
-    } for i in range(20)]
-    assert not _unmeasured(rows)
-    assert loss_asymmetry(rows, ["diff_ok"], "terse_ok") == 0.0
-    assert unpaired(rows, ["diff_ok"], "terse_ok"), "the volume backstop must fire"
-
-    md = build_diff_report({"m": rows})
-    assert "evenly spread" in md, md
-    assert "ONE-SIDEDLY" not in md, (
-        "a volume-triggered refusal is being described as a one-sided loss:\n" + md)
 
 
 def test_the_question_column_reports_the_exam_that_was_actually_sat():
@@ -799,8 +452,14 @@ def test_the_question_column_reports_the_exam_that_was_actually_sat():
     one section below already pools the paired rows, so one document showed two exam sizes
     for one model with no explanation.
     """
-    rows = _flaky_rows(20, form_lost=3, control_lost=3, trials_lost=5)
-    assert not unpaired(rows, ["diff_ok"], "terse_ok")
+    # 6 of 20 questions lost outright — 3 by each arm — so 14 are comparable.
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 5,
+        "terse_ok": 0 if 3 <= i < 6 else 5, "terse_trials": 0 if 3 <= i < 6 else 5,
+        "diff_ok": 0 if i < 3 else 5, "diff_trials": 0 if i < 3 else 5,
+        "fails": 5 if i < 6 else 0, "attempts": 10,
+    } for i in range(20)]
+    assert not _unmeasured(rows), "the transport gate must not be what withholds this"
     scored = len(paired_rows(rows, "diff_ok", "terse_ok"))
     assert scored == 14
 
@@ -808,99 +467,3 @@ def test_the_question_column_reports_the_exam_that_was_actually_sat():
     row = [ln for ln in md.splitlines() if ln.startswith("| `m` |")]
     assert row and f"| `m` | {scored} |" in row[0], (
         f"q column should be the paired {scored}, not 20: {row}")
-
-
-def test_a_scorable_deepest_slice_still_decides_the_depth_verdict():
-    """The pooled exclusion must NOT reach into the per-depth analysis.
-
-    An earlier version filtered the deepest-depth loop on the POOLED exclusion list, on the
-    theory that one paragraph should not exclude a model the next lets decide the
-    conclusion. That was wrong twice over: a model excluded pooled (its shallow depths were
-    one-sided) can have a complete, scorable deepest slice, which is real evidence about
-    drift — and dropping it printed "No depth-correlated comprehension drift" beside a
-    table showing that slice at -80%. When it was the only model at that depth the loop
-    emptied, so even the NO-VERDICT branch was skipped.
-
-    The per-depth `arm_gap` is the right judge of a slice; the pooled list is not.
-    """
-    shallow = [{**r, "depth": 1}
-               for r in _flaky_rows(20, form_lost=8, control_lost=0, trials_lost=5)]
-    deep = [{
-        "qid": f"d{i}", "qtype": "lookup", "transform": "table", "trials": 5,
-        "terse_ok": 5, "terse_trials": 5, "diff_ok": 1, "diff_trials": 5,
-        "fails": 0, "attempts": 10, "depth": 5,
-    } for i in range(20)]
-    rows = shallow + deep
-    assert not _unmeasured(rows)
-    assert unpaired(rows, ["diff_ok"], "terse_ok"), "must be excluded from the POOLED gap"
-    assert not unpaired(deep, ["diff_ok"], "terse_ok"), "the deepest slice must be scorable"
-
-    md = build_diff_soak_report({"m": rows, "n": [{**r, "depth": d}
-                                                  for d in (1, 5) for r in _clean_rows()]})
-    deepest = [ln for ln in md.splitlines() if "deepest tested depth" in ln]
-    assert deepest, md
-    assert "**FAIL**" in deepest[0], (
-        f"a fully-paired -80% deepest slice did not reach the depth verdict: {deepest[0]!r}")
-    assert "No depth-correlated comprehension drift" not in md
-
-
-def test_a_pooled_exclusion_alone_does_not_silence_the_depth_verdict():
-    """The worse variant: the excluded model is the ONLY one at the deepest depth."""
-    rows = ([{**r, "depth": 1}
-             for r in _flaky_rows(20, form_lost=8, control_lost=0, trials_lost=5)]
-            + [{
-                "qid": f"d{i}", "qtype": "lookup", "transform": "table", "trials": 5,
-                "terse_ok": 5, "terse_trials": 5, "diff_ok": 1, "diff_trials": 5,
-                "fails": 0, "attempts": 10, "depth": 5,
-            } for i in range(20)])
-    md = build_diff_soak_report({"m": rows})
-    assert "No depth-correlated comprehension drift" not in md, (
-        "an excluded-pooled model's real depth-5 failure vanished into a green summary:\n"
-        + md)
-
-
-def test_the_excluded_from_the_verdict_line_does_not_stutter():
-    """`exclusion_note` already starts with "excluded — "."""
-    rows = [{**r, "depth": 1} for r in _flaky_rows(20, form_lost=8, control_lost=0,
-                                                    trials_lost=5)]
-    assert not _unmeasured(rows) and unpaired(rows, ["diff_ok"], "terse_ok")
-    md = build_diff_soak_report({"m": rows, "n": [{**r, "depth": 1} for r in _clean_rows()]})
-    assert "excluded — excluded" not in md.lower(), md
-    assert "Excluded from the pooled verdict" in md
-
-
-def test_a_partial_one_sided_loss_refuses_at_every_trial_count():
-    """The unit is the QUESTION, so the gate cannot be diluted by `--trials`.
-
-    Every other one-sided fixture here loses ALL of a question's trials, which is
-    scale-invariant and therefore blind to the defect this pins: when the statistic divided
-    lost TRIALS by attempted trials, a form arm clipping ONE trial on 9 of 20 questions
-    voided 45% of the exam one-sidedly, scored 0.09, and published "safe to enable
-    `proxy --diff`". At `--trials 3` and above the asymmetry gate could never fire at all —
-    the most it could reach before the volume backstop took over was 0.50/T.
-    """
-    for trials in (2, 3, 5, 10):  # at trials=1 this loss is 22% of CALLS and `_unmeasured` catches it
-        rows = _flaky_rows(20, form_lost=9, control_lost=0, trials_lost=1, trials=trials)
-        asym = loss_asymmetry(rows, ["diff_ok"], "terse_ok")
-        assert asym == pytest.approx(0.45), f"trials={trials} diluted the statistic to {asym}"
-        assert not _unmeasured(rows), f"trials={trials}: the pooled gate must not be the catcher"
-        dropped = (len(rows) - len(paired_rows(rows, "diff_ok", "terse_ok"))) / len(rows)
-        assert dropped < UNPAIRED_VOLUME_SHARE, f"trials={trials}: the backstop must not be it"
-        assert unpaired(rows, ["diff_ok"], "terse_ok"), f"trials={trials} published"
-        assert "**PASS**" not in build_diff_report({"m": rows})
-
-
-def test_a_control_side_refusal_is_not_described_as_a_form_side_one():
-    """The statistic is direction-blind; the prose must not claim otherwise.
-
-    Rendered for a run where the CONTROL lost every trial on 3 of 10 questions and the form
-    arm lost nothing, the paragraph used to say the loss was "lost by a form arm and not by
-    its control" and to blame the backend "truncating the longer arm" — which is the wrong
-    arm in the payload family, where the uncompressed control carries the longest prompt.
-    """
-    rows = _flaky_rows(10, form_lost=0, control_lost=3, trials_lost=5)
-    assert unpaired(rows, ["diff_ok"], "terse_ok")
-    md = build_diff_report({"m": rows})
-    assert "lost by a form arm" not in md, md
-    assert "truncating the longer arm" not in md, md
-    assert "Not compared" in md

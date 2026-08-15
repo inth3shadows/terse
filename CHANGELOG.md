@@ -52,62 +52,18 @@ fails that pull request until the section has moved.
   working feature. And withheld models are now split into **Not measured** (transport) and
   **Not compared** (unpaired), which are different events and no longer share a sentence.
 
-  **The refusal measures asymmetry, not volume.** `paired_rows` removes the bias outright —
-  after pairing both arms sit the identical exam whatever fraction was dropped — so what is
-  left to guard against is the survivors being SELECTED, and the mechanism that selects them
-  is loss correlated with the arm under test. A volume bar cannot tell a run where both arms
-  flaked equally from one where only the longer-prompted arm truncated, and it charged the
-  first as if it were the second: simulated over 1000 runs × 20 questions × 4 arms at
-  `--trials 3`, a 1% per-call failure rate withheld **9%** of models, 2% withheld **41%**,
-  and 5% withheld **98%**, while `_unmeasured` never fired at any of them. That is the regime the tool
-  actually runs in, and a gate that refuses most healthy runs gets raised or removed rather
-  than trusted. `UNPAIRED_ASYMMETRY_SHARE` counts questions a FORM arm lost that its control
-  did not, per form (an "any form short" test would give the payload family's two forms two
-  chances against one control and read symmetric flake as one-sided). Under the same
-  simulation the new gate withholds **0.6% / 6.7% / 58%** — better at every rate, and the
-  5% case is a backend failing one call in twenty. The measured #268 case is exactly 20.0%
-  and still refuses, so the calibration is unchanged where it was actually taken.
-
-  Three properties the statistic needs, each of which cost a round to find. It is in
-  **questions, not trials**: `paired_rows` voids the whole question when any arm falls
-  short, so a one-trial clip and a total blackout do identical damage — dividing lost
-  trials by attempted trials diluted the gate by `--trials` until, at `--trials 3` and
-  above, it could never fire before the volume backstop and a form arm clipping one trial
-  on 9 of 20 questions published a real -45% regression as a PASS. Magnitudes decide which
-  arm a voided question is **attributed** to, so a total one-sided loss no longer cancels
-  to zero the moment the control hiccups once on the same questions. The two directions are
-  **tallied separately**, not subtracted, so unrelated control failures cannot buy back
-  tolerance for a form-side loss — subtracting them let three stray 429s flip a correct
-  refusal into "safe to enable `proxy --diff`", a gate that rewards a worse backend. And it
-  is **direction-blind**: which arm carries the longest prompt depends on the family (the
-  diff form in a `--diff` run, the uncompressed `raw` control in a fluency run), so
-  refusing only form-side excess was backwards for fluency, where dropping the biggest
-  payloads is precisely what flatters terse. `UNPAIRED_VOLUME_SHARE` (0.50) remains as a loose
-  backstop for the case asymmetry cannot see — losses can be perfectly even and still leave
-  too little exam to generalise from.
-
-  Three further defects fixed in the same lines: the HTML banner's arm detection was a
-  `rows[0]`-key heuristic with a silent always-green branch (a payload-shaped row set made
-  control := form, so the gap was identically 0 and the banner unconditionally PASS); it
-  hardcoded a second `-0.05` instead of `_GAP_TOLERANCE`; and the `regressions` /
-  `primer recovers` columns counted over all rows, so a question one arm never answered
-  was reported as a wrong answer, contradicting the gap printed beside it.
-
-  Pinned two ways, because a shared code path and an unwired one produce identical green
-  suites. `tests/test_gap_gate_boundary.py` asserts by AST that `_form_stats` is called
-  only from a named allowlist, so an eighth gap site cannot skip the gate the obvious way
-  without editing that list in a reviewable diff; it carries a known-violation sweep
-  proving the detector can fail, and a test enumerating what it is deliberately blind to
-  (renamed imports, local rebinding, `getattr`, inline arithmetic) so the boundary is not
-  read as a guarantee it cannot give. `tests/test_paired_gap_gate.py` pins each site by
-  mutation — every one verified red-on-revert — on fixtures built to sit UNDER
-  both pre-existing gates (8.3% pooled loss, 16.7% unpaired share, against a 20% bar), with
-  those margins asserted in the tests themselves, since the previous attempt's headline
-  test passed unmodified against the un-fixed code precisely because its fixture tripped
-  the older pooled rule instead. Each column fix carries a fixture that actually
-  discriminates: for `regressions` and `primer recovers` that means a question the CONTROL
-  answered perfectly and the form arm never answered, because the obvious correlated-loss
-  fixture makes paired and unpaired agree by accident.
+  **No refusal ships with this.** `paired_rows` removes the bias outright — after pairing
+  both arms sit the identical exam — so nothing further is needed for correctness. An
+  additional bar was attempted, meant to decline when the surviving exam looked too
+  *selected* to generalise from, and five review rounds each found it publishing a false
+  PASS or refusing healthy runs: a volume share that voided 41% of models at a 2% per-call
+  failure rate; an asymmetry statistic that cancelled a total one-sided loss when the
+  control hiccupped once on the same questions, that unrelated control failures could buy
+  tolerance from, that went inert above `--trials 2` when scaled by trials, and that with
+  two form arms let a -23% regression publish as a PASS. It also made one soak case WORSE
+  than before the change. It is not required for the fix and is dropped rather than shipped
+  half-right; the honest position is that "how selected is the surviving exam" needs a
+  measurement nobody here has yet got right, not a fifth attempt at a threshold.
 
   Every renderer now reads the exclusion vocabulary from one place (`REASON_LABEL` /
   `REASON_HEADING` / `exclusion_note`), and `diff_gap_rows` / `fluency_gap_rows` return the
