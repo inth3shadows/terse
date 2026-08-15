@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.25.3] - 2026-08-14
+
 ### Fixed
 
 - **A model that returns HTTP 200 with no content is scored as unanswered, not wrong**
