@@ -531,7 +531,7 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
         # card on a page titled "comprehension gap" reads as "no gap found". The second
         # sentence is reason-specific: telling a reader to fix a backend that answered 90%
         # of its calls sends them to re-run something that will fail the same way.
-        only_unpaired = bool(excluded) and all(w == "unpaired" for w in excluded.values())
+        only_unpaired = bool(excluded) and all(w in ("unpaired", "exam too small") for w in excluded.values())
         why = ("nothing could be compared. The backend answered, but no model had enough "
                "questions completed by both arms to score a gap, so this run says nothing "
                "either way. Lower <code>--trials</code>, or re-run once the backend stops "
@@ -553,7 +553,7 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
             tail = (" An unanswered call is not a wrong answer; check stderr for a "
                     "<code>returned no content</code> line." if why == "unmeasured" else
                     " A question counts only when every arm answered all of its trials, so "
-                    "one lost trial withholds the whole question." if why == "unpaired"
+                    "one lost trial withholds the whole question." if why in ("unpaired", "exam too small")
                     else "")
             verdict_html += (f'<p>{_esc(REASON_HEADING.get(why, "Excluded"))} — '
                              f'{_esc(REASON_LABEL.get(why, why))} for: {names}.{tail}</p>')

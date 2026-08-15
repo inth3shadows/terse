@@ -248,8 +248,10 @@ def test_a_few_transient_failures_do_not_void_an_otherwise_complete_run():
     text = _report({"flaky": rows})
     assert "NO VERDICT" not in text
     assert "Partially degraded" in text and "2/80" in text
-    # terse is still 100%: the 19 completed rows are the denominator, not 20.
-    assert "| `flaky` | 20 | 100% ±0 | 100% ±0" in text
+    # terse is still 100%, and `q` is 19 — the PAIRED exam these percentages are actually
+    # over. It used to print 20, the number of questions generated, next to accuracies
+    # computed from 19 of them (#280): one line stating two different denominators.
+    assert "| `flaky` | 19 | 100% ±0 | 100% ±0" in text
 
 
 def test_a_mostly_dead_backend_is_still_withheld():

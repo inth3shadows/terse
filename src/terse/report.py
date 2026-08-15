@@ -65,11 +65,13 @@ def _ci(se: float) -> float:
 #
 # A volume bar cannot tell those apart. It counted a run where both arms flaked equally the
 # same as one where only the arm under test truncated — so uncorrelated 429 background
-# voided runs it had no reason to. Simulated over 200 runs x 20 questions at 4 arms, a 1%
-# per-call failure rate withheld 13% of models under the volume rule, 2% withheld 44%, and
-# 5% withheld 98%, while `_unmeasured` never fired at any of them. That is the regime the
-# tool actually runs in, and a gate that refuses most healthy runs gets raised or removed
-# rather than trusted.
+# voided runs it had no reason to. Simulated over 1000 runs x 20 questions x 4 arms at
+# `--trials 3` (the trials count is the parameter that matters here, since one lost trial
+# voids a whole question — at `--trials 1` every rate is far milder), a 1% per-call failure
+# rate withheld 9% of models under the volume rule, 2% withheld 41%, and 5% withheld 98%,
+# while `_unmeasured` never fired at any of them. The asymmetry rule withholds 0% / 0% /
+# 16% on the same inputs. That is the regime the tool actually runs in, and a gate that
+# refuses most healthy runs gets raised or removed rather than trusted.
 #
 # Calibration is unchanged where it was actually measured. The #268 case — a model
 # answering its control perfectly and returning no content on every `deref` question, the
@@ -136,43 +138,72 @@ def paired_rows(rows: list[dict[str, Any]], *forms: str) -> list[dict[str, Any]]
     return out
 
 
-def _short_rows(rows: list[dict[str, Any]], form: str) -> set[int]:
-    """Indices of rows where `form` did not complete every trial it attempted.
+def _short_rows(rows: list[dict[str, Any]], form: str) -> list[tuple[int, int]]:
+    """Trials `form` did NOT complete, per row, and the trials attempted — (lost, attempted).
 
-    Rows with no `attempts` counter are never short: their uneven per-form counts are a
-    `score_pack` collection choice, not a loss (see `paired_rows`)."""
+    Magnitudes, not a boolean. A per-row "was this arm short at all" predicate cannot tell
+    "answered 0 of 5" from "answered 4 of 5", and when both arms are short on the same row
+    those two cancel — which let a TOTAL one-sided loss read as perfectly symmetric as soon
+    as the control hiccuped once on the same questions. That is not a corner case: a
+    token-budget stop that kills the form arm's longer prompt on a hard question is MORE
+    likely, not less, to occasionally kill the control's prompt on that same question.
+
+    Rows with no `attempts` counter contribute nothing to either total: their uneven
+    per-form counts are a `score_pack` collection choice, not a loss (see `paired_rows`)."""
     key = form[:-3] + "_trials" if form.endswith("_ok") else form
-    out = set()
-    for i, r in enumerate(rows):
+    out = []
+    for r in rows:
         t = int(r.get("trials", 1))
-        if "attempts" in r and int(r.get(key, t)) != t:
-            out.add(i)
+        if "attempts" not in r:
+            out.append((0, 0))
+            continue
+        out.append((t - int(r.get(key, t)), t))
     return out
 
 
 def loss_asymmetry(rows: list[dict[str, Any]], forms: list[str], control: str) -> float:
-    """How one-sidedly the pairing losses fall on a FORM arm rather than on the control.
+    """How ONE-SIDEDLY the pairing losses fall on one arm rather than the other.
 
-    For each form separately: (questions this form lost and the control did not) minus
-    (questions the control lost and this form did not), over the question count. The worst
-    form wins, because the verdict gates on the worst arm.
+    Per row, the excess of one arm's lost trials over the other's; summed in each direction
+    separately, and the larger direction reported, as a share of the trials attempted. The
+    worst form wins, because the verdict gates on the worst arm.
 
-    Per form separately, not "any form", on purpose: the payload family has two gated forms
-    against one control, so an `any` test would give the form side two chances to be short
-    against the control's one and read symmetric flake as a one-sided loss.
+    Three properties this shape has and a count of short rows does not:
 
-    FLOORED AT ZERO. A control-side excess biases against the form and so understates it —
-    a false FAIL, the safe error on a ship gate — and no caller refuses on it, so it is
-    reported as "no form-side asymmetry" rather than as a negative number that a future
-    caller might compare with `abs()` and start refusing the harmless direction."""
+    MAGNITUDE-AWARE. A row where the form answered none of its 5 trials and the control
+    answered 4 is 4 trials of one-sidedness, not "both were short, so they cancel".
+
+    MONOTONE IN THE CONTROL'S FAILURES. The two directions are accumulated separately
+    rather than subtracted, so a control-side loss on some OTHER question cannot buy back
+    tolerance for a form-side loss here. Subtracting them meant three stray 429s on the
+    control flipped a correct refusal into "safe to enable `proxy --diff`" — a gate that
+    rewards a worse backend.
+
+    DIRECTIONLESS. Both directions refuse, because which arm carries the longest prompt —
+    and so truncates first — depends on the family. In the diff family the FORM is longer
+    (`PREVIOUS RESULT … UPDATE …` versus the compressed payload alone). In the payload
+    family it is the CONTROL: `run_payload` sends uncompressed `raw_text` against
+    `compress(obj)`, because shrinking that is terse's entire purpose. So a control-side
+    excess there drops the biggest payloads — exactly where terse's saving is largest and
+    its comprehension risk highest — and removing them FLATTERS terse. An earlier version
+    floored this at zero on the argument that a control-side excess is "the safe error";
+    that argument holds for the diff family and is backwards for the fluency one.
+
+    Per form separately, not "any form": the payload family gates two forms against one
+    control, so an any-test gives the form side two chances against the control's one and
+    reads symmetric flake as a one-sided loss."""
     if not rows:
         return 0.0
-    c_short = _short_rows(rows, control)
+    c_loss = _short_rows(rows, control)
     worst = 0.0
     for f in forms:
-        f_short = _short_rows(rows, f)
-        excess = len(f_short - c_short) - len(c_short - f_short)
-        worst = max(worst, excess / len(rows))
+        f_loss = _short_rows(rows, f)
+        attempted = sum(t for _, t in f_loss)
+        if not attempted:
+            continue
+        form_side = sum(max(0, fl - cl) for (fl, _), (cl, _) in zip(f_loss, c_loss, strict=True))
+        ctrl_side = sum(max(0, cl - fl) for (fl, _), (cl, _) in zip(f_loss, c_loss, strict=True))
+        worst = max(worst, max(form_side, ctrl_side) / attempted)
     return worst
 
 
@@ -190,12 +221,27 @@ def unpaired(rows: list[dict[str, Any]], forms: list[str], control: str) -> bool
     Trigger 1 replaced a plain volume bar, which could not tell a run where both arms flaked
     equally from one where only the arm under test truncated — see `UNPAIRED_ASYMMETRY_SHARE`
     for the measured cost of that confusion."""
+    return unpaired_reason(rows, forms, control) is not None
+
+
+def unpaired_reason(rows: list[dict[str, Any]], forms: list[str],
+                    control: str) -> str | None:
+    """Which of the two refusals fired, or None. `"unpaired"` | `"exam too small"`.
+
+    Separate strings because the two are separate findings and the reports say different
+    things about them. A single label made the "Not compared" paragraph assert that "the
+    losses fell ONE-SIDEDLY on an arm under test" and that "even losses do not trigger it"
+    for a run refused at exactly 0.0 asymmetry by the volume backstop — every clause false,
+    and it advised re-running at a lower `--trials` when the finding was "half the exam is
+    gone"."""
     if not rows:
-        return False
+        return None
     if loss_asymmetry(rows, forms, control) >= UNPAIRED_ASYMMETRY_SHARE:
-        return True
+        return "unpaired"
     dropped = len(rows) - len(paired_rows(rows, *forms, control))
-    return dropped / len(rows) >= UNPAIRED_VOLUME_SHARE
+    if dropped / len(rows) >= UNPAIRED_VOLUME_SHARE:
+        return "exam too small"
+    return None
 
 
 # Share of a model's calls that may fail before its numbers stop meaning anything (#263).
@@ -293,8 +339,9 @@ def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
         return ArmGap(0.0, 0.0, 0.0, 0.0, [], "empty")
     if _unmeasured(rows):
         return ArmGap(0.0, 0.0, 0.0, 0.0, [], "unmeasured")
-    if unpaired(rows, gating, control):
-        return ArmGap(0.0, 0.0, 0.0, 0.0, [], "unpaired")
+    why = unpaired_reason(rows, gating, control)
+    if why:
+        return ArmGap(0.0, 0.0, 0.0, 0.0, [], why)
     pr = paired_rows(rows, *gating, control)
     arms = {f: _form_stats(pr, f) for f in (*gating, control, *display)}
     cacc, cse = arms[control]
@@ -340,7 +387,8 @@ def best_arm_gap(rows: list[dict[str, Any]], forms: list[str], control: str,
 # invariant over all of them so a seventh renderer cannot invent a seventh phrasing.
 REASON_LABEL = {
     "unmeasured": "calls went unanswered",
-    "unpaired": "too little of the question set could be compared",
+    "unpaired": "one-sided losses left the arms not comparable",
+    "exam too small": "too little of the question set survived pairing to compare",
     "broken control": "control arm failed",
     "not a diff run": "no diff arm in these rows",
     "empty": "no rows",
@@ -352,6 +400,7 @@ REASON_LABEL = {
 REASON_HEADING = {
     "unmeasured": "Not measured",
     "unpaired": "Not compared",
+    "exam too small": "Not compared",
     "broken control": "Excluded",
     "not a diff run": "Not applicable",
     "empty": "Not measured",
@@ -384,8 +433,10 @@ def _not_measured_lines(withheld: dict[str, tuple[str | None, int, int]]) -> lis
     if not withheld:
         return []
     out: list[str] = []
-    lost = {m: (f, a) for m, (why, f, a) in withheld.items() if why != "unpaired"}
+    lost = {m: (f, a) for m, (why, f, a) in withheld.items()
+            if why not in ("unpaired", "exam too small")}
     unpair = sorted(m for m, (why, _, _) in withheld.items() if why == "unpaired")
+    small = sorted(m for m, (why, _, _) in withheld.items() if why == "exam too small")
     if lost:
         out.append(
             "**Not measured** — too many calls went unanswered (connection error, rate "
@@ -410,6 +461,19 @@ def _not_measured_lines(withheld: dict[str, tuple[str | None, int, int]]) -> lis
               f"merely fewer, and the two arms are no longer sitting the same exam (#280). "
               f"Even losses do not trigger it; re-run at a lower `--trials`, or once the "
               f"backend stops truncating the longer arm.")
+    if small:
+        # Its own paragraph. The one above asserts one-sidedness, which is exactly what did
+        # NOT happen here — this is the symmetric case, refused on volume alone.
+        out.append(
+            "**Not compared** — the backend answered and its losses were evenly spread, but "
+            "pairing left too little of the question set to publish a gap for: "
+            + ", ".join(f"`{m}`" for m in small)
+            + f". A question is comparable only when every arm answered all of its trials, "
+              f"so one lost trial withholds the whole question; past "
+              f"{UNPAIRED_VOLUME_SHARE:.0%} of the exam gone, what survives is too small to "
+              f"generalise from however evenly it was lost (#280). Lower `--trials` so a "
+              f"single failure costs less of the question, or re-run once the backend is "
+              f"steadier.")
     out.append("")
     return out
 
@@ -1122,7 +1186,10 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         regr = sum(1 for r in g.rows if int(r["terse_ok"]) == r.get("trials", 1)
                    and int(r["diff_ok"]) < r.get("trials", 1))
         gap_rows[model] = (dacc, dse, facc, fse)  # form=diff, control=control_label
-        out.append(f"| `{model}` | {n} | {facc:.0%} ±{_ci(fse) * 100:.0f} "
+        # `len(g.rows)`, not `len(rows)`: every accuracy on this line is computed over the
+        # PAIRED subset, so printing the full question count beside them states a
+        # denominator the numbers do not use. `q` is the exam that was actually sat.
+        out.append(f"| `{model}` | {len(g.rows)} | {facc:.0%} ±{_ci(fse) * 100:.0f} "
                    f"| {dacc:.0%} ±{_ci(dse) * 100:.0f} | {regr} |")
     out.append("")
     out += _not_measured_lines(unmeasured)
@@ -1142,7 +1209,7 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         # read as a go/no-go on `proxy --diff`, and an empty one reads as "no objection".
         # Reason-specific advice: "fix the backend" is wrong guidance for a run whose
         # backend answered every call and whose arms merely could not be paired.
-        if unmeasured and all(w == "unpaired" for w, _, _ in unmeasured.values()):
+        if unmeasured and all(w in ("unpaired", "exam too small") for w, _, _ in unmeasured.values()):
             out.append("- **NO VERDICT — nothing could be compared.** The backend answered, "
                        "but no model had enough questions completed by both arms to score a "
                        "gap, so this run says nothing about the diff form either way. Lower "
@@ -1293,7 +1360,8 @@ def build_diff_soak_report(results: dict) -> str:
                 f"`{m}` (depth {', '.join(str(d) for d in sorted(ds[why]))})"
                 for m, ds in sorted(withheld_depths.items()) if why in ds)
             lead = ("**Depths not compared** — the backend answered, but one arm did not "
-                    "complete enough of the same questions at: " if why == "unpaired" else
+                    "complete enough of the same questions at: "
+                    if why in ("unpaired", "exam too small") else
                     "**Depths not measured** — too many calls went unanswered at: ")
             out += [lead + at + ". Those depths are excluded from the verdict below rather "
                     "than scored on a question set the two arms did not share (#280).", ""]
@@ -1313,7 +1381,7 @@ def build_diff_soak_report(results: dict) -> str:
             continue
         gap_rows[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
     if pooled_out:
-        out += [f"**Excluded from the verdict** — {exclusion_note(pooled_out)}.", ""]
+        out += [f"**Excluded from the verdict** — {exclusion_note(pooled_out)[len('excluded — '):]}.", ""]
 
     out += ["## Verdict", ""]
     worst = _worst_case_gap(gap_rows)
@@ -1323,7 +1391,7 @@ def build_diff_soak_report(results: dict) -> str:
         # The advice has to match the cause. "Fix the backend(s) and re-run" sends a reader
         # to re-run something that will fail identically when the backend answered fine and
         # the arms simply could not be paired.
-        if pooled_out and all(w == "unpaired" for w in pooled_out.values()):
+        if pooled_out and all(w in ("unpaired", "exam too small") for w in pooled_out.values()):
             out.append("- **NO VERDICT — nothing could be compared.** The backend answered, "
                        "but no model had enough questions completed by both arms to score a "
                        "gap, so this run says nothing about diff-chain drift either way. "
@@ -1342,9 +1410,15 @@ def build_diff_soak_report(results: dict) -> str:
         # depth-specific signal computing off withheld models, so a down backend still
         # decided the drift conclusion — the same defect, one paragraph further down the
         # same function. Found by the invariance test, not by review.
+        # `pooled_out` too, not just `unmeasured`: a model the section above just named as
+        # "Excluded from the verdict" could still be the sole contributor to the deepest-
+        # depth line, so one paragraph excluded it and the next let it decide the drift
+        # conclusion. Same defect as the `unmeasured` one this comment already describes,
+        # against the exclusion list added later.
         deep_rows = {m: r for m, r in
                      ((m, [x for x in rs if x["depth"] == deep])
-                      for m, rs in results.items() if m not in unmeasured) if r}
+                      for m, rs in results.items()
+                      if m not in unmeasured and m not in pooled_out) if r}
         deep_gaps = {}
         for m, rs in deep_rows.items():
             dg = arm_gap(rs, "diff_ok", "terse_ok")
@@ -1626,7 +1700,7 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         # "unmeasured" now covers `unpaired` too — a run where the backend was up but one
         # arm lost too much of the question set is equally unpublishable, and it reaches
         # the reader through the same `n/a` row rather than a second vocabulary.
-        unmeasured = g.excluded in ("unmeasured", "unpaired")
+        unmeasured = g.excluded in ("unmeasured", "unpaired", "exam too small")
         reasons[model] = g.excluded
         summary[model] = {"n": n, "raw": racc, "raw_se": rse,
                           "terse": tacc, "terse_se": tse, "primer": pacc, "primer_se": pse,
@@ -1643,7 +1717,8 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
             out.append(f"| `{model}` | {n} | n/a | n/a | n/a | n/a | n/a | n/a |")
         else:
             out.append(
-                f"| `{model}` | {n} | {racc:.0%} ±{_ci(rse) * 100:.0f} "
+                # `len(g.rows)` — the paired exam these percentages are actually over.
+                f"| `{model}` | {len(g.rows)} | {racc:.0%} ±{_ci(rse) * 100:.0f} "
                 f"| {tacc:.0%} ±{_ci(tse) * 100:.0f} "
                 f"| {pacc:.0%} ±{_ci(pse) * 100:.0f} | {inline_cell} | {regr} | {rec} |"
             )
@@ -1659,7 +1734,9 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
                 if s.get("fails") and not s.get("unmeasured")}
     if degraded:
         out += [
-            "Partially degraded (failed calls excluded from their arm's denominator, "
+            "Partially degraded (a question is dropped from EVERY arm unless all of them "
+            "completed all of its trials, so the `q` column is the paired exam, not the "
+            "questions generated; the losses below are calls, "
             "not scored as wrong): "
             + ", ".join(f"`{m}` ({s['fails']}/{s['attempts']})"
                         for m, s in sorted(degraded.items()))
@@ -1684,7 +1761,7 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     # withheld model, which contradicted the "**Not compared** — the backend answered"
     # paragraph printed ten lines above it in the same document.
     unmeasured_models = [m for m, r in reasons.items() if r == "unmeasured"]
-    unpaired_models = [m for m, r in reasons.items() if r == "unpaired"]
+    unpaired_models = [m for m, r in reasons.items() if r in ("unpaired", "exam too small")]
     gated = {m: s for m, s in summary.items() if reasons.get(m) is None}
     if broken:
         out.append(f"- Excluded (raw control failed — backend/config error, not comprehension): "

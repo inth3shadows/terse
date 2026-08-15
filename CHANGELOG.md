@@ -57,18 +57,25 @@ fails that pull request until the section has moved.
   left to guard against is the survivors being SELECTED, and the mechanism that selects them
   is loss correlated with the arm under test. A volume bar cannot tell a run where both arms
   flaked equally from one where only the longer-prompted arm truncated, and it charged the
-  first as if it were the second: simulated over 200 runs × 20 questions at 4 arms, a 1%
-  per-call failure rate withheld **13%** of models, 2% withheld **44%**, and 5% withheld
-  **98%**, while `_unmeasured` never fired at any of them. That is the regime the tool
+  first as if it were the second: simulated over 1000 runs × 20 questions × 4 arms at
+  `--trials 3`, a 1% per-call failure rate withheld **9%** of models, 2% withheld **41%**,
+  and 5% withheld **98%**, while `_unmeasured` never fired at any of them. That is the regime the tool
   actually runs in, and a gate that refuses most healthy runs gets raised or removed rather
   than trusted. `UNPAIRED_ASYMMETRY_SHARE` counts questions a FORM arm lost that its control
   did not, per form (an "any form short" test would give the payload family's two forms two
   chances against one control and read symmetric flake as one-sided). Under the same
-  simulation the new gate withholds **0% / 2.8% / 25%**, and the measured #268 case — the
-  form arm losing one question type of five, the control losing none — is exactly 20.0%
-  asymmetry and still refuses, so the calibration is unchanged where it was actually taken.
-  Direction is deliberate: a control-side excess understates the form (a false FAIL, the
-  safe error) and does not refuse. `UNPAIRED_VOLUME_SHARE` (0.50) remains as a loose
+  simulation the new gate withholds **0% / 0% / 16%**, and the measured #268 case — the
+  form arm returning no content on every trial of one question type of five, the control
+  losing none — is exactly 20.0% asymmetry and still refuses, so the calibration is
+  unchanged where it was actually taken. The statistic counts **trials, not short rows**,
+  and accumulates the two directions **separately**: a binary per-row test let a total
+  one-sided loss cancel to zero as soon as the control hiccuped once on the same questions,
+  and subtracting the directions let three stray 429s on the control flip a correct refusal
+  into "safe to enable `proxy --diff`" — a gate that rewards a worse backend. It is also
+  **direction-blind**: which arm carries the longest prompt depends on the family (the form
+  in the diff family, the uncompressed `raw` control in the payload family), so refusing
+  only form-side excess was backwards for fluency, where dropping the biggest payloads is
+  precisely what flatters terse. `UNPAIRED_VOLUME_SHARE` (0.50) remains as a loose
   backstop for the case asymmetry cannot see — losses can be perfectly even and still leave
   too little exam to generalise from.
 
