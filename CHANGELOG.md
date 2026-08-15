@@ -13,7 +13,79 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A loss that correlates with the arm under test can no longer publish a PASS** (`#280`).
+  When a model's unanswered calls track the arm being measured — a token-budget stop kills
+  the LONGEST prompt first, and the diff/terse arm's prompt is strictly longer than its
+  control's — `_form_stats` divided each arm by its OWN surviving trial count, scoring the
+  arm that lost the hard questions over an easier exam than its control. Measured: a real
+  **-20% FAIL** rendered as **-3% PASS**, printing "safe to enable `proxy --diff`".
+
+  This is the fourth pass at the same class of bug, and the first to treat it as
+  structural. `_form_stats(rows, form)` computes ONE arm, so every gap site called it twice
+  and subtracted — and nothing in that shape can enforce that the two arms answered the
+  same questions, because pairing is a property of the pair. Each previous pass wired
+  pairing into the sites it was looking at; the next site stayed writable by accident. The
+  third attempt's commit claimed "every diff-vs-control gap site", and reverting its
+  pairing at two of the three left the entire suite green.
+
+  So the shape is gone rather than the sites patched. `arm_gap` / `best_arm_gap` are now
+  the only way to turn a form and a control into comparable numbers: they gate
+  (`_unmeasured`, then a new `unpaired` refusal), pair the rows, and compute every arm over
+  that paired subset — numbers and gate arrive together, so a caller cannot take one
+  without the other. All seven sites route through it: the diff markdown table, the HTML
+  banner, both terminal forest plots, the soak by-depth table and its deepest-depth
+  verdict, and the fluency verdict. `build_fluency_report` also loses its duplicate copy of
+  `fluency_gap_rows`' best-of math.
+
+  The new per-depth gate made one branch newly reachable, and it was wrong: with the
+  deepest slice withheld while the pooled model still published, `deepest is None` was read
+  as "passed" and the soak printed **"No depth-correlated comprehension drift"** about the
+  one depth nobody scored. It now prints `NO VERDICT at the deepest tested depth`, and
+  withheld depths are named rather than left as an unexplained `n/a`.
+
+  Two things pairing must NOT treat as a loss, both of which it initially did. A row with
+  no `attempts` counter comes from `score_pack`, where uneven per-form trial counts are a
+  documented collection mode (#91) rather than a failure — `score_pack` never calls a
+  backend, so it has no transport to lose calls to, and voiding those rows deleted a
+  working feature. And withheld models are now split into **Not measured** (transport) and
+  **Not compared** (unpaired), which are different events and no longer share a sentence.
+
+  **No refusal ships with this.** `paired_rows` removes the bias outright — after pairing
+  both arms sit the identical exam — so nothing further is needed for correctness. An
+  additional bar was attempted, meant to decline when the surviving exam looked too
+  *selected* to generalise from, and five review rounds each found it publishing a false
+  PASS or refusing healthy runs: a volume share that voided 41% of models at a 2% per-call
+  failure rate; an asymmetry statistic that cancelled a total one-sided loss when the
+  control hiccupped once on the same questions, that unrelated control failures could buy
+  tolerance from, that went inert above `--trials 2` when scaled by trials, and that with
+  two form arms let a -23% regression publish as a PASS. It also made one soak case WORSE
+  than before the change. It is not required for the fix and is dropped rather than shipped
+  half-right; the honest position is that "how selected is the surviving exam" needs a
+  measurement nobody here has yet got right, not a fifth attempt at a threshold.
+
+  Every renderer now reads the exclusion vocabulary from one place (`REASON_LABEL` /
+  `REASON_HEADING` / `exclusion_note`), and `diff_gap_rows` / `fluency_gap_rows` return the
+  reason rather than a bare name list. Five of six renderers had been restating it wrongly:
+  the terminal fluency plot called an unpaired model "raw control failed" while its raw
+  control read 100%, the HTML page told the reader to check stderr for a `returned no
+  content` line about a backend that answered every call, and the soak's NO-VERDICT line
+  said "fix the backend(s) and re-run" about a run that would fail identically on re-run.
+  One fact restated independently at six sites, drifting at five — the same shape as the
+  bug this change exists to fix, in prose instead of numbers. The soak also now names
+  models it drops from its own verdict, which it previously discarded silently.
+
+  `_per_transform_table` pools paired rows too. It computes no gap, so it stays on the
+  `_form_stats` allowlist, but pooling unpaired rows reintroduced the same bias one section
+  below the fix: a partially-lost row contributes only its surviving trials, and the
+  surviving trials are the easy ones. Measured on the added fixture, that read 36% where
+  the paired truth is 33% — in the table whose own comment says a reader uses it to decide
+  which transforms to keep in the policy.
+
+  `_safe_ask`'s handling of a non-str reply is deliberately unchanged: on `main` the
+  `AttributeError` from calling `.strip()` inside the `try` is what converts "answerer
+  returned garbage" into "unanswered", and that is correct.
 
 ## [0.25.3] - 2026-08-14
 

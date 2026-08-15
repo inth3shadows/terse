@@ -22,6 +22,7 @@ from .report import (
     _sum,
     diff_gap_rows,
     dropeval_gap_rows,
+    exclusion_note,
     fluency_gap_rows,
     inconclusive_models,
 )
@@ -221,8 +222,11 @@ def build_terminal_diff_report(results: dict, form_label: str = "diff-form",
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
                            "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
     text = forest_bar_lines(plot_rows, form_label, control_label, color=color)
+    # `exclusion_note` rather than a hardcoded phrase: this line said "calls went
+    # unanswered" for every exclusion, including a model whose calls were all answered and
+    # whose arms simply could not be paired (#280).
     if excluded:
-        text += f"\n  (excluded — calls went unanswered: {', '.join(excluded)})"
+        text += f"\n  ({exclusion_note(excluded)})"
     return text
 
 
@@ -239,7 +243,7 @@ def build_terminal_fluency_report(results: dict, color: bool | None = None) -> s
                            "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
     text = forest_bar_lines(plot_rows, "best terse-form", "raw", color=color)
     if broken:
-        text += f"\n  (excluded — raw control failed: {', '.join(broken)})"
+        text += f"\n  ({exclusion_note(broken)})"
     return text
 
 

@@ -10,8 +10,9 @@ Palette, mark specs, and chart-form choices follow the project's data-viz method
   - savings % is a polarity value (above/below zero) -> diverging blue/red bars
   - tier attribution is part-to-whole across 3 fixed series -> categorical stacked bars
   - fluesncy/diff comprehension is per-model magnitude -> point+whisker (forest) rows
-Reuses report.py's stats math (_form_stats / _worst_case_gap) rather than
-re-deriving it, so the verdict a reader sees here always matches the markdown report.
+Reuses report.py's stats math (arm_gap / _worst_case_gap) rather than re-deriving it, so
+the verdict a reader sees here always matches the markdown report. `arm_gap` specifically,
+not `_form_stats` twice: the gap gate lives inside it (#280).
 """
 
 from __future__ import annotations
@@ -20,7 +21,16 @@ import html as _html
 from collections.abc import Sequence
 from typing import Any
 
-from .report import _ci, _form_stats, _pct, _sum, _unmeasured, _worst_case_gap
+from .report import (
+    _GAP_TOLERANCE,
+    REASON_HEADING,
+    REASON_LABEL,
+    _ci,
+    _pct,
+    _sum,
+    _worst_case_gap,
+    arm_gap,
+)
 
 # --- palette (dataviz skill reference instance) ---------------------------------
 
@@ -467,7 +477,7 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
     """HTML counterpart to report.build_diff_report / build_fluency_report's gap
     section: a forest plot of per-model accuracy with 95% CI, gated on the worst model."""
     plot_rows, gap_rows = [], {}
-    excluded: list[str] = []
+    excluded: dict[str, str | None] = {}
     for model, rows in results.items():
         n = len(rows)
         if not n:
@@ -477,20 +487,35 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
         # and this page rendered a green "✓ PASS" banner off calls that never happened.
         # A green banner is the single most quoted artifact of a run; it is the last
         # place a false pass should survive.
-        if _unmeasured(rows):
-            excluded.append(model)
+        #
+        # Routed through `arm_gap` (#280) rather than two bare `_form_stats` calls, so the
+        # pairing gate the markdown and terminal renderers apply cannot be missing here —
+        # which is exactly what it was: this page printed a green +7% PASS on a run the
+        # markdown correctly failed at -10%.
+        #
+        # The old arm detection was a `rows[0]`-key heuristic with a silent always-green
+        # branch: a payload-shaped row carrying no `diff_ok` set control := form, making
+        # the gap identically 0 and the banner unconditionally PASS. A row set with no
+        # `diff_ok` is not a diff run and gets no verdict at all.
+        #
+        # `all`, not `rows[0]`: a result file that MIXES shapes (a later row missing
+        # `diff_ok`) would pass a first-row check and then hit `int(r[form])` in
+        # `_form_stats` — a KeyError instead of an exclusion. Same defence `has_inline`
+        # already uses one file over.
+        if not all("diff_ok" in r and "terse_ok" in r for r in rows):
+            excluded[model] = "not a diff run"
             continue
-        facc, fse = _form_stats(rows, "terse_ok" if "terse_ok" in rows[0] else "diff_ok")
-        cacc, cse = facc, fse
-        if "diff_ok" in rows[0] and "terse_ok" in rows[0]:
-            facc, fse = _form_stats(rows, "diff_ok")
-            cacc, cse = _form_stats(rows, "terse_ok")
-        gap_rows[model] = (facc, fse, cacc, cse)
+        g = arm_gap(rows, "diff_ok", "terse_ok")
+        if g.excluded:
+            excluded[model] = g.excluded
+            continue
+        gap_rows[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
 
     worst = _worst_case_gap(gap_rows)
     for model, (facc, fse, cacc, cse) in gap_rows.items():
         gap = facc - cacc
-        passed = gap >= -0.05 - 1e-9
+        # `_GAP_TOLERANCE`, not a second hardcoded 0.05 that has to be remembered.
+        passed = gap >= -_GAP_TOLERANCE - 1e-9
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
                            "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
 
@@ -503,19 +528,35 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
                         f'(gap {worst.gap:+.0%} ±{worst.gap_ci * 100:.0f}pt)</div>')
     else:
         # Nothing survived the gate. Never render this neutral or absent: an empty verdict
-        # card on a page titled "comprehension gap" reads as "no gap found".
-        verdict_html = ('<div class="banner critical">NO VERDICT — nothing was measured. '
-                        'No model returned enough calls to score, so this run says nothing '
-                        'either way.</div>')
+        # card on a page titled "comprehension gap" reads as "no gap found". The second
+        # sentence is reason-specific: telling a reader to fix a backend that answered 90%
+        # of its calls sends them to re-run something that will fail the same way.
+        only_unpaired = bool(excluded) and all(w in ("unpaired", "exam too small") for w in excluded.values())
+        why = ("nothing could be compared. The backend answered, but no model had enough "
+               "questions completed by both arms to score a gap, so this run says nothing "
+               "either way. Lower <code>--trials</code>, or re-run once the backend stops "
+               "truncating."
+               if only_unpaired else
+               "nothing was measured. No model returned enough calls to score, so this "
+               "run says nothing either way.")
+        verdict_html = f'<div class="banner critical">NO VERDICT — {why}</div>'
     if excluded:
-        # Same wording as the markdown and the terminal renderer on purpose: one
-        # condition described three ways is how a reader concludes they are three
-        # different problems. "Unanswered" also covers the #268 case the old phrasing
-        # actively mis-stated — a backend that WAS reached and returned no content.
-        verdict_html += ('<p>Not measured — calls went unanswered for: '
-                         + ", ".join(f"<code>{_esc(m)}</code>" for m in excluded)
-                         + ". An unanswered call is not a wrong answer; check stderr for a "
-                           "<code>returned no content</code> line.</p>")
+        # One vocabulary, shared with the markdown and terminal renderers via
+        # `exclusion_note`. This paragraph used to say "calls went unanswered ... check
+        # stderr for a `returned no content` line" for EVERY exclusion, which is false for
+        # a model whose calls were all answered and whose arms simply could not be paired.
+        by_reason: dict[str, list[str]] = {}
+        for model, reason in sorted(excluded.items()):
+            by_reason.setdefault(reason or "unmeasured", []).append(model)
+        for why, models in sorted(by_reason.items()):
+            names = ", ".join(f"<code>{_esc(m)}</code>" for m in models)
+            tail = (" An unanswered call is not a wrong answer; check stderr for a "
+                    "<code>returned no content</code> line." if why == "unmeasured" else
+                    " A question counts only when every arm answered all of its trials, so "
+                    "one lost trial withholds the whole question." if why in ("unpaired", "exam too small")
+                    else "")
+            verdict_html += (f'<p>{_esc(REASON_HEADING.get(why, "Excluded"))} — '
+                             f'{_esc(REASON_LABEL.get(why, why))} for: {names}.{tail}</p>')
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
