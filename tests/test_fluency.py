@@ -433,12 +433,12 @@ def test_diff_gap_rows_matches_build_diff_report_verdict():
     assert facc == 0.8 and cacc == 1.0
     # Rows predating the failure counters carry no `fails`/`attempts`, so the #264 gate
     # must treat them as measured — otherwise every stored result file goes dark.
-    assert excluded == []
+    assert excluded == {}
 
 
 def test_diff_gap_rows_skips_empty_models():
     from terse.report import diff_gap_rows
-    assert diff_gap_rows({"empty": []}) == ({}, [])
+    assert diff_gap_rows({"empty": []}) == ({}, {})
 
 
 def test_fluency_gap_rows_best_of_terse_or_primer_vs_raw():
@@ -447,13 +447,14 @@ def test_fluency_gap_rows_best_of_terse_or_primer_vs_raw():
     gap_rows, broken = fluency_gap_rows({"m": _rows(20, 19, 20)})
     facc, _, cacc, _ = gap_rows["m"]
     assert facc == 1.0 and cacc == 1.0
-    assert broken == []
+    assert broken == {}
 
 
 def test_fluency_gap_rows_excludes_broken_raw_control():
     from terse.report import fluency_gap_rows
     gap_rows, broken = fluency_gap_rows({"broken": _rows(0, 0, 0), "good": _rows(20, 20, 20)})
-    assert "broken" not in gap_rows and broken == ["broken"]
+    # `broken` now maps model -> REASON, so a renderer can say WHY (#280).
+    assert "broken" not in gap_rows and broken == {"broken": "broken control"}
     assert "good" in gap_rows
 
 

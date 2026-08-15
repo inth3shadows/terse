@@ -359,6 +359,123 @@ def test_an_unpaired_exclusion_is_not_described_as_a_transport_failure():
         "an unpaired model was reported as a transport failure:\n" + md)
 
 
+def test_the_per_transform_table_pools_only_paired_rows():
+    """The by-transform columns are display-only, but they were still biased.
+
+    A row with a PARTIAL loss is the discriminating shape: `_form_stats` already drops
+    lost trials from the denominator, so a row an arm never touched contributes nothing
+    either way — but a row where the arm answered 1 of 3 trials contributes that one
+    surviving trial, and the surviving trials are the easy ones. Pooling unpaired rows
+    therefore reads HIGH. This is the table whose own comment says a reader uses it to
+    decide which transforms to keep in the policy.
+    """
+    rows = [{
+        "qid": "partial", "qtype": "lookup", "transform": "table", "trials": 3,
+        "raw_ok": 3, "raw_trials": 3,
+        "terse_ok": 1, "terse_trials": 1,     # 2 of 3 trials lost; the survivor was right
+        "primer_ok": 3, "primer_trials": 3,
+        "fails": 2, "attempts": 9,
+    }] + [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 3,
+        "raw_ok": 3, "raw_trials": 3,
+        "terse_ok": 1, "terse_trials": 3,     # genuinely poor: 1 of 3
+        "primer_ok": 3, "primer_trials": 3,
+        "fails": 0, "attempts": 9,
+    } for i in range(7)]
+    # The model itself must still publish, or the table never renders.
+    assert not _unmeasured(rows)
+    assert not unpaired(rows, "terse_ok", "primer_ok", "raw_ok")
+
+    md = build_fluency_report({"m": rows}, [])
+    line = [ln for ln in md.splitlines() if ln.startswith("| table |")]
+    assert line, md
+    terse_cell = [c.strip() for c in line[0].split("|")][3]
+    # paired: 7/21 = 33%. unpaired: 8/22 = 36%, flattered by the one surviving easy trial.
+    assert terse_cell == "33%", (
+        f"per-transform terse column was {terse_cell!r} — expected the paired 33%, not the "
+        f"unpaired 36%: {line[0]!r}")
+
+
+def test_the_soak_names_a_model_dropped_from_its_verdict():
+    """A model silently dropped from the ship gate is an undisclosed exclusion.
+
+    The soak `continue`d past it with no record anywhere, so the verdict could read
+    "Worst-case model `n` ... PASS" while `m`'s pooled gap had been withheld entirely —
+    the other report families name their exclusions and this one did not.
+    """
+    dropped = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 3,
+        "terse_ok": 3, "terse_trials": 3,
+        "diff_ok": 2, "diff_trials": 2, "fails": 1, "attempts": 6, "depth": 1,
+    } for i in range(6)]
+    clean = [{**r, "depth": 1} for r in _clean_rows()]
+    assert not _unmeasured(dropped) and unpaired(dropped, "diff_ok", "terse_ok")
+
+    md = build_diff_soak_report({"m": dropped, "n": clean})
+    assert "Excluded from the verdict" in md, md
+    assert "`m`" in md.split("## Verdict")[0], (
+        "the dropped model is not named anywhere before the verdict:\n" + md)
+
+
+def test_every_renderer_names_the_right_exclusion_reason():
+    """No renderer may call an `unpaired` model a transport failure — in ANY renderer.
+
+    The per-renderer version of this test existed for `build_diff_report` alone, which is
+    structurally the same mistake this whole change is about: fix the site you are looking
+    at, leave the next one to drift. Five of six renderers were in fact wrong — the
+    terminal fluency plot said "raw control failed" about a model whose raw control read
+    100%, and the HTML page told the reader to check stderr for a `returned no content`
+    line about a backend that answered every call.
+
+    Looping the invariant means a seventh renderer has to opt in to the shared vocabulary
+    rather than invent its own.
+    """
+    # trials=5 so a single lost trial per row is a small share of CALLS (6.7-10%, under the
+    # transport bar) while still voiding every QUESTION — which is precisely the regime the
+    # two gates disagree about, and the one whose prose kept coming out wrong.
+    diff_rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 5,
+        "terse_ok": 5, "terse_trials": 5, "diff_ok": 4, "diff_trials": 4,
+        "fails": 1, "attempts": 10,
+    } for i in range(6)]
+    payload_rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 5,
+        "raw_ok": 5, "raw_trials": 5, "terse_ok": 4, "terse_trials": 4,
+        "primer_ok": 5, "primer_trials": 5, "fails": 1, "attempts": 15,
+    } for i in range(6)]
+    # Both are unpaired-but-answered: the gate must fire, and the backend must look healthy.
+    for rows, forms in ((diff_rows, ("diff_ok", "terse_ok")),
+                        (payload_rows, ("terse_ok", "primer_ok", "raw_ok"))):
+        assert not _unmeasured(rows), "these tests need a HEALTHY backend"
+        assert unpaired(rows, *forms), "the unpaired gate must fire"
+
+    soak_rows = [{**r, "depth": 1} for r in diff_rows]
+    renderings = {
+        "diff markdown": build_diff_report({"m": diff_rows}),
+        "soak markdown": build_diff_soak_report({"m": soak_rows}),
+        "fluency markdown": build_fluency_report({"m": payload_rows}, []),
+        "html banner": build_html_diff_report({"m": diff_rows}),
+        "diff forest plot": build_terminal_diff_report({"m": diff_rows}, color=False),
+        "fluency forest plot": build_terminal_fluency_report({"m": payload_rows}, color=False),
+    }
+    # Phrases that assert something false about a backend that answered every call.
+    forbidden = ("calls went unanswered", "raw control failed", "control arm failed",
+                 "returned no content", "once the backend is reachable",
+                 "Fix the backend")
+    for name, text in renderings.items():
+        assert "m" in text, f"{name}: the withheld model is not named at all"
+        for phrase in forbidden:
+            assert phrase not in text, (
+                f"{name} describes an UNPAIRED exclusion as a transport failure "
+                f"({phrase!r}) — the backend answered every call:\n{text}")
+        # And it must POSITIVELY say what happened. Absence of the wrong words is not the
+        # same as telling the reader anything: without this, deleting a renderer's
+        # exclusion line entirely passes the check above.
+        assert "compar" in text.lower(), (
+            f"{name} withheld a model and never says the arms could not be compared — a "
+            f"silent exclusion:\n{text}")
+
+
 def test_the_diff_table_counts_regressions_over_the_paired_subset():
     """The diff-side twin of the fluency F5 test, with its own discriminating fixture.
 

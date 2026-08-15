@@ -79,6 +79,24 @@ fails that pull request until the section has moved.
   answered perfectly and the form arm never answered, because the obvious correlated-loss
   fixture makes paired and unpaired agree by accident.
 
+  Every renderer now reads the exclusion vocabulary from one place (`REASON_LABEL` /
+  `REASON_HEADING` / `exclusion_note`), and `diff_gap_rows` / `fluency_gap_rows` return the
+  reason rather than a bare name list. Five of six renderers had been restating it wrongly:
+  the terminal fluency plot called an unpaired model "raw control failed" while its raw
+  control read 100%, the HTML page told the reader to check stderr for a `returned no
+  content` line about a backend that answered every call, and the soak's NO-VERDICT line
+  said "fix the backend(s) and re-run" about a run that would fail identically on re-run.
+  One fact restated independently at six sites, drifting at five — the same shape as the
+  bug this change exists to fix, in prose instead of numbers. The soak also now names
+  models it drops from its own verdict, which it previously discarded silently.
+
+  `_per_transform_table` pools paired rows too. It computes no gap, so it stays on the
+  `_form_stats` allowlist, but pooling unpaired rows reintroduced the same bias one section
+  below the fix: a partially-lost row contributes only its surviving trials, and the
+  surviving trials are the easy ones. Measured on the added fixture, that read 36% where
+  the paired truth is 33% — in the table whose own comment says a reader uses it to decide
+  which transforms to keep in the policy.
+
   `_safe_ask`'s handling of a non-str reply is deliberately unchanged: on `main` the
   `AttributeError` from calling `.strip()` inside the `try` is what converts "answerer
   returned garbage" into "unanswered", and that is correct.

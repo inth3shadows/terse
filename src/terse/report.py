@@ -265,6 +265,53 @@ def best_arm_gap(rows: list[dict[str, Any]], forms: list[str], control: str,
     return _gap(rows, forms, control, display)
 
 
+# The ONE vocabulary for why a model was withheld. Every renderer reads it from here.
+#
+# Three exclusions reach the reports and they are different events: the backend never
+# answered, the backend answered but the arms cannot be compared, and the control itself
+# failed. Each renderer used to hardcode a single phrase for whatever landed in its
+# exclusion list — so the terminal plot called an unpaired model "raw control failed" while
+# its raw control read 100%, and the HTML page told a reader to check stderr for a
+# `returned no content` line about a backend that answered 90% of its calls.
+#
+# That is the #280 defect wearing different clothes: one fact, restated independently at
+# six sites, drifting at five of them. `exclusion_note` is to the prose what `arm_gap` is
+# to the numbers, and `test_every_renderer_names_the_right_exclusion_reason` loops the
+# invariant over all of them so a seventh renderer cannot invent a seventh phrasing.
+REASON_LABEL = {
+    "unmeasured": "calls went unanswered",
+    "unpaired": "too little of the question set could be compared",
+    "broken control": "control arm failed",
+    "not a diff run": "no diff arm in these rows",
+    "empty": "no rows",
+}
+
+# The heading each reason gets in prose renderers (markdown, HTML). "Not measured" and
+# "Not compared" are different claims and the distinction is the whole point: one says the
+# backend did not answer, the other says it did.
+REASON_HEADING = {
+    "unmeasured": "Not measured",
+    "unpaired": "Not compared",
+    "broken control": "Excluded",
+    "not a diff run": "Not applicable",
+    "empty": "Not measured",
+}
+
+
+def exclusion_note(reasons: dict[str, str | None]) -> str:
+    """`(excluded — <why>: a, b; <why>: c)`, grouped by reason. "" when nothing was cut.
+
+    One line, because its consumers are a terminal plot footer and an HTML paragraph that
+    both sat on a single hardcoded phrase before."""
+    if not reasons:
+        return ""
+    by: dict[str, list[str]] = {}
+    for model, why in sorted(reasons.items()):
+        by.setdefault(REASON_LABEL.get(why or "", str(why)), []).append(model)
+    return "excluded — " + "; ".join(
+        f"{label}: {', '.join(models)}" for label, models in sorted(by.items()))
+
+
 def _not_measured_lines(withheld: dict[str, tuple[str | None, int, int]]) -> list[str]:
     """The "**Not measured**" paragraph, split by WHY each model was withheld.
 
@@ -344,7 +391,7 @@ def _format_worst_case_line(verdict: GapVerdict, tol: float, form_label: str, co
 
 
 def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, float]],
-                                          list[str]]:
+                                          dict[str, str | None]]:
     """(form=diff_ok, control=terse_ok) gap-row tuples per model — the same shape
     `_worst_case_gap` and the bar-chart renderers (html/terminal) consume, computed
     once here so a chart's gap can never read differently than build_diff_report's.
@@ -357,19 +404,22 @@ def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, f
     off the same rows. `cli` prints both together for all three diff paths (`--diff`,
     `--diff-soak`, `--text-diff-eval`), and the chart is what a reader sees first."""
     out: dict[str, tuple[float, float, float, float]] = {}
-    excluded: list[str] = []
+    excluded: dict[str, str | None] = {}
     for model, rows in results.items():
         if not rows:
             continue
         g = arm_gap(rows, "diff_ok", "terse_ok")
         if g.excluded:
-            excluded.append(model)
+            # The REASON, not just the name. The terminal plot used to render every
+            # exclusion as "calls went unanswered", which is false for an `unpaired` model.
+            excluded[model] = g.excluded
             continue
         out[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
     return out, excluded
 
 
-def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, float]], list[str]]:
+def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, float]],
+                                             dict[str, str | None]]:
     """(form=best of terse/primer, control=raw) gap-row tuples per model, for the bar-
     chart renderers. Excludes any model whose raw control failed (0% — a backend/config
     error, not a comprehension result) AND any model too degraded by transport failures to
@@ -382,13 +432,13 @@ def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float
     false verdict #263 exists to kill, surviving in the renderer the reader looks at
     first."""
     out: dict[str, tuple[float, float, float, float]] = {}
-    broken: list[str] = []
+    broken: dict[str, str | None] = {}
     for model, rows in results.items():
         if not rows:
             continue
         g = best_arm_gap(rows, ["terse_ok", "primer_ok"], "raw_ok")
         if g.excluded:
-            broken.append(model)
+            broken[model] = g.excluded
             continue
         out[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
     return out, broken
@@ -1027,9 +1077,18 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
     else:
         # Nothing survived the gate. Say so instead of falling silent — this verdict is
         # read as a go/no-go on `proxy --diff`, and an empty one reads as "no objection".
-        out.append("- **NO VERDICT — nothing was measured.** No model returned enough "
-                   "calls to score, so this run says nothing about the diff form either "
-                   "way. Fix the backend(s) and re-run before enabling `proxy --diff`.")
+        # Reason-specific advice: "fix the backend" is wrong guidance for a run whose
+        # backend answered every call and whose arms merely could not be paired.
+        if unmeasured and all(w == "unpaired" for w, _, _ in unmeasured.values()):
+            out.append("- **NO VERDICT — nothing could be compared.** The backend answered, "
+                       "but no model had enough questions completed by both arms to score a "
+                       "gap, so this run says nothing about the diff form either way. Lower "
+                       "`--trials`, or re-run once the backend stops truncating, before "
+                       "enabling `proxy --diff`.")
+        else:
+            out.append("- **NO VERDICT — nothing was measured.** No model returned enough "
+                       "calls to score, so this run says nothing about the diff form either "
+                       "way. Fix the backend(s) and re-run before enabling `proxy --diff`.")
     out.append("")
     return "\n".join(out)
 
@@ -1119,7 +1178,9 @@ def build_diff_soak_report(results: dict) -> str:
     # exactly 0 and reads as PASS — and the by-depth table shows a flat, reassuring
     # no-drift line drawn entirely from calls that never happened.
     unmeasured = {m: rows for m, rows in results.items() if rows and _unmeasured(rows)}
-    withheld_depths: dict[str, set[int]] = {}  # model -> depths withheld by the per-depth gate
+    # model -> reason -> depths withheld by the per-depth gate. Keyed by reason because
+    # "the backend answered, but..." is false for a slice withheld by `_unmeasured`.
+    withheld_depths: dict[str, dict[str, set[int]]] = {}
     for model, rows in results.items():
         for depth in depths:
             drows = [r for r in rows if r["depth"] == depth]
@@ -1135,7 +1196,8 @@ def build_diff_soak_report(results: dict) -> str:
                 # Recorded, because an `n/a` in this table with no prose anywhere is how a
                 # withheld DEEPEST depth turned into a green "no drift" conclusion below.
                 if model not in unmeasured:
-                    withheld_depths.setdefault(model, set()).add(depth)
+                    withheld_depths.setdefault(model, {}).setdefault(
+                        dg.excluded or "unmeasured", set()).add(depth)
                 continue
             facc, fse = dg.control_acc, dg.control_se
             dacc, dse = dg.form_acc, dg.form_se
@@ -1161,33 +1223,52 @@ def build_diff_soak_report(results: dict) -> str:
         # An `n/a` row with no explanation is not a disclosure. Named here because the
         # deepest depth is exactly the one a soak exists to measure, and losing it silently
         # is how "no depth-correlated drift" gets printed about a depth nobody scored.
-        out += [
-            "**Depths not compared** — the backend answered, but one arm did not complete "
-            "enough of the same questions at: "
-            + ", ".join(f"`{m}` (depth {', '.join(str(d) for d in sorted(ds))})"
-                        for m, ds in sorted(withheld_depths.items()))
-            + ". Those depths are excluded from the verdict below rather than scored on a "
-              "question set the two arms did not share (#280).",
-            "",
-        ]
+        # Grouped by reason: a slice withheld because its calls FAILED must not be
+        # described as one where "the backend answered".
+        for why in sorted({w for d in withheld_depths.values() for w in d}):
+            at = ", ".join(
+                f"`{m}` (depth {', '.join(str(d) for d in sorted(ds[why]))})"
+                for m, ds in sorted(withheld_depths.items()) if why in ds)
+            lead = ("**Depths not compared** — the backend answered, but one arm did not "
+                    "complete enough of the same questions at: " if why == "unpaired" else
+                    "**Depths not measured** — too many calls went unanswered at: ")
+            out += [lead + at + ". Those depths are excluded from the verdict below rather "
+                    "than scored on a question set the two arms did not share (#280).", ""]
 
     gap_rows: dict[str, tuple[float, float, float, float]] = {}
+    pooled_out: dict[str, str | None] = {}
     for model, rows in results.items():
         if not rows or model in unmeasured:
             continue
         g = arm_gap(rows, "diff_ok", "terse_ok")
         if g.excluded:
+            # Recorded and named below. Dropping a model from the ship gate with no trace
+            # anywhere let a soak print "Worst-case model `N` ... PASS" while `M`'s pooled
+            # gap had been withheld entirely — the other two report families name their
+            # exclusions and this one did not.
+            pooled_out[model] = g.excluded
             continue
         gap_rows[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
+    if pooled_out:
+        out += [f"**Excluded from the verdict** — {exclusion_note(pooled_out)}.", ""]
 
     out += ["## Verdict", ""]
     worst = _worst_case_gap(gap_rows)
     if not worst:
         # Nothing survived the gate. An empty verdict on a drift soak reads as "no drift
         # found", which is the opposite of "nothing was looked at".
-        out.append("- **NO VERDICT — nothing was measured.** No model returned enough "
-                   "calls to score, so this run says nothing about diff-chain drift "
-                   "either way. Fix the backend(s) and re-run.")
+        # The advice has to match the cause. "Fix the backend(s) and re-run" sends a reader
+        # to re-run something that will fail identically when the backend answered fine and
+        # the arms simply could not be paired.
+        if pooled_out and all(w == "unpaired" for w in pooled_out.values()):
+            out.append("- **NO VERDICT — nothing could be compared.** The backend answered, "
+                       "but no model had enough questions completed by both arms to score a "
+                       "gap, so this run says nothing about diff-chain drift either way. "
+                       "Lower `--trials`, or re-run once the backend stops truncating.")
+        else:
+            out.append("- **NO VERDICT — nothing was measured.** No model returned enough "
+                       "calls to score, so this run says nothing about diff-chain drift "
+                       "either way. Fix the backend(s) and re-run.")
     if worst:
         out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "chain-form",
                                            "full-terse"))
@@ -1254,7 +1335,14 @@ def _per_transform_table(results: dict, summary: dict[str, dict[str, float]]) ->
         # policy change made on a backend outage.
         if summary.get(model, {}).get("unmeasured"):
             continue
-        for r in rows:
+        # PAIRED rows only. These columns pool one arm at a time — so they are not a gap
+        # and stay on the `_form_stats` allowlist — but pooling UNPAIRED rows reintroduced
+        # exactly the bias this change removes elsewhere: an arm that lost the hard
+        # questions of one transform is divided by its own smaller denominator and reads
+        # inflated. This is the table whose own comment says a reader uses it "to decide
+        # 'restrict the policy to the transforms that held'", so a flattered row here
+        # becomes a policy decision.
+        for r in paired_rows(rows, "terse_ok", "primer_ok", "raw_ok"):
             by_tf.setdefault(r["transform"], []).append(r)
     if not by_tf:
         return []
@@ -1529,7 +1617,11 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     # model answered wrongly. A counted unanswered call catches the partial case too, which
     # is the one that reaches a plausible-looking verdict (#263) — including, since #268,
     # a model that WAS reached and produced no content.
-    unmeasured_models = [m for m, s in summary.items() if s.get("unmeasured")]
+    # Split by REASON, not lumped. This line said "calls went unanswered" for every
+    # withheld model, which contradicted the "**Not compared** — the backend answered"
+    # paragraph printed ten lines above it in the same document.
+    unmeasured_models = [m for m, r in reasons.items() if r == "unmeasured"]
+    unpaired_models = [m for m, r in reasons.items() if r == "unpaired"]
     gated = {m: s for m, s in summary.items() if reasons.get(m) is None}
     if broken:
         out.append(f"- Excluded (raw control failed — backend/config error, not comprehension): "
@@ -1537,6 +1629,10 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     if unmeasured_models:
         out.append(f"- Excluded (calls went unanswered — not measured): "
                    f"{', '.join(f'`{m}`' for m in unmeasured_models)}.")
+    if unpaired_models:
+        out.append(f"- Excluded (the backend answered, but too little of the question set "
+                   f"could be compared across arms — not compared): "
+                   f"{', '.join(f'`{m}`' for m in unpaired_models)}.")
     # best terse-side form per model, carrying its own SE for the gap's confidence interval.
     # gap CI: raw and the best form are over the same questions (not independent), so
     # √(se_raw²+se_best²) is a conservative over-estimate of the gap's SE — the honest
