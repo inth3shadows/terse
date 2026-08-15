@@ -38,6 +38,7 @@ import pytest
 from terse.html_report import build_html_diff_report
 from terse.report import (
     UNMEASURED_FAIL_SHARE,
+    UNPAIRED_QUESTION_SHARE,
     _unmeasured,
     build_diff_report,
     build_diff_soak_report,
@@ -280,6 +281,155 @@ def test_the_fluency_table_counts_regressions_over_the_paired_subset():
 # The pairing predicate's own contract.
 # --------------------------------------------------------------------------------------
 
+def test_an_uneven_score_pack_still_publishes():
+    """A hand-built pack with fewer replies for one form is a COLLECTION mode, not a loss.
+
+    `score_pack` emits per-form trial counts precisely so a sparser form is scored over its
+    own denominator (#91). Those rows carry no `attempts`, because nothing was ever sent to
+    a backend — so an uneven count there is not evidence of a lost call, and pairing on it
+    would delete a documented feature to defend against a failure that cannot occur.
+    """
+    rows = [{
+        "tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "lookup", "transform": "table",
+        "trials": 3,
+        "raw_ok": 3, "raw_trials": 3,
+        "terse_ok": 2, "terse_trials": 2,   # only two replies collected for this form
+        "primer_ok": 3, "primer_trials": 3,
+    } for i in range(6)]
+    assert paired_rows(rows, "terse_ok", "raw_ok") == rows
+    assert not unpaired(rows, "terse_ok", "primer_ok", "raw_ok")
+
+    md = build_fluency_report({"m": rows}, [])
+    assert "n/a | n/a | n/a" not in md, "an uneven pack was withheld as if calls were lost"
+    assert "100%" in md  # the raw column still publishes
+
+
+def test_a_withheld_deepest_depth_is_not_reported_as_no_drift():
+    """Absence of a measurement is not a passing measurement.
+
+    The per-depth gate can withhold the deepest slice while the pooled model still
+    publishes, which made `deepest is None` reachable inside `if worst:` — where it was
+    read as "passed" and printed "No depth-correlated comprehension drift" about the one
+    depth the soak exists to probe.
+    """
+    def q(depth: int, *, lost: bool) -> dict:
+        return {
+            "qid": f"d{depth}", "qtype": "lookup", "transform": "table", "trials": 1,
+            "terse_ok": 1, "terse_trials": 1,
+            "diff_ok": 0 if lost else 1, "diff_trials": 0 if lost else 1,
+            "fails": 1 if lost else 0, "attempts": 2, "depth": depth,
+        }
+
+    # Depths 1-4 clean; the deepest loses 3 questions of 10 — 30% of that SLICE, over the
+    # refusal bar, so depth 5 is withheld. Pooled over the whole model it is 3 of 50
+    # questions and 3 of 100 calls, under every model-level gate, so the overall gap still
+    # publishes a PASS. That combination is what made the bug reachable.
+    rows = [q(d, lost=False) for d in (1, 2, 3, 4) for _ in range(10)]
+    rows += [q(5, lost=False) for _ in range(7)] + [q(5, lost=True) for _ in range(3)]
+
+    assert not _unmeasured(rows), "the per-model gate fired; this test would prove nothing"
+    assert not unpaired(rows, "diff_ok", "terse_ok"), "the model-level refusal fired"
+    deep = [r for r in rows if r["depth"] == 5]
+    assert unpaired(deep, "diff_ok", "terse_ok"), "depth 5 was not withheld"
+
+    md = build_diff_soak_report({"m": rows})
+    assert "**PASS**" in md, f"the overall gap should still publish a PASS:\n{md}"
+    assert "No depth-correlated comprehension drift" not in md, md
+    assert "NO VERDICT at the deepest tested depth" in md, md
+    # And the withheld depth is NAMED, rather than left as an unexplained `n/a`.
+    assert "Depths not compared" in md
+    assert "depth 5" in md
+
+
+def test_an_unpaired_exclusion_is_not_described_as_a_transport_failure():
+    """The report may not print "too many calls went unanswered" for a model whose calls
+    were answered — especially while printing the call count that refutes it."""
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 3,
+        "terse_ok": 3, "terse_trials": 3,
+        "diff_ok": 2, "diff_trials": 2,   # one trial lost on every question
+        "fails": 1, "attempts": 6,
+    } for i in range(6)]
+    assert not _unmeasured(rows)
+    assert unpaired(rows, "diff_ok", "terse_ok")
+
+    md = build_diff_report({"m": rows})
+    assert "Not compared" in md, md
+    assert "too many calls went unanswered" not in md, (
+        "an unpaired model was reported as a transport failure:\n" + md)
+
+
+def test_the_diff_table_counts_regressions_over_the_paired_subset():
+    """The diff-side twin of the fluency F5 test, with its own discriminating fixture.
+
+    `_correlated_loss_rows` cannot show this: its withheld row has `terse_ok == 0`, so the
+    predicate's `terse_ok == trials` clause rejects it paired or unpaired and the counts
+    agree by accident. The shape that separates them is a question the CONTROL answered
+    perfectly and the form arm never answered at all.
+    """
+    rows = [{
+        "qid": "never-answered", "qtype": "deref", "transform": "table", "trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS, "diff_ok": 0, "diff_trials": 0,
+        "fails": TRIALS, "attempts": TRIALS * 2,
+    }] + [{
+        "qid": f"ok{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS, "diff_ok": TRIALS, "diff_trials": TRIALS,
+        "fails": 0, "attempts": TRIALS * 2,
+    } for i in range(5)]
+    assert not _unmeasured(rows)
+    assert not unpaired(rows, "diff_ok", "terse_ok")
+
+    md = build_diff_report({"m": rows})
+    row = [ln for ln in md.splitlines() if ln.startswith("| `m` |")]
+    assert row, md
+    cells = [c.strip() for c in row[0].split("|")]
+    assert cells[5] == "0", (
+        f"regressions cell was {cells[5]!r} — the unanswered question is being counted as "
+        f"a wrong answer: {row[0]!r}")
+
+
+def test_the_fluency_table_counts_primer_recoveries_over_the_paired_subset():
+    """Same for the `primer recovers` column, which had no discriminating fixture either.
+
+    Needs a row the terse arm never answered but the PRIMER arm answered perfectly —
+    unpaired that reads as "the primer rescued a question terse got wrong", which is a
+    claim about a question terse was never asked.
+    """
+    rows = [{
+        "qid": "never-answered", "qtype": "deref", "transform": "table", "trials": TRIALS,
+        "raw_ok": TRIALS, "raw_trials": TRIALS,
+        "terse_ok": 0, "terse_trials": 0,
+        "primer_ok": TRIALS, "primer_trials": TRIALS,
+        "fails": TRIALS, "attempts": TRIALS * 3,
+    }] + [{
+        "qid": f"ok{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
+        "raw_ok": TRIALS, "raw_trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS,
+        "primer_ok": TRIALS, "primer_trials": TRIALS,
+        "fails": 0, "attempts": TRIALS * 3,
+    } for i in range(5)]
+    assert not _unmeasured(rows)
+    assert not unpaired(rows, "terse_ok", "primer_ok", "raw_ok")
+
+    md = build_fluency_report({"m": rows}, [])
+    row = [ln for ln in md.splitlines() if ln.startswith("| `m` |")]
+    assert row, md
+    cells = [c.strip() for c in row[0].split("|")]
+    assert cells[8] == "0", (
+        f"primer-recovers cell was {cells[8]!r} — a question terse never answered is being "
+        f"counted as one the primer rescued: {row[0]!r}")
+
+
+def test_the_payload_fixture_also_stays_under_both_pre_existing_gates():
+    """Sites 3b and 5 rest on this fixture; its margins deserve the same assertion."""
+    rows = _payload_correlated_loss_rows()
+    lost = sum(r["fails"] for r in rows) / sum(r["attempts"] for r in rows)
+    assert lost < UNMEASURED_FAIL_SHARE, f"pooled loss {lost:.1%} would trip `_unmeasured`"
+    assert not _unmeasured(rows)
+    dropped = (len(rows) - len(paired_rows(rows, "terse_ok", "primer_ok", "raw_ok"))) / len(rows)
+    assert dropped < UNPAIRED_QUESTION_SHARE, f"unpaired share {dropped:.1%} would refuse"
+
+
 def test_rows_without_per_form_counters_are_treated_as_fully_paired():
     """Legacy result files and `score_pack` output carry no `<form>_trials` key at all.
 
@@ -297,8 +447,10 @@ def test_unpaired_refuses_at_the_boundary_share():
     """`>=`, not `>`. One question type of five is exactly 20.0%, and that is the measured
     case in which a real -20% FAIL published as PASS. On a ship gate the boundary belongs
     on the refusing side."""
+    # `attempts` present: these rows come from a live harness, so an uneven trial count IS
+    # evidence of a lost call. Without it they would be read as a hand-built pack and kept.
     rows = [{"qid": str(i), "trials": 1, "terse_ok": 1, "terse_trials": 1,
-             "diff_ok": 1, "diff_trials": 1} for i in range(5)]
-    rows[0]["diff_trials"] = 0
+             "diff_ok": 1, "diff_trials": 1, "fails": 0, "attempts": 2} for i in range(5)]
+    rows[0].update({"diff_trials": 0, "fails": 1})
     assert (len(rows) - len(paired_rows(rows, "diff_ok", "terse_ok"))) / len(rows) == 0.20
     assert unpaired(rows, "diff_ok", "terse_ok")

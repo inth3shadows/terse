@@ -510,6 +510,21 @@ def _payload_rows(*, degraded: bool):
                  trials=2, fails=2, attempts=8) for _ in range(4)]
 
 
+def _depth_unpaired_rows(depth: int = 1):
+    """A model the per-MODEL gate lets through, withheld only by the per-DEPTH one (#280).
+
+    3 of 10 questions lost by the diff arm: 15% of calls, under `UNMEASURED_FAIL_SHARE`, so
+    `_unmeasured` stays quiet — but 30% of the question set, over `UNPAIRED_QUESTION_SHARE`,
+    so the arms cannot be compared. Without this shape the invariance test never exercises
+    the by-depth table at all: its `dead` fixture is caught per-model, which renders those
+    rows `n/a` for a reason that has nothing to do with the per-depth gate.
+    """
+    return [{"qid": f"q{i}", "qtype": "count", "transform": "table", "trials": 1,
+             "terse_ok": 1, "terse_trials": 1,
+             "diff_ok": 0 if i < 3 else 1, "diff_trials": 0 if i < 3 else 1,
+             "fails": 1 if i < 3 else 0, "attempts": 2, "depth": depth} for i in range(10)]
+
+
 def test_an_unmeasured_model_changes_no_renderers_verdict():
     """THE rule. Adding a backend that never answered must not move any verdict, in any
     renderer, in either direction.
@@ -568,6 +583,13 @@ def test_an_unmeasured_model_changes_no_renderers_verdict():
         ("html diff report",
          banner(build_html_diff_report(d_alone)),
          banner(build_html_diff_report(d_both))),
+        # The same rule for the OTHER withholding reason. `unpaired` is a model the backend
+        # answered, so `_unmeasured` never fires and only the per-depth gate withholds it —
+        # the case that reaches the by-depth table, which `_gate_signature` now covers.
+        ("soak markdown, unpaired-at-depth",
+         _gate_signature(build_diff_soak_report(s_alone)),
+         _gate_signature(build_diff_soak_report(
+             {"good": soak(good_d), "unpaired": _depth_unpaired_rows()}))),
     ]
 
     for name, baseline, with_dead in cases:

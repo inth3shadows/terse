@@ -34,10 +34,27 @@ fails that pull request until the section has moved.
   the only way to turn a form and a control into comparable numbers: they gate
   (`_unmeasured`, then a new `unpaired` refusal), pair the rows, and compute every arm over
   that paired subset — numbers and gate arrive together, so a caller cannot take one
-  without the other. All six sites route through it: the diff markdown table, the HTML
-  banner, both terminal forest plots, the soak by-depth table and deepest-depth verdict,
-  and the fluency verdict. `build_fluency_report` also loses its duplicate copy of
+  without the other. All seven sites route through it: the diff markdown table, the HTML
+  banner, both terminal forest plots, the soak by-depth table and its deepest-depth
+  verdict, and the fluency verdict. `build_fluency_report` also loses its duplicate copy of
   `fluency_gap_rows`' best-of math.
+
+  The new per-depth gate made one branch newly reachable, and it was wrong: with the
+  deepest slice withheld while the pooled model still published, `deepest is None` was read
+  as "passed" and the soak printed **"No depth-correlated comprehension drift"** about the
+  one depth nobody scored. It now prints `NO VERDICT at the deepest tested depth`, and
+  withheld depths are named rather than left as an unexplained `n/a`.
+
+  Two things pairing must NOT treat as a loss, both of which it initially did. A row with
+  no `attempts` counter comes from `score_pack`, where uneven per-form trial counts are a
+  documented collection mode (#91) rather than a failure — `score_pack` never calls a
+  backend, so it has no transport to lose calls to, and voiding those rows deleted a
+  working feature. And the `unpaired` refusal now has its own constant,
+  `UNPAIRED_QUESTION_SHARE`: it is a share of QUESTIONS, while `UNMEASURED_FAIL_SHARE` is a
+  share of CALLS, and borrowing the latter made reports describe an unpaired exclusion as
+  "too many calls went unanswered" while printing a call count that refuted it. Withheld
+  models are now split into **Not measured** (transport) and **Not compared** (unpaired),
+  which are different events and no longer share a sentence.
 
   Three further defects fixed in the same lines: the HTML banner's arm detection was a
   `rows[0]`-key heuristic with a silent always-green branch (a payload-shaped row set made
@@ -48,13 +65,19 @@ fails that pull request until the section has moved.
 
   Pinned two ways, because a shared code path and an unwired one produce identical green
   suites. `tests/test_gap_gate_boundary.py` asserts by AST that `_form_stats` is called
-  only from a named allowlist, so a seventh gap site cannot skip the gate without editing
-  that list in a reviewable diff; it carries a known-violation sweep proving the detector
-  can fail. `tests/test_paired_gap_gate.py` pins each site by mutation — every one verified
-  red-on-revert — on a fixture built to sit UNDER both pre-existing gates (8.3% pooled
-  loss, 16.7% unpaired share, against a 20% bar), asserted in the test itself, since the
-  previous attempt's headline test passed unmodified against the un-fixed code precisely
-  because its fixture tripped the older pooled rule instead.
+  only from a named allowlist, so an eighth gap site cannot skip the gate the obvious way
+  without editing that list in a reviewable diff; it carries a known-violation sweep
+  proving the detector can fail, and a test enumerating what it is deliberately blind to
+  (renamed imports, local rebinding, `getattr`, inline arithmetic) so the boundary is not
+  read as a guarantee it cannot give. `tests/test_paired_gap_gate.py` pins each site by
+  mutation — 15 mutants, every one verified red-on-revert — on fixtures built to sit UNDER
+  both pre-existing gates (8.3% pooled loss, 16.7% unpaired share, against a 20% bar), with
+  those margins asserted in the tests themselves, since the previous attempt's headline
+  test passed unmodified against the un-fixed code precisely because its fixture tripped
+  the older pooled rule instead. Each column fix carries a fixture that actually
+  discriminates: for `regressions` and `primer recovers` that means a question the CONTROL
+  answered perfectly and the form arm never answered, because the obvious correlated-loss
+  fixture makes paired and unpaired agree by accident.
 
   `_safe_ask`'s handling of a non-str reply is deliberately unchanged: on `main` the
   `AttributeError` from calling `.strip()` inside the `try` is what converts "answerer
