@@ -8,35 +8,46 @@ survive the worst case", not "what does terse cost on the payloads it actually w
 default, not a follow-up.
 
 The obvious construction — cap `scripts/bench/corpus/` by token size — biases the result.
-Measured (cl100k, full payloads), an ~8.5k cap keeps four:
+Measured (cl100k, full payloads), an ~8.5k cap keeps four (gh_dir_listing, gh_repo_single,
+gh_labels, gh_rate_limit) and cuts five, including terse's four largest SAVINGS by absolute
+tokens: gh_pulls, gh_workflow_runs, gh_issues, gh_commits. (By percentage the 4th-largest
+is gh_dir_listing, which the cap keeps — the ranking that matters here is tokens saved.)
+The per-payload figures are not restated here on purpose: they live in BENCHMARKS.md §1,
+which `tests/test_published_benchmarks.py` pins, and a third hand-copied version of that
+table would drift silently since `fetch_corpus.sh` can re-fetch the source data.
 
-    gh_dir_listing 6,736 tok / 31.4%   gh_repo_single 1,652 / 0.0%
-    gh_labels        632 tok / 15.2%   gh_rate_limit    357 / 13.4%
-
-and cuts five, including every one of terse's four largest wins — gh_workflow_runs
-(76,032 / 80.3%), gh_pulls (151,165 / 76.1%), gh_issues (48,032 / 38.8%), gh_commits
-(69,652 / 26.5%). What survives is dominated by payloads small enough that repetition
-never accumulates, and one survivor (gh_repo_single) compresses by nothing at all. The
-cap is not a clean "keeps only the low-compression shapes" filter — it also cuts
-gh_commits_flat at 2.4% — but it does remove the top of the range, which is the half the
-comprehension question is actually about.
+What the cap leaves is dominated by payloads small enough that repetition never
+accumulates, and one survivor (gh_repo_single) compresses by nothing at all. It is not a
+clean "keeps only the low-compression shapes" filter — it also cuts gh_commits_flat at
+2.4% — but it does remove the top of the range, which is the half the comprehension
+question is actually about.
 
 So this takes a RECORD PREFIX of each payload instead. Every payload stays represented,
 and each keeps its own nesting and intra-record repetition — only the number of records
 shrinks, to bring each into a token band a fluency question can be asked over without the
 prompt dominating the run.
 
-Two caveats, stated up front rather than discovered later:
+Three caveats, stated up front rather than discovered later:
 
-  - A 1-record prefix of `gh_pulls` loses the CROSS-record repetition that produced its
-    76.1% headline (dozens of repeated `repo` objects folding to one legend entry). It
-    still compresses on intra-record repetition, but the prefix shifts which tier does the
-    work. This corpus measures comprehension across a realistic compression range; it is
-    not a reproduction of BENCHMARKS §1.
+  - THE PREFIX MAKES THE QUESTIONS EASIER, not just the payload smaller. `gen_questions`
+    derives the count/enumerate answers from the records present, so an N-record prefix
+    asks the model to count to N and to enumerate N values. `questions.py:333` records
+    that "under-enumeration of wide tables was terse's measured recall gap" — precisely
+    what a short prefix stops testing. This is the flattery channel of this construction
+    and it is why the prefixes below are as large as the token budget allows rather than
+    as small as the exam permits. It cannot be eliminated: gh_pulls is ~5.0k tok/record,
+    so its full 30 records is a 151k-token prompt. Read any verdict from this corpus as
+    "at these record counts", never as "at production scale".
+  - A short prefix also loses CROSS-record repetition, so the codec here runs below the
+    published figure (gh_pulls reaches 68.9% at 6 records against 76.1% at 30). The prefix
+    shifts which tier does the work; this is not a reproduction of BENCHMARKS §1.
   - Not every payload contributes to the exam. Some generate no questions at all, and
-    `gh_repo_single` compresses to a byte-identical result, so its questions ask the model
-    the same text in both arms and can only tie. The summary table flags both, because a
-    headline codec range computed over payloads that measure nothing overstates coverage.
+    `gh_repo_single` compresses to a byte-identical result *when tiktoken is installed*, so
+    its questions ask the model the same text in both arms and can only tie. The summary
+    table flags both, because a headline codec range computed over payloads that measure
+    nothing overstates coverage. Both flags are tokenizer-dependent — without tiktoken,
+    `compress` picks candidates by a byte heuristic and the vacuous set changes — so the
+    summary says so in that mode.
 
     python scripts/gen_real_corpus.py [corpus_dir]   # default: corpus-real
 """
@@ -49,7 +60,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from terse.capture import capture_payload  # noqa: E402
+from terse.capture import capture_payload, load_corpus  # noqa: E402
 from terse.fluency.questions import gen_questions  # noqa: E402
 from terse.tokenize import count_cl100k  # noqa: E402
 from terse.transforms import compress, minify  # noqa: E402
@@ -57,20 +68,29 @@ from terse.transforms import compress, minify  # noqa: E402
 BENCH_CORPUS = Path(__file__).resolve().parent / "bench" / "corpus"
 
 # Records to keep per payload; None = the whole payload (already small enough, or not a
-# record list at all). Chosen to land every payload near ~10k cl100k tokens while keeping
-# each payload IN THE EXAM. That second constraint is not free: `gen_questions` needs at
-# least 2 records to build a record-list question, so a 1-record prefix silently drops a
-# payload out of the exam entirely — which for `gh_pulls` and `gh_workflow_runs` would
-# have removed terse's two highest-compression shapes, exactly the bias this construction
-# exists to avoid. Never lower one of these to 1.
+# record list at all). Sized AS LARGE AS a ~30k cl100k prompt allows, not as small as the
+# exam permits — see caveat 1: the record count is the count/enumerate answer, so a short
+# prefix quietly converts the hardest payloads into "count to 2". At the previous values
+# (pulls 2, runs 2) those two asked exactly that, at 44.3%/55.3% codec against the
+# 76.1%/80.3% production emits.
+#
+# Two hard floors, both load-bearing:
+#   - Never lower one of these to 1. `gen_questions` needs >= 2 records to build a
+#     record-list question (`transforms.py:182`), so a 1-record prefix silently drops the
+#     payload out of the exam entirely — which for gh_pulls and gh_workflow_runs would
+#     remove terse's two highest-compression shapes, the exact bias this file exists to
+#     avoid.
+#   - Raising these costs run time and degraded calls superlinearly (4 arms x trials, and
+#     #268's no-content failures scale with prompt length). ~30k is the ceiling that keeps
+#     a 4-arm trials=5 panel run tractable.
 PREFIXES: dict[str, int | None] = {
-    "gh_pulls": 2,
-    "gh_workflow_runs": 2,
-    "gh_issues": 5,
+    "gh_pulls": 6,
+    "gh_workflow_runs": 6,
+    "gh_issues": 8,
     "gh_rate_limit": None,
     "gh_dir_listing": None,
     "gh_labels": None,
-    "gh_commits": 3,
+    "gh_commits": 8,
     "gh_repo_single": None,
     "gh_commits_flat": 25,
 }
@@ -115,10 +135,11 @@ def main() -> int:
         cmp_text = compress(obj)
         cmp_tok = count_cl100k(cmp_text)
         codec = (1 - cmp_tok / raw_tok) if (raw_tok and cmp_tok is not None) else None
-        # Report the scope that was actually APPLIED: `prefix_of` returns the whole
-        # object untouched when it is not a list, so `n` alone can name a prefix that
-        # was never taken (a payload arriving as a dict envelope instead of a array).
-        scope = f"first {n}" if (n is not None and isinstance(obj, list)) else "whole"
+        # Report the scope that was actually APPLIED, measured off the result rather than
+        # the request: `prefix_of` returns the whole object untouched when it is not a
+        # list, and a re-fetch returning fewer records than the prefix would otherwise
+        # print "first 25" for 3 records. `len(obj)` can never disagree with the artifact.
+        scope = f"first {len(obj)}" if (n is not None and isinstance(obj, list)) else "whole"
         # Two ways a payload can be in the corpus but absent from the exam.
         nq = len(gen_questions(obj))
         vacuous = cmp_text == raw
@@ -147,12 +168,24 @@ def main() -> int:
         print("\nno payload contributes a non-vacuous question — the exam would be empty")
     else:
         # The range that matters is the one over payloads the exam can actually fail on.
-        # Without tiktoken there are no codecs to range over, but the exam is still real —
-        # report the coverage and say the range is unavailable rather than implying both.
+        # Without tiktoken there are no codecs to range over AND `compress` picks
+        # candidates by a byte heuristic instead, which changes which payloads come out
+        # vacuous — so the coverage count is tokenizer-dependent too, not just the range.
+        # Saying only "range unavailable" would present a shifted count as if it were firm.
         rng = (f"codec range {min(codecs):.1%}–{max(codecs):.1%}" if codecs
-               else "codec range unavailable (no tiktoken)")
+               else "codec range and vacuous flags unavailable/approximate (no tiktoken)")
         print(f"\n{len(scored)}/{len(rows)} payloads contribute {nq_total} non-vacuous "
               f"questions, {rng}")
+
+    # The loop reports what THIS run wrote; the eval loads whatever is in the directory.
+    # `max_per_tool=1` replaces a tool's stale envelope but cannot remove a tool dropped
+    # from PREFIXES, nor anything captured here previously — so a stale tool would be
+    # scored while going unmentioned above. Compare against the artifact and say so.
+    extra = sorted({e["tool"] for e in load_corpus(out_dir)} - set(PREFIXES))
+    if extra:
+        print(f"\nWARNING: {out_dir} also holds envelopes the eval WILL score but this "
+              f"run did not write: {', '.join(extra)}. Remove them or add them to "
+              f"PREFIXES — the table above does not describe them.", file=sys.stderr)
     return 0
 
 
