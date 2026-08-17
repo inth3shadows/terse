@@ -842,10 +842,16 @@ def _build_answerers(args: argparse.Namespace, make_openai) -> dict:
     Shared by plain `fluency` (`make_openai=fluency.openai_answerer`) and
     `fluency --drop-eval` (`make_openai` bound to `dropeval.openai_tool_answerer` +
     the retrieve tool) so the two eval modes stay configured identically — only the
-    answerer FACTORY differs, never the env/flag precedence. Every model is reached over
-    the OpenAI-compatible path (the broker pool or a loopback gateway) — there is no
-    other model backend."""
+    answerer FACTORY differs, never the env/flag precedence.
+
+    Two backends, selected per-model by id. A `cli:<alias>` id goes to `cli_answerer`
+    (`claude -p` on the OAuth subscription) and needs no base URL or key; everything else
+    goes over the OpenAI-compatible path. They mix freely in one `--models` list, which is
+    the point: the only way to reach a REAL Anthropic model here is `cli:`, because the
+    loopback gateway aliases every `claude-*` id onto DeepSeek (#249)."""
     import os
+
+    from . import fluency
 
     # Flags win over env so a credential-injecting launcher (e.g. secret_inject_env,
     # which sets the key under its own env var) can drive the CLI without a shell.
@@ -853,8 +859,17 @@ def _build_answerers(args: argparse.Namespace, make_openai) -> dict:
     base = args.base_url or os.environ.get("TERSE_FLUENCY_BASE_URL")
     key = os.environ.get(args.api_key_env or "TERSE_FLUENCY_API_KEY")
     models = args.models or os.environ.get("TERSE_FLUENCY_MODELS", "")
-    if base and key and models:
-        for m in (x.strip() for x in models.split(",") if x.strip()):
+    for m in (x.strip() for x in models.split(",") if x.strip()):
+        if m.startswith(fluency.CLI_PREFIX):
+            if make_openai is not fluency.openai_answerer:
+                # --drop-eval needs a TOOL-CALLING answerer; `claude -p --output-format
+                # json` returns prose, not tool calls. Refusing loudly beats handing that
+                # mode an answerer that can never call `terse.retrieve` and scoring the
+                # resulting silence as "the model declined to retrieve".
+                raise SystemExit(f"terse fluency: {m}: the cli: backend does not support "
+                                 f"--drop-eval (it cannot make tool calls)")
+            answerers[m] = fluency.cli_answerer(m[len(fluency.CLI_PREFIX):])
+        elif base and key:
             answerers[m] = make_openai(base, key, m)
     return answerers
 
@@ -1703,7 +1718,10 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--policy", help="policy file with a drop-to-retrieve field (used only "
                                     "by --drop-eval)")
     f.add_argument("--base-url", help="OpenAI-compatible base URL (else $TERSE_FLUENCY_BASE_URL)")
-    f.add_argument("--models", help="comma-separated model ids (else $TERSE_FLUENCY_MODELS)")
+    f.add_argument("--models", help="comma-separated model ids (else $TERSE_FLUENCY_MODELS); "
+                   "a cli:<alias> id (e.g. cli:opus) runs `claude -p` on the OAuth "
+                   "subscription instead of the OpenAI-compatible endpoint — the only way "
+                   "to reach a real Anthropic model")
     f.add_argument("--api-key-env", default="TERSE_FLUENCY_API_KEY",
                    help="env var holding the API key (default TERSE_FLUENCY_API_KEY)")
     f.add_argument("--bars", action="store_true",
