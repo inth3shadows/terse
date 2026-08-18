@@ -188,9 +188,14 @@ def test_no_success_count_can_exceed_its_own_trial_count():
     for n_fail in (0, 1, 3, 5, 12):
         for row in _live_rows(n_fail):
             for form in ("retrieve", "answer", "handle", "control"):
-                ok, t = row.get(f"{form}_ok"), row.get(f"{form}_trials")
+                ok = row.get(f"{form}_ok")
                 if ok is None:
                     continue
+                # Mirror `_form_stats`' own lookup: a per-form `<form>_trials` when the row
+                # carries one, else the shared `trials`. The treatment arm deliberately
+                # carries none, so it divides by `trials` — checking a key that is absent
+                # by design would test the test, not the invariant.
+                t = row.get(f"{form}_trials", row["trials"])
                 assert 0 <= ok <= t, f"{form}: {ok} successes over {t} trials (n_fail={n_fail})"
 
 
@@ -198,6 +203,56 @@ def test_the_report_renders_rather_than_crashing_when_calls_fail():
     """End-to-end guard on the same invariant: `_form_stats` -> math.sqrt(negative)."""
     rows = _live_rows(n_fail=4)
     build_dropeval_report({"m": rows})  # must not raise
+
+
+def test_a_treatment_error_stays_IN_the_recall_denominator_and_is_scored_a_miss():
+    """The regression this test exists for: adding `retrieve_trials = trials - errors`
+    removed errored trials from the recall/precision/handle denominators, turning a 33%
+    recall FAIL into a 100% PASS at an 11% error rate — under the INCONCLUSIVE gate, so
+    nothing withheld it.
+
+    Direction is what decides this. gap = treatment - control, so scoring a treatment
+    error as a MISS pushes the gap negative (the drop looks worse — conservative), while
+    excluding it flatters the treatment. final-accuracy is protected by `paired_rows`;
+    recall/precision/handle are NOT, so they must keep every trial in the denominator.
+    `openai_tool_answerer`'s own comment says so."""
+    rows = _live_rows(n_fail=4, trials=3)
+    assert rows
+    for r in rows:
+        # The treatment arm must NOT carry its own denominator...
+        for form in ("retrieve", "answer", "handle"):
+            assert f"{form}_trials" not in r, (
+                f"{form}_trials removes errored trials from the denominator — the "
+                f"documented dangerous direction")
+        # ...so _form_stats divides by the shared, full trial count.
+        assert r["trials"] == 3
+    # ...while the CONTROL does, because deflating the control would flatter the drop.
+    assert all("control_trials" in r for r in rows)
+
+
+def test_a_degraded_recall_arm_reports_a_low_number_not_a_perfect_one():
+    """End-to-end form of the same regression: two of three trials return nothing, the
+    surviving one is correct. That is 33% recall, not 100%."""
+    rows = _live_rows(n_fail=8, trials=3)
+    recall = [r for r in rows if r["kind"] == "recall"]
+    assert recall, "fixture must produce recall rows"
+    acc = sum(r["retrieve_ok"] for r in recall) / sum(r["trials"] for r in recall)
+    assert acc < 1.0, "a model that failed most of its calls must not read as 100% recall"
+
+
+def test_the_control_denominator_EXCLUDES_the_controls_own_failures():
+    """The mirror of the test above, and the dangerous direction. gap = treatment -
+    control, so scoring a failed CONTROL call as a miss deflates the control, shrinks the
+    gap, and flatters the drop — #268 on the control side, with no k>t crash to expose it.
+    The control therefore carries its own denominator where the treatment does not."""
+    rows = _live_rows(n_fail=6, trials=3)
+    assert rows
+    lost = [r for r in rows if r["control_errors"] > 0]
+    assert lost, "fixture must lose at least one control call or it tests nothing"
+    for r in lost:
+        assert r["control_trials"] == r["trials"] - r["control_errors"], (
+            "control_trials must remove the control's own failures, else a failed control "
+            "call is scored as a wrong answer and the gap flatters the drop")
 
 
 def test_errors_are_recorded_PER_ARM_not_only_as_a_total():

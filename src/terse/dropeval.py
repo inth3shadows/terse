@@ -559,16 +559,28 @@ def _run_questions_against(questions: list[DropQuestion], applied: policy_mod.Ap
         row = {
             "qid": q.qid, "kind": q.kind, "trials": trials,
             "retrieve_ok": retrieve_ok, "answer_ok": answer_ok, "handle_ok": handle_ok,
-            # Per-arm DENOMINATORS excluding calls that never returned. Without these a
-            # transport failure or an empty reply is scored as a WRONG ANSWER, which is
-            # #268 on this path — and #269's own reproduction shows it: failed-call count
-            # rank-ordered final-accuracy exactly (2 fails -> 54%, 0 -> 88%). `_form_stats`
-            # prefers `<form>_trials` over the shared `trials`, so naming them this way is
-            # all it takes. retrieve/answer/handle all come from the treatment arm and so
-            # share its surviving-trial count.
-            "retrieve_trials": trials - errors,
-            "answer_trials": trials - errors,
-            "handle_trials": trials - errors,
+            # NO per-form denominator for the TREATMENT arm — deliberately, and note the
+            # asymmetry with `control_trials` below. An earlier revision of this change
+            # added `retrieve_trials`/`answer_trials`/`handle_trials` = `trials - errors`,
+            # which `_form_stats` prefers over the shared `trials`, and so removed errored
+            # trials from the recall/precision/handle denominators. That reverses the
+            # decision `openai_tool_answerer` documents ("DELIBERATELY NOT excluded from
+            # the accuracy denominators ... excluding would be the dangerous direction"),
+            # and it is not theoretical: measured on identical model behaviour, a recall
+            # column of 33% (FAIL) became 100% (PASS, "safe to enable drop-to-retrieve") at
+            # an 11% error rate — far under the INCONCLUSIVE gate. `Turn.error` covers a
+            # `no_content` / token-budget stop, which is prompt-length correlated, and the
+            # treatment arm carries the longest prompt here, so the losses are exactly the
+            # arm-correlated kind. final-accuracy is protected by `paired_rows`;
+            # recall/precision/handle are not.
+            #
+            # The direction is what decides it. gap = treatment - control:
+            #   treatment errors scored as MISSES  -> treatment lower -> gap more negative
+            #                                         -> the drop looks worse. Conservative.
+            #   control errors scored as MISSES    -> control lower  -> gap less negative
+            #                                         -> the drop looks BETTER. Dangerous.
+            # So the treatment keeps every trial in its denominator, and only the control
+            # gets one that excludes its own failures.
             # Total failed calls across BOTH arms, with the matching attempt count, so the
             # INCONCLUSIVE gate reads a true ratio rather than dividing two-arm failures by
             # one arm's trials.
