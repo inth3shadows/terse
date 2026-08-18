@@ -156,6 +156,23 @@ def test_a_timeout_kills_the_group_and_returns_a_non_answer(monkeypatch):
     assert killed == [proc.pid]
 
 
+def test_a_permission_error_killing_the_group_is_reported_not_swallowed(monkeypatch, capsys):
+    """If we can't signal the group we ourselves created, that's surprising and worth
+    a loud stderr line — silently falling back to killing only the direct child would
+    reintroduce the orphaned-descendants quota leak this code exists to prevent."""
+    proc = _FakeProc(timeout=True)
+    _spy(monkeypatch, proc)
+    monkeypatch.setattr("os.getpgid", lambda pid: pid)
+
+    def raise_perm(pgid, sig):
+        raise PermissionError()
+
+    monkeypatch.setattr("os.killpg", raise_perm)
+    assert cli_answerer("opus", timeout=1)("", "q") is None
+    assert proc.killed
+    assert "permission denied" in capsys.readouterr().err.lower()
+
+
 def test_is_error_is_a_non_answer_even_on_a_clean_exit(monkeypatch):
     _spy(monkeypatch, _FakeProc(out=json.dumps({"is_error": True, "result": "nope"})))
     assert cli_answerer("opus")("", "q") is None
@@ -163,6 +180,13 @@ def test_is_error_is_a_non_answer_even_on_a_clean_exit(monkeypatch):
 
 def test_non_json_stdout_is_a_non_answer(monkeypatch):
     _spy(monkeypatch, _FakeProc(out="not json at all"))
+    assert cli_answerer("opus")("", "q") is None
+
+
+def test_valid_json_that_is_not_an_object_is_a_non_answer_not_a_crash(monkeypatch):
+    """`json.loads` can succeed on a bare `null`/array/string — `.get()` on that would
+    raise AttributeError and skip the stderr diagnostic every other failure path prints."""
+    _spy(monkeypatch, _FakeProc(out="null"))
     assert cli_answerer("opus")("", "q") is None
 
 

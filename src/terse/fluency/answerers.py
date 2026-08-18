@@ -11,8 +11,10 @@ cost issue #249 a whole panel.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -142,7 +144,11 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
     """
     # One scratch dir per answerer, not per call: a cwd with no CLAUDE.md and an empty MCP
     # config, so no project instructions or tool definitions leak into the prompt under test.
+    # Cleaned up at interpreter exit (atexit, not a `with`) because the returned `ask`
+    # closure is called many times across a whole panel run — there is no single point
+    # to `rmtree` it right after creation.
     workdir = tempfile.mkdtemp(prefix="terse-fluency-cli-")
+    atexit.register(shutil.rmtree, workdir, ignore_errors=True)
     mcp_cfg = os.path.join(workdir, "empty-mcp.json")
     with open(mcp_cfg, "w") as fh:
         fh.write('{"mcpServers":{}}')
@@ -167,7 +173,15 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
         except subprocess.TimeoutExpired:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+            except ProcessLookupError:
+                pass  # group already exited — nothing left to orphan
+            except PermissionError:
+                # Can't signal the group we created ourselves — should not happen for a
+                # same-user start_new_session child, but if it does, say so loudly rather
+                # than silently leaving descendants running past the timeout.
+                print(f"terse fluency: {alias}: permission denied killing its process "
+                      f"group after timeout — descendants may keep running and burn "
+                      f"subscription quota", file=sys.stderr)
                 proc.kill()
             proc.communicate()
             print(f"terse fluency: {alias} timed out after {timeout}s — counted as a "
@@ -182,6 +196,8 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
         try:
             body = json.loads(out)
         except ValueError:
+            body = None
+        if not isinstance(body, dict):
             print(f"terse fluency: {alias} returned non-JSON: {out[:200]} — counted as a "
                   f"non-answer, not scored", file=sys.stderr)
             return None
