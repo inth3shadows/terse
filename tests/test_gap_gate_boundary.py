@@ -47,10 +47,14 @@ ALLOWED = {
     "_gap",
     # Display-only, single-arm pooled columns. No gap, no verdict.
     "_per_transform_table",
-    # dropeval scores against a fixed 100% ideal rather than a measured control arm, so
-    # there is no second arm to pair with. That is itself a defect — see #269, which
-    # proposes giving final-accuracy a real control arm. When it does, these two move
-    # behind `arm_gap` and come OFF this list.
+    # dropeval's `dropeval_gap_rows` / `build_dropeval_report` used to be here, exempted
+    # because final-accuracy was scored against a fixed 100% ideal and so had no second arm
+    # to pair with. #269 gave it a measured no-drop control arm, they moved behind
+    # `arm_gap` (via `_accuracy_gate`), and they came off this list — which is exactly what
+    # the note that used to sit here said would happen. The `_form_stats` calls they still
+    # make are the retrieve-recall / no-overfetch / handle-accuracy columns, which really
+    # are single pooled arms against a fixed ideal: a tool call either happened or it did
+    # not, so 100% IS the target and there is no second arm by construction.
     "dropeval_gap_rows",
     "build_dropeval_report",
 }

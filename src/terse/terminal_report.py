@@ -251,30 +251,54 @@ _DROPEVAL_METRICS = (("recall", "retrieve-recall"), ("precision", "no-overfetch"
                      ("accuracy", "final-accuracy"))
 
 
-def build_terminal_dropeval_report(results: dict, color: bool | None = None) -> str:
+def build_terminal_dropeval_report(results: dict, color: bool | None = None,
+                                   accept_degraded: bool = False) -> str:
     """Terminal counterpart to report.build_dropeval_report's verdict section — three
     forest plots (retrieve-recall, no-overfetch, final-accuracy), each vs a fixed
     100%-ideal control, gated on the worst model per metric. Fed by report.py's
-    dropeval_gap_rows so the gap a chart shows can never diverge from the markdown."""
+    dropeval_gap_rows so the gap a chart shows can never diverge from the markdown.
+
+    `accept_degraded` must mirror build_dropeval_report's own flag: without it, this used
+    to refuse unconditionally on ANY transport-error rate past the INCONCLUSIVE threshold,
+    while the markdown — given the same flag by `cli` — rendered a full verdict over the
+    surviving questions right below it (review finding 4 on #300, "so chart and markdown
+    cannot disagree" holding for every case except the one operators reach for it)."""
     dead = inconclusive_models(results)
-    if dead:
+    if dead and not accept_degraded:
         # Never draw a forest plot from transport errors: the bars would be indistinguishable
         # from a model that answered and got it wrong. Same refusal build_dropeval_report
         # renders, from the same helper, so chart and markdown cannot disagree.
         return "  INCONCLUSIVE — " + ", ".join(
             f"{m} failed {e}/{a} model calls" for m, (e, a) in sorted(dead.items()))
-    gaps = dropeval_gap_rows(results)
+    gaps, excluded = dropeval_gap_rows(results)
     if not gaps:
         return "  (no data)"
     sections = []
+    if dead and accept_degraded:
+        sections.append("  (degraded run accepted --accept-degraded; see the markdown "
+                        "report for the per-arm failure split before trusting this)")
     for key, label in _DROPEVAL_METRICS:
         plot_rows = []
         for model, metrics in gaps.items():
-            facc, fse, cacc, cse = metrics[key]
+            # `.get`: dropeval_gap_rows omits "accuracy" entirely when no no-drop control
+            # arm ran (#269). Drawing it against a 100% that was never measured is the
+            # thing that issue exists to stop, and a KeyError here would be the renderer
+            # insisting on a number the report declined to publish.
+            metric = metrics.get(key)
+            if metric is None:
+                continue
+            facc, fse, cacc, cse = metric
             gap = facc - cacc
             passed = gap >= -_GAP_TOLERANCE - 1e-9
             plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
                                "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
-        sections.append(f"{label}:")
-        sections.append(forest_bar_lines(plot_rows, label, "ideal (100%)", color=color))
+        if not plot_rows:
+            continue
+        # final-accuracy is the one metric with a measured control; the other two really
+        # are gated against a fixed ideal, so they must not share a label.
+        control_label = "no-drop control" if key == "accuracy" else "ideal (100%)"
+        section = f"{label}:\n" + forest_bar_lines(plot_rows, label, control_label, color=color)
+        if key == "accuracy" and excluded:
+            section += f"\n  ({exclusion_note(excluded)})"
+        sections.append(section)
     return "\n\n".join(sections)
