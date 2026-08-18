@@ -125,11 +125,17 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
     twice under Anthropic names, and reported it as multi-vendor. `modelbench` hit the same
     wall and records it at `runner.py:423`. This backend is the only path to the real thing.
 
-    **The system slot is passed explicitly, always.** `--system-prompt` REPLACES Claude
-    Code's default preamble rather than appending to it, so the primer arm and the
-    no-primer arm differ by exactly the primer and nothing else. Omitting the flag for the
-    no-primer arm would silently hand that arm Claude Code's own multi-thousand-token
-    system prompt — an arm-correlated confound in the one comparison #249 turns on.
+    **The system slot is passed explicitly, always.** `--system-prompt` replaces the
+    *system prompt* only — NOT, as an earlier draft of this claimed, Claude Code's whole
+    default preamble. Measured directly: `""` costs 19,816 input tokens, `"You are a
+    calculator."` costs 19,821 — the ~19.8k of tool-definition/context preamble is present
+    in BOTH arms, constant, and so not a confound. What the flag does buy is real: the
+    primer arm and the no-primer arm still differ by exactly the primer content and
+    nothing else, because omitting the flag for the no-primer arm would hand that arm its
+    own multi-thousand-token system prompt on top of the shared preamble — an
+    arm-correlated confound in the one comparison #249 turns on. Treat this as a validity
+    caveat on absolute accuracy and on any cross-backend comparison, not on the
+    primer/no-primer contrast itself.
 
     **The environment is scrubbed on purpose.** `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
     / `ANTHROPIC_API_KEY` are dropped from the child env; a session running under
@@ -154,41 +160,76 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
         fh.write('{"mcpServers":{}}')
     env = {k: v for k, v in os.environ.items()
            if k not in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")}
+    # Per-answerer circuit breaker: once THIS model's subscription window is confirmed
+    # exhausted, every remaining call for it returns immediately instead of spawning
+    # another doomed `claude -p` process that can only time out or quota-fail.
+    quota_hit = False
+
+    def _kill_group(proc: subprocess.Popen, *, why: str) -> None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # group already exited — nothing left to orphan
+        except PermissionError:
+            # Can't signal the group we created ourselves — should not happen for a
+            # same-user start_new_session child, but if it does, say so loudly rather
+            # than silently leaving descendants running past the timeout.
+            print(f"terse fluency: {alias}: permission denied killing its process "
+                  f"group ({why}) — descendants may keep running and burn "
+                  f"subscription quota", file=sys.stderr)
+            proc.kill()
 
     def ask(system: str, user: str) -> str | None:
+        nonlocal quota_hit
+        if quota_hit:
+            return None
         argv = ["claude", "-p", "--model", alias, "--output-format", "json",
                 "--strict-mcp-config", "--mcp-config", mcp_cfg,
+                # No built-in tools either (Bash/Read/Write/...) — openai_answerer sends
+                # none, so the two backends must answer under equivalent conditions. A
+                # model electing a tool call here, failing in the scratch dir, and
+                # replying with prose like "I can't run that" would otherwise be a
+                # non-None string scored as a WRONG answer, not a non-answer.
+                "--tools", "",
                 # Empty string is deliberate and load-bearing — see docstring.
                 "--system-prompt", system]
         # start_new_session puts claude and everything it spawns in a fresh process group.
         # Killing only the direct child on timeout orphans that tree, and the orphans keep
         # generating — burning subscription quota invisibly for the rest of the run.
-        proc = subprocess.Popen(
-            argv, cwd=workdir, env=env, text=True,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
         try:
-            out, err = proc.communicate(user, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass  # group already exited — nothing left to orphan
-            except PermissionError:
-                # Can't signal the group we created ourselves — should not happen for a
-                # same-user start_new_session child, but if it does, say so loudly rather
-                # than silently leaving descendants running past the timeout.
-                print(f"terse fluency: {alias}: permission denied killing its process "
-                      f"group after timeout — descendants may keep running and burn "
-                      f"subscription quota", file=sys.stderr)
-                proc.kill()
-            proc.communicate()
-            print(f"terse fluency: {alias} timed out after {timeout}s — counted as a "
+            proc = subprocess.Popen(
+                argv, cwd=workdir, env=env, text=True, errors="replace",
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except OSError as e:
+            print(f"terse fluency: {alias}: could not launch claude ({e}) — counted as a "
                   f"non-answer, not scored", file=sys.stderr)
             return None
+        try:
+            try:
+                out, err = proc.communicate(user, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _kill_group(proc, why="timeout")
+                try:
+                    proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass  # best-effort drain — the group is already dead or unkillable
+                print(f"terse fluency: {alias} timed out after {timeout}s — counted as a "
+                      f"non-answer, not scored", file=sys.stderr)
+                return None
+        finally:
+            # Safety net for anything that unwinds through here WITHOUT going through the
+            # timeout branch above — KeyboardInterrupt or MemoryError during
+            # communicate() is a BaseException/Exception `_safe_ask` upstream may not
+            # stop from propagating. Leaving the group running past this point is the
+            # exact orphaned-quota-burn incident modelbench already hit once.
+            if proc.poll() is None:
+                _kill_group(proc, why="cleanup")
         if proc.returncode != 0:
             why = "subscription window limit" if _looks_like_quota(err, out) else "cli error"
+            if why == "subscription window limit":
+                quota_hit = True
             print(f"terse fluency: {alias} {why} (exit {proc.returncode}): "
                   f"{(err or out)[:200]} — counted as a non-answer, not scored",
                   file=sys.stderr)
@@ -204,8 +245,11 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
         # `is_error` is the CLI's own flag for "this turn failed"; the quota wall arrives
         # here as well as via a nonzero exit, depending on where it lands.
         if body.get("is_error"):
+            error_text = str(body.get("result"))
+            if _looks_like_quota(error_text):
+                quota_hit = True
             print(f"terse fluency: {alias} reported is_error "
-                  f"({str(body.get('result'))[:200]}) — counted as a non-answer, not "
+                  f"({error_text[:200]}) — counted as a non-answer, not "
                   f"scored", file=sys.stderr)
             return None
         result = body.get("result")

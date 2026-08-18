@@ -20,16 +20,25 @@ from terse.fluency import CLI_PREFIX, cli_answerer
 class _FakeProc:
     """Stand-in for Popen: records what it was constructed with, replays a canned result."""
 
-    def __init__(self, out: str = "", err: str = "", code: int = 0, *, timeout: bool = False):
+    def __init__(self, out: str = "", err: str = "", code: int = 0, *, timeout: bool = False,
+                raises: BaseException | None = None):
         self._out, self._err, self.returncode, self._timeout = out, err, code, timeout
+        self._raises = raises
         self.pid = 4242
         self.killed = False
+        self._finished = False  # poll() mirrors this — None until a call "reaps" it
 
     def communicate(self, _input=None, timeout=None):
+        if self._raises is not None:
+            raise self._raises
         if self._timeout:
             self._timeout = False  # the post-kill drain call must succeed
             raise subprocess.TimeoutExpired(cmd="claude", timeout=timeout)
+        self._finished = True
         return self._out, self._err
+
+    def poll(self):
+        return self.returncode if self._finished else None
 
     def kill(self):
         self.killed = True
@@ -105,6 +114,29 @@ def test_the_named_alias_reaches_the_model_flag(monkeypatch):
     assert argv[argv.index("--model") + 1] == "haiku"
 
 
+def test_builtin_tools_are_also_disabled_not_just_mcp(monkeypatch):
+    """`--strict-mcp-config` only pins off MCP servers — Read/Write/Bash/Glob are still on
+    by default. `openai_answerer` sends no tools at all, so the two backends the panel
+    compares must answer under equivalent conditions or a tool-call failure ("I can't run
+    that") comes back as a non-None string and gets scored as a WRONG answer, not a
+    non-answer — the exact contract this file exists to protect."""
+    seen = _spy(monkeypatch, _FakeProc(out=_reply("4")))
+    cli_answerer("opus")("", "q")
+    argv = seen["argv"]
+    assert argv[argv.index("--tools") + 1] == ""
+
+
+def test_a_missing_claude_binary_is_reported_not_silently_swallowed(monkeypatch, capsys):
+    """Every other failure path here prints a stderr diagnostic; a missing/unresolvable
+    `claude` binary must not be the one silent exception `_safe_ask`'s catch-all absorbs."""
+    def raise_enoent(argv, **kw):
+        raise FileNotFoundError("claude")
+
+    monkeypatch.setattr(subprocess, "Popen", raise_enoent)
+    assert cli_answerer("opus")("", "q") is None
+    assert "could not launch" in capsys.readouterr().err
+
+
 def test_mcp_is_pinned_off_so_no_tool_definitions_enter_the_prompt(monkeypatch):
     seen = _spy(monkeypatch, _FakeProc(out=_reply("4")))
     cli_answerer("opus")("", "q")
@@ -135,10 +167,45 @@ def test_a_good_reply_comes_back_verbatim(monkeypatch):
     assert cli_answerer("opus")("", "q") == "  BANANA  "
 
 
+def test_the_user_prompt_actually_reaches_the_child(monkeypatch):
+    """Nothing else in this file asserts on communicate()'s stdin argument — a regression
+    that stopped sending the question (e.g. `proc.communicate(timeout=timeout)` losing its
+    positional `user` argument) would still pass every other test here."""
+    sent: list = []
+    proc = _FakeProc(out=_reply("4"))
+    real_communicate = proc.communicate
+
+    def spying_communicate(_input=None, timeout=None):
+        sent.append(_input)
+        return real_communicate(_input, timeout=timeout)
+
+    proc.communicate = spying_communicate
+    _spy(monkeypatch, proc)
+    cli_answerer("opus")("", "What is 2+2?")
+    assert sent == ["What is 2+2?"]
+
+
 def test_a_quota_wall_is_a_non_answer_not_a_wrong_answer(monkeypatch):
     """The wall lands partway through a run; scoring it wrong invalidates the remainder."""
     _spy(monkeypatch, _FakeProc(err="Claude usage limit reached", code=1))
     assert cli_answerer("opus")("", "q") is None
+
+
+def test_a_confirmed_quota_wall_trips_a_breaker_for_the_rest_of_this_models_calls(monkeypatch):
+    """Once THIS model's window is confirmed exhausted, remaining calls for it must not
+    spawn another doomed `claude -p` — at 100+ calls/model that's hundreds of launches
+    that can only time out or quota-fail while `_unmeasured` withholds the report anyway."""
+    launches: list = []
+
+    def fake_popen(argv, **kw):
+        launches.append(argv)
+        return _FakeProc(err="Claude usage limit reached", code=1)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    answerer = cli_answerer("opus")
+    assert answerer("", "q1") is None
+    assert answerer("", "q2") is None
+    assert len(launches) == 1, "second call should have short-circuited, not re-launched"
 
 
 def test_a_nonzero_exit_is_a_non_answer(monkeypatch):
@@ -171,6 +238,22 @@ def test_a_permission_error_killing_the_group_is_reported_not_swallowed(monkeypa
     assert cli_answerer("opus", timeout=1)("", "q") is None
     assert proc.killed
     assert "permission denied" in capsys.readouterr().err.lower()
+
+
+def test_a_non_timeout_exception_still_kills_the_group_before_propagating(monkeypatch):
+    """`start_new_session=True` detaches the child; only the TimeoutExpired branch used to
+    kill the group. A KeyboardInterrupt (or MemoryError) during communicate() is not a
+    timeout and is not caught by `_safe_ask`'s `except Exception` upstream (BaseException) —
+    without a safety net the group is left running, generating and burning subscription
+    quota with nothing left to stop it. This is the modelbench incident #249 already hit."""
+    proc = _FakeProc(raises=KeyboardInterrupt())
+    _spy(monkeypatch, proc)
+    killed: list = []
+    monkeypatch.setattr("os.getpgid", lambda pid: pid)
+    monkeypatch.setattr("os.killpg", lambda pgid, sig: killed.append(pgid))
+    with pytest.raises(KeyboardInterrupt):
+        cli_answerer("opus")("", "q")
+    assert killed == [proc.pid]
 
 
 def test_is_error_is_a_non_answer_even_on_a_clean_exit(monkeypatch):
