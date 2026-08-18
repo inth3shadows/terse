@@ -30,7 +30,8 @@ class _FakeProc:
 
     def communicate(self, _input=None, timeout=None):
         if self._raises is not None:
-            raise self._raises
+            exc, self._raises = self._raises, None  # the post-kill drain call must succeed
+            raise exc
         if self._timeout:
             self._timeout = False  # the post-kill drain call must succeed
             raise subprocess.TimeoutExpired(cmd="claude", timeout=timeout)
@@ -254,6 +255,10 @@ def test_a_non_timeout_exception_still_kills_the_group_before_propagating(monkey
     with pytest.raises(KeyboardInterrupt):
         cli_answerer("opus")("", "q")
     assert killed == [proc.pid]
+    # The killed process must also be reaped (not left a zombie holding open pipe fds) —
+    # the fake only reaches its normal return path (setting _finished) via a communicate()
+    # call made AFTER the interrupt, which only the safety net's drain would issue.
+    assert proc._finished, "the killed process was never drained/reaped"
 
 
 def test_is_error_is_a_non_answer_even_on_a_clean_exit(monkeypatch):

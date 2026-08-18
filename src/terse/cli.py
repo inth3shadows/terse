@@ -861,6 +861,14 @@ def _build_answerers(args: argparse.Namespace, make_openai) -> dict:
     models = args.models or os.environ.get("TERSE_FLUENCY_MODELS", "")
     for m in (x.strip() for x in models.split(",") if x.strip()):
         if m.startswith(fluency.CLI_PREFIX):
+            cli_alias = m[len(fluency.CLI_PREFIX):]
+            if not cli_alias:
+                # `cli:` with nothing after it (a plausible typo for `cli:opus`) would
+                # otherwise launch `claude -p --model ""` once per question — every call
+                # fails and gets logged as a generic cli error, silently shrinking the
+                # panel to "unmeasured" instead of refusing loudly at config time.
+                raise SystemExit(f"terse fluency: {m!r}: cli: needs a model alias after "
+                                 f"the prefix, e.g. cli:opus")
             if make_openai is not fluency.openai_answerer:
                 # --drop-eval needs a TOOL-CALLING answerer; `claude -p --output-format
                 # json` returns prose, not tool calls. Refusing loudly beats handing that
@@ -868,7 +876,7 @@ def _build_answerers(args: argparse.Namespace, make_openai) -> dict:
                 # resulting silence as "the model declined to retrieve".
                 raise SystemExit(f"terse fluency: {m}: the cli: backend does not support "
                                  f"--drop-eval (it cannot make tool calls)")
-            answerers[m] = fluency.cli_answerer(m[len(fluency.CLI_PREFIX):])
+            answerers[m] = fluency.cli_answerer(cli_alias)
         elif base and key:
             answerers[m] = make_openai(base, key, m)
         else:

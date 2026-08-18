@@ -226,6 +226,13 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
             # exact orphaned-quota-burn incident modelbench already hit once.
             if proc.poll() is None:
                 _kill_group(proc, why="cleanup")
+                try:
+                    # Best-effort reap so a killed child doesn't sit as a zombie holding
+                    # its pipe fds — swallow any error so we never mask whatever
+                    # exception is already propagating through this finally.
+                    proc.communicate(timeout=10)
+                except Exception:
+                    pass
         if proc.returncode != 0:
             why = "subscription window limit" if _looks_like_quota(err, out) else "cli error"
             if why == "subscription window limit":
