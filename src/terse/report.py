@@ -1362,7 +1362,7 @@ def _per_transform_table(results: dict, summary: dict[str, dict[str, float]]) ->
     return out
 
 
-def build_dropeval_report(results: dict) -> str:
+def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
     """Render the drop-to-retrieve behavioral eval: does a real tool-calling model call
     `terse.retrieve` when a dropped field is needed (recall), and leave it alone when it
     isn't (precision / no-overfetch)?
@@ -1468,12 +1468,42 @@ def build_dropeval_report(results: dict) -> str:
             out += ["> **Where they failed** (per arm — the attrition #299 is about): "
                     + ", ".join(split) + ". A large imbalance means the paired subset is "
                     "selected by which arm survived, and the gap above is biased in that "
-                    "arm's favour.", ""]
+                    "arm's favour; roughly equal counts are what infrastructure failure "
+                    "looks like and leave the survivors an approximately random sample.", ""]
+        # How many questions actually SURVIVED pairing. This, not the failure rate, is what
+        # decides whether a degraded run still means anything: `paired_rows` needs every
+        # trial complete on BOTH arms, so a 50%-loss run can leave 15 usable questions or
+        # 2, and the failure percentage alone cannot tell them apart. Printed whenever any
+        # call failed, because that is exactly when a reader needs it.
+        surviving = []
+        for model, rows in sorted(results.items()):
+            g = _accuracy_gate(rows)
+            if not g.excluded:
+                surviving.append(f"`{model}` {len(g.rows)}/{len(rows)}")
+        if surviving:
+            out += ["> **Questions surviving the pairing**: " + ", ".join(surviving)
+                    + ". The gap is computed over these only — read it as accuracy among "
+                    "jointly-completed questions, and note that at small n one question "
+                    "moves it a long way (#297).", ""]
 
     out += ["## Verdict", ""]
     # Half of a model's calls failing means its accuracy columns are mostly counting
     # transport errors. Refuse to render a pass/fail rather than let the run be cited.
     inconclusive = inconclusive_models(results)
+    if inconclusive and accept_degraded:
+        # The operator has asserted the losses have a known, model-independent cause (a
+        # gateway restart, a local rate limit). That is a claim the harness cannot verify,
+        # so it is recorded in the verdict rather than silently honoured — and the arm
+        # split above is the evidence that decides whether it is credible: symmetric
+        # losses leave the survivors an approximately random sample, a skew does not.
+        out += ["> **Degraded run accepted** (`--accept-degraded`) — "
+                + ", ".join(f"`{m}` failed {e}/{a} calls" for m, (e, a) in
+                            sorted(inconclusive.items()))
+                + ". The verdict below is computed over the surviving questions only. It is "
+                "valid ONLY if the failures were independent of the model and of the arm; "
+                "check the per-arm split and the surviving-question counts above before "
+                "citing it.", ""]
+        inconclusive = {}
     if inconclusive:
         out += ["- **INCONCLUSIVE** — "
                 + ", ".join(f"`{m}` failed {e}/{a} model calls" for m, (e, a) in

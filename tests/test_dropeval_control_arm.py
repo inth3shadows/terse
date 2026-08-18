@@ -212,6 +212,28 @@ def test_errors_are_recorded_PER_ARM_not_only_as_a_total():
     assert sum(r["treatment_errors"] for r in rows) > 0
 
 
+def test_a_degraded_run_is_inconclusive_by_default_and_renderable_on_request():
+    """The operator may know the cause is model-independent (a gateway restart). That is a
+    claim the harness cannot verify, so it is RECORDED in the verdict rather than silently
+    honoured — and the arm split is the evidence that decides whether to believe it."""
+    rows = _live_rows(n_fail=40, trials=3)
+    default = build_dropeval_report({"m": rows})
+    assert "INCONCLUSIVE" in default
+
+    accepted = build_dropeval_report({"m": rows}, accept_degraded=True)
+    assert "Degraded run accepted" in accepted
+    # It must not quietly become a normal-looking verdict.
+    assert "valid ONLY if the failures were independent" in accepted
+
+
+def test_the_report_says_how_many_questions_survived_the_pairing():
+    """The failure RATE cannot distinguish a 50%-loss run with 15 usable questions from
+    one with 2. The surviving count can, and it is what the gap is computed over."""
+    rows = _live_rows(n_fail=6, trials=3)
+    report = build_dropeval_report({"m": rows}, accept_degraded=True)
+    assert "Questions surviving the pairing" in report
+
+
 def test_the_report_names_which_arm_lost_the_calls():
     rows = _live_rows(n_fail=4, trials=3)
     report = build_dropeval_report({"m": rows})

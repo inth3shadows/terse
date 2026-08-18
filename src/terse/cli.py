@@ -900,7 +900,7 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
     results = dropeval.run_drop_fluency(envelopes, pol.select, answerers,
                                         trials=args.trials,
                                         control=not args.no_control)
-    print("\n" + build_dropeval_report(results))
+    print("\n" + build_dropeval_report(results, accept_degraded=args.accept_degraded))
     print("If the worst-case model PASSES, enable the verified fields by renaming that tool's "
           "'_suggested_fields' -> 'fields' in the policy.")
     return 0
@@ -1032,7 +1032,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         results = dropeval.run_drop_fluency(envelopes, pol.select, answerers,
                                             trials=args.trials,
                                             control=not args.no_control)
-        _write_report(build_dropeval_report(results), args.out)
+        _write_report(build_dropeval_report(results, accept_degraded=args.accept_degraded),
+                      args.out)
         if args.bars:
             print("\n" + build_terminal_dropeval_report(results))
         return 0
@@ -1704,6 +1705,13 @@ def main(argv: list[str] | None = None) -> int:
                         "when a dropped field is needed (recall), and leave it alone when "
                         "it isn't (precision)? needs --policy with a drop-to-retrieve field "
                         "+ a configured model")
+    f.add_argument("--accept-degraded", action="store_true",
+                   help="--drop-eval: render a verdict even when enough calls failed to "
+                        "trip the INCONCLUSIVE gate. For when the cause is known and "
+                        "model-independent (a gateway restart, a local rate limit). The "
+                        "report says so, and prints the per-arm failure split and the "
+                        "surviving-question counts, which are what decide whether the "
+                        "surviving sample is still unbiased")
     f.add_argument("--no-control", action="store_true",
                    help="--drop-eval: skip the no-drop CONTROL arm. The control asks every "
                         "question a second time against the same payload with the drop rule "
@@ -1735,6 +1743,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="also verify the suggested drops with a live tool-calling model "
                          "(needs TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS or --base-url/--models)")
     tn.add_argument("--trials", type=int, default=1, help="drop-eval trials per question")
+    tn.add_argument("--accept-degraded", action="store_true",
+                    help="--drop-eval: render a verdict despite the INCONCLUSIVE gate when "
+                         "the call failures have a known model-independent cause (see "
+                         "`terse fluency --help`)")
     tn.add_argument("--no-control", action="store_true",
                     help="--drop-eval: skip the no-drop CONTROL arm (see `terse fluency "
                          "--help`); halves the calls and restores the old, confounded "
