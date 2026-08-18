@@ -70,6 +70,21 @@ def test_control_text_carries_no_drop_markers_and_the_treatment_does():
     assert "E" * 200 in ctl
 
 
+def test_control_text_on_the_non_json_path_also_carries_no_drop_markers():
+    """The is_json=False branch of `_control_text` — `$text.code_blocks`, the drop under
+    test on the non-JSON path — had zero coverage: only the rule object was tested
+    (`test_control_rule_strips_text_span_drops_too` above), never the text the control
+    arm actually sends to the model (review finding 6 on #300)."""
+    raw = "intro\n```\n" + "x" * 200 + "\n```\ntail"
+    rule = _rule(**{"$text.code_blocks": {"lossy": "drop-to-retrieve", "min": 10}})
+    applied, staging = dropeval._staged_apply_text(raw, rule, "t")
+    ctl = dropeval._control_text(raw, rule, "t", is_json=False)
+    assert staging, "fixture must actually drop something or it tests nothing"
+    assert "__terse_dropped__" in applied.text
+    assert "__terse_dropped__" not in ctl
+    assert "x" * 200 in ctl
+
+
 # --------------------------------------------------------------------------- #
 # The gate: a control that did not run withholds the verdict.
 # --------------------------------------------------------------------------- #
@@ -93,12 +108,28 @@ def test_no_control_arm_excludes_the_metric_rather_than_defaulting_to_the_ideal(
 
 
 def test_a_control_arm_makes_final_accuracy_a_gap_between_two_measured_arms():
-    g = _accuracy_gate(_rows(answer=0, control=0))
+    """The control here ties the treatment at a measured, non-degenerate 50% — NOT
+    all-zero. An all-zero control is a different, and more suspicious, case: see
+    `test_an_all_zero_control_is_excluded_as_broken_not_scored_as_a_free_pass` below
+    (review finding 3 on #300)."""
+    rows = _rows(n=3, answer=1, control=1) + _rows(n=3, answer=0, control=0)
+    g = _accuracy_gate(rows)
     assert not g.excluded
-    # Both arms fail the verbatim question equally -> the DROP costs nothing, which the
-    # old fixed-100% control reported as a total failure.
-    assert g.form_acc == 0.0 and g.control_acc == 0.0
+    # Both arms tie at 50% -> the DROP costs nothing, which the old fixed-100% control
+    # reported as a total failure.
+    assert g.form_acc == 0.5 and g.control_acc == 0.5
     assert g.form_acc - g.control_acc == 0.0
+
+
+def test_an_all_zero_control_is_excluded_as_broken_not_scored_as_a_free_pass():
+    """A no-drop control that reproduces a value sitting verbatim in its own payload
+    scoring exactly 0% across every row is not "the drop is blameless" — #269's own live
+    reproduction measured the un-dropped arm at 88%. 0% means the grader or backend
+    produced no signal, and treating it as a legitimate tie let a dead control arm PASS
+    with "safe to enable drop-to-retrieve" (review finding 3 on #300). Mirrors the
+    identical guard fluency's `raw_ok` control already had."""
+    g = _accuracy_gate(_rows(answer=0, control=0))
+    assert g.excluded == "broken control"
 
 
 def _both_kinds(**kw):
@@ -107,14 +138,43 @@ def _both_kinds(**kw):
 
 
 def test_the_metric_that_used_to_fail_now_passes_when_the_drop_is_blameless():
-    """#269's live reproduction in miniature: perfect mechanism metrics, a low
-    final-accuracy, and a control that is exactly as low. Old gate: FAIL (the drop was
+    """#269's live reproduction in miniature: perfect mechanism metrics, a final-accuracy
+    well under 100%, and a control that is exactly as low. Old gate: FAIL (the drop was
     charged for a verbatim-reproduction limit). New gate: PASS, because the drop changed
-    nothing — which is the entire point of running a control."""
-    rows = _both_kinds(n=5, answer=0, control=0, trials=1)
+    nothing — which is the entire point of running a control. Mixed 50/50 rather than an
+    all-zero control, which is excluded as broken rather than scored as a free pass (see
+    `test_an_all_zero_control_is_excluded_as_broken_not_scored_as_a_free_pass`)."""
+    rows = (_both_kinds(n=3, answer=1, control=1, trials=1)
+            + _both_kinds(n=3, answer=0, control=0, trials=1))
     report = build_dropeval_report({"m": rows})
     assert "no-drop control" in report
     assert "safe to enable drop-to-retrieve" in report
+
+
+def test_a_dead_control_arm_does_not_pass_the_verdict_end_to_end():
+    """The end-to-end form of `test_an_all_zero_control_is_excluded_as_broken_...`: an
+    all-zero control must not let `build_dropeval_report` print "safe to enable
+    drop-to-retrieve" off a control that measured nothing."""
+    rows = _both_kinds(n=5, answer=0, control=0, trials=1)
+    report = build_dropeval_report({"m": rows})
+    assert "safe to enable drop-to-retrieve" not in report
+    assert "not gated" in report
+
+
+def test_the_report_names_the_real_exclusion_reason_not_a_hardcoded_one():
+    """When a control ran and failed (excluded as "broken control"), the report must not
+    say "no no-drop control arm was run" — that is a different, false claim. Old code
+    hardcoded that phrasing (and the table's "not run" cell) for every exclusion reason
+    alike, so a run under `--accept-degraded` whose control errored out on every call
+    printed both "the control lost N calls" and "no control arm was run" two sentences
+    apart (review finding 2 on #300)."""
+    rows = _both_kinds(n=5, answer=0, control=0, trials=1)
+    report = build_dropeval_report({"m": rows})
+    assert "control arm failed" in report
+    assert "no no-drop control arm was run" not in report
+    # The table cell must match: "not run" is specifically for "no control arm", and this
+    # run's control DID run — it just failed every trial.
+    assert "not run" not in report
 
 
 def test_a_drop_that_really_hurts_still_fails():
@@ -149,8 +209,12 @@ def test_mechanism_metrics_alone_do_not_license_enabling_the_drop():
 
 
 def test_gap_rows_omit_accuracy_entirely_without_a_control():
-    assert "accuracy" not in dropeval_gap_rows({"m": _rows(answer=1)})["m"]
-    assert "accuracy" in dropeval_gap_rows({"m": _rows(answer=1, control=1)})["m"]
+    gaps, excluded = dropeval_gap_rows({"m": _rows(answer=1)})
+    assert "accuracy" not in gaps["m"]
+    assert excluded == {"m": "no control arm"}
+    gaps2, excluded2 = dropeval_gap_rows({"m": _rows(answer=1, control=1)})
+    assert "accuracy" in gaps2["m"]
+    assert excluded2 == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -267,6 +331,19 @@ def test_errors_are_recorded_PER_ARM_not_only_as_a_total():
     assert sum(r["treatment_errors"] for r in rows) > 0
 
 
+def test_treatment_and_control_errors_are_attributed_to_the_right_arm():
+    """The test above only checks the SUM equals `errors` — a swap of the two fields at
+    the assignment site (`row["treatment_errors"] = errors` / `row["control_errors"] =
+    control_errors`) would satisfy it identically and survived review (finding 6 on #300).
+    `n_fail=1` fails only the very first call the harness makes — the treatment's first
+    turn of the first question — so the ground truth here is unambiguous: exactly one
+    treatment error, zero control errors."""
+    rows = _live_rows(n_fail=1, trials=1)
+    assert rows
+    assert sum(r["treatment_errors"] for r in rows) == 1
+    assert sum(r["control_errors"] for r in rows) == 0
+
+
 def test_a_degraded_run_is_inconclusive_by_default_and_renderable_on_request():
     """The operator may know the cause is model-independent (a gateway restart). That is a
     claim the harness cannot verify, so it is RECORDED in the verdict rather than silently
@@ -283,10 +360,33 @@ def test_a_degraded_run_is_inconclusive_by_default_and_renderable_on_request():
 
 def test_the_report_says_how_many_questions_survived_the_pairing():
     """The failure RATE cannot distinguish a 50%-loss run with 15 usable questions from
-    one with 2. The surviving count can, and it is what the gap is computed over."""
-    rows = _live_rows(n_fail=6, trials=3)
+    one with 2. The surviving count can, and it is what the gap is computed over.
+
+    Built synthetically rather than via `_live_rows`: that fixture's dummy answerer
+    always replies "whatever", which never matches a real expected answer and so scores
+    the control at a uniform 0% — exactly the degenerate control
+    `test_an_all_zero_control_is_excluded_as_broken_not_scored_as_a_free_pass` now
+    excludes (review finding 3 on #300), which would make the accuracy gate excluded here
+    too and this message never print."""
+    rows = _both_kinds(n=5, answer=1, control=1, trials=3, errors=0)
+    for r in rows[:5]:
+        r["control_trials"], r["control_errors"], r["errors"] = 2, 1, 1
     report = build_dropeval_report({"m": rows}, accept_degraded=True)
     assert "Questions surviving the pairing" in report
+
+
+def test_the_surviving_count_uses_the_paired_subset_not_the_full_row_count():
+    """The test above only checks the LABEL appears, not that the two numbers in "N/M" are
+    the right ones — `len(g.rows)/len(rows)` swapped for `len(rows)/len(rows)` (mutation:
+    reading the raw count for the numerator too) would still print a "Questions surviving"
+    line and survived review (finding 6 on #300). One row is forced to miss a control
+    trial (`control_trials=2` of `trials=3`), which drops it from `paired_rows` while it
+    still counts toward the raw `len(rows)` — so the paired subset (9) is strictly smaller
+    than the raw count (10), and only the correct denominator prints "9/10"."""
+    rows = _both_kinds(n=5, answer=1, control=1, trials=3, errors=0)
+    rows[0] = dict(rows[0], control_trials=2, control_errors=1, errors=1)
+    report = build_dropeval_report({"m": rows})
+    assert "9/10" in report
 
 
 def test_the_report_names_which_arm_lost_the_calls():
@@ -294,6 +394,30 @@ def test_the_report_names_which_arm_lost_the_calls():
     report = build_dropeval_report({"m": rows})
     assert "Where they failed" in report
     assert "treatment" in report and "control" in report
+
+
+def test_the_where_they_failed_line_binds_the_counts_to_the_right_arm():
+    """The test above only checks that the words "treatment" and "control" appear
+    somewhere in the header, which is true regardless of which number sits next to which
+    word — swapping `t`/`c` in the f-string survived review (finding 6 on #300). A row
+    with a deliberately asymmetric split (5 treatment errors, 1 control error) makes the
+    two numbers distinguishable."""
+    rows = _both_kinds(n=5, answer=1, control=1, trials=3, errors=0)
+    rows[0] = dict(rows[0], errors=5, treatment_errors=5, control_errors=1)
+    report = build_dropeval_report({"m": rows})
+    assert "treatment 5 / control 1" in report
+    assert "treatment 1 / control 5" not in report
+
+
+def test_the_failed_calls_column_uses_the_attempts_field_not_bare_trials():
+    """`attempts` counts calls across BOTH arms when a control ran (double the trial
+    count); falling back to `trials` alone would understate it by half and survived
+    review (finding 6 on #300): every prior fixture happened to have `attempts ==
+    trials` or never checked the column's value at all."""
+    rows = _both_kinds(n=1, answer=1, control=1, trials=4, errors=0)
+    report = build_dropeval_report({"m": rows})
+    # 2 rows (recall + precision) x (trials=4, doubled for the control) = 16 attempts.
+    assert "0/16" in report
 
 
 def test_the_control_arm_still_runs_every_trial_when_the_treatment_errors():

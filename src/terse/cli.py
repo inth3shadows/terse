@@ -1035,7 +1035,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         _write_report(build_dropeval_report(results, accept_degraded=args.accept_degraded),
                       args.out)
         if args.bars:
-            print("\n" + build_terminal_dropeval_report(results))
+            print("\n" + build_terminal_dropeval_report(results,
+                                                         accept_degraded=args.accept_degraded))
         return 0
 
     # Diff mode: does a model read a cross-call DIFF as well as the full result? Needs a

@@ -201,10 +201,15 @@ def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
     pr = paired_rows(rows, *gating, control)
     arms = {f: _form_stats(pr, f) for f in (*gating, control, *display)}
     cacc, cse = arms[control]
-    if control == "raw_ok" and cacc == 0:
-        # A raw control at exactly 0% is a backend/config error, not a comprehension
-        # result — every form would "beat" it. Kept here rather than at the call sites so
-        # the markdown verdict and the forest plot cannot disagree about it.
+    if control in ("raw_ok", "control_ok") and cacc == 0:
+        # A control at exactly 0% is a backend/config error, not a comprehension result —
+        # every form would "beat" it for free. True for `raw_ok` (fluency's raw-payload
+        # control) AND `control_ok` (dropeval's no-drop control, #269): the control arm
+        # answers a question with the value sitting verbatim in its payload, and #269's own
+        # live reproduction measured that arm at 88%, not 0% — a 0% control means the
+        # grader or backend produced no signal, not that the drop is blameless (review
+        # finding 3 on #300). Kept here rather than at the call sites so the markdown
+        # verdict and the forest plot cannot disagree about it.
         return ArmGap(0.0, 0.0, cacc, cse, pr, "broken control", arms)
     best = max((arms[f] for f in gating), key=lambda s: s[0])
     return ArmGap(best[0], best[1], cacc, cse, pr, None, arms)
@@ -246,6 +251,8 @@ REASON_LABEL = {
     "broken control": "control arm failed",
     "not a diff run": "no diff arm in these rows",
     "empty": "no rows",
+    "no control arm": "no control arm was run",
+    "partial control coverage": "control ran on only some rows",
 }
 
 # The heading each reason gets in prose renderers (markdown, HTML). "Not measured" and
@@ -256,6 +263,8 @@ REASON_HEADING = {
     "broken control": "Excluded",
     "not a diff run": "Not applicable",
     "empty": "Not measured",
+    "no control arm": "Not run",
+    "partial control coverage": "Excluded",
 }
 
 
@@ -451,14 +460,25 @@ def _accuracy_gate(rows: list[dict[str, Any]]) -> ArmGap:
     return arm_gap(rows, "answer_ok", "control_ok")
 
 
-def dropeval_gap_rows(results: dict) -> dict[str, dict[str, tuple[float, float, float, float]]]:
+def dropeval_gap_rows(results: dict) -> tuple[dict[str, dict[str, tuple[float, float, float, float]]],
+                                              dict[str, str | None]]:
     """Per-model (recall, precision, accuracy) gap-row tuples for build_dropeval_report
     and its terminal-bar companion. Recall and precision keep a fixed 100% ideal (se=0),
-    which is correct for them — a tool call either happens or it doesn't. Accuracy routes
-    through `_accuracy_gate`, which pairs against a measured control arm when one ran
-    (#269). Same per-model math build_dropeval_report's own table loop uses, kept in one
-    place so the two verdicts (markdown table, terminal chart) can never disagree."""
+    which is correct for them — a tool call either happens or it doesn't, so neither is
+    ever excluded. Accuracy routes through `_accuracy_gate`, which pairs against a
+    measured control arm when one ran (#269). Same per-model math build_dropeval_report's
+    own table loop uses, kept in one place so the two verdicts (markdown table, terminal
+    chart) can never disagree.
+
+    Returns (gap_rows, accuracy_excluded) — mirroring `diff_gap_rows`/`fluency_gap_rows`,
+    unlike which this function's `out` is never itself empty for an excluded model (recall
+    and precision still render); only the "accuracy" key is missing, and
+    `accuracy_excluded` names why. `build_terminal_dropeval_report` used to swallow that
+    reason — a model excluded from the accuracy gate vanished from the accuracy plot with
+    no note, while the verdict text still said "the worst model" as if every model had
+    been considered for every metric (review finding 5 on #300)."""
     out: dict[str, dict[str, tuple[float, float, float, float]]] = {}
+    excluded: dict[str, str | None] = {}
     for model, rows in results.items():
         if not rows:
             continue
@@ -475,7 +495,9 @@ def dropeval_gap_rows(results: dict) -> dict[str, dict[str, tuple[float, float, 
         g = _accuracy_gate(rows)
         if not g.excluded:
             out[model]["accuracy"] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
-    return out
+        else:
+            excluded[model] = g.excluded
+    return out, excluded
 
 
 def _pct(saved: int, base: int) -> str:
@@ -1413,6 +1435,13 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
     recall_gate: dict[str, tuple[float, float, float, float]] = {}
     precision_gate: dict[str, tuple[float, float, float, float]] = {}
     accuracy_gate: dict[str, tuple[float, float, float, float]] = {}
+    # Populated only for EXCLUDED models, and only with the reason `_accuracy_gate`
+    # actually returned. The verdict's "not gated" fallback used to say "no no-drop
+    # control arm was run" unconditionally — true for "no control arm", false for e.g.
+    # "broken control" (a control that ran, and whose entire arm errored out under
+    # `--accept-degraded`), which made the report assert a control was never run in the
+    # same breath as reporting how many of its calls it lost (review finding 2 on #300).
+    accuracy_excluded: dict[str, str | None] = {}
     for model, rows in results.items():
         if not rows:
             continue
@@ -1430,16 +1459,22 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
         g = _accuracy_gate(rows)
         if not g.excluded:
             accuracy_gate[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
+        else:
+            accuracy_excluded[model] = g.excluded
         aacc, ase, cacc = g.form_acc, g.form_se, g.control_acc
         errs = sum(r.get("errors", 0) for r in rows)
         attempts = sum(r.get("attempts", r.get("trials", 1)) for r in rows)
         err_by_model[model] = (errs, attempts)
-        # Both cells go to "not run" together: without a control there is no paired subset,
-        # so the final-accuracy number would be computed over a different question set than
-        # the one the column header implies. Printing a bare 100% under "control (no drop)"
-        # is precisely the misreading #269 is about.
+        # Both cells go to "not gated" together, but the control cell names the ACTUAL
+        # reason rather than assuming "not run": without a control there is no paired
+        # subset, so the final-accuracy number would be computed over a different question
+        # set than the one the column header implies. Printing a bare 100% under "control
+        # (no drop)" is precisely the misreading #269 is about — and printing "not run" for
+        # a control that ran and errored out is a different misreading #300 is about.
         if g.excluded:
-            acc_cell, ctl_cell = "not gated", "not run"
+            acc_cell = "not gated"
+            ctl_cell = "not run" if g.excluded == "no control arm" \
+                else REASON_LABEL.get(g.excluded, g.excluded)
         else:
             acc_cell = f"{aacc:.0%} ±{_ci(ase) * 100:.0f}"
             ctl_cell = f"{cacc:.0%}"
@@ -1525,6 +1560,19 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
             # one the verdict was making.
             out.append(_format_worst_case_line(accuracy_worst, _GAP_TOLERANCE,
                                                "final-accuracy", "no-drop control"))
+        elif accuracy_excluded and set(accuracy_excluded.values()) != {"no control arm"}:
+            # At least one model was excluded for a reason OTHER than "a control never
+            # ran" — e.g. "broken control", when `--accept-degraded` accepted a run whose
+            # control arm errored out entirely. The old fallback said "no no-drop control
+            # arm was run" unconditionally here, which is false in that case: the control
+            # DID run, and the "Where they failed" paragraph above already says how many
+            # of its calls it lost. Name the real reason instead of contradicting that
+            # paragraph two sentences later (review finding 2 on #300).
+            out.append("- **final-accuracy: not gated** — " + exclusion_note(accuracy_excluded)
+                       + ". It is scored by JSON value-equality against the full original "
+                       "value, and a model given the UN-dropped payload does not reproduce "
+                       "a long prose field verbatim either — gating that against an unrun "
+                       "100% measures verbatim reproduction and bills it to the drop (#269).")
         else:
             out.append("- **final-accuracy: not gated** — no no-drop control arm was run, "
                        "so there is nothing to compare the drop against. It is scored by "
