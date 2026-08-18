@@ -215,10 +215,15 @@ def test_handle_resolves_to_exact_original_or_the_real_miss_string():
 # --------------------------------------------------------------------------- #
 # build_dropeval_report
 # --------------------------------------------------------------------------- #
-def _row(kind, retrieve_ok, answer_ok, handle_ok, trials=1):
+def _row(kind, retrieve_ok, answer_ok, handle_ok, trials=1, control_ok=None):
     qid = "drop-recall" if kind == "recall" else "drop-precision"
-    return {"tool": "t", "sha": "s", "qid": qid, "kind": kind, "trials": trials,
-            "retrieve_ok": retrieve_ok, "answer_ok": answer_ok, "handle_ok": handle_ok}
+    row = {"tool": "t", "sha": "s", "qid": qid, "kind": kind, "trials": trials,
+           "retrieve_ok": retrieve_ok, "answer_ok": answer_ok, "handle_ok": handle_ok}
+    if control_ok is not None:
+        # A row carrying the no-drop control arm (#269). Without it final-accuracy is not
+        # gated at all, so a fixture that wants the fully-gated verdict must supply one.
+        row |= {"control_ok": control_ok, "control_trials": trials}
+    return row
 
 
 def test_build_dropeval_report_verdict_gates_on_the_worst_model():
@@ -231,12 +236,23 @@ def test_build_dropeval_report_verdict_gates_on_the_worst_model():
 
 
 def test_build_dropeval_report_passes_when_every_model_is_reliable():
-    rows = [_row("recall", 1, 1, 1), _row("precision", 1, 1, 1)] * 10
+    rows = [_row("recall", 1, 1, 1, control_ok=1),
+            _row("precision", 1, 1, 1, control_ok=1)] * 10
     report = build_dropeval_report({"m1": rows, "m2": rows})
     verdict = report.split("## Verdict", 1)[1]
     assert "PASS" in verdict
     assert "FAIL" not in verdict
     assert "safe to enable drop-to-retrieve" in verdict
+
+
+def test_perfect_mechanism_metrics_alone_do_not_say_safe_to_enable():
+    """Same fixture WITHOUT the control arm. Recall and no-overfetch say the model
+    operates the protocol correctly; they say nothing about whether the answer it lands
+    on is right, so "safe to enable" is unsupported (#269)."""
+    rows = [_row("recall", 1, 1, 1), _row("precision", 1, 1, 1)] * 10
+    verdict = build_dropeval_report({"m1": rows}).split("## Verdict", 1)[1]
+    assert "safe to enable drop-to-retrieve" not in verdict
+    assert "INCONCLUSIVE for enabling" in verdict
 
 
 def test_build_dropeval_report_empty_results_shows_guidance_and_does_not_crash():

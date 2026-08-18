@@ -30,7 +30,7 @@ import sys
 import urllib.request
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from . import capture, fluency
@@ -114,6 +114,33 @@ def _staged_apply_text(raw: str, rule: Any, tool: str) -> tuple[policy_mod.Appli
     staging: dict[str, Any] = {}
     applied = policy_mod.apply(raw, tool, pol, drop_sink=staging.__setitem__)
     return applied, staging
+
+
+def _control_rule(rule: Any) -> Any:
+    """`rule` with every drop-to-retrieve field spec removed — the CONTROL arm's policy.
+
+    The control has to differ from the treatment in exactly one way: the drop. So it is not
+    the raw payload and not `compress()` — it is the *same rule*, same tiers, same tabular
+    and dictionary transforms, with only the `lossy: drop-to-retrieve` entries stripped.
+    Anything else would confound the drop with a codec difference and reproduce, one level
+    over, the defect this arm exists to fix (#269).
+
+    Text selectors are stripped too: `_text_drop_specs` addresses spans of a non-JSON
+    payload and is the drop under test on that path, so leaving it in would give the
+    control arm the very cut it is supposed to lack."""
+    dropped = {p for p, _ in lossy_mod._drop_specs(rule)}
+    dropped |= {p for p, _ in lossy_mod._text_drop_specs(rule)}
+    return replace(rule, fields={p: s for p, s in rule.fields.items() if p not in dropped})
+
+
+def _control_text(payload: Any, rule: Any, tool: str, *, is_json: bool) -> str:
+    """The text the model would have seen had this rule carried no drop at all.
+
+    `drop_sink` is deliberately omitted: with the drop specs stripped there is nothing to
+    stage, and passing a sink would imply otherwise to a reader."""
+    pol = policy_mod.Policy(rules=[_control_rule(rule)])
+    raw = json.dumps(payload) if is_json else payload
+    return policy_mod.apply(raw, tool, pol).text
 
 
 # A line-numbered source line, the form every `codegraph_explore` block uses: `184\t<code>`.
@@ -409,7 +436,15 @@ def _safe_call(answerer: ToolAnswerer, messages: list[dict]) -> Turn:
     clean 0%-recall verdict rather than an error."""
     try:
         return answerer(messages)
-    except Exception:
+    except Exception as exc:
+        # Say WHY on stderr. Swallowing the exception silently made a degraded run
+        # uninterpretable: a real 3-model run lost 12/48 calls on one backend and the
+        # output carried no way to tell a token-budget stop from a rate limit from an
+        # billing failure — so the cause got guessed instead of read. `fluency`'s
+        # answerer already prints its `finish_reason` for exactly this reason; this path
+        # is the one that did not.
+        print(f"terse dropeval: call failed ({type(exc).__name__}: {exc!s:.200}) — counted "
+              f"as a non-answer, not scored", file=sys.stderr)
         return Turn(text="", tool_calls=[], error=True)
 
 
@@ -470,31 +505,93 @@ def _run_question(question: DropQuestion, applied_text: str, staging: dict[str, 
 
 def _run_questions_against(questions: list[DropQuestion], applied: policy_mod.Applied,
                            staging: dict[str, Any], answerer: ToolAnswerer,
-                           trials: int = 1) -> list[dict]:
+                           trials: int = 1, control_text: str | None = None) -> list[dict]:
     """Run `trials` trials of the real 2-turn retrieve protocol for each of `questions`
     against one `answerer`, over an already-staged `(applied, staging)` pair. Split out
     of `run_drop_payload` so `run_drop_fluency` can compute `_questions_and_staging`
     ONCE per envelope and reuse it across every configured model, instead of
-    re-deriving it (a JSON parse + a `policy.apply()` pass) once per model."""
+    re-deriving it (a JSON parse + a `policy.apply()` pass) once per model.
+
+    `control_text` (#269) is the same payload with the drop rule stripped. When given,
+    every question is ALSO asked against it and scored into `control_ok`, so
+    final-accuracy becomes a gap between two measured arms instead of a gap against an
+    assumed-perfect ideal that was never run. This matters because the recall answer is
+    JSON value-equality against a 500+ character prose field: a model handed the
+    UN-dropped payload does not reproduce that verbatim either — it paraphrases — so the
+    fixed-100% control charged the drop for a verbatim-reproduction limit that has
+    nothing to do with dropping. It doubles the call count, which is why it is opt-in at
+    the call site rather than unconditional.
+
+    The control reuses `_run_question` with an EMPTY staging rather than a bespoke
+    single-turn path: identical prompt assembly, identical primer, identical scoring, and
+    a control that spuriously calls retrieve still gets a coherent miss-response and a
+    final answer. The only difference between the arms is the payload text, which is the
+    whole point of a control."""
     rows: list[dict] = []
     for q in questions:
         retrieve_ok = answer_ok = handle_ok = errors = 0
+        control_ok = control_errors = 0
         for _ in range(trials):
             r_ok, a_ok, h_ok, err = _run_question(q, applied.text, staging, answerer)
-            retrieve_ok += int(r_ok)
-            answer_ok += int(a_ok)
-            handle_ok += int(h_ok)
             errors += int(err)
-        rows.append({
+            # An errored trial contributes to NO success counter of its own arm. It is not
+            # merely "not correct": `_run_question` still computes `retrieve_ok` as
+            # `retrieved == needs_retrieve`, so a precision question whose call never
+            # reached the model scores a free +1 for not retrieving. Counting that while
+            # also removing the trial from `retrieve_trials` makes successes EXCEED trials,
+            # which drives `_form_stats`'s `p̂(1-p̂)` negative and crashes the whole report
+            # on `math.sqrt`. Found by a live run, not by the unit tests — hence the
+            # k<=t invariant test that now guards it.
+            if not err:
+                retrieve_ok += int(r_ok)
+                answer_ok += int(a_ok)
+                handle_ok += int(h_ok)
+            # The control runs on EVERY trial, independently of whether the treatment
+            # errored. Skipping it after a treatment failure would save a call but leave
+            # `control_trials` counting attempts the control never made — the same
+            # successes-exceed-trials class of bug, one arm over. The arms are independent
+            # measurements; only `paired_rows` relates them, and it does so afterwards.
+            if control_text is not None:
+                _, c_ok, _, c_err = _run_question(q, control_text, {}, answerer)
+                control_errors += int(c_err)
+                if not c_err:
+                    control_ok += int(c_ok)
+        row = {
             "qid": q.qid, "kind": q.kind, "trials": trials,
             "retrieve_ok": retrieve_ok, "answer_ok": answer_ok, "handle_ok": handle_ok,
-            "errors": errors,
-        })
+            # Per-arm DENOMINATORS excluding calls that never returned. Without these a
+            # transport failure or an empty reply is scored as a WRONG ANSWER, which is
+            # #268 on this path — and #269's own reproduction shows it: failed-call count
+            # rank-ordered final-accuracy exactly (2 fails -> 54%, 0 -> 88%). `_form_stats`
+            # prefers `<form>_trials` over the shared `trials`, so naming them this way is
+            # all it takes. retrieve/answer/handle all come from the treatment arm and so
+            # share its surviving-trial count.
+            "retrieve_trials": trials - errors,
+            "answer_trials": trials - errors,
+            "handle_trials": trials - errors,
+            # Total failed calls across BOTH arms, with the matching attempt count, so the
+            # INCONCLUSIVE gate reads a true ratio rather than dividing two-arm failures by
+            # one arm's trials.
+            "errors": errors + control_errors,
+            # ...and the SPLIT, because the total alone cannot answer the question that
+            # matters. #299's hazard is that attrition is ARM-CORRELATED — the treatment
+            # runs two turns to the control's one, so it should fail first under a
+            # token-budget stop. A collapsed count makes that untestable, and a real run
+            # then had its 12/48 failures ATTRIBUTED to that mechanism with no evidence
+            # either way. These two fields are what make the claim checkable.
+            "treatment_errors": errors,
+            "control_errors": control_errors,
+            "attempts": trials * (2 if control_text is not None else 1),
+        }
+        if control_text is not None:
+            row["control_ok"] = control_ok
+            row["control_trials"] = trials - control_errors
+        rows.append(row)
     return rows
 
 
 def run_drop_payload(obj: Any, raw: str, rule: Any, tool: str, answerer: ToolAnswerer,
-                     trials: int = 1) -> list[dict]:
+                     trials: int = 1, control: bool = False) -> list[dict]:
     """Ask each of a payload's drop questions `trials` times over the real 2-turn
     protocol. Returns one row per question carrying per-metric success COUNTS (0..trials)
     plus `trials` — the same convention fluency.py uses so report.py's `_form_stats`
@@ -510,11 +607,14 @@ def run_drop_payload(obj: Any, raw: str, rule: Any, tool: str, answerer: ToolAns
     if not questions:
         return []
     assert applied is not None and staging is not None  # guaranteed when questions is non-empty
-    return _run_questions_against(questions, applied, staging, answerer, trials=trials)
+    ctl = _control_text(obj, rule, tool, is_json=True) if control else None
+    return _run_questions_against(questions, applied, staging, answerer, trials=trials,
+                                  control_text=ctl)
 
 
 def run_drop_fluency(envelopes: list[dict], rule_for: Callable[..., Any],
-                     answerers: dict[str, ToolAnswerer], trials: int = 1) -> dict:
+                     answerers: dict[str, ToolAnswerer], trials: int = 1,
+                     control: bool = False) -> dict:
     """Run the drop-eval for each named tool-capable answerer over every record-shaped,
     drop-marked payload in the corpus. Mirrors `fluency.run_diff_fluency`'s shape.
     Returns {model_name: [scored_row, ...]}; a payload/tool with no drop-marked field
@@ -539,22 +639,27 @@ def run_drop_fluency(envelopes: list[dict], rule_for: Callable[..., Any],
             # Not JSON: the span-addressed text path is the only one that can drop here.
             # Same envelope-outer/model-inner nesting and the same scored-row shape, so a
             # text payload's results merge into the report exactly like a JSON one's.
-            questions, applied, staging = _text_questions_and_staging(
-                env.get("raw") or "", rule, tool)
+            text_raw = env.get("raw") or ""
+            questions, applied, staging = _text_questions_and_staging(text_raw, rule, tool)
             if not questions:
                 continue
             assert applied is not None and staging is not None
+            ctl = _control_text(text_raw, rule, tool, is_json=False) if control else None
             for name, fn in answerers.items():
                 for row in _run_questions_against(questions, applied, staging, fn,
-                                                  trials=trials):
+                                                  trials=trials, control_text=ctl):
                     results[name].append({"tool": tool, "sha": env.get("sha", "?"), **row})
             continue
         questions, applied, staging = _questions_and_staging(obj, rule, tool)
         if not questions:
             continue
         assert applied is not None and staging is not None
+        # Computed once per envelope, like the questions themselves — the control text is
+        # the same regardless of which model answers it.
+        ctl = _control_text(obj, rule, tool, is_json=True) if control else None
         for name, fn in answerers.items():
-            for row in _run_questions_against(questions, applied, staging, fn, trials=trials):
+            for row in _run_questions_against(questions, applied, staging, fn, trials=trials,
+                                              control_text=ctl):
                 results[name].append({"tool": tool, "sha": env.get("sha", "?"), **row})
     return results
 

@@ -270,11 +270,23 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None) -> 
     for key, label in _DROPEVAL_METRICS:
         plot_rows = []
         for model, metrics in gaps.items():
-            facc, fse, cacc, cse = metrics[key]
+            # `.get`: dropeval_gap_rows omits "accuracy" entirely when no no-drop control
+            # arm ran (#269). Drawing it against a 100% that was never measured is the
+            # thing that issue exists to stop, and a KeyError here would be the renderer
+            # insisting on a number the report declined to publish.
+            metric = metrics.get(key)
+            if metric is None:
+                continue
+            facc, fse, cacc, cse = metric
             gap = facc - cacc
             passed = gap >= -_GAP_TOLERANCE - 1e-9
             plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
                                "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
+        if not plot_rows:
+            continue
+        # final-accuracy is the one metric with a measured control; the other two really
+        # are gated against a fixed ideal, so they must not share a label.
+        control_label = "no-drop control" if key == "accuracy" else "ideal (100%)"
         sections.append(f"{label}:")
-        sections.append(forest_bar_lines(plot_rows, label, "ideal (100%)", color=color))
+        sections.append(forest_bar_lines(plot_rows, label, control_label, color=color))
     return "\n\n".join(sections)

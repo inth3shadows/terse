@@ -158,15 +158,32 @@ def test_build_terminal_fluency_report_excludes_broken_model():
     assert "excluded" in text and "broken" in text
 
 
+def _dropeval_rows(control: bool):
+    base = {"trials": 1, "retrieve_ok": 1, "answer_ok": 1, "handle_ok": 1}
+    if control:
+        base |= {"control_ok": 1, "control_trials": 1, "answer_trials": 1}
+    return ([{"kind": "recall", **base} for _ in range(10)]
+            + [{"kind": "precision", **base} for _ in range(10)])
+
+
 def test_build_terminal_dropeval_report_renders_three_metrics():
-    rows = [{"kind": "recall", "trials": 1, "retrieve_ok": 1, "answer_ok": 1, "handle_ok": 1}
-            for _ in range(10)] + [{"kind": "precision", "trials": 1, "retrieve_ok": 1,
-                                    "answer_ok": 1, "handle_ok": 1} for _ in range(10)]
-    text = build_terminal_dropeval_report({"m": rows}, color=False)
+    text = build_terminal_dropeval_report({"m": _dropeval_rows(control=True)}, color=False)
     assert "retrieve-recall" in text
     assert "no-overfetch" in text
     assert "final-accuracy" in text
+    # final-accuracy is the only metric with a MEASURED control; the other two are gated
+    # against a fixed ideal and must not claim otherwise (#269).
+    assert "no-drop control" in text
     assert "PASS" in text and "FAIL" not in text
+
+
+def test_final_accuracy_is_omitted_when_no_control_arm_ran():
+    """Without a control there is nothing to compare the drop against, so the chart must
+    draw nothing rather than plot the gap against a 100% nobody measured (#269)."""
+    text = build_terminal_dropeval_report({"m": _dropeval_rows(control=False)}, color=False)
+    assert "retrieve-recall" in text
+    assert "no-overfetch" in text
+    assert "final-accuracy" not in text
 
 
 def test_build_terminal_dropeval_report_empty():

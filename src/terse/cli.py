@@ -897,7 +897,9 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
         return 0
     print("\nverifying the suggested drops with a live model (does it call terse.retrieve "
           "when the dropped field is needed, and skip it when not?)...")
-    results = dropeval.run_drop_fluency(envelopes, pol.select, answerers, trials=args.trials)
+    results = dropeval.run_drop_fluency(envelopes, pol.select, answerers,
+                                        trials=args.trials,
+                                        control=not args.no_control)
     print("\n" + build_dropeval_report(results))
     print("If the worst-case model PASSES, enable the verified fields by renaming that tool's "
           "'_suggested_fields' -> 'fields' in the policy.")
@@ -1027,7 +1029,9 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             print("`fluency --drop-eval` needs a configured model: set TERSE_FLUENCY_BASE_URL/"
                   "_API_KEY/_MODELS.")
             return 1
-        results = dropeval.run_drop_fluency(envelopes, pol.select, answerers, trials=args.trials)
+        results = dropeval.run_drop_fluency(envelopes, pol.select, answerers,
+                                            trials=args.trials,
+                                            control=not args.no_control)
         _write_report(build_dropeval_report(results), args.out)
         if args.bars:
             print("\n" + build_terminal_dropeval_report(results))
@@ -1700,6 +1704,12 @@ def main(argv: list[str] | None = None) -> int:
                         "when a dropped field is needed (recall), and leave it alone when "
                         "it isn't (precision)? needs --policy with a drop-to-retrieve field "
                         "+ a configured model")
+    f.add_argument("--no-control", action="store_true",
+                   help="--drop-eval: skip the no-drop CONTROL arm. The control asks every "
+                        "question a second time against the same payload with the drop rule "
+                        "stripped, so final-accuracy is a gap between two measured arms "
+                        "rather than against an unrun 100%% ideal (#269). Skipping halves "
+                        "the calls and restores the old, confounded number")
     f.add_argument("--policy", help="policy file with a drop-to-retrieve field (used only "
                                     "by --drop-eval)")
     f.add_argument("--base-url", help="OpenAI-compatible base URL (else $TERSE_FLUENCY_BASE_URL)")
@@ -1725,6 +1735,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="also verify the suggested drops with a live tool-calling model "
                          "(needs TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS or --base-url/--models)")
     tn.add_argument("--trials", type=int, default=1, help="drop-eval trials per question")
+    tn.add_argument("--no-control", action="store_true",
+                    help="--drop-eval: skip the no-drop CONTROL arm (see `terse fluency "
+                         "--help`); halves the calls and restores the old, confounded "
+                         "final-accuracy number")
     tn.add_argument("--base-url", help="OpenAI-compatible base URL (else $TERSE_FLUENCY_BASE_URL)")
     tn.add_argument("--models", help="comma-separated model ids (else $TERSE_FLUENCY_MODELS)")
     tn.add_argument("--api-key-env", default="TERSE_FLUENCY_API_KEY",
