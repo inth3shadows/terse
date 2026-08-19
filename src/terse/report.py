@@ -337,18 +337,27 @@ def codec_verdict(rows: list[dict[str, Any]]) -> tuple[str, ArmGap]:
     `_GAP_TOLERANCE`. `arm_gap` still does the pairing and exclusion-gating work (so a
     dead backend or an unpaired question set reports UNRESOLVED via the same `_unmeasured`/
     `paired_rows` machinery every other renderer uses) — but the pass/fail decision itself
-    is a demonstrated-corruption gate: ANY paired trial where terse's form produced a
-    structurally different tool-call argument than raw did is UNSAFE, full stop, regardless
-    of how small a fraction of the sample it is. Zero observed failures is SAFE only once
-    `_CODEC_MIN_TRIALS` zero-failure trials have accumulated; short of that it is
-    UNRESOLVED — an early, thin run must not be able to print a confident SAFE."""
+    is a demonstrated-corruption gate: ANY paired excess of terse-arm misses beyond what the
+    raw arm ALSO missed is UNSAFE, full stop, regardless of how small a fraction of the
+    sample it is. Zero observed excess is SAFE only once `_CODEC_MIN_TRIALS` zero-failure
+    trials have accumulated; short of that it is UNRESOLVED.
+
+    Deliberately NOT `terse_ok < terse_trials` (raw code review, PR #302 F1) — that counts
+    every terse miss as codec-caused, including one the model would have missed on raw too
+    (a hard reconstruction, a prose-reply habit, anything about the MODEL rather than the
+    FORM). Measured: a model scoring 80% on BOTH raw and terse — identical behavior, no
+    demonstrated difference — printed UNSAFE under that definition. `max(0, raw_ok -
+    terse_ok)` per row is this file's own established "regression" shape (`harnesses.py`'s
+    module docstring: "a regression is a question the model got right on raw and wrong on
+    terse — a stronger signal than two independent accuracy rates"), just kept at
+    trial-count granularity instead of a per-row boolean, so it stays comparable to `n` for
+    the Clopper-Pearson framing above."""
     g = arm_gap(rows, "terse_ok", "raw_ok")
     if g.excluded:
         return "UNRESOLVED", g
     n = sum(r.get("terse_trials", r.get("trials", 1)) for r in g.rows)
-    failures = sum(r.get("terse_trials", r.get("trials", 1)) - int(r["terse_ok"])
-                   for r in g.rows)
-    if failures > 0:
+    excess_terse_misses = sum(max(0, int(r["raw_ok"]) - int(r["terse_ok"])) for r in g.rows)
+    if excess_terse_misses > 0:
         return "UNSAFE", g
     if n >= _CODEC_MIN_TRIALS:
         return "SAFE", g
@@ -373,8 +382,9 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
         "identical whether it read raw JSON or terse's compressed form? Scored on `deref`",
         "questions only — reconstructing an aliased or table-encoded value back into the",
         "original structure, which is what an agent does when it feeds a result into the",
-        "next tool call. No percentage tolerance: any demonstrated structural mismatch is",
-        "UNSAFE; a clean run needs enough trials to trust the zero, or it is UNRESOLVED.",
+        "next tool call, PAIRED against the same question answered from raw. No percentage",
+        "tolerance: any trial where raw succeeded and terse did not is UNSAFE; a clean run",
+        "needs enough trials to trust the zero, or it is UNRESOLVED.",
         "",
     ]
     if not results or not any(results.values()):
@@ -411,7 +421,10 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
         assert worst_gap is not None  # by_model is never empty — every group has >=1 model
         n = sum(r.get("terse_trials", r.get("trials", 1)) for r in worst_gap.rows)
         if worst_verdict == "UNSAFE":
-            why = "structural mismatch demonstrated"
+            excess = sum(max(0, int(r["raw_ok"]) - int(r["terse_ok"]))
+                        for r in worst_gap.rows)
+            why = (f"{excess} trial(s) where raw succeeded and terse did not "
+                  f"(raw {worst_gap.control_acc:.0%}, terse {worst_gap.form_acc:.0%})")
         elif worst_gap.excluded:
             why = REASON_LABEL.get(worst_gap.excluded, worst_gap.excluded)
         elif worst_verdict == "UNRESOLVED":

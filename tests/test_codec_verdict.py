@@ -1,12 +1,17 @@
 """Tests for the codec-tier material-preservation verdict (#295) — `report.codec_verdict`
 and `build_codec_verdict_report`.
 
-This gate is deliberately NOT a tolerance: any demonstrated structural mismatch is UNSAFE
-regardless of sample size, and a clean run needs `_CODEC_MIN_TRIALS` zero-failure trials
-before it can print SAFE rather than UNRESOLVED. Every boundary below is the kind of edge a
-tolerance-shaped gate would get wrong by construction — this file exists so an accidental
-reintroduction of a ratio/threshold shows up as a red test, not a silent regression.
-"""
+This gate is deliberately NOT a tolerance: any PAIRED excess of terse-arm misses beyond
+what the raw arm also missed is UNSAFE regardless of sample size, and a clean run needs
+`_CODEC_MIN_TRIALS` zero-failure trials before it can print SAFE rather than UNRESOLVED.
+Every boundary below is the kind of edge a tolerance-shaped gate would get wrong by
+construction — this file exists so an accidental reintroduction of a ratio/threshold shows
+up as a red test, not a silent regression.
+
+The identical-performance fixtures below (`test_identical_failure_on_both_arms_...`) pin the
+PR #302 review's finding 1: a first draft compared `terse_ok` to `terse_trials` alone,
+ignoring `raw_ok` entirely, and printed UNSAFE for a model that failed EQUALLY on raw and
+terse — i.e. for behavior with no demonstrated codec-caused difference at all."""
 from __future__ import annotations
 
 from terse.report import (
@@ -41,6 +46,31 @@ def test_zero_failures_below_the_trial_floor_is_UNRESOLVED_not_SAFE():
     rows = [_row(f"q{i}", 1, 1) for i in range(_CODEC_MIN_TRIALS - 1)]
     verdict, gap = codec_verdict(rows)
     assert verdict == "UNRESOLVED"
+
+
+def test_identical_failure_on_both_arms_is_not_UNSAFE():
+    # raw_ok == terse_ok on every row: the model is imperfect, but EQUALLY imperfect on
+    # raw and terse — no demonstrated codec-caused difference. Below the trial floor, so
+    # this is UNRESOLVED (not enough clean evidence), never UNSAFE.
+    rows = [_row(f"q{i}", 0, 0, trials=1) for i in range(5)]
+    verdict, gap = codec_verdict(rows)
+    assert verdict != "UNSAFE"
+
+
+def test_identical_partial_failure_on_both_arms_at_the_trial_floor_is_SAFE():
+    # A single row, 25 trials each, raw and terse both succeed on the SAME 20/25 — no
+    # excess terse-specific miss, and n clears the floor.
+    rows = [_row("q1", raw_ok=20, terse_ok=20, trials=25)]
+    verdict, gap = codec_verdict(rows)
+    assert verdict == "SAFE"
+
+
+def test_a_genuine_terse_specific_regression_is_UNSAFE_even_when_raw_is_imperfect():
+    # raw succeeds MORE often than terse on the same row — a real excess, not just raw's
+    # own baseline imperfection. Must still be UNSAFE.
+    rows = [_row("q1", raw_ok=20, terse_ok=15, trials=25)]
+    verdict, gap = codec_verdict(rows)
+    assert verdict == "UNSAFE"
 
 
 def test_zero_failures_at_exactly_the_trial_floor_is_SAFE():

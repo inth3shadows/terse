@@ -121,15 +121,21 @@ def test_run_codec_payload_scores_zero_but_not_errored_when_the_model_answers_in
     assert row["fails"] == 0
 
 
-def test_run_codec_payload_excludes_a_transport_failure_from_the_denominator():
+def test_run_codec_payload_counts_a_transport_failure_as_a_miss_in_a_fixed_denominator():
+    # A safety verdict must not let a silent non-answer shrink itself out of the sample
+    # (review finding 3 on PR #302) — unlike `harnesses.run_payload`'s comprehension arms,
+    # `raw_trials`/`terse_trials` stay fixed at `trials` regardless of errors, and the
+    # errored call scores as a miss (not a match) rather than being excluded.
     def always_errors(messages):
         raise RuntimeError("connection refused")
 
     rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, always_errors, trials=2)
     row = rows[0]
-    assert row["raw_trials"] == 0
-    assert row["terse_trials"] == 0
-    assert row["fails"] == 4  # 2 raw + 2 terse
+    assert row["raw_ok"] == 0
+    assert row["terse_ok"] == 0
+    assert row["raw_trials"] == 2  # fixed, not reduced
+    assert row["terse_trials"] == 2
+    assert row["fails"] == 4  # 2 raw + 2 terse — still tracked for the _unmeasured gate
     assert row["attempts"] == 4
 
 
@@ -145,10 +151,58 @@ def test_run_codec_payload_asks_the_same_question_against_both_forms():
 
     codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, capture, trials=1)
     q = _deref_question()
-    assert all(q.prompt in s and q.instruction in s for s in seen)
+    assert all(q.prompt in s and codeceval._codec_instruction() in s for s in seen)
     # Different DATA blocks: the raw arm's prompt must literally contain raw JSON text,
     # the terse arm's must contain terse's compressed form, not the same string twice.
     assert seen[0] != seen[1]
+
+
+def test_run_codec_payload_sends_no_system_message_at_all():
+    # Not an EMPTY system message — some OpenAI-compatible backends reject one outright
+    # (review finding 4 on PR #302). Only a user message should ever be sent.
+    seen: list[list[dict]] = []
+
+    def capture(messages):
+        seen.append(messages)
+        return Turn(text="", tool_calls=[])
+
+    codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, capture, trials=1)
+    assert seen
+    for messages in seen:
+        assert all(m["role"] != "system" for m in messages)
+        assert [m["role"] for m in messages] == ["user"]
+
+
+def test_run_codec_payload_uses_the_last_tool_call_when_the_model_calls_twice():
+    q = _deref_question()
+
+    def calls_twice_first_correct(messages):
+        return Turn(text="", tool_calls=[
+            ToolCall(call_id="c1", name=codeceval.RECORD_VALUE_TOOL,
+                     arguments={"value": q.expected}),
+            ToolCall(call_id="c2", name=codeceval.RECORD_VALUE_TOOL,
+                     arguments={"value": {"wrong": "value"}}),
+        ])
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, calls_twice_first_correct, trials=1)
+    row = rows[0]
+    # Last-wins: the LATER (wrong) call decides the score, not the first (correct) one.
+    assert row["raw_ok"] == 0
+    assert row["terse_ok"] == 0
+
+
+def test_run_codec_payload_scores_zero_when_the_value_key_is_missing():
+    def calls_without_value_key(messages):
+        return Turn(text="", tool_calls=[
+            ToolCall(call_id="c1", name=codeceval.RECORD_VALUE_TOOL, arguments={}),
+        ])
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, calls_without_value_key, trials=1)
+    row = rows[0]
+    assert row["raw_ok"] == 0
+    assert row["terse_ok"] == 0
+    assert row["raw_trials"] == 1  # the call landed; a missing key is a miss, not a transport error
+    assert row["fails"] == 0
 
 
 # --------------------------------------------------------------------------- #

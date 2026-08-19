@@ -35,8 +35,11 @@ structural equality (`_value_matches`) — not a text-extraction heuristic, and 
 free-text comprehension score. This is what #295 calls "material equivalence": would the
 model's downstream tool call carry the same value regardless of which form it read.
 
-**No system primer** on either arm (`""`, matching `harnesses.run_payload`'s bare `terse_ok`
-arm — see `fluency/harnesses.py`). This is a deliberate, separate choice from #249's
+**No system primer** on either arm — the system message is OMITTED entirely (matching
+`fluency.answerers`' `if system:` guard, not `harnesses.run_payload`'s bare `terse_ok` arm,
+which was corrected here after review found the first draft sent an empty-string system
+message where `fluency`'s own no-primer arm sends none at all — some OpenAI-compatible
+backends reject an empty message). This is a deliberate, separate choice from #249's
 primer-necessity question: this eval asks whether the codec is materially safe, not whether
 a primer helps a model read it, and testing without one is the more conservative bound —
 a pass here implies a pass with a primer, not the reverse.
@@ -59,11 +62,14 @@ makes tier separation a first-class requirement ("split by tier — do not confl
 module imports dropeval's tool-loop primitives; it does not extend dropeval's drop-specific
 vocabulary.
 
-Row shape emitted here matches `harnesses.run_payload`'s convention exactly
+Row shape emitted here carries the same KEYS as `harnesses.run_payload`'s convention
 (`<form>_ok`/`<form>_trials`/`trials`/`fails`/`attempts`) so it slots into `report.arm_gap`/
 `report._form_stats`/`report.paired_rows` unchanged — no new pairing logic needed, and
 `tests/test_gap_gate_boundary.py`'s AST allowlist stays untouched as long as this module only
-ever reaches those through `arm_gap`.
+ever reaches those through `arm_gap`. One deliberate divergence: `<form>_trials` here is
+always the FIXED `trials` count, never reduced by an errored call — see
+`run_codec_payload`'s docstring for why (review finding 3 on PR #302: this eval renders a
+safety verdict, and a silent non-answer must not be able to shrink itself out of the sample).
 """
 
 from __future__ import annotations
@@ -116,28 +122,46 @@ def _value_matches(got: Any, expected: Any) -> bool:
     return got == expected
 
 
+def _codec_instruction() -> str:
+    """The instruction half of the user prompt for a codec-eval trial.
+
+    Deliberately NOT `question.instruction` — that string is written for `fluency.py`'s
+    single-shot text-reply protocol ("Reply with only that value as compact JSON, and
+    nothing else"), which tells a compliant model to answer in PROSE. `tool_choice` is
+    `"auto"` (`dropeval.openai_tool_answerer`), so a model that obeys that instruction
+    literally never calls `RECORD_VALUE_TOOL` at all — a harness-caused miss with nothing
+    to do with the codec, found by live trace during review of PR #302 (finding 2). This
+    eval's whole premise is a downstream TOOL CALL, so the instruction has to ask for one."""
+    return ("Call the tool with that value as its argument. Do not reply in prose, and do "
+           "not call any other tool.")
+
+
 def _ask_codec_question(question: fluency.Question, payload_text: str,
                         answerer: ToolAnswerer) -> tuple[bool, bool]:
     """One trial: ask `question` over `payload_text`, expect a `RECORD_VALUE_TOOL` call.
-    Returns (matched, errored). A call that never reaches the model, or reaches it and gets
-    no tool call back, both score as `matched=False` — `errored` is what keeps that
-    DISTINGUISHABLE from a real structural mismatch (#263's fail-open contract, same as
-    `dropeval._run_question`)."""
+    Returns (matched, errored).
+
+    `errored` means the call never produced a scorable turn — either a transport failure
+    (`_safe_call`'s except branch) or a live backend returning 200 with neither text nor a
+    tool call (`dropeval.openai_tool_answerer`'s `no_content` branch; the two are
+    indistinguishable through the shared `Turn` contract, so both are treated the same way
+    here). Deliberately scored as a MISS, not excluded from the trial count — mirroring
+    `dropeval._run_question`'s documented stance ("excluding would be the dangerous
+    direction"), not `fluency.harnesses`' per-form-trial-reduction convention: this eval
+    renders a SAFE/UNSAFE verdict, and a silent non-answer — the worst possible outcome for
+    a downstream tool call — must not be able to shrink itself out of the denominator and
+    help a run reach SAFE (review finding 3 on PR #302). A model that reaches the tool
+    definition and declines to call anything is scored the same way, for the same reason
+    (not a transport error, but still the failure mode this eval exists to catch)."""
     messages: list[dict] = [
-        {"role": "system", "content": ""},  # no primer — see module docstring
-        {"role": "user", "content": fluency._user_prompt(question.prompt, question.instruction,
+        {"role": "user", "content": fluency._user_prompt(question.prompt, _codec_instruction(),
                                                           payload_text)},
     ]
     turn: Turn = _safe_call(answerer, messages)
     if turn.error:
-        return False, True
+        return False, True  # counted as a miss by the caller, kept in the fixed denominator
     record_calls = [c for c in turn.tool_calls if c.name == RECORD_VALUE_TOOL]
     if not record_calls:
-        # Answered in prose instead of calling the tool, or called something else — not a
-        # transport error, just not the downstream call this eval measures. Scored as a
-        # miss, not excluded: a model that won't make the call at all is not materially
-        # safe to feed compressed data to, any more than one that calls it with the wrong
-        # value.
         return False, False
     got = record_calls[-1].arguments.get("value")
     return _value_matches(got, question.expected), False
@@ -146,9 +170,15 @@ def _ask_codec_question(question: fluency.Question, payload_text: str,
 def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
                       trials: int = 1) -> list[dict]:
     """Ask each `deref` question in `obj` over raw vs terse, `trials` times each, via the
-    tool-calling protocol. One row per question, success COUNTS (0..trials) per arm plus
-    `trials`/`fails`/`attempts` — the exact convention `harnesses.run_payload` emits, so
-    `report.arm_gap`/`_form_stats`/`paired_rows` work on these rows unchanged."""
+    tool-calling protocol. One row per question.
+
+    `raw_trials`/`terse_trials` are the FIXED `trials` count, not reduced by errors (see
+    `_ask_codec_question`'s docstring) — this differs from `fluency.harnesses.run_payload`'s
+    convention on purpose, even though the row otherwise matches its key shape closely
+    enough to flow through `report.arm_gap`/`_form_stats`/`paired_rows` unchanged. `fails`/
+    `attempts` still track raw call losses, so `report._unmeasured`'s >20%-loss gate still
+    catches a substantially-down backend and reports UNRESOLVED rather than a confident
+    verdict computed over a small, self-selected surviving sample."""
     terse_text = fluency.compress(obj)
     out: list[dict] = []
     for q in gen_codec_questions(obj):
@@ -156,16 +186,16 @@ def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
         for _ in range(trials):
             ok, err = _ask_codec_question(q, raw_text, answerer)
             raw_fail += int(err)
-            raw_ok += int(ok and not err)
+            raw_ok += int(ok)  # an errored call scores as a miss, not an exclusion
         for _ in range(trials):
             ok, err = _ask_codec_question(q, terse_text, answerer)
             terse_fail += int(err)
-            terse_ok += int(ok and not err)
+            terse_ok += int(ok)
         out.append({
             "qid": q.qid, "qtype": q.qtype, "transform": q.transform, "trials": trials,
             "raw_ok": raw_ok, "terse_ok": terse_ok,
-            "raw_trials": trials - raw_fail,
-            "terse_trials": trials - terse_fail,
+            "raw_trials": trials,
+            "terse_trials": trials,
             "fails": raw_fail + terse_fail,
             "attempts": trials * 2,
         })

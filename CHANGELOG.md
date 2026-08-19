@@ -13,7 +13,24 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **`terse fluency --codec-verdict`: a downstream-outcome verdict for the codec tier**
+  (`#295`). The existing fluency harness renders a single PASS/FAIL against a fixed 5%
+  comprehension-accuracy tolerance — a budget for how much semantic damage the codec's
+  *unconditionally lossless* tier is allowed to cause at the reader, which contradicts its
+  own round-trip-proven losslessness claim. Comprehension failures also concentrate in
+  `deref` (reconstructing terse's compressed form back into JSON), which is exactly what an
+  agent does when it feeds a value into the next tool call — a `deref` miss is a malformed
+  downstream tool argument, not "a wrong answer".
+
+  `--codec-verdict` asks each `deref` question over raw vs terse via a real tool-calling
+  model, scoring the emitted tool-call ARGUMENT by structural equality rather than a
+  free-text comprehension score, and renders **SAFE / UNSAFE / UNRESOLVED per (tool,
+  shape)** — never a global percentage. Any PAIRED excess of terse-arm misses beyond what
+  raw also missed is UNSAFE, full stop, regardless of sample size; a clean run needs enough
+  zero-failure trials (Clopper-Pearson bounded) to claim SAFE rather than UNRESOLVED. Drop
+  tier is unaffected — `dropeval.py` already has this shape there.
 
 ## [0.26.0] - 2026-08-18
 
