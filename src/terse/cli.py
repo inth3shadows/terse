@@ -836,13 +836,16 @@ def _cmd_probe_cross_server(args: argparse.Namespace, envelopes: list[dict]) -> 
     return 0
 
 
-def _build_answerers(args: argparse.Namespace, make_openai) -> dict:
+def _build_answerers(args: argparse.Namespace, make_openai, mode_name: str = "--drop-eval") -> dict:
     """Assemble named answerers from env + flags. Empty means keyless (pack) mode.
 
-    Shared by plain `fluency` (`make_openai=fluency.openai_answerer`) and
-    `fluency --drop-eval` (`make_openai` bound to `dropeval.openai_tool_answerer` +
-    the retrieve tool) so the two eval modes stay configured identically — only the
-    answerer FACTORY differs, never the env/flag precedence.
+    Shared by plain `fluency` (`make_openai=fluency.openai_answerer`) and every
+    tool-calling eval mode (`fluency --drop-eval`/`--codec-verdict`, `make_openai` bound
+    to the mode's own `openai_tool_answerer` + tool def) so every eval mode stays
+    configured identically — only the answerer FACTORY differs, never the env/flag
+    precedence. `mode_name` is only for the `cli:` refusal message below — it does not
+    change any selection logic — so a `--codec-verdict` user with a `cli:` model sees the
+    flag they actually passed named back to them, not a hardcoded `--drop-eval`.
 
     Two backends, selected per-model by id. A `cli:<alias>` id goes to `cli_answerer`
     (`claude -p` on the OAuth subscription) and needs no base URL or key; everything else
@@ -870,12 +873,12 @@ def _build_answerers(args: argparse.Namespace, make_openai) -> dict:
                 raise SystemExit(f"terse fluency: {m!r}: cli: needs a model alias after "
                                  f"the prefix, e.g. cli:opus")
             if make_openai is not fluency.openai_answerer:
-                # --drop-eval needs a TOOL-CALLING answerer; `claude -p --output-format
-                # json` returns prose, not tool calls. Refusing loudly beats handing that
-                # mode an answerer that can never call `terse.retrieve` and scoring the
-                # resulting silence as "the model declined to retrieve".
+                # Every tool-calling mode needs a TOOL-CALLING answerer; `claude -p
+                # --output-format json` returns prose, not tool calls. Refusing loudly
+                # beats handing that mode an answerer that can never call the tool under
+                # test and scoring the resulting silence as "the model declined to call it".
                 raise SystemExit(f"terse fluency: {m}: the cli: backend does not support "
-                                 f"--drop-eval (it cannot make tool calls)")
+                                 f"{mode_name} (it cannot make tool calls)")
             answerers[m] = fluency.cli_answerer(cli_alias)
         elif base and key:
             answerers[m] = make_openai(base, key, m)
@@ -1072,6 +1075,30 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         if args.bars:
             print("\n" + build_terminal_dropeval_report(results,
                                                          accept_degraded=args.accept_degraded))
+        return 0
+
+    # Codec-verdict mode (#295): does a real tool-calling model's downstream tool-call
+    # argument stay structurally identical whether it read raw JSON or terse's compressed
+    # form? Replaces the comprehension-accuracy tolerance with a demonstrated-corruption
+    # gate, rendered per (tool, shape) rather than as one global number. Live-model-only,
+    # same as --drop-eval and --diff — this measures real tool-call behavior, not a
+    # ground-truth-scored reply.
+    if args.codec_verdict:
+        from . import codeceval
+        from .report import build_codec_verdict_report
+
+        answerers = _build_answerers(
+            args,
+            lambda base, key, m: dropeval.openai_tool_answerer(
+                base, key, m, tools=[codeceval.RECORD_VALUE_TOOL_DEF]),
+            mode_name="--codec-verdict",
+        )
+        if not answerers:
+            print("`fluency --codec-verdict` needs a configured model: set "
+                  "TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS.")
+            return 1
+        results = codeceval.run_codec_fluency(envelopes, answerers, trials=args.trials)
+        _write_report(build_codec_verdict_report(results), args.out)
         return 0
 
     # Diff mode: does a model read a cross-call DIFF as well as the full result? Needs a
@@ -1741,6 +1768,12 @@ def main(argv: list[str] | None = None) -> int:
                         "when a dropped field is needed (recall), and leave it alone when "
                         "it isn't (precision)? needs --policy with a drop-to-retrieve field "
                         "+ a configured model")
+    f.add_argument("--codec-verdict", action="store_true",
+                   help="behavioral eval (#295): does a real tool-calling model's downstream "
+                        "tool-call argument stay structurally identical whether it read raw "
+                        "JSON or terse's compressed form? scored on deref questions only, "
+                        "rendered as SAFE/UNSAFE/UNRESOLVED per (tool, shape) rather than a "
+                        "global accuracy tolerance; needs a configured tool-calling model")
     f.add_argument("--accept-degraded", action="store_true",
                    help="--drop-eval: render a verdict even when enough calls failed to "
                         "trip the INCONCLUSIVE gate. For when the cause is known and "
