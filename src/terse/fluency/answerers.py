@@ -14,6 +14,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -101,15 +102,23 @@ def openai_answerer(base_url: str, api_key: str, model: str,
 # same way.
 CLI_PREFIX = "cli:"
 
-# Substrings that mean "the subscription hit its window limit", not "the model was wrong".
+# Phrases that mean "the subscription hit its window limit", not "the model was wrong".
 # Scoring a quota wall as a wrong answer is what invalidated a whole modelbench run: the
 # wall hits partway through and every remaining call writes a confident-looking failure.
-_QUOTA_MARKERS = ("usage limit", "rate limit", "quota", "too many requests", "429")
+# Multi-word phrases are matched as plain substrings — low false-positive risk, since
+# unrelated text rarely contains "usage limit" or "too many requests" verbatim. The bare
+# HTTP status "429" is matched on a word boundary instead of a raw substring: this result
+# feeds a PERMANENT per-model circuit breaker (once tripped, every remaining question for
+# that model is skipped), so a partial match inside an unrelated number (a line count, a
+# token count, a corpus id) must not be able to trip it.
+_QUOTA_PHRASES = ("usage limit", "rate limit", "quota", "too many requests")
+_QUOTA_RE = re.compile(
+    r"(?:" + "|".join(re.escape(p) for p in _QUOTA_PHRASES) + r")|\b429\b", re.IGNORECASE)
 
 
 def _looks_like_quota(*texts: str) -> bool:
-    blob = " ".join(t for t in texts if t).lower()
-    return any(m in blob for m in _QUOTA_MARKERS)
+    blob = " ".join(t for t in texts if t)
+    return bool(_QUOTA_RE.search(blob))
 
 
 def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
@@ -178,7 +187,7 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
     quota_hit = False
     quota_hit_warned = False
 
-    def _kill_group(proc: subprocess.Popen, *, why: str) -> None:
+    def _kill_and_drain(proc: subprocess.Popen, *, why: str) -> None:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except ProcessLookupError:
@@ -191,6 +200,13 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
                   f"group ({why}) — descendants may keep running and burn "
                   f"subscription quota", file=sys.stderr)
             proc.kill()
+        try:
+            # Best-effort reap so a killed child doesn't sit as a zombie holding its
+            # pipe fds — swallow any error so we never mask whatever exception (if any)
+            # is already propagating past this call.
+            proc.communicate(timeout=10)
+        except Exception:
+            pass
 
     def ask(system: str, user: str) -> str | None:
         nonlocal quota_hit, quota_hit_warned
@@ -237,11 +253,7 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
             try:
                 out, err = proc.communicate(user, timeout=timeout)
             except subprocess.TimeoutExpired:
-                _kill_group(proc, why="timeout")
-                try:
-                    proc.communicate(timeout=10)
-                except subprocess.TimeoutExpired:
-                    pass  # best-effort drain — the group is already dead or unkillable
+                _kill_and_drain(proc, why="timeout")
                 print(f"terse fluency: {alias} timed out after {timeout}s — counted as a "
                       f"non-answer, not scored", file=sys.stderr)
                 return None
@@ -252,14 +264,7 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
             # stop from propagating. Leaving the group running past this point is the
             # exact orphaned-quota-burn incident modelbench already hit once.
             if proc.poll() is None:
-                _kill_group(proc, why="cleanup")
-                try:
-                    # Best-effort reap so a killed child doesn't sit as a zombie holding
-                    # its pipe fds — swallow any error so we never mask whatever
-                    # exception is already propagating through this finally.
-                    proc.communicate(timeout=10)
-                except Exception:
-                    pass
+                _kill_and_drain(proc, why="cleanup")
         if proc.returncode != 0:
             why = "subscription window limit" if _looks_like_quota(err, out) else "cli error"
             if why == "subscription window limit":

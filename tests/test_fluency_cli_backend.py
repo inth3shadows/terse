@@ -203,6 +203,37 @@ def test_a_quota_wall_is_a_non_answer_not_a_wrong_answer(monkeypatch):
     assert cli_answerer("opus")("", "q") is None
 
 
+def test_a_bare_429_still_trips_the_breaker_but_a_number_containing_429_does_not(monkeypatch):
+    """The quota result feeds a PERMANENT per-model circuit breaker — a partial match
+    inside an unrelated number (line count, token count, corpus id) must not trip it,
+    but a genuine standalone HTTP 429 in an error message still must."""
+    launches: list = []
+
+    def fake_popen(argv, **kw):
+        launches.append(argv)
+        return _FakeProc(err="request failed: 429", code=1)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    answerer = cli_answerer("opus")
+    assert answerer("", "q1") is None
+    assert answerer("", "q2") is None
+    assert len(launches) == 1, "bare 429 should have tripped the breaker"
+
+
+def test_an_unrelated_number_containing_429_does_not_trip_the_breaker(monkeypatch):
+    launches: list = []
+
+    def fake_popen(argv, **kw):
+        launches.append(argv)
+        return _FakeProc(err="processed 3429 records, exit code 2", code=2)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    answerer = cli_answerer("opus")
+    assert answerer("", "q1") is None
+    assert answerer("", "q2") is None
+    assert len(launches) == 2, "3429 must not be read as the HTTP status 429"
+
+
 def test_a_confirmed_quota_wall_trips_a_breaker_for_the_rest_of_this_models_calls(monkeypatch):
     """Once THIS model's window is confirmed exhausted, remaining calls for it must not
     spawn another doomed `claude -p` — at 100+ calls/model that's hundreds of launches
