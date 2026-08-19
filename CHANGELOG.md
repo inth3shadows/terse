@@ -15,6 +15,39 @@ fails that pull request until the section has moved.
 
 _Nothing yet._
 
+## [0.26.0] - 2026-08-18
+
+### Added
+
+- **`cli:<alias>` answerer reaches real Anthropic models through `claude -p` OAuth**
+  (`#249`). Every prior "frontier panel" was measured against the loopback LiteLLM
+  gateway, whose `claude-sonnet-5` / `claude-fable-5` / `claude-haiku-4-*` ids are
+  aliases onto DeepSeek, not real Claude — a published four-model panel was actually
+  two DeepSeek models measured twice under Anthropic names. `cli:<alias>` ids mix
+  freely with gateway ids in one `--models` list, always pass `--system-prompt`
+  (empty string included) so it *replaces* rather than appends Claude Code's default
+  preamble, and strip `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY`
+  from the child env so a session already routed through the aliasing gateway can't
+  route this path back through it. Every failure returns `None`, never a string,
+  after killing the process group so orphaned children don't burn subscription quota
+  unseen. `--drop-eval` refuses `cli:` models outright rather than mis-scoring their
+  prose output as a declined retrieval.
+
+## [0.25.5] - 2026-08-18
+
+### Fixed
+
+- **`dropeval`'s final-accuracy metric is scored against a measured no-drop control,
+  not a fixed 100% ideal that was never run** (`#269`). The metric is JSON
+  value-equality against 500+ character prose fields, and a model handed the
+  un-dropped payload paraphrases rather than reproducing it verbatim — so the old
+  fixed ideal billed normal paraphrase loss to the drop. A live reproduction showed
+  every mechanism metric at 100% and final-accuracy at 54%, verdict FAIL. The new
+  control arm strips only the drop specs (same tiers, codec, and primer) and measures
+  76-88% across three models from three labs, not 100% — flipping two of three models
+  from FAIL to PASS. No control run excludes the metric rather than defaulting back to
+  the fixed ideal, and per-arm trial counts now exclude errored calls.
+
 ## [0.25.4] - 2026-08-15
 
 ### Fixed
