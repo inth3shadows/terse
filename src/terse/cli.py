@@ -883,9 +883,14 @@ def _build_answerers(args: argparse.Namespace, make_openai) -> dict:
             # Refuse loudly rather than silently dropping this model from the panel —
             # a `--models` list mixing `cli:` and OpenAI-style ids must not let a
             # missing base-url/key quietly shrink the panel to just the cli: entries.
+            # This also fires for a single stale named model (e.g. a leftover
+            # TERSE_FLUENCY_MODELS export from an earlier live run) — the error names
+            # the escape hatch explicitly since that case has no `cli:` entry to hint at
+            # one.
             raise SystemExit(f"terse fluency: {m}: no base URL/key configured "
-                             f"(set --base-url/{args.api_key_env or 'TERSE_FLUENCY_API_KEY'} "
-                             f"or use a cli: model)")
+                             f"(set --base-url/{args.api_key_env or 'TERSE_FLUENCY_API_KEY'}, "
+                             f"use a cli: model, or unset --models/TERSE_FLUENCY_MODELS "
+                             f"for keyless pack mode)")
     return answerers
 
 

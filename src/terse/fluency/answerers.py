@@ -126,16 +126,28 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
     wall and records it at `runner.py:423`. This backend is the only path to the real thing.
 
     **The system slot is passed explicitly, always.** `--system-prompt` replaces the
-    *system prompt* only — NOT, as an earlier draft of this claimed, Claude Code's whole
-    default preamble. Measured directly: `""` costs 19,816 input tokens, `"You are a
-    calculator."` costs 19,821 — the ~19.8k of tool-definition/context preamble is present
-    in BOTH arms, constant, and so not a confound. What the flag does buy is real: the
-    primer arm and the no-primer arm still differ by exactly the primer content and
-    nothing else, because omitting the flag for the no-primer arm would hand that arm its
-    own multi-thousand-token system prompt on top of the shared preamble — an
-    arm-correlated confound in the one comparison #249 turns on. Treat this as a validity
-    caveat on absolute accuracy and on any cross-backend comparison, not on the
-    primer/no-primer contrast itself.
+    *system prompt* only, never Claude Code's whole preamble — and `--setting-sources ""`
+    (below) is what keeps that preamble itself small and constant. Measured directly with
+    both flags in place: `""` costs 3,131 total input tokens, `"You are a calculator."`
+    costs 3,136 — a +5-token additive difference, matching the prompt's own length. The
+    remaining ~3.1k baseline — tool-definition/context preamble — is present in BOTH arms,
+    constant, and so not a confound. What the flag does buy is real: the primer arm and
+    the no-primer arm still differ by exactly the primer content and nothing else, because
+    omitting the flag for the no-primer arm would hand that arm its own multi-thousand-token
+    system prompt on top of the shared preamble — an arm-correlated confound in the one
+    comparison #249 turns on. Treat the ~3.1k baseline as a validity caveat on absolute
+    accuracy and on any cross-backend comparison, not on the primer/no-primer contrast
+    itself.
+
+    **Settings sources are cut, not just the system prompt.** `--setting-sources ""`
+    disables CLAUDE.md auto-discovery and hooks — `--strict-mcp-config` only touches MCP
+    servers, not this. Without it, an operator's own personal `~/.claude/CLAUDE.md` and
+    hooks leak into every call under test — measured on a real operator machine: input
+    tokens per call dropped from ~19.8k to ~3.1k with this flag added, i.e. roughly 16.7k
+    tokens of that operator's own instructions were silently part of "the primer arm"
+    before this flag existed. `--bare` was considered and rejected: it also forces
+    API-key auth, which this backend cannot use — see above, it needs the OAuth
+    subscription specifically.
 
     **The environment is scrubbed on purpose.** `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
     / `ANTHROPIC_API_KEY` are dropped from the child env; a session running under
@@ -164,6 +176,7 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
     # exhausted, every remaining call for it returns immediately instead of spawning
     # another doomed `claude -p` process that can only time out or quota-fail.
     quota_hit = False
+    quota_hit_warned = False
 
     def _kill_group(proc: subprocess.Popen, *, why: str) -> None:
         try:
@@ -180,8 +193,13 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
             proc.kill()
 
     def ask(system: str, user: str) -> str | None:
-        nonlocal quota_hit
+        nonlocal quota_hit, quota_hit_warned
         if quota_hit:
+            if not quota_hit_warned:
+                quota_hit_warned = True
+                print(f"terse fluency: {alias}: subscription window already confirmed "
+                      f"exhausted — skipping remaining calls for this model rather than "
+                      f"launching more doomed processes", file=sys.stderr)
             return None
         argv = ["claude", "-p", "--model", alias, "--output-format", "json",
                 "--strict-mcp-config", "--mcp-config", mcp_cfg,
@@ -191,6 +209,15 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
                 # replying with prose like "I can't run that" would otherwise be a
                 # non-None string scored as a WRONG answer, not a non-answer.
                 "--tools", "",
+                # No user/project/local settings sources either — CLAUDE.md auto-discovery
+                # and hooks are NOT covered by --strict-mcp-config (that's MCP only), and
+                # `--bare` isn't usable here because it also forces API-key auth, which
+                # this backend cannot use (see docstring: it needs the OAuth subscription,
+                # not a key). Load-bearing, not just tidy: on an operator's real machine
+                # with a nontrivial user-level CLAUDE.md this cut measured input tokens
+                # from ~19.8k to ~3.1k per call — the difference is that operator's own
+                # personal instructions leaking into the prompt under test.
+                "--setting-sources", "",
                 # Empty string is deliberate and load-bearing — see docstring.
                 "--system-prompt", system]
         # start_new_session puts claude and everything it spawns in a fresh process group.
@@ -250,9 +277,18 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
                   f"non-answer, not scored", file=sys.stderr)
             return None
         # `is_error` is the CLI's own flag for "this turn failed"; the quota wall arrives
-        # here as well as via a nonzero exit, depending on where it lands.
+        # here as well as via a nonzero exit, depending on where it lands. The error text
+        # itself is NOT always in `result` — the CLI's own error subtypes (hitting
+        # --max-turns or a budget cap) carry it in `variant.errors` instead, with `result`
+        # absent; falling back to `str(None)` there would hide the real cause behind a
+        # useless "(None)" on every remaining call for this model.
         if body.get("is_error"):
-            error_text = str(body.get("result"))
+            error_text = body.get("result")
+            if error_text is None:
+                variant = body.get("variant")
+                if isinstance(variant, dict) and isinstance(variant.get("errors"), list):
+                    error_text = "; ".join(str(e) for e in variant["errors"])
+            error_text = str(error_text)
             if _looks_like_quota(error_text):
                 quota_hit = True
             print(f"terse fluency: {alias} reported is_error "

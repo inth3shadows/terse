@@ -127,6 +127,17 @@ def test_builtin_tools_are_also_disabled_not_just_mcp(monkeypatch):
     assert argv[argv.index("--tools") + 1] == ""
 
 
+def test_settings_sources_are_cut_so_an_operators_own_claude_md_cannot_leak_in(monkeypatch):
+    """`--strict-mcp-config` does not touch CLAUDE.md auto-discovery or hooks — only
+    `--setting-sources ""` does. Measured on a real machine: dropped per-call input tokens
+    from ~19.8k to ~3.1k, i.e. an operator's own personal CLAUDE.md/hooks were silently
+    part of every arm's prompt under test without this flag."""
+    seen = _spy(monkeypatch, _FakeProc(out=_reply("4")))
+    cli_answerer("opus")("", "q")
+    argv = seen["argv"]
+    assert argv[argv.index("--setting-sources") + 1] == ""
+
+
 def test_a_missing_claude_binary_is_reported_not_silently_swallowed(monkeypatch, capsys):
     """Every other failure path here prints a stderr diagnostic; a missing/unresolvable
     `claude` binary must not be the one silent exception `_safe_ask`'s catch-all absorbs."""
@@ -209,6 +220,23 @@ def test_a_confirmed_quota_wall_trips_a_breaker_for_the_rest_of_this_models_call
     assert len(launches) == 1, "second call should have short-circuited, not re-launched"
 
 
+def test_the_breaker_short_circuit_is_reported_once_not_silently(monkeypatch, capsys):
+    """Every other non-answer path in this file prints a stderr diagnostic — the breaker's
+    fast-path return must not be the one silent exception, or an operator watching a long
+    panel run has no way to tell "confirmed exhausted" from "still calling and failing"."""
+    def fake_popen(argv, **kw):
+        return _FakeProc(err="Claude usage limit reached", code=1)
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    answerer = cli_answerer("opus")
+    answerer("", "q1")
+    capsys.readouterr()  # drain the first call's own diagnostic
+    answerer("", "q2")
+    answerer("", "q3")
+    err = capsys.readouterr().err
+    assert err.count("already confirmed exhausted") == 1, "should warn once, not per call"
+
+
 def test_a_nonzero_exit_is_a_non_answer(monkeypatch):
     _spy(monkeypatch, _FakeProc(err="boom", code=2))
     assert cli_answerer("opus")("", "q") is None
@@ -264,6 +292,18 @@ def test_a_non_timeout_exception_still_kills_the_group_before_propagating(monkey
 def test_is_error_is_a_non_answer_even_on_a_clean_exit(monkeypatch):
     _spy(monkeypatch, _FakeProc(out=json.dumps({"is_error": True, "result": "nope"})))
     assert cli_answerer("opus")("", "q") is None
+
+
+def test_an_error_variant_with_no_result_field_still_reports_its_real_cause(monkeypatch, capsys):
+    """The CLI's own error subtypes (hitting --max-turns or a budget cap) carry the error
+    text in `variant.errors`, not `result` — `result` is absent entirely on these. Falling
+    back to `str(None)` would print a useless "(None)" for every remaining call."""
+    body = json.dumps({"is_error": True,
+                       "variant": {"subtype": "error_max_turns",
+                                   "errors": ["Reached maximum number of turns (5)"]}})
+    _spy(monkeypatch, _FakeProc(out=body))
+    assert cli_answerer("opus")("", "q") is None
+    assert "Reached maximum number of turns" in capsys.readouterr().err
 
 
 def test_non_json_stdout_is_a_non_answer(monkeypatch):
