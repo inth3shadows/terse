@@ -26,7 +26,10 @@ Method (the honesty bar, principle #24):
 The answerer is a pluggable `(system, user) -> reply` callable, so the pure core
 (question generation + scoring) runs offline with no network or key. The live backend
 (`openai_answerer` over stdlib urllib) reaches any OpenAI-compatible endpoint — the
-broker pool or a loopback gateway — and adds zero new dependencies.
+broker pool or a loopback gateway — and adds zero new dependencies. A `cli:<alias>`
+model id selects `cli_answerer` instead, which shells out to `claude -p` on the OAuth
+subscription: it is the ONLY way to reach a real Anthropic model here, because the
+loopback gateway's `claude-*` ids are aliases onto DeepSeek (#249).
 
 Package layout (#78 — split from one 958-line module; this facade preserves the
 `fluency.X` surface every caller/test already uses):
@@ -45,7 +48,9 @@ from .. import text_diff  # noqa: F401
 from ..transforms import compress  # noqa: F401
 from .answerers import (  # noqa: F401
     _LOOPBACK_HOSTS,
+    CLI_PREFIX,
     Answerer,
+    cli_answerer,
     openai_answerer,
 )
 from .harnesses import (  # noqa: F401

@@ -3,12 +3,23 @@
 The pure core (question generation + scoring) runs offline with no network or key;
 the live backend (`openai_answerer` over stdlib urllib) reaches any OpenAI-compatible
 endpoint — the broker pool or a loopback gateway — and adds zero new dependencies.
+
+`cli_answerer` is the second backend, and it exists because the OpenAI-compatible path
+CANNOT reach a real Anthropic model in this setup — see its docstring for the trap that
+cost issue #249 a whole panel.
 """
 
 from __future__ import annotations
 
+import atexit
 import json
+import os
+import re
+import shutil
+import signal
+import subprocess
 import sys
+import tempfile
 import urllib.request
 from collections.abc import Callable
 
@@ -82,5 +93,233 @@ def openai_answerer(base_url: str, api_key: str, model: str,
                   f"non-answer, not scored", file=sys.stderr)
             return None
         return content
+
+    return ask
+
+
+# Model ids carrying this prefix are served by `cli_answerer`, not by the OpenAI path.
+# Mirrors modelbench's `cli:` convention so the two harnesses name the same thing the
+# same way.
+CLI_PREFIX = "cli:"
+
+# Phrases that mean "the subscription hit its window limit", not "the model was wrong".
+# Scoring a quota wall as a wrong answer is what invalidated a whole modelbench run: the
+# wall hits partway through and every remaining call writes a confident-looking failure.
+# Multi-word phrases are matched as plain substrings — low false-positive risk, since
+# unrelated text rarely contains "usage limit" or "too many requests" verbatim. The bare
+# HTTP status "429" is matched on a word boundary instead of a raw substring: this result
+# feeds a PERMANENT per-model circuit breaker (once tripped, every remaining question for
+# that model is skipped), so a partial match inside an unrelated number (a line count, a
+# token count, a corpus id) must not be able to trip it.
+_QUOTA_PHRASES = ("usage limit", "rate limit", "quota", "too many requests")
+_QUOTA_RE = re.compile(
+    r"(?:" + "|".join(re.escape(p) for p in _QUOTA_PHRASES) + r")|\b429\b", re.IGNORECASE)
+
+
+def _looks_like_quota(*texts: str) -> bool:
+    blob = " ".join(t for t in texts if t)
+    return bool(_QUOTA_RE.search(blob))
+
+
+def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
+    """Real Anthropic models via the `claude -p` OAuth subscription (no API key).
+
+    **Why this backend exists at all.** No OpenAI-compatible endpoint in this setup serves
+    a real Anthropic model. The local LiteLLM gateway defines `claude-sonnet-5`,
+    `claude-fable-5` and `claude-haiku-4-*` as ALIASES onto DeepSeek — its config says so
+    outright ("route Anthropic model IDs to DeepSeek direct ... without touching real
+    Claude"), because they exist to exercise Claude Code's `/v1/messages` path against a
+    cheap backend. That is a fine thing to have and a disastrous thing to point an eval at:
+    #249 ran a four-model "frontier panel" that was actually two DeepSeek models measured
+    twice under Anthropic names, and reported it as multi-vendor. `modelbench` hit the same
+    wall and records it at `runner.py:423`. This backend is the only path to the real thing.
+
+    **The system slot is passed explicitly, always.** `--system-prompt` replaces the
+    *system prompt* only, never Claude Code's whole preamble — and `--setting-sources ""`
+    (below) is what keeps that preamble itself small and constant. Measured directly with
+    both flags in place: `""` costs 3,131 total input tokens, `"You are a calculator."`
+    costs 3,136 — a +5-token additive difference, matching the prompt's own length. The
+    remaining ~3.1k baseline — tool-definition/context preamble — is present in BOTH arms,
+    constant, and so not a confound. What the flag does buy is real: the primer arm and
+    the no-primer arm still differ by exactly the primer content and nothing else, because
+    omitting the flag for the no-primer arm would hand that arm its own multi-thousand-token
+    system prompt on top of the shared preamble — an arm-correlated confound in the one
+    comparison #249 turns on. Treat the ~3.1k baseline as a validity caveat on absolute
+    accuracy and on any cross-backend comparison, not on the primer/no-primer contrast
+    itself.
+
+    **Settings sources are cut, not just the system prompt.** `--setting-sources ""`
+    disables CLAUDE.md auto-discovery and hooks — `--strict-mcp-config` only touches MCP
+    servers, not this. Without it, an operator's own personal `~/.claude/CLAUDE.md` and
+    hooks leak into every call under test — measured on a real operator machine: input
+    tokens per call dropped from ~19.8k to ~3.1k with this flag added, i.e. roughly 16.7k
+    tokens of that operator's own instructions were silently part of "the primer arm"
+    before this flag existed. `--bare` was considered and rejected: it also forces
+    API-key auth, which this backend cannot use — see above, it needs the OAuth
+    subscription specifically.
+
+    **The environment is scrubbed on purpose.** `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
+    / `ANTHROPIC_API_KEY` are dropped from the child env; a session running under
+    `claude-gw`/`claude-alt` exports them, which would route this backend straight back
+    through the aliasing gateway it exists to bypass — measuring DeepSeek while the report
+    says `cli:opus`.
+
+    Not bit-comparable to the gateway path: each `claude -p` is a fresh process, so there is
+    a per-call cached preamble (~10k tokens) no gateway model pays, and the OAuth
+    subscription enforces a rolling window limit. Treat cross-backend comparisons as
+    directional; run one Anthropic model per window.
+    """
+    # One scratch dir per answerer, not per call: a cwd with no CLAUDE.md and an empty MCP
+    # config, so no project instructions or tool definitions leak into the prompt under test.
+    # Cleaned up at interpreter exit (atexit, not a `with`) because the returned `ask`
+    # closure is called many times across a whole panel run — there is no single point
+    # to `rmtree` it right after creation.
+    workdir = tempfile.mkdtemp(prefix="terse-fluency-cli-")
+    atexit.register(shutil.rmtree, workdir, ignore_errors=True)
+    mcp_cfg = os.path.join(workdir, "empty-mcp.json")
+    with open(mcp_cfg, "w") as fh:
+        fh.write('{"mcpServers":{}}')
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY")}
+    # Per-answerer circuit breaker: once THIS model's subscription window is confirmed
+    # exhausted, every remaining call for it returns immediately instead of spawning
+    # another doomed `claude -p` process that can only time out or quota-fail.
+    quota_hit = False
+    quota_hit_warned = False
+
+    def _kill_and_drain(proc: subprocess.Popen, *, why: str) -> None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # group already exited — nothing left to orphan
+        except PermissionError:
+            # Can't signal the group we created ourselves — should not happen for a
+            # same-user start_new_session child, but if it does, say so loudly rather
+            # than silently leaving descendants running past the timeout.
+            print(f"terse fluency: {alias}: permission denied killing its process "
+                  f"group ({why}) — descendants may keep running and burn "
+                  f"subscription quota", file=sys.stderr)
+            proc.kill()
+        except OSError as e:
+            # Any other OSError from getpgid/killpg (e.g. a pid-recycle race) — this whole
+            # function is called from a `finally` safety net, so it must never itself raise:
+            # an uncaught exception here would REPLACE whatever exception (a
+            # KeyboardInterrupt, say) was already propagating through that finally.
+            print(f"terse fluency: {alias}: error killing its process group ({why}): "
+                  f"{e} — descendants may keep running and burn subscription quota",
+                  file=sys.stderr)
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            # Best-effort reap so a killed child doesn't sit as a zombie holding its
+            # pipe fds — swallow any error so we never mask whatever exception (if any)
+            # is already propagating past this call.
+            proc.communicate(timeout=10)
+        except Exception:
+            pass
+
+    def ask(system: str, user: str) -> str | None:
+        nonlocal quota_hit, quota_hit_warned
+        if quota_hit:
+            if not quota_hit_warned:
+                quota_hit_warned = True
+                print(f"terse fluency: {alias}: subscription window already confirmed "
+                      f"exhausted — skipping remaining calls for this model rather than "
+                      f"launching more doomed processes", file=sys.stderr)
+            return None
+        argv = ["claude", "-p", "--model", alias, "--output-format", "json",
+                "--strict-mcp-config", "--mcp-config", mcp_cfg,
+                # No built-in tools either (Bash/Read/Write/...) — openai_answerer sends
+                # none, so the two backends must answer under equivalent conditions. A
+                # model electing a tool call here, failing in the scratch dir, and
+                # replying with prose like "I can't run that" would otherwise be a
+                # non-None string scored as a WRONG answer, not a non-answer.
+                "--tools", "",
+                # No user/project/local settings sources either — CLAUDE.md auto-discovery
+                # and hooks are NOT covered by --strict-mcp-config (that's MCP only), and
+                # `--bare` isn't usable here because it also forces API-key auth, which
+                # this backend cannot use (see docstring: it needs the OAuth subscription,
+                # not a key). Load-bearing, not just tidy: on an operator's real machine
+                # with a nontrivial user-level CLAUDE.md this cut measured input tokens
+                # from ~19.8k to ~3.1k per call — the difference is that operator's own
+                # personal instructions leaking into the prompt under test.
+                "--setting-sources", "",
+                # Empty string is deliberate and load-bearing — see docstring.
+                "--system-prompt", system]
+        # start_new_session puts claude and everything it spawns in a fresh process group.
+        # Killing only the direct child on timeout orphans that tree, and the orphans keep
+        # generating — burning subscription quota invisibly for the rest of the run.
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=workdir, env=env, text=True, errors="replace",
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except OSError as e:
+            print(f"terse fluency: {alias}: could not launch claude ({e}) — counted as a "
+                  f"non-answer, not scored", file=sys.stderr)
+            return None
+        try:
+            try:
+                out, err = proc.communicate(user, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _kill_and_drain(proc, why="timeout")
+                print(f"terse fluency: {alias} timed out after {timeout}s — counted as a "
+                      f"non-answer, not scored", file=sys.stderr)
+                return None
+        finally:
+            # Safety net for anything that unwinds through here WITHOUT going through the
+            # timeout branch above — KeyboardInterrupt or MemoryError during
+            # communicate() is a BaseException/Exception `_safe_ask` upstream may not
+            # stop from propagating. Leaving the group running past this point is the
+            # exact orphaned-quota-burn incident modelbench already hit once.
+            if proc.poll() is None:
+                _kill_and_drain(proc, why="cleanup")
+        if proc.returncode != 0:
+            why = "subscription window limit" if _looks_like_quota(err, out) else "cli error"
+            if why == "subscription window limit":
+                quota_hit = True
+            print(f"terse fluency: {alias} {why} (exit {proc.returncode}): "
+                  f"{(err or out)[:200]} — counted as a non-answer, not scored",
+                  file=sys.stderr)
+            return None
+        try:
+            body = json.loads(out)
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            print(f"terse fluency: {alias} returned non-JSON: {out[:200]} — counted as a "
+                  f"non-answer, not scored", file=sys.stderr)
+            return None
+        # `is_error` is the CLI's own flag for "this turn failed"; the quota wall arrives
+        # here as well as via a nonzero exit, depending on where it lands. The error text
+        # itself is NOT always in `result` — the CLI's own error subtypes (hitting
+        # --max-turns or a budget cap) carry it in `variant.errors` instead, with `result`
+        # absent OR blank; falling back to `str(None)`/"" there would hide the real cause
+        # behind a useless diagnostic on every remaining call for this model.
+        if body.get("is_error"):
+            error_text = body.get("result")
+            if not error_text:  # None OR blank — either way there's nothing useful to show
+                variant = body.get("variant")
+                if isinstance(variant, dict) and isinstance(variant.get("errors"), list):
+                    error_text = "; ".join(str(e) for e in variant["errors"])
+            error_text = str(error_text)
+            if _looks_like_quota(error_text):
+                quota_hit = True
+            print(f"terse fluency: {alias} reported is_error "
+                  f"({error_text[:200]}) — counted as a non-answer, not "
+                  f"scored", file=sys.stderr)
+            return None
+        result = body.get("result")
+        # Same contract as `openai_answerer`: no content and no call are one fact to every
+        # consumer downstream — unanswered, so counted and never scored (#263/#268).
+        if not isinstance(result, str) or not result.strip():
+            print(f"terse fluency: {alias} returned no content "
+                  f"(stop_reason={body.get('stop_reason')!r}) — counted as a non-answer, "
+                  f"not scored", file=sys.stderr)
+            return None
+        return result
 
     return ask

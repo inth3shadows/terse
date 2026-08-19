@@ -11,6 +11,8 @@ import json
 import stat
 import sys
 
+import pytest
+
 from terse.cli import _corpus_size, _redact_args, main
 
 PAYLOAD = json.dumps([{"id": 1, "name": "alpha"}, {"id": 2, "name": "beta"}])
@@ -751,7 +753,13 @@ def test_fluency_cmd_bars_flag_prints_forest_plot(tmp_path, capsys):
     assert "perfect-model" in text
 
 
-def test_fluency_cmd_keyless_pack_is_written_with_restricted_permissions(tmp_path):
+def test_fluency_cmd_keyless_pack_is_written_with_restricted_permissions(tmp_path, monkeypatch):
+    # Isolate from whatever the ambient shell happens to export — this test pins the TRUE
+    # keyless case (no --models at all), not "a model was named but its key is missing"
+    # (that's a config error and refuses loudly instead, by design).
+    monkeypatch.delenv("TERSE_FLUENCY_MODELS", raising=False)
+    monkeypatch.delenv("TERSE_FLUENCY_BASE_URL", raising=False)
+    monkeypatch.delenv("TERSE_FLUENCY_API_KEY", raising=False)
     f = _write(tmp_path, "payload.json", PAYLOAD)
     corpus = tmp_path / "corpus"
     assert main(["capture", str(f), "--tool", "demo", "--corpus", str(corpus)]) == 0
@@ -764,6 +772,51 @@ def test_fluency_cmd_keyless_pack_is_written_with_restricted_permissions(tmp_pat
     if sys.platform != "win32":
         mode = stat.S_IMODE(pack.stat().st_mode)
         assert mode == 0o600, f"pack file mode {oct(mode)} is not restricted to 0600"
+
+
+def test_build_answerers_refuses_rather_than_drops_an_unconfigured_model(monkeypatch):
+    """A `--models` list mixing `cli:` and OpenAI-style ids must not silently shrink to
+    just the cli: entries when base-url/key are unset — that's exactly the class of
+    silent panel-mismeasurement #249 exists to catch. Must error, not drop."""
+    import argparse
+
+    from terse import cli, fluency
+
+    monkeypatch.setattr(fluency, "cli_answerer", lambda alias, **kw: (lambda s, u: "ok"))
+    args = argparse.Namespace(models="cli:opus,claude-sonnet-5", base_url=None,
+                              api_key_env=None)
+    monkeypatch.delenv("TERSE_FLUENCY_BASE_URL", raising=False)
+    monkeypatch.delenv("TERSE_FLUENCY_API_KEY", raising=False)
+    with pytest.raises(SystemExit, match="claude-sonnet-5"):
+        cli._build_answerers(args, fluency.openai_answerer)
+
+
+def test_build_answerers_all_cli_models_need_no_base_url_or_key(monkeypatch):
+    """The keyless cli: path stays keyless: an all-`cli:` panel must not be forced
+    through the base-url/key guard just because a sibling model requires one."""
+    import argparse
+
+    from terse import cli, fluency
+
+    monkeypatch.setattr(fluency, "cli_answerer", lambda alias, **kw: (lambda s, u: "ok"))
+    args = argparse.Namespace(models="cli:opus,cli:haiku", base_url=None, api_key_env=None)
+    monkeypatch.delenv("TERSE_FLUENCY_BASE_URL", raising=False)
+    monkeypatch.delenv("TERSE_FLUENCY_API_KEY", raising=False)
+    answerers = cli._build_answerers(args, fluency.openai_answerer)
+    assert set(answerers) == {"cli:opus", "cli:haiku"}
+
+
+def test_build_answerers_refuses_a_bare_cli_prefix_with_no_alias(monkeypatch):
+    """`--models cli:` (a plausible typo for `cli:opus`) must refuse loudly at config
+    time, not launch `claude -p --model ""` once per question and log each as a generic
+    cli error — the exact "silently shrink the panel" class the sibling guards close."""
+    import argparse
+
+    from terse import cli, fluency
+
+    args = argparse.Namespace(models="cli:", base_url=None, api_key_env=None)
+    with pytest.raises(SystemExit, match="cli:"):
+        cli._build_answerers(args, fluency.openai_answerer)
 
 
 def test_fluency_diff_html_writes_forest_plot(tmp_path, monkeypatch, capsys):
