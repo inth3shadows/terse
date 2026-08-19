@@ -285,11 +285,11 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
         # here as well as via a nonzero exit, depending on where it lands. The error text
         # itself is NOT always in `result` — the CLI's own error subtypes (hitting
         # --max-turns or a budget cap) carry it in `variant.errors` instead, with `result`
-        # absent; falling back to `str(None)` there would hide the real cause behind a
-        # useless "(None)" on every remaining call for this model.
+        # absent OR blank; falling back to `str(None)`/"" there would hide the real cause
+        # behind a useless diagnostic on every remaining call for this model.
         if body.get("is_error"):
             error_text = body.get("result")
-            if error_text is None:
+            if not error_text:  # None OR blank — either way there's nothing useful to show
                 variant = body.get("variant")
                 if isinstance(variant, dict) and isinstance(variant.get("errors"), list):
                     error_text = "; ".join(str(e) for e in variant["errors"])

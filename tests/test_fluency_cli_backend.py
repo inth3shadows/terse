@@ -337,6 +337,18 @@ def test_an_error_variant_with_no_result_field_still_reports_its_real_cause(monk
     assert "Reached maximum number of turns" in capsys.readouterr().err
 
 
+def test_an_error_variant_with_a_blank_result_also_falls_back_to_variant_errors(monkeypatch,
+                                                                                 capsys):
+    """`result` can be present but BLANK alongside `variant.errors` — an `is None` check
+    alone misses this and prints a useless empty diagnostic instead of the real cause."""
+    body = json.dumps({"is_error": True, "result": "",
+                       "variant": {"subtype": "error_max_budget_usd",
+                                   "errors": ["Reached maximum budget ($5)"]}})
+    _spy(monkeypatch, _FakeProc(out=body))
+    assert cli_answerer("opus")("", "q") is None
+    assert "Reached maximum budget" in capsys.readouterr().err
+
+
 def test_non_json_stdout_is_a_non_answer(monkeypatch):
     _spy(monkeypatch, _FakeProc(out="not json at all"))
     assert cli_answerer("opus")("", "q") is None
