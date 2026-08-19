@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.27.0] - 2026-08-19
+
 ### Added
 
 - **`terse fluency --codec-verdict`: a downstream-outcome verdict for the codec tier**
