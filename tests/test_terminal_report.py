@@ -158,19 +158,64 @@ def test_build_terminal_fluency_report_excludes_broken_model():
     assert "excluded" in text and "broken" in text
 
 
+def _dropeval_rows(control: bool):
+    base = {"trials": 1, "retrieve_ok": 1, "answer_ok": 1, "handle_ok": 1}
+    if control:
+        base |= {"control_ok": 1, "control_trials": 1, "answer_trials": 1}
+    return ([{"kind": "recall", **base} for _ in range(10)]
+            + [{"kind": "precision", **base} for _ in range(10)])
+
+
 def test_build_terminal_dropeval_report_renders_three_metrics():
-    rows = [{"kind": "recall", "trials": 1, "retrieve_ok": 1, "answer_ok": 1, "handle_ok": 1}
-            for _ in range(10)] + [{"kind": "precision", "trials": 1, "retrieve_ok": 1,
-                                    "answer_ok": 1, "handle_ok": 1} for _ in range(10)]
-    text = build_terminal_dropeval_report({"m": rows}, color=False)
+    text = build_terminal_dropeval_report({"m": _dropeval_rows(control=True)}, color=False)
     assert "retrieve-recall" in text
     assert "no-overfetch" in text
     assert "final-accuracy" in text
+    # final-accuracy is the only metric with a MEASURED control; the other two are gated
+    # against a fixed ideal and must not claim otherwise (#269).
+    assert "no-drop control" in text
     assert "PASS" in text and "FAIL" not in text
+
+
+def test_final_accuracy_is_omitted_when_no_control_arm_ran():
+    """Without a control there is nothing to compare the drop against, so the chart must
+    draw nothing rather than plot the gap against a 100% nobody measured (#269)."""
+    text = build_terminal_dropeval_report({"m": _dropeval_rows(control=False)}, color=False)
+    assert "retrieve-recall" in text
+    assert "no-overfetch" in text
+    assert "final-accuracy" not in text
 
 
 def test_build_terminal_dropeval_report_empty():
     assert "no data" in build_terminal_dropeval_report({}, color=False)
+
+
+def test_build_terminal_dropeval_report_names_the_excluded_accuracy_model():
+    """A model excluded from the accuracy gate must not silently vanish from the chart
+    with no note — the markdown table still shows it for recall/precision, and before
+    `dropeval_gap_rows` returned WHY a model was missing, `build_terminal_dropeval_report`
+    could not say so, so "the worst model" silently meant a different model set for
+    accuracy than for the other two metrics (review finding 5 on #300)."""
+    results = {"has-control": _dropeval_rows(control=True),
+              "no-control": _dropeval_rows(control=False)}
+    text = build_terminal_dropeval_report(results, color=False)
+    assert "no-control" in text  # still drawn for recall/precision
+    assert "excluded" in text and "no control arm was run" in text
+
+
+def test_build_terminal_dropeval_report_respects_accept_degraded():
+    """Without `--accept-degraded` the chart refuses on a degraded run, matching the
+    markdown default. Given the flag, the two must still agree: the chart used to refuse
+    unconditionally regardless of what `cli` passed the markdown side, so `--bars` printed
+    INCONCLUSIVE immediately below a markdown verdict computed over the surviving
+    questions (review finding 4 on #300)."""
+    rows = _dropeval_rows(control=True)
+    for r in rows[:11]:
+        r["errors"] = 1
+    default = build_terminal_dropeval_report({"m": rows}, color=False)
+    assert "INCONCLUSIVE" in default
+    accepted = build_terminal_dropeval_report({"m": rows}, color=False, accept_degraded=True)
+    assert "INCONCLUSIVE" not in accepted
 
 
 def test_trend_sparkline_lines_needs_at_least_two_runs():
