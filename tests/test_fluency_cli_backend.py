@@ -300,6 +300,26 @@ def test_a_permission_error_killing_the_group_is_reported_not_swallowed(monkeypa
     assert "permission denied" in capsys.readouterr().err.lower()
 
 
+def test_an_unexpected_oserror_killing_the_group_is_reported_and_never_masks_propagation(
+        monkeypatch, capsys):
+    """`_kill_and_drain` runs from a `finally` safety net — it must never itself raise, or
+    an uncaught exception there would REPLACE whatever exception (e.g. a KeyboardInterrupt)
+    was already propagating through that finally. A generic OSError from getpgid/killpg
+    (e.g. a pid-recycle race) is a real, if rare, possibility beyond the two named cases
+    already handled."""
+    proc = _FakeProc(timeout=True)
+    _spy(monkeypatch, proc)
+    monkeypatch.setattr("os.getpgid", lambda pid: pid)
+
+    def raise_oserror(pgid, sig):
+        raise OSError("something else went wrong")
+
+    monkeypatch.setattr("os.killpg", raise_oserror)
+    assert cli_answerer("opus", timeout=1)("", "q") is None
+    assert proc.killed
+    assert "something else went wrong" in capsys.readouterr().err
+
+
 def test_a_non_timeout_exception_still_kills_the_group_before_propagating(monkeypatch):
     """`start_new_session=True` detaches the child; only the TimeoutExpired branch used to
     kill the group. A KeyboardInterrupt (or MemoryError) during communicate() is not a

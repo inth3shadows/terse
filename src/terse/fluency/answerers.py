@@ -200,6 +200,18 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
                   f"group ({why}) — descendants may keep running and burn "
                   f"subscription quota", file=sys.stderr)
             proc.kill()
+        except OSError as e:
+            # Any other OSError from getpgid/killpg (e.g. a pid-recycle race) — this whole
+            # function is called from a `finally` safety net, so it must never itself raise:
+            # an uncaught exception here would REPLACE whatever exception (a
+            # KeyboardInterrupt, say) was already propagating through that finally.
+            print(f"terse fluency: {alias}: error killing its process group ({why}): "
+                  f"{e} — descendants may keep running and burn subscription quota",
+                  file=sys.stderr)
+            try:
+                proc.kill()
+            except OSError:
+                pass
         try:
             # Best-effort reap so a killed child doesn't sit as a zombie holding its
             # pipe fds — swallow any error so we never mask whatever exception (if any)
