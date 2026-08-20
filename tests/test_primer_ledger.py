@@ -55,8 +55,8 @@ def _note_call(inter, mid, name):
 def _primed(structured=False):
     """Drive one compressible result through a lazily-primed Interceptor and return
     (emitted result, recorded primer rows)."""
-    rows: list[tuple[str, str]] = []
-    inter = Interceptor(FULL, stats_primer=lambda cadence, text: rows.append((cadence, text)))
+    rows: list[tuple[str, str, bool]] = []
+    inter = Interceptor(FULL, stats_primer=lambda c, t, a=True: rows.append((c, t, a)))
     _note_call(inter, 2, "gh.api.items")
     out = json.loads(inter.transform_response(
         _result_msg(2, _records_text(), structured=structured)))
@@ -108,7 +108,7 @@ def test_the_lazy_attach_records_exactly_one_primer():
     assert transforms.decompress(blocks[1]["text"]) == json.loads(_records_text())
     assert inter._primer_sent is True
     assert len(rows) == 1
-    cadence, text = rows[0]
+    cadence, text, _attached = rows[0]
     assert cadence == PRIMER_CADENCE_ONCE
     assert PRIMER_HEAD in text                        # the real text, so the size is real
 
@@ -122,18 +122,71 @@ def test_a_second_result_does_not_bill_the_primer_again():
     assert len(rows) == 1
 
 
-def test_a_structuredContent_result_records_no_primer():
-    """#286, pinned. The lazy attach is gated on the absence of `structuredContent`, so a
-    server whose results always carry it pays ZERO forever — and the ledger must say so
-    rather than leaving the reader to infer payment from "it was called".
+def test_a_structuredContent_result_RECORDS_the_suppression():
+    """#286, and the shape of the answer changed here.
 
-    If the guard at the attach site is ever removed, this test fails: the mutation attaches
-    a primer, which records a row, which makes `rows` non-empty.
-    """
+    The lazy attach is gated on the absence of `structuredContent`, so a server whose
+    results always carry it pays ZERO forever. Recording nothing at all (the first attempt)
+    left the reader to infer that from a MISSING row — which cannot work, because a
+    `--since` window or a ledger rotation starting mid-session drops the row for reasons
+    that have nothing to do with the server. So the suppression is written down instead:
+    the same decision, stated positively.
+
+    Nothing goes on the wire either way — that part is unchanged and asserted here."""
     inter, out, rows = _primed(structured=True)
     assert inter._primer_sent is False                # nothing was attached...
     assert PRIMER_HEAD not in json.dumps(out)         # ...on the wire either
-    assert rows == []                                 # ...so nothing was billed
+    assert len(rows) == 1
+    cadence, _text, attached = rows[0]
+    assert (cadence, attached) == ("once/session", False)
+
+
+def test_a_suppression_is_recorded_once_per_session_not_once_per_result():
+    """A server that returns `structuredContent` on every call would otherwise write a row
+    per result — the ledger would grow without bound and the reader would see N "proofs" of
+    the same single fact."""
+    rows: list[tuple[str, str, bool]] = []
+    inter = Interceptor(FULL, stats_primer=lambda c, t, a=True: rows.append((c, t, a)))
+    for mid in (2, 3, 4):
+        _note_call(inter, mid, "gh.api.items")
+        inter.transform_response(_result_msg(mid, _records_text(), structured=True))
+    assert len(rows) == 1
+
+
+def test_no_suppression_is_recorded_when_no_primer_was_owed():
+    """A result with no terse wire form owes no primer, so refusing to attach one is not a
+    fact worth recording. Without this gate every `structuredContent` result from a
+    passthrough tool would manufacture a "provably free" verdict."""
+    passthrough = Policy(rules=[Rule("gh.*", ())])     # () = hands off entirely
+    rows: list[tuple[str, str, bool]] = []
+    inter = Interceptor(passthrough,
+                        stats_primer=lambda c, t, a=True: rows.append((c, t, a)))
+    _note_call(inter, 2, "gh.api.items")
+    out = inter.transform_response(_result_msg(2, _records_text(), structured=True))
+    assert '"__terse_' not in out                      # nothing terse went out...
+    assert rows == []                                  # ...so nothing was recorded
+
+
+def test_a_session_that_suppresses_then_attaches_records_both_and_the_attach_wins():
+    """Real sessions mix shapes. Suppressing early and attaching later means the primer WAS
+    paid, so the reader must not read the suppression as proof of a free wrap."""
+    rows: list[tuple[str, str, bool]] = []
+    inter = Interceptor(FULL, stats_primer=lambda c, t, a=True: rows.append((c, t, a)))
+    _note_call(inter, 2, "gh.api.items")
+    inter.transform_response(_result_msg(2, _records_text(), structured=True))
+    _note_call(inter, 3, "gh.api.items")
+    inter.transform_response(_result_msg(3, _records_text()))       # text-only: attaches
+    assert [a for _c, _t, a in rows] == [False, True]
+
+    # ...and the READER sizes it from the attach, never calling it free.
+    recs = [build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE,
+                                primer="P" * 40, attached=a) for _c, _t, a in rows]
+    liab = primer_liability([_scan_row()],
+                            _agg_with(blocks_for="gh-server", primer_rows=recs))
+    row = liab["servers"][0]
+    assert row["primer_source"] == "recorded"
+    assert row["primer_tokens"] == count_cl100k("P" * 40)
+    assert row["server"] not in liab["free"]
 
 
 def test_a_session_that_never_calls_a_wrapped_tool_records_nothing():
@@ -170,7 +223,7 @@ def test_the_eager_initialize_site_records_nothing_by_design():
 def test_a_write_failure_never_reaches_the_client():
     """Fail-open, same contract as every other stats path: the ledger is never
     load-bearing, so a broken writer degrades the report and not the proxy."""
-    def boom(cadence, text):
+    def boom(cadence, text, attached=True):
         raise RuntimeError("ledger is on fire")
 
     inter = Interceptor(FULL, stats_primer=boom)
@@ -340,7 +393,7 @@ def test_the_primer_write_happens_after_the_lock_is_released():
     seen: list[bool] = []
     inter = Interceptor(FULL)
 
-    def probe(cadence, text):
+    def probe(cadence, text, attached=True):
         # True = the lock was free at write time, i.e. the write is genuinely deferred.
         got = inter._local_lock.acquire(blocking=False)
         seen.append(got)
@@ -375,7 +428,7 @@ def test_a_blocking_primer_writer_cannot_wedge_the_next_call():
     inter = Interceptor(FULL)
     attached: list[str] = []
 
-    def slow(cadence, text):
+    def slow(cadence, text, was_attached=True):   # NOT `attached` — shadows the list below
         attached.append(cadence)
         entered.set()                  # the sink is now running
         release.wait(timeout=10)       # ...and stays running until we say otherwise
@@ -417,3 +470,103 @@ def test_zero_token_emissions_are_never_published_as_a_measured_free_primer():
     row = liab["servers"][0]
     assert row["primer_source"] == "estimated"
     assert row["primer_tokens"] > 0
+
+
+# --- the reader: a suppression is proof, absence is not (#286, #317-redesign) ---
+
+def _suppressed(label="gh-server"):
+    return build_primer_record(label, cadence=PRIMER_CADENCE_ONCE, primer="P" * 992,
+                               attached=False)
+
+
+def test_a_recorded_suppression_reports_a_MEASURED_zero():
+    """#286's whole point. The server compresses plenty and never primes, so its true cost
+    is zero — and now the ledger says so instead of the reader billing a full primer off
+    "it was called"."""
+    liab = primer_liability([_scan_row()],
+                            _agg_with(blocks_for="gh-server",
+                                      primer_rows=[_suppressed()]))
+    row = liab["servers"][0]
+    assert row["primer_tokens"] == 0
+    assert row["primer_source"] == "recorded"          # measured, not estimated
+    assert row["cadence"] == "once/session (unpaid)"   # not "1x, pays once per session"
+    assert liab["free"] == ["gh"]                      # the list whose job is naming these
+    assert liab["session_once_tokens"] == 0
+
+
+def test_a_window_that_lost_the_row_falls_back_instead_of_publishing_a_false_zero():
+    """THE regression that forced this redesign, and the reason absence is never proof.
+
+    A primer decision happens ONCE, at a session's first compressible result; result rows
+    accrue for hours afterwards. So `terse stats --since 1h` on a session that began three
+    hours ago — and, identically, a two-generation ledger rotation — keeps the result rows
+    and drops the primer row. The first design read that as "never attached" and published
+    a fabricated zero AS A MEASUREMENT. Same ledger, two different answers.
+
+    Falling back to the labelled estimate is the entire fix: absence now means "this window
+    cannot say", which is the only thing it can honestly mean."""
+    full = _agg_with(blocks_for="gh-server", primer_rows=[_suppressed()])
+    truncated = _agg_with(blocks_for="gh-server")        # the row aged out of the window
+    assert primer_liability([_scan_row()], full)["servers"][0]["primer_source"] == "recorded"
+    row = primer_liability([_scan_row()], truncated)["servers"][0]
+    assert row["primer_source"] == "estimated"
+    assert row["primer_tokens"] > 0, "a truncated window must never report a measured zero"
+
+
+def test_an_untokenized_attach_is_never_read_as_a_suppression():
+    """A primer emitted by a terse running without tiktoken records `tokens: None`. That row
+    is proof the primer WAS sent; reading it as absence would invert the fact it carries.
+
+    The first design did exactly that — the accumulator skipped untokenized rows, leaving
+    the same `rec_em == 0` that meant "no row at all", and published 0/"recorded" for a
+    server whose ledger proved it paid."""
+    rec = build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 992)
+    rec["tokens"] = None
+    row = primer_liability([_scan_row()],
+                           _agg_with(blocks_for="gh-server",
+                                     primer_rows=[rec]))["servers"][0]
+    assert row["primer_source"] == "estimated"   # cannot size it -> estimate, not zero
+    assert row["primer_tokens"] > 0
+
+
+def test_a_router_is_never_a_measured_zero():
+    """Routers prime EAGERLY at `initialize`, and no eager site records anything — so a
+    router has no primer rows BY CONSTRUCTION. Reading that as proof of non-payment would
+    zero the recurring cost of the one shape that genuinely pays every single turn.
+
+    Pinned because the `not is_router` guard survived a mutation run of 230 tests: nothing
+    was watching it, and its failure mode is the largest number in the report going to 0."""
+    router = {"server": "terse", "state": "router", "wraps": "kb,gh", "scope": "user",
+              "policy": None}
+    recs = [{"server": lbl, "tool": "t", "raw_chars": 2000, "out_chars": 800,
+             "raw_tokens": 500, "out_tokens": 200, "decision": "tabularize",
+             "passthrough": False} for lbl in ("kb", "gh") for _ in range(5)]
+    liab = primer_liability([router], aggregate(recs))
+    row = liab["servers"][0]
+    assert row["primer_source"] == "estimated"
+    assert row["primer_tokens"] > 0, "a router's recurring primer must not be zeroed"
+    assert row["cadence"] == "per-turn"
+    assert liab["per_turn_tokens"] > 0
+
+    # ...and not even a suppression row for a peer label can flip it.
+    liab2 = primer_liability([router], aggregate(recs + [_suppressed("kb"),
+                                                         _suppressed("gh")]))
+    assert liab2["servers"][0]["primer_source"] == "estimated"
+    assert liab2["per_turn_tokens"] > 0
+
+
+def test_an_attach_anywhere_in_the_window_beats_a_suppression():
+    """A session that suppressed once and attached once has PAID, so the suppression must
+    not win. Pinned by the `not measured` term in `measured_zero`.
+
+    Deliberately NOT claiming to pin the `all()` across labels: `_wrapped_labels` returns at
+    most one label and multi-label entries are routers, which are excluded anyway, so `all`
+    and `any` are structurally identical here and no test can tell them apart. Saying
+    otherwise would be a green assertion pretending to guard something."""
+    recs = [_suppressed("gh-server"),
+            build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)]
+    liab = primer_liability([_scan_row()],
+                            _agg_with(blocks_for="gh-server", primer_rows=recs))
+    row = liab["servers"][0]
+    assert row["primer_tokens"] == count_cl100k("P" * 40)   # the attach wins
+    assert row["server"] not in liab["free"]

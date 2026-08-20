@@ -68,7 +68,8 @@ RETRIEVE_ROW = {"server", "tool", "path", "calls", "hits", "misses", "bytes", "t
 # #311. `emissions` is the load-bearing one and the likeliest to be dropped by someone
 # tidying `aggregate`: `primer_liability` divides `tokens` by it to recover the PER-SESSION
 # primer, so losing it silently restores the window-sum over-bill this row exists to fix.
-PRIMER_ROW = {"server", "cadence", "emissions", "bytes", "tokens", "untokenized"}
+PRIMER_ROW = {"server", "cadence", "attached", "emissions", "bytes", "tokens",
+              "untokenized"}
 
 LIABILITY = {"servers", "per_turn_tokens", "session_once_tokens", "unresolved",
              "idle", "free", "uncertain", "saved_tokens", "turns_covered",
@@ -119,6 +120,12 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     # #311 primer rows: emissions/bytes/tokens are counts, `untokenized` is the
     # None-is-not-zero escape hatch every other record already has.
     "emissions": (int,),
+    # #286: False means the proxy DECLINED to send this primer (`structuredContent` would
+    # have made the client discard it). A row with `attached: false` is a measured ZERO, and
+    # is the only thing that can distinguish "this server never pays" from "this window does
+    # not contain the row". Absent on rows written before the field: read a missing
+    # `attached` as True, since the suppression row did not exist then.
+    "attached": (bool,),
     "blocks_to_break_even": (float, int, type(None)),
     "break_even_verdict": (str, type(None)),
     "per_turn_tokens": (int,), "session_once_tokens": (int,), "unresolved": (int,),
@@ -224,8 +231,10 @@ def _check_types(where: str, obj: dict) -> None:
         if allowed is None:
             continue
         # `bool` is an `int` subclass; a flag arriving where a count belongs would pass a
-        # plain isinstance check and then be summed as 0/1 by a consumer.
-        assert not isinstance(value, bool), f"{where}.{key} is a bool"
+        # plain isinstance check and then be summed as 0/1 by a consumer. So a bool is
+        # rejected unless the contract DECLARES one — `primers[].attached` is a genuine
+        # flag, and blanket-rejecting bools would have made it unpinnable rather than safe.
+        assert bool in allowed or not isinstance(value, bool), f"{where}.{key} is a bool"
         assert isinstance(value, allowed), (
             f"{where}.{key} is {type(value).__name__} ({value!r}), contract says "
             f"{[t.__name__ for t in allowed]}")

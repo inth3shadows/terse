@@ -289,7 +289,7 @@ class Interceptor:
                  dropped_bytes: list[int] | None = None,
                  origins: dict[str, tuple[str, str, str]] | None = None,
                  stats_retrieve: Callable[[str, str, str, bool, str], None] | None = None,
-                 stats_primer: Callable[[str, str], None] | None = None,
+                 stats_primer: Callable[[str, str, bool], None] | None = None,
                  ledger_label: str | None = None,
                  log_prefix: str = "[terse-proxy]",
                  lazy_primer: bool = True):
@@ -431,6 +431,13 @@ class Interceptor:
         # emits no compressible form at all" (`build_primer` returns "" for a default-deny
         # policy) into the same no-op state, so neither needs its own branch later.
         self._primer_sent = not (lazy_primer and self._primer_text)
+        # Whether this process has already recorded a SUPPRESSED primer (#286). Separate
+        # from `_primer_sent` because they answer different questions and a session can do
+        # both -- suppressed on an early `structuredContent` result, attached on a later
+        # text-only one. One row of each is the truth; the reader treats an attach as
+        # authoritative. Bounded to one per process so a server that returns
+        # `structuredContent` on every call writes one row, not one per result.
+        self._primer_suppressed_logged = False
         # The two proxy pump threads call note_request (client->server) and
         # transform_response (server->client) concurrently, both mutating pending/last/
         # since_keyframe/init_id state. `_local_lock` serializes each method against the
@@ -507,6 +514,7 @@ class Interceptor:
                 # tools/call results would compress freely with no primer ever explaining
                 # the wire forms to the NEW context.
                 self._primer_sent = not (self._lazy_primer and self._primer_text)
+                self._primer_suppressed_logged = False
                 # A reconnecting client restarts its JSON-RPC ids at 1 while this process
                 # keeps one session id, so `sess:1` from before and after the reconnect
                 # would name two unrelated results the same and the corpus would fuse them
@@ -867,6 +875,39 @@ class Interceptor:
             # `structuredContent` never finds that later call — a known, narrow, accepted
             # gap (see #168 plan notes), not silently pretended away.
             structured_present = isinstance(result, dict) and "structuredContent" in result
+            # Ordered so the `json.dumps` is the LAST term: `and` short-circuits, so it runs
+            # at most once per process -- only when a primer is genuinely owed, unsent, and
+            # suppressed -- and never on the hot path for an ordinary result.
+            suppressed_owed = (
+                not self._primer_sent and self._lazy_primer and structured_present
+                and not self._primer_suppressed_logged
+                and '"__terse_' in json.dumps(result, ensure_ascii=False))
+            if suppressed_owed:
+                # The SUPPRESSION, written down rather than left to be inferred (#286,
+                # #317-redesign). This branch is the one #286 is about: the result carries a
+                # terse wire form, so a primer is owed, and the guard above refuses to
+                # attach it because the client would discard the text block unread. The
+                # cost is therefore genuinely zero -- and until this row existed, nothing
+                # in the ledger said so, leaving `primer_liability` to bill the full primer
+                # on the strength of "the server was called".
+                #
+                # Inference from a MISSING row cannot substitute: the primer decision
+                # happens once, at the session's first compressible result, while result
+                # rows accrue for hours afterwards, so any `--since` window or ledger
+                # rotation starting mid-session drops it and keeps the rest. A positive
+                # record survives both, because a truncated window then simply falls back
+                # to the estimate instead of publishing a fabricated zero.
+                #
+                # Gated on a wire form being present for the same reason the attach is: a
+                # result carrying no terse marker owes no primer, so suppressing one is not
+                # a fact worth recording. Checked across the WHOLE result, not just text --
+                # `structuredContent` itself may be what got compressed (#141).
+                self._primer_suppressed_logged = True
+                deferred.append((
+                    "primer ledger", "(primer)",
+                    partial(self._emit_primer, PRIMER_CADENCE_ONCE,
+                            self._primer_text, False),
+                ))
             if not self._primer_sent and self._lazy_primer and not structured_present:
                 marker_in_text = any(
                     isinstance(b, dict) and b.get("type") == "text"
@@ -1622,7 +1663,7 @@ class Interceptor:
         except Exception as exc:  # noqa: BLE001 — audit is never load-bearing
             self._warn_sink("audit", shown_tool, exc)
 
-    def _emit_primer(self, cadence: str, text: str) -> None:
+    def _emit_primer(self, cadence: str, text: str, attached: bool = True) -> None:
         """Record a primer that actually went out, with the cadence of the site that sent
         it (#311, #286).
 
@@ -1647,7 +1688,7 @@ class Interceptor:
         # and a dead ledger going silent is what #131 exists to prevent. It also avoids the
         # substring "stats skipped", which is what a reader (and a test) greps for to count
         # RESULT-ledger failures.
-        emit(cadence, text)
+        emit(cadence, text, attached)
 
     def _emit_stats(self, tool: str, pairs: list[tuple[str, str]], *,
                     display_tool: str | None = None, diff_reason: str | None = None,

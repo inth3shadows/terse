@@ -865,10 +865,18 @@ command that answers the what-if. The verdict is in `--json` either way, so a sc
 needs both flags.
 
 `--json` is a **contract**, not a debug dump: `tests/test_stats_json_contract.py` pins every
-field name and type at seven shapes — the top level, `total`, each `tools[]` row, each value
-of the `versions` object, the `primer_liability` blob, each of its `servers[]` rows, and each
-of those rows' `contributors[]` — so a rename or a removal fails CI rather than a consumer's
-script. Four things worth knowing before you parse it:
+field name and type at nine shapes — the top level, `total`, each `tools[]` row, each value
+of the `versions` object, each `retrieves[]` row, each `primers[]` row, the `primer_liability`
+blob, each of its `servers[]` rows, and each of those rows' `contributors[]` — so a rename or
+a removal fails CI rather than a consumer's script. Five things worth knowing before you
+parse it:
+
+- **`primers[]` rows carry an `attached` flag.** `true` is a primer that went out and cost
+  its `tokens`; `false` is one the proxy declined to send because the result carried
+  `structuredContent` (the client would have discarded it unread), which costs nothing. A
+  row with `attached: false` is how `terse stats` knows a server pays no primer at all,
+  rather than guessing from a row that is simply not in your window — so a `--since` that
+  excludes it makes that server fall back to an estimate, not to zero.
 
 - **`versions` is an object, not an array**, keyed by the terse version string that wrote
   those records (`{"0.17.1": {"blocks": …}}`). Iterating it directly gives you version
