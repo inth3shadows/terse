@@ -26,9 +26,13 @@ jobs:
       fail-fast: false
       matrix:
         # Floor (the requires-python promise) through current stable. Test both ends so
-        # a ">=3.11" claim is actually verified, not just the dev default. 3.14 is left
-        # off until tiktoken ships wheels for it (else CI compiles the Rust ext + fails).
-        python-version: ["3.11", "3.12", "3.13"]
+        # a ">=3.11" claim is actually verified, not just the dev default.
+        # 3.14 was held off while tiktoken had no wheel for it, which would have made CI
+        # compile the Rust extension and fail. That blocker is gone: tiktoken 0.13.0 (what
+        # uv.lock pins) publishes cp314-cp314-manylinux_2_28_x86_64 -- precisely the tag
+        # these amd64 runners resolve -- so nothing is built from source here. Verified by
+        # running the suite on CPython 3.14.5 before the change, not inferred. See #314.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     env:
       UV_PYTHON: ${{ matrix.python-version }}
     steps:
