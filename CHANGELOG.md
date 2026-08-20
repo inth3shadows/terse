@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.28.1] - 2026-08-20
+
 ### Fixed
 
 - **The primer charge is measured where it can be, instead of always inferred**
