@@ -40,6 +40,10 @@ from terse.stats import append_stats
 # retrieve was recorded — so a consumer can read it unconditionally rather than branching on
 # whether this build has the key.
 TOP_LEVEL = {"total", "decisions", "diff_reasons", "tools", "versions", "retrieves",
+             # #311: primers ACTUALLY emitted this window, by label and cadence. Empty on
+             # every ledger written before it shipped, and a consumer must read empty as
+             # "this ledger cannot say", never as "no primer was sent".
+             "primers",
              "primer_liability"}
 
 TOTAL = {"blocks", "raw_chars", "out_chars", "raw_tokens", "out_tokens",
@@ -76,7 +80,13 @@ LIABILITY_SERVER = {"server", "scope", "state", "primer_tokens", "ledger_labels"
                     # #285 review: ledger labels this entry almost certainly wrote under
                     # BEFORE `--server-name` was baked in, reported so the split history is
                     # visible and never summed into any rate above it.
-                    "superseded_labels"}
+                    "superseded_labels",
+                    # #311: where `primer_tokens` came from. "recorded" = the proxy wrote
+                    # down an emission this window; "estimated" = sized from the installed
+                    # policy and INFERRED to have been paid, which is the pre-#311
+                    # behaviour and the defect #286 reported. Published so a consumer never
+                    # has to guess which of its numbers is a measurement.
+                    "primer_source"}
 
 # Deliberately verdict-INCAPABLE (#238): no `primer_tokens`, no `blocks_to_break_even`, no
 # `break_even_verdict`, no `verdict`. A peer has no primer to divide by -- the router pays one
@@ -98,6 +108,12 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "ledger_labels": (list,), "tokenized_blocks": (int, type(None)),
     "superseded_labels": (list,),
     "cadence": (str,), "saved_per_block": (float, int, type(None)),
+    # #311: always one of exactly two strings, never null -- there is always an answer to
+    # "where did this number come from", even when the answer is "we inferred it".
+    "primer_source": (str,),
+    # #311 primer rows: emissions/bytes/tokens are counts, `untokenized` is the
+    # None-is-not-zero escape hatch every other record already has.
+    "emissions": (int,),
     "blocks_to_break_even": (float, int, type(None)),
     "break_even_verdict": (str, type(None)),
     "per_turn_tokens": (int,), "session_once_tokens": (int,), "unresolved": (int,),

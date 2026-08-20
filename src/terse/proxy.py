@@ -37,6 +37,13 @@ from typing import Any, TextIO
 from . import lossy as lossy_mod
 from . import policy as policy_mod
 from . import text_diff, transforms
+
+# Only the two cadence labels, at module scope: they are string constants, `stats` has no
+# module-level dependency on anything heavy (json/os/re/time plus `_secure_io` and the
+# `tokenize` this module already imports), and there is no cycle -- `stats` never imports
+# `proxy`. The WRITER is still imported lazily in `run_proxy` as before. Naming the site's
+# cadence from the one definition beats re-spelling the literal at each call site.
+from .stats import PRIMER_CADENCE_ONCE
 from .tokenize import count_cl100k
 from .transport import HttpTransport, build_transport
 
@@ -282,6 +289,7 @@ class Interceptor:
                  dropped_bytes: list[int] | None = None,
                  origins: dict[str, tuple[str, str, str]] | None = None,
                  stats_retrieve: Callable[[str, str, str, bool, str], None] | None = None,
+                 stats_primer: Callable[[str, str], None] | None = None,
                  ledger_label: str | None = None,
                  log_prefix: str = "[terse-proxy]",
                  lazy_primer: bool = True):
@@ -398,6 +406,11 @@ class Interceptor:
         # Optional payload-FREE ledger callback for a retrieve round-trip:
         # (server, tool, path, hit, payload). Same fail-open contract as `stats`.
         self.stats_retrieve = stats_retrieve
+        # Optional callback for a primer that was actually EMITTED (#311): (cadence, text).
+        # Same payload-free, fail-open contract as `stats`. Fires at most once per session
+        # on the lazy path and exactly once on the eager one, so it is nowhere near a hot
+        # path -- which is why it is a separate writer rather than a branch inside `stats`.
+        self.stats_primer = stats_primer
         self.init_id: Any = None        # id of the initialize request, to prime its reply
         # `clientInfo.name` from the handshake, when the client declared one (#128). Drives
         # `"structured": "auto"`; None until an initialize is seen, and None means "leave".
@@ -863,6 +876,13 @@ class Interceptor:
                     content.insert(0, {"type": "text", "text": self._primer_text})
                     self._primer_sent = True
                     changed = True
+                    # Record the charge HERE, inside the branch that actually attached it
+                    # (#311). Everything outside this `if` -- a result carrying
+                    # `structuredContent`, one with no terse marker, a session that never
+                    # produces a compressible result at all -- pays nothing, and #286 is
+                    # what billing those anyway looked like in production. The ledger could
+                    # not tell them apart because nothing wrote the distinction down.
+                    self._emit_primer(PRIMER_CADENCE_ONCE, self._primer_text)
 
             if self.stats is not None:
                 deferred.append((
@@ -1212,6 +1232,11 @@ class Interceptor:
         if PRIMER_HEAD in existing:
             return None
         result["instructions"] = primer + (f"\n\n{existing}" if existing else "")
+        # NOT recorded, deliberately (#311). This site emits unconditionally whenever the
+        # policy yields a primer at all -- the same predicate `primer_liability` already
+        # evaluates from the INSTALLED policy -- so inference here is exact and a ledger
+        # row would cost bytes without adding knowledge. Only the LAZY attach is
+        # unobservable from outside the process, and that is the one #286 got wrong.
         if self.debug:
             sys.stderr.write(f"[terse-proxy] injected terse format primer "
                              f"({len(primer)} chars) into initialize.instructions\n")
@@ -1588,6 +1613,33 @@ class Interceptor:
         except Exception as exc:  # noqa: BLE001 — audit is never load-bearing
             self._warn_sink("audit", shown_tool, exc)
 
+    def _emit_primer(self, cadence: str, text: str) -> None:
+        """Record a primer that actually went out, with the cadence of the site that sent
+        it (#311, #286).
+
+        Called from the two sites that emit one, and ONLY from inside the branch that
+        genuinely attached it -- a primer skipped for `structuredContent`, or never reached
+        because no compressible result arrived, writes nothing. That silence is the point:
+        `primer_liability` previously had to assume any called server paid, and #286 is what
+        that assumption cost in production.
+
+        Same fail-open contract as `_emit_stats`: the callback owns its I/O and a failure
+        here can never change what the client receives, so a dead ledger degrades the report
+        rather than the proxy."""
+        emit = self.stats_primer
+        if emit is None:
+            return
+        try:
+            emit(cadence, text)
+        except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
+            # Its OWN sink kind, not "stats". `_warn_sink` writes the first failure of each
+            # kind unconditionally and silences the rest, so sharing a kind would let this
+            # consume the result ledger's one guaranteed warning -- and a dead ledger going
+            # silent is precisely what #131 exists to prevent. Worded to avoid the substring
+            # "stats skipped" for the same reason: that is what a reader (and a test) greps
+            # for to count RESULT-ledger failures.
+            self._warn_sink("primer ledger", "(primer)", exc)
+
     def _emit_stats(self, tool: str, pairs: list[tuple[str, str]], *,
                     display_tool: str | None = None, diff_reason: str | None = None,
                     structured: str | None = None,
@@ -1864,9 +1916,11 @@ def run_proxy(
 
     stats = None
     stats_retrieve = None
+    stats_primer = None
     ledger_label = None
     if stats_log is not None:
         from .stats import (
+            build_primer_writer,
             build_retrieve_writer,
             build_stats_writer,
             resolve_ledger_identity,
@@ -1877,9 +1931,14 @@ def run_proxy(
         # Same ledger identity as the result writer, so a drop rule's saving and its
         # retrieve cost group under one `server` key (#251).
         stats_retrieve = build_retrieve_writer(stats_log, label)
+        # Same ledger identity again: the primer's cost has to group under the same
+        # `server` key as the savings it is weighed against, or break-even compares two
+        # different servers (#285 was that bug for the wrap label).
+        stats_primer = build_primer_writer(stats_log, label)
 
     inter = Interceptor(pol, debug=debug, capture=capture, audit=audit, stats=stats,
-                        stats_retrieve=stats_retrieve, ledger_label=ledger_label,
+                        stats_retrieve=stats_retrieve, stats_primer=stats_primer,
+                        ledger_label=ledger_label,
                         server_name=server_name, lazy_primer=lazy_primer)
 
     try:
