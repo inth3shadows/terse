@@ -376,9 +376,29 @@ everything screened out and why, is
 
 A working, measured, selective **lossless** library, CLI, and MCP
 stdio proxy. The proxy's open question — *does a model read the compressed form as
-well as raw JSON?* — now has a measured answer: on a stress corpus, Claude Haiku 4.5
-and Gemini 2.5 Flash match raw-JSON accuracy on the compressed form (100% paired) at a
-37% token saving (`terse fluency`; see TECHNICAL.md). Whole-subtree aliasing (folding
+well as raw JSON, and does it need the format primer to do so?* — has a real,
+model-dependent answer as of #249 (2026-08-19), though not yet a final one. The
+earlier claim here (Claude Haiku 4.5 and Gemini 2.5 Flash match raw-JSON accuracy,
+100% paired, 37% token saving) was a joint panel figure whose "Haiku 4.5" entry
+predates the fix that let this harness reach real Anthropic models at all — the
+eval gateway's `claude-*` ids were DeepSeek aliases (see #249) — so the 100%
+comprehension figure is unconfirmed rather than cleanly reattributable to Gemini
+alone. The 37% token saving is deterministic tokenizer arithmetic, unaffected by
+that bug, and still holds. A same-day frontier-panel run, via a real `claude -p`
+OAuth backend on the stress corpus (`--trials 1` throughout), found: Opus 5
+unaffected either way (raw = terse = 100%, 0 regressions); Haiku 4.5 shows a real
+8-point gap without the primer (92% vs. 100% raw), fully recovered by it; Sonnet 5
+shows a smaller gap (96% -> 100%). Opus and Sonnet are both single-trial reads and
+unconfirmed — a later same-day deepening pass re-ran four other (substitute,
+non-Anthropic) models at `--trials 3-5` and found three of four flipped
+conclusion under more trials. Only Haiku, among the named models, was re-run at
+`--trials 3`, and it held (92% -> 99%, essentially unchanged) — the one figure in
+this table that is independently replicated. That same deepening pass also found
+the primer can measurably *hurt* a smaller substitute model at higher trial
+counts. Net: the primer's effect is real but model-dependent, not "unnecessary"
+or "always required." See #249 for the full panel, the replication story, and the
+still-open real-payload-corpus precondition before any default changes.
+Whole-subtree aliasing (folding
 repeated objects, not just strings) is built. Cross-call diffing is a lossless tier
 that is **off by default** (#170) — not for lack of confidence, but on cost: its primer
 paragraph adds 190 cl100k tokens to that server's primer — the largest single section —
@@ -389,7 +409,11 @@ active fleet passes immediately. That is the standalone cadence; behind a router
 same paragraph rides `initialize` and is re-read every turn, which only widens the gap.
 Its full
 validation program did pass: pair fluency
-(`fluency --diff`, 4-model panel 100%), the nested-record surface (`structure`: diff
+(`fluency --diff`, 4-model panel 100% — per the 0.26.0 changelog entry (#249), this
+panel's `claude-sonnet-5`/`claude-fable-5`/`claude-haiku-4-*` gateway ids are
+confirmed DeepSeek aliases, so it was two DeepSeek models measured twice under
+Anthropic names, not four; the 100% pass itself is unaffected by which name each
+run carried), the nested-record surface (`structure`: diff
 100% vs full-terse 94%), and long-chain drift soaked from both sides — mechanically
 (`tests/test_diff_soak.py` — exact reconstruction hundreds of chained hops deep) and
 behaviorally (`fluency --diff-soak` — no depth-correlated accuracy loss up to the
