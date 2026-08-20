@@ -1394,7 +1394,13 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # labels is one mean over all its emissions, not a mean of means.
         rec_tok = sum(recorded_tokens.get(lbl, 0) for lbl in labels) if labels else 0
         rec_em = sum(recorded_emissions.get(lbl, 0) for lbl in labels) if labels else 0
-        measured = rec_em > 0 and not is_router
+        # `rec_tok > 0` mirrors the accumulator's `tokenized_emissions <= 0` skip. The
+        # proxy cannot produce emissions totalling zero tokens -- an empty primer sets
+        # `_primer_sent` at construction so the attach never fires -- but a hand-edited or
+        # truncated ledger can, and without this it publishes `primer_tokens: 0` under the
+        # `recorded` label: a claim that we MEASURED a free primer. Unknown must degrade to
+        # the labelled estimate, never to a fabricated zero.
+        measured = rec_em > 0 and rec_tok > 0 and not is_router
         if measured:
             tokens = round(rec_tok / rec_em)
         # None, not 0, when no label could be recovered: "unknown" and "never called" are

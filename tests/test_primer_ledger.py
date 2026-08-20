@@ -355,29 +355,65 @@ def test_the_primer_write_happens_after_the_lock_is_released():
 
 
 def test_a_blocking_primer_writer_cannot_wedge_the_next_call():
-    """The consequence the deferral buys, stated as behaviour rather than structure: with
-    the write deferred, a slow sink delays only its own response's return and `note_request`
-    stays available. Pinned with a writer that BLOCKS (not one that raises) because that is
-    the case try/except never covered."""
+    """The consequence the deferral buys, as behaviour rather than structure: a slow sink
+    delays only its own response's return, and `note_request` stays available. Pinned with a
+    writer that BLOCKS (not one that raises) because that is the case try/except never
+    covered.
+
+    SYNCHRONISED, not timed (found in re-review). The first version started both threads and
+    gave `note_request` a 3s budget, which measured thread-scheduling latency rather than
+    lock availability -- on a loaded runner it hit 3.4s and failed while the code was
+    correct. Now `slow` signals on ENTRY and the probe does not start until that signal
+    arrives, so by construction the sink is executing when `note_request` is attempted. The
+    remaining timeouts are deadlock escapes, not measurements: if the write were back inside
+    the lock, `entered` would be set while the lock is held and the probe could never finish
+    at any budget.
+    """
     import threading
-    released = threading.Event()
+    entered = threading.Event()
+    release = threading.Event()
     inter = Interceptor(FULL)
+    attached: list[str] = []
 
     def slow(cadence, text):
-        # Runs on the response path; while it sleeps, note_request must still be servable.
-        released.wait(timeout=5)
+        attached.append(cadence)
+        entered.set()                  # the sink is now running
+        release.wait(timeout=10)       # ...and stays running until we say otherwise
 
     inter.stats_primer = slow
     _note_call(inter, 2, "gh.api.items")
-    t = threading.Thread(target=lambda: inter.transform_response(
-        _result_msg(2, _records_text())), daemon=True)
-    t.start()
-    # Give the response path time to reach the deferred sink and block there.
-    other = threading.Thread(target=lambda: _note_call(inter, 3, "gh.api.items"),
-                             daemon=True)
-    other.start()
-    other.join(timeout=3)
-    unblocked = not other.is_alive()
-    released.set()
-    t.join(timeout=5)
-    assert unblocked, "note_request was blocked by a slow primer-ledger write"
+    responder = threading.Thread(
+        target=lambda: inter.transform_response(_result_msg(2, _records_text())),
+        daemon=True)
+    responder.start()
+    assert entered.wait(timeout=10), "the primer sink never ran at all"
+
+    # The sink is mid-write RIGHT NOW. If that write held `_local_lock`, this cannot finish.
+    done = threading.Event()
+    threading.Thread(target=lambda: (_note_call(inter, 3, "gh.api.items"), done.set()),
+                     daemon=True).start()
+    unblocked = done.wait(timeout=10)
+    release.set()
+    responder.join(timeout=10)
+
+    # Not a vacuous pass: the earlier version asserted only `unblocked`, which is trivially
+    # true if the attach never fires and the sink is never called at all.
+    assert attached == ["once/session"], "the primer never attached, so nothing was proven"
+    assert unblocked, "note_request was blocked by an in-flight primer-ledger write"
+
+
+def test_zero_token_emissions_are_never_published_as_a_measured_free_primer():
+    """Re-review, flagged for symmetry. A corrupt ledger can carry emissions whose tokens
+    total zero. Publishing `primer_tokens: 0` under `primer_source: "recorded"` claims we
+    MEASURED a free primer — the same fabrication the accumulator's `tokenized_emissions`
+    skip exists to prevent, entered through the numerator instead of the divisor.
+
+    Unreachable from the proxy (an empty primer sets `_primer_sent` at construction, so the
+    attach never fires), which is why it is pinned here rather than left to chance."""
+    rec = build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)
+    rec["tokens"] = 0                      # emissions happened; they cost "nothing"
+    liab = primer_liability([_scan_row()], _agg_with(blocks_for="gh-server",
+                                                     primer_rows=[rec]))
+    row = liab["servers"][0]
+    assert row["primer_source"] == "estimated"
+    assert row["primer_tokens"] > 0

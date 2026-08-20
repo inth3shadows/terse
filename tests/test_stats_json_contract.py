@@ -211,8 +211,8 @@ def test_every_named_field_also_has_a_pinned_type():
     person to add a field only has to touch the NAME manifest to go green and the type
     promise silently stops applying to it (found in review — the same
     tolerates-growth-silently failure this module's own docstring warns about)."""
-    named = (TOTAL | TOOL_ROW | VERSION_ROW | RETRIEVE_ROW | LIABILITY | LIABILITY_SERVER
-             | LIABILITY_CONTRIBUTOR)
+    named = (TOTAL | TOOL_ROW | VERSION_ROW | RETRIEVE_ROW | PRIMER_ROW | LIABILITY
+             | LIABILITY_SERVER | LIABILITY_CONTRIBUTOR)
     assert not named - set(TYPES), (
         f"no type pinned for: {sorted(named - set(TYPES))}. {_ADD_ON_PURPOSE}")
 
