@@ -606,6 +606,43 @@ def test_scan_scopes_includes_project_and_local_when_present(tmp_path, monkeypat
     assert by_scope[("project", "proj-demo")]["policy"] == "/proj.json"
 
 
+def test_scan_scopes_reads_the_EQUALS_spelling_for_policy_and_server_name(tmp_path,
+                                                                           monkeypatch):
+    """The scan derived `policy` from a bare `"--policy" in args` scan, which saw only the
+    two-token spelling `wrap` emits. A hand-edited `--policy=/p.json` therefore left the row's
+    policy None, `policy_missing` never fired for a deleted file, and `terse stats` sized the
+    entry's primer from `default_policy()` — billing a primer to an entry whose real policy
+    emits a different one (or none at all).
+
+    `--server-name=` with an EMPTY value is the paired case: `resolve_ledger_identity`
+    (`name or server_label(cmd)`) falls back to the command basename for it, so the identity
+    is a GUESS and must not be reported as explicit — doing so tells break-even to trust it
+    and skips the ambiguity guard (#285)."""
+    cfg = tmp_path / ".claude.json"
+    missing = tmp_path / "gone.json"          # never created -> policy_missing
+    cfg.write_text(json.dumps({"mcpServers": {
+        "eq": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", f"--policy={missing}", "--server-name=kb",
+            "--", "kb-server"]},
+        "blank": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", "--server-name=", "--", "kb-server"]},
+    }}))
+    im.stash_path(cfg).write_text(json.dumps({"user": {
+        "eq": {"command": "kb-server", "args": []},
+        "blank": {"command": "kb-server", "args": []}}}))
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+    monkeypatch.chdir(tmp_path)
+
+    by = {r["server"]: r for r in im.scan_scopes() if r["scope"] == "user"}
+    assert by["eq"]["policy"] == str(missing)
+    assert by["eq"]["policy_missing"] is True
+    assert by["eq"]["ledger_identity"] == "kb"
+    assert by["eq"]["ledger_identity_explicit"] is True
+    # Empty value: identity falls back to the basename, so it is a guess, not explicit.
+    assert by["blank"]["ledger_identity"] == "kb-server"
+    assert by["blank"]["ledger_identity_explicit"] is False
+
+
 def test_scan_scopes_surfaces_wraps_diff_stats_and_missing_policy(tmp_path, monkeypatch):
     cfg = tmp_path / ".claude.json"
     missing = tmp_path / "gone.json"          # never created -> policy_missing
@@ -1137,6 +1174,31 @@ def test_parse_proxy_opts_reads_policy_capture_and_server_between_proxy_and_sep(
                       "--", "runecho-mcp"]}
     assert im.parse_proxy_opts(entry) == {
         "policy": "/p/pol.json", "server_name": "runecho", "capture_dir": "/c/corpus"}
+
+
+def test_parse_proxy_opts_reads_the_EQUALS_spelling_too():
+    """`--server-name` is a plain argparse optional, so `--server-name=kb` is accepted by
+    the proxy and written to the ledger as `kb`. `wrap` only ever emits the two-token form,
+    so the `=` spelling means a HAND-EDITED entry — exactly the population every caller uses
+    this to inspect. Missing it made the flag invisible to `mcp-status` and to `terse stats`'
+    break-even, which then guessed `foo-server` from the command and reported an entry with
+    200 blocks as `never called` — #285's under-report, on an entry that had already baked
+    the flag that fixes it.
+
+    A value containing `=` survives: argparse splits on the FIRST one only."""
+    entry = {"command": "/home/u/.local/bin/terse",
+             "args": ["proxy", "--server-name=kb", "--policy=/p/a=b.json",
+                      "--capture-dir=/c/corpus", "--", "/opt/bin/foo-server", "--stdio"]}
+    assert im.parse_proxy_opts(entry) == {
+        "server_name": "kb", "policy": "/p/a=b.json", "capture_dir": "/c/corpus"}
+
+
+def test_parse_proxy_opts_ignores_a_DOWNSTREAM_equals_flag():
+    """The `=` spelling must respect the same `--` boundary the two-token form does."""
+    entry = {"command": "/home/u/.local/bin/terse",
+             "args": ["proxy", "--", "some-server", "--policy=/downstream.json",
+                      "--server-name=not-terses"]}
+    assert im.parse_proxy_opts(entry) == {}
 
 
 def test_parse_proxy_opts_recognizes_console_script_launcher():

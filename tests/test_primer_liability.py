@@ -25,6 +25,8 @@ import json
 import pytest
 
 from terse.stats import (
+    _build_break_even_table,
+    _is_launcher_basename,
     build_primer_section,
     build_recommend_section,
     build_stats_report,
@@ -40,9 +42,17 @@ def _policy(tmp_path, name="p.json", tool="kb.*", tiers=("minify", "tabularize")
     return str(path)
 
 
-def _scan(server, state, wraps, policy, scope="user"):
-    return {"scope": scope, "server": server, "state": state, "wraps": wraps,
-            "policy": policy}
+def _scan(server, state, wraps, policy, scope="user", identity=None, explicit=None):
+    """`identity`/`explicit` mirror `scan_scopes`' `ledger_identity` /
+    `ledger_identity_explicit` — what `--server-name` resolved to, and whether the flag was
+    actually present. Omitted by default so the older rows above keep exercising the
+    command-basename fallback."""
+    row = {"scope": scope, "server": server, "state": state, "wraps": wraps,
+           "policy": policy}
+    if identity is not None:
+        row["ledger_identity"] = identity
+        row["ledger_identity_explicit"] = explicit
+    return row
 
 
 def _agg(*rows):
@@ -188,6 +198,149 @@ def test_a_wrapped_entrys_ledger_label_comes_from_its_downstream_command(tmp_pat
     assert liab["servers"][0]["blocks"] == 3
 
 
+@pytest.mark.parametrize("name,launcher", [
+    # Launchers: the basename says nothing about which server ran.
+    ("python", True), ("python3", True), ("python3.12", True), ("py", True),
+    ("Python3.12.EXE", True), ("py.exe", True), ("node", True), ("node.exe", True),
+    ("NPX", True), ("nodejs", True), ("uvx", True), ("pnpm", True), ("java", True),
+    ("dotnet", True), ("sudo", True), ("docker", True),
+    # Servers whose name merely LOOKS launcher-ish. Over-breadth here is not a cosmetic
+    # defect: every one of these would silently lose a correct measurement.
+    ("pymcp", False), ("pypi-server", False), ("python-mcp", False), ("py-server", False),
+    ("pypy-server", False), ("node-thing", False), ("envoy", False), ("docker-mcp", False),
+    ("kb-server", False), ("scrapy", False), ("sb-run", False), ("", False),
+])
+def test_is_launcher_basename_is_narrow(name, launcher):
+    """Pinned directly, not only through the fleet-level guard: the guard's blast radius is
+    "this entry's number disappears", so the set it consults has to be exactly right."""
+    assert _is_launcher_basename(name) is launcher
+
+
+def test_a_server_name_wrap_is_billed_against_its_OWN_rows_not_the_interpreters(tmp_path):
+    """#285, the manufactured-KEEP direction. `--server-name` is exactly the flag that
+    overrides what the proxy writes to `server`, and deriving the label from the downstream
+    COMMAND ignores it: `searxng-mcp` launches `.venv/bin/python -m searxng_mcp`, so it used
+    to read the unrelated `python` rows — a real label with real rows, which is why none of
+    the missing-label guards fired. Its cleared verdict was another server's savings."""
+    pol = _policy(tmp_path)
+    liab = primer_liability(
+        [_scan("searxng-mcp", "wrapped", ".venv/bin/python -m searxng_mcp", pol,
+               identity="searxng-mcp", explicit=True)],
+        # The colliding demo rows, and the server's own — deliberately far apart in rate so
+        # reading the wrong ones cannot coincidentally produce the right number.
+        _agg(("python", 3, 6152, 2762), ("searxng-mcp", 2, 1800, 1462)))
+    row = liab["servers"][0]
+    assert row["ledger_labels"] == ["searxng-mcp"]
+    assert row["blocks"] == 2
+    assert [c["label"] for c in row["contributors"]] == ["searxng-mcp"]
+    assert row["saved_per_block"] == 169.0        # 338 / 2, not 3390 / 3
+
+
+def test_a_server_name_wrap_that_WAS_called_does_not_read_as_never_called(tmp_path):
+    """#285, the silent-under-report direction, and the worse of the two: `secret-broker`
+    launches `.venv/bin/python3 -m secret_broker`, whose basename matched no ledger row at
+    all, so the fleet's second-best compressor was published as "installed but never
+    triggered" in the same report whose per-tool table showed its 21 blocks."""
+    pol = _policy(tmp_path)
+    liab = primer_liability(
+        [_scan("secret-broker", "wrapped", ".venv/bin/python3 -m secret_broker", pol,
+               identity="secret-broker", explicit=True)],
+        _agg(("secret-broker", 21, 222496, 89992)))
+    row = liab["servers"][0]
+    assert row["ledger_labels"] == ["secret-broker"]
+    assert row["blocks"] == 21
+    assert row["break_even_verdict"] != "never called"
+    assert liab["free"] == []          # not "installed, lazy, costing nothing at all"
+
+
+def test_two_entries_guessing_the_SAME_launcher_label_both_say_they_cannot_say(tmp_path):
+    """A hand-edited entry passes no `--server-name`, so its label is a GUESS. When two of
+    them guess the same launcher basename, that label's ledger rows belong to both and to
+    neither: no missing-label guard can fire (`python3.12` is a real label with real rows),
+    so the only honest reading is that attribution is gone. It gets its OWN reason string —
+    `no ledger label` is documented as "matched no ledger rows", which is not what happened.
+
+    `scan_scopes` fills `ledger_identity` even when the flag is ABSENT (it is
+    `resolve_ledger_identity`, whose fallback is that same basename), so the guard has to
+    read `ledger_identity_explicit`, not merely the presence of an identity — otherwise it
+    is dead on every row a real scan produces. Both shapes are exercised."""
+    pol = _policy(tmp_path)
+    a, b = "/usr/bin/python3.12 -m server_a", "/opt/py/python3.12 -m server_b"
+    for rows in ([_scan("hand-a", "wrapped", a, pol, identity="python3.12", explicit=False),
+                  _scan("hand-b", "wrapped", b, pol, identity="python3.12", explicit=False)],
+                 [_scan("hand-a", "wrapped", a, pol),      # older scan: no identity at all
+                  _scan("hand-b", "wrapped", b, pol)]):
+        liab = primer_liability(rows, _agg(("python3.12", 3, 6152, 2762)))
+        for row in liab["servers"]:
+            assert row["ledger_labels"] == []
+            assert row["blocks"] is None
+            assert row["break_even_verdict"] == "ambiguous ledger label"
+            assert row["verdict"] == "INSUFFICIENT"
+        assert sorted(liab["uncertain"]) == ["hand-a", "hand-b"]   # unknown, not free/idle
+        assert liab["free"] == [] and liab["idle"] == []
+
+
+def test_a_LONE_launcher_wrap_keeps_its_measurement(tmp_path):
+    """The counterweight to the test above, and the reason ambiguity is measured across the
+    fleet rather than assumed from the basename alone: one `python3.12 -m x` wrap owns every
+    `python3.12` row in the ledger. Dropping its label would delete a CORRECT measurement
+    from the one population that cannot fix it by re-running `install-mcp` — a hand-written
+    entry — and would leave the guard dead on a fleet whose entries all bake the flag."""
+    pol = _policy(tmp_path)
+    liab = primer_liability(
+        [_scan("lone", "wrapped", "/usr/bin/python3.12 -m server_a", pol,
+               identity="python3.12", explicit=False)],
+        _agg(("python3.12", 3, 6152, 2762)))
+    row = liab["servers"][0]
+    assert row["ledger_labels"] == ["python3.12"]
+    assert row["blocks"] == 3
+    assert row["break_even_verdict"] not in ("no ledger label", "ambiguous ledger label")
+
+
+def test_ambiguity_needs_a_LAUNCHER_not_merely_a_shared_label(tmp_path):
+    """Two entries cannot share a non-launcher basename without launching the same binary —
+    one logical server, one honest label. Widening the guard to any shared guess would drop
+    the label for a server installed twice (project + user scope, or two client configs)."""
+    pol = _policy(tmp_path)
+    liab = primer_liability(
+        [_scan("kb-a", "wrapped", "/opt/bin/kb-server --stdio", pol,
+               identity="kb-server", explicit=False),
+         _scan("kb-b", "wrapped", "/usr/local/bin/kb-server", pol,
+               identity="kb-server", explicit=False)],
+        _agg(("kb-server", 4, 900, 300)))
+    assert all(r["ledger_labels"] == ["kb-server"] for r in liab["servers"])
+
+
+def test_one_server_in_two_scopes_is_not_a_collision_with_itself(tmp_path):
+    """`primer_liability` de-duplicates by server NAME — the same entry in project and user
+    scope is one server to the client, not two primers. The ambiguity count has to
+    de-duplicate the same way, or a single dual-scope `npx` wrap manufactures a collision
+    against its own second row and loses a measurement nothing else disputes."""
+    pol = _policy(tmp_path)
+    liab = primer_liability(
+        [_scan("js-server", "wrapped", "npx some-mcp", pol, scope="project",
+               identity="npx", explicit=False),
+         _scan("js-server", "wrapped", "npx some-mcp", pol, scope="user",
+               identity="npx", explicit=False)],
+        _agg(("npx", 5, 1000, 400)))
+    assert len(liab["servers"]) == 1
+    assert liab["servers"][0]["ledger_labels"] == ["npx"]
+    assert liab["servers"][0]["blocks"] == 5
+
+
+def test_a_guessed_label_that_names_a_real_server_is_still_used(tmp_path):
+    """The launcher guard is scoped to basenames that identify nothing. A downstream that
+    names its own binary is still the honest guess — dropping THAT would trade one silent
+    misreport for a report that can never say anything about a hand-written entry."""
+    pol = _policy(tmp_path)
+    liab = primer_liability(
+        [_scan("my-entry", "wrapped", "/opt/bin/kb-server --stdio", pol,
+               identity="kb-server", explicit=False)],
+        _agg(("kb-server", 3, 900, 300)))
+    assert liab["servers"][0]["ledger_labels"] == ["kb-server"]
+    assert liab["servers"][0]["blocks"] == 3
+
+
 def test_an_unknown_label_is_not_an_accusation_of_being_idle(tmp_path):
     """"Unknown" and "never called" are different claims, and only the second one accuses
     an install of being pure cost. A row with nothing to derive a label from reports
@@ -195,6 +348,156 @@ def test_an_unknown_label_is_not_an_accusation_of_being_idle(tmp_path):
     liab = primer_liability([_scan("x", "wrapped", "", _policy(tmp_path))], _agg())
     assert liab["servers"][0]["blocks"] is None
     assert liab["idle"] == []
+
+
+def test_a_peerless_router_is_billed_nothing_instead_of_a_phantom_peers_primer(tmp_path):
+    """`(no peers)` is the scan's SENTINEL for an empty peers file, not a peer name. Read as
+    one it became a ledger label AND a peer the union primer was sized against, so a router
+    fronting nothing published a fabricated identity in `ledger_labels`/`contributors` and
+    was BILLED a per-turn primer it cannot emit — a charge that landed in the headline
+    `recurring tok/turn` figure. Peerless is the one state where zero is KNOWN on both
+    sides: no peer can have banked anything, and `union_primer([])` is empty."""
+    from terse.install_mcp import NO_PEERS
+    liab = primer_liability([_scan("terse", "router", NO_PEERS, _policy(tmp_path))],
+                            _agg(("kb", 5, 1000, 400)))
+    row = liab["servers"][0]
+    assert row["ledger_labels"] == [] and row["contributors"] == []
+    assert row["blocks"] == 0                      # KNOWN zero, not None
+    assert row["primer_tokens"] == 0               # nothing to prime for
+    assert row["break_even_verdict"] == "never called"
+    assert liab["per_turn_tokens"] == 0            # was a real charge for a phantom peer
+    # Not `idle`: that list is "pays every turn and banked nothing", and this pays nothing.
+    assert liab["idle"] == []
+
+
+def test_history_stranded_by_baking_server_name_is_reported_not_merged(tmp_path):
+    """The ledger is append-only and records the identity in force at write time, so baking
+    `--server-name` renames the server from that moment and splits its history in two. The
+    rows are REPORTED, never summed: merging them would be exactly the guessing #285 removed,
+    and two labels can equally be two servers. Every published rate stays on one identity."""
+    pol = _policy(tmp_path)
+    liab = primer_liability(
+        [_scan("runecho", "wrapped", "/usr/local/bin/runecho-mcp", pol,
+               identity="runecho", explicit=True)],
+        _agg(("runecho", 245, 204260, 202928), ("runecho-mcp", 14, 88609, 83219)))
+    row = liab["servers"][0]
+    assert row["superseded_labels"] == ["runecho-mcp"]
+    assert row["blocks"] == 245                              # the old rows are NOT merged
+    assert [c["label"] for c in row["contributors"]] == ["runecho"]
+    lines = "\n".join(build_primer_section(liab))
+    assert "runecho-mcp" in lines and "NOT counted" in lines
+
+
+def test_a_launcher_basename_is_never_reported_as_stranded_history(tmp_path):
+    """The guard that keeps this from re-manufacturing #285's cross-attribution: `searxng-mcp`
+    guesses `python`, and the `python` rows in the live ledger are an unrelated demo server,
+    not its own past. A launcher basename is precisely where "these rows are probably yours"
+    cannot be said, so it is not said."""
+    pol = _policy(tmp_path)
+    liab = primer_liability(
+        [_scan("searxng-mcp", "wrapped", ".venv/bin/python -m searxng_mcp", pol,
+               identity="searxng-mcp", explicit=True)],
+        _agg(("python", 3, 6152, 2762), ("searxng-mcp", 2, 1800, 1462)))
+    assert liab["servers"][0]["superseded_labels"] == []
+
+
+def test_stranded_history_needs_rows_and_a_baked_name(tmp_path):
+    """Two negatives worth pinning: a guessed label with NO rows is not history (nothing was
+    stranded), and an entry that never baked a name has not renamed anything — its rows are
+    still under the guess, which `_wrapped_labels` already returns, so `guess in labels`
+    covers it without a second check on the flag."""
+    pol = _policy(tmp_path)
+    empty = primer_liability(
+        [_scan("runecho", "wrapped", "/usr/local/bin/runecho-mcp", pol,
+               identity="runecho", explicit=True)], _agg(("runecho", 245, 204260, 202928)))
+    assert empty["servers"][0]["superseded_labels"] == []
+    unbaked = primer_liability(
+        [_scan("runecho", "wrapped", "/usr/local/bin/runecho-mcp", pol,
+               identity="runecho-mcp", explicit=False)],
+        _agg(("runecho", 245, 204260, 202928), ("runecho-mcp", 14, 88609, 83219)))
+    assert unbaked["servers"][0]["superseded_labels"] == []
+    assert unbaked["servers"][0]["ledger_labels"] == ["runecho-mcp"]
+
+
+def test_stranded_history_never_names_a_label_the_fleet_still_answers_to(tmp_path):
+    """The second subtraction, missing from the first cut of this feature. "Almost certainly
+    yours" cannot be said about rows another INSTALLED entry is reading as its own live rate
+    in the same report — otherwise one server's present is printed as another's past.
+
+    Both shapes: a sibling wrapped entry that never baked a name and still answers to the
+    guess, and a router peer. In each case the guess has rows and is not a launcher, so only
+    the liveness check can suppress it."""
+    pol = _policy(tmp_path)
+    baked = _scan("kb", "wrapped", "/opt/bin/sb-run", pol, identity="kb", explicit=True)
+    agg = _agg(("kb", 10, 5000, 2000), ("sb-run", 7, 3000, 1500))
+
+    sibling = primer_liability(
+        [baked, _scan("legacy-kb", "wrapped", "/opt/bin/sb-run", pol,
+                      identity="sb-run", explicit=False)], agg)
+    rows = {r["server"]: r for r in sibling["servers"]}
+    assert rows["kb"]["superseded_labels"] == []          # sb-run is legacy-kb's LIVE label
+    assert rows["legacy-kb"]["ledger_labels"] == ["sb-run"] and rows["legacy-kb"]["blocks"] == 7
+
+    peer = primer_liability(
+        [_scan("x", "wrapped", "/opt/bin/kb", pol, identity="x", explicit=True),
+         _scan("terse", "router", "kb, runecho", pol)],
+        _agg(("kb", 50, 90000, 20000), ("x", 4, 900, 300)))
+    assert {r["server"]: r["superseded_labels"] for r in peer["servers"]}["x"] == []
+
+
+def test_two_unbaked_entries_collide_even_when_one_wrote_an_empty_server_name(tmp_path):
+    """`--server-name=` parses to `""`, and `resolve_ledger_identity` (`name or
+    server_label(cmd)`) correctly falls back to the command basename for it. Calling that
+    identity "explicit" told break-even to TRUST a guess as if the operator had named it,
+    which skips the ambiguity guard and re-opens #285's cross-attribution on exactly the
+    hand-edited entries the guard exists for. The scan now reports explicitness by the same
+    truthiness the identity resolution uses, so these two collide and both say so."""
+    pol = _policy(tmp_path)
+    rows = [_scan(n, "wrapped", f"/usr/bin/python3.12 -m {n}", pol,
+                  identity="python3.12", explicit=False) for n in ("a", "b")]
+    liab = primer_liability(rows, _agg(("python3.12", 9, 6000, 3000)))
+    assert all(r["break_even_verdict"] == "ambiguous ledger label" for r in liab["servers"])
+    assert all(r["blocks"] is None for r in liab["servers"])
+
+
+def test_the_rendered_section_separates_the_two_causes_of_an_unknown_label(tmp_path):
+    """The whole point of `ambiguous ledger label` is that it has an ACTIONABLE fix and `no
+    ledger label` does not, so the prose has to say which is which — including the cadence
+    legend, which attributed every `1x?` to "no ledger label" and re-collapsed the two one
+    line below the table that distinguishes them. Both branches render alone and together."""
+    pol = _policy(tmp_path)
+    amb = [_scan(n, "wrapped", f"/usr/bin/python3.12 -m {n}", pol) for n in ("a", "b")]
+    nolabel = [_scan("x", "wrapped", "", pol)]
+    agg = _agg(("python3.12", 3, 6152, 2762))
+
+    only_amb = "\n".join(build_primer_section(primer_liability(amb, agg)))
+    assert "cannot be told apart: a, b" in only_amb
+    assert "`--server-name <name>`" in only_amb          # the fix, named
+    assert "no ledger label, so it is unknown" not in only_amb
+
+    only_unknown = "\n".join(build_primer_section(primer_liability(nolabel, agg)))
+    assert "no ledger label, so it is unknown" in only_unknown
+    assert "cannot be told apart" not in only_unknown
+
+    both = "\n".join(build_primer_section(primer_liability(amb + nolabel, agg)))
+    assert "cannot be told apart: a, b" in both
+    assert "no ledger label, so it is unknown whether the lazy primer ever attached: x" in both
+
+
+def test_the_break_even_legend_does_not_re_collapse_the_two_causes(tmp_path):
+    """`1x?` reaches the table from either cause; the legend used to name only one of them.
+
+    A CALLED server is in the fleet on purpose: the table is gated on someone having been
+    called, so an all-ambiguous install renders no table at all and the primer-section prose
+    above is the only thing that speaks — which the test above pins."""
+    pol = _policy(tmp_path)
+    liab = primer_liability(
+        [_scan(n, "wrapped", f"/usr/bin/python3.12 -m {n}", pol) for n in ("a", "b")]
+        + [_scan("kb", "wrapped", "/opt/bin/kb-server", pol)],
+        _agg(("python3.12", 3, 6152, 2762), ("kb-server", 9, 9000, 3000)))
+    lines = "\n".join(_build_break_even_table(liab["servers"]))
+    assert "ambiguous ledger label" in lines            # the table cell
+    assert "no ledger label, or an ambiguous one" in lines   # the legend agrees with it
 
 
 def test_an_unreadable_policy_is_excluded_and_the_total_labelled_a_lower_bound(tmp_path):

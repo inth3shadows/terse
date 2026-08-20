@@ -72,7 +72,11 @@ LIABILITY_SERVER = {"server", "scope", "state", "primer_tokens", "ledger_labels"
                     # never null — there is always an answer, even when it is INSUFFICIENT —
                     # while `break_even_coverage` is null wherever the ratio is undefined,
                     # never a fabricated 0 or infinity.
-                    "verdict", "verdict_reason", "break_even_coverage", "contributors"}
+                    "verdict", "verdict_reason", "break_even_coverage", "contributors",
+                    # #285 review: ledger labels this entry almost certainly wrote under
+                    # BEFORE `--server-name` was baked in, reported so the split history is
+                    # visible and never summed into any rate above it.
+                    "superseded_labels"}
 
 # Deliberately verdict-INCAPABLE (#238): no `primer_tokens`, no `blocks_to_break_even`, no
 # `break_even_verdict`, no `verdict`. A peer has no primer to divide by -- the router pays one
@@ -92,6 +96,7 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "server": (str,), "tool": (str,), "scope": (str, type(None)),
     "state": (str, type(None)), "primer_tokens": (int, type(None)),
     "ledger_labels": (list,), "tokenized_blocks": (int, type(None)),
+    "superseded_labels": (list,),
     "cadence": (str,), "saved_per_block": (float, int, type(None)),
     "blocks_to_break_even": (float, int, type(None)),
     "break_even_verdict": (str, type(None)),

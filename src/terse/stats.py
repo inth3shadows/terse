@@ -666,6 +666,164 @@ _PAYS_PRIMER = ("wrapped", "wrapped-unstashed", "router", "router-ambiguous")
 # first compressible result, and nothing at all if that result never comes.
 _PRIMES_EAGERLY = ("router", "router-ambiguous")
 
+# Command basenames that name a LAUNCHER, not a server. `server_label` of such a command is
+# a label every unrelated `python -m ...` / `npx ...` wrap in the fleet shares, so reading
+# ledger rows under it hands one server another server's savings — the manufactured-KEEP
+# half of #285. Only ever consulted for a GUESSED label; an explicit `--server-name` is the
+# server's own name and is trusted whatever it says.
+_LAUNCHER_BASENAMES = frozenset({
+    "node", "nodejs", "npx", "npm", "pnpm", "pnpx", "yarn", "bun", "bunx", "deno",
+    "uv", "uvx", "pipx", "pip", "poetry", "pdm", "conda", "mise", "nix", "nix-shell",
+    "ruby", "perl", "java", "dotnet", "sh", "bash", "zsh", "pwsh", "powershell",
+    "env", "sudo", "docker", "podman",
+})
+
+# `python`, `python3`, `python3.12`, `py` — the versioned family the set above can't list.
+# No anchors: every call site uses `fullmatch`, and a `$` here would quietly survive a
+# future switch to `search` while turning names like `pypy-server` into false positives.
+_LAUNCHER_RE = re.compile(r"(?:python|pypy|py)\d*(?:\.\d+)*", re.IGNORECASE)
+
+
+def _is_launcher_basename(label: str) -> bool:
+    """True for a command basename that identifies no server on its own. Case- and
+    `.exe`-insensitive; deliberately narrow — `pymcp`, `pypi-server`, `node-thing`,
+    `envoy` and `docker-mcp` all name a SERVER and are not launchers."""
+    name = label.lower().removesuffix(".exe")
+    return name in _LAUNCHER_BASENAMES or bool(_LAUNCHER_RE.fullmatch(name))
+
+
+def _guessed_label(row: dict[str, Any]) -> str:
+    """The ledger label a WRAPPED entry's records are GUESSED to carry — the downstream
+    command's basename. Empty when the entry baked an explicit `--server-name` (nothing is
+    guessed then, the flag says outright what the proxy writes) or there is no downstream
+    to guess from."""
+    if row.get("ledger_identity_explicit"):
+        return ""
+    ident = row.get("ledger_identity")
+    if ident:
+        return str(ident)
+    wraps = row.get("wraps") or ""
+    return server_label(wraps.split()) if wraps else ""
+
+
+def _ambiguous_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
+    """Guessed launcher labels that MORE THAN ONE installed entry resolves to — the only
+    state in which reading ledger rows under one is provably attributing another server's
+    traffic (#285).
+
+    Both halves are load-bearing. Launcher-ness alone is not ambiguity: a lone `node
+    /srv/x.js` wrap owns every `node` row in the ledger, and dropping its label would
+    delete a correct measurement from the one population that cannot fix it by re-running
+    `install-mcp` — the first draft of this fix did exactly that. Sharing alone is not
+    ambiguity either: two entries cannot share a NON-launcher basename without launching
+    the same binary, which is one logical server and one honest label.
+
+    De-duplicated by server NAME first: the same entry present in both project and user
+    scope is one server to the client (the caller's own `seen` set says so), and counting
+    it twice would manufacture a collision with itself."""
+    by_name: dict[str, str] = {}
+    for row in scan_rows:
+        name = row.get("server")
+        if row.get("state") not in _PAYS_PRIMER or not name or name in by_name:
+            continue
+        by_name[str(name)] = _guessed_label(row)
+    counts: dict[str, int] = {}
+    for lbl in by_name.values():
+        if lbl and _is_launcher_basename(lbl):
+            counts[lbl] = counts.get(lbl, 0) + 1
+    return {lbl for lbl, n in counts.items() if n > 1}
+
+
+def _live_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
+    """Every ledger label some INSTALLED entry currently answers to — a router's peer names,
+    and each wrapped entry's own identity or guess. The set `_superseded_labels` has to
+    subtract, so it cannot hand one server another server's live rows."""
+    live: set[str] = set()
+    for row in scan_rows:
+        state = row.get("state")
+        wraps = row.get("wraps") or ""
+        if state in ("router", "router-ambiguous"):
+            live.update(p for p in (q.strip() for q in wraps.split(",")) if p)
+            continue
+        # Folded peers are the router's labels too — they write their own ledger records
+        # even though they never pay a primer, so `_PAYS_PRIMER` is the wrong filter here.
+        # `ident` ALONE is what makes a baked entry's command basename correctly absent
+        # here: `resolve_ledger_identity` already collapsed the two cases, returning the
+        # baked name for a baked entry (whose basename is exactly what is no longer live —
+        # the thing `_superseded_labels` exists to name) and the basename itself for an
+        # unbaked one. The `elif` is only the fallback for a row predating that field.
+        ident = row.get("ledger_identity")
+        if ident:
+            live.add(str(ident))
+        elif wraps:
+            live.add(server_label(wraps.split()))
+        name = row.get("server")
+        if name and state and state.startswith("folded"):
+            live.add(str(name))
+    return live
+
+
+def _superseded_labels(row: dict[str, Any], labels: list[str],
+                       by_label: dict[str, int], live: set[str]) -> list[str]:
+    """Ledger labels that hold rows this entry almost certainly WROTE, but which its current
+    identity no longer claims — the history stranded when `--server-name` was baked into an
+    entry that had been guessing (#285 review).
+
+    The ledger is append-only and records the identity in force at write time, so baking the
+    flag renames the server from that moment on and silently splits its history in two: the
+    live fleet has `secret-broker` 214 rows next to `sb-run` 200, and `runecho` 245 next to
+    `runecho-mcp` 14. Merging them is NOT the fix — that would be the guessing this issue
+    removed, and two labels can equally be two servers — so the rows are reported, never
+    counted. Every published rate stays measured against one identity.
+
+    Two subtractions keep "almost certainly WROTE" honest, and review found the second one
+    missing. First, never a launcher basename: `searxng-mcp` guesses `python`, and the
+    `python` rows in the ledger are an unrelated demo server, not its own history — a
+    launcher basename is exactly where "these rows are probably yours" cannot be said.
+    Second, never a label some OTHER installed entry still answers to (`live`): a
+    `--server-name kb` entry over `sb-run` sits next to an unbaked `legacy-kb` reading those
+    same `sb-run` rows as its live rate, and an entry over `kb` sits next to a router
+    fronting `kb` as a peer. Claiming either as stranded history would print one server's
+    live traffic as another's past, in the same report."""
+    guess = server_label((row.get("wraps") or "").split()) if row.get("wraps") else ""
+    # `guess in labels` is what makes an UNBAKED entry report nothing without a separate
+    # `ledger_identity_explicit` check: with no flag its rows ARE under the guess, so
+    # `_wrapped_labels` already returned it and nothing was stranded. Only a baked name can
+    # move the live identity off the guess and leave the old rows behind.
+    if not guess or guess in labels or _is_launcher_basename(guess) or guess in live:
+        return []
+    return [guess] if by_label.get(guess) else []
+
+
+def _wrapped_labels(row: dict[str, Any], wraps: str, ambiguous: set[str]) -> list[str]:
+    """The ledger label(s) a WRAPPED (standalone) entry's records are written under.
+
+    `--server-name` (#83, baked by `install-mcp` since #152) overrides what the proxy
+    writes to `server`, so the scan's `ledger_identity` — `resolve_ledger_identity`, the
+    ONE resolution rule, shared with `proxy.py`'s write path — is the answer whenever the
+    flag was explicit. Re-deriving the label from the downstream COMMAND here instead (what
+    this did before #285) misreads every entry that passes the flag, and both directions
+    are reachable: `searxng-mcp` (`.venv/bin/python -m searxng_mcp` -> `python`) billed its
+    break-even against unrelated `python` rows, manufacturing a cleared verdict out of
+    another server's savings, while `secret-broker` (`... python3 ...` -> `python3`)
+    matched nothing and read as `never called` — the fleet's second-best compressor
+    reported as pure cost, exactly the claim #175 exists to prevent.
+
+    A scan row without an explicit flag still falls back to the command basename — that IS
+    what the proxy guessed too, so the two paths still agree. The one exception is a guess
+    in `ambiguous` (see `_ambiguous_labels`), where two installed entries provably resolve
+    to the same launcher basename: `python` is then a real label with real rows belonging
+    to more than one server, so no missing-label guard fires and no honest reading exists.
+    Saying "cannot say" there is the same unknown-is-not-zero discipline `_break_even`'s
+    vocabulary already keeps — and it gets its OWN reason string, because `no ledger label`
+    is documented as "matched no ledger rows", which is not what happened here."""
+    ident = row.get("ledger_identity")
+    if ident and row.get("ledger_identity_explicit"):
+        return [ident]
+    guess = ident or (server_label(wraps.split()) if wraps else "")
+    return [] if not guess or guess in ambiguous else [guess]
+
+
 # Per-server cadence labels. The whole point of splitting them is that `tok/turn` and
 # `tok/session` are different units and summing them was the defect (#211 follow-up).
 _PER_TURN = "per-turn"
@@ -688,7 +846,14 @@ KEEP, TUNE, UNWRAP, INSUFFICIENT = "KEEP", "TUNE", "UNWRAP", "INSUFFICIENT"
 # `_break_even` reasons that describe MISSING DATA rather than a measured outcome. `never
 # called` is NOT here: it is a real measurement whose meaning depends on cadence (see
 # `_recommend`), which is the whole idle-router/free-standalone split (#211).
-_NO_DATA_REASONS = ("no ledger label", "no token data", "primer unknown")
+_NO_DATA_REASONS = ("no ledger label", "ambiguous ledger label", "no token data",
+                    "primer unknown")
+
+# A guessed label two installed entries share (#285). Distinct from `no ledger label`, whose
+# documented meaning is "matched no ledger rows": here rows exist, they just belong to more
+# than one server. Collapsing the two would tell an operator to go looking for traffic that
+# is sitting right there under a name they can fix with `--server-name`.
+_R_AMBIGUOUS = "ambiguous ledger label"
 
 # Verdict reason vocabulary beyond the `_break_even` strings it passes through. Closed set --
 # `--json` consumers switch on these.
@@ -760,7 +925,8 @@ def _cadence(state: str | None, blocks: int | None, encoded: int | None) -> str:
 
 
 def _break_even(primer_tokens: int | None, blocks: int | None,
-                tokenized: int | None, saved: int) -> dict[str, Any]:
+                tokenized: int | None, saved: int,
+                *, no_label_reason: str | None = None) -> dict[str, Any]:
     """Per-server `saved/block` and `blocks to break even` (#175).
 
     The rule the positioning issue states — *wrap a server when its typical payload saves
@@ -787,6 +953,11 @@ def _break_even(primer_tokens: int | None, blocks: int | None,
 
       no ledger label   the config entry's downstream command matched no ledger rows, so we
                         cannot even say whether it was called. NOT "never called".
+      ambiguous ledger label
+                        the entry bakes no `--server-name` and its downstream command's
+                        basename is a launcher (`python`, `npx`, ...) that ANOTHER installed
+                        entry also resolves to, so its rows cannot be told from that
+                        server's. Rows exist; attribution does not (#285).
       never called      installed, pays a primer, banked nothing this window.
       no token data     called, but every matching row was recorded without tiktoken. The
                         savings in TOKENS are unknown, not zero — and dividing a cl100k
@@ -809,8 +980,11 @@ def _break_even(primer_tokens: int | None, blocks: int | None,
     a server that is in fact paying for itself (found in review of #197).
     """
     if blocks is None:
+        # `no_label_reason` refines WHY there is no label when the caller knows — today only
+        # `ambiguous ledger label`. Defaulted, so every existing caller keeps the original
+        # string and this stays additive to the `--json` vocabulary.
         return {"saved_per_block": None, "blocks_to_break_even": None,
-                "break_even_verdict": "no ledger label"}
+                "break_even_verdict": no_label_reason or "no ledger label"}
     if blocks == 0:
         return {"saved_per_block": None, "blocks_to_break_even": None,
                 "break_even_verdict": "never called"}
@@ -1003,6 +1177,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
     """
     # Imported here, not at module scope: `stats` is on the proxy's hot path and these pull
     # in the policy/primer machinery only when a report is actually being rendered.
+    from .install_mcp import NO_PEERS
     from .policy import default_policy, load_policy
     from .proxy import build_primer, union_primer
 
@@ -1037,6 +1212,10 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
             encoded_by_label[lbl] = (encoded_by_label.get(lbl) or 0) + enc
     servers: list[dict[str, Any]] = []
     seen: set[str] = set()
+    # Computed over ALL rows before any is rendered: whether one entry's guessed label is
+    # ambiguous is a fact about the fleet, not about that row (#285).
+    ambiguous = _ambiguous_labels(scan_rows)
+    live = _live_labels(scan_rows)
     for row in scan_rows:
         name, state = row.get("server"), row.get("state")
         if state not in _PAYS_PRIMER or not name or name in seen:
@@ -1045,12 +1224,23 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         is_router = state in ("router", "router-ambiguous")
         # `wraps` means two different things by state, and reading it the wrong way is how
         # a busy router reports as never-called: for a wrapped entry it is the downstream
-        # COMMAND (the ledger keys on `server_label` of that, not on the MCP entry name),
-        # for a router it is the comma-joined peer NAMES — and multiproxy tags each peer's
-        # ledger records with its own name, so those names ARE the labels.
+        # COMMAND, for a router it is the comma-joined peer NAMES — and multiproxy tags each
+        # peer's ledger records with its own name, so those names ARE the labels. A wrapped
+        # entry's label is NOT `server_label(wraps)`: `--server-name` overrides it, which is
+        # `_wrapped_labels`' whole subject (#285).
         wraps = row.get("wraps") or ""
-        peers = [p for p in (q.strip() for q in wraps.split(",")) if p] if is_router else []
-        labels = peers if is_router else ([server_label(wraps.split())] if wraps else [])
+        # `(no peers)` is the scan's SENTINEL for an empty peers file, not a peer name.
+        # Reading it as one gave a peerless router a ledger label of "(no peers)", which
+        # matched nothing and produced the right verdict (UNWRAP — it primes every turn and
+        # fronts nothing) off a fabricated label that `--json` published in `ledger_labels`
+        # and `contributors`. Peerless is the one state where zero is KNOWN rather than
+        # unknown: there is no peer that could have banked anything, so `blocks` is a real 0
+        # and the verdict is earned instead of lucky (#285 review).
+        peerless = is_router and wraps == NO_PEERS
+        peers = ([] if peerless
+                 else [p for p in (q.strip() for q in wraps.split(",")) if p]
+                 ) if is_router else []
+        labels = peers if is_router else _wrapped_labels(row, wraps, ambiguous)
         pol_path = row.get("policy")
         tokens: int | None = None
         try:
@@ -1064,25 +1254,35 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
             tokens = None
         # None, not 0, when no label could be recovered: "unknown" and "never called" are
         # different claims, and only the second one accuses an install of being pure cost.
-        blocks = sum(by_label.get(lbl, 0) for lbl in labels) if labels else None
+        blocks = (sum(by_label.get(lbl, 0) for lbl in labels) if labels
+                  else (0 if peerless else None))
         # Same `if labels else None` guard as `blocks`: with no recoverable label, 0 would
         # claim "nothing was tokenized" to a `--json` consumer when the truth is that we
         # never found the rows to ask (review of #197).
         tokenized = (sum(tokenized_by_label.get(lbl, 0) for lbl in labels)
-                     if labels else None)
+                     if labels else (0 if peerless else None))
         # None if no label, or if any contributing label could not report — same
         # unknown-is-not-zero discipline as `blocks`.
         per_label_enc = [encoded_by_label.get(lbl) for lbl in labels]
-        encoded = (None if (not labels or any(e is None for e in per_label_enc))
+        encoded = (0 if peerless
+                   else None if (not labels or any(e is None for e in per_label_enc))
                    else sum(e or 0 for e in per_label_enc))
         row_out: dict[str, Any] = {
             "server": name, "scope": row.get("scope"), "state": state,
             "primer_tokens": tokens, "ledger_labels": labels, "blocks": blocks,
             "tokenized_blocks": tokenized, "cadence": _cadence(state, blocks, encoded),
             **_break_even(tokens, blocks, tokenized,
-                          sum(saved_by_label.get(lbl, 0) for lbl in labels)),
+                          sum(saved_by_label.get(lbl, 0) for lbl in labels),
+                          # Same shape as `no ledger label` — nothing measurable — but a
+                          # different CAUSE, and the only one with an actionable fix.
+                          no_label_reason=(_R_AMBIGUOUS
+                                           if not labels and not is_router
+                                           and _guessed_label(row) in ambiguous
+                                           else None)),
             "contributors": _contributors(labels, by_label, saved_by_label,
                                           tokenized_by_label),
+            # Reported, never summed into anything above — see `_superseded_labels`.
+            "superseded_labels": _superseded_labels(row, labels, by_label, live),
         }
         # Last, and from the finished row: the verdict is a rollup of the published fields,
         # so it is computed from them rather than alongside them.
@@ -1174,8 +1374,29 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         lines.append(f"  {liab['unresolved']} server(s) have an unreadable policy and are "
                      f"NOT counted — treat both figures as lower bounds.")
     if liab.get("uncertain"):
-        lines.append(f"  no ledger label, so it is unknown whether the lazy primer ever "
-                     f"attached: {', '.join(sorted(liab['uncertain']))}")
+        # Split by CAUSE, because only one of the two has a fix the operator can act on.
+        # `mcp-status` already tells this entry to bake `--server-name`; saying "no ledger
+        # label" here and nothing else made the two commands read as unrelated complaints.
+        unknown = set(liab["uncertain"])
+        amb = sorted(s["server"] for s in liab["servers"]
+                     if s["server"] in unknown
+                     and s.get("break_even_verdict") == _R_AMBIGUOUS)
+        rest = [n for n in sorted(unknown) if n not in set(amb)]
+        if rest:
+            lines.append(f"  no ledger label, so it is unknown whether the lazy primer ever "
+                         f"attached: {', '.join(rest)}")
+        if amb:
+            lines.append(f"  ambiguous ledger label — these entries share a launcher "
+                         f"basename, so their rows cannot be told apart: {', '.join(amb)}")
+            lines.append("  bake `--server-name <name>` into each (re-run `install-mcp`) to "
+                         "make them measurable.")
+    # Reported here rather than folded into the rate above: the split is a FACT about the
+    # ledger, and merging the two identities would be the guessing #285 removed.
+    for srv in liab["servers"]:
+        sup = srv.get("superseded_labels") or []
+        if sup:
+            lines.append(f"  {srv['server']}: ledger rows under `{', '.join(sup)}` predate "
+                         f"its `--server-name` and are NOT counted in its rate above.")
     saved = liab["saved_tokens"]
     turns = liab["turns_covered"]
     if turns is not None:
@@ -1342,8 +1563,8 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
         lines.append("  1x = a lazily-primed standalone entry (#211): the break-even is "
                      "blocks ONCE PER SESSION, a far lower bar.")
         if _ONCE_FREE in shown or _ONCE_UNKNOWN in shown:
-            lines.append("  1x? = called-ness unknown (no ledger label); 1x- = installed "
-                         "but not triggered, so unpaid.")
+            lines.append("  1x? = called-ness unknown (no ledger label, or an ambiguous "
+                         "one); 1x- = installed but not triggered, so unpaid.")
     lines.append("  a BLOCK is one emitted tool-result text block — >=1 per call, so this "
                  "is a conservative bar (#141).")
     return lines
