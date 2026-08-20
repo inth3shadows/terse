@@ -734,8 +734,37 @@ def _ambiguous_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
     return {lbl for lbl, n in counts.items() if n > 1}
 
 
+def _live_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
+    """Every ledger label some INSTALLED entry currently answers to — a router's peer names,
+    and each wrapped entry's own identity or guess. The set `_superseded_labels` has to
+    subtract, so it cannot hand one server another server's live rows."""
+    live: set[str] = set()
+    for row in scan_rows:
+        state = row.get("state")
+        wraps = row.get("wraps") or ""
+        if state in ("router", "router-ambiguous"):
+            live.update(p for p in (q.strip() for q in wraps.split(",")) if p)
+            continue
+        # Folded peers are the router's labels too — they write their own ledger records
+        # even though they never pay a primer, so `_PAYS_PRIMER` is the wrong filter here.
+        # `ident` ALONE is what makes a baked entry's command basename correctly absent
+        # here: `resolve_ledger_identity` already collapsed the two cases, returning the
+        # baked name for a baked entry (whose basename is exactly what is no longer live —
+        # the thing `_superseded_labels` exists to name) and the basename itself for an
+        # unbaked one. The `elif` is only the fallback for a row predating that field.
+        ident = row.get("ledger_identity")
+        if ident:
+            live.add(str(ident))
+        elif wraps:
+            live.add(server_label(wraps.split()))
+        name = row.get("server")
+        if name and state and state.startswith("folded"):
+            live.add(str(name))
+    return live
+
+
 def _superseded_labels(row: dict[str, Any], labels: list[str],
-                       by_label: dict[str, int]) -> list[str]:
+                       by_label: dict[str, int], live: set[str]) -> list[str]:
     """Ledger labels that hold rows this entry almost certainly WROTE, but which its current
     identity no longer claims — the history stranded when `--server-name` was baked into an
     entry that had been guessing (#285 review).
@@ -747,16 +776,21 @@ def _superseded_labels(row: dict[str, Any], labels: list[str],
     removed, and two labels can equally be two servers — so the rows are reported, never
     counted. Every published rate stays measured against one identity.
 
-    Only ever a NON-launcher basename, which is what keeps this from re-manufacturing #285's
-    cross-attribution: `searxng-mcp` guesses `python`, and the `python` rows in the ledger
-    are `demo_orders`, not its own history. A launcher basename is exactly the case where
-    "these rows are probably yours" cannot be said, so it is not said."""
+    Two subtractions keep "almost certainly WROTE" honest, and review found the second one
+    missing. First, never a launcher basename: `searxng-mcp` guesses `python`, and the
+    `python` rows in the ledger are an unrelated demo server, not its own history — a
+    launcher basename is exactly where "these rows are probably yours" cannot be said.
+    Second, never a label some OTHER installed entry still answers to (`live`): a
+    `--server-name kb` entry over `sb-run` sits next to an unbaked `legacy-kb` reading those
+    same `sb-run` rows as its live rate, and an entry over `kb` sits next to a router
+    fronting `kb` as a peer. Claiming either as stranded history would print one server's
+    live traffic as another's past, in the same report."""
     guess = server_label((row.get("wraps") or "").split()) if row.get("wraps") else ""
     # `guess in labels` is what makes an UNBAKED entry report nothing without a separate
     # `ledger_identity_explicit` check: with no flag its rows ARE under the guess, so
     # `_wrapped_labels` already returned it and nothing was stranded. Only a baked name can
     # move the live identity off the guess and leave the old rows behind.
-    if not guess or guess in labels or _is_launcher_basename(guess):
+    if not guess or guess in labels or _is_launcher_basename(guess) or guess in live:
         return []
     return [guess] if by_label.get(guess) else []
 
@@ -1181,6 +1215,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
     # Computed over ALL rows before any is rendered: whether one entry's guessed label is
     # ambiguous is a fact about the fleet, not about that row (#285).
     ambiguous = _ambiguous_labels(scan_rows)
+    live = _live_labels(scan_rows)
     for row in scan_rows:
         name, state = row.get("server"), row.get("state")
         if state not in _PAYS_PRIMER or not name or name in seen:
@@ -1247,7 +1282,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
             "contributors": _contributors(labels, by_label, saved_by_label,
                                           tokenized_by_label),
             # Reported, never summed into anything above — see `_superseded_labels`.
-            "superseded_labels": _superseded_labels(row, labels, by_label),
+            "superseded_labels": _superseded_labels(row, labels, by_label, live),
         }
         # Last, and from the finished row: the verdict is a rollup of the published fields,
         # so it is computed from them rather than alongside them.
@@ -1342,10 +1377,11 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         # Split by CAUSE, because only one of the two has a fix the operator can act on.
         # `mcp-status` already tells this entry to bake `--server-name`; saying "no ledger
         # label" here and nothing else made the two commands read as unrelated complaints.
+        unknown = set(liab["uncertain"])
         amb = sorted(s["server"] for s in liab["servers"]
-                     if s["server"] in set(liab["uncertain"])
+                     if s["server"] in unknown
                      and s.get("break_even_verdict") == _R_AMBIGUOUS)
-        rest = [n for n in sorted(liab["uncertain"]) if n not in set(amb)]
+        rest = [n for n in sorted(unknown) if n not in set(amb)]
         if rest:
             lines.append(f"  no ledger label, so it is unknown whether the lazy primer ever "
                          f"attached: {', '.join(rest)}")
@@ -1359,9 +1395,8 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     for srv in liab["servers"]:
         sup = srv.get("superseded_labels") or []
         if sup:
-            lines.append(f"  {srv['server']}: {sum(1 for _ in sup)} earlier ledger "
-                         f"identity(ies) ({', '.join(sup)}) predate its `--server-name` and "
-                         f"are NOT counted in its rate above.")
+            lines.append(f"  {srv['server']}: ledger rows under `{', '.join(sup)}` predate "
+                         f"its `--server-name` and are NOT counted in its rate above.")
     saved = liab["saved_tokens"]
     turns = liab["turns_covered"]
     if turns is not None:
@@ -1528,8 +1563,8 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
         lines.append("  1x = a lazily-primed standalone entry (#211): the break-even is "
                      "blocks ONCE PER SESSION, a far lower bar.")
         if _ONCE_FREE in shown or _ONCE_UNKNOWN in shown:
-            lines.append("  1x? = called-ness unknown (no ledger label); 1x- = installed "
-                         "but not triggered, so unpaid.")
+            lines.append("  1x? = called-ness unknown (no ledger label, or an ambiguous "
+                         "one); 1x- = installed but not triggered, so unpaid.")
     lines.append("  a BLOCK is one emitted tool-result text block — >=1 per call, so this "
                  "is a conservative bar (#141).")
     return lines

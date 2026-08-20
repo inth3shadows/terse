@@ -13,6 +13,14 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Added
+
+- **`terse stats --json`: two additions to the break-even vocabulary** (`#285`). A new
+  per-server `superseded_labels` (list) names ledger labels an entry wrote under before
+  `--server-name` was baked in, and `break_even_verdict` gains `ambiguous ledger label` to
+  its documented closed set. Both are additive, but a consumer switching exhaustively on
+  that set will see a value it does not know — which is why this releases as a minor.
+
 ### Fixed
 
 - **`terse stats` billed a wrapped server's break-even against another server's ledger
@@ -40,7 +48,17 @@ fails that pull request until the section has moved.
   hand-edited entry using the `=` spelling was therefore invisible to both `terse mcp-status`
   and break-even, reproducing the same silent `never called` on an entry that had already
   baked the flag that fixes it. Both spellings are now read, for `--policy` and
-  `--capture-dir` too; a value containing `=` survives (split on the first one only).
+  `--capture-dir` too; a value containing `=` survives (split on the first one only). The
+  config scan now sources `policy` from the same parser instead of its own two-token-only
+  scan, so `--policy=/p.json` no longer leaves the row's policy unset — which had
+  `terse stats` size that entry's primer from `default_policy()`, billing a primer to an
+  entry whose real policy emits a different one, and stopped `policy_missing` from ever
+  firing for a deleted file.
+- **`--server-name=` (empty value) was reported as an explicit identity** (`#285` review).
+  `resolve_ledger_identity` is `name or server_label(cmd)`, so an empty value correctly
+  falls back to the command basename — but the scan flagged explicitness with `is not None`,
+  telling break-even to trust that guess and skipping the ambiguity guard on exactly the
+  hand-edited entries it exists for. Both now use the same truthiness.
 - **A peerless multiproxy router was billed a primer for a phantom peer** (`#285` review).
   `scan_scopes` writes the literal `(no peers)` into a router row's `wraps` when its peers
   file is empty; break-even read that sentinel as a peer NAME, so the router published it as
@@ -53,7 +71,12 @@ fails that pull request until the section has moved.
   label is surfaced per-server as `superseded_labels` (and named in the report) rather than
   merged: merging would be the guessing this release removed, and two labels can equally be
   two servers. Suppressed for launcher basenames, where "these rows are probably yours"
-  cannot be said.
+  cannot be said, and for any label another installed entry still answers to — a sibling
+  wrap that never baked a name, or a router peer — so one server's live traffic is never
+  printed as another's past.
+- **The cadence legend re-collapsed the two causes of an unknown label** (`#285` review).
+  It attributed every `1x?` to "no ledger label" one line below the table that had just
+  distinguished it from `ambiguous ledger label`.
 
 ## [0.27.0] - 2026-08-19
 

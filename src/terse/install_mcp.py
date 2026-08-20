@@ -1500,16 +1500,20 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
             # are all recoverable from here — none of which the old status line showed,
             # leaving no way to spot e.g. a --no-diff or a wrong downstream from status.
             args = servers[name].get("args") or []
-            if "--policy" in args:
-                i = args.index("--policy")
-                if i + 1 < len(args):
-                    policy = args[i + 1]
-                    # Only an absolute policy path is unambiguously checkable: a relative
-                    # one resolves against the MCP launcher's cwd, which a status scan
-                    # can't know, so we never false-flag it (see #58's drift lineage — the
-                    # point is to surface real drift, not manufacture noise).
-                    if os.path.isabs(policy) and not os.path.exists(policy):
-                        policy_missing = True
+            # Via `parse_proxy_opts`, NOT a bare `"--policy" in args` scan: that saw only
+            # the two-token spelling, so a hand-edited `--policy=/p.json` left this row's
+            # policy None and `terse stats` then sized the entry's primer from
+            # `default_policy()` — billing a 248-token primer to an entry running a
+            # default-deny policy that emits none, and never flagging a deleted policy
+            # file. Same defect family as #285's `--server-name=`.
+            opts = parse_proxy_opts(servers[name]) or {}
+            policy = opts.get("policy") or policy
+            # Only an absolute policy path is unambiguously checkable: a relative one
+            # resolves against the MCP launcher's cwd, which a status scan can't know, so we
+            # never false-flag it (see #58's drift lineage — the point is to surface real
+            # drift, not manufacture noise).
+            if policy and os.path.isabs(policy) and not os.path.exists(policy):
+                policy_missing = True
             downstream: list[str] = []
             if "--" in args:
                 downstream = args[args.index("--") + 1:]
@@ -1547,10 +1551,15 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
             # `--server-name` (#152); a missing one here means a hand-edited entry, which
             # is exactly the case this can't catch any other way (#237's boundary keeps
             # this a detector, not a proxy behavior change — nothing here alters routing).
-            opts = parse_proxy_opts(servers[name]) or {}
             explicit_name = opts.get("server_name")
             ledger_identity = resolve_ledger_identity(explicit_name, downstream)
-            ledger_identity_explicit = explicit_name is not None
+            # TRUTHINESS, not `is not None`, so this agrees with `resolve_ledger_identity`'s
+            # own `server_name or server_label(cmd)`. `--server-name=` (empty value) parses
+            # to `""`: the identity correctly falls back to the command basename, and
+            # calling that "explicit" told `terse stats` to trust a GUESS as if the operator
+            # had named it — re-opening #285's cross-attribution on exactly the hand-edited
+            # entries the ambiguity guard exists for.
+            ledger_identity_explicit = bool(explicit_name)
         if state in ("router", "router-ambiguous"):
             # A router has no `--` downstream and no single `--policy`: what it fronts is
             # the peers file's list, and each peer carries its own policy there.

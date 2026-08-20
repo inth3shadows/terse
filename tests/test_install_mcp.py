@@ -606,6 +606,43 @@ def test_scan_scopes_includes_project_and_local_when_present(tmp_path, monkeypat
     assert by_scope[("project", "proj-demo")]["policy"] == "/proj.json"
 
 
+def test_scan_scopes_reads_the_EQUALS_spelling_for_policy_and_server_name(tmp_path,
+                                                                           monkeypatch):
+    """The scan derived `policy` from a bare `"--policy" in args` scan, which saw only the
+    two-token spelling `wrap` emits. A hand-edited `--policy=/p.json` therefore left the row's
+    policy None, `policy_missing` never fired for a deleted file, and `terse stats` sized the
+    entry's primer from `default_policy()` — billing a primer to an entry whose real policy
+    emits a different one (or none at all).
+
+    `--server-name=` with an EMPTY value is the paired case: `resolve_ledger_identity`
+    (`name or server_label(cmd)`) falls back to the command basename for it, so the identity
+    is a GUESS and must not be reported as explicit — doing so tells break-even to trust it
+    and skips the ambiguity guard (#285)."""
+    cfg = tmp_path / ".claude.json"
+    missing = tmp_path / "gone.json"          # never created -> policy_missing
+    cfg.write_text(json.dumps({"mcpServers": {
+        "eq": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", f"--policy={missing}", "--server-name=kb",
+            "--", "kb-server"]},
+        "blank": {"command": "/abs/python", "args": [
+            "-m", "terse", "proxy", "--server-name=", "--", "kb-server"]},
+    }}))
+    im.stash_path(cfg).write_text(json.dumps({"user": {
+        "eq": {"command": "kb-server", "args": []},
+        "blank": {"command": "kb-server", "args": []}}}))
+    monkeypatch.setattr(im, "config_path", lambda: cfg)
+    monkeypatch.chdir(tmp_path)
+
+    by = {r["server"]: r for r in im.scan_scopes() if r["scope"] == "user"}
+    assert by["eq"]["policy"] == str(missing)
+    assert by["eq"]["policy_missing"] is True
+    assert by["eq"]["ledger_identity"] == "kb"
+    assert by["eq"]["ledger_identity_explicit"] is True
+    # Empty value: identity falls back to the basename, so it is a guess, not explicit.
+    assert by["blank"]["ledger_identity"] == "kb-server"
+    assert by["blank"]["ledger_identity_explicit"] is False
+
+
 def test_scan_scopes_surfaces_wraps_diff_stats_and_missing_policy(tmp_path, monkeypatch):
     cfg = tmp_path / ".claude.json"
     missing = tmp_path / "gone.json"          # never created -> policy_missing

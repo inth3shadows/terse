@@ -25,6 +25,7 @@ import json
 import pytest
 
 from terse.stats import (
+    _build_break_even_table,
     _is_launcher_basename,
     build_primer_section,
     build_recommend_section,
@@ -416,6 +417,87 @@ def test_stranded_history_needs_rows_and_a_baked_name(tmp_path):
         _agg(("runecho", 245, 204260, 202928), ("runecho-mcp", 14, 88609, 83219)))
     assert unbaked["servers"][0]["superseded_labels"] == []
     assert unbaked["servers"][0]["ledger_labels"] == ["runecho-mcp"]
+
+
+def test_stranded_history_never_names_a_label_the_fleet_still_answers_to(tmp_path):
+    """The second subtraction, missing from the first cut of this feature. "Almost certainly
+    yours" cannot be said about rows another INSTALLED entry is reading as its own live rate
+    in the same report — otherwise one server's present is printed as another's past.
+
+    Both shapes: a sibling wrapped entry that never baked a name and still answers to the
+    guess, and a router peer. In each case the guess has rows and is not a launcher, so only
+    the liveness check can suppress it."""
+    pol = _policy(tmp_path)
+    baked = _scan("kb", "wrapped", "/opt/bin/sb-run", pol, identity="kb", explicit=True)
+    agg = _agg(("kb", 10, 5000, 2000), ("sb-run", 7, 3000, 1500))
+
+    sibling = primer_liability(
+        [baked, _scan("legacy-kb", "wrapped", "/opt/bin/sb-run", pol,
+                      identity="sb-run", explicit=False)], agg)
+    rows = {r["server"]: r for r in sibling["servers"]}
+    assert rows["kb"]["superseded_labels"] == []          # sb-run is legacy-kb's LIVE label
+    assert rows["legacy-kb"]["ledger_labels"] == ["sb-run"] and rows["legacy-kb"]["blocks"] == 7
+
+    peer = primer_liability(
+        [_scan("x", "wrapped", "/opt/bin/kb", pol, identity="x", explicit=True),
+         _scan("terse", "router", "kb, runecho", pol)],
+        _agg(("kb", 50, 90000, 20000), ("x", 4, 900, 300)))
+    assert {r["server"]: r["superseded_labels"] for r in peer["servers"]}["x"] == []
+
+
+def test_two_unbaked_entries_collide_even_when_one_wrote_an_empty_server_name(tmp_path):
+    """`--server-name=` parses to `""`, and `resolve_ledger_identity` (`name or
+    server_label(cmd)`) correctly falls back to the command basename for it. Calling that
+    identity "explicit" told break-even to TRUST a guess as if the operator had named it,
+    which skips the ambiguity guard and re-opens #285's cross-attribution on exactly the
+    hand-edited entries the guard exists for. The scan now reports explicitness by the same
+    truthiness the identity resolution uses, so these two collide and both say so."""
+    pol = _policy(tmp_path)
+    rows = [_scan(n, "wrapped", f"/usr/bin/python3.12 -m {n}", pol,
+                  identity="python3.12", explicit=False) for n in ("a", "b")]
+    liab = primer_liability(rows, _agg(("python3.12", 9, 6000, 3000)))
+    assert all(r["break_even_verdict"] == "ambiguous ledger label" for r in liab["servers"])
+    assert all(r["blocks"] is None for r in liab["servers"])
+
+
+def test_the_rendered_section_separates_the_two_causes_of_an_unknown_label(tmp_path):
+    """The whole point of `ambiguous ledger label` is that it has an ACTIONABLE fix and `no
+    ledger label` does not, so the prose has to say which is which — including the cadence
+    legend, which attributed every `1x?` to "no ledger label" and re-collapsed the two one
+    line below the table that distinguishes them. Both branches render alone and together."""
+    pol = _policy(tmp_path)
+    amb = [_scan(n, "wrapped", f"/usr/bin/python3.12 -m {n}", pol) for n in ("a", "b")]
+    nolabel = [_scan("x", "wrapped", "", pol)]
+    agg = _agg(("python3.12", 3, 6152, 2762))
+
+    only_amb = "\n".join(build_primer_section(primer_liability(amb, agg)))
+    assert "cannot be told apart: a, b" in only_amb
+    assert "`--server-name <name>`" in only_amb          # the fix, named
+    assert "no ledger label, so it is unknown" not in only_amb
+
+    only_unknown = "\n".join(build_primer_section(primer_liability(nolabel, agg)))
+    assert "no ledger label, so it is unknown" in only_unknown
+    assert "cannot be told apart" not in only_unknown
+
+    both = "\n".join(build_primer_section(primer_liability(amb + nolabel, agg)))
+    assert "cannot be told apart: a, b" in both
+    assert "no ledger label, so it is unknown whether the lazy primer ever attached: x" in both
+
+
+def test_the_break_even_legend_does_not_re_collapse_the_two_causes(tmp_path):
+    """`1x?` reaches the table from either cause; the legend used to name only one of them.
+
+    A CALLED server is in the fleet on purpose: the table is gated on someone having been
+    called, so an all-ambiguous install renders no table at all and the primer-section prose
+    above is the only thing that speaks — which the test above pins."""
+    pol = _policy(tmp_path)
+    liab = primer_liability(
+        [_scan(n, "wrapped", f"/usr/bin/python3.12 -m {n}", pol) for n in ("a", "b")]
+        + [_scan("kb", "wrapped", "/opt/bin/kb-server", pol)],
+        _agg(("python3.12", 3, 6152, 2762), ("kb-server", 9, 9000, 3000)))
+    lines = "\n".join(_build_break_even_table(liab["servers"]))
+    assert "ambiguous ledger label" in lines            # the table cell
+    assert "no ledger label, or an ambiguous one" in lines   # the legend agrees with it
 
 
 def test_an_unreadable_policy_is_excluded_and_the_total_labelled_a_lower_bound(tmp_path):
