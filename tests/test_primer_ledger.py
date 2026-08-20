@@ -27,6 +27,7 @@ from terse.stats import (
     build_primer_record,
     primer_liability,
 )
+from terse.tokenize import count_cl100k
 
 FULL = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))])
 
@@ -196,13 +197,105 @@ def _agg_with(blocks_for="gh", primer_rows=()):
 
 def test_a_recorded_primer_replaces_the_inferred_size():
     """The correction itself. Inference sizes the primer from policy and assumes a called
-    server paid it; a recorded row says what actually went out."""
+    server paid it; a recorded row says what actually went out.
+
+    Asserted against an INDEPENDENTLY computed expectation, not against
+    `aggregate([rec])["primers"][0]["tokens"]`. The original version did the latter and was
+    structurally incapable of failing — it compared the reader's output to the same sum the
+    reader consumed, so it stayed green through the window-sum bug below."""
     rec = build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)
     liab = primer_liability([_scan_row()], _agg_with(blocks_for="gh-server",
                                                      primer_rows=[rec]))
     row = liab["servers"][0]
     assert row["primer_source"] == "recorded"
-    assert row["primer_tokens"] == aggregate([rec])["primers"][0]["tokens"]
+    assert row["primer_tokens"] == count_cl100k("P" * 40)
+
+
+def test_a_multi_session_window_reports_ONE_primer_not_the_windows_sum():
+    """THE regression this file exists for after review. `primer_tokens` is a PER-SESSION
+    charge: `_break_even` divides by it to get "blocks once per session" and the report
+    renders it "N tok/session". `aggregate` sums a whole WINDOW, and a standalone proxy is
+    one process per session writing one row per session — so assigning the window sum to
+    that field over-bills by the session count and flips break-even to NET NEGATIVE on any
+    multi-session window, which is the default (`terse stats` with no `--since` reads all
+    history).
+
+    Same mis-denomination class #312 was closed for, and it made the "measured" number
+    WORSE than the estimate it replaced. Pinned across several session counts because the
+    single-row fixture above cannot see it: at one emission the mean and the sum agree."""
+    one = count_cl100k("P" * 40)
+    for sessions in (1, 2, 5, 20):
+        rows = [build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE,
+                                    primer="P" * 40) for _ in range(sessions)]
+        liab = primer_liability([_scan_row()],
+                                _agg_with(blocks_for="gh-server", primer_rows=rows))
+        row = liab["servers"][0]
+        assert row["primer_source"] == "recorded"
+        assert row["primer_tokens"] == one, (
+            f"{sessions} sessions reported {row['primer_tokens']} for a {one}-token primer")
+        # ...and the consumers that divide by it stay in per-session units too.
+        assert liab["session_once_tokens"] == one
+    # Break-even must not drift with session count either — it is "blocks ONCE PER SESSION".
+    be = [primer_liability([_scan_row()],
+                           _agg_with(blocks_for="gh-server",
+                                     primer_rows=[build_primer_record(
+                                         "gh-server", cadence=PRIMER_CADENCE_ONCE,
+                                         primer="P" * 40) for _ in range(n)])
+                           )["servers"][0]["blocks_to_break_even"] for n in (1, 20)]
+    assert be[0] == be[1]
+
+
+def test_emissions_with_no_token_count_are_not_published_as_a_measurement():
+    """A tiktoken-less terse records that the primer WENT OUT but not what it cost. The
+    divisor is tokenized emissions, so a row whose tokens are unknown must not be treated as
+    a zero-cost emission — that would drag the mean down and publish a fabricated
+    measurement under the `recorded` label."""
+    rec = build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)
+    rec["tokens"] = None                       # exactly what a tiktoken-less writer emits
+    liab = primer_liability([_scan_row()], _agg_with(blocks_for="gh-server",
+                                                     primer_rows=[rec]))
+    row = liab["servers"][0]
+    assert row["primer_source"] == "estimated"     # falls back, does not invent
+    assert row["primer_tokens"]                    # still sized from policy
+
+    # A corrupt divisor must also fall back rather than publish an inflated figure. A
+    # hand-edited ledger can carry `untokenized > emissions`, making the tokenized-emission
+    # count NEGATIVE — and a negative divisor is how an over-bill would re-enter through
+    # the very arithmetic the mean exists to prevent.
+    #
+    # TWO guards stop it and neither is pinned alone here, because either one suffices and
+    # a test asserting one would pass with it deleted: the `tokenized_emissions <= 0` skip
+    # in the accumulator, and `measured = rec_em > 0` at the point of use. What IS pinned is
+    # the property that matters — a nonsense divisor yields the labelled estimate, never a
+    # number presented as a measurement.
+    good = build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)
+    agg = _agg_with(blocks_for="gh-server", primer_rows=[good, good, good])
+    for prow in agg["primers"]:
+        prow["emissions"] += 1          # a fourth emission...
+        prow["untokenized"] += 5        # ...with an untokenized count that cannot be real
+    liab2 = primer_liability([_scan_row()], agg)
+    corrupt = liab2["servers"][0]
+    assert corrupt["primer_source"] == "estimated"
+    assert corrupt["primer_tokens"] == row["primer_tokens"]   # the policy size, untouched
+    assert corrupt["primer_tokens"] > 0                       # and never negative/zero
+
+
+def test_a_recorded_emission_beats_the_encoded_zero_inference():
+    """#311 review. `_cadence` infers "never paid" from `encoded == 0`, and its own
+    docstring names the path where that is wrong: a `passthrough` result whose downstream
+    payload quotes a terse marker attaches the primer while `encoded` stays 0. A recorded
+    row settles it. Before this, one report called the server MEASURED and listed it under
+    "costing nothing at all" simultaneously, and dropped the charge from the total."""
+    rec = build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)
+    passthrough = {"server": "gh-server", "tool": "gh.api.items", "raw_chars": 900,
+                   "out_chars": 900, "raw_tokens": 200, "out_tokens": 200,
+                   "decision": "passthrough", "passthrough": True}
+    liab = primer_liability([_scan_row()], aggregate([passthrough, rec]))
+    row = liab["servers"][0]
+    assert row["primer_source"] == "recorded"
+    assert row["cadence"] == "once/session"          # NOT "once/session (unpaid)"
+    assert row["server"] not in liab["free"]
+    assert liab["session_once_tokens"] == count_cl100k("P" * 40)
 
 
 def test_no_recorded_row_keeps_the_inference_and_says_so():
@@ -227,3 +320,64 @@ def test_measured_and_estimated_are_never_summed_into_one_unlabelled_number():
     text = "\n".join(build_primer_section(liab))
     assert "MEASURED" in text
     assert "inferred to have paid" in text
+
+
+def test_the_primer_write_happens_after_the_lock_is_released():
+    """#311 review, and the one finding the two reviewers disagreed on.
+
+    Every other sink (capture/audit/stats) is queued into `deferred` and run once
+    `_local_lock` is released. The comment above that list says why in terms a try/except
+    cannot satisfy: it catches a sink that RAISES, and does nothing for one that BLOCKS —
+    a stalled mount or a full disk mid-rotation would hold `_local_lock`, freeze
+    `note_request` (same lock) and wedge every later tools/call on the connection.
+    `append_stats` stats, may rotate, reads and appends a file, so it is exactly that kind
+    of sink. The primer write shipped INSIDE the lock.
+
+    Asserted by having the writer itself try to take the lock: if it still ran under the
+    lock this deadlocks (non-reentrant `Lock`), so the test would hang rather than fail —
+    hence the explicit non-blocking probe, which turns a hang into a clean assertion.
+    """
+    seen: list[bool] = []
+    inter = Interceptor(FULL)
+
+    def probe(cadence, text):
+        # True = the lock was free at write time, i.e. the write is genuinely deferred.
+        got = inter._local_lock.acquire(blocking=False)
+        seen.append(got)
+        if got:
+            inter._local_lock.release()
+
+    inter.stats_primer = probe
+    _note_call(inter, 2, "gh.api.items")
+    out = json.loads(inter.transform_response(_result_msg(2, _records_text())))
+    assert PRIMER_HEAD in out["result"]["content"][0]["text"]   # it really attached
+    assert seen == [True], "the primer ledger write ran while _local_lock was held"
+
+
+def test_a_blocking_primer_writer_cannot_wedge_the_next_call():
+    """The consequence the deferral buys, stated as behaviour rather than structure: with
+    the write deferred, a slow sink delays only its own response's return and `note_request`
+    stays available. Pinned with a writer that BLOCKS (not one that raises) because that is
+    the case try/except never covered."""
+    import threading
+    released = threading.Event()
+    inter = Interceptor(FULL)
+
+    def slow(cadence, text):
+        # Runs on the response path; while it sleeps, note_request must still be servable.
+        released.wait(timeout=5)
+
+    inter.stats_primer = slow
+    _note_call(inter, 2, "gh.api.items")
+    t = threading.Thread(target=lambda: inter.transform_response(
+        _result_msg(2, _records_text())), daemon=True)
+    t.start()
+    # Give the response path time to reach the deferred sink and block there.
+    other = threading.Thread(target=lambda: _note_call(inter, 3, "gh.api.items"),
+                             daemon=True)
+    other.start()
+    other.join(timeout=3)
+    unblocked = not other.is_alive()
+    released.set()
+    t.join(timeout=5)
+    assert unblocked, "note_request was blocked by a slow primer-ledger write"

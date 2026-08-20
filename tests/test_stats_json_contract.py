@@ -65,6 +65,11 @@ VERSION_ROW = {"blocks", "tokenized", "raw_tokens", "out_tokens"}
 RETRIEVE_ROW = {"server", "tool", "path", "calls", "hits", "misses", "bytes", "tokens",
                 "untokenized"}
 
+# #311. `emissions` is the load-bearing one and the likeliest to be dropped by someone
+# tidying `aggregate`: `primer_liability` divides `tokens` by it to recover the PER-SESSION
+# primer, so losing it silently restores the window-sum over-bill this row exists to fix.
+PRIMER_ROW = {"server", "cadence", "emissions", "bytes", "tokens", "untokenized"}
+
 LIABILITY = {"servers", "per_turn_tokens", "session_once_tokens", "unresolved",
              "idle", "free", "uncertain", "saved_tokens", "turns_covered",
              "session_covered"}
@@ -239,6 +244,22 @@ def test_the_total_and_tool_rows_are_exactly_these_keys(stats_json):
         assert set(row) == TOOL_ROW, _ADD_ON_PURPOSE
         _check_types("tools[]", row)
     _check_types("total", out["total"])
+
+
+def test_the_primer_rows_are_exactly_these_keys(stats_json):
+    """The primer-emission row (#311), published to `--json` and described in the CHANGELOG
+    as a contract addition — so it needs the same pinning every other published shape has.
+    It shipped with `primers` in TOP_LEVEL but no row manifest and no type check, which
+    `test_every_named_field_also_has_a_pinned_type` cannot catch: that test only checks
+    named-minus-TYPES, so a field in TYPES with no manifest entry goes green silently."""
+    from terse.stats import PRIMER_CADENCE_ONCE, build_primer_record
+    out = stats_json([_rec(),
+                      build_primer_record("kb", cadence=PRIMER_CADENCE_ONCE,
+                                          primer="p" * 200)])
+    assert out["primers"], "a primer record must produce a primer row"
+    for row in out["primers"]:
+        assert set(row) == PRIMER_ROW, _ADD_ON_PURPOSE
+        _check_types("primers[]", row)
 
 
 def test_the_retrieve_rows_are_exactly_these_keys(stats_json):

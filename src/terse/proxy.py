@@ -876,13 +876,22 @@ class Interceptor:
                     content.insert(0, {"type": "text", "text": self._primer_text})
                     self._primer_sent = True
                     changed = True
-                    # Record the charge HERE, inside the branch that actually attached it
-                    # (#311). Everything outside this `if` -- a result carrying
-                    # `structuredContent`, one with no terse marker, a session that never
-                    # produces a compressible result at all -- pays nothing, and #286 is
-                    # what billing those anyway looked like in production. The ledger could
-                    # not tell them apart because nothing wrote the distinction down.
-                    self._emit_primer(PRIMER_CADENCE_ONCE, self._primer_text)
+                    # DEFERRED, not called here (review of #311). The decision to bill is
+                    # made inside this branch -- the branch that actually attached it, so
+                    # everything outside it (a result carrying `structuredContent`, one
+                    # with no terse marker, a session that never produces a compressible
+                    # result at all) writes nothing, which is the whole point of #286. But
+                    # the WRITE has to happen after `_local_lock` is released, like every
+                    # other sink: `append_stats` stats/rotates/reads/appends a file, and a
+                    # blocking one -- stalled mount, full disk mid-rotation -- would hold
+                    # this lock, freeze `note_request`, and wedge every later tools/call on
+                    # the connection. try/except catches a sink that RAISES and does
+                    # nothing for one that BLOCKS; see the note above `deferred`.
+                    deferred.append((
+                        "primer ledger", "(primer)",
+                        partial(self._emit_primer, PRIMER_CADENCE_ONCE,
+                                self._primer_text),
+                    ))
 
             if self.stats is not None:
                 deferred.append((
@@ -1629,16 +1638,16 @@ class Interceptor:
         emit = self.stats_primer
         if emit is None:
             return
-        try:
-            emit(cadence, text)
-        except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
-            # Its OWN sink kind, not "stats". `_warn_sink` writes the first failure of each
-            # kind unconditionally and silences the rest, so sharing a kind would let this
-            # consume the result ledger's one guaranteed warning -- and a dead ledger going
-            # silent is precisely what #131 exists to prevent. Worded to avoid the substring
-            # "stats skipped" for the same reason: that is what a reader (and a test) greps
-            # for to count RESULT-ledger failures.
-            self._warn_sink("primer ledger", "(primer)", exc)
+        # NOT wrapped in try/except here: this runs from the `deferred` drain loop, which
+        # already catches and routes to `_warn_sink` under the "primer ledger" label. A
+        # second catch here would swallow the error before the loop could see it, and the
+        # warning would be lost entirely. The label is deliberately NOT "stats": `_warn_sink`
+        # writes the first failure of each kind unconditionally and silences the rest, so
+        # sharing a kind would let this consume the result ledger's one guaranteed warning,
+        # and a dead ledger going silent is what #131 exists to prevent. It also avoids the
+        # substring "stats skipped", which is what a reader (and a test) greps for to count
+        # RESULT-ledger failures.
+        emit(cadence, text)
 
     def _emit_stats(self, tool: str, pairs: list[tuple[str, str]], *,
                     display_tool: str | None = None, diff_reason: str | None = None,
