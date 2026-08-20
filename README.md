@@ -376,9 +376,20 @@ everything screened out and why, is
 
 A working, measured, selective **lossless** library, CLI, and MCP
 stdio proxy. The proxy's open question — *does a model read the compressed form as
-well as raw JSON?* — now has a measured answer: on a stress corpus, Claude Haiku 4.5
-and Gemini 2.5 Flash match raw-JSON accuracy on the compressed form (100% paired) at a
-37% token saving (`terse fluency`; see TECHNICAL.md). Whole-subtree aliasing (folding
+well as raw JSON, and does it need the format primer to do so?* — has a real,
+model-dependent answer as of #249 (2026-08-19). Earlier "Haiku 4.5" claims here
+predate the fix that let this harness reach real Anthropic models at all (its
+gateway `claude-*` ids were DeepSeek aliases — see #249) and should be discounted.
+The first genuine frontier-panel run, via a real `claude -p` OAuth backend on a
+stress corpus, found: Opus 5 unaffected either way (raw = terse = 100%, 0
+regressions); Claude Haiku 4.5 shows a real, replicated 8-point gap without the
+primer (92% vs. 100% raw) that the primer closes to within noise (99%,
+`--trials 3`); Sonnet 5 shows a smaller gap (96% -> 100%) at a single trial, not
+yet confirmed at higher trial counts. The primer is not universally beneficial —
+it measurably *hurt* a smaller substitute model at higher trial counts — so the
+honest finding is "model-dependent," not "unnecessary" or "always required." See
+#249 for the full panel and the still-open real-payload-corpus precondition
+before any default changes. Whole-subtree aliasing (folding
 repeated objects, not just strings) is built. Cross-call diffing is a lossless tier
 that is **off by default** (#170) — not for lack of confidence, but on cost: its primer
 paragraph adds 190 cl100k tokens to that server's primer — the largest single section —
