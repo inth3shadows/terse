@@ -500,6 +500,49 @@ def test_the_break_even_legend_does_not_re_collapse_the_two_causes(tmp_path):
     assert "no ledger label, or an ambiguous one" in lines   # the legend agrees with it
 
 
+def _agg_sessions(agg, sessions, unsessioned=0):
+    """Stamp a hand-built agg with what `aggregate` would report about sessions (#311)."""
+    agg["sessions"] = sessions
+    agg["total"]["unsessioned"] = unsessioned
+    return agg
+
+
+def test_session_coverage_stays_a_BOUND_while_any_record_is_unmarked(tmp_path):
+    """#311's load-bearing half. `session_covered` treats the whole window as ONE session,
+    the most favourable reading available, because the ledger could not count K. With any
+    unmarked record the distinct count is a FLOOR, and dividing by a floor would publish an
+    upper bound wearing a measurement's name — the substitution the field exists to end.
+    Every record predates the field today, so this is also the live path."""
+    pol = _policy(tmp_path)
+    rows = [_scan("kb", "wrapped", "/opt/bin/kb-server", pol)]
+    for sessions, unsessioned in ((None, 3), (2, 1)):   # nothing known; partially known
+        liab = primer_liability(
+            rows, _agg_sessions(_agg(("kb-server", 9, 9000, 3000)), sessions, unsessioned))
+        assert liab["sessions"] is None
+        assert liab["session_covered_measured"] is None
+        assert liab["session_covered"] is not None      # the bound still ships
+        lines = "\n".join(build_primer_section(liab))
+        assert "at most" in lines and "more than one session" in lines
+
+
+def test_session_coverage_becomes_a_MEASUREMENT_once_every_record_is_marked(tmp_path):
+    """Each of K sessions paid the one-time charge again, so the real denominator is
+    `once * K` — not `once`. The bound stays published alongside it so a consumer already
+    reading it keeps working and can tighten when the measurement is non-None."""
+    pol = _policy(tmp_path)
+    liab = primer_liability([_scan("kb", "wrapped", "/opt/bin/kb-server", pol)],
+                            _agg_sessions(_agg(("kb-server", 9, 9000, 3000)), 4))
+    once = liab["session_once_tokens"]
+    assert liab["sessions"] == 4
+    assert liab["session_covered"] == pytest.approx(6000 / once)          # the ceiling
+    assert liab["session_covered_measured"] == pytest.approx(6000 / (once * 4))
+    lines = "\n".join(build_primer_section(liab))
+    assert "4 session(s) measured in this window" in lines
+    assert "each paid it again" in lines
+    assert "ceiling if it were one session" in lines    # the bound is named, not dropped
+    assert "more than one session, which it usually does" not in lines   # the hedge is gone
+
+
 def test_an_unreadable_policy_is_excluded_and_the_total_labelled_a_lower_bound(tmp_path):
     """Substituting the built-in default would OVERSTATE (the default emits every form).
     Leave it out, count it, and say the number is a floor."""

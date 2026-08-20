@@ -147,7 +147,17 @@ off by default because it failed rung 4 at the measured hit rate.
   never blended). `aggregate` also rolls up `versions` (per-writer-version blocks and
   token sums, so "did that release help?" is answerable without a payload-mix-confounded
   time slice) and `total.unversioned` (records predating the field — never bucketed
-  under a `None` key), and canonicalizes tool names at READ time via `canonical_tool`,
+  under a `None` key). Each record also carries a `session` — a random per-PROCESS id, and
+  one `terse proxy` is one process per session (#311) — so `aggregate` reports `sessions`
+  (distinct ids seen in the window, `None` and never `0` when none are known) and
+  `total.unsessioned`. That count is the denominator every per-session figure previously
+  had to publish as an optimistic bound: `session_covered` reads the whole window as one
+  session, while `session_covered_measured` divides by the K actually observed and is
+  present ONLY when `unsessioned == 0` — with any unmarked record the distinct count is a
+  floor, and dividing by a floor would publish a bound wearing a measurement's name. The
+  count is per-WINDOW: rotation and `--since` can each split a session. There is
+  deliberately no TURN marker — a stdio proxy cannot observe turns, which is why
+  `turns_covered` is a ratio. `aggregate` also canonicalizes tool names at READ time via `canonical_tool`,
   which strips a router's `<server>__` qualification when it merely repeats the record's
   own server label. Read-time, not write-time, so it also repairs records already on
   disk, where the same tool split into two rows depending on which topology handled it. The record's `server` is `proxy --server-name` when given (the config's

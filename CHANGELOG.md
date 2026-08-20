@@ -13,7 +13,33 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **The savings ledger now records a session marker** (`#311`). Every record carries a
+  `session` — a random per-process id, and one `terse proxy` is one process per session,
+  the same fact `primer_liability` already leans on when it charges the lazy primer (#211)
+  once per session. `aggregate` reports `sessions` (distinct ids in the window) and
+  `total.unsessioned`, and `terse stats` leads its headline with the count.
+
+  This closes a gap the code had already named and deferred: *"The only thing that could
+  turn either bound into a measurement is a ledger-side session/turn marker, which is a
+  ledger SHAPE change and a separate decision."* Every per-session figure terse published
+  was an optimistic **bound** — `session_covered` reads the whole window as a single
+  session, the most favourable reading available, because K was unobservable. The new
+  `session_covered_measured` divides by the K actually seen.
+
+  Unknown stays unknown. `sessions` is `None`, never `0`, when nothing is marked, and the
+  measurement is published ONLY when `unsessioned == 0`: with any unmarked record the
+  distinct count is a floor, and dividing by a floor would publish a bound wearing a
+  measurement's name — the `#144/#186/#188` family this discipline exists to prevent. Every
+  record written before this release is unmarked, so existing ledgers keep reporting today's
+  bound, with today's wording, until they accumulate marked traffic.
+
+  Deliberately **no turn marker**: a stdio proxy cannot observe turns, which is why
+  `turns_covered` is a ratio in the first place. The router's per-turn figure stays an
+  explicit bound. The id is random and never derived from pid, hostname, or cwd — the
+  ledger is safe to leave always-on precisely because it stores sizes and decisions, not
+  identity.
 
 ## [0.28.0] - 2026-08-19
 

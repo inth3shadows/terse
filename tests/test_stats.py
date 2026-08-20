@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 
 import pytest
 
@@ -11,6 +13,7 @@ from terse.stats import (
     aggregate,
     append_stats,
     build_record,
+    build_retrieve_record,
     build_stats_report,
     build_stats_writer,
     build_version_section,
@@ -415,6 +418,68 @@ def test_records_predating_the_version_field_are_counted_not_bucketed():
     assert agg["versions"] == {}
     assert agg["total"]["unversioned"] == 1
     assert "None" not in agg["versions"]
+
+
+def test_build_record_stamps_one_session_id_for_the_whole_process():
+    """One `terse proxy` is one process per session (#311) — the fact `primer_liability`
+    already leans on when it charges the lazy primer once per session. So a per-process id
+    IS a session id, and every record a process writes must carry the SAME one: a fresh id
+    per record would make the distinct count a block count wearing a session's name."""
+    a, b = build_record("s", "t1", RAW, RAW, False), build_record("s", "t2", RAW, RAW, False)
+    assert a["session"] and a["session"] == b["session"]
+    # A retrieve is a COST inside the same session, not a session of its own — otherwise a
+    # window's session count would depend on which record types happened to land in it.
+    assert build_retrieve_record("s", "t1", "$.x", hit=True)["session"] == a["session"]
+    # Random, never derived from the environment: the ledger is safe to leave always-on
+    # precisely because it stores sizes and decisions, not identity. A pid or hostname in
+    # this field would quietly put environment identity in an always-on file.
+    assert str(os.getpid()) not in a["session"]
+    assert socket.gethostname() not in a["session"]
+
+
+def test_aggregate_counts_DISTINCT_sessions():
+    recs = [
+        {"ts": 1, "session": "aaa", "server": "s", "tool": "t", "decision": "compressed",
+         "raw_chars": 10, "out_chars": 8, "raw_tokens": 10, "out_tokens": 8},
+        {"ts": 2, "session": "aaa", "server": "s", "tool": "t", "decision": "compressed",
+         "raw_chars": 10, "out_chars": 8, "raw_tokens": 10, "out_tokens": 8},
+        {"ts": 3, "session": "bbb", "server": "s", "tool": "t", "decision": "compressed",
+         "raw_chars": 10, "out_chars": 8, "raw_tokens": 10, "out_tokens": 8},
+    ]
+    agg = aggregate(recs)
+    assert agg["sessions"] == 2          # not 3 blocks, not 1 window
+    assert agg["total"]["unsessioned"] == 0
+
+
+def test_records_predating_the_session_field_are_counted_not_folded_into_one():
+    """The whole risk of #311. Every record ever written lacks the field; folding them into
+    a single session would manufacture exactly the denominator this exists to measure — the
+    `#144/#186/#188` family. Counted as unknown, and `sessions` stays None, never 0: a 0
+    reads as "this window had no sessions" when the truth is the records could not say."""
+    recs = [{"ts": 1, "server": "s", "tool": "t", "decision": "compressed",
+             "raw_chars": 10, "out_chars": 8, "raw_tokens": 10, "out_tokens": 8}]
+    agg = aggregate(recs)
+    assert agg["sessions"] is None
+    assert agg["total"]["unsessioned"] == 1
+
+
+def test_the_headline_states_sessions_only_when_it_can_measure_them():
+    """`blocks` answers "how much traffic"; `sessions` answers "across how many runs", and
+    the second is the denominator the per-session figures below used to guess at. Omitted
+    rather than printed as 0 or "?" when any record predates the field — an absent count
+    reads as not stated, a printed one reads as measured."""
+    marked = [{"ts": 1, "session": "aaa", "server": "s", "tool": "t",
+               "decision": "compressed", "raw_chars": 10, "out_chars": 8,
+               "raw_tokens": 10, "out_tokens": 8},
+              {"ts": 2, "session": "bbb", "server": "s", "tool": "t",
+               "decision": "compressed", "raw_chars": 10, "out_chars": 8,
+               "raw_tokens": 10, "out_tokens": 8}]
+    assert "sessions: 2" in build_stats_report(aggregate(marked), log_path="x")
+    legacy = [{k: v for k, v in r.items() if k != "session"} for r in marked]
+    assert "sessions:" not in build_stats_report(aggregate(legacy), log_path="x")
+    # One marked, one not: the count is a FLOOR, so it is not stated at all.
+    assert "sessions:" not in build_stats_report(aggregate([marked[0], legacy[1]]),
+                                                 log_path="x")
 
 
 def test_version_section_is_suppressed_when_nothing_is_versioned():

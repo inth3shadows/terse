@@ -39,11 +39,18 @@ from terse.stats import append_stats
 # aggregate previously could not express at all. Always present — an empty list when no
 # retrieve was recorded — so a consumer can read it unconditionally rather than branching on
 # whether this build has the key.
+# `sessions` (#311) is the count of DISTINCT writing processes seen in this window, or
+# None when none are known — never 0, which would read as "this window had no sessions"
+# when the truth is that the records could not say. It is what lets a per-session figure be
+# published as a measurement instead of the upper bound it has always been.
 TOP_LEVEL = {"total", "decisions", "diff_reasons", "tools", "versions", "retrieves",
-             "primer_liability"}
+             "primer_liability", "sessions"}
 
 TOTAL = {"blocks", "raw_chars", "out_chars", "raw_tokens", "out_tokens",
-         "untokenized", "unversioned"}
+         "untokenized", "unversioned",
+         # Records predating the session field. Parallel to `unversioned`: a per-session
+         # figure may only be a measurement while this is 0.
+         "unsessioned"}
 
 # `encoded` is the newest and the one most likely to be dropped by someone tidying
 # `aggregate`: `primer_liability` reads it to tell a server that merely was CALLED from one
@@ -63,7 +70,12 @@ RETRIEVE_ROW = {"server", "tool", "path", "calls", "hits", "misses", "bytes", "t
 
 LIABILITY = {"servers", "per_turn_tokens", "session_once_tokens", "unresolved",
              "idle", "free", "uncertain", "saved_tokens", "turns_covered",
-             "session_covered"}
+             # `session_covered` is the upper BOUND (the window read as one session);
+             # `session_covered_measured` divides by the K sessions actually observed and
+             # is present only when every record in the window carries a session id (#311).
+             # Both ship: a consumer already reading the bound keeps working and can tighten
+             # when the measurement is non-None.
+             "session_covered", "session_covered_measured", "sessions"}
 
 LIABILITY_SERVER = {"server", "scope", "state", "primer_tokens", "ledger_labels",
                     "blocks", "tokenized_blocks", "cadence",
@@ -92,7 +104,8 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "blocks": (int, type(None)), "tokenized": (int,), "encoded": (int,),
     "diffs": (int,), "raw_chars": (int,), "out_chars": (int,),
     "raw_tokens": (int,), "out_tokens": (int,),
-    "untokenized": (int,), "unversioned": (int,),
+    "untokenized": (int,), "unversioned": (int,), "unsessioned": (int,),
+    "sessions": (int, type(None)),
     "server": (str,), "tool": (str,), "scope": (str, type(None)),
     "state": (str, type(None)), "primer_tokens": (int, type(None)),
     "ledger_labels": (list,), "tokenized_blocks": (int, type(None)),
@@ -103,6 +116,7 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "per_turn_tokens": (int,), "session_once_tokens": (int,), "unresolved": (int,),
     "idle": (list,), "free": (list,), "uncertain": (list,), "saved_tokens": (int,),
     "turns_covered": (float, int, type(None)),
+    "session_covered_measured": (float, int, type(None)),
     "session_covered": (float, int, type(None)),
     "servers": (list,),
     "verdict": (str,), "verdict_reason": (str,),

@@ -102,6 +102,39 @@ def _ledger_version() -> str:
 _VERSION_CACHE: str | None = None
 
 
+def _session_id() -> str:
+    """The proxy PROCESS that wrote this record, resolved once per process (#311).
+
+    One `terse proxy` is one process per session — the same fact `primer_liability`
+    already leans on when it says the lazy primer (#211) is charged once per session and
+    `Interceptor._primer_sent` re-arms at every `initialize`. So a per-process id IS a
+    session id, and the count of distinct ids in a window is the denominator every
+    per-session figure was missing: `session_covered` had to be published as an optimistic
+    BOUND ("at most ~1,631x — fewer if this window spans more than one session") because
+    the ledger could not see K.
+
+    RANDOM, never derived from pid/hostname/cwd. The ledger's contract is that it stores
+    sizes and decisions only and is therefore safe to leave always-on; an id carrying
+    environment identity would quietly break that.
+
+    Deliberately the same shape as `_ledger_version` above — module-scope cache, hot-path
+    rationale, forward-only. That function is the precedent for "a per-process constant on
+    every record", and a second pattern for the same job would be the drift, not the reuse.
+
+    Forward-only by construction: records written before this field cannot be backfilled,
+    and `aggregate` counts them as `unsessioned` rather than folding them into one session
+    — which would manufacture exactly the denominator this exists to measure.
+    """
+    global _SESSION_CACHE
+    if _SESSION_CACHE is None:
+        import uuid
+        _SESSION_CACHE = uuid.uuid4().hex[:12]
+    return _SESSION_CACHE
+
+
+_SESSION_CACHE: str | None = None
+
+
 def canonical_tool(server: str, tool: str) -> str:
     """Strip a router's `<server>__` qualification when it merely repeats `server`.
 
@@ -188,6 +221,9 @@ def build_record(server: str, tool: str, raw: str, emitted: str,
         # The writer's version, so a later "did release X help?" is answerable from the
         # ledger instead of from a time slice that payload mix confounds.
         "version": _ledger_version(),
+        # The writing PROCESS, which is one session (#311) — the denominator every
+        # per-session figure previously had to publish as a bound.
+        "session": _session_id(),
         "server": server,
         "tool": tool,
         "decision": classify_decision(raw, emitted, passthrough),
@@ -240,6 +276,10 @@ def build_retrieve_record(server: str, tool: str, path: str, *,
     return {
         "ts": int(time.time()),
         "version": _ledger_version(),
+        # Same process, same session as the compression records around it (#311). A
+        # retrieve is a COST inside a session; leaving it unmarked would make a window's
+        # session count depend on which record types happened to land in it.
+        "session": _session_id(),
         "server": server,
         "tool": tool,
         "event": RETRIEVE_EVENT,
@@ -339,7 +379,16 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     # N and a joined/partial one contributes 1 per folded unit. Naming it `blocks` keeps
     # the count honest — it moves with join behaviour by design, not by call volume (#141).
     total = {"blocks": 0, "raw_chars": 0, "out_chars": 0,
-             "raw_tokens": 0, "out_tokens": 0, "untokenized": 0, "unversioned": 0}
+              "raw_tokens": 0, "out_tokens": 0, "untokenized": 0, "unversioned": 0,
+              # Records predating the session field (#311). Parallel to `unversioned`, and
+              # load-bearing for the same reason: a per-session figure may only be published
+              # as a MEASUREMENT when this is 0. Any unmarked record and the window's true
+              # session count is unknown, so the figure stays the bound it has always been.
+              "unsessioned": 0}
+    # Distinct writing processes = distinct sessions. A set, not a counter: the question is
+    # how many, and a `{id: blocks}` map would invite reporting per-session block counts
+    # that rotation can silently truncate (see `sessions` in the return).
+    session_ids: set[str] = set()
     decisions: dict[str, int] = {}
     # Which terse wrote each record (forward-only — see `_ledger_version`), carrying the
     # SAME token sums as the per-tool rows. A `{version: count}` counter would have been
@@ -402,6 +451,11 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             # Counted, never bucketed under a "None" key: a record written before the
             # field existed is an unknown writer, not a writer named None.
             total["unversioned"] += 1
+        sid = rec.get("session")
+        if isinstance(sid, str) and sid:
+            session_ids.add(sid)
+        else:
+            total["unsessioned"] += 1
         row = tools.setdefault(key, {"blocks": 0, "tokenized": 0, "encoded": 0,
                                      "raw_tokens": 0, "out_tokens": 0,
                                      "raw_chars": 0, "out_chars": 0, "diffs": 0})
@@ -457,6 +511,12 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             total["untokenized"] += 1
     return {"total": total, "decisions": decisions, "diff_reasons": diff_reasons,
             "versions": versions,
+            # DISTINCT sessions observed in this window (#311), or None when none are
+            # known — never 0, which a consumer would read as "this window had no
+            # sessions" when the truth is that the records could not say. Per-WINDOW by
+            # construction: rotation (`stats.jsonl` -> `.1`) and `--since` can each split a
+            # session, so this counts sessions SEEN here, not sessions that ran.
+            "sessions": len(session_ids) or None,
             # Costliest rule first: tokens the model spent fetching dropped values back.
             "retrieves": [{"server": s, "tool": t, "path": p, **row}
                           for (s, t, p), row in sorted(
@@ -504,8 +564,15 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
             lines += build_primer_section(liability)
         return "\n".join(lines) + "\n"
     tok_raw, tok_out = total["raw_tokens"], total["out_tokens"]
-    lines.append(f"blocks: {total['blocks']}   "
-                 f"decisions: " + ", ".join(f"{k}={v}" for k, v in sorted(decisions.items())))
+    # `sessions` leads the headline when it is knowable (#311): blocks answer "how much
+    # traffic", sessions answer "across how many runs" — and the second is the denominator
+    # every per-session figure below used to have to guess at. Omitted rather than shown as
+    # 0 or "?" when any record predates the field: an absent count reads as "not stated",
+    # a printed one reads as measured.
+    sess = agg.get("sessions") if not (total.get("unsessioned") or 0) else None
+    lines.append((f"sessions: {sess}   " if sess else "")
+                 + f"blocks: {total['blocks']}   "
+                 + "decisions: " + ", ".join(f"{k}={v}" for k, v in sorted(decisions.items())))
     diff_reasons = agg.get("diff_reasons") or {}
     if diff_reasons:
         # Phase 1: the diff hit-rate breakdown. `no_prior` = tool never re-called;
@@ -1295,6 +1362,8 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
     unresolved = sum(1 for s in servers if s["primer_tokens"] is None)
     total = agg.get("total") or {}
     saved = (total.get("raw_tokens") or 0) - (total.get("out_tokens") or 0)
+    # Usable only when nothing in the window is unmarked — see `sessions` in the return.
+    sessions = agg.get("sessions") if not (total.get("unsessioned") or 0) else None
     return {
         "servers": servers,
         # REDEFINED by the #211 follow-up: recurring (eager-priming) entries only. It used
@@ -1335,6 +1404,17 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # direction — if even the best case does not clear 1.0, the install is genuinely
         # net negative and no session count can rescue it.
         "session_covered": (saved / once) if once else None,
+        # The K the bound above could not see (#311). None — never a number — unless EVERY
+        # record in the window carries a session id: with any unmarked record the distinct
+        # count is a FLOOR, and dividing by a floor would publish an upper bound wearing a
+        # measurement's name, which is the exact substitution this field exists to end.
+        "sessions": sessions,
+        # The measurement `session_covered` was a ceiling for. Each of K sessions paid the
+        # one-time charge again, so the real denominator is `once * K`. Present only
+        # alongside a known K; the bound stays published either way, so a consumer that
+        # already reads it keeps working and can tighten when this is non-None.
+        "session_covered_measured": ((saved / (once * sessions))
+                                     if once and sessions else None),
     }
 
 
@@ -1423,7 +1503,15 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         # real cost is 555*turns + 555 and the install is deeply negative. Said once, below,
         # rather than hedged into both sentences.
         covered = liab["session_covered"]
-        if covered >= 1:
+        exact, k = liab.get("session_covered_measured"), liab.get("sessions")
+        if exact is not None and k:
+            # The bound's own caveat, now answered (#311): K is measured, so say the real
+            # number instead of the ceiling and the hedge. The ceiling stays in `--json`.
+            lines.append(f"  the same {saved:,} tok covers the {once:,} tok one-time charge "
+                         f"~{exact:,.1f}x across the")
+            lines.append(f"  {k} session(s) measured in this window — each paid it again "
+                         f"(ceiling if it were one session: ~{covered:,.0f}x).")
+        elif covered >= 1:
             lines.append(f"  the same {saved:,} tok covers the {once:,} tok one-time charge "
                          f"at most ~{covered:,.0f}x — fewer if this")
             lines.append("  window spans more than one session, which it usually does; "
