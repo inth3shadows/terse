@@ -484,19 +484,42 @@ by the next patch (PyPI versions cannot be re-uploaded).
   not all clients surface `instructions`; the inline self-describing forms remain the
   fallback. This was the main open question for proxy *usefulness* (correctness is
   covered by the round-trip tests).
-  **Measured (`terse fluency`):** over a synthetic stress corpus that maximizes the
-  riskiest transforms, Claude Haiku 4.5 and Gemini 2.5 Flash answered terse-form
-  questions within tolerance of raw JSON (96–100% paired) at a ~38% token saving;
-  DeepSeek matched raw within the 5% tolerance. The decisive lever is the `~N`
+  **Measured (`terse fluency`):** the "Claude Haiku 4.5" figure previously quoted here
+  (96–100% paired, ~38% token saving, jointly attributed alongside Gemini 2.5 Flash and
+  a DeepSeek alias-resolution figure of 83% bare / 100% with primer) predates the fix
+  (#249, 2026-08-19) that let this harness reach real Anthropic models at all — the
+  gateway's `claude-sonnet-5`/`claude-fable-5`/`claude-haiku-4-*` ids were DeepSeek
+  aliases. Those figures were panel-level, not cleanly separable by model, and the panel
+  included the mislabeled Haiku entry — treat the whole paragraph as unconfirmed legacy
+  data, not as individually reattributable to Gemini or DeepSeek, and not as flatly
+  wrong either (a `cli:`-backend result, or an id that never carried a `claude-*` alias,
+  such as a direct Gemini/DeepSeek route, is unaffected by this specific bug). The ~38%
+  token saving is deterministic tokenizer arithmetic and still holds regardless.
+  **Real measurement, via `claude -p` OAuth,
+  on the stress corpus (`--trials 1` throughout):** Opus 5 shows 0 regressions with or
+  without the primer; Haiku 4.5 shows a real 8-point gap without the primer (92% vs.
+  100% raw); Sonnet 5 shows a smaller gap (96% -> 100%). Opus and Sonnet are both
+  single-trial reads and unconfirmed — a later same-day deepening pass on the same
+  issue re-ran four *other* (substitute, non-Anthropic) models at `--trials 3-5` and
+  found three of four flipped conclusion under more trials, including one where the
+  primer measurably *hurt* a smaller substitute model. Only Haiku, among the named
+  models, was re-run at `--trials 3`, and it held (92% -> 99%, closed to within noise
+  by the primer) — the one figure here that is independently replicated.
+  The decisive lever is the `~N`
   dictionary alias — especially the whole-subtree variant where `~N` expands to an
-  entire OBJECT (the `deref` question probes this). Alias-resolution accuracy is 83%
-  bare but **100% with the one-time primer**, and the primer recovered every DeepSeek
-  regression. Takeaway: alias-heavy payloads (including subtree aliasing) are safe in
-  the proxy *with the primer system note*; without it a weaker model can regress past
-  tolerance. Verdict gates on the worst model, not the mean. Run-to-run noise at
+  entire OBJECT (the `deref` question probes this). Takeaway: the primer's benefit is
+  real but **model-dependent**, not universal, so "always inject the
+  primer" is not the correct blanket policy — nor, on this evidence, is "never inject
+  it." Verdict gates on the worst model, not the
+  mean. See #249 for the full panel, the replication story, and its still-open
+  real-payload-corpus precondition.
+  Run-to-run noise at
   temperature 0 is no longer eyeballed: `terse fluency --trials N` repeats each question
-  N times and reports accuracy with a pooled binomial confidence interval, so the
-  verdict is a bound, not a direction. (Parametric SE over N×Q×P Bernoulli draws is
+  N times and reports accuracy with a pooled binomial confidence interval — though #295
+  (open) found that bound collapses to `±0` at `--trials 1` regardless of true accuracy,
+  which is exactly the failure mode #249's deepening pass demonstrated three times above;
+  read a low-trial interval as directional at best, not as the tight bound this sentence
+  used to promise unconditionally. (Parametric SE over N×Q×P Bernoulli draws is
   used rather than the std of N whole-eval runs, which is itself noise at small N.)
 - **Proxy transport and fan-out (#5).** A `terse proxy` downstream is either a stdio
   command or an MCP Streamable-HTTP `url` (`transport.py`'s `Transport` abstraction —
@@ -525,7 +548,10 @@ by the next patch (PyPI versions cannot be re-uploaded).
   grounds (above), not on a fidelity finding:
   (1) the round-trip gate proves the diff reconstructs but **not** that a model *reads*
   it as well as the full form — since PASSED by `terse fluency --diff` (4-model panel,
-  incl. the nested-record surface, #72) and at chain depth by `fluency --diff-soak`
+  incl. the nested-record surface, #72 — per the 0.26.0 changelog entry (#249), this
+  panel's gateway ids are confirmed DeepSeek aliases, so it was two DeepSeek models
+  measured twice under Anthropic names, not four; the PASS itself is unaffected by
+  which name each run carried) and at chain depth by `fluency --diff-soak`
   (#75); (2) the diff references the prior result in the model's context, which a
   context compaction could evict. Risk (2) is bounded by **keyframes**: the proxy
   forces a self-contained full result after every K consecutive diffs per tool, so a
