@@ -891,6 +891,13 @@ def _looks_like_terse_launcher(entry: dict) -> bool:
     return isinstance(args, list) and "terse" in args
 
 
+# A router row's `wraps` is its comma-joined peer NAMES; this is what goes there when the
+# peers file is empty. Named rather than inlined because `terse stats` has to recognise it:
+# reading it as a peer name gave a peerless router a ledger label of "(no peers)" (#285
+# review).
+NO_PEERS = "(no peers)"
+
+
 def parse_proxy_opts(entry: dict) -> dict[str, str] | None:
     """The terse proxy options baked into a wrapped MCP server `entry`'s args —
     `{'policy','capture_dir','server_name'}` for whichever keys are present — or None
@@ -898,7 +905,14 @@ def parse_proxy_opts(entry: dict) -> dict[str, str] | None:
 
     Only the segment BETWEEN the `proxy` subcommand and the first `--` (the downstream
     boundary `wrap` writes) is scanned, so a value on the DOWNSTREAM side that happens to
-    equal `--policy` (e.g. the wrapped server's own flag) is never misread as terse's."""
+    equal `--policy` (e.g. the wrapped server's own flag) is never misread as terse's.
+
+    BOTH argparse spellings are recognised, `--flag value` and `--flag=value`. `wrap`
+    only ever writes the two-token form, so the `=` form means a HAND-EDITED entry — which
+    is the one population this has to read correctly, since every caller uses it to detect
+    what a hand-edit did. Missing it made `--server-name=kb` invisible to `mcp-status` and
+    to `terse stats`' break-even, reproducing #285's silent under-report on an entry that
+    had baked the very flag that fixes it."""
     if not _looks_like_terse_launcher(entry):
         return None
     args = entry.get("args")
@@ -918,12 +932,18 @@ def parse_proxy_opts(entry: dict) -> dict[str, str] | None:
     opts: dict[str, str] = {}
     i = 0
     while i < len(seg):
-        key = flag_map.get(seg[i]) if isinstance(seg[i], str) else None
+        tok = seg[i] if isinstance(seg[i], str) else ""
+        key = flag_map.get(tok)
         if key is not None and i + 1 < len(seg) and isinstance(seg[i + 1], str):
             opts[key] = seg[i + 1]
             i += 2
-        else:
-            i += 1
+            continue
+        # `--flag=value`. Split once only: a policy path or server name may itself contain
+        # `=`, and everything after the FIRST one is the value argparse would have taken.
+        flag, sep, value = tok.partition("=")
+        if sep and (key := flag_map.get(flag)) is not None:
+            opts[key] = value
+        i += 1
     return opts
 
 
@@ -1534,7 +1554,7 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
         if state in ("router", "router-ambiguous"):
             # A router has no `--` downstream and no single `--policy`: what it fronts is
             # the peers file's list, and each peer carries its own policy there.
-            wraps = ", ".join(sorted(folded)) or "(no peers)"
+            wraps = ", ".join(sorted(folded)) or NO_PEERS
             policy_missing = bool(policy and os.path.isabs(policy)
                                   and not os.path.exists(policy))
         rows.append({"scope": scope, "server": name, "state": state, "policy": policy,

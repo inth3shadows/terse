@@ -1139,6 +1139,31 @@ def test_parse_proxy_opts_reads_policy_capture_and_server_between_proxy_and_sep(
         "policy": "/p/pol.json", "server_name": "runecho", "capture_dir": "/c/corpus"}
 
 
+def test_parse_proxy_opts_reads_the_EQUALS_spelling_too():
+    """`--server-name` is a plain argparse optional, so `--server-name=kb` is accepted by
+    the proxy and written to the ledger as `kb`. `wrap` only ever emits the two-token form,
+    so the `=` spelling means a HAND-EDITED entry — exactly the population every caller uses
+    this to inspect. Missing it made the flag invisible to `mcp-status` and to `terse stats`'
+    break-even, which then guessed `foo-server` from the command and reported an entry with
+    200 blocks as `never called` — #285's under-report, on an entry that had already baked
+    the flag that fixes it.
+
+    A value containing `=` survives: argparse splits on the FIRST one only."""
+    entry = {"command": "/home/u/.local/bin/terse",
+             "args": ["proxy", "--server-name=kb", "--policy=/p/a=b.json",
+                      "--capture-dir=/c/corpus", "--", "/opt/bin/foo-server", "--stdio"]}
+    assert im.parse_proxy_opts(entry) == {
+        "server_name": "kb", "policy": "/p/a=b.json", "capture_dir": "/c/corpus"}
+
+
+def test_parse_proxy_opts_ignores_a_DOWNSTREAM_equals_flag():
+    """The `=` spelling must respect the same `--` boundary the two-token form does."""
+    entry = {"command": "/home/u/.local/bin/terse",
+             "args": ["proxy", "--", "some-server", "--policy=/downstream.json",
+                      "--server-name=not-terses"]}
+    assert im.parse_proxy_opts(entry) == {}
+
+
 def test_parse_proxy_opts_recognizes_console_script_launcher():
     entry = {"command": "/home/u/.local/bin/terse",
              "args": ["proxy", "--policy", "/p.json", "--server-name", "kb", "--", "sb-run"]}

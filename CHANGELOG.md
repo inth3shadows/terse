@@ -13,7 +13,47 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **`terse stats` billed a wrapped server's break-even against another server's ledger
+  rows** (`#285`). The per-server break-even table derived each standalone entry's ledger
+  label from its downstream *command*, ignoring `--server-name` — the one flag that
+  overrides what the proxy writes to `server`. Both failure directions were live in a real
+  fleet and neither was distinguishable from a measurement: `searxng-mcp`
+  (`.venv/bin/python -m searxng_mcp` → label `python`) was billed against unrelated `python`
+  rows, manufacturing a cleared verdict out of another server's 3,390 saved tokens, while
+  `secret-broker` (`… python3 …` → label `python3`) matched nothing and was published as
+  `never called` in the same report whose per-tool table showed its 21 blocks at 59.6%. The
+  existing guards could not catch either: their vocabulary (`no ledger label`, `never
+  called`, `no token data`) all describes a *missing* label, and `python` is a real label
+  with real rows. Break-even now reads the scan's `ledger_identity` —
+  `resolve_ledger_identity`, the same rule `proxy.py`'s write path uses — whenever
+  `--server-name` was explicit. Where two installed entries bake no flag and *guess* the
+  same launcher basename (`python`, `python3.12`, `node`, `npx`, `uv`, …), that label's rows
+  belong to both and to neither, so it now reports a new `ambiguous ledger label` verdict —
+  distinct from `no ledger label`, which is documented as "matched no ledger rows" — naming
+  the entries and the `--server-name` fix. A *lone* launcher wrap owns its rows outright and
+  keeps its measurement.
+- **`parse_proxy_opts` did not recognise `--flag=value`** (`#285`). `--server-name` is a
+  plain argparse optional, so `--server-name=kb` is accepted by the proxy and written to the
+  ledger as `kb`, but the config scan saw only the two-token form `wrap` emits. A
+  hand-edited entry using the `=` spelling was therefore invisible to both `terse mcp-status`
+  and break-even, reproducing the same silent `never called` on an entry that had already
+  baked the flag that fixes it. Both spellings are now read, for `--policy` and
+  `--capture-dir` too; a value containing `=` survives (split on the first one only).
+- **A peerless multiproxy router was billed a primer for a phantom peer** (`#285` review).
+  `scan_scopes` writes the literal `(no peers)` into a router row's `wraps` when its peers
+  file is empty; break-even read that sentinel as a peer NAME, so the router published it as
+  a ledger label and — worse — sized its union primer against it, charging a real per-turn
+  cost into the headline `recurring tok/turn` figure for instructions it cannot emit. A
+  peerless router now reports a known zero on both sides.
+- **History stranded by baking `--server-name` is now reported** (`#285` review). The ledger
+  records the identity in force at write time, so adding the flag to an entry that had been
+  guessing renames the server from that moment and silently splits its history. The earlier
+  label is surfaced per-server as `superseded_labels` (and named in the report) rather than
+  merged: merging would be the guessing this release removed, and two labels can equally be
+  two servers. Suppressed for launcher basenames, where "these rows are probably yours"
+  cannot be said.
 
 ## [0.27.0] - 2026-08-19
 
