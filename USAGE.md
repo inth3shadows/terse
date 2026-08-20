@@ -550,7 +550,8 @@ This is **lossy and opt-in** — the same bar as any drop:
   instead of answering from the surrounding prose.
 
 **That behavioral question is now measured, not assumed.** 30 captured `codegraph_explore`
-payloads, 5 models over an OpenAI-compatible gateway:
+payloads, 5 models (see caveat below) over an OpenAI-compatible gateway, table dated
+2026-07-23:
 
 | model | called retrieve when needed | asked for the right block | left it alone when not needed | answered correctly |
 |---|--:|--:|--:|--:|
@@ -566,6 +567,20 @@ a comprehension check on the *retrieved* content and is deliberately un-guessabl
 lower than the retrieve columns because the model has to read the fetched source, not
 because it failed to fetch it. Reproduce with
 `terse fluency --drop-eval --corpus <dir> --policy <file> --base-url ... --models ...`.
+
+**Caveat added 2026-08-19 (#249), corrected same day after review:** on this project's own
+eval gateway, `claude-sonnet-5` is a confirmed DeepSeek alias, not real Anthropic — the
+same routing this table's `deepseek-v4-pro` row already names honestly (`answerers.py` and
+the 0.26.0 changelog entry both state this outright, not as a hedge). The two rows' numbers
+are *not* identical (97% vs. 100% on the last column) — do **not** read that as evidence
+they're different backends: #249's own stress-panel data shows two confirmed-identical
+DeepSeek aliases producing non-identical numbers on the same corpus (a documented
+run-to-run noise floor, #295), so a numeric mismatch here is the *expected* outcome for a
+duplicate, not counter-evidence against one. The genuinely open question is dating, not
+identity: this table predates #249's alias discovery by nearly a month (git blame:
+2026-07-23), and the gateway's alias config isn't version-controlled, so whether the
+aliasing was already in effect when this table was measured can't be checked from this
+repo. Treat "5 models" as unconfirmed on that basis, most likely 4.
 
 **State the downside too.** 87% is a *gross* number: a retrieve returns the span in full,
 so the conversation then holds both the stub and the original. Best case, the model never
