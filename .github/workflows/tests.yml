@@ -44,3 +44,42 @@ jobs:
       # baseline would be an arbitrary gate that fails on unrelated PRs. Printing it every
       # run is what makes the number visible enough to set an honest floor later.
       - run: uv run pytest -q --cov --cov-report=term-missing
+  docker:
+    # The image is a DOCUMENTED user path (`docker run -i --rm terse uvx some-mcp-server`,
+    # see the Dockerfile header and USAGE.md) that nothing verified: it was added in #194
+    # on 2026-07-30 and sat unbuilt for three weeks. It is NOT covered by the Glama
+    # registry either — Glama builds a spec it generates itself and ignores this file — so
+    # this job is the only thing standing between the Dockerfile and silent rot.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0        # hatch-vcs derives the version from git history + tags
+      - run: docker build -t terse:ci .
+      # Build-only would pass on an image that starts and compresses NOTHING. So drive a
+      # real MCP stdio session and assert on the codec output. The trailing `sleep` holds
+      # stdin open long enough for the last response: the container exits on EOF, and
+      # without it the proxy is killed mid-reply.
+      - name: smoke test the image over MCP stdio
+        run: |
+          set -euo pipefail
+          {
+            echo '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"1.0"}}}'
+            echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+            echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+            echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"demo_orders","arguments":{"limit":40}}}'
+            sleep 5
+          } | docker run -i --rm terse:ci > smoke.out
+          cat smoke.out
+          # Three responses, in order: initialize, tools/list, the compressed tools/call.
+          # Match on "id" loosely — terse re-serializes compactly (`"id":2`) while the
+          # downstream demo server emits `"id": 2`, so a spaced pattern silently misses.
+          test "$(wc -l < smoke.out)" -eq 3 \
+            || { echo "::error::expected 3 JSON-RPC responses, got $(wc -l < smoke.out)"; exit 1; }
+          grep -q '"serverInfo"' smoke.out \
+            || { echo "::error::no initialize result — the proxy never came up"; exit 1; }
+          grep -q '"demo_orders"' smoke.out \
+            || { echo "::error::tools/list did not reach through the proxy"; exit 1; }
+          # The actual product claim: the 40-record order book came back table-encoded.
+          grep -q '__terse_table__' smoke.out \
+            || { echo "::error::result was NOT compressed — the codec did not fire"; exit 1; }
