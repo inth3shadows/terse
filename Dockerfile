@@ -3,9 +3,17 @@
 # terse has NO tools of its own — it rewrites another server's `tools/call` results in
 # place. So the image bundles a small stdlib-only downstream (examples/demo_mcp_server.py)
 # as the default CMD, which is what makes the container answer `tools/list` at all instead
-# of looking broken to a registry inspector. Calling `demo_orders` returns the compressed
-# form of a 40-record order book (9019 -> 3187 chars on the local run, -65%), so the demo
+# of looking broken when it is run bare. Calling `demo_orders` returns the compressed form
+# of a 40-record order book (9019 -> 3187 chars on the local run, -65%), so the demo
 # demonstrates the actual product rather than just proving the image starts.
+#
+# This image is NOT what the Glama registry builds, despite #194's commit message saying it
+# was added "so the Glama listing builds". Glama generates its own spec (debian:trixie-slim,
+# `uv sync`, wrapped in mcp-proxy) and ignores this file; `glama.json`'s schema admits
+# exactly one key, `maintainers`, so there is no way to point the registry at a Dockerfile.
+# What this file IS for is the documented `docker run` path below -- and the `docker` job in
+# .github/workflows/tests.yml is the only thing keeping it from rotting unnoticed, which it
+# did for three weeks after #194. Verified 2026-08-20.
 #
 # Point it at a real server to use the image for work — CMD is the downstream command:
 #   docker run -i --rm terse uvx some-mcp-server
