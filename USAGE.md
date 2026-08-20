@@ -567,6 +567,14 @@ lower than the retrieve columns because the model has to read the fetched source
 because it failed to fetch it. Reproduce with
 `terse fluency --drop-eval --corpus <dir> --policy <file> --base-url ... --models ...`.
 
+**Caveat added 2026-08-19 (#249):** on this project's own eval gateway, `claude-sonnet-5`
+is a DeepSeek alias, not real Anthropic — the same routing this table's `deepseek-v4-pro`
+row already names honestly. Unverified here whether this specific 5-row table predates
+that aliasing or the two rows really are two different backends despite the shared route
+(their numbers aren't identical, which cuts against a simple duplicate); either way, treat
+"5 models" as unconfirmed and don't cite this table as proof of a 5-way comparison without
+re-checking which backend each row actually hit.
+
 **State the downside too.** 87% is a *gross* number: a retrieve returns the span in full,
 so the conversation then holds both the stub and the original. Best case, the model never
 retrieves and you keep the full saving; worst case it retrieves every block and you are

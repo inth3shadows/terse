@@ -231,6 +231,16 @@ classifier surfacing this trade-off at wrap time — #168 (per-server primer
 gating) and #172 (mcp-status stash-membership classification) are both closed;
 nothing currently open covers either follow-up.
 
+**This entire doc assumes the primer is paid, only asking whether it's worth
+paying.** #249 (open as of 2026-08-19) is testing a prior question — whether a
+capable model needs the primer at all to read terse's wire form. Early results
+are model-dependent (helps some, hurts one measured so far, no effect on the
+strongest tested), not a clean "drop it" — so no number on this page should be
+treated as obsolete yet. If #249 lands on a `--primer=auto|never` default, the
+248/312/555 arithmetic above becomes a legacy-mode footnote for whichever models
+still need it, not the universal cost model it is today. Revisit this doc once
+that issue closes.
+
 ## Related
 
 - [README.md](../README.md) — "Does terse help my server?" quick heuristic table
