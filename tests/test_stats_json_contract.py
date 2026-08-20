@@ -40,6 +40,10 @@ from terse.stats import append_stats
 # retrieve was recorded — so a consumer can read it unconditionally rather than branching on
 # whether this build has the key.
 TOP_LEVEL = {"total", "decisions", "diff_reasons", "tools", "versions", "retrieves",
+             # #311: primers ACTUALLY emitted this window, by label and cadence. Empty on
+             # every ledger written before it shipped, and a consumer must read empty as
+             # "this ledger cannot say", never as "no primer was sent".
+             "primers",
              "primer_liability"}
 
 TOTAL = {"blocks", "raw_chars", "out_chars", "raw_tokens", "out_tokens",
@@ -61,6 +65,11 @@ VERSION_ROW = {"blocks", "tokenized", "raw_tokens", "out_tokens"}
 RETRIEVE_ROW = {"server", "tool", "path", "calls", "hits", "misses", "bytes", "tokens",
                 "untokenized"}
 
+# #311. `emissions` is the load-bearing one and the likeliest to be dropped by someone
+# tidying `aggregate`: `primer_liability` divides `tokens` by it to recover the PER-SESSION
+# primer, so losing it silently restores the window-sum over-bill this row exists to fix.
+PRIMER_ROW = {"server", "cadence", "emissions", "bytes", "tokens", "untokenized"}
+
 LIABILITY = {"servers", "per_turn_tokens", "session_once_tokens", "unresolved",
              "idle", "free", "uncertain", "saved_tokens", "turns_covered",
              "session_covered"}
@@ -76,7 +85,13 @@ LIABILITY_SERVER = {"server", "scope", "state", "primer_tokens", "ledger_labels"
                     # #285 review: ledger labels this entry almost certainly wrote under
                     # BEFORE `--server-name` was baked in, reported so the split history is
                     # visible and never summed into any rate above it.
-                    "superseded_labels"}
+                    "superseded_labels",
+                    # #311: where `primer_tokens` came from. "recorded" = the proxy wrote
+                    # down an emission this window; "estimated" = sized from the installed
+                    # policy and INFERRED to have been paid, which is the pre-#311
+                    # behaviour and the defect #286 reported. Published so a consumer never
+                    # has to guess which of its numbers is a measurement.
+                    "primer_source"}
 
 # Deliberately verdict-INCAPABLE (#238): no `primer_tokens`, no `blocks_to_break_even`, no
 # `break_even_verdict`, no `verdict`. A peer has no primer to divide by -- the router pays one
@@ -98,6 +113,12 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "ledger_labels": (list,), "tokenized_blocks": (int, type(None)),
     "superseded_labels": (list,),
     "cadence": (str,), "saved_per_block": (float, int, type(None)),
+    # #311: always one of exactly two strings, never null -- there is always an answer to
+    # "where did this number come from", even when the answer is "we inferred it".
+    "primer_source": (str,),
+    # #311 primer rows: emissions/bytes/tokens are counts, `untokenized` is the
+    # None-is-not-zero escape hatch every other record already has.
+    "emissions": (int,),
     "blocks_to_break_even": (float, int, type(None)),
     "break_even_verdict": (str, type(None)),
     "per_turn_tokens": (int,), "session_once_tokens": (int,), "unresolved": (int,),
@@ -190,8 +211,8 @@ def test_every_named_field_also_has_a_pinned_type():
     person to add a field only has to touch the NAME manifest to go green and the type
     promise silently stops applying to it (found in review — the same
     tolerates-growth-silently failure this module's own docstring warns about)."""
-    named = (TOTAL | TOOL_ROW | VERSION_ROW | RETRIEVE_ROW | LIABILITY | LIABILITY_SERVER
-             | LIABILITY_CONTRIBUTOR)
+    named = (TOTAL | TOOL_ROW | VERSION_ROW | RETRIEVE_ROW | PRIMER_ROW | LIABILITY
+             | LIABILITY_SERVER | LIABILITY_CONTRIBUTOR)
     assert not named - set(TYPES), (
         f"no type pinned for: {sorted(named - set(TYPES))}. {_ADD_ON_PURPOSE}")
 
@@ -223,6 +244,22 @@ def test_the_total_and_tool_rows_are_exactly_these_keys(stats_json):
         assert set(row) == TOOL_ROW, _ADD_ON_PURPOSE
         _check_types("tools[]", row)
     _check_types("total", out["total"])
+
+
+def test_the_primer_rows_are_exactly_these_keys(stats_json):
+    """The primer-emission row (#311), published to `--json` and described in the CHANGELOG
+    as a contract addition — so it needs the same pinning every other published shape has.
+    It shipped with `primers` in TOP_LEVEL but no row manifest and no type check, which
+    `test_every_named_field_also_has_a_pinned_type` cannot catch: that test only checks
+    named-minus-TYPES, so a field in TYPES with no manifest entry goes green silently."""
+    from terse.stats import PRIMER_CADENCE_ONCE, build_primer_record
+    out = stats_json([_rec(),
+                      build_primer_record("kb", cadence=PRIMER_CADENCE_ONCE,
+                                          primer="p" * 200)])
+    assert out["primers"], "a primer record must produce a primer row"
+    for row in out["primers"]:
+        assert set(row) == PRIMER_ROW, _ADD_ON_PURPOSE
+        _check_types("primers[]", row)
 
 
 def test_the_retrieve_rows_are_exactly_these_keys(stats_json):

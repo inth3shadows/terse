@@ -13,7 +13,34 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **The primer charge is measured where it can be, instead of always inferred**
+  (`#311`, `#286`). `terse stats` sized every wrapped server's primer from its installed
+  policy and then billed it to anyone the ledger showed had been *called*. For a server
+  whose results always carry `structuredContent`, the lazy attach never fires — so it
+  paid nothing and was billed anyway. `#286` caught this in production: `searxng-mcp`
+  charged 312 tok/session for a primer it is structurally incapable of sending, which
+  made a free wrap look marginal.
+
+  The proxy now writes a ledger row at the moment it attaches a lazy primer, so the cost
+  is recorded rather than reconstructed. Servers with a recorded row report the measured
+  figure; the rest keep the old estimate and are **labelled as estimates** rather than
+  blended in. Deliberately no session id, epoch id, or cross-process correlation — that
+  design was tried and rejected in `#312`.
+
+  Reading absence of a row as proof of non-payment still needs a ledger-version floor
+  (an old ledger has no primer rows either), so `#286`'s phantom bill is corrected only
+  once the server has attached at least one primer in the window. Tracked on `#311`.
+
+### Added
+
+- **`terse stats --json`: two additions** (`#311`). Top-level `primers` lists primers
+  actually emitted this window, by label and cadence — **empty means "this ledger cannot
+  say", never "no primer was sent"**. Per-server `primer_source` is `"recorded"` or
+  `"estimated"`, so a consumer never has to guess which of its numbers is a measurement.
+  Both additive; the eager `initialize` sites are deliberately not recorded, since they
+  emit unconditionally and inference there is already exact.
 
 ## [0.28.0] - 2026-08-19
 

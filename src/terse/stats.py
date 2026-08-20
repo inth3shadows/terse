@@ -207,6 +207,58 @@ def build_record(server: str, tool: str, raw: str, emitted: str,
 
 RETRIEVE_EVENT = "retrieve"
 
+PRIMER_EVENT = "primer"
+
+# The two primer cadences, public because the WRITE sites (proxy, multiproxy) have to name
+# one and the read side buckets on it. `_PER_TURN`/`_ONCE` below are aliases, not copies:
+# the report has always spelled these strings and a second literal would be a silent
+# divergence waiting to happen the first time one side is reworded.
+PRIMER_CADENCE_PER_TURN = "per-turn"
+PRIMER_CADENCE_ONCE = "once/session"
+
+
+def build_primer_record(server: str, *, cadence: str, primer: str) -> dict[str, Any]:
+    """One ledger line for a primer that was ACTUALLY emitted (#311, #286).
+
+    `primer_liability` sizes the primer from the INSTALLED policy and then uses the ledger
+    only to decide who was called. Its own docstring concedes what that cannot see: a
+    session whose every compressible result also carried `structuredContent` never reaches
+    the lazy attach (`proxy.py`'s guard), so the server was called, paid nothing, and was
+    billed anyway. #286 is that bill observed in the wild -- `searxng-mcp` charged 312
+    tok/session for a primer it is structurally incapable of sending.
+
+    No read-side cleverness can recover this, because the fact is only known at the attach
+    site. So the attach site records it. That is the whole design, and it is deliberately
+    less than #312 attempted: no session id, no epoch id, no cross-process correlation.
+    A record here says "this text went out, once, now" and nothing more.
+
+    `cadence` is `_ONCE` or `_PER_TURN` -- stored rather than re-derived, because which one
+    applies is a property of the SITE that emitted it (a lazy attach is once per session, an
+    `initialize` injection is re-read every turn) and the reader cannot recover the site.
+    The two are different units and must never be summed; storing the label is what keeps a
+    consumer from having to guess.
+
+    Payload-free like every other record: the primer is measured and discarded. It is
+    policy-derived text the operator's own configuration produced, never tool output.
+
+    Deliberately carries NO `raw_chars`/`out_chars`. `aggregate` skips any row lacking both
+    ("not a ledger record"), so a primer can never be counted as a compressed block or fold
+    its bytes into the published savings percentage. That skip is load-bearing, not
+    incidental -- see `test_a_primer_record_never_enters_the_savings_total`.
+    """
+    return {
+        "ts": int(time.time()),
+        "version": _ledger_version(),
+        "server": server,
+        "event": PRIMER_EVENT,
+        # Which cadence this site pays on. NOT a total: `_PER_TURN` rows are billed again
+        # every turn by the client re-reading `instructions`, `_ONCE` rows are not.
+        "cadence": cadence,
+        "bytes": len(primer),
+        # None (not 0) without tiktoken, matching `build_record`: unknown is not zero.
+        "tokens": count_cl100k(primer),
+    }
+
 
 def build_retrieve_record(server: str, tool: str, path: str, *,
                           hit: bool, payload: str = "") -> dict[str, Any]:
@@ -356,7 +408,30 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     # — a retrieve is not a compressed block, and adding it to a tool's `blocks` would
     # make the same call show up twice in the saving denominator.
     retrieves: dict[tuple[str, str, str], dict[str, int]] = {}
+    # Primer-emission rows (#311): a primer that was ACTUALLY sent, keyed by the ledger
+    # label that sent it. Its own map for the same reason `retrieves` has one -- a primer
+    # is not a compressed block, and it must never reach the saving denominator. Keyed by
+    # (server, cadence) because the two cadences are different units and summing them is
+    # the exact error `primer_liability` splits its report to avoid.
+    primers: dict[tuple[str, str], dict[str, int]] = {}
     for rec in records:
+        if rec.get("event") == PRIMER_EVENT:
+            psrv = str(rec.get("server", "unknown"))
+            pkey = (psrv, str(rec.get("cadence", "unknown")))
+            prow = primers.setdefault(pkey, {"emissions": 0, "tokens": 0,
+                                             "bytes": 0, "untokenized": 0})
+            prow["emissions"] += 1
+            pb = rec.get("bytes")
+            if isinstance(pb, int):
+                prow["bytes"] += pb
+            pt = rec.get("tokens")
+            # None-is-not-zero, same as every other record: a ledger written without
+            # tiktoken knows the primer went out but not what it cost.
+            if isinstance(pt, int):
+                prow["tokens"] += pt
+            else:
+                prow["untokenized"] += 1
+            continue
         if rec.get("event") == RETRIEVE_EVENT:
             rsrv = str(rec.get("server", "unknown"))
             rkey = (rsrv, canonical_tool(rsrv, str(rec.get("tool", "unknown"))),
@@ -457,6 +532,11 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             total["untokenized"] += 1
     return {"total": total, "decisions": decisions, "diff_reasons": diff_reasons,
             "versions": versions,
+            # Primers actually emitted this window, by label and cadence (#311). Empty on
+            # every ledger written before this shipped -- readers MUST treat empty as "this
+            # ledger cannot say", not as "no primer was sent".
+            "primers": [{"server": s, "cadence": c, **row}
+                        for (s, c), row in sorted(primers.items())],
             # Costliest rule first: tokens the model spent fetching dropped values back.
             "retrieves": [{"server": s, "tool": t, "path": p, **row}
                           for (s, t, p), row in sorted(
@@ -826,8 +906,8 @@ def _wrapped_labels(row: dict[str, Any], wraps: str, ambiguous: set[str]) -> lis
 
 # Per-server cadence labels. The whole point of splitting them is that `tok/turn` and
 # `tok/session` are different units and summing them was the defect (#211 follow-up).
-_PER_TURN = "per-turn"
-_ONCE = "once/session"
+_PER_TURN = PRIMER_CADENCE_PER_TURN
+_ONCE = PRIMER_CADENCE_ONCE
 _ONCE_FREE = "once/session (unpaid)"
 _ONCE_UNKNOWN = "once/session (?)"
 
@@ -883,7 +963,8 @@ def _cadences_of(servers: list[dict[str, Any]]) -> set[str]:
     return {s.get("cadence") or _PER_TURN for s in servers}
 
 
-def _cadence(state: str | None, blocks: int | None, encoded: int | None) -> str:
+def _cadence(state: str | None, blocks: int | None, encoded: int | None,
+             recorded: bool = False) -> str:
     """How often this entry actually pays its primer, post-#211.
 
     `blocks` is the ledger's answer to "was it called", and its three-way None/0/N is load
@@ -917,6 +998,16 @@ def _cadence(state: str | None, blocks: int | None, encoded: int | None) -> str:
     direction the module argues is the safe one."""
     if state in _PRIMES_EAGERLY:
         return _PER_TURN
+    # `recorded` ENDS the inference above, and is checked before every other branch (#311
+    # review). Everything this docstring argues is about evidence: `encoded` is "strong
+    # evidence, not a demonstration", `blocks is None` is "we never found the rows to ask".
+    # A recorded emission is neither -- the attach site wrote down that it happened. The
+    # very path this docstring names as still open (a `passthrough` result whose downstream
+    # payload quotes a terse marker attaches the primer while `encoded` stays 0) is exactly
+    # where the two disagree, and the report used to call such a server MEASURED and list it
+    # as "costing nothing at all" in the same breath.
+    if recorded:
+        return _ONCE
     if blocks is None:
         return _ONCE_UNKNOWN
     # `encoded is None` is the hand-rolled/pre-counter agg: fall back to `blocks`, which is
@@ -1181,6 +1272,42 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
     from .policy import default_policy, load_policy
     from .proxy import build_primer, union_primer
 
+    # Primers ACTUALLY emitted this window, by ledger label (#311). Only the once/session
+    # cadence: the eager sites emit unconditionally and are already exact by inference, so
+    # they are not recorded and must not be looked for here.
+    #
+    # TOKENS AND EMISSIONS, not tokens alone. `primer_tokens` is a PER-SESSION charge --
+    # `_break_even` divides by it to get "blocks once per session", the report renders it
+    # "N tok/session" -- while `aggregate` sums a whole window, and a standalone proxy is
+    # one process per session and writes one row per session. Assigning the window sum to a
+    # per-session field over-bills by the session count and flips break-even to NET
+    # NEGATIVE on any multi-session window, which is the normal case (`terse stats` with no
+    # `--since` reads all history). That is the same mis-denomination #312 was closed for,
+    # one layer down, and it made the "measured" figure WORSE than the estimate it replaced
+    # (caught in review before merge; see `test_a_multi_session_window_reports_one_primer`).
+    #
+    # The divisor is TOKENIZED emissions, not `emissions`: `tokens` only accumulates rows
+    # where `count_cl100k` returned an int, so dividing by a count that also includes
+    # untokenized rows would understate the per-session charge in proportion to how much of
+    # the window a tiktoken-less terse wrote.
+    recorded_tokens: dict[str, int] = {}
+    recorded_emissions: dict[str, int] = {}
+    for prow in (agg.get("primers") or []):
+        if prow.get("cadence") != _ONCE:
+            continue
+        plbl = str(prow.get("server", ""))
+        if not plbl:
+            continue
+        tokenized_emissions = (prow.get("emissions") or 0) - (prow.get("untokenized") or 0)
+        if tokenized_emissions <= 0:
+            # Emissions happened but none carries a token count. We know it was PAID and not
+            # what it COST, so there is nothing to measure with -- leave the label out and
+            # let the policy-derived estimate stand, labelled `estimated`. Inventing a size
+            # here, or dividing by an emission count the tokens do not cover, would publish
+            # a fabricated measurement.
+            continue
+        recorded_tokens[plbl] = recorded_tokens.get(plbl, 0) + (prow.get("tokens") or 0)
+        recorded_emissions[plbl] = recorded_emissions.get(plbl, 0) + tokenized_emissions
     by_label: dict[str, int] = {}
     # Savings too, not just call counts (#175): the per-server break-even below divides one
     # by the other, and rolling them up in the same pass keeps them from being taken over
@@ -1252,6 +1379,30 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
                                   else build_primer(pol, name))
         except Exception:  # noqa: BLE001 — an unreadable policy is reported, never raised
             tokens = None
+        # A primer this entry is KNOWN to have sent, because the attach site wrote it down
+        # (#311). Recorded beats inferred whenever it exists: `tokens` above is what the
+        # installed policy WOULD assemble, which is the right size but says nothing about
+        # whether the lazy attach ever fired. #286 is that gap billed as a fact.
+        #
+        # Absence is NOT yet read as evidence of non-payment. A window written by a terse
+        # predating this field has no primer rows at all, and cannot be distinguished here
+        # from one whose attach genuinely never fired -- so an entry with no recorded row
+        # keeps the old inference and is labelled `estimated` rather than silently mixed
+        # in. Closing that last step needs a ledger-version floor; see #311.
+        # The MEAN recorded primer, which is the per-session unit this field is read in --
+        # never the window sum. Summed across labels first so an entry answering to several
+        # labels is one mean over all its emissions, not a mean of means.
+        rec_tok = sum(recorded_tokens.get(lbl, 0) for lbl in labels) if labels else 0
+        rec_em = sum(recorded_emissions.get(lbl, 0) for lbl in labels) if labels else 0
+        # `rec_tok > 0` mirrors the accumulator's `tokenized_emissions <= 0` skip. The
+        # proxy cannot produce emissions totalling zero tokens -- an empty primer sets
+        # `_primer_sent` at construction so the attach never fires -- but a hand-edited or
+        # truncated ledger can, and without this it publishes `primer_tokens: 0` under the
+        # `recorded` label: a claim that we MEASURED a free primer. Unknown must degrade to
+        # the labelled estimate, never to a fabricated zero.
+        measured = rec_em > 0 and rec_tok > 0 and not is_router
+        if measured:
+            tokens = round(rec_tok / rec_em)
         # None, not 0, when no label could be recovered: "unknown" and "never called" are
         # different claims, and only the second one accuses an install of being pure cost.
         blocks = (sum(by_label.get(lbl, 0) for lbl in labels) if labels
@@ -1270,7 +1421,13 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         row_out: dict[str, Any] = {
             "server": name, "scope": row.get("scope"), "state": state,
             "primer_tokens": tokens, "ledger_labels": labels, "blocks": blocks,
-            "tokenized_blocks": tokenized, "cadence": _cadence(state, blocks, encoded),
+            # Where `primer_tokens` came from, published so a --json consumer never has to
+            # guess which of its numbers is a measurement (#311). "recorded" = the proxy
+            # wrote down an emission this window; "estimated" = sized from the installed
+            # policy and inferred to have been paid, the pre-#311 behaviour.
+            "primer_source": "recorded" if measured else "estimated",
+            "tokenized_blocks": tokenized,
+            "cadence": _cadence(state, blocks, encoded, recorded=measured),
             **_break_even(tokens, blocks, tokenized,
                           sum(saved_by_label.get(lbl, 0) for lbl in labels),
                           # Same shape as `no ledger label` — nothing measurable — but a
@@ -1370,6 +1527,13 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     if len(cadences) > 1 and _PER_TURN in cadences:
         lines.append("  the two figures are different units and are deliberately not "
                      "summed.")
+    measured = [s_["server"] for s_ in servers
+                if s_.get("primer_source") == "recorded"]
+    if measured:
+        lines.append(f"  {len(measured)} of {len(servers)} server(s) report a MEASURED "
+                     f"primer (the proxy recorded the")
+        lines.append("             emission); the rest are sized from policy and inferred "
+                     "to have paid.")
     if liab["unresolved"]:
         lines.append(f"  {liab['unresolved']} server(s) have an unreadable policy and are "
                      f"NOT counted — treat both figures as lower bounds.")
@@ -1706,6 +1870,36 @@ def build_stats_writer(stats_log: str | Path, server: str):
                      stats_log)
 
     return stats
+
+
+def build_primer_writer(stats_log: str | Path, server: str):
+    """The proxy-side callback for a primer that actually went out (#311, #286).
+
+    A THIRD writer for the same reason `build_retrieve_writer` is a second one: a primer is
+    not a result, shares none of the result record's size fields, and fires from a different
+    code path -- at most once per session, on the lazy attach. Widening the result writer
+    would put a branch taken at most once on the hot path for every compressed block.
+
+    Wired at exactly ONE site, `run_proxy`, and deliberately NOT alongside the other two in
+    `multiproxy._build_peers` (#311; an earlier draft of this docstring claimed otherwise
+    and was corrected in review). Two independent reasons, either sufficient:
+
+      * Peers run `lazy_primer=False`, so a peer's `_primer_sent` starts True and its lazy
+        attach can never fire. A per-peer writer would be dead code.
+      * The router emits ONE `union_primer` for N peers. Wiring this into the peer loop with
+        `spec.name` would bill N primers for the one the client receives -- the over-count
+        that sank #312's design.
+
+    The router's own union primer is therefore not recorded at all. It does not need to be:
+    it is emitted unconditionally at `initialize`, which is the same predicate
+    `primer_liability` already evaluates from the installed policy, so inference there is
+    exact. Recording it would also require a ledger identity the router does not have --
+    the reader derives a router's identity from its PEER names, so no synthetic label would
+    join."""
+    def primer(cadence: str, text: str) -> None:
+        append_stats(build_primer_record(server, cadence=cadence, primer=text), stats_log)
+
+    return primer
 
 
 def build_retrieve_writer(stats_log: str | Path, server: str):

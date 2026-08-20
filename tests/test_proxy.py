@@ -1331,9 +1331,17 @@ def test_run_proxy_stats_log_writes_payload_free_ledger(tmp_path):
                    stats_log=str(log))
     assert rc == 0
     recs = load_stats(log)
-    # exactly the one tools/call result was recorded (initialize is not a tool call)
-    assert len(recs) == 1
-    rec = recs[0]
+    # Two rows, and they are different KINDS: the one tools/call result (initialize is not
+    # a tool call), plus the lazy primer this session actually attached to it (#311). The
+    # primer row is asserted on rather than filtered away silently, because "the ledger
+    # grew a row" is exactly the kind of change a bare count hides.
+    assert len(recs) == 2
+    primer_rows = [r for r in recs if r.get("event") == "primer"]
+    assert len(primer_rows) == 1
+    assert primer_rows[0]["cadence"] == "once/session"
+    assert primer_rows[0]["tokens"]
+    assert "raw_chars" not in primer_rows[0]      # never enters the savings total
+    rec = next(r for r in recs if r.get("event") != "primer")
     assert rec["tool"] == "gh.api.items"
     assert rec["server"] == pathlib.Path(sys.executable).name  # downstream identity
     assert rec["decision"] == "compressed"
