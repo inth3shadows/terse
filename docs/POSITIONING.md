@@ -234,12 +234,16 @@ nothing currently open covers either follow-up.
 **This entire doc assumes the primer is paid, only asking whether it's worth
 paying.** #249 (open as of 2026-08-19) is testing a prior question — whether a
 capable model needs the primer at all to read terse's wire form. Early results
-are model-dependent (helps some, hurts one measured so far, no effect on the
-strongest tested), not a clean "drop it" — so no number on this page should be
-treated as obsolete yet. If #249 lands on a `--primer=auto|never` default, the
-248/312/555 arithmetic above becomes a legacy-mode footnote for whichever models
-still need it, not the universal cost model it is today. Revisit this doc once
-that issue closes.
+are model-dependent (helps some, hurts one measured so far, no measured effect
+on the strongest tested — Opus 5, but at a single trial, unconfirmed, the same
+caveat carried by every other single-trial read in this thread), not a clean
+"drop it" — so no number on this page should be treated as obsolete yet. Two
+outcomes would move it: if #249 lands on `--primer=auto|never`, the 248/312/555
+arithmetic above becomes a legacy-mode footnote for whichever models still need
+it; if it instead lands on "keep the primer but shrink it" (the issue's other
+pre-registered branch — 155 of the 248 baseline tokens are one paragraph), those
+same numbers move downward without disappearing. Revisit this doc once that
+issue closes, under either outcome.
 
 ## Related
 
