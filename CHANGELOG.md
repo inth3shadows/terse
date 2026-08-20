@@ -13,7 +13,35 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A primer that provably never attached is now billed as zero, not estimated**
+  (`#317`, closing the other half of `#286`). `#311` made `terse stats` record a primer
+  when it attaches, but it could not read the ABSENCE of a row — a ledger written before
+  that shipped has none either. The servers `#286` is about are exactly the ones that can
+  never produce the evidence: a `structuredContent`-only server pays nothing *because*
+  the lazy attach never fires, so `searxng-mcp` kept its phantom 312 tok/session.
+
+  Every record already carries the terse `version` that wrote it, and **v0.28.1 is the
+  release that introduced primer recording**. A label whose every row was written at or
+  above that floor came from a build that would have recorded a primer had one attached,
+  so no row now means no primer: `primer_tokens: 0` with `primer_source: "recorded"`.
+
+  Anything short of that — a pre-0.28.1 writer, a window spanning the upgrade, an
+  unversioned or unparseable row, or an entry whose ledger label could not be recovered —
+  keeps the policy estimate and stays labelled `estimated`. The asymmetry is deliberate: a
+  false zero published as a measurement is worse than an honest estimate. Note a `.devN`
+  build of the floor release itself counts as BELOW it, since it may predate the code.
+
+  The liability report no longer describes these servers as having "recorded the
+  emission", which was false for a measured zero.
+
+### Added
+
+- **`terse stats --json`: `label_versions`** (`#317`), listing every terse version that
+  wrote for each ledger label (`""` for records predating the version field). This is what
+  lets a consumer tell "no primer was sent" from "this ledger cannot say" — without it,
+  `primers: []` is ambiguous forever. Additive.
 
 ## [0.28.1] - 2026-08-20
 

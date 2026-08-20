@@ -44,6 +44,10 @@ TOP_LEVEL = {"total", "decisions", "diff_reasons", "tools", "versions", "retriev
              # every ledger written before it shipped, and a consumer must read empty as
              # "this ledger cannot say", never as "no primer was sent".
              "primers",
+             # #317: every terse version that wrote for each label. This is what lets a
+             # consumer tell "no primer was sent" from "this ledger cannot say" — without
+             # it, `primers: []` is ambiguous forever.
+             "label_versions",
              "primer_liability"}
 
 TOTAL = {"blocks", "raw_chars", "out_chars", "raw_tokens", "out_tokens",
@@ -69,6 +73,11 @@ RETRIEVE_ROW = {"server", "tool", "path", "calls", "hits", "misses", "bytes", "t
 # tidying `aggregate`: `primer_liability` divides `tokens` by it to recover the PER-SESSION
 # primer, so losing it silently restores the window-sum over-bill this row exists to fix.
 PRIMER_ROW = {"server", "cadence", "emissions", "bytes", "tokens", "untokenized"}
+
+# #317. `versions` is a list of version strings, `""` for a record predating the version
+# field — NOT null, because a consumer distinguishing "old writer" from "no data" needs the
+# entry to be present either way.
+LABEL_VERSION_ROW = {"server", "versions"}
 
 LIABILITY = {"servers", "per_turn_tokens", "session_once_tokens", "unresolved",
              "idle", "free", "uncertain", "saved_tokens", "turns_covered",
@@ -119,6 +128,8 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     # #311 primer rows: emissions/bytes/tokens are counts, `untokenized` is the
     # None-is-not-zero escape hatch every other record already has.
     "emissions": (int,),
+    # #317: a list of version strings, never null — see LABEL_VERSION_ROW.
+    "versions": (list,),
     "blocks_to_break_even": (float, int, type(None)),
     "break_even_verdict": (str, type(None)),
     "per_turn_tokens": (int,), "session_once_tokens": (int,), "unresolved": (int,),
@@ -211,8 +222,8 @@ def test_every_named_field_also_has_a_pinned_type():
     person to add a field only has to touch the NAME manifest to go green and the type
     promise silently stops applying to it (found in review — the same
     tolerates-growth-silently failure this module's own docstring warns about)."""
-    named = (TOTAL | TOOL_ROW | VERSION_ROW | RETRIEVE_ROW | PRIMER_ROW | LIABILITY
-             | LIABILITY_SERVER | LIABILITY_CONTRIBUTOR)
+    named = (TOTAL | TOOL_ROW | VERSION_ROW | RETRIEVE_ROW | PRIMER_ROW
+             | LABEL_VERSION_ROW | LIABILITY | LIABILITY_SERVER | LIABILITY_CONTRIBUTOR)
     assert not named - set(TYPES), (
         f"no type pinned for: {sorted(named - set(TYPES))}. {_ADD_ON_PURPOSE}")
 
@@ -244,6 +255,18 @@ def test_the_total_and_tool_rows_are_exactly_these_keys(stats_json):
         assert set(row) == TOOL_ROW, _ADD_ON_PURPOSE
         _check_types("tools[]", row)
     _check_types("total", out["total"])
+
+
+def test_the_label_version_rows_are_exactly_these_keys(stats_json):
+    """#317. Published so a consumer can tell "no primer was sent" from "this ledger cannot
+    say" — an ambiguity that is permanent without it, since a pre-#316 ledger and a server
+    that never attaches both show `primers: []`."""
+    out = stats_json([_rec()])
+    assert out["label_versions"], "a versioned record must produce a label-version row"
+    for row in out["label_versions"]:
+        assert set(row) == LABEL_VERSION_ROW, _ADD_ON_PURPOSE
+        _check_types("label_versions[]", row)
+        assert all(isinstance(v, str) for v in row["versions"]), _ADD_ON_PURPOSE
 
 
 def test_the_primer_rows_are_exactly_these_keys(stats_json):

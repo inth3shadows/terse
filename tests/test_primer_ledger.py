@@ -299,10 +299,12 @@ def test_a_recorded_emission_beats_the_encoded_zero_inference():
 
 
 def test_no_recorded_row_keeps_the_inference_and_says_so():
-    """Absence is NOT yet read as evidence of non-payment: a window written before this
-    field existed has no primer rows at all and cannot be distinguished here from one whose
-    attach never fired. Such an entry keeps the old estimate and is LABELLED, rather than
-    being silently mixed in with the measured ones."""
+    """A window whose writer could not have recorded a primer keeps the old estimate and is
+    LABELLED, rather than being silently mixed in with the measured ones.
+
+    `_agg_with` builds unversioned rows, so this is the pre-#317 fallback path specifically.
+    #317 narrowed WHEN this applies — absence is now proof for a recording-capable writer —
+    but not what it does when it does apply."""
     liab = primer_liability([_scan_row()], _agg_with(blocks_for="gh-server"))
     row = liab["servers"][0]
     assert row["primer_source"] == "estimated"
@@ -312,10 +314,27 @@ def test_no_recorded_row_keeps_the_inference_and_says_so():
 def test_measured_and_estimated_are_never_summed_into_one_unlabelled_number():
     """#312 was closed for mis-denominating a ratio. The same error one layer down would be
     adding a measured primer to an inferred one and publishing the total as if both were
-    facts. The report has to name the split."""
+    facts. The report has to name the split.
+
+    Both kinds are present in the fixture on purpose: with only measured servers the
+    "the rest are inferred" sentence is correctly omitted, and a test asserting it anyway
+    would be pinning the wrong thing (it broke exactly that way when #317 reworded this).
+    """
     rec = build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)
-    agg = _agg_with(blocks_for="gh-server", primer_rows=[rec])
-    liab = primer_liability([_scan_row()], agg)
+    # One MEASURED entry (a recorded row) and one ESTIMATED entry (unversioned rows, so its
+    # absence proves nothing) in a single report.
+    other = {"server": "kb", "tool": "kb.read", "raw_chars": 900, "out_chars": 400,
+             "raw_tokens": 250, "out_tokens": 100, "decision": "tabularize",
+             "passthrough": False}
+    agg = aggregate([rec, other, other, other,
+                     {"server": "gh-server", "tool": "gh.api.items", "raw_chars": 1000,
+                      "out_chars": 400, "raw_tokens": 250, "out_tokens": 100,
+                      "decision": "tabularize", "passthrough": False}])
+    liab = primer_liability(
+        [_scan_row(), {"server": "kb", "state": "wrapped", "wraps": "kb", "scope": "user",
+                       "policy": None}], agg)
+    sources = {s_["server"]: s_["primer_source"] for s_ in liab["servers"]}
+    assert set(sources.values()) == {"recorded", "estimated"}, sources
     from terse.stats import build_primer_section
     text = "\n".join(build_primer_section(liab))
     assert "MEASURED" in text
@@ -417,3 +436,121 @@ def test_zero_token_emissions_are_never_published_as_a_measured_free_primer():
     row = liab["servers"][0]
     assert row["primer_source"] == "estimated"
     assert row["primer_tokens"] > 0
+
+
+# --- #317: absence of a row as proof of non-payment, where the writer could have written one
+
+def test_version_ordering_puts_a_dev_build_BELOW_the_release_it_is_named_for():
+    """The load-bearing property, and the one that is easy to get backwards.
+
+    `0.28.1.devN` is built from a commit BEFORE the 0.28.1 tag, so it may predate the
+    primer-recording code and must NOT be trusted to have written a row. `0.28.2.devN` is
+    built after that tag and does contain it. Getting this inverted publishes a fabricated
+    zero under the `recorded` label for every dev build of the floor release."""
+    from terse.stats import _version_key, _writes_primer_rows
+    assert _version_key("0.28.1.dev1") < _version_key("0.28.1")
+    assert _version_key("0.28.1") < _version_key("0.28.2.dev1")
+    # ...and that ordering is what the capability predicate actually reads.
+    assert _writes_primer_rows(["0.28.1"]) is True
+    assert _writes_primer_rows(["0.28.2.dev1+gabc.d20260820"]) is True
+    assert _writes_primer_rows(["0.28.1.dev3+gabc.d20260820"]) is False
+    assert _writes_primer_rows(["0.28.0"]) is False
+
+
+def test_an_unorderable_version_is_never_treated_as_capable():
+    """`None`, never a guess. The cost of being wrong is asymmetric: a false "capable"
+    publishes a measured zero where the truth is unknown."""
+    from terse.stats import _version_key, _writes_primer_rows
+    for bad in ("0.28.1rc1", "", "garbage", "0.28.x", None):
+        assert _version_key(bad) is None, bad
+        assert _writes_primer_rows([bad]) is False, bad
+    # "every", not "any": one stale writer in the window is enough to disqualify it.
+    assert _writes_primer_rows(["0.29.0", "0.27.0"]) is False
+    assert _writes_primer_rows(["0.29.0", ""]) is False
+    # An empty list is not a vacuous truth here — no rows means no evidence.
+    assert _writes_primer_rows([]) is False
+    assert _writes_primer_rows(None) is False
+
+
+def _blocks(ver, n=10, label="gh-server"):
+    rec = {"server": label, "tool": "gh.api.items", "raw_chars": 2000, "out_chars": 800,
+           "raw_tokens": 500, "out_tokens": 200, "decision": "tabularize",
+           "passthrough": False}
+    if ver:
+        rec["version"] = ver
+    return [dict(rec) for _ in range(n)]
+
+
+def test_the_286_shape_reports_a_MEASURED_zero_not_a_phantom_bill():
+    """#286 end to end. A `structuredContent`-only server never reaches the lazy attach, so
+    it pays zero forever AND can never produce the row that would prove it — which is why
+    recording alone (#311) could not close this. A recent-enough ledger with no primer row
+    is now the proof."""
+    row = primer_liability([_scan_row()],
+                           aggregate(_blocks("0.28.1")))["servers"][0]
+    assert row["primer_tokens"] == 0
+    assert row["primer_source"] == "recorded"       # a measurement, not an estimate
+    assert row["blocks"] == 10                      # ...and it WAS called, so this is not
+    assert row["break_even_verdict"] == "no primer"  # "never triggered"
+
+
+def test_every_ambiguous_window_falls_back_to_the_labelled_estimate():
+    """The asymmetry, pinned as one table. A false zero published as a measurement is worse
+    than an honest estimate, so anything short of "every row was written by a build that
+    would have recorded it" keeps today's behaviour."""
+    cases = {
+        "pre-floor writer": _blocks("0.28.0"),
+        "unversioned rows": _blocks(None),
+        "dev build OF the floor release": _blocks("0.28.1.dev3+gabc.d20260820"),
+        "window spanning the upgrade": _blocks("0.28.1", 5) + _blocks("0.27.0", 5),
+        "unparseable version": _blocks("0.28.1rc1"),
+    }
+    for name, recs in cases.items():
+        row = primer_liability([_scan_row()], aggregate(recs))["servers"][0]
+        assert row["primer_source"] == "estimated", name
+        assert row["primer_tokens"] > 0, name
+
+
+def test_a_capable_window_with_a_recorded_row_still_reports_the_recorded_size():
+    """The two halves must not fight: absence proves zero, presence proves the size."""
+    rec = build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)
+    rec["version"] = "0.28.1"
+    row = primer_liability([_scan_row()],
+                           aggregate(_blocks("0.28.1") + [rec]))["servers"][0]
+    assert row["primer_source"] == "recorded"
+    assert row["primer_tokens"] == count_cl100k("P" * 40)
+
+
+def test_an_entry_whose_label_cannot_be_recovered_is_never_a_measured_zero():
+    """`bool(labels)` in the guard, and it has to be exercised on the path that really
+    produces an EMPTY label list — the ambiguous-launcher case, where two installed entries
+    provably resolve to the same basename so no honest reading exists.
+
+    `all([])` is vacuously True, so without the guard an entry we know the least about gets
+    the strongest possible verdict: a measured zero. That is the exact inversion #317 is
+    supposed to prevent.
+
+    An earlier version of this test used a scan row naming a server with no ledger rows,
+    which yields a NON-empty label list that simply matches nothing — it passed with the
+    guard deleted, i.e. it never tested the guard at all."""
+    scan = [{"server": "a", "state": "wrapped", "scope": "user", "policy": None,
+             "wraps": "/x/.venv/bin/python -m a_mcp"},
+            {"server": "b", "state": "wrapped", "scope": "user", "policy": None,
+             "wraps": "/y/.venv/bin/python -m b_mcp"}]
+    rows = primer_liability(scan, aggregate(_blocks("0.28.1", label="python")))["servers"]
+    for row in rows:
+        assert row["ledger_labels"] == [], "fixture must produce the empty-label path"
+        assert row["primer_source"] == "estimated", row["server"]
+        assert row["primer_tokens"] > 0, row["server"]
+
+
+def test_the_report_does_not_claim_an_emission_that_never_happened():
+    """The prose, not just the number. The measured-zero case has NO emission, so the line
+    that says "recorded the emission" is false for it — and a report that misdescribes its
+    own evidence is the defect class this whole issue is about."""
+    from terse.stats import build_primer_section
+    text = "\n".join(build_primer_section(
+        primer_liability([_scan_row()], aggregate(_blocks("0.28.1")))))
+    assert "provably never attached one" in text
+    assert "pay NOTHING" in text
+    assert "recorded an emission" not in text

@@ -216,6 +216,63 @@ PRIMER_EVENT = "primer"
 PRIMER_CADENCE_PER_TURN = "per-turn"
 PRIMER_CADENCE_ONCE = "once/session"
 
+# The first release whose proxy writes primer rows: v0.28.1 is #316's merge commit. A
+# ledger row stamped with this version or later came from a writer that WOULD have recorded
+# a primer had one attached -- which is what makes the ABSENCE of a row evidence rather than
+# silence, and is the whole of #317.
+PRIMER_LEDGER_FLOOR = (0, 28, 1)
+
+
+def _version_key(ver: str | None) -> tuple[tuple[int, ...], int, int] | None:
+    """Order one hatch-vcs version string, or None if it cannot be ordered confidently.
+
+    Hand-rolled rather than `packaging.version`: terse's only runtime dependency is
+    tiktoken, and pulling in a second one to make a single comparison is exactly the
+    dependency sprawl this repo argues against. The strings are our own output, so the
+    grammar is narrow -- `0.28.1` and `0.28.1.dev1+g7047d60d7.d20260820`.
+
+    The ONE PEP 440 property that matters here: a `.devN` release sorts BEFORE its base,
+    and that is not a detail to round off. `0.28.1.devN` is built from a commit BEFORE the
+    0.28.1 tag, so it may well predate the primer-recording code and must NOT be trusted to
+    have written a row; `0.28.2.devN` is built after that tag and does contain it. Encoding
+    dev as a 0 in the middle slot (release = 1) gives exactly that ordering:
+
+        0.28.1.dev1 -> ((0,28,1), 0, 1)   below   0.28.1 -> ((0,28,1), 1, 0)
+        0.28.2.dev1 -> ((0,28,2), 0, 1)   above   0.28.1
+
+    Returns None -- never a guess -- for anything outside that grammar. The caller treats
+    None as "below the floor", because the cost of being wrong here is asymmetric: a false
+    "capable" publishes a fabricated zero under the `recorded` label, which is worse than
+    the honest estimate it would replace.
+    """
+    if not isinstance(ver, str) or not ver:
+        return None
+    base = ver.split("+", 1)[0]              # drop the local segment (+g<sha>.d<date>)
+    dev = 1                                  # 1 = a real release, 0 = a .devN prerelease
+    devnum = 0
+    if ".dev" in base:
+        base, _, tail = base.partition(".dev")
+        dev = 0
+        devnum = int(tail) if tail.isdigit() else 0
+    parts = base.split(".")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None                          # rc/alpha/post//anything unrecognised
+    return (tuple(int(p) for p in parts), dev, devnum)
+
+
+def _writes_primer_rows(versions: list[str] | None) -> bool:
+    """True only if EVERY version that wrote for this label is at or above the floor.
+
+    "Every", not "any", and an empty list is False. A window can legitimately span the
+    upgrade, and in a mixed window the absence of a primer row is explained equally well by
+    the old writer not having the feature -- so it proves nothing and must fall back. An
+    unparseable or missing version counts as below the floor via `_version_key`'s None.
+    """
+    if not versions:
+        return False
+    keys = [_version_key(v) for v in versions]
+    return all(k is not None and k >= (PRIMER_LEDGER_FLOOR, 1, 0) for k in keys)
+
 
 def build_primer_record(server: str, *, cadence: str, primer: str) -> dict[str, Any]:
     """One ledger line for a primer that was ACTUALLY emitted (#311, #286).
@@ -414,7 +471,22 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     # (server, cadence) because the two cadences are different units and summing them is
     # the exact error `primer_liability` splits its report to avoid.
     primers: dict[tuple[str, str], dict[str, int]] = {}
+    # Which terse versions wrote for each ledger label (#317). PER LABEL, where `versions`
+    # above is fleet-global -- the question "could this server's absence of a primer row
+    # mean anything?" is asked about one entry, and a fleet-wide answer would let one
+    # freshly-upgraded server vouch for a stale one. Collected across EVERY record kind
+    # (result, retrieve, primer) because any of them proves which build was running.
+    #
+    # A row with no `version` contributes the empty string rather than being skipped: an
+    # unversioned writer is evidence of an OLD writer, and dropping it would let a label
+    # whose only versioned row is recent look uniformly capable.
+    label_versions: dict[str, set[str]] = {}
     for rec in records:
+        rsrv_any = rec.get("server")
+        if isinstance(rsrv_any, str) and rsrv_any:
+            rver = rec.get("version")
+            label_versions.setdefault(rsrv_any, set()).add(
+                rver if isinstance(rver, str) and rver else "")
         if rec.get("event") == PRIMER_EVENT:
             psrv = str(rec.get("server", "unknown"))
             pkey = (psrv, str(rec.get("cadence", "unknown")))
@@ -534,9 +606,16 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             "versions": versions,
             # Primers actually emitted this window, by label and cadence (#311). Empty on
             # every ledger written before this shipped -- readers MUST treat empty as "this
-            # ledger cannot say", not as "no primer was sent".
+            # ledger cannot say", not as "no primer was sent". #317 is what lets a reader
+            # tell those two apart, using `label_versions` below.
             "primers": [{"server": s, "cadence": c, **row}
                         for (s, c), row in sorted(primers.items())],
+            # Every terse version that wrote for each ledger label (#317). `""` is a record
+            # that predates the version field. RAW, deliberately: whether these clear the
+            # primer-recording floor is a verdict, and this module puts verdicts in the
+            # reader (`primer_liability`) and facts in `aggregate`.
+            "label_versions": [{"server": s, "versions": sorted(v)}
+                               for s, v in sorted(label_versions.items())],
             # Costliest rule first: tokens the model spent fetching dropped values back.
             "retrieves": [{"server": s, "tool": t, "path": p, **row}
                           for (s, t, p), row in sorted(
@@ -1290,6 +1369,10 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
     # where `count_cl100k` returned an int, so dividing by a count that also includes
     # untokenized rows would understate the per-session charge in proportion to how much of
     # the window a tiktoken-less terse wrote.
+    # Which labels were written by a terse that records primers at all (#317). Without
+    # this, the absence of a primer row is silence; with it, absence is a measurement.
+    capable_label = {str(r.get("server", "")): _writes_primer_rows(r.get("versions"))
+                     for r in (agg.get("label_versions") or [])}
     recorded_tokens: dict[str, int] = {}
     recorded_emissions: dict[str, int] = {}
     for prow in (agg.get("primers") or []):
@@ -1388,7 +1471,16 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # predating this field has no primer rows at all, and cannot be distinguished here
         # from one whose attach genuinely never fired -- so an entry with no recorded row
         # keeps the old inference and is labelled `estimated` rather than silently mixed
-        # in. Closing that last step needs a ledger-version floor; see #311.
+        # in.
+        #
+        # #317 closes that step where it can be closed. A label whose every row was written
+        # at or above `PRIMER_LEDGER_FLOOR` came from a proxy that WOULD have recorded a
+        # primer had one attached, so no row means no primer: a measured ZERO rather than an
+        # unknown. That is the half of #286 recording alone could never reach -- a
+        # `structuredContent`-only server pays nothing precisely BECAUSE the attach never
+        # fires, so it can never produce the row that would clear it. Everywhere else (a
+        # pre-floor writer, a window spanning the upgrade, an unversioned row) absence is
+        # explained just as well by "that build could not record", so the estimate stands.
         # The MEAN recorded primer, which is the per-session unit this field is read in --
         # never the window sum. Summed across labels first so an entry answering to several
         # labels is one mean over all its emissions, not a mean of means.
@@ -1401,6 +1493,14 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # `recorded` label: a claim that we MEASURED a free primer. Unknown must degrade to
         # the labelled estimate, never to a fabricated zero.
         measured = rec_em > 0 and rec_tok > 0 and not is_router
+        # A measured ZERO (#317): labels exist, every one was written by a recording-capable
+        # build, and not one primer row among them. `bool(labels)` is load-bearing -- an
+        # entry whose label could not be recovered has no rows to reason about, and reading
+        # "no evidence" as "no cost" is the exact inversion this is guarding against.
+        measured_zero = (not measured and not is_router and bool(labels) and rec_em == 0
+                         and all(capable_label.get(lbl, False) for lbl in labels))
+        if measured_zero:
+            tokens = 0
         if measured:
             tokens = round(rec_tok / rec_em)
         # None, not 0, when no label could be recovered: "unknown" and "never called" are
@@ -1425,8 +1525,11 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
             # guess which of its numbers is a measurement (#311). "recorded" = the proxy
             # wrote down an emission this window; "estimated" = sized from the installed
             # policy and inferred to have been paid, the pre-#311 behaviour.
-            "primer_source": "recorded" if measured else "estimated",
+            "primer_source": "recorded" if (measured or measured_zero) else "estimated",
             "tokenized_blocks": tokenized,
+            # `measured_zero` deliberately does NOT pass `recorded=True`: it is proof the
+            # primer was never PAID, so the entry belongs in the unpaid bucket `_cadence`
+            # already derives, not forced into `_ONCE`.
             "cadence": _cadence(state, blocks, encoded, recorded=measured),
             **_break_even(tokens, blocks, tokenized,
                           sum(saved_by_label.get(lbl, 0) for lbl in labels),
@@ -1470,8 +1573,16 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # servers as pure cost. Guarded on a non-zero primer for the same reason `idle` is:
         # a default-deny server is free because it emits nothing, which is a different fact
         # and already has its own `no primer` verdict in the table.
+        #
+        # `or primer_source == "recorded"` keeps a MEASURED zero in the list (#317). The
+        # truthy-primer guard was standing in for "this server has a primer in its policy",
+        # which held while `primer_tokens` was always the policy size — proving the primer
+        # is never paid sets it to 0 and made the entry vanish from the one list whose whole
+        # job is naming free servers. A default-deny server is still excluded: it has no
+        # ledger evidence either way, so it is never `recorded`.
         "free": [s["server"] for s in servers
-                 if s["cadence"] == _ONCE_FREE and s["primer_tokens"]],
+                 if s["cadence"] == _ONCE_FREE
+                 and (s["primer_tokens"] or s.get("primer_source") == "recorded")],
         # Lazy, but no ledger label was recoverable, so we cannot say whether the attach
         # ever fired. Neither total counts it — same discipline as `unresolved`.
         "uncertain": [s["server"] for s in servers if s["cadence"] == _ONCE_UNKNOWN],
@@ -1527,13 +1638,25 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     if len(cadences) > 1 and _PER_TURN in cadences:
         lines.append("  the two figures are different units and are deliberately not "
                      "summed.")
-    measured = [s_["server"] for s_ in servers
-                if s_.get("primer_source") == "recorded"]
-    if measured:
-        lines.append(f"  {len(measured)} of {len(servers)} server(s) report a MEASURED "
-                     f"primer (the proxy recorded the")
-        lines.append("             emission); the rest are sized from policy and inferred "
-                     "to have paid.")
+    # TWO kinds of measurement, and calling both "recorded the emission" is false for the
+    # second -- the whole point of a measured zero is that no emission happened (#317).
+    paid = [s_ for s_ in servers
+            if s_.get("primer_source") == "recorded" and s_.get("primer_tokens")]
+    never = [s_ for s_ in servers
+             if s_.get("primer_source") == "recorded" and not s_.get("primer_tokens")]
+    if paid or never:
+        lines.append(f"  {len(paid) + len(never)} of {len(servers)} server(s) are MEASURED "
+                     f"rather than inferred:")
+        if paid:
+            lines.append(f"             {len(paid)} recorded an emission this window.")
+        if never:
+            lines.append(f"             {len(never)} provably never attached one, so they "
+                         f"pay NOTHING (#286) --")
+            lines.append("             their ledger was written by a build that would have "
+                         "recorded it.")
+        if len(paid) + len(never) < len(servers):
+            lines.append("             The rest are sized from policy and inferred to have "
+                         "paid.")
     if liab["unresolved"]:
         lines.append(f"  {liab['unresolved']} server(s) have an unreadable policy and are "
                      f"NOT counted — treat both figures as lower bounds.")
