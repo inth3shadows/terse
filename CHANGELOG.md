@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.28.0] - 2026-08-19
+
 ### Added
 
 - **`terse stats --json`: two additions to the break-even vocabulary** (`#285`). A new
