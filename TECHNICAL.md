@@ -515,12 +515,14 @@ by the next patch (PyPI versions cannot be re-uploaded).
   real-payload-corpus precondition.
   Run-to-run noise at
   temperature 0 is no longer eyeballed: `terse fluency --trials N` repeats each question
-  N times and reports accuracy with a pooled binomial confidence interval — though #295
-  (open) found that bound collapses to `±0` at `--trials 1` regardless of true accuracy,
-  which is exactly the failure mode #249's deepening pass demonstrated three times above;
-  read a low-trial interval as directional at best, not as the tight bound this sentence
-  used to promise unconditionally. (Parametric SE over N×Q×P Bernoulli draws is
-  used rather than the std of N whole-eval runs, which is itself noise at small N.)
+  N times and reports accuracy with a question-clustered (sandwich) confidence interval —
+  #297 fixed the mechanical defect where the previous pooled-binomial bound collapsed to
+  `±0` regardless of true accuracy whenever every question was internally consistent
+  across its trials (the normal case at `--trials 1`), which is exactly the failure mode
+  #249's deepening pass demonstrated three times above. The estimator now clusters on the
+  QUESTION as the sampling unit, so it tightens with more questions without limit and
+  with more trials only down to a between-question floor. #295 (open) carries the larger,
+  separate question of what this interval should be compared against.
 - **Proxy transport and fan-out (#5).** A `terse proxy` downstream is either a stdio
   command or an MCP Streamable-HTTP `url` (`transport.py`'s `Transport` abstraction —
   `Interceptor`/`pump` are transport-agnostic; drop-to-retrieve's swallow-and-reply logic

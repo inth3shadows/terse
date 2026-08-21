@@ -28,7 +28,7 @@ import math
 
 import pytest
 
-from terse.report import _ci, _form_stats
+from terse.report import _ci, _form_stats, build_fluency_report
 
 
 def test_one_wholly_wrong_question_is_not_reported_as_more_certain_than_five_slightly_wrong():
@@ -78,3 +78,44 @@ def test_a_success_count_exceeding_its_trial_count_raises_rather_than_publishing
 def test_a_negative_success_count_also_raises():
     with pytest.raises(ValueError):
         _form_stats([{"terse_ok": -1, "trials": 5}, {"terse_ok": 5, "trials": 5}], "terse_ok")
+
+
+def test_a_success_scored_on_zero_trials_also_raises():
+    # A first cut of the k<=t guard was gated on `t > 0`, which let exactly this shape
+    # through -- and it is not hypothetical: it is the coordinate the guard's own comment
+    # cites (a `<form>_trials = trials - errors` bug scoring a "success" on an errored,
+    # zero-remaining-trial row).
+    with pytest.raises(ValueError):
+        _form_stats([{"terse_ok": 1, "trials": 0}, {"terse_ok": 1, "trials": 5}], "terse_ok")
+
+
+def test_a_negative_trial_count_raises_rather_than_indexerrors():
+    with pytest.raises(ValueError):
+        _form_stats([{"terse_ok": 0, "trials": -1}], "terse_ok")
+
+
+def _lopsided_regression_rows() -> list[dict]:
+    """25 questions, trials=1: raw 68% vs terse 52% -- a real 16pt regression whose
+    independence-combined gap_ci (±27pts, since #297 made both arm SEs cluster-robust
+    rather than ~0) is wide enough to exceed the gap itself. Round-2 review's own repro."""
+    rows = []
+    for i in range(17):
+        ok = 1 if i < 13 else 0
+        rows.append({"qid": f"r{i}", "qtype": "lookup", "transform": "table", "trials": 1,
+                     "raw_ok": 1, "terse_ok": ok, "primer_ok": ok, "fails": 0, "attempts": 3})
+    for i in range(8):
+        rows.append({"qid": f"w{i}", "qtype": "lookup", "transform": "table", "trials": 1,
+                     "raw_ok": 0, "terse_ok": 0, "primer_ok": 0, "fails": 0, "attempts": 3})
+    return rows
+
+
+def test_a_wide_conservative_gap_ci_never_argues_a_real_fail_is_noise():
+    """gap_ci here is only ever an OVER-estimate of the gap's true spread (it discards the
+    positive correlation between paired arms), so it can rule a gap "not yet tightly
+    measured" but must never rule a genuine FAIL "indistinguishable from noise" -- round-2
+    review's repro of exactly that contradiction, now gated on `not worst.passed`."""
+    md = build_fluency_report({"m1": _lopsided_regression_rows()}, [])
+    assert "**FAIL**" in md
+    assert "not distinguishable from noise" not in md
+    assert "indistinguishable" not in md
+    assert "treat the FAIL as real" in md
