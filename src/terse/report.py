@@ -22,14 +22,30 @@ _GAP_TOLERANCE = 0.05  # shared pass/fail tolerance for both worst-case verdict 
 def _form_stats(rows: list[dict[str, Any]], form: str) -> tuple[float, float]:
     """(accuracy, standard_error) for one form over rows carrying success COUNTS.
 
-    accuracy = Σsuccesses / Σtrials. SE is the pooled binomial SE of that estimator:
-    each row is t trials of a Bernoulli with p̂=k/t, so Var(total successes)=Σ t·p̂(1-p̂)
-    and SE(acc)=√Var / Σt. This is stable at the realistic small trial count (N=2–3),
-    where an empirical std across N whole-eval runs would be pure noise. At trials=1
-    every p̂∈{0,1} → SE=0, so single-trial runs report exactly as before.
+    accuracy = Σsuccesses / Σtrials. SE is the cluster-robust (sandwich) SE of that
+    ratio estimator, clustering on the question — each row is one question, worth
+    t trials of a Bernoulli:
+
+        SE = sqrt( n/(n-1) · Σ(kᵢ − acc·tᵢ)² ) / Σt
+
+    A pooled *within-question* SE (Σt·p̂(1−p̂)) looks stable but is measuring the wrong
+    thing: at temperature 0 a question is nearly always all-right or all-wrong across
+    its trials, so p̂(1−p̂)≈0 for every row and that estimator collapses to ≈0 SE at ANY
+    accuracy, regardless of how much the *set of questions* disagreed with each other
+    (#297). This form instead treats the question as the sampling unit — the axis that
+    actually varies run to run — and reduces to 0 only when every row's per-question
+    rate already equals the overall accuracy.
+
+    n<2 clusters can't estimate a BETWEEN-question spread at all (that needs at least
+    two questions to compare), but reporting a flat SE=0 there would print false
+    certainty on exactly one draw — the same failure #297 filed against the old
+    estimator, just relocated. So a single surviving question instead falls back to
+    that question's own within-question binomial SE (√(t·p̂(1−p̂))/t), which is the
+    pre-#297 formula restricted to n=1 — the best estimate available with one cluster,
+    not a confident zero.
     """
-    tot_t = tot_k = 0
-    var = 0.0
+    ks: list[int] = []
+    ts: list[int] = []
     for r in rows:
         # Prefer a per-form trial count ("terse_ok" -> "terse_trials") when the row
         # carries one — an uneven hand-built pack can collect fewer replies for one form,
@@ -39,14 +55,31 @@ def _form_stats(rows: list[dict[str, Any]], form: str) -> tuple[float, float]:
         t_key = form[:-3] + "_trials" if form.endswith("_ok") else ""
         t = r.get(t_key, r.get("trials", 1))
         k = int(r[form])
-        tot_t += t
-        tot_k += k
+        # Every emitter is responsible for its own k<=t invariant (dropeval's is pinned
+        # by test_no_success_count_can_exceed_its_own_trial_count) — this is the
+        # last-line check so a future violation fails loud here, at its source, instead
+        # of silently publishing an impossible accuracy. `0 <= k <= t` alone already
+        # rejects every t<0 row (no k>=0 can satisfy k<=t<0) as well as the t==0/k>0
+        # corner (a row can score a "success" on zero trials only by the same class of
+        # bug this guard exists to catch) — not gated on `t > 0` the way an earlier
+        # revision was, which let exactly that corner through.
+        if not (0 <= k <= t):
+            raise ValueError(f"{form}: {k} successes over {t} trials is not a valid count")
         if t > 0:
-            p = k / t
-            var += t * p * (1 - p)
-    if tot_t == 0:
+            ks.append(k)
+            ts.append(t)
+    if not ks:
         return 0.0, 0.0
-    return tot_k / tot_t, math.sqrt(var) / tot_t
+    tot_t, tot_k = sum(ts), sum(ks)
+    acc = tot_k / tot_t
+    n = len(ks)
+    if n < 2:
+        k, t = ks[0], ts[0]
+        p = k / t
+        return acc, math.sqrt(t * p * (1 - p)) / t
+    resid_sq_sum = sum((k - acc * t) ** 2 for k, t in zip(ks, ts, strict=True))
+    se = math.sqrt(n / (n - 1) * resid_sq_sum) / tot_t
+    return acc, se
 
 
 def _ci(se: float) -> float:
@@ -453,12 +486,33 @@ def _worst_case_gap(
     the worst model, never the mean. `rows` maps model to a 4-tuple of form_acc, form_se,
     control_acc, control_se. Returns the model with the lowest gap as a GapVerdict, or
     None if `rows` is empty. gap = form_acc minus control_acc; gap_ci is the 95%
-    half-width of the pooled standard error; passed iff gap is at least -tol, inclusive
-    of the boundary. Callers access fields by name, e.g. verdict.form_acc, never by
-    position, so a future field reorder can't silently swap values."""
+    half-width of the independence-combined question-clustered (sandwich) SE of the two
+    arms; passed iff gap is at least -tol, inclusive of the boundary. Callers access
+    fields by name, e.g. verdict.form_acc, never by position, so a future field reorder
+    can't silently swap values."""
     worst = None  # (model, gap, facc, cacc, gap_ci) — cheapest to track positionally here;
     for model, (facc, fse, cacc, cse) in rows.items():  # this is a private local, not the
         gap = facc - cacc                               # public interface callers rely on.
+        # sqrt(fse^2+cse^2) assumes the two arms' SEs are independent, which overstates
+        # the true paired-on-question variance FOR ANY PAIR OF ARMS THAT ARE POSITIVELY
+        # CORRELATED — the normal case, since question difficulty is shared across arms.
+        # (It is not a universal upper bound: two arms that are anti-correlated on which
+        # questions they get right would make this an UNDER-estimate instead — just not a
+        # shape real comprehension arms take.) `passed` below does NOT read gap_ci (it
+        # gates on the point estimate `gap` alone), so this looseness cannot flip the
+        # merge gate itself; every consumer of `gap_ci` (`build_fluency_report`'s worst-
+        # case prose here, `_format_worst_case_line`'s "±N pts" headline shared by the
+        # diff/diff-soak/dropeval/fluency reports, the diff-soak deepest-slice line, and
+        # `build_html_diff_report`'s verdict banner) renders it as a width, never as a
+        # significance test — note this is NOT the HTML forest plot's whiskers, which read
+        # per-arm `form_ci`/`control_ci`, not `gap_ci`, at all —
+        # which is why `build_fluency_report` is written to never let a wide gap_ci argue
+        # AWAY a verdict: a bound that is only reliably an over-estimate can rule a gap
+        # "not yet tightly measured", never "not real". #297 made both SEs cluster-robust
+        # instead of ~0, so this bound is now wide enough to matter in practice, not just
+        # a formality. A tighter, correct fix is a paired cluster-robust SE on the
+        # per-question DIFFERENCE rather than combining two independent arm SEs; tracked
+        # as a follow-up rather than folded into #297's scope.
         gap_ci = _ci(math.sqrt(fse ** 2 + cse ** 2))
         if worst is None or gap < worst[1]:
             worst = (model, gap, facc, cacc, gap_ci)
@@ -1170,8 +1224,8 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
     out += [
         "## Accuracy by model",
         "",
-        f"Trials per question: **{trials}**. `±` is the 95% half-width of a pooled "
-        "binomial bound.",
+        f"Trials per question: **{trials}**. `±` is the 95% half-width of a "
+        "question-clustered (sandwich) bound.",
         "",
         f"| Model | q | {control_label} | diff | regressions |",
         "|---|---|---|---|---|",
@@ -1309,8 +1363,8 @@ def build_diff_soak_report(results: dict) -> str:
     out += [
         "## Accuracy by chain depth",
         "",
-        f"Trials per question: **{trials}**. `±` is the 95% half-width of a pooled "
-        "binomial bound. depth = diffs chained after the full anchor.",
+        f"Trials per question: **{trials}**. `±` is the 95% half-width of a "
+        "question-clustered (sandwich) bound. depth = diffs chained after the full anchor.",
         "",
         "| Model | depth | q | full-terse | chain | gap |",
         "|---|---|---|---|---|---|",
@@ -1548,8 +1602,8 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
     out += [
         "## Accuracy by model",
         "",
-        f"Trials per question: **{trials}**. `±` is the 95% half-width of a pooled "
-        "binomial bound.",
+        f"Trials per question: **{trials}**. `±` is the 95% half-width of a "
+        "question-clustered (sandwich) bound.",
         "",
         "| Model | recall q | retrieve-recall | precision (no-overfetch) | final-accuracy "
         "| control (no drop) | handle-accuracy | failed calls |",
@@ -1776,8 +1830,8 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     out += [
         "## Accuracy by model and form",
         "",
-        f"Trials per question: **{trials}**. `±` is the 95% half-width of a pooled "
-        "binomial bound on the accuracy.",
+        f"Trials per question: **{trials}**. `±` is the 95% half-width of a "
+        "question-clustered (sandwich) bound on the accuracy.",
         "",
         "| Model | q | raw | terse | terse+primer | terse+inline | regressions | "
         "primer recovers |",
@@ -1912,9 +1966,29 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     if worst:
         helps = sum(1 for s in gated.values() if s["primer"] > s["terse"] + 1e-9)
         out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "best terse-form", "raw"))
+        # `gap_ci` combines the two arms' SEs as if independent (√(fse²+cse²)), which
+        # overstates the true variance of a PAIRED gap whenever the arms are positively
+        # correlated (the normal case — question difficulty is shared) — before #297 that
+        # didn't matter because both SEs were ~0 by default, but the cluster-robust SE is
+        # routinely several points wide, and this bound is wide enough in practice to call
+        # a genuine regression "noise" (the correct paired CI on the same data can be
+        # several times tighter and not cross the gap at all). A bound that is only ever
+        # an OVER-estimate cannot support a "not distinguishable" conclusion on EITHER
+        # side of the tolerance line, so neither branch below claims one — only that the
+        # gap is smaller than a loose ceiling on its own noise. (A proper paired
+        # cluster-robust SE on the per-question difference would let this section make a
+        # real significance claim — tracked as a follow-up, not folded into #297's scope.)
         if worst.gap_ci > 1e-9 and abs(worst.gap) < worst.gap_ci:
-            out.append("- The gap is within its own confidence interval — terse and raw are "
-                       "indistinguishable at this trial count (raise `--trials` to tighten).")
+            # More questions tighten this bound without limit; more trials also tighten
+            # it, but only down to a between-question floor they can't cross (they
+            # resample k, not the question set) — so this is neither "raise `--trials`"
+            # (#297's own estimator makes that false as the SOLE lever) nor "trials never
+            # help" (also false).
+            verdict_word = "This passing gap" if worst.passed else "Note: this gap"
+            out.append(f"- {verdict_word} is smaller than a (loose, conservative) "
+                       "upper-bound estimate of its own noise floor — treat the verdict "
+                       "above as real, not yet as a tightly measured margin; more "
+                       "questions would tighten this bound further than more trials would.")
         out.append(f"- The primer improves terse-form accuracy for {helps}/{len(gated)} model(s).")
         if worst.passed:
             out.append("- terse's compressed form preserves comprehension within tolerance — "

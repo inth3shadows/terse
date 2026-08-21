@@ -1869,7 +1869,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="path for the offline eval pack (written when no model is configured)")
     f.add_argument("--responses", help="score a collected responses JSON against --pack")
     f.add_argument("--trials", type=int, default=1,
-                   help="repeat each question N times; report mean ± a binomial bound (default 1)")
+                   help="repeat each question N times; report mean ± a question-clustered "
+                        "bound (more questions tighten it further than more trials; "
+                        "default 1)")
     f.add_argument("--diff", action="store_true",
                    help="eval whether a model reads a cross-call DIFF as well as the full "
                         "result (needs same-tool corpus pairs + a configured model)")

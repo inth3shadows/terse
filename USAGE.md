@@ -976,7 +976,8 @@ TERSE_FLUENCY_API_KEY=sk-... \
 TERSE_FLUENCY_MODELS=google/gemini-2.5-flash,deepseek/deepseek-chat \
   uv run terse fluency --corpus corpus-stress
 
-# 2c. tighten the verdict: repeat each question N times for a confidence interval
+# 2c. repeat each question N times to shrink the within-question noise
+#     (the reported CI is bounded by question count, not by --trials alone)
 TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \
   uv run terse fluency --corpus corpus-stress --trials 5
 ```
@@ -986,7 +987,9 @@ format note ("primer"), flags which transform (if any) costs comprehension, and 
 PASS/FAIL gated on the *worst* model. A model that scores 0% on raw JSON is a setup
 error (wrong model id, no key) and is excluded from the verdict, not counted as a
 comprehension failure. `--trials N` repeats each question N times and reports each
-accuracy with a `±` 95% bound, so the verdict is a tight bound rather than directional.
+accuracy with a question-clustered `±` 95% bound — more questions tighten it without
+limit, more trials only down to a between-question floor they can't cross, so treat a
+wide `±` as "not yet tightly measured," not as "run more trials."
 
 Add `--bars` for the same verdict as a terminal forest plot — a point + 95% CI track
 per model (best terse-form vs raw, or diff-form vs full-terse under `--diff`) with a

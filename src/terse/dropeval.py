@@ -539,9 +539,9 @@ def _run_questions_against(questions: list[DropQuestion], applied: policy_mod.Ap
             # `retrieved == needs_retrieve`, so a precision question whose call never
             # reached the model scores a free +1 for not retrieving. Counting that while
             # also removing the trial from `retrieve_trials` makes successes EXCEED trials,
-            # which drives `_form_stats`'s `p̂(1-p̂)` negative and crashes the whole report
-            # on `math.sqrt`. Found by a live run, not by the unit tests — hence the
-            # k<=t invariant test that now guards it.
+            # which `_form_stats` treats as an invariant violation and raises on rather
+            # than silently publishing an impossible >100% accuracy. Found by a live run,
+            # not by the unit tests — hence the k<=t invariant test that now guards it.
             if not err:
                 retrieve_ok += int(r_ok)
                 answer_ok += int(a_ok)
