@@ -390,7 +390,7 @@ def test_measured_and_estimated_are_never_summed_into_one_unlabelled_number():
     text = "\n".join(build_primer_section(liab))
     assert "MEASURED" in text
     assert "recorded an emission" in text
-    assert "inferred to have paid" in text
+    assert "assumed paid" in text
 
 
 def test_the_primer_write_happens_after_the_lock_is_released():
@@ -645,8 +645,9 @@ def test_a_suppression_row_records_zero_bytes_and_zero_tokens():
                               attached=False)
     assert rec["tokens"] == 0 and rec["bytes"] == 0
     assert rec["attached"] is False
-    # Not None: `None` means "emitted, size unknown", which is a different claim.
-    assert rec["tokens"] is not None
+    # NB the distinction that matters here is 0 vs None, not 0 vs absent: `None` would mean
+    # "emitted, size unknown", a different claim entirely. Asserting `is not None` after
+    # `== 0` cannot fail, so it is stated as a comment rather than a green assertion.
 
 
 def test_no_suppression_is_recorded_after_the_primer_has_already_attached():
@@ -717,3 +718,60 @@ def test_a_suppression_claiming_a_nonzero_size_is_not_believed():
     assert row["primer_source"] == "estimated"
     assert row["primer_tokens"] > 0
     assert liab["free"] == []
+
+
+def test_a_structured_only_payload_records_the_suppression_via_rewrote_structured():
+    """`rewrote_structured` is the ONLY term that records #286's flagship shape, and nothing
+    was testing it — deleting it left the whole suite green while the phantom bill returned.
+
+    Every other suppression test drives the gate through `marker_in_text`, because the shared
+    `_result_msg(..., structured=True)` fixture always carries a text block of 20 records that
+    tabularizes. So the text marker alone carried the gate and the structured term was
+    decoration as far as the suite could tell.
+
+    Here the text block is deliberately NOT compressible, so the only wire form terse emits is
+    in `structuredContent` itself (#141) — which is exactly what a `structuredContent`-only
+    downstream looks like."""
+    rows: list[tuple[str, str, bool]] = []
+    inter = Interceptor(FULL, stats_primer=lambda c, t, a=True: rows.append((c, t, a)))
+    # `structured: auto` decides per CLIENT, so the handshake has to happen or the typed
+    # field is left untouched and this test would silently stop exercising the term.
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                   "params": {"clientInfo": {"name": "claude-code"}}}))
+    _note_call(inter, 2, "gh.api.items")
+    msg = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {
+        # Short, non-record text: no terse marker can appear here.
+        "content": [{"type": "text", "text": "ok"}],
+        # The compressible payload lives ONLY in the typed field.
+        "structuredContent": {"result": [{"id": i, "status": "active",
+                                          "url": "https://x/api"} for i in range(20)]}}})
+    out = json.loads(inter.transform_response(msg))
+
+    # Precondition: the text block really carries no marker, so `marker_in_text` is False
+    # and this test genuinely exercises the structured term rather than riding the text one.
+    assert '"__terse_' not in json.dumps(out["result"]["content"])
+    assert '"__terse_' in json.dumps(out["result"]["structuredContent"])
+
+    assert rows == [("once/session", inter._primer_text, False)]
+
+
+def test_the_report_names_the_declined_case_and_its_legend():
+    """The two rewritten strings that the `free` line's test did not cover. Both were
+    reworded because they described `free` by its only previous cause and so stated
+    falsehoods about #286's shape — and both survived mutation afterwards, which is how
+    the first wrong wording lasted as long as it did."""
+    from terse.stats import build_primer_section
+    liab = primer_liability([_scan_row()],
+                            _agg_with(blocks_for="gh-server", primer_rows=[_suppressed()]))
+    text = "\n".join(build_primer_section(liab))
+    # Collapsed whitespace, so these assert the SENTENCE and not where it happens to wrap —
+    # a line break moving is not a regression, and pinning one makes the test brittle.
+    flat = " ".join(text.split())
+    assert "DECLINED" in flat                       # the measured-zero stanza exists...
+    assert "so they pay nothing at all (#286)" in flat
+    assert "every result carried" not in flat       # ...and no longer over-claims
+    # The table legend for the cadence this entry now reports.
+    assert "1x- = unpaid" in flat
+    assert "every primer was declined" in flat
+    # The old wording asserted something the blocks column contradicts.
+    assert "1x- = installed but not triggered" not in flat

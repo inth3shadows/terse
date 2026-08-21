@@ -909,7 +909,16 @@ class Interceptor:
                 isinstance(b, dict) and b.get("type") == "text"
                 and isinstance(b.get("text"), str) and '"__terse_' in b["text"]
                 for b in content)
-            wire_form_emitted = (primer_pending and changed
+            # NO `changed` term, deliberately: the attach gate four lines below is
+            # `marker_in_text` alone, and these two must agree on what "the client will see a
+            # terse envelope" means or the same content records a primer when it is text-only
+            # and records NOTHING when `structuredContent` rides along. A round-2 revision had
+            # `changed and ...` here and disagreed on 96 of a 504-case matrix -- every one of
+            # them a doubly-wrapped peer or a downstream whose own text is already a terse
+            # envelope, a shape `_cadence`'s docstring names as live. It failed safe (an
+            # estimate, never a fabricated zero) but re-opened #286's bill for exactly that
+            # shape. `primer_pending` already does the cost-avoidance `changed` was added for.
+            wire_form_emitted = (primer_pending
                                  and (marker_in_text or rewrote_structured))
             suppressed_owed = (structured_present and wire_form_emitted
                                and not self._primer_suppressed_logged)

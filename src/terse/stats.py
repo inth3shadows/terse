@@ -1491,7 +1491,9 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # A measured ZERO: the proxy recorded a SUPPRESSION for every label of this entry
         # and no attach anywhere. `not any(... attached_label)` is what makes an attach win
         # and is the load-bearing term -- `not measured` alone was NOT enough, because an
-        # untokenized attach fails `measured` while still being proof of payment. The `all()` is defensive only -- `_wrapped_labels` returns at most
+        # untokenized attach fails `measured` while still being proof of payment.
+        #
+        # The `all()` is defensive only -- `_wrapped_labels` returns at most
         # one label and multi-label entries are routers, excluded below -- so `all` and `any`
         # are structurally identical today and no test can distinguish them. Kept because it
         # states the intent for whoever makes an entry multi-label, not because it fires.
@@ -1659,13 +1661,23 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         if paid:
             lines.append(f"             {len(paid)} recorded an emission.")
         if never:
+            # NOT "every result carried `structuredContent`": the row proves only that the
+            # result which WOULD have carried the primer did, and that none attached later.
+            # A server that emits one such result and then only passthrough text produces
+            # the same row. The verdict stays true; that reason would not.
             lines.append(f"             {len(never)} recorded that the primer was DECLINED "
-                         f"(every result carried")
-            lines.append("             `structuredContent`), so they pay nothing at all "
-                         "(#286).")
+                         f"— `structuredContent` on the")
+            lines.append("             result that would have carried it, and none attached "
+                         "later, so they pay")
+            lines.append("             nothing at all (#286).")
         if len(paid) + len(never) < len(servers):
-            lines.append("             The rest are sized from policy and inferred to have "
-                         "paid.")
+            # "except any listed as free below": an estimated entry that was never triggered
+            # appears in BOTH this sentence and the free list below, which reads as a
+            # contradiction. The estimate is about the primer's SIZE, not about whether it
+            # was paid; the free list is the authority on the latter.
+            lines.append("             The rest are sized from policy and assumed paid — "
+                         "except any listed as")
+            lines.append("             free below, where the ledger settles it.")
     if liab["unresolved"]:
         lines.append(f"  {liab['unresolved']} server(s) have an unreadable policy and are "
                      f"NOT counted — treat both figures as lower bounds.")
@@ -1744,7 +1756,7 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         # column three lines below it.
         lines.append("  cost nothing at all this window — never triggered, or triggered "
                      "and the primer was")
-        lines.append(f"  declined every time (#211, #286): "
+        lines.append(f"  declined and never attached (#211, #286): "
                      f"{', '.join(sorted(liab['free']))}")
     lines += _build_break_even_table(servers)
     return lines
