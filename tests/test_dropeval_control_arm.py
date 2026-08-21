@@ -219,10 +219,12 @@ def test_gap_rows_omit_accuracy_entirely_without_a_control():
 
 # --------------------------------------------------------------------------- #
 # The k <= t invariant. Every row this module emits is later divided by its own
-# `<form>_trials` inside `_form_stats`, which computes p̂(1-p̂); p̂ > 1 makes that
-# NEGATIVE and takes `math.sqrt` down with it, killing the whole report at render
-# time. This crashed a live 3-model run and no unit test saw it, because every
-# hand-built fixture happened to satisfy the invariant by construction.
+# `<form>_trials` inside `_form_stats`, which now raises ValueError on a k>t
+# violation rather than silently computing an impossible accuracy (#297) —
+# still killing the whole report at render time, just loudly and by design
+# instead of via a stray `math.sqrt(negative)`. This crashed a live 3-model run
+# and no unit test saw it, because every hand-built fixture happened to satisfy
+# the invariant by construction.
 # --------------------------------------------------------------------------- #
 
 
@@ -264,7 +266,7 @@ def test_no_success_count_can_exceed_its_own_trial_count():
 
 
 def test_the_report_renders_rather_than_crashing_when_calls_fail():
-    """End-to-end guard on the same invariant: `_form_stats` -> math.sqrt(negative)."""
+    """End-to-end guard on the same invariant: `_form_stats` raises ValueError on k>t."""
     rows = _live_rows(n_fail=4)
     build_dropeval_report({"m": rows})  # must not raise
 

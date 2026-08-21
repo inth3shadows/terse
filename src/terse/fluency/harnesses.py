@@ -67,7 +67,7 @@ def _ask_n(answerer: Answerer, system: str, user: str,
 
     Repeating at temperature 0 is not redundant — it surfaces the provider-side
     nondeterminism (batching / MoE routing) behind the ~5pt run-to-run accuracy wobble the
-    report's binomial bound quantifies.
+    report's question-clustered bound quantifies.
 
     An unanswered call is counted SEPARATELY and never scored. It is not a wrong answer:
     either the model was never reached at all (transport failure, #263), or it was reached
