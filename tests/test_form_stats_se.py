@@ -113,9 +113,33 @@ def test_a_wide_conservative_gap_ci_never_argues_a_real_fail_is_noise():
     """gap_ci here is only ever an OVER-estimate of the gap's true spread (it discards the
     positive correlation between paired arms), so it can rule a gap "not yet tightly
     measured" but must never rule a genuine FAIL "indistinguishable from noise" -- round-2
-    review's repro of exactly that contradiction, now gated on `not worst.passed`."""
+    review's repro of exactly that contradiction. Round 2's first fix only gated the FAIL
+    side; round 3 removed the "not distinguishable from noise" verdict-language entirely
+    (it was still reachable on a PASS, off the same over-loose bound) in favor of wording
+    that never claims significance either way."""
     md = build_fluency_report({"m1": _lopsided_regression_rows()}, [])
     assert "**FAIL**" in md
     assert "not distinguishable from noise" not in md
     assert "indistinguishable" not in md
-    assert "treat the FAIL as real" in md
+    assert "treat the verdict above as real" in md
+
+
+def _wide_ci_pass_rows() -> list[dict]:
+    """25 questions, trials=5: a real ~5pt regression that PASSES the tolerance gate, whose
+    gap_ci (±17pts) is wide enough that the old wording would have called it "not
+    distinguishable from noise" -- round-3 review's repro that the PASS side of the same
+    branch had the identical bug the FAIL side was fixed for in round 2."""
+    raw_terse = [(2, 2), (4, 4), (2, 1), (1, 1), (2, 2), (5, 5), (2, 2), (4, 4), (5, 5),
+                 (4, 4), (0, 0), (3, 3), (1, 0), (1, 1), (2, 1), (1, 1), (1, 1), (4, 4),
+                 (1, 0), (4, 4), (2, 1), (3, 2), (3, 3), (5, 5), (3, 3)]
+    return [{"qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 5,
+             "raw_ok": r, "terse_ok": t, "primer_ok": t, "fails": 0, "attempts": 15}
+            for i, (r, t) in enumerate(raw_terse)]
+
+
+def test_a_wide_conservative_gap_ci_also_never_argues_a_pass_is_noise():
+    md = build_fluency_report({"m1": _wide_ci_pass_rows()}, [])
+    assert "**PASS**" in md
+    assert "not distinguishable from noise" not in md
+    assert "indistinguishable" not in md
+    assert "This PASS is smaller than a" in md

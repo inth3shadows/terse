@@ -44,7 +44,6 @@ def _form_stats(rows: list[dict[str, Any]], form: str) -> tuple[float, float]:
     pre-#297 formula restricted to n=1 — the best estimate available with one cluster,
     not a confident zero.
     """
-    tot_t = tot_k = 0
     ks: list[int] = []
     ts: list[int] = []
     for r in rows:
@@ -59,19 +58,19 @@ def _form_stats(rows: list[dict[str, Any]], form: str) -> tuple[float, float]:
         # Every emitter is responsible for its own k<=t invariant (dropeval's is pinned
         # by test_no_success_count_can_exceed_its_own_trial_count) — this is the
         # last-line check so a future violation fails loud here, at its source, instead
-        # of silently publishing an impossible accuracy. Covers t<0 and the t==0/k>0
-        # corner too (a row can score a "success" on zero trials only by the same class
-        # of bug this guard exists to catch) — not gated on `t > 0` the way an earlier
+        # of silently publishing an impossible accuracy. `0 <= k <= t` alone already
+        # rejects every t<0 row (no k>=0 can satisfy k<=t<0) as well as the t==0/k>0
+        # corner (a row can score a "success" on zero trials only by the same class of
+        # bug this guard exists to catch) — not gated on `t > 0` the way an earlier
         # revision was, which let exactly that corner through.
-        if t < 0 or not (0 <= k <= t):
+        if not (0 <= k <= t):
             raise ValueError(f"{form}: {k} successes over {t} trials is not a valid count")
-        tot_t += t
-        tot_k += k
         if t > 0:
             ks.append(k)
             ts.append(t)
-    if tot_t <= 0 or not ks:
+    if not ks:
         return 0.0, 0.0
+    tot_t, tot_k = sum(ts), sum(ks)
     acc = tot_k / tot_t
     n = len(ks)
     if n < 2:
@@ -494,17 +493,21 @@ def _worst_case_gap(
     for model, (facc, fse, cacc, cse) in rows.items():  # this is a private local, not the
         gap = facc - cacc                               # public interface callers rely on.
         # sqrt(fse^2+cse^2) assumes the two arms' SEs are independent, which overstates
-        # the true (positively correlated, paired-on-question) variance — a one-sided
-        # OVER-estimate of the gap's spread, never an under-estimate. `passed` below does
-        # NOT read gap_ci (it gates on the point estimate `gap` alone), so this looseness
-        # cannot flip the merge gate itself; the only consumer of `gap_ci` is advisory
-        # prose (`build_fluency_report`), which is why that prose is written to never let
-        # a wide gap_ci argue AWAY a FAIL — an over-estimate can rule a gap "not yet
-        # tightly measured", never "not real". #297 made both SEs cluster-robust instead
-        # of ~0, so this bound is now wide enough to matter for that prose, not just a
-        # formality. A tighter, correct fix is a paired cluster-robust SE on the
-        # per-question DIFFERENCE rather than combining two independent arm SEs; tracked
-        # as a follow-up rather than folded into #297's scope.
+        # the true paired-on-question variance FOR ANY PAIR OF ARMS THAT ARE POSITIVELY
+        # CORRELATED — the normal case, since question difficulty is shared across arms.
+        # (It is not a universal upper bound: two arms that are anti-correlated on which
+        # questions they get right would make this an UNDER-estimate instead — just not a
+        # shape real comprehension arms take.) `passed` below does NOT read gap_ci (it
+        # gates on the point estimate `gap` alone), so this looseness cannot flip the
+        # merge gate itself; the only consumer of `gap_ci` is advisory prose
+        # (`build_fluency_report`), which is why that prose is written to never let a wide
+        # gap_ci argue AWAY a verdict — a bound that is only reliably an over-estimate can
+        # rule a gap "not yet tightly measured", never "not real". #297 made both SEs
+        # cluster-robust instead of ~0, so this bound is now wide enough to matter for
+        # that prose in practice, not just a formality. A tighter, correct fix is a
+        # paired cluster-robust SE on the per-question DIFFERENCE rather than combining
+        # two independent arm SEs; tracked as a follow-up rather than folded into #297's
+        # scope.
         gap_ci = _ci(math.sqrt(fse ** 2 + cse ** 2))
         if worst is None or gap < worst[1]:
             worst = (model, gap, facc, cacc, gap_ci)
@@ -1958,28 +1961,28 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     if worst:
         helps = sum(1 for s in gated.values() if s["primer"] > s["terse"] + 1e-9)
         out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "best terse-form", "raw"))
-        # Gated on `not worst.passed` on purpose: `gap_ci` combines the two arms' SEs as
-        # if independent (√(fse²+cse²)), which overstates the true, positively-correlated
-        # variance of a PAIRED gap — before #297 that didn't matter because both SEs were
-        # ~0 by default, but the cluster-robust SE is routinely several points wide, and
-        # measured against a real fixture this bound is wide enough to call a genuine
-        # FAIL "noise" (the correct paired CI on the same data was tighter and did NOT
-        # cross the gap). A bound that is only ever an OVER-estimate cannot support a
-        # "not distinguishable" conclusion, so it must never contradict a FAIL; showing
-        # it only alongside a PASS is the honest use of a one-sided bound. (A proper
-        # paired cluster-robust SE on the per-question difference would let this fire
-        # under a FAIL too — tracked as a follow-up, not folded into #297's scope.)
-        if not worst.passed and worst.gap_ci > 1e-9 and abs(worst.gap) < worst.gap_ci:
-            out.append("- Note: this gap is also smaller than a (loose, conservative) "
-                       "upper-bound estimate of its own noise floor — treat the FAIL as "
-                       "real, but not yet tightly measured.")
-        elif worst.gap_ci > 1e-9 and abs(worst.gap) < worst.gap_ci:
-            # More questions tighten this without limit; more trials only tighten it down
-            # to the between-question floor (they resample k, not the question set) — so
-            # this is deliberately NOT "raise `--trials`", which #297's own estimator
-            # makes false as the sole lever, but also not "trials never help".
-            out.append("- The gap is within its own (conservative) confidence interval — "
-                       "not distinguishable from noise at this question count; more "
+        # `gap_ci` combines the two arms' SEs as if independent (√(fse²+cse²)), which
+        # overstates the true variance of a PAIRED gap whenever the arms are positively
+        # correlated (the normal case — question difficulty is shared) — before #297 that
+        # didn't matter because both SEs were ~0 by default, but the cluster-robust SE is
+        # routinely several points wide, and this bound is wide enough in practice to call
+        # a genuine regression "noise" (the correct paired CI on the same data can be
+        # several times tighter and not cross the gap at all). A bound that is only ever
+        # an OVER-estimate cannot support a "not distinguishable" conclusion on EITHER
+        # side of the tolerance line, so neither branch below claims one — only that the
+        # gap is smaller than a loose ceiling on its own noise. (A proper paired
+        # cluster-robust SE on the per-question difference would let this section make a
+        # real significance claim — tracked as a follow-up, not folded into #297's scope.)
+        if worst.gap_ci > 1e-9 and abs(worst.gap) < worst.gap_ci:
+            # More questions tighten this bound without limit; more trials also tighten
+            # it, but only down to a between-question floor they can't cross (they
+            # resample k, not the question set) — so this is neither "raise `--trials`"
+            # (#297's own estimator makes that false as the SOLE lever) nor "trials never
+            # help" (also false).
+            verdict_word = "This PASS" if worst.passed else "Note: this gap"
+            out.append(f"- {verdict_word} is smaller than a (loose, conservative) "
+                       "upper-bound estimate of its own noise floor — treat the verdict "
+                       "above as real, not yet as a tightly measured margin; more "
                        "questions would tighten this bound further than more trials would.")
         out.append(f"- The primer improves terse-form accuracy for {helps}/{len(gated)} model(s).")
         if worst.passed:

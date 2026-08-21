@@ -21,10 +21,10 @@ fails that pull request until the section has moved.
   all-wrong across its own trials, so the SE collapsed to ≈0 at ANY accuracy regardless of
   how much the *questions* disagreed with each other run to run — two runs at identical
   accuracy could report `±0%` and `±3%`, with the more volatile one printing as more
-  certain. Replaced with a cluster-robust (sandwich) SE that clusters on the question, and
-  is invariant to `--trials` by construction (more questions tighten it; more trials only
-  down to a between-question floor). Every report's `±` column, the `--trials` help text,
-  and a stale "raise `--trials` to tighten" remediation line are updated to match.
+  certain. Replaced with a cluster-robust (sandwich) SE that clusters on the question:
+  more questions tighten it without limit, while more trials tighten it only down to a
+  between-question floor they can't cross. Every report's `±` column, the `--trials` help
+  text, and a stale "raise `--trials` to tighten" remediation line are updated to match.
 
 ## [0.28.2] - 2026-08-20
 
