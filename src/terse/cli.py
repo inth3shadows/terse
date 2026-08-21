@@ -410,7 +410,16 @@ def _ledger_keys(server: str | None, tool: str) -> set[str]:
 def _ledger_traffic(rows: list[dict]) -> dict[str, dict[str, int]]:
     """Live traffic per candidate rule name. A row contributes to each of its names
     separately (a lookup reads exactly one), so a qualified/bare collision cannot
-    double-count."""
+    double-count *within a single lookup* — a caller that looks up more than one
+    overlapping name for the same underlying rows (a bare AND a qualified spelling of
+    what is really one tool) and sums both can still double-count; nothing here prevents
+    that, because the caller — not this index — knows which names it is treating as
+    distinct rules.
+
+    Carries `raw_chars`/`out_chars` alongside the token fields (#274 review) so a caller
+    can fall back to chars on a tiktoken-less ledger, the same fallback `terse stats`
+    itself uses — without this a chars-only ledger left every consumer's token fields at
+    0 and any threshold check gated on them went silently, permanently inert."""
     from .capture import qualify
 
     idx: dict[str, dict[str, int]] = {}
@@ -421,10 +430,80 @@ def _ledger_traffic(rows: list[dict]) -> dict[str, dict[str, int]]:
         # what the rule actually carries. The blind-spot check cannot afford the same
         # licence — there, a wrong match hides traffic instead of merely widening a count.
         for key in {qualify(tool, _ledger_server(row)), tool}:
-            acc = idx.setdefault(key, {"blocks": 0, "raw_tokens": 0, "out_tokens": 0})
+            acc = idx.setdefault(key, {"blocks": 0, "raw_tokens": 0, "out_tokens": 0,
+                                        "raw_chars": 0, "out_chars": 0})
             for f in acc:
                 acc[f] += row.get(f, 0)
     return idx
+
+
+def _tune_ledger_warnings(rows: list[dict],
+                          traffic: dict[str, dict[str, int]]
+                          ) -> list[tuple[str, int, float, str, int]]:
+    """`(tool, blocks, live_pct, unit, raw)`, DESCRIPTIVE not a verdict: live ledger
+    traffic for every `tune`-generated passthrough row that has any (#274).
+
+    The corpus is idempotent by sha (`capture_payload`, capture.py) — it holds each
+    payload's first sighting, not every call — and capped at `MAX_SAMPLES_PER_TOOL` (200)
+    samples per tool, oldest evicted first. So a tool called twice and one called 800 times
+    weigh alike in `_tool_decision`'s percentage: the corpus is structurally blind to call
+    FREQUENCY and can under-represent a high-volume tool's real shape. `policy autotune`
+    already cross-checks its DOWNGRADES against the ledger for the same reason (`_weight`,
+    `_cmd_policy_autotune`); `tune` authors a policy from nothing, so every passthrough row
+    gets the same second look here — shown, not judged, for the same reason `_weight` never
+    asserts a verdict either:
+
+    `live_pct` is NOT the same quantity `--threshold` gates. The corpus percentage is the
+    LOSSLESS-tier-only saving `_tool_decision` measures; the ledger percentage is whatever
+    the currently-DEPLOYED policy actually achieved, which can include the cross-call diff
+    tier, a different policy revision entirely, or (via the chars fallback below) a
+    different unit. An earlier cut of this function compared the two against `--threshold`
+    directly and could flag a tool the corpus classified correctly — review finding. There
+    is no reliable way to normalise them from a ledger row alone, so this returns the raw
+    numbers and leaves the judgment to the operator, same as `_weight` already does.
+
+    Excludes only the one unmistakably non-economic passthrough: a round-trip failure
+    (`gate_fail`, `_tool_decision` — its reason names it, matched by `\"round-trip\"`).
+    "capture more" cannot fix a tool the codec cannot losslessly handle at all. A
+    `total_pct < threshold` passthrough caused by a failed EMBEDDED round-trip (`emb_fail`)
+    is not excluded here: its base lossless tiers were measured and genuinely fell short,
+    which is the ordinary economic case with an extra reason attached, not a different one.
+
+    Falls back to chars where the ledger has no tokens — the same fallback `terse stats`
+    itself uses at the whole-ledger level (`stats.py`'s `use_tokens`) — so a tiktoken-less
+    ledger does not leave this permanently, silently inert (review finding: gating on
+    `raw_tokens` alone did exactly that). `blocks` still counts EVERY ledger row for the
+    tool, tokenized or not, while `raw`/`live_pct` sum only whichever unit (tok, else
+    chars) actually had a nonzero total. On a ledger mixing the two for one tool — spanning
+    a tokenizer-availability change — the printed block count is not merely a little wide of
+    the percentage's real denominator; it can be dominated by rows the percentage never
+    counted at all (100 chars-only rows plus 1 tokenized row prints "N% saved over 101 live
+    block(s)" computed from that 1 row alone — review finding). Left as an informational
+    imprecision rather than tracked per-unit in `_ledger_traffic`, same as `_weight`'s block
+    count carries today, now that this is display only rather than a threshold gate.
+
+    Looked up by tool name alone, same as `_weight` — not through `_ledger_keys`/identities,
+    so a corpus holding both a bare and a qualified row for what is really one tool
+    (mixed-vintage captures before and after `--server-name`) can have both shown with
+    their live totals overlapping, and a ledger whose resolved server label differs from
+    the corpus's `--server` can miss the match entirely. Both pre-existing in the shared
+    lookup pattern, not introduced here; left as-is rather than pulling identity resolution
+    into `tune` for edge cases `policy autotune` itself does not close in `_weight` either
+    (review findings)."""
+    passthrough = [r for r in rows if not r["tiers"] and "round-trip" not in r["reason"]]
+    shown = []
+    for r in passthrough:
+        t = traffic.get(r["tool"])
+        if not t:
+            continue
+        if t["raw_tokens"]:
+            raw, out, unit = t["raw_tokens"], t["out_tokens"], "tok"
+        elif t["raw_chars"]:
+            raw, out, unit = t["raw_chars"], t["out_chars"], "chars"
+        else:
+            continue
+        shown.append((r["tool"], t["blocks"], (raw - out) / raw * 100, unit, raw))
+    return sorted(shown, key=lambda f: -f[2])
 
 
 def _ledger_blind_spots(rows: list[dict],
@@ -462,18 +541,26 @@ def _ledger_blind_spots(rows: list[dict],
                   reverse=True)
 
 
-def _resolve_ledger(arg: str | None) -> tuple[list[dict], Path | None, int]:
+def _resolve_ledger(arg: str | None, cmd: str = "policy autotune"
+                    ) -> tuple[list[dict], Path | None, int]:
     """`(rows, path, exit_code)`. The ledger is an ENRICHMENT, never a precondition —
-    autotune must behave identically on a machine that has never written one, so a missing
+    the caller must behave identically on a machine that has never written one, so a missing
     default path is skipped in silence. A path the operator *named*, though, is an error:
-    they asked for coverage to be checked against a specific file, and quietly proceeding
-    without it would misreport how much of the install was actually seen."""
+    they asked for the corpus's verdict to be cross-checked against a specific file, and
+    quietly proceeding without it would misreport what that file actually showed.
+
+    Shared by two callers with different uses for the rows: `policy autotune` checks
+    coverage (which live tools the corpus never captured at all, and whether a proposed
+    DOWNGRADE has real traffic behind it) and `tune` checks a fresh passthrough decision
+    against live savings (#274). `cmd` names the error line only, so each caller's own
+    missing-file failure says who was asked for it rather than misattributing to the
+    other."""
     from .stats import aggregate, default_stats_log, load_stats
 
     path = Path(arg).expanduser() if arg is not None else default_stats_log()
     if not path.exists() and not path.with_name(path.name + ".1").exists():
         if arg is not None:
-            print(f"policy autotune: no ledger at {path}", file=sys.stderr)
+            print(f"{cmd}: no ledger at {path}", file=sys.stderr)
             return [], None, 2
         return [], None, 0
     return aggregate(load_stats(str(path)))["tools"], path, 0
@@ -960,6 +1047,45 @@ def _cmd_tune(args: argparse.Namespace) -> int:
     doc, rows = generate_policy(envelopes, threshold=args.threshold)
     cands = [{"tool": r["tool"], **dr} for r in rows for dr in r.get("drop_rows", [])]
 
+    # Resolved before the report, same convention as `policy autotune`: a named-but-missing
+    # ledger fails loud rather than silently printing a report the operator would then have
+    # to discard. Skipped entirely when neither applies — no `--ledger` given AND no
+    # passthrough row could use one — so a well-tuned install's plain `terse tune` does not
+    # pay for a ledger load (potentially the whole file, `load_stats`) it has no use for
+    # (review finding). A NAMED path is always resolved regardless, so `--ledger <path>`
+    # keeps its fail-loud contract even when it turns out nothing needed it.
+    passthrough_exists = any(not r["tiers"] and "round-trip" not in r["reason"]
+                             for r in rows)
+    traffic: dict[str, dict[str, int]] = {}
+    if args.ledger is not None or passthrough_exists:
+        ledger_rows, ledger_path, rc = _resolve_ledger(args.ledger, cmd="tune")
+        if rc:
+            return rc
+        # Unconditional, matching `_cmd_policy_autotune`'s own call: `ledger_path` is None
+        # only when `ledger_rows` is already `[]`, and `_ledger_traffic([])` is `{}` either
+        # way — the extra guard implied a code path that cannot occur (review finding).
+        traffic = _ledger_traffic(ledger_rows)
+
+    print(f"# terse tune — {len(envelopes)} payload(s), {len(rows)} tool(s), "
+          f"{len(cands)} drop candidate(s)")
+
+    # Rationale in `_tune_ledger_warnings`'s own docstring (#274) — this call site just
+    # prints whatever it finds. Printed BEFORE `--out` writes the policy below: writing
+    # first and reporting after would have shown the write as already a fait accompli
+    # (review finding).
+    shown = _tune_ledger_warnings(rows, traffic)
+    if shown:
+        print(f"\n[note] {len(shown)} tool(s) this corpus marks passthrough have live "
+              f"traffic in the ledger:")
+        for tool, blocks, live_pct, unit, raw in shown:
+            print(f"  ! {tool:<28} {live_pct:5.1f}% saved over {blocks:,} live "
+                  f"block(s), {raw:,} {unit} raw")
+        print("    the corpus is a SAMPLE (idempotent by sha, capped per tool) and can "
+              "under-represent these tools. This is not a verdict — the two percentages "
+              "measure different things (deployed policy vs. this corpus's lossless "
+              "tiers) — but a passthrough tool with real live traffic is worth a look "
+              "with `terse stats` before trusting the corpus alone.")
+
     if args.out:
         from .policy import load_policy
         out = Path(args.out)
@@ -967,8 +1093,6 @@ def _cmd_tune(args: argparse.Namespace) -> int:
         out.write_text(_json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         load_policy(out)  # fail loud if we just wrote a policy our own loader rejects
 
-    print(f"# terse tune — {len(envelopes)} payload(s), {len(rows)} tool(s), "
-          f"{len(cands)} drop candidate(s)")
     if not cands:
         print("no drop-to-retrieve candidates — the lossless tiers already cover these tools, "
               "or every large field is a key/identity (never dropped).")
@@ -1811,6 +1935,13 @@ def main(argv: list[str] | None = None) -> int:
     tn.add_argument("--out", help="write the generated policy here (suggestions inactive)")
     tn.add_argument("--threshold", type=float, default=5.0, metavar="PCT",
                     help="min total savings %% to compress a tool at all (default 5.0)")
+    tn.add_argument("--ledger", default=None, metavar="FILE",
+                    help="savings ledger to show live traffic for passthrough tools "
+                         "(default: the one `terse stats` reads; skipped silently if "
+                         "absent). The corpus is idempotent by sha and capped per tool, so "
+                         "it is blind to call frequency — this surfaces a passthrough "
+                         "tool's live numbers so you can judge whether it under-sampled "
+                         "(#274).")
     tn.add_argument("--drop-eval", action="store_true",
                     help="also verify the suggested drops with a live tool-calling model "
                          "(needs TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS or --base-url/--models)")
