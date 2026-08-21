@@ -501,8 +501,10 @@ def _worst_case_gap(
         # gates on the point estimate `gap` alone), so this looseness cannot flip the
         # merge gate itself; every consumer of `gap_ci` (`build_fluency_report`'s worst-
         # case prose here, `_format_worst_case_line`'s "±N pts" headline shared by the
-        # diff/diff-soak/dropeval reports, the diff-soak deepest-slice line, and the HTML
-        # forest plot's whiskers) renders it as a width, never as a significance test —
+        # diff/diff-soak/dropeval/fluency reports, the diff-soak deepest-slice line, and
+        # `build_html_diff_report`'s verdict banner) renders it as a width, never as a
+        # significance test — note this is NOT the HTML forest plot's whiskers, which read
+        # per-arm `form_ci`/`control_ci`, not `gap_ci`, at all —
         # which is why `build_fluency_report` is written to never let a wide gap_ci argue
         # AWAY a verdict: a bound that is only reliably an over-estimate can rule a gap
         # "not yet tightly measured", never "not real". #297 made both SEs cluster-robust
