@@ -96,7 +96,13 @@ def test_an_uncalled_standalone_entry_costs_nothing_rather_than_a_turn_of_primer
     assert liab["session_once_tokens"] == 0
     assert liab["idle"] == []                          # NOT "pure cost"
     assert liab["free"] == ["kb"]
-    assert "costing nothing at all" in "\n".join(build_primer_section(liab))
+    text = "\n".join(build_primer_section(liab))
+    assert "cost nothing at all this window" in text
+    # The sentence was reworded when `free` gained a second population (#286: triggered
+    # heavily, primer declined every time). It used to assert "installed but not triggered",
+    # which became a flat contradiction of the `blocks` column for that case. Both causes
+    # are named now, so this entry — genuinely never triggered — is still covered.
+    assert "never triggered" in text
 
 
 def test_a_called_standalone_entry_is_billed_once_per_session_not_per_turn(tmp_path):

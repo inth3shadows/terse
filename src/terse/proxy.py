@@ -289,7 +289,7 @@ class Interceptor:
                  dropped_bytes: list[int] | None = None,
                  origins: dict[str, tuple[str, str, str]] | None = None,
                  stats_retrieve: Callable[[str, str, str, bool, str], None] | None = None,
-                 stats_primer: Callable[[str, str], None] | None = None,
+                 stats_primer: Callable[[str, str, bool], None] | None = None,
                  ledger_label: str | None = None,
                  log_prefix: str = "[terse-proxy]",
                  lazy_primer: bool = True):
@@ -431,6 +431,13 @@ class Interceptor:
         # emits no compressible form at all" (`build_primer` returns "" for a default-deny
         # policy) into the same no-op state, so neither needs its own branch later.
         self._primer_sent = not (lazy_primer and self._primer_text)
+        # Whether this process has already recorded a SUPPRESSED primer (#286). Separate
+        # from `_primer_sent` because they answer different questions and a session can do
+        # both -- suppressed on an early `structuredContent` result, attached on a later
+        # text-only one. One row of each is the truth; the reader treats an attach as
+        # authoritative. Bounded to one per process so a server that returns
+        # `structuredContent` on every call writes one row, not one per result.
+        self._primer_suppressed_logged = False
         # The two proxy pump threads call note_request (client->server) and
         # transform_response (server->client) concurrently, both mutating pending/last/
         # since_keyframe/init_id state. `_local_lock` serializes each method against the
@@ -507,6 +514,7 @@ class Interceptor:
                 # tools/call results would compress freely with no primer ever explaining
                 # the wire forms to the NEW context.
                 self._primer_sent = not (self._lazy_primer and self._primer_text)
+                self._primer_suppressed_logged = False
                 # A reconnecting client restarts its JSON-RPC ids at 1 while this process
                 # keeps one session id, so `sess:1` from before and after the reconnect
                 # would name two unrelated results the same and the corpus would fuse them
@@ -867,32 +875,99 @@ class Interceptor:
             # `structuredContent` never finds that later call — a known, narrow, accepted
             # gap (see #168 plan notes), not silently pretended away.
             structured_present = isinstance(result, dict) and "structuredContent" in result
-            if not self._primer_sent and self._lazy_primer and not structured_present:
-                marker_in_text = any(
-                    isinstance(b, dict) and b.get("type") == "text"
-                    and isinstance(b.get("text"), str) and '"__terse_' in b["text"]
-                    for b in content)
-                if marker_in_text:
-                    content.insert(0, {"type": "text", "text": self._primer_text})
-                    self._primer_sent = True
-                    changed = True
-                    # DEFERRED, not called here (review of #311). The decision to bill is
-                    # made inside this branch -- the branch that actually attached it, so
-                    # everything outside it (a result carrying `structuredContent`, one
-                    # with no terse marker, a session that never produces a compressible
-                    # result at all) writes nothing, which is the whole point of #286. But
-                    # the WRITE has to happen after `_local_lock` is released, like every
-                    # other sink: `append_stats` stats/rotates/reads/appends a file, and a
-                    # blocking one -- stalled mount, full disk mid-rotation -- would hold
-                    # this lock, freeze `note_request`, and wedge every later tools/call on
-                    # the connection. try/except catches a sink that RAISES and does
-                    # nothing for one that BLOCKS; see the note above `deferred`.
-                    deferred.append((
-                        "primer ledger", "(primer)",
-                        partial(self._emit_primer, PRIMER_CADENCE_ONCE,
-                                self._primer_text),
-                    ))
-
+            # Did terse put a wire form on THIS result? Computed once and shared by both
+            # branches below, because both ask the same question and only differ on what to
+            # do with the answer.
+            #
+            # An earlier revision asked it with `'"__terse_' in json.dumps(result)` and a
+            # comment claiming the short-circuit made that run "at most once per process".
+            # The claim was backwards (found in review): `_primer_suppressed_logged` only
+            # latches when the marker IS found, so on a server that never produces one --
+            # all-passthrough rules, a shape the codec never wins on -- every preceding term
+            # stayed true and the whole result was re-serialized on EVERY response, forever,
+            # inside `_local_lock`. Measured at ~265ms per response on 2MB payloads, on the
+            # very path `proxy.py` otherwise takes care never to serialize.
+            #
+            # `rewrote_structured` is the precise answer for the structured side (terse
+            # rewrote that field, so the marker is in it by construction) and a text-block
+            # scan is the answer for the other. No serialization, and it drops the
+            # quoted-marker false positive the dump inherited from the attach gate as well.
+            # Gated on `primer_pending`, not computed unconditionally. BOTH consumers below
+            # already require it, so without this guard the scan ran on every response for
+            # the entire life of the process -- long after the primer was sent, and even with
+            # `lazy_primer` off -- at ~0.8ms per 2MB no-match payload, under `_local_lock`.
+            # Hoisting the scan out of the old branch was right; hoisting it past its own
+            # precondition was not.
+            #
+            # Deliberately NOT covered by a dedicated test: "this expression did not
+            # evaluate" is not observable from outside without contriving a fixture that
+            # tests the contrivance. Its one behavioural consequence -- no suppression is
+            # recorded once the primer has been sent -- IS pinned, by
+            # `test_no_suppression_is_recorded_after_the_primer_has_already_attached`.
+            primer_pending = not self._primer_sent and self._lazy_primer
+            marker_in_text = primer_pending and any(
+                isinstance(b, dict) and b.get("type") == "text"
+                and isinstance(b.get("text"), str) and '"__terse_' in b["text"]
+                for b in content)
+            # NO `changed` term, deliberately: the attach gate four lines below is
+            # `marker_in_text` alone, and these two must agree on what "the client will see a
+            # terse envelope" means or the same content records a primer when it is text-only
+            # and records NOTHING when `structuredContent` rides along. A round-2 revision had
+            # `changed and ...` here and disagreed on 96 of a 504-case matrix -- every one of
+            # them a doubly-wrapped peer or a downstream whose own text is already a terse
+            # envelope, a shape `_cadence`'s docstring names as live. It failed safe (an
+            # estimate, never a fabricated zero) but re-opened #286's bill for exactly that
+            # shape. `primer_pending` already does the cost-avoidance `changed` was added for.
+            wire_form_emitted = (primer_pending
+                                 and (marker_in_text or rewrote_structured))
+            suppressed_owed = (structured_present and wire_form_emitted
+                               and not self._primer_suppressed_logged)
+            if suppressed_owed:
+                # The SUPPRESSION, written down rather than left to be inferred (#286,
+                # #317-redesign). This branch is the one #286 is about: the result carries a
+                # terse wire form, so a primer is owed, and the guard above refuses to
+                # attach it because the client would discard the text block unread. The
+                # cost is therefore genuinely zero -- and until this row existed, nothing
+                # in the ledger said so, leaving `primer_liability` to bill the full primer
+                # on the strength of "the server was called".
+                #
+                # Inference from a MISSING row cannot substitute: the primer decision
+                # happens once, at the session's first compressible result, while result
+                # rows accrue for hours afterwards, so any `--since` window or ledger
+                # rotation starting mid-session drops it and keeps the rest. A positive
+                # record survives both, because a truncated window then simply falls back
+                # to the estimate instead of publishing a fabricated zero.
+                #
+                # Gated on a wire form being present for the same reason the attach is: a
+                # result carrying no terse marker owes no primer, so suppressing one is not
+                # a fact worth recording. Checked across the WHOLE result, not just text --
+                # `structuredContent` itself may be what got compressed (#141).
+                self._primer_suppressed_logged = True
+                deferred.append((
+                    "primer ledger", "(primer)",
+                    partial(self._emit_primer, PRIMER_CADENCE_ONCE,
+                            self._primer_text, False),
+                ))
+            if primer_pending and not structured_present and marker_in_text:
+                content.insert(0, {"type": "text", "text": self._primer_text})
+                self._primer_sent = True
+                changed = True
+                # DEFERRED, not called here (review of #311). The decision to bill is
+                # made inside this branch -- the branch that actually attached it, so
+                # everything outside it (a result carrying `structuredContent`, one
+                # with no terse marker, a session that never produces a compressible
+                # result at all) writes nothing, which is the whole point of #286. But
+                # the WRITE has to happen after `_local_lock` is released, like every
+                # other sink: `append_stats` stats/rotates/reads/appends a file, and a
+                # blocking one -- stalled mount, full disk mid-rotation -- would hold
+                # this lock, freeze `note_request`, and wedge every later tools/call on
+                # the connection. try/except catches a sink that RAISES and does
+                # nothing for one that BLOCKS; see the note above `deferred`.
+                deferred.append((
+                    "primer ledger", "(primer)",
+                    partial(self._emit_primer, PRIMER_CADENCE_ONCE,
+                            self._primer_text),
+                ))
             if self.stats is not None:
                 deferred.append((
                     "stats", capture_tool,
@@ -1622,15 +1697,20 @@ class Interceptor:
         except Exception as exc:  # noqa: BLE001 — audit is never load-bearing
             self._warn_sink("audit", shown_tool, exc)
 
-    def _emit_primer(self, cadence: str, text: str) -> None:
+    def _emit_primer(self, cadence: str, text: str, attached: bool = True) -> None:
         """Record a primer that actually went out, with the cadence of the site that sent
         it (#311, #286).
 
-        Called from the two sites that emit one, and ONLY from inside the branch that
-        genuinely attached it -- a primer skipped for `structuredContent`, or never reached
-        because no compressible result arrived, writes nothing. That silence is the point:
-        `primer_liability` previously had to assume any called server paid, and #286 is what
-        that assumption cost in production.
+        Called from the two branches that make the decision, and only from inside them: the
+        one that ATTACHED a primer (`attached=True`, its real size) and the one that DECLINED
+        to, because the result carried `structuredContent` and the client would have discarded
+        it unread (`attached=False`, zero). A session that simply never produces a
+        compressible result writes nothing at all, which is correct -- it made no decision.
+
+        Recording the refusal rather than staying silent about it is the whole of #286.
+        Silence cannot be read: a window with no primer row is indistinguishable from one
+        whose row aged out of a `--since` or a rotation, so `primer_liability` had to fall
+        back to billing every called server a full primer.
 
         Same fail-open contract as `_emit_stats`: the callback owns its I/O and a failure
         here can never change what the client receives, so a dead ledger degrades the report
@@ -1647,7 +1727,7 @@ class Interceptor:
         # and a dead ledger going silent is what #131 exists to prevent. It also avoids the
         # substring "stats skipped", which is what a reader (and a test) greps for to count
         # RESULT-ledger failures.
-        emit(cadence, text)
+        emit(cadence, text, attached)
 
     def _emit_stats(self, tool: str, pairs: list[tuple[str, str]], *,
                     display_tool: str | None = None, diff_reason: str | None = None,

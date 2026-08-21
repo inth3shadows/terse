@@ -217,7 +217,8 @@ PRIMER_CADENCE_PER_TURN = "per-turn"
 PRIMER_CADENCE_ONCE = "once/session"
 
 
-def build_primer_record(server: str, *, cadence: str, primer: str) -> dict[str, Any]:
+def build_primer_record(server: str, *, cadence: str, primer: str,
+                        attached: bool = True) -> dict[str, Any]:
     """One ledger line for a primer that was ACTUALLY emitted (#311, #286).
 
     `primer_liability` sizes the primer from the INSTALLED policy and then uses the ledger
@@ -238,6 +239,19 @@ def build_primer_record(server: str, *, cadence: str, primer: str) -> dict[str, 
     The two are different units and must never be summed; storing the label is what keeps a
     consumer from having to guess.
 
+    `attached=False` records the OPPOSITE fact: a primer this proxy decided NOT to send,
+    because the result carried `structuredContent` and a text block inserted beside it would
+    be discarded by the client unread. That row is the whole of #286. Its `tokens` is 0
+    because nothing went out -- the cost really is zero, and the row exists to say so.
+
+    Recording the suppression rather than inferring it from a MISSING row is deliberate and
+    was arrived at the hard way (#317, redesigned after review). Inference cannot work: the
+    primer decision happens once, at a session's first compressible result, while result
+    rows accrue for hours after it, so any `--since` window or ledger rotation that starts
+    mid-session drops the primer row and keeps the rest. Absence therefore means "this
+    window cannot say", permanently and unfixably. Presence means something. So the proxy
+    writes down both answers and the reader never has to guess.
+
     Payload-free like every other record: the primer is measured and discarded. It is
     policy-derived text the operator's own configuration produced, never tool output.
 
@@ -254,9 +268,15 @@ def build_primer_record(server: str, *, cadence: str, primer: str) -> dict[str, 
         # Which cadence this site pays on. NOT a total: `_PER_TURN` rows are billed again
         # every turn by the client re-reading `instructions`, `_ONCE` rows are not.
         "cadence": cadence,
-        "bytes": len(primer),
+        # Whether the primer actually went out. False is not a failure -- it is a
+        # measurement of zero, and the ONLY thing that can distinguish "this server never
+        # pays a primer" from "this window does not contain the row".
+        "attached": bool(attached),
+        # 0 on a suppressed row: nothing was sent, so nothing was spent. Not `None` --
+        # `None` means "emitted, size unknown", which is a different claim entirely.
+        "bytes": len(primer) if attached else 0,
         # None (not 0) without tiktoken, matching `build_record`: unknown is not zero.
-        "tokens": count_cl100k(primer),
+        "tokens": count_cl100k(primer) if attached else 0,
     }
 
 
@@ -413,13 +433,31 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     # is not a compressed block, and it must never reach the saving denominator. Keyed by
     # (server, cadence) because the two cadences are different units and summing them is
     # the exact error `primer_liability` splits its report to avoid.
-    primers: dict[tuple[str, str], dict[str, int]] = {}
+    # Keyed by (server, cadence, attached): an attach and a suppression are opposite facts
+    # about the same server and must never merge into one row. That third key is what makes
+    # "this server provably pays nothing" expressible at all (#286).
+    primers: dict[tuple[str, str, bool], dict[str, int]] = {}
     for rec in records:
         if rec.get("event") == PRIMER_EVENT:
             psrv = str(rec.get("server", "unknown"))
-            pkey = (psrv, str(rec.get("cadence", "unknown")))
+            # A row with no `attached` key predates the field and can only be an attach --
+            # the suppression row did not exist then. Defaulting to True keeps an old ledger
+            # reading exactly as it did.
+            # `is not False`, NOT `bool(...)`. `.get` returns the default only when the key
+            # is ABSENT: an explicit `"attached": null` returns None, and `bool(None)` is
+            # False -- so a row that is self-evidently an attach (496 tokens, 992 bytes) was
+            # bucketed as a suppression and the entry published a measured zero. Same
+            # hand-edited/foreign-writer threat class the `rec_tok > 0` guard defends
+            # against. Only an explicit `false` means the primer was declined.
+            pkey = (psrv, str(rec.get("cadence", "unknown")),
+                    rec.get("attached", True) is not False)
             prow = primers.setdefault(pkey, {"emissions": 0, "tokens": 0,
                                              "bytes": 0, "untokenized": 0})
+            # Counts recorded DECISIONS, not emissions, on an `attached: false` row -- the
+            # decision there was to send nothing. The name predates the suppression row and
+            # is kept because it is a published `--json` field; `attached` is what tells a
+            # consumer which sense applies, and `primer_liability` never divides by an
+            # emission count from a suppressed row.
             prow["emissions"] += 1
             pb = rec.get("bytes")
             if isinstance(pb, int):
@@ -535,8 +573,8 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             # Primers actually emitted this window, by label and cadence (#311). Empty on
             # every ledger written before this shipped -- readers MUST treat empty as "this
             # ledger cannot say", not as "no primer was sent".
-            "primers": [{"server": s, "cadence": c, **row}
-                        for (s, c), row in sorted(primers.items())],
+            "primers": [{"server": s, "cadence": c, "attached": a, **row}
+                        for (s, c, a), row in sorted(primers.items())],
             # Costliest rule first: tokens the model spent fetching dropped values back.
             "retrieves": [{"server": s, "tool": t, "path": p, **row}
                           for (s, t, p), row in sorted(
@@ -964,7 +1002,7 @@ def _cadences_of(servers: list[dict[str, Any]]) -> set[str]:
 
 
 def _cadence(state: str | None, blocks: int | None, encoded: int | None,
-             recorded: bool = False) -> str:
+             recorded: bool = False, unpaid: bool = False) -> str:
     """How often this entry actually pays its primer, post-#211.
 
     `blocks` is the ledger's answer to "was it called", and its three-way None/0/N is load
@@ -1006,6 +1044,11 @@ def _cadence(state: str | None, blocks: int | None, encoded: int | None,
     # payload quotes a terse marker attaches the primer while `encoded` stays 0) is exactly
     # where the two disagree, and the report used to call such a server MEASURED and list it
     # as "costing nothing at all" in the same breath.
+    if unpaid:
+        # Proof, from a recorded suppression, that the primer never went out. Checked before
+        # `recorded` and before every inference: this is the one branch backed by a row the
+        # proxy wrote at the moment it made the decision.
+        return _ONCE_FREE
     if recorded:
         return _ONCE
     if blocks is None:
@@ -1057,8 +1100,16 @@ def _break_even(primer_tokens: int | None, blocks: int | None,
                         threshold it must clear is unknown. Reporting this as `never` would
                         condemn a server on evidence about a missing FILE (found in review
                         of #197).
-      no primer         a default-deny policy emits no compressed form and therefore no
-                        primer — nothing to earn back, at any rate, positive or negative.
+      no primer         nothing to earn back, at any rate, positive or negative. TWO
+                        distinguishable causes share this string, deliberately: a
+                        default-deny policy that emits no compressed form and therefore no
+                        primer, and (#286) a server whose primer is DECLINED on every result
+                        because `structuredContent` would make the client discard it. A
+                        `--json` consumer separates them without a new verdict value —
+                        `primer_source == "recorded"` with `cadence == "once/session
+                        (unpaid)"` is the second; the first has neither. The value is not
+                        split because the closed set is a published contract and both cases
+                        give the operator the same answer: this wrap costs no primer.
       never             a known non-positive rate: no block volume earns this primer back.
                         The one verdict here that should stop an operator, which is why it
                         is a word and not a very large number.
@@ -1292,12 +1343,43 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
     # the window a tiktoken-less terse wrote.
     recorded_tokens: dict[str, int] = {}
     recorded_emissions: dict[str, int] = {}
+    # Labels with a recorded SUPPRESSION and no attach: proof the primer costs nothing
+    # (#286). Tracked separately because it is the opposite fact, and because an attach
+    # anywhere in the window overrides it -- a session can suppress on an early
+    # `structuredContent` result and attach on a later text-only one, and having paid once
+    # is what matters.
+    suppressed_label: set[str] = set()
+    # Labels with ANY attach row, recorded before the tokenization skip below. Kept separate
+    # from `recorded_emissions` because those two answer different questions: "did it pay?"
+    # and "can we size what it paid?". An attach written without tiktoken carries
+    # `tokens: None`, so it can only answer the first -- and folding the two together meant a
+    # session that suppressed early and attached late inverted to "provably free" whenever
+    # tiktoken was unavailable, publishing a fabricated zero AS A MEASUREMENT. That is the
+    # precise failure this whole design exists to prevent, re-entered through the divisor
+    # (found in review of #320; see `test_an_untokenized_attach_still_beats_a_suppression`).
+    attached_label: set[str] = set()
     for prow in (agg.get("primers") or []):
         if prow.get("cadence") != _ONCE:
             continue
         plbl = str(prow.get("server", ""))
         if not plbl:
             continue
+        # The `True` default is defensive only and CANNOT be mutation-pinned: `aggregate`
+        # always injects `attached` into every published row, so this default never fires on
+        # its output -- only on a hand-built or foreign blob. The default that does matter is
+        # the one in `aggregate` itself, which is pinned. Flagged rather than left to look
+        # guarded (a mutation of it passes the whole suite).
+        if not prow.get("attached", True):
+            # Defence in depth: a suppression is a claim that NOTHING went out, so a row
+            # claiming it while carrying a size is self-contradictory and cannot be trusted
+            # as proof of non-payment. Ignoring it falls back to the estimate, which is the
+            # safe direction; believing it publishes a fabricated zero.
+            if not (prow.get("tokens") or 0) and not (prow.get("bytes") or 0):
+                suppressed_label.add(plbl)
+            continue
+        # BEFORE the tokenization skip: an attach is proof of payment whether or not we can
+        # size it.
+        attached_label.add(plbl)
         tokenized_emissions = (prow.get("emissions") or 0) - (prow.get("untokenized") or 0)
         if tokenized_emissions <= 0:
             # Emissions happened but none carries a token count. We know it was PAID and not
@@ -1384,11 +1466,16 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # installed policy WOULD assemble, which is the right size but says nothing about
         # whether the lazy attach ever fired. #286 is that gap billed as a fact.
         #
-        # Absence is NOT yet read as evidence of non-payment. A window written by a terse
-        # predating this field has no primer rows at all, and cannot be distinguished here
-        # from one whose attach genuinely never fired -- so an entry with no recorded row
-        # keeps the old inference and is labelled `estimated` rather than silently mixed
-        # in. Closing that last step needs a ledger-version floor; see #311.
+        # Absence is read as evidence of NOTHING, permanently and by design. A window with
+        # no primer row cannot be told apart from one whose row simply aged out: the primer
+        # decision happens once, at a session's first compressible result, while result rows
+        # accrue for hours after it, so any `--since` or ledger rotation starting mid-session
+        # drops it and keeps the rest. Such an entry keeps the policy estimate and is
+        # labelled `estimated`.
+        #
+        # A ledger-version floor was tried for this (#319) and does NOT close it -- a floor
+        # proves the WRITER could record, never that the WINDOW is session-complete. Do not
+        # re-attempt it; the answer is the `attached: false` row, which is positive evidence.
         # The MEAN recorded primer, which is the per-session unit this field is read in --
         # never the window sum. Summed across labels first so an entry answering to several
         # labels is one mean over all its emissions, not a mean of means.
@@ -1401,6 +1488,29 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # `recorded` label: a claim that we MEASURED a free primer. Unknown must degrade to
         # the labelled estimate, never to a fabricated zero.
         measured = rec_em > 0 and rec_tok > 0 and not is_router
+        # A measured ZERO: the proxy recorded a SUPPRESSION for every label of this entry
+        # and no attach anywhere. `not any(... attached_label)` is what makes an attach win
+        # and is the load-bearing term -- `not measured` alone was NOT enough, because an
+        # untokenized attach fails `measured` while still being proof of payment.
+        #
+        # The `all()` is defensive only -- `_wrapped_labels` returns at most
+        # one label and multi-label entries are routers, excluded below -- so `all` and `any`
+        # are structurally identical today and no test can distinguish them. Kept because it
+        # states the intent for whoever makes an entry multi-label, not because it fires.
+        #
+        # Routers are excluded because they prime EAGERLY at `initialize` and no eager site
+        # records anything -- a router has no primer rows by construction, and reading that
+        # as proof of non-payment would zero the recurring cost of the one shape that
+        # genuinely pays every turn.
+        #
+        # An entry with NO primer rows reaches neither branch and keeps the policy estimate.
+        # That fallback is what makes a truncated `--since` window or a rotated ledger safe:
+        # absence means "this window cannot say", never "it costs nothing".
+        measured_zero = (not measured and not is_router and bool(labels)
+                         and not any(lbl in attached_label for lbl in labels)
+                         and all(lbl in suppressed_label for lbl in labels))
+        if measured_zero:
+            tokens = 0
         if measured:
             tokens = round(rec_tok / rec_em)
         # None, not 0, when no label could be recovered: "unknown" and "never called" are
@@ -1425,9 +1535,14 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
             # guess which of its numbers is a measurement (#311). "recorded" = the proxy
             # wrote down an emission this window; "estimated" = sized from the installed
             # policy and inferred to have been paid, the pre-#311 behaviour.
-            "primer_source": "recorded" if measured else "estimated",
+            "primer_source": "recorded" if (measured or measured_zero) else "estimated",
             "tokenized_blocks": tokenized,
-            "cadence": _cadence(state, blocks, encoded, recorded=measured),
+            # `unpaid=measured_zero` forces the UNPAID bucket. `_cadence` alone returns
+            # `_ONCE` ("pays once per session") whenever `encoded > 0`, and #286's shape
+            # compresses plenty -- it just never attaches. Without this the flagship case
+            # renders `1x` beside a zero and never reaches the `free` list.
+            "cadence": _cadence(state, blocks, encoded, recorded=measured,
+                                unpaid=measured_zero),
             **_break_even(tokens, blocks, tokenized,
                           sum(saved_by_label.get(lbl, 0) for lbl in labels),
                           # Same shape as `no ledger label` — nothing measurable — but a
@@ -1465,13 +1580,19 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # never-called standalone entry is the `free` list below, not this one.
         "idle": [s["server"] for s in servers
                  if s["cadence"] == _PER_TURN and s["blocks"] == 0 and s["primer_tokens"]],
-        # Installed, lazy, not triggered this window — costs nothing at all. Reported
-        # because it is the thing #211 bought, and because the old code billed exactly these
-        # servers as pure cost. Guarded on a non-zero primer for the same reason `idle` is:
-        # a default-deny server is free because it emits nothing, which is a different fact
-        # and already has its own `no primer` verdict in the table.
+        # Installed and lazy, and it cost nothing at all this window. TWO ways to earn
+        # that, and the list covers both: never triggered (the thing #211 bought), or
+        # triggered plenty and provably never primed (#286 -- every result carried
+        # `structuredContent`, so the attach was suppressed and the proxy recorded it).
+        #
+        # Guarded on a non-zero primer for the same reason `idle` is: a default-deny server
+        # is free because it emits nothing, which is a different fact with its own `no
+        # primer` verdict in the table. `or primer_source == "recorded"` re-admits the
+        # second case, whose primer_tokens is a MEASURED 0 rather than an absent one -- and
+        # that is a real distinction, not a loophole: only a recorded suppression sets it.
         "free": [s["server"] for s in servers
-                 if s["cadence"] == _ONCE_FREE and s["primer_tokens"]],
+                 if s["cadence"] == _ONCE_FREE
+                 and (s["primer_tokens"] or s.get("primer_source") == "recorded")],
         # Lazy, but no ledger label was recoverable, so we cannot say whether the attach
         # ever fired. Neither total counts it — same discipline as `unresolved`.
         "uncertain": [s["server"] for s in servers if s["cadence"] == _ONCE_UNKNOWN],
@@ -1527,13 +1648,36 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     if len(cadences) > 1 and _PER_TURN in cadences:
         lines.append("  the two figures are different units and are deliberately not "
                      "summed.")
-    measured = [s_["server"] for s_ in servers
-                if s_.get("primer_source") == "recorded"]
-    if measured:
-        lines.append(f"  {len(measured)} of {len(servers)} server(s) report a MEASURED "
-                     f"primer (the proxy recorded the")
-        lines.append("             emission); the rest are sized from policy and inferred "
-                     "to have paid.")
+    # TWO kinds of measurement and they are opposite facts, so one sentence cannot describe
+    # both: "recorded the emission" is false for a server whose primer was DECLINED, which is
+    # the whole point of #286. Split by the token count -- a measured zero is the suppression.
+    paid = [s_["server"] for s_ in servers
+            if s_.get("primer_source") == "recorded" and s_.get("primer_tokens")]
+    never = [s_["server"] for s_ in servers
+             if s_.get("primer_source") == "recorded" and not s_.get("primer_tokens")]
+    if paid or never:
+        lines.append(f"  {len(paid) + len(never)} of {len(servers)} server(s) are MEASURED, "
+                     f"not inferred:")
+        if paid:
+            lines.append(f"             {len(paid)} recorded an emission.")
+        if never:
+            # NOT "every result carried `structuredContent`": the row proves only that the
+            # result which WOULD have carried the primer did, and that none attached later.
+            # A server that emits one such result and then only passthrough text produces
+            # the same row. The verdict stays true; that reason would not.
+            lines.append(f"             {len(never)} recorded that the primer was DECLINED "
+                         f"— `structuredContent` on the")
+            lines.append("             result that would have carried it, and none attached "
+                         "later, so they pay")
+            lines.append("             nothing at all (#286).")
+        if len(paid) + len(never) < len(servers):
+            # "except any listed as free below": an estimated entry that was never triggered
+            # appears in BOTH this sentence and the free list below, which reads as a
+            # contradiction. The estimate is about the primer's SIZE, not about whether it
+            # was paid; the free list is the authority on the latter.
+            lines.append("             The rest are sized from policy and assumed paid — "
+                         "except any listed as")
+            lines.append("             free below, where the ledger settles it.")
     if liab["unresolved"]:
         lines.append(f"  {liab['unresolved']} server(s) have an unreadable policy and are "
                      f"NOT counted — treat both figures as lower bounds.")
@@ -1605,8 +1749,15 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
                      f"{', '.join(sorted(liab['idle']))} — pure cost until they handle a "
                      f"compressible result.")
     if liab.get("free"):
-        lines.append(f"  installed but not triggered this window, so costing nothing at "
-                     f"all (#211): {', '.join(sorted(liab['free']))}")
+        # TWO ways to be free and the line has to allow both, or it states a falsehood about
+        # the server this list was widened for: #286's shape is triggered heavily and still
+        # pays nothing, because every result carried `structuredContent` and the primer was
+        # declined. Saying "not triggered" printed a flat contradiction of the `blocks`
+        # column three lines below it.
+        lines.append("  cost nothing at all this window — never triggered, or triggered "
+                     "and the primer was")
+        lines.append(f"  declined and never attached (#211, #286): "
+                     f"{', '.join(sorted(liab['free']))}")
     lines += _build_break_even_table(servers)
     return lines
 
@@ -1728,7 +1879,9 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
                      "blocks ONCE PER SESSION, a far lower bar.")
         if _ONCE_FREE in shown or _ONCE_UNKNOWN in shown:
             lines.append("  1x? = called-ness unknown (no ledger label, or an ambiguous "
-                         "one); 1x- = installed but not triggered, so unpaid.")
+                         "one); 1x- = unpaid, either")
+            lines.append("  because it was never triggered or because every primer was "
+                         "declined (#286).")
     lines.append("  a BLOCK is one emitted tool-result text block — >=1 per call, so this "
                  "is a conservative bar (#141).")
     return lines
@@ -1896,8 +2049,9 @@ def build_primer_writer(stats_log: str | Path, server: str):
     exact. Recording it would also require a ledger identity the router does not have --
     the reader derives a router's identity from its PEER names, so no synthetic label would
     join."""
-    def primer(cadence: str, text: str) -> None:
-        append_stats(build_primer_record(server, cadence=cadence, primer=text), stats_log)
+    def primer(cadence: str, text: str, attached: bool = True) -> None:
+        append_stats(build_primer_record(server, cadence=cadence, primer=text,
+                                         attached=attached), stats_log)
 
     return primer
 

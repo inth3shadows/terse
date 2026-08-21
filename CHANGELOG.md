@@ -13,7 +13,41 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A primer the proxy declines to send is now recorded as costing zero, instead of being
+  billed in full** (`#286`, `#317`). `terse stats` sized every wrapped server's primer from
+  its installed policy and billed it to anyone the ledger showed was *called*. A server
+  whose results always carry `structuredContent` never reaches the lazy attach — the client
+  would discard the text block unread — so it pays **nothing, forever**, and was billed
+  anyway. `searxng-mcp` was charged 312 tok/session for a primer it cannot send, which made
+  a zero-cost wrap look marginal.
+
+  The proxy now writes a ledger row at the moment it *declines* to attach, carrying
+  `attached: false` and zero tokens. A server with such a row and no attach reports
+  `primer_tokens: 0` with `primer_source: "recorded"`, lands in the `free` list, and is
+  labelled `once/session (unpaid)` rather than "pays once per session".
+
+  **Absence of a row still means nothing**, deliberately. The primer decision happens once,
+  at a session's first compressible result, while result rows accrue for hours afterwards —
+  so any `--since` window or ledger rotation starting mid-session drops it and keeps the
+  rest. A window with no primer row therefore falls back to the labelled policy estimate. An
+  earlier attempt inferred non-payment from that absence and produced two different
+  "measurements" from one ledger; a false zero published as a measurement is worse than an
+  honest estimate.
+
+- **The liability report no longer contradicts its own table.** Three rendered strings
+  still described the `free` list by its only previous cause. A `structuredContent`-only
+  server is triggered heavily and pays nothing, so "installed but not triggered this
+  window", the `1x-` legend, and "the proxy recorded the emission" were each false for the
+  very server this change is about — printed directly above a `blocks` column reading 500.
+
+### Added
+
+- **`terse stats --json`: `primers[].attached`** (`#286`). `true` = the primer was emitted
+  and cost its `tokens`; `false` = the proxy declined to send it, costing nothing. Rows
+  written before this field have no `attached` key and are read as `true`, since the
+  suppression row did not exist then. Additive.
 
 ## [0.28.1] - 2026-08-20
 
