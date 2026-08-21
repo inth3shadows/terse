@@ -904,6 +904,48 @@ def test_tune_cmd_reports_no_candidates(tmp_path, capsys):
     assert "no drop-to-retrieve candidates" in capsys.readouterr().out
 
 
+def test_tune_flags_a_passthrough_tool_the_ledger_measures_above_threshold(tmp_path, capsys):
+    """#274: `kb.read.list_principles` scored 4.5% (passthrough) from a corpus capped at
+    200 samples/tool and idempotent by sha, while the live ledger measured the SAME tool at
+    15.1% over 881 blocks — applying the corpus's verdict would have turned off compression
+    on the fleet's single largest source of savings. The corpus is structurally blind to
+    call frequency; the ledger is not, so a passthrough row gets cross-checked against it,
+    the same second look `policy autotune` already gives a downgrade."""
+    f = _write(tmp_path, "p.json", json.dumps({"ok": True}))    # the known passthrough shape
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "kb.x", "--corpus", str(corpus)]) == 0
+    led = _ledger(tmp_path, [_rec("kb", "x", 900, 400)] * 3)
+    rc = main(["tune", "--corpus", str(corpus), "--ledger", str(led)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "marks passthrough have LIVE savings" in out
+    assert "kb.x" in out and "55.6% saved" in out
+    assert "3 live block(s)" in out and "2,700 tok raw" in out
+
+
+def test_tune_does_not_flag_a_passthrough_tool_the_ledger_agrees_is_dead(tmp_path, capsys):
+    """The warning is a disagreement detector, not a blanket ledger dump: a passthrough
+    tool with genuinely low live savings must not be flagged."""
+    f = _write(tmp_path, "p.json", json.dumps({"ok": True}))
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "kb.x", "--corpus", str(corpus)]) == 0
+    led = _ledger(tmp_path, [_rec("kb", "x", 900, 890)])        # 1.1% saved — below threshold
+    main(["tune", "--corpus", str(corpus), "--ledger", str(led)])
+    assert "marks passthrough have LIVE savings" not in capsys.readouterr().out
+
+
+def test_tune_ledger_missing_file_fails_loud_and_names_tune(tmp_path, capsys):
+    """A path the operator NAMED is an error, same convention as `policy autotune` — and
+    the error must say `tune`, not misattribute itself to the other command sharing the
+    resolver (#274 generalised `_resolve_ledger` to take the caller's name)."""
+    f = _write(tmp_path, "p.json", json.dumps({"ok": True}))
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "kb.x", "--corpus", str(corpus)]) == 0
+    rc = main(["tune", "--corpus", str(corpus), "--ledger", str(tmp_path / "absent.jsonl")])
+    assert rc == 2
+    assert "tune: no ledger at" in capsys.readouterr().err
+
+
 # --- #136: `policy autotune` writes nothing without --apply, and never a broken policy ---
 
 def _autotune_setup(tmp_path):
