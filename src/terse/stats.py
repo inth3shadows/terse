@@ -1834,7 +1834,18 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
     rate. An install where nothing was called renders a table of dashes that says nothing
     the `idle` line above did not already say — but a server that WAS called and still has
     no rate is the tiktoken-missing case, and "no token data" against a real block count is
-    exactly the row that sends the operator to fix it."""
+    exactly the row that sends the operator to fix it.
+
+    A SECOND way to reach the empty case, added by #307: `blocks` is also `None` for a row
+    whose ledger label is `ambiguous ledger label` (a hand-edited launcher wrap sharing a
+    basename with a sibling). An all-ambiguous fleet has no row with a `blocks` count either,
+    so this gate suppresses the table there too — silently, from this function's point of
+    view. That silence is not a second bug: `build_primer_section`, which calls this, already
+    prints the ambiguity line and the `--server-name` fix before falling through to here (see
+    `test_the_rendered_section_separates_the_two_causes_of_an_unknown_label` and
+    `test_the_break_even_legend_does_not_re_collapse_the_two_causes`), so the operator is
+    told why in the paragraph above the missing table, not left with an unexplained gap.
+    Reviewed and kept as the cheapest of three options in #310."""
     if not any(s.get("blocks") for s in servers):
         return []
     # Widths are load-bearing twice over: four tests match right-aligned cells, and the row
