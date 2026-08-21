@@ -447,6 +447,11 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
                     bool(rec.get("attached", True)))
             prow = primers.setdefault(pkey, {"emissions": 0, "tokens": 0,
                                              "bytes": 0, "untokenized": 0})
+            # Counts recorded DECISIONS, not emissions, on an `attached: false` row -- the
+            # decision there was to send nothing. The name predates the suppression row and
+            # is kept because it is a published `--json` field; `attached` is what tells a
+            # consumer which sense applies, and `primer_liability` never divides by an
+            # emission count from a suppressed row.
             prow["emissions"] += 1
             pb = rec.get("bytes")
             if isinstance(pb, int):
@@ -1089,8 +1094,16 @@ def _break_even(primer_tokens: int | None, blocks: int | None,
                         threshold it must clear is unknown. Reporting this as `never` would
                         condemn a server on evidence about a missing FILE (found in review
                         of #197).
-      no primer         a default-deny policy emits no compressed form and therefore no
-                        primer — nothing to earn back, at any rate, positive or negative.
+      no primer         nothing to earn back, at any rate, positive or negative. TWO
+                        distinguishable causes share this string, deliberately: a
+                        default-deny policy that emits no compressed form and therefore no
+                        primer, and (#286) a server whose primer is DECLINED on every result
+                        because `structuredContent` would make the client discard it. A
+                        `--json` consumer separates them without a new verdict value —
+                        `primer_source == "recorded"` with `cadence == "once/session
+                        (unpaid)"` is the second; the first has neither. The value is not
+                        split because the closed set is a published contract and both cases
+                        give the operator the same answer: this wrap costs no primer.
       never             a known non-positive rate: no block volume earns this primer back.
                         The one verdict here that should stop an operator, which is why it
                         is a word and not a very large number.
@@ -1330,15 +1343,32 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
     # `structuredContent` result and attach on a later text-only one, and having paid once
     # is what matters.
     suppressed_label: set[str] = set()
+    # Labels with ANY attach row, recorded before the tokenization skip below. Kept separate
+    # from `recorded_emissions` because those two answer different questions: "did it pay?"
+    # and "can we size what it paid?". An attach written without tiktoken carries
+    # `tokens: None`, so it can only answer the first -- and folding the two together meant a
+    # session that suppressed early and attached late inverted to "provably free" whenever
+    # tiktoken was unavailable, publishing a fabricated zero AS A MEASUREMENT. That is the
+    # precise failure this whole design exists to prevent, re-entered through the divisor
+    # (found in review of #320; see `test_an_untokenized_attach_still_beats_a_suppression`).
+    attached_label: set[str] = set()
     for prow in (agg.get("primers") or []):
         if prow.get("cadence") != _ONCE:
             continue
         plbl = str(prow.get("server", ""))
         if not plbl:
             continue
+        # The `True` default is defensive only and CANNOT be mutation-pinned: `aggregate`
+        # always injects `attached` into every published row, so this default never fires on
+        # its output -- only on a hand-built or foreign blob. The default that does matter is
+        # the one in `aggregate` itself, which is pinned. Flagged rather than left to look
+        # guarded (a mutation of it passes the whole suite).
         if not prow.get("attached", True):
             suppressed_label.add(plbl)
             continue
+        # BEFORE the tokenization skip: an attach is proof of payment whether or not we can
+        # size it.
+        attached_label.add(plbl)
         tokenized_emissions = (prow.get("emissions") or 0) - (prow.get("untokenized") or 0)
         if tokenized_emissions <= 0:
             # Emissions happened but none carries a token count. We know it was PAID and not
@@ -1443,8 +1473,9 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # the labelled estimate, never to a fabricated zero.
         measured = rec_em > 0 and rec_tok > 0 and not is_router
         # A measured ZERO: the proxy recorded a SUPPRESSION for every label of this entry
-        # and no attach anywhere. `not measured` is what makes an attach win, and it IS
-        # mutation-pinned. The `all()` is defensive only -- `_wrapped_labels` returns at most
+        # and no attach anywhere. `not any(... attached_label)` is what makes an attach win
+        # and is the load-bearing term -- `not measured` alone was NOT enough, because an
+        # untokenized attach fails `measured` while still being proof of payment. The `all()` is defensive only -- `_wrapped_labels` returns at most
         # one label and multi-label entries are routers, excluded below -- so `all` and `any`
         # are structurally identical today and no test can distinguish them. Kept because it
         # states the intent for whoever makes an entry multi-label, not because it fires.
@@ -1458,6 +1489,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # That fallback is what makes a truncated `--since` window or a rotated ledger safe:
         # absence means "this window cannot say", never "it costs nothing".
         measured_zero = (not measured and not is_router and bool(labels)
+                         and not any(lbl in attached_label for lbl in labels)
                          and all(lbl in suppressed_label for lbl in labels))
         if measured_zero:
             tokens = 0
@@ -1598,13 +1630,26 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     if len(cadences) > 1 and _PER_TURN in cadences:
         lines.append("  the two figures are different units and are deliberately not "
                      "summed.")
-    measured = [s_["server"] for s_ in servers
-                if s_.get("primer_source") == "recorded"]
-    if measured:
-        lines.append(f"  {len(measured)} of {len(servers)} server(s) report a MEASURED "
-                     f"primer (the proxy recorded the")
-        lines.append("             emission); the rest are sized from policy and inferred "
-                     "to have paid.")
+    # TWO kinds of measurement and they are opposite facts, so one sentence cannot describe
+    # both: "recorded the emission" is false for a server whose primer was DECLINED, which is
+    # the whole point of #286. Split by the token count -- a measured zero is the suppression.
+    paid = [s_["server"] for s_ in servers
+            if s_.get("primer_source") == "recorded" and s_.get("primer_tokens")]
+    never = [s_["server"] for s_ in servers
+             if s_.get("primer_source") == "recorded" and not s_.get("primer_tokens")]
+    if paid or never:
+        lines.append(f"  {len(paid) + len(never)} of {len(servers)} server(s) are MEASURED, "
+                     f"not inferred:")
+        if paid:
+            lines.append(f"             {len(paid)} recorded an emission.")
+        if never:
+            lines.append(f"             {len(never)} recorded that the primer was DECLINED "
+                         f"(every result carried")
+            lines.append("             `structuredContent`), so they pay nothing at all "
+                         "(#286).")
+        if len(paid) + len(never) < len(servers):
+            lines.append("             The rest are sized from policy and inferred to have "
+                         "paid.")
     if liab["unresolved"]:
         lines.append(f"  {liab['unresolved']} server(s) have an unreadable policy and are "
                      f"NOT counted — treat both figures as lower bounds.")
@@ -1676,8 +1721,15 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
                      f"{', '.join(sorted(liab['idle']))} — pure cost until they handle a "
                      f"compressible result.")
     if liab.get("free"):
-        lines.append(f"  installed but not triggered this window, so costing nothing at "
-                     f"all (#211): {', '.join(sorted(liab['free']))}")
+        # TWO ways to be free and the line has to allow both, or it states a falsehood about
+        # the server this list was widened for: #286's shape is triggered heavily and still
+        # pays nothing, because every result carried `structuredContent` and the primer was
+        # declined. Saying "not triggered" printed a flat contradiction of the `blocks`
+        # column three lines below it.
+        lines.append("  cost nothing at all this window — never triggered, or triggered "
+                     "and the primer was")
+        lines.append(f"  declined every time (#211, #286): "
+                     f"{', '.join(sorted(liab['free']))}")
     lines += _build_break_even_table(servers)
     return lines
 
@@ -1799,7 +1851,9 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
                      "blocks ONCE PER SESSION, a far lower bar.")
         if _ONCE_FREE in shown or _ONCE_UNKNOWN in shown:
             lines.append("  1x? = called-ness unknown (no ledger label, or an ambiguous "
-                         "one); 1x- = installed but not triggered, so unpaid.")
+                         "one); 1x- = unpaid, either")
+            lines.append("  because it was never triggered or because every primer was "
+                         "declined (#286).")
     lines.append("  a BLOCK is one emitted tool-result text block — >=1 per call, so this "
                  "is a conservative bar (#141).")
     return lines

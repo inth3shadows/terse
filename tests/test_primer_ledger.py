@@ -365,13 +365,31 @@ def test_no_recorded_row_keeps_the_inference_and_says_so():
 def test_measured_and_estimated_are_never_summed_into_one_unlabelled_number():
     """#312 was closed for mis-denominating a ratio. The same error one layer down would be
     adding a measured primer to an inferred one and publishing the total as if both were
-    facts. The report has to name the split."""
+    facts. The report has to name the split.
+
+    Both kinds are in the fixture on purpose: with only measured servers the "the rest are
+    inferred" sentence is correctly omitted, and asserting it anyway would pin the wrong
+    thing (it broke exactly that way when the report prose was split).
+    """
     rec = build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)
-    agg = _agg_with(blocks_for="gh-server", primer_rows=[rec])
-    liab = primer_liability([_scan_row()], agg)
+    # One MEASURED entry (a recorded attach) and one ESTIMATED entry (no primer rows at
+    # all, so nothing can be said about it) in a single report.
+    agg = aggregate([rec,
+                     {"server": "gh-server", "tool": "gh.api.items", "raw_chars": 1000,
+                      "out_chars": 400, "raw_tokens": 250, "out_tokens": 100,
+                      "decision": "tabularize", "passthrough": False},
+                     {"server": "kb", "tool": "kb.read", "raw_chars": 900, "out_chars": 400,
+                      "raw_tokens": 250, "out_tokens": 100, "decision": "tabularize",
+                      "passthrough": False}])
+    liab = primer_liability(
+        [_scan_row(), {"server": "kb", "state": "wrapped", "wraps": "kb", "scope": "user",
+                       "policy": None}], agg)
+    sources = {s_["server"]: s_["primer_source"] for s_ in liab["servers"]}
+    assert set(sources.values()) == {"recorded", "estimated"}, sources
     from terse.stats import build_primer_section
     text = "\n".join(build_primer_section(liab))
     assert "MEASURED" in text
+    assert "recorded an emission" in text
     assert "inferred to have paid" in text
 
 
@@ -570,3 +588,97 @@ def test_an_attach_anywhere_in_the_window_beats_a_suppression():
     row = liab["servers"][0]
     assert row["primer_tokens"] == count_cl100k("P" * 40)   # the attach wins
     assert row["server"] not in liab["free"]
+
+
+# --- guards that nothing was watching (review of #320) ---
+
+def test_an_untokenized_attach_still_beats_a_suppression():
+    """The HIGH from the #320 review, and the sharpest can't-fail lesson of the lot.
+
+    An attach written without tiktoken carries `tokens: None`. The accumulator skipped such
+    rows on its way to computing a MEAN, which left no trace that an attach existed — so a
+    session that suppressed early and attached late inverted to "provably free" whenever
+    tiktoken was unavailable. Same session, same facts, and the verdict flipped on whether a
+    tokenizer happened to be installed.
+
+    The shipped test covered an untokenized attach ALONE, which safely falls back; it never
+    paired one with a suppression, which is the combination that inverts."""
+    sup = _suppressed()
+    att = build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 992)
+    att["tokens"] = None                       # exactly what a tiktoken-less writer emits
+    liab = primer_liability([_scan_row()],
+                            _agg_with(blocks_for="gh-server", primer_rows=[sup, att]))
+    row = liab["servers"][0]
+    assert row["primer_source"] == "estimated", "an attach must never lose to a suppression"
+    assert row["primer_tokens"] > 0
+    assert liab["free"] == []
+
+
+def test_a_primer_row_with_no_attached_key_is_read_as_an_ATTACH():
+    """Backward compatibility, stated as a contract in the CHANGELOG, in USAGE.md and in the
+    `TYPES` entry — and previously pinned by nothing.
+
+    Every primer row written before this field existed came from the attach path; the
+    suppression row did not exist yet. Reading a missing `attached` as False would make
+    EVERY wrapped server in EVERY pre-#286 ledger report a measured zero and land in `free`
+    — the fabricated-zero-as-measurement failure this design exists to reject, applied
+    retroactively to all recorded history. Both defaults survived mutation with 80 tests
+    green."""
+    legacy = build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)
+    del legacy["attached"]                     # a row from terse <= 0.28.1
+    agg = _agg_with(blocks_for="gh-server", primer_rows=[legacy])
+    # 1. `aggregate` buckets it as an attach...
+    assert agg["primers"][0]["attached"] is True
+    # 2. ...and the reader bills it, rather than calling the server free.
+    liab = primer_liability([_scan_row()], agg)
+    row = liab["servers"][0]
+    assert row["primer_source"] == "recorded"
+    assert row["primer_tokens"] == count_cl100k("P" * 40)
+    assert liab["free"] == []
+
+
+def test_a_suppression_row_records_zero_bytes_and_zero_tokens():
+    """Published `--json` fields, asserted as a contract by the record's own docstring
+    ("Its `tokens` is 0 because nothing went out") and pinned by nothing. A consumer summing
+    `primers[].tokens` would otherwise bill primers that were never sent."""
+    rec = build_primer_record("gh", cadence=PRIMER_CADENCE_ONCE, primer="P" * 992,
+                              attached=False)
+    assert rec["tokens"] == 0 and rec["bytes"] == 0
+    assert rec["attached"] is False
+    # Not None: `None` means "emitted, size unknown", which is a different claim.
+    assert rec["tokens"] is not None
+
+
+def test_no_suppression_is_recorded_after_the_primer_has_already_attached():
+    """`not self._primer_sent` in the suppression gate, which survived mutation.
+
+    A session that attached on a text-only result has PAID. A later `structuredContent`
+    result must not then record a suppression for it — the reader's attach-wins precedence
+    masks it today, but relying on that is how the untokenized-attach inversion above got
+    in."""
+    rows: list[tuple[str, str, bool]] = []
+    inter = Interceptor(FULL, stats_primer=lambda c, t, a=True: rows.append((c, t, a)))
+    _note_call(inter, 2, "gh.api.items")
+    inter.transform_response(_result_msg(2, _records_text()))              # attaches
+    assert inter._primer_sent is True
+    _note_call(inter, 3, "gh.api.items")
+    inter.transform_response(_result_msg(3, _records_text(), structured=True))
+    assert [a for _c, _t, a in rows] == [True], "a paid session must not record a suppression"
+
+
+def test_a_reconnect_re_arms_the_suppression_latch():
+    """The re-arm at the reconnect handler, asserted by its surrounding comment and pinned by
+    nothing. A downstream that reconnects starts a new session which will be primed again —
+    so it can also decline again, and that second decision is its own fact."""
+    rows: list[tuple[str, str, bool]] = []
+    inter = Interceptor(FULL, stats_primer=lambda c, t, a=True: rows.append((c, t, a)))
+    _note_call(inter, 2, "gh.api.items")
+    inter.transform_response(_result_msg(2, _records_text(), structured=True))
+    assert [a for _c, _t, a in rows] == [False]
+    # A reconnect IS a second `initialize` over the same process — that is the only signal
+    # terse gets that the model's context (and any primer in it) is gone.
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 9, "method": "initialize",
+                                   "params": {}}))
+    _note_call(inter, 3, "gh.api.items")
+    inter.transform_response(_result_msg(3, _records_text(), structured=True))
+    assert [a for _c, _t, a in rows] == [False, False]

@@ -875,13 +875,31 @@ class Interceptor:
             # `structuredContent` never finds that later call — a known, narrow, accepted
             # gap (see #168 plan notes), not silently pretended away.
             structured_present = isinstance(result, dict) and "structuredContent" in result
-            # Ordered so the `json.dumps` is the LAST term: `and` short-circuits, so it runs
-            # at most once per process -- only when a primer is genuinely owed, unsent, and
-            # suppressed -- and never on the hot path for an ordinary result.
+            # Did terse put a wire form on THIS result? Computed once and shared by both
+            # branches below, because both ask the same question and only differ on what to
+            # do with the answer.
+            #
+            # An earlier revision asked it with `'"__terse_' in json.dumps(result)` and a
+            # comment claiming the short-circuit made that run "at most once per process".
+            # The claim was backwards (found in review): `_primer_suppressed_logged` only
+            # latches when the marker IS found, so on a server that never produces one --
+            # all-passthrough rules, a shape the codec never wins on -- every preceding term
+            # stayed true and the whole result was re-serialized on EVERY response, forever,
+            # inside `_local_lock`. Measured at ~265ms per response on 2MB payloads, on the
+            # very path `proxy.py` otherwise takes care never to serialize.
+            #
+            # `rewrote_structured` is the precise answer for the structured side (terse
+            # rewrote that field, so the marker is in it by construction) and a text-block
+            # scan is the answer for the other. No serialization, and it drops the
+            # quoted-marker false positive the dump inherited from the attach gate as well.
+            marker_in_text = any(
+                isinstance(b, dict) and b.get("type") == "text"
+                and isinstance(b.get("text"), str) and '"__terse_' in b["text"]
+                for b in content)
+            wire_form_emitted = changed and (marker_in_text or rewrote_structured)
             suppressed_owed = (
                 not self._primer_sent and self._lazy_primer and structured_present
-                and not self._primer_suppressed_logged
-                and '"__terse_' in json.dumps(result, ensure_ascii=False))
+                and not self._primer_suppressed_logged and wire_form_emitted)
             if suppressed_owed:
                 # The SUPPRESSION, written down rather than left to be inferred (#286,
                 # #317-redesign). This branch is the one #286 is about: the result carries a
@@ -908,32 +926,27 @@ class Interceptor:
                     partial(self._emit_primer, PRIMER_CADENCE_ONCE,
                             self._primer_text, False),
                 ))
-            if not self._primer_sent and self._lazy_primer and not structured_present:
-                marker_in_text = any(
-                    isinstance(b, dict) and b.get("type") == "text"
-                    and isinstance(b.get("text"), str) and '"__terse_' in b["text"]
-                    for b in content)
-                if marker_in_text:
-                    content.insert(0, {"type": "text", "text": self._primer_text})
-                    self._primer_sent = True
-                    changed = True
-                    # DEFERRED, not called here (review of #311). The decision to bill is
-                    # made inside this branch -- the branch that actually attached it, so
-                    # everything outside it (a result carrying `structuredContent`, one
-                    # with no terse marker, a session that never produces a compressible
-                    # result at all) writes nothing, which is the whole point of #286. But
-                    # the WRITE has to happen after `_local_lock` is released, like every
-                    # other sink: `append_stats` stats/rotates/reads/appends a file, and a
-                    # blocking one -- stalled mount, full disk mid-rotation -- would hold
-                    # this lock, freeze `note_request`, and wedge every later tools/call on
-                    # the connection. try/except catches a sink that RAISES and does
-                    # nothing for one that BLOCKS; see the note above `deferred`.
-                    deferred.append((
-                        "primer ledger", "(primer)",
-                        partial(self._emit_primer, PRIMER_CADENCE_ONCE,
-                                self._primer_text),
-                    ))
-
+            if (not self._primer_sent and self._lazy_primer and not structured_present
+                    and marker_in_text):
+                content.insert(0, {"type": "text", "text": self._primer_text})
+                self._primer_sent = True
+                changed = True
+                # DEFERRED, not called here (review of #311). The decision to bill is
+                # made inside this branch -- the branch that actually attached it, so
+                # everything outside it (a result carrying `structuredContent`, one
+                # with no terse marker, a session that never produces a compressible
+                # result at all) writes nothing, which is the whole point of #286. But
+                # the WRITE has to happen after `_local_lock` is released, like every
+                # other sink: `append_stats` stats/rotates/reads/appends a file, and a
+                # blocking one -- stalled mount, full disk mid-rotation -- would hold
+                # this lock, freeze `note_request`, and wedge every later tools/call on
+                # the connection. try/except catches a sink that RAISES and does
+                # nothing for one that BLOCKS; see the note above `deferred`.
+                deferred.append((
+                    "primer ledger", "(primer)",
+                    partial(self._emit_primer, PRIMER_CADENCE_ONCE,
+                            self._primer_text),
+                ))
             if self.stats is not None:
                 deferred.append((
                     "stats", capture_tool,

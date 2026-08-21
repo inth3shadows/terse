@@ -264,11 +264,20 @@ def test_the_primer_rows_are_exactly_these_keys(stats_json):
     from terse.stats import PRIMER_CADENCE_ONCE, build_primer_record
     out = stats_json([_rec(),
                       build_primer_record("kb", cadence=PRIMER_CADENCE_ONCE,
-                                          primer="p" * 200)])
-    assert out["primers"], "a primer record must produce a primer row"
+                                          primer="p" * 200),
+                      # BOTH shapes through the real CLI: the suppressed row is a separate
+                      # bucket in `aggregate` and had never traversed `main(["stats",
+                      # "--json"])`, so its published shape was unpinned.
+                      build_primer_record("kb2", cadence=PRIMER_CADENCE_ONCE,
+                                          primer="p" * 200, attached=False)])
+    assert len(out["primers"]) == 2, "attach and suppression are separate published rows"
+    assert {r["attached"] for r in out["primers"]} == {True, False}
     for row in out["primers"]:
         assert set(row) == PRIMER_ROW, _ADD_ON_PURPOSE
         _check_types("primers[]", row)
+    # The suppressed row's zeros are contract, not incidental.
+    sup = next(r for r in out["primers"] if not r["attached"])
+    assert sup["tokens"] == 0 and sup["bytes"] == 0
 
 
 def test_the_retrieve_rows_are_exactly_these_keys(stats_json):

@@ -36,6 +36,12 @@ fails that pull request until the section has moved.
   "measurements" from one ledger; a false zero published as a measurement is worse than an
   honest estimate.
 
+- **The liability report no longer contradicts its own table.** Three rendered strings
+  still described the `free` list by its only previous cause. A `structuredContent`-only
+  server is triggered heavily and pays nothing, so "installed but not triggered this
+  window", the `1x-` legend, and "the proxy recorded the emission" were each false for the
+  very server this change is about — printed directly above a `blocks` column reading 500.
+
 ### Added
 
 - **`terse stats --json`: `primers[].attached`** (`#286`). `true` = the primer was emitted
