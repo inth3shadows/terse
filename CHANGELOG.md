@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.28.2] - 2026-08-20
+
 ### Fixed
 
 - **A primer the proxy declines to send is now recorded as costing zero, instead of being
