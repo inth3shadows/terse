@@ -976,7 +976,7 @@ TERSE_FLUENCY_API_KEY=sk-... \
 TERSE_FLUENCY_MODELS=google/gemini-2.5-flash,deepseek/deepseek-chat \
   uv run terse fluency --corpus corpus-stress
 
-# 2c. repeat each question N times to shrink the within-question noise floor
+# 2c. repeat each question N times to shrink the within-question noise
 #     (the reported CI is bounded by question count, not by --trials alone)
 TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \
   uv run terse fluency --corpus corpus-stress --trials 5

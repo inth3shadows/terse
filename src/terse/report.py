@@ -486,9 +486,10 @@ def _worst_case_gap(
     the worst model, never the mean. `rows` maps model to a 4-tuple of form_acc, form_se,
     control_acc, control_se. Returns the model with the lowest gap as a GapVerdict, or
     None if `rows` is empty. gap = form_acc minus control_acc; gap_ci is the 95%
-    half-width of the pooled standard error; passed iff gap is at least -tol, inclusive
-    of the boundary. Callers access fields by name, e.g. verdict.form_acc, never by
-    position, so a future field reorder can't silently swap values."""
+    half-width of the independence-combined question-clustered (sandwich) SE of the two
+    arms; passed iff gap is at least -tol, inclusive of the boundary. Callers access
+    fields by name, e.g. verdict.form_acc, never by position, so a future field reorder
+    can't silently swap values."""
     worst = None  # (model, gap, facc, cacc, gap_ci) — cheapest to track positionally here;
     for model, (facc, fse, cacc, cse) in rows.items():  # this is a private local, not the
         gap = facc - cacc                               # public interface callers rely on.
