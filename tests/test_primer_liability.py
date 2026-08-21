@@ -506,6 +506,26 @@ def test_the_break_even_legend_does_not_re_collapse_the_two_causes(tmp_path):
     assert "no ledger label, or an ambiguous one" in lines   # the legend agrees with it
 
 
+def test_an_all_ambiguous_fleet_still_says_why_there_is_no_table(tmp_path):
+    """#310: an install where EVERY wrapped entry is a hand-edited launcher wrap has no row
+    with a `blocks` count, so `_build_break_even_table`'s call-gate suppresses the table —
+    with no header and no dashes, unlike the "nothing was called" case the gate was written
+    for. Reviewed and kept (the cheapest of three options in #310) because the omission is
+    not silent from the full report's point of view: `build_primer_section` prints the
+    ambiguity line and the `--server-name` fix before ever reaching the table. Pin the
+    contract at the boundary that matters — the whole rendered report, not the table alone —
+    so a future change to either function cannot reopen unexplained silence."""
+    pol = _policy(tmp_path)
+    liab = primer_liability(
+        [_scan(n, "wrapped", f"/usr/bin/python3.12 -m {n}", pol) for n in ("a", "b")],
+        _agg(("python3.12", 3, 6152, 2762)))
+    out = build_stats_report(_agg(("python3.12", 3, 6152, 2762)),
+                             log_path="/tmp/x.jsonl", liability=liab)
+    has_table = "saved/block" in out
+    explains_why = "ambiguous ledger label" in out and "--server-name" in out
+    assert has_table or explains_why
+
+
 def test_an_unreadable_policy_is_excluded_and_the_total_labelled_a_lower_bound(tmp_path):
     """Substituting the built-in default would OVERSTATE (the default emits every form).
     Leave it out, count it, and say the number is a floor."""
