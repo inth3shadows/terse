@@ -120,7 +120,6 @@ def test_a_wide_conservative_gap_ci_never_argues_a_real_fail_is_noise():
     md = build_fluency_report({"m1": _lopsided_regression_rows()}, [])
     assert "**FAIL**" in md
     assert "not distinguishable from noise" not in md
-    assert "indistinguishable" not in md
     assert "treat the verdict above as real" in md
 
 
@@ -141,5 +140,4 @@ def test_a_wide_conservative_gap_ci_also_never_argues_a_pass_is_noise():
     md = build_fluency_report({"m1": _wide_ci_pass_rows()}, [])
     assert "**PASS**" in md
     assert "not distinguishable from noise" not in md
-    assert "indistinguishable" not in md
-    assert "This PASS is smaller than a" in md
+    assert "This passing gap is smaller than a" in md

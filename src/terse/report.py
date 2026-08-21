@@ -499,15 +499,17 @@ def _worst_case_gap(
         # questions they get right would make this an UNDER-estimate instead — just not a
         # shape real comprehension arms take.) `passed` below does NOT read gap_ci (it
         # gates on the point estimate `gap` alone), so this looseness cannot flip the
-        # merge gate itself; the only consumer of `gap_ci` is advisory prose
-        # (`build_fluency_report`), which is why that prose is written to never let a wide
-        # gap_ci argue AWAY a verdict — a bound that is only reliably an over-estimate can
-        # rule a gap "not yet tightly measured", never "not real". #297 made both SEs
-        # cluster-robust instead of ~0, so this bound is now wide enough to matter for
-        # that prose in practice, not just a formality. A tighter, correct fix is a
-        # paired cluster-robust SE on the per-question DIFFERENCE rather than combining
-        # two independent arm SEs; tracked as a follow-up rather than folded into #297's
-        # scope.
+        # merge gate itself; every consumer of `gap_ci` (`build_fluency_report`'s worst-
+        # case prose here, `_format_worst_case_line`'s "±N pts" headline shared by the
+        # diff/diff-soak/dropeval reports, the diff-soak deepest-slice line, and the HTML
+        # forest plot's whiskers) renders it as a width, never as a significance test —
+        # which is why `build_fluency_report` is written to never let a wide gap_ci argue
+        # AWAY a verdict: a bound that is only reliably an over-estimate can rule a gap
+        # "not yet tightly measured", never "not real". #297 made both SEs cluster-robust
+        # instead of ~0, so this bound is now wide enough to matter in practice, not just
+        # a formality. A tighter, correct fix is a paired cluster-robust SE on the
+        # per-question DIFFERENCE rather than combining two independent arm SEs; tracked
+        # as a follow-up rather than folded into #297's scope.
         gap_ci = _ci(math.sqrt(fse ** 2 + cse ** 2))
         if worst is None or gap < worst[1]:
             worst = (model, gap, facc, cacc, gap_ci)
@@ -1979,7 +1981,7 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
             # resample k, not the question set) — so this is neither "raise `--trials`"
             # (#297's own estimator makes that false as the SOLE lever) nor "trials never
             # help" (also false).
-            verdict_word = "This PASS" if worst.passed else "Note: this gap"
+            verdict_word = "This passing gap" if worst.passed else "Note: this gap"
             out.append(f"- {verdict_word} is smaller than a (loose, conservative) "
                        "upper-bound estimate of its own noise floor — treat the verdict "
                        "above as real, not yet as a tightly measured margin; more "
