@@ -472,12 +472,15 @@ def _tune_ledger_warnings(rows: list[dict],
     Falls back to chars where the ledger has no tokens — the same fallback `terse stats`
     itself uses at the whole-ledger level (`stats.py`'s `use_tokens`) — so a tiktoken-less
     ledger does not leave this permanently, silently inert (review finding: gating on
-    `raw_tokens` alone did exactly that). `blocks` still counts every ledger row for the
-    tool regardless of which rows carried the units actually summed into `raw`/`live_pct` —
-    a ledger spanning a tokenizer-availability change can therefore show a block count
-    slightly wider than its own percentage's denominator. Left as an informational
-    imprecision, same as `_weight`'s block count carries today, now that this is display
-    only rather than a threshold gate (review finding).
+    `raw_tokens` alone did exactly that). `blocks` still counts EVERY ledger row for the
+    tool, tokenized or not, while `raw`/`live_pct` sum only whichever unit (tok, else
+    chars) actually had a nonzero total. On a ledger mixing the two for one tool — spanning
+    a tokenizer-availability change — the printed block count is not merely a little wide of
+    the percentage's real denominator; it can be dominated by rows the percentage never
+    counted at all (100 chars-only rows plus 1 tokenized row prints "N% saved over 101 live
+    block(s)" computed from that 1 row alone — review finding). Left as an informational
+    imprecision rather than tracked per-unit in `_ledger_traffic`, same as `_weight`'s block
+    count carries today, now that this is display only rather than a threshold gate.
 
     Looked up by tool name alone, same as `_weight` — not through `_ledger_keys`/identities,
     so a corpus holding both a bare and a qualified row for what is really one tool

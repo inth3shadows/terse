@@ -982,7 +982,12 @@ def test_tune_ledger_missing_file_fails_loud_and_names_tune(tmp_path, capsys):
     assert main(["capture", str(f), "--tool", "x.y", "--corpus", str(corpus)]) == 0
     rc = main(["tune", "--corpus", str(corpus), "--ledger", str(tmp_path / "absent.jsonl")])
     assert rc == 2
-    assert "tune: no ledger at" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    # `startswith`, not `in`: "policy autotune: no ledger at" also CONTAINS "tune: no ledger
+    # at" (the tail of "autotune:"), so a substring check alone cannot tell the two prefixes
+    # apart and would not fail if the `cmd="tune"` kwarg were silently dropped (review
+    # finding — mutation-verified: `in` passed against the wrong-caller message too).
+    assert err.startswith("tune: no ledger at")
 
 
 def test_tune_skips_the_ledger_load_when_nothing_could_use_it(tmp_path, monkeypatch):
@@ -1046,6 +1051,24 @@ def test_tune_ledger_warnings_scoped_to_passthrough_rows_only():
                                "raw_chars": 0, "out_chars": 0}}
     flagged = _tune_ledger_warnings(rows, traffic)
     assert [f[0] for f in flagged] == ["passthrough"]
+
+
+def test_tune_ledger_warnings_sorts_highest_live_savings_first():
+    """No existing fixture flagged more than one tool, so nothing pinned the documented
+    "heaviest first" order (review finding: deleting the `sorted(...)` call still passed
+    the suite). A low-savings tool ahead of a high-savings one would invert the priority
+    signal the note exists to give the operator."""
+    from terse.cli import _tune_ledger_warnings
+
+    rows = [_pt_row("low"), _pt_row("high"), _pt_row("mid")]
+    traffic = {"low": {"blocks": 1, "raw_tokens": 900, "out_tokens": 895,
+                       "raw_chars": 0, "out_chars": 0},          # 0.6%
+               "high": {"blocks": 1, "raw_tokens": 900, "out_tokens": 100,
+                        "raw_chars": 0, "out_chars": 0},         # 88.9%
+               "mid": {"blocks": 1, "raw_tokens": 900, "out_tokens": 500,
+                       "raw_chars": 0, "out_chars": 0}}          # 44.4%
+    flagged = _tune_ledger_warnings(rows, traffic)
+    assert [f[0] for f in flagged] == ["high", "mid", "low"]
 
 
 def test_tune_ledger_warnings_falls_back_to_chars_on_a_tiktokenless_ledger():
