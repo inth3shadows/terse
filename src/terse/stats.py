@@ -443,8 +443,14 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             # A row with no `attached` key predates the field and can only be an attach --
             # the suppression row did not exist then. Defaulting to True keeps an old ledger
             # reading exactly as it did.
+            # `is not False`, NOT `bool(...)`. `.get` returns the default only when the key
+            # is ABSENT: an explicit `"attached": null` returns None, and `bool(None)` is
+            # False -- so a row that is self-evidently an attach (496 tokens, 992 bytes) was
+            # bucketed as a suppression and the entry published a measured zero. Same
+            # hand-edited/foreign-writer threat class the `rec_tok > 0` guard defends
+            # against. Only an explicit `false` means the primer was declined.
             pkey = (psrv, str(rec.get("cadence", "unknown")),
-                    bool(rec.get("attached", True)))
+                    rec.get("attached", True) is not False)
             prow = primers.setdefault(pkey, {"emissions": 0, "tokens": 0,
                                              "bytes": 0, "untokenized": 0})
             # Counts recorded DECISIONS, not emissions, on an `attached: false` row -- the
@@ -1364,7 +1370,12 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # the one in `aggregate` itself, which is pinned. Flagged rather than left to look
         # guarded (a mutation of it passes the whole suite).
         if not prow.get("attached", True):
-            suppressed_label.add(plbl)
+            # Defence in depth: a suppression is a claim that NOTHING went out, so a row
+            # claiming it while carrying a size is self-contradictory and cannot be trusted
+            # as proof of non-payment. Ignoring it falls back to the estimate, which is the
+            # safe direction; believing it publishes a fabricated zero.
+            if not (prow.get("tokens") or 0) and not (prow.get("bytes") or 0):
+                suppressed_label.add(plbl)
             continue
         # BEFORE the tokenization skip: an attach is proof of payment whether or not we can
         # size it.
@@ -1455,11 +1466,16 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         # installed policy WOULD assemble, which is the right size but says nothing about
         # whether the lazy attach ever fired. #286 is that gap billed as a fact.
         #
-        # Absence is NOT yet read as evidence of non-payment. A window written by a terse
-        # predating this field has no primer rows at all, and cannot be distinguished here
-        # from one whose attach genuinely never fired -- so an entry with no recorded row
-        # keeps the old inference and is labelled `estimated` rather than silently mixed
-        # in. Closing that last step needs a ledger-version floor; see #311.
+        # Absence is read as evidence of NOTHING, permanently and by design. A window with
+        # no primer row cannot be told apart from one whose row simply aged out: the primer
+        # decision happens once, at a session's first compressible result, while result rows
+        # accrue for hours after it, so any `--since` or ledger rotation starting mid-session
+        # drops it and keeps the rest. Such an entry keeps the policy estimate and is
+        # labelled `estimated`.
+        #
+        # A ledger-version floor was tried for this (#319) and does NOT close it -- a floor
+        # proves the WRITER could record, never that the WINDOW is session-complete. Do not
+        # re-attempt it; the answer is the `attached: false` row, which is positive evidence.
         # The MEAN recorded primer, which is the per-session unit this field is read in --
         # never the window sum. Summed across labels first so an entry answering to several
         # labels is one mean over all its emissions, not a mean of means.

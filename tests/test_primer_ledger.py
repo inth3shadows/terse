@@ -682,3 +682,38 @@ def test_a_reconnect_re_arms_the_suppression_latch():
     _note_call(inter, 3, "gh.api.items")
     inter.transform_response(_result_msg(3, _records_text(), structured=True))
     assert [a for _c, _t, a in rows] == [False, False]
+
+
+def test_an_explicit_null_attached_is_read_as_an_ATTACH_not_a_suppression():
+    """`.get(key, default)` returns the default only when the key is ABSENT. An explicit
+    `"attached": null` returns None, and `bool(None)` is False — so a row that is
+    self-evidently an attach was bucketed as a suppression, producing an aggregate row
+    reading `attached: False` beside 496 tokens, and a published measured zero.
+
+    Reachable from any writer that is not `build_primer_record`: a merged or truncated
+    ledger, a hand-edited line, a foreign tool. Same threat class the `rec_tok > 0` guard
+    already defends against."""
+    rec = build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)
+    rec["attached"] = None
+    agg = _agg_with(blocks_for="gh-server", primer_rows=[rec])
+    assert agg["primers"][0]["attached"] is True
+    liab = primer_liability([_scan_row()], agg)
+    row = liab["servers"][0]
+    assert row["primer_tokens"] == count_cl100k("P" * 40)
+    assert liab["free"] == []
+
+
+def test_a_suppression_claiming_a_nonzero_size_is_not_believed():
+    """A suppression asserts that NOTHING went out, so a row claiming it while carrying a
+    size contradicts itself and cannot be proof of non-payment. Falling back to the estimate
+    is the safe direction; believing it publishes a fabricated zero for a server that may
+    well have paid."""
+    bad = build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40,
+                              attached=False)
+    bad["tokens"] = 496                       # a size, on a row claiming nothing was sent
+    liab = primer_liability([_scan_row()],
+                            _agg_with(blocks_for="gh-server", primer_rows=[bad]))
+    row = liab["servers"][0]
+    assert row["primer_source"] == "estimated"
+    assert row["primer_tokens"] > 0
+    assert liab["free"] == []

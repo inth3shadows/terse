@@ -892,14 +892,27 @@ class Interceptor:
             # rewrote that field, so the marker is in it by construction) and a text-block
             # scan is the answer for the other. No serialization, and it drops the
             # quoted-marker false positive the dump inherited from the attach gate as well.
-            marker_in_text = any(
+            # Gated on `primer_pending`, not computed unconditionally. BOTH consumers below
+            # already require it, so without this guard the scan ran on every response for
+            # the entire life of the process -- long after the primer was sent, and even with
+            # `lazy_primer` off -- at ~0.8ms per 2MB no-match payload, under `_local_lock`.
+            # Hoisting the scan out of the old branch was right; hoisting it past its own
+            # precondition was not.
+            #
+            # Deliberately NOT covered by a dedicated test: "this expression did not
+            # evaluate" is not observable from outside without contriving a fixture that
+            # tests the contrivance. Its one behavioural consequence -- no suppression is
+            # recorded once the primer has been sent -- IS pinned, by
+            # `test_no_suppression_is_recorded_after_the_primer_has_already_attached`.
+            primer_pending = not self._primer_sent and self._lazy_primer
+            marker_in_text = primer_pending and any(
                 isinstance(b, dict) and b.get("type") == "text"
                 and isinstance(b.get("text"), str) and '"__terse_' in b["text"]
                 for b in content)
-            wire_form_emitted = changed and (marker_in_text or rewrote_structured)
-            suppressed_owed = (
-                not self._primer_sent and self._lazy_primer and structured_present
-                and not self._primer_suppressed_logged and wire_form_emitted)
+            wire_form_emitted = (primer_pending and changed
+                                 and (marker_in_text or rewrote_structured))
+            suppressed_owed = (structured_present and wire_form_emitted
+                               and not self._primer_suppressed_logged)
             if suppressed_owed:
                 # The SUPPRESSION, written down rather than left to be inferred (#286,
                 # #317-redesign). This branch is the one #286 is about: the result carries a
@@ -926,8 +939,7 @@ class Interceptor:
                     partial(self._emit_primer, PRIMER_CADENCE_ONCE,
                             self._primer_text, False),
                 ))
-            if (not self._primer_sent and self._lazy_primer and not structured_present
-                    and marker_in_text):
+            if primer_pending and not structured_present and marker_in_text:
                 content.insert(0, {"type": "text", "text": self._primer_text})
                 self._primer_sent = True
                 changed = True
@@ -1680,11 +1692,16 @@ class Interceptor:
         """Record a primer that actually went out, with the cadence of the site that sent
         it (#311, #286).
 
-        Called from the two sites that emit one, and ONLY from inside the branch that
-        genuinely attached it -- a primer skipped for `structuredContent`, or never reached
-        because no compressible result arrived, writes nothing. That silence is the point:
-        `primer_liability` previously had to assume any called server paid, and #286 is what
-        that assumption cost in production.
+        Called from the two branches that make the decision, and only from inside them: the
+        one that ATTACHED a primer (`attached=True`, its real size) and the one that DECLINED
+        to, because the result carried `structuredContent` and the client would have discarded
+        it unread (`attached=False`, zero). A session that simply never produces a
+        compressible result writes nothing at all, which is correct -- it made no decision.
+
+        Recording the refusal rather than staying silent about it is the whole of #286.
+        Silence cannot be read: a window with no primer row is indistinguishable from one
+        whose row aged out of a `--since` or a rotation, so `primer_liability` had to fall
+        back to billing every called server a full primer.
 
         Same fail-open contract as `_emit_stats`: the callback owns its I/O and a failure
         here can never change what the client receives, so a dead ledger degrades the report
