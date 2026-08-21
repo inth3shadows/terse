@@ -904,60 +904,101 @@ def test_tune_cmd_reports_no_candidates(tmp_path, capsys):
     assert "no drop-to-retrieve candidates" in capsys.readouterr().out
 
 
-def test_tune_flags_a_passthrough_tool_the_ledger_measures_above_threshold(tmp_path, capsys):
+def _tune_setup(tmp_path, tool="kb.x"):
+    """A one-tool corpus in the known passthrough shape (`{"ok": true}` — see
+    `test_compact_object_tool_is_passthrough` in test_policy_gen.py), captured under
+    `tool`. Shared by every `tune`-ledger CLI test below (review of #274: four near-
+    identical fixtures pasted inline was the finding)."""
+    f = _write(tmp_path, "p.json", json.dumps({"ok": True}))
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", tool, "--corpus", str(corpus)]) == 0
+    return corpus
+
+
+def test_tune_shows_live_ledger_traffic_for_a_passthrough_tool(tmp_path, capsys):
     """#274: `kb.read.list_principles` scored 4.5% (passthrough) from a corpus capped at
     200 samples/tool and idempotent by sha, while the live ledger measured the SAME tool at
-    15.1% over 881 blocks — applying the corpus's verdict would have turned off compression
-    on the fleet's single largest source of savings. The corpus is structurally blind to
-    call frequency; the ledger is not, so a passthrough row gets cross-checked against it,
-    the same second look `policy autotune` already gives a downgrade."""
-    f = _write(tmp_path, "p.json", json.dumps({"ok": True}))    # the known passthrough shape
-    corpus = tmp_path / "corpus"
-    assert main(["capture", str(f), "--tool", "kb.x", "--corpus", str(corpus)]) == 0
+    15.1% over 881 blocks. The corpus is structurally blind to call frequency; the ledger
+    is not, so a passthrough row's live traffic is surfaced — descriptively, not as a
+    verdict (review: the two percentages measure different things and are not a valid
+    threshold comparison), the same second look `policy autotune` already gives a
+    downgrade via `_weight`."""
+    corpus = _tune_setup(tmp_path)
     led = _ledger(tmp_path, [_rec("kb", "x", 900, 400)] * 3)
     rc = main(["tune", "--corpus", str(corpus), "--ledger", str(led)])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "marks passthrough have LIVE savings" in out
+    assert "tool(s) this corpus marks passthrough have live traffic" in out
     assert "kb.x" in out and "55.6% saved" in out
     assert "3 live block(s)" in out and "2,700 tok raw" in out
 
 
-def test_tune_prints_the_ledger_warning_before_confirming_the_write(tmp_path, capsys):
+def test_tune_still_shows_a_passthrough_tool_with_low_live_savings(tmp_path, capsys):
+    """This is descriptive, not a disagreement detector (review finding: an earlier cut
+    gated on `--threshold`, comparing two quantities that are not the same measurement —
+    the corpus's lossless-tier-only percentage vs. whatever the deployed policy actually
+    achieved). A passthrough tool with ANY live traffic is shown regardless of how much it
+    saved, and the operator judges it."""
+    corpus = _tune_setup(tmp_path)
+    led = _ledger(tmp_path, [_rec("kb", "x", 900, 890)])         # 1.1% saved
+    main(["tune", "--corpus", str(corpus), "--ledger", str(led)])
+    out = capsys.readouterr().out
+    assert "kb.x" in out and "1.1% saved" in out
+
+
+def test_tune_does_not_show_a_passthrough_tool_with_no_ledger_traffic_at_all(tmp_path,
+                                                                             capsys):
+    """A ledger that never saw this tool has nothing to add — the section must not print
+    an empty or fabricated row for it."""
+    corpus = _tune_setup(tmp_path)
+    capsys.readouterr()                                          # drain the capture line
+    led = _ledger(tmp_path, [_rec("gh", "other", 900, 400)])     # a different tool
+    main(["tune", "--corpus", str(corpus), "--ledger", str(led)])
+    assert "have live traffic" not in capsys.readouterr().out
+
+
+def test_tune_prints_the_ledger_note_before_confirming_the_write(tmp_path, capsys):
     """The write happened before the report on the first cut of this feature — an operator
-    piping stdout live saw 'policy written' before ever seeing the warning about the very
-    tool it just wrote as passthrough (review of #274). The warning must print first."""
-    f = _write(tmp_path, "p.json", json.dumps({"ok": True}))
-    corpus = tmp_path / "corpus"
-    assert main(["capture", str(f), "--tool", "kb.x", "--corpus", str(corpus)]) == 0
+    piping stdout live saw 'policy written' before ever seeing the note about the very tool
+    it just wrote as passthrough (review of #274). The note must print first."""
+    corpus = _tune_setup(tmp_path)
     led = _ledger(tmp_path, [_rec("kb", "x", 900, 400)] * 3)
     out_pol = tmp_path / "pol.json"
     main(["tune", "--corpus", str(corpus), "--ledger", str(led), "--out", str(out_pol)])
     out = capsys.readouterr().out
-    assert out.index("marks passthrough have LIVE savings") < out.index("policy written to")
-
-
-def test_tune_does_not_flag_a_passthrough_tool_the_ledger_agrees_is_dead(tmp_path, capsys):
-    """The warning is a disagreement detector, not a blanket ledger dump: a passthrough
-    tool with genuinely low live savings must not be flagged."""
-    f = _write(tmp_path, "p.json", json.dumps({"ok": True}))
-    corpus = tmp_path / "corpus"
-    assert main(["capture", str(f), "--tool", "kb.x", "--corpus", str(corpus)]) == 0
-    led = _ledger(tmp_path, [_rec("kb", "x", 900, 890)])        # 1.1% saved — below threshold
-    main(["tune", "--corpus", str(corpus), "--ledger", str(led)])
-    assert "marks passthrough have LIVE savings" not in capsys.readouterr().out
+    assert out.index("have live traffic") < out.index("policy written to")
 
 
 def test_tune_ledger_missing_file_fails_loud_and_names_tune(tmp_path, capsys):
     """A path the operator NAMED is an error, same convention as `policy autotune` — and
     the error must say `tune`, not misattribute itself to the other command sharing the
-    resolver (#274 generalised `_resolve_ledger` to take the caller's name)."""
-    f = _write(tmp_path, "p.json", json.dumps({"ok": True}))
+    resolver (#274 generalised `_resolve_ledger` to take the caller's name). Fails loud
+    even though this corpus has no passthrough row to use it for — a NAMED ledger is
+    always resolved, regardless of whether anything ends up needing it (review finding:
+    the resolve is otherwise skipped when nothing could use it)."""
     corpus = tmp_path / "corpus"
-    assert main(["capture", str(f), "--tool", "kb.x", "--corpus", str(corpus)]) == 0
+    payload = json.dumps({"result": [{"id": i, "status": "ok"} for i in range(5)]})
+    f = _write(tmp_path, "p.json", payload)
+    assert main(["capture", str(f), "--tool", "x.y", "--corpus", str(corpus)]) == 0
     rc = main(["tune", "--corpus", str(corpus), "--ledger", str(tmp_path / "absent.jsonl")])
     assert rc == 2
     assert "tune: no ledger at" in capsys.readouterr().err
+
+
+def test_tune_skips_the_ledger_load_when_nothing_could_use_it(tmp_path, monkeypatch):
+    """A well-tuned corpus with no `--ledger` flag has no passthrough row and named no
+    file, so resolving the (possibly large) default ledger buys nothing — skip it (review
+    finding: the load previously ran on every invocation regardless)."""
+    payload = json.dumps({"result": [{"id": i, "description": "d" * 250 + str(i)}
+                                     for i in range(20)]})
+    f = _write(tmp_path, "p.json", payload)
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "kb.x", "--corpus", str(corpus)]) == 0
+
+    def _boom(*a, **kw):
+        raise AssertionError("_resolve_ledger must not be called")
+    monkeypatch.setattr("terse.cli._resolve_ledger", _boom)
+    assert main(["tune", "--corpus", str(corpus)]) == 0
 
 
 def _pt_row(tool, reason="passthrough — 0.0% < 5.0% threshold"):
@@ -967,13 +1008,29 @@ def _pt_row(tool, reason="passthrough — 0.0% < 5.0% threshold"):
 def test_tune_ledger_warnings_ignores_a_correctness_passthrough():
     """A round-trip failure (`gate_fail` in `_tool_decision`) also returns `tiers: []`, but
     no amount of live traffic makes 'capture more' the right remedy for a tool the codec
-    cannot losslessly handle at all — the warning must not fire for it (review of #274)."""
+    cannot losslessly handle at all — it must never be shown (review of #274)."""
     from terse.cli import _tune_ledger_warnings
 
     rows = [_pt_row("x", reason="passthrough — 1/1 result(s) failed round-trip")]
     traffic = {"x": {"blocks": 3, "raw_tokens": 900, "out_tokens": 400,
                      "raw_chars": 0, "out_chars": 0}}
-    assert _tune_ledger_warnings(rows, traffic, 5.0) == []
+    assert _tune_ledger_warnings(rows, traffic) == []
+
+
+def test_tune_ledger_warnings_does_not_exclude_an_embedded_gate_failure():
+    """Deliberately NOT excluded (review discussion): `_tool_decision` zeroes `embedded`
+    and recomputes `total_pct` from the surviving lossless tiers BEFORE the passthrough
+    check, so a row whose passthrough was caused by a failed embedded round-trip carries
+    the exact same reason string as an ordinary threshold miss — `_tool_decision` records
+    no distinguishing marker for it. The base tiers were genuinely measured and genuinely
+    fell short; this is the ordinary economic case, not the unfixable one, and is included
+    on purpose (unlike `gate_fail`, which fails the DEFAULT pipeline and is excluded)."""
+    from terse.cli import _tune_ledger_warnings
+
+    rows = [_pt_row("x")]                    # indistinguishable from a plain threshold miss
+    traffic = {"x": {"blocks": 3, "raw_tokens": 900, "out_tokens": 400,
+                     "raw_chars": 0, "out_chars": 0}}
+    assert [f[0] for f in _tune_ledger_warnings(rows, traffic)] == ["x"]
 
 
 def test_tune_ledger_warnings_scoped_to_passthrough_rows_only():
@@ -987,7 +1044,7 @@ def test_tune_ledger_warnings_scoped_to_passthrough_rows_only():
                               "raw_chars": 0, "out_chars": 0},
                "passthrough": {"blocks": 3, "raw_tokens": 900, "out_tokens": 400,
                                "raw_chars": 0, "out_chars": 0}}
-    flagged = _tune_ledger_warnings(rows, traffic, 5.0)
+    flagged = _tune_ledger_warnings(rows, traffic)
     assert [f[0] for f in flagged] == ["passthrough"]
 
 
@@ -1000,7 +1057,7 @@ def test_tune_ledger_warnings_falls_back_to_chars_on_a_tiktokenless_ledger():
     rows = [_pt_row("x")]
     traffic = {"x": {"blocks": 3, "raw_tokens": 0, "out_tokens": 0,
                      "raw_chars": 3600, "out_chars": 1600}}
-    flagged = _tune_ledger_warnings(rows, traffic, 5.0)
+    flagged = _tune_ledger_warnings(rows, traffic)
     assert len(flagged) == 1
     tool, blocks, live_pct, unit, raw = flagged[0]
     assert unit == "chars" and raw == 3600 and round(live_pct, 1) == 55.6
