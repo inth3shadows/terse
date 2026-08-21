@@ -410,7 +410,16 @@ def _ledger_keys(server: str | None, tool: str) -> set[str]:
 def _ledger_traffic(rows: list[dict]) -> dict[str, dict[str, int]]:
     """Live traffic per candidate rule name. A row contributes to each of its names
     separately (a lookup reads exactly one), so a qualified/bare collision cannot
-    double-count."""
+    double-count *within a single lookup* — a caller that looks up more than one
+    overlapping name for the same underlying rows (a bare AND a qualified spelling of
+    what is really one tool) and sums both can still double-count; nothing here prevents
+    that, because the caller — not this index — knows which names it is treating as
+    distinct rules.
+
+    Carries `raw_chars`/`out_chars` alongside the token fields (#274 review) so a caller
+    can fall back to chars on a tiktoken-less ledger, the same fallback `terse stats`
+    itself uses — without this a chars-only ledger left every consumer's token fields at
+    0 and any threshold check gated on them went silently, permanently inert."""
     from .capture import qualify
 
     idx: dict[str, dict[str, int]] = {}
@@ -421,10 +430,60 @@ def _ledger_traffic(rows: list[dict]) -> dict[str, dict[str, int]]:
         # what the rule actually carries. The blind-spot check cannot afford the same
         # licence — there, a wrong match hides traffic instead of merely widening a count.
         for key in {qualify(tool, _ledger_server(row)), tool}:
-            acc = idx.setdefault(key, {"blocks": 0, "raw_tokens": 0, "out_tokens": 0})
+            acc = idx.setdefault(key, {"blocks": 0, "raw_tokens": 0, "out_tokens": 0,
+                                        "raw_chars": 0, "out_chars": 0})
             for f in acc:
                 acc[f] += row.get(f, 0)
     return idx
+
+
+def _tune_ledger_warnings(rows: list[dict], traffic: dict[str, dict[str, int]],
+                          threshold: float) -> list[tuple[str, int, float, str, int]]:
+    """`(tool, blocks, live_pct, unit, raw)` for every `tune`-generated passthrough row
+    the ledger measures at or above `threshold` (#274).
+
+    The corpus is idempotent by sha (`capture_payload`, capture.py) — it holds each
+    payload's first sighting, not every call — and capped at `MAX_SAMPLES_PER_TOOL` (200)
+    samples per tool, oldest evicted first. So a tool called twice and one called 800 times
+    weigh alike in `_tool_decision`'s percentage: the corpus is structurally blind to call
+    FREQUENCY and can under-represent a high-volume tool's real shape. That is exactly how
+    a tool the live ledger measures well above threshold can still generate a `tiers: []`
+    passthrough rule from this corpus. `policy autotune` already cross-checks its
+    DOWNGRADES against the ledger for the same reason; `tune` authors a policy from
+    nothing, so every passthrough row gets the same second look here.
+
+    Restricted to the ECONOMIC passthrough (`"threshold"` in `reason`), not the correctness
+    one: a round-trip failure (`gate_fail`, `_tool_decision`) also returns `tiers: []`, but
+    for a reason no amount of extra traffic can fix — "capture more" is the wrong remedy
+    for a tool the codec cannot losslessly handle at all (review finding). `_tool_decision`
+    gives no other signal to tell the two apart from a row alone.
+
+    Falls back to chars where the ledger has no tokens — the same fallback `terse stats`
+    uses — so a tiktoken-less ledger does not leave this permanently, silently inert
+    (review finding: gating on `raw_tokens` alone did exactly that).
+
+    Looked up by tool name alone, same as autotune's downgrade weight (`_weight`,
+    `_cmd_policy_autotune`) — not through `_ledger_keys`/identities, so a corpus holding
+    both a bare and a qualified row for what is really one tool (mixed-vintage captures
+    before and after `--server-name`) can have both flagged with their live totals summed
+    twice. Pre-existing in the shared lookup pattern, not introduced here; left as-is
+    rather than pulling identity resolution into `tune` for an edge case (review finding)."""
+    passthrough = [r for r in rows if not r["tiers"] and "threshold" in r["reason"]]
+    flagged = []
+    for r in passthrough:
+        t = traffic.get(r["tool"])
+        if not t:
+            continue
+        if t["raw_tokens"]:
+            raw, out, unit = t["raw_tokens"], t["out_tokens"], "tok"
+        elif t["raw_chars"]:
+            raw, out, unit = t["raw_chars"], t["out_chars"], "chars"
+        else:
+            continue
+        live_pct = (raw - out) / raw * 100
+        if live_pct >= threshold:
+            flagged.append((r["tool"], t["blocks"], live_pct, unit, raw))
+    return sorted(flagged, key=lambda f: -f[2])
 
 
 def _ledger_blind_spots(rows: list[dict],
@@ -467,12 +526,15 @@ def _resolve_ledger(arg: str | None, cmd: str = "policy autotune"
     """`(rows, path, exit_code)`. The ledger is an ENRICHMENT, never a precondition —
     the caller must behave identically on a machine that has never written one, so a missing
     default path is skipped in silence. A path the operator *named*, though, is an error:
-    they asked for coverage to be checked against a specific file, and quietly proceeding
-    without it would misreport how much of the install was actually seen.
+    they asked for the corpus's verdict to be cross-checked against a specific file, and
+    quietly proceeding without it would misreport what that file actually showed.
 
-    `cmd` names the error line only — shared by `policy autotune` and `tune` (#274), whose
-    `--ledger` cross-checks differ but whose missing-file failure should each say who was
-    asked for it."""
+    Shared by two callers with different uses for the rows: `policy autotune` checks
+    coverage (which live tools the corpus never captured at all, and whether a proposed
+    DOWNGRADE has real traffic behind it) and `tune` checks a fresh passthrough decision
+    against live savings (#274). `cmd` names the error line only, so each caller's own
+    missing-file failure says who was asked for it rather than misattributing to the
+    other."""
     from .stats import aggregate, default_stats_log, load_stats
 
     path = Path(arg).expanduser() if arg is not None else default_stats_log()
@@ -973,6 +1035,25 @@ def _cmd_tune(args: argparse.Namespace) -> int:
         return rc
     traffic = _ledger_traffic(ledger_rows) if ledger_path else {}
 
+    print(f"# terse tune — {len(envelopes)} payload(s), {len(rows)} tool(s), "
+          f"{len(cands)} drop candidate(s)")
+
+    # Rationale in `_tune_ledger_warnings`'s own docstring (#274) — this call site just
+    # prints whatever it flags. Printed BEFORE `--out` writes the policy below: writing
+    # first and warning after would have shown the write as already a fait accompli
+    # (review finding).
+    flagged = _tune_ledger_warnings(rows, traffic, args.threshold)
+    if flagged:
+        print(f"\n[warn] {len(flagged)} tool(s) this corpus marks passthrough have LIVE "
+              f"savings at or above the {args.threshold:.1f}% threshold in the ledger:")
+        for tool, blocks, live_pct, unit, raw in flagged:
+            print(f"  ! {tool:<28} {live_pct:5.1f}% saved over {blocks:,} live "
+                  f"block(s), {raw:,} {unit} raw")
+        print("    the corpus can under-represent these tools — writing this policy "
+              "would turn OFF compression that is measurably earning today. Capture "
+              "more of their traffic, or raise MAX_SAMPLES_PER_TOOL, before trusting "
+              "the passthrough verdict above.")
+
     if args.out:
         from .policy import load_policy
         out = Path(args.out)
@@ -980,36 +1061,6 @@ def _cmd_tune(args: argparse.Namespace) -> int:
         out.write_text(_json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         load_policy(out)  # fail loud if we just wrote a policy our own loader rejects
 
-    print(f"# terse tune — {len(envelopes)} payload(s), {len(rows)} tool(s), "
-          f"{len(cands)} drop candidate(s)")
-
-    # The corpus is idempotent by sha (`capture_payload`, capture.py) — it holds each
-    # payload's first sighting, not every call — and capped at `MAX_SAMPLES_PER_TOOL` (200)
-    # samples per tool, oldest evicted first. So a tool called twice and one called 800
-    # times weigh alike in `_tool_decision`'s percentage: the corpus is structurally blind
-    # to call FREQUENCY and can under-represent a high-volume tool's real shape. That is
-    # exactly how a tool the live ledger measures well above threshold can still generate a
-    # `"tiers": []` passthrough rule from this corpus (#274). `policy autotune` already
-    # cross-checks its DOWNGRADES against the ledger for the same reason; `tune` authors a
-    # policy from nothing, so every passthrough row gets the same second look here.
-    passthrough = [r for r in rows if not r["tiers"]]
-    if traffic:
-        flagged = [(r["tool"], traffic[r["tool"]],
-                    (traffic[r["tool"]]["raw_tokens"] - traffic[r["tool"]]["out_tokens"])
-                    / traffic[r["tool"]]["raw_tokens"] * 100)
-                   for r in passthrough
-                   if traffic.get(r["tool"], {}).get("raw_tokens")]
-        flagged = [f for f in flagged if f[2] >= args.threshold]
-        if flagged:
-            print(f"\n[warn] {len(flagged)} tool(s) this corpus marks passthrough have LIVE "
-                  f"savings at or above the {args.threshold:.1f}% threshold in the ledger:")
-            for tool, t, live_pct in sorted(flagged, key=lambda f: -f[2]):
-                print(f"  ! {tool:<28} {live_pct:5.1f}% saved over {t['blocks']:,} live "
-                      f"block(s), {t['raw_tokens']:,} tok raw")
-            print("    the corpus can under-represent these tools — writing this policy "
-                  "would turn OFF compression that is measurably earning today. Capture "
-                  "more of their traffic, or raise MAX_SAMPLES_PER_TOOL, before trusting "
-                  "the passthrough verdict above.")
     if not cands:
         print("no drop-to-retrieve candidates — the lossless tiers already cover these tools, "
               "or every large field is a key/identity (never dropped).")

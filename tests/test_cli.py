@@ -923,6 +923,20 @@ def test_tune_flags_a_passthrough_tool_the_ledger_measures_above_threshold(tmp_p
     assert "3 live block(s)" in out and "2,700 tok raw" in out
 
 
+def test_tune_prints_the_ledger_warning_before_confirming_the_write(tmp_path, capsys):
+    """The write happened before the report on the first cut of this feature — an operator
+    piping stdout live saw 'policy written' before ever seeing the warning about the very
+    tool it just wrote as passthrough (review of #274). The warning must print first."""
+    f = _write(tmp_path, "p.json", json.dumps({"ok": True}))
+    corpus = tmp_path / "corpus"
+    assert main(["capture", str(f), "--tool", "kb.x", "--corpus", str(corpus)]) == 0
+    led = _ledger(tmp_path, [_rec("kb", "x", 900, 400)] * 3)
+    out_pol = tmp_path / "pol.json"
+    main(["tune", "--corpus", str(corpus), "--ledger", str(led), "--out", str(out_pol)])
+    out = capsys.readouterr().out
+    assert out.index("marks passthrough have LIVE savings") < out.index("policy written to")
+
+
 def test_tune_does_not_flag_a_passthrough_tool_the_ledger_agrees_is_dead(tmp_path, capsys):
     """The warning is a disagreement detector, not a blanket ledger dump: a passthrough
     tool with genuinely low live savings must not be flagged."""
@@ -944,6 +958,52 @@ def test_tune_ledger_missing_file_fails_loud_and_names_tune(tmp_path, capsys):
     rc = main(["tune", "--corpus", str(corpus), "--ledger", str(tmp_path / "absent.jsonl")])
     assert rc == 2
     assert "tune: no ledger at" in capsys.readouterr().err
+
+
+def _pt_row(tool, reason="passthrough — 0.0% < 5.0% threshold"):
+    return {"tool": tool, "tiers": [], "reason": reason}
+
+
+def test_tune_ledger_warnings_ignores_a_correctness_passthrough():
+    """A round-trip failure (`gate_fail` in `_tool_decision`) also returns `tiers: []`, but
+    no amount of live traffic makes 'capture more' the right remedy for a tool the codec
+    cannot losslessly handle at all — the warning must not fire for it (review of #274)."""
+    from terse.cli import _tune_ledger_warnings
+
+    rows = [_pt_row("x", reason="passthrough — 1/1 result(s) failed round-trip")]
+    traffic = {"x": {"blocks": 3, "raw_tokens": 900, "out_tokens": 400,
+                     "raw_chars": 0, "out_chars": 0}}
+    assert _tune_ledger_warnings(rows, traffic, 5.0) == []
+
+
+def test_tune_ledger_warnings_scoped_to_passthrough_rows_only():
+    """Mutating the scoping filter to include every row, not just passthrough ones, must
+    fail this test — a tool the corpus ALREADY compresses is not a disagreement to flag."""
+    from terse.cli import _tune_ledger_warnings
+
+    rows = [{"tool": "compresses", "tiers": ["minify"], "reason": "10.0% saved (...)"},
+            _pt_row("passthrough")]
+    traffic = {"compresses": {"blocks": 5, "raw_tokens": 900, "out_tokens": 400,
+                              "raw_chars": 0, "out_chars": 0},
+               "passthrough": {"blocks": 3, "raw_tokens": 900, "out_tokens": 400,
+                               "raw_chars": 0, "out_chars": 0}}
+    flagged = _tune_ledger_warnings(rows, traffic, 5.0)
+    assert [f[0] for f in flagged] == ["passthrough"]
+
+
+def test_tune_ledger_warnings_falls_back_to_chars_on_a_tiktokenless_ledger():
+    """A tiktoken-less ledger leaves `raw_tokens`/`out_tokens` at 0 for every row
+    (`stats.aggregate`) — gating on tokens alone left this permanently, silently inert for
+    exactly the installs it exists to help (review of #274)."""
+    from terse.cli import _tune_ledger_warnings
+
+    rows = [_pt_row("x")]
+    traffic = {"x": {"blocks": 3, "raw_tokens": 0, "out_tokens": 0,
+                     "raw_chars": 3600, "out_chars": 1600}}
+    flagged = _tune_ledger_warnings(rows, traffic, 5.0)
+    assert len(flagged) == 1
+    tool, blocks, live_pct, unit, raw = flagged[0]
+    assert unit == "chars" and raw == 3600 and round(live_pct, 1) == 55.6
 
 
 # --- #136: `policy autotune` writes nothing without --apply, and never a broken policy ---
@@ -1242,7 +1302,8 @@ def test_ledger_traffic_does_not_double_count_a_bare_named_tool():
 
     idx = _ledger_traffic([{"server": "kb", "tool": "kb.search", "blocks": 3,
                             "raw_tokens": 100, "out_tokens": 40}])
-    assert idx["kb.search"] == {"blocks": 3, "raw_tokens": 100, "out_tokens": 40}
+    assert idx["kb.search"] == {"blocks": 3, "raw_tokens": 100, "out_tokens": 40,
+                                "raw_chars": 0, "out_chars": 0}
 
 
 def test_autotune_downgrade_warning_carries_live_block_counts(tmp_path, capsys, monkeypatch):
