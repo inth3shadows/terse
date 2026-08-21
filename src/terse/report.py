@@ -22,14 +22,25 @@ _GAP_TOLERANCE = 0.05  # shared pass/fail tolerance for both worst-case verdict 
 def _form_stats(rows: list[dict[str, Any]], form: str) -> tuple[float, float]:
     """(accuracy, standard_error) for one form over rows carrying success COUNTS.
 
-    accuracy = Σsuccesses / Σtrials. SE is the pooled binomial SE of that estimator:
-    each row is t trials of a Bernoulli with p̂=k/t, so Var(total successes)=Σ t·p̂(1-p̂)
-    and SE(acc)=√Var / Σt. This is stable at the realistic small trial count (N=2–3),
-    where an empirical std across N whole-eval runs would be pure noise. At trials=1
-    every p̂∈{0,1} → SE=0, so single-trial runs report exactly as before.
+    accuracy = Σsuccesses / Σtrials. SE is the cluster-robust (sandwich) SE of that
+    ratio estimator, clustering on the question — each row is one question, worth
+    t trials of a Bernoulli:
+
+        SE = sqrt( n/(n-1) · Σ(kᵢ − acc·tᵢ)² ) / Σt
+
+    A pooled *within-question* SE (Σt·p̂(1−p̂)) looks stable but is measuring the wrong
+    thing: at temperature 0 a question is nearly always all-right or all-wrong across
+    its trials, so p̂(1−p̂)≈0 for every row and that estimator collapses to ≈0 SE at ANY
+    accuracy, regardless of how much the *set of questions* disagreed with each other
+    (#297). This form instead treats the question as the sampling unit — the axis that
+    actually varies run to run — and reduces to 0 only when every row's per-question
+    rate already equals the overall accuracy, or when there are fewer than 2 clusters
+    (n<2: no between-question spread to estimate, so SE=0 rather than a divide-by-zero).
     """
     tot_t = tot_k = 0
-    var = 0.0
+    n = 0
+    ks: list[int] = []
+    ts: list[int] = []
     for r in rows:
         # Prefer a per-form trial count ("terse_ok" -> "terse_trials") when the row
         # carries one — an uneven hand-built pack can collect fewer replies for one form,
@@ -42,11 +53,17 @@ def _form_stats(rows: list[dict[str, Any]], form: str) -> tuple[float, float]:
         tot_t += t
         tot_k += k
         if t > 0:
-            p = k / t
-            var += t * p * (1 - p)
+            n += 1
+            ks.append(k)
+            ts.append(t)
     if tot_t == 0:
         return 0.0, 0.0
-    return tot_k / tot_t, math.sqrt(var) / tot_t
+    acc = tot_k / tot_t
+    if n < 2:
+        return acc, 0.0
+    resid_sq_sum = sum((k - acc * t) ** 2 for k, t in zip(ks, ts, strict=True))
+    se = math.sqrt(n / (n - 1) * resid_sq_sum) / tot_t
+    return acc, se
 
 
 def _ci(se: float) -> float:
