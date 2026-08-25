@@ -37,6 +37,7 @@ from terse.html_report import build_html_diff_report
 from terse.report import (
     UNMEASURED_FAIL_SHARE,
     _unmeasured,
+    arm_gap,
     build_diff_report,
     build_diff_soak_report,
     build_fluency_report,
@@ -325,6 +326,9 @@ def test_a_withheld_deepest_depth_is_not_reported_as_no_drift():
     assert "No depth-correlated comprehension drift" not in md, md
     assert "NO VERDICT at the deepest tested depth" in md, md
     # And the withheld depth is NAMED, rather than left as an unexplained `n/a`.
+    # Dead backend at this depth, so the TRANSPORT heading is the true one. #332 briefly
+    # collapsed both causes into "not compared" here; the per-depth `_unmeasured` split
+    # restored the distinction, and this is the fixture that proves the right half fires.
     assert "Depths not measured" in md
     assert "depth 5" in md
 
@@ -467,3 +471,188 @@ def test_the_question_column_reports_the_exam_that_was_actually_sat():
     row = [ln for ln in md.splitlines() if ln.startswith("| `m` |")]
     assert row and f"| `m` | {scored} |" in row[0], (
         f"q column should be the paired {scored}, not 20: {row}")
+
+# --------------------------------------------------------------------------------------
+# Site 6 — the pairing-loss floor itself (#332).
+#
+# The gate above voids a row when either arm lost a trial of it. Nothing then checked how
+# much of the question set that left. `_gap`'s docstring promised a second stage for
+# exactly this ("too little of the question set survived on one side to compare") and it
+# was never implemented, so a form arm that lost every paired trial reached the reader as
+# a green PASS.
+#
+# Why the fail-share gate cannot catch it: `paired_rows` voids a WHOLE ROW for ONE lost
+# trial, so loss is amplified from the call level to the question level. At 3 trials per
+# arm, one lost call per row is 1-in-6 of the calls (16.7%, under `UNMEASURED_FAIL_SHARE`)
+# and 6-in-6 of the questions. The two gates measure different quantities; the second one
+# is not redundant with the first at any threshold.
+# --------------------------------------------------------------------------------------
+
+def _pairing_wipeout_rows(n: int = 10, lost: int | None = None) -> list[dict]:
+    """`lost` of `n` questions lose one diff trial apiece — enough to void them entirely.
+
+    Verbatim shape from #332: the control answers all three trials of every question, and
+    the form arm is one trial short on the damaged ones. Overall fail share stays at
+    16.7%, so `_unmeasured` never fires."""
+    lost = n if lost is None else lost
+    return [{
+        "qid": f"q{i}", "qtype": "count", "transform": "table", "trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS,
+        "diff_ok": 0 if i < lost else TRIALS,
+        "diff_trials": TRIALS - 1 if i < lost else TRIALS,
+        "attempts": TRIALS * 2, "fails": 1 if i < lost else 0,
+    } for i in range(n)]
+
+
+def test_the_wipeout_fixture_stays_under_the_pre_existing_gate():
+    """Same precondition the rest of this file lives by: if `_unmeasured` already fired,
+    the tests below would pass with the pairing floor deleted."""
+    rows = _pairing_wipeout_rows()
+    lost = sum(r["fails"] for r in rows) / sum(r["attempts"] for r in rows)
+    assert lost < UNMEASURED_FAIL_SHARE, f"pooled loss {lost:.1%} trips `_unmeasured` alone"
+    assert not _unmeasured(rows)
+    assert paired_rows(rows, "diff_ok", "terse_ok") == []
+
+
+def test_a_total_pairing_loss_is_withheld_rather_than_scored():
+    g = arm_gap(_pairing_wipeout_rows(), "diff_ok", "terse_ok")
+    assert g.excluded == "unmeasured", (
+        "nothing survived pairing, so there is no comparison to publish")
+
+
+def test_a_total_pairing_loss_cannot_publish_PASS_in_the_html_banner():
+    html = build_html_diff_report({"m": _pairing_wipeout_rows()}, "diff-form", "full-terse")
+    assert "✓ PASS" not in html
+
+
+def test_a_total_pairing_loss_cannot_publish_PASS_in_the_diff_markdown():
+    md = build_diff_report({"m": _pairing_wipeout_rows()})
+    assert "**PASS**" not in md
+    assert "safe to enable" not in md
+
+
+def test_a_total_pairing_loss_cannot_publish_PASS_in_the_diff_forest_plot():
+    plot = build_terminal_diff_report({"m": _pairing_wipeout_rows()}, color=False)
+    assert "PASS" not in plot
+
+
+def test_a_demonstrated_regression_is_never_withheld_as_unmeasured():
+    """The guard against re-introducing a survival FLOOR. Read this before adding one.
+
+    The first fix for #332 withheld any model whose paired subset fell under half the
+    question set. That is worse than the bug: an excluded model leaves the gate entirely,
+    so withholding one can IMPROVE a run's verdict. Here six rows are voided by pairing and
+    four SURVIVE it showing a real -100% regression — at 10% call loss, half of
+    `UNMEASURED_FAIL_SHARE`. The survivors are fully paired: the strongest evidence the
+    harness produces, not a degraded remnant.
+
+    Under the floor this rendered `**PASS** ... safe to enable proxy --diff`, off the other
+    model alone. The rows that survive pairing must always be scored."""
+    bad = [{
+        "qid": f"b{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS, "diff_ok": 0,
+        # First six lose a trial and are voided; last four are complete and score 0/3.
+        "diff_trials": TRIALS - 1 if i < 6 else TRIALS,
+        "attempts": TRIALS * 2, "fails": 1 if i < 6 else 0,
+    } for i in range(10)]
+    lost = sum(r["fails"] for r in bad) / sum(r["attempts"] for r in bad)
+    assert lost < UNMEASURED_FAIL_SHARE, f"pooled loss {lost:.1%} trips `_unmeasured` alone"
+
+    g = arm_gap(bad, "diff_ok", "terse_ok")
+    assert g.excluded is None, "a demonstrated regression must never be withheld"
+    assert len(g.rows) == 4
+    assert g.form_acc == 0.0 and g.control_acc == 1.0
+
+    # End to end, alongside a healthy model: the exclusion must not be able to rescue it.
+    md = build_diff_report({"good": _clean_rows(), "bad": bad})
+    assert "**FAIL**" in md
+    assert "safe to enable" not in md
+
+
+def test_a_minority_paired_subset_still_publishes():
+    """No survival threshold. Two of ten questions surviving is a small sample, not an
+    unmeasured one — the reader weighs `n`, the gate does not withhold it."""
+    rows = _pairing_wipeout_rows(n=10, lost=8)
+    g = arm_gap(rows, "diff_ok", "terse_ok")
+    assert g.excluded is None
+    assert len(g.rows) == 2
+
+
+def test_the_canonical_correlated_loss_fixture_is_still_scored():
+    """The rest of this file asserts a FAIL reaches the reader for `_correlated_loss_rows`.
+    That only means anything while the fixture is still SCORED — a gate that withheld it
+    would turn fifteen tests green for the wrong reason."""
+    rows = _correlated_loss_rows()
+    assert paired_rows(rows, "diff_ok", "terse_ok")
+    assert arm_gap(rows, "diff_ok", "terse_ok").excluded is None
+
+
+def test_a_withheld_model_is_not_told_its_backend_was_unreachable():
+    """The reason string is shared, but its WORDING has to be true of both causes.
+
+    `test_every_renderer_describes_an_unanswered_call_the_same_way` reads
+    `REASON_LABEL["unmeasured"]` out of the source, so it pins that the renderers AGREE and
+    is silent on whether they are right — reverting the label to its pre-#332 wording
+    ("calls went unanswered") leaves it green. That is a real mutation this file has to
+    catch, because the second cause reaches a reader whose backend answered almost
+    everything: here 16.7% of calls are lost and the losses simply land so that no question
+    survives on both arms.
+
+    So this asserts the CLAIM, not the vocabulary: nothing may state that the calls went
+    unanswered as the settled cause, and the pairing cause must be offered."""
+    rows = _pairing_wipeout_rows()
+    lost = sum(r["fails"] for r in rows) / sum(r["attempts"] for r in rows)
+    assert lost < UNMEASURED_FAIL_SHARE
+
+    # The shared label is the html and terminal renderers' ENTIRE explanation — they carry
+    # no second sentence to hedge in — so its wording has to hold for both causes on its
+    # own. Asserted against the constant directly: going through rendered output cannot
+    # distinguish this, because the markdown's (legitimate) hedge "either too many calls
+    # went unanswered, or..." contains the bad phrase as a substring.
+    from terse.report import REASON_LABEL
+    assert REASON_LABEL["unmeasured"] == "too few calls to compare", (
+        f"the shared label is {REASON_LABEL['unmeasured']!r}; the renderers spell this "
+        f"phrase literally in their own tests, so changing it here alone splits them")
+    assert "unanswered" not in REASON_LABEL["unmeasured"], (
+        f"REASON_LABEL['unmeasured'] is {REASON_LABEL['unmeasured']!r}, which asserts a "
+        f"cause that is false whenever the arms merely failed to pair")
+
+    md = build_diff_report({"m": rows})
+    html = build_html_diff_report({"m": rows}, "diff-form", "full-terse")
+    term = build_terminal_diff_report({"m": rows}, color=False)
+    for name, text in (("markdown", md), ("html", html), ("terminal", term)):
+        assert "too many calls went unanswered (" not in text, (
+            f"the {name} renderer states an unreachable backend as the settled cause for a "
+            f"model whose backend answered {1 - lost:.0%} of its calls")
+    # The remedy must not send the reader at a backend that is working.
+    assert "Fix the backend(s) and re-run" not in md
+    # ...and the cause that DID apply has to be named where the reader is looking.
+    assert "no question completed every trial on BOTH arms" in md
+
+
+def test_the_fluency_verdict_does_not_assert_a_dead_backend():
+    """The seventh renderer. `REASON_LABEL`'s note claims a seventh phrasing is impossible
+    and cites `test_every_renderer_names_the_right_exclusion_reason` as the loop that makes
+    it so — that test does not exist anywhere in the repo, which is how
+    `build_fluency_report`'s verdict bullet kept hardcoding "calls went unanswered" through
+    the #332 sweep that hedged every other site.
+
+    Here the backend answers 88.9% of its calls; the one it loses per question is a
+    `primer` trial, so `paired_rows` voids every row and the model is withheld. The
+    document must not contain a bullet asserting its calls went unanswered."""
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
+        "raw_ok": TRIALS, "raw_trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS,
+        "primer_ok": 0, "primer_trials": TRIALS - 1,
+        "attempts": TRIALS * 3, "fails": 1,
+    } for i in range(10)]
+    lost = sum(r["fails"] for r in rows) / sum(r["attempts"] for r in rows)
+    assert lost < UNMEASURED_FAIL_SHARE, f"pooled loss {lost:.1%} trips `_unmeasured` alone"
+    assert paired_rows(rows, "terse_ok", "primer_ok", "raw_ok") == []
+
+    md = build_fluency_report({"m": rows}, [])
+    assert "`m`" in md, "the withheld model must still be named"
+    assert "Excluded (calls went unanswered" not in md, (
+        f"the fluency verdict asserts an unreachable backend for a model whose backend "
+        f"answered {1 - lost:.1%} of its calls")

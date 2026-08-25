@@ -121,7 +121,7 @@ def test_a_partially_failing_model_cannot_force_a_regression_verdict():
     flaky = [_row(raw_ok=1, terse_ok=0, primer_ok=0, inline_ok=0, fails=2) for _ in range(4)]
     text = _report({"good": healthy, "flaky": flaky})
     verdict = text.split("## Verdict")[1]
-    assert "Excluded (calls went unanswered — not measured)" in verdict
+    assert "Excluded (too few calls to compare — not measured)" in verdict
     assert "`flaky`" in verdict
     # The healthy model is measured and holds, so the run must PASS. With `flaky` gated,
     # its 0% terse against 100% raw is a -100pt worst-case gap and this reads FAIL.
@@ -325,7 +325,7 @@ def test_a_dead_backend_cannot_produce_a_PASS_on_the_diff_ship_gate():
     text = build_diff_report({"gemini-dead": rows})
     verdict = text.split("## Verdict")[1]
     assert "safe to enable" not in verdict, "a dead backend must never green-light --diff"
-    assert "NO VERDICT — nothing was measured" in verdict
+    assert "NO VERDICT — nothing was scored" in verdict
     assert "16/16 calls lost" in text
     assert "| `gemini-dead` | 4 | n/a | n/a | n/a |" in text
 
@@ -372,7 +372,7 @@ def test_the_diff_forest_plot_excludes_the_same_models_the_diff_markdown_does():
     assert "good" in gap_rows
     chart = build_terminal_diff_report({"good": good, "dead": dead}, color=False)
     assert "FAIL" not in chart, "a dead backend must not render a FAIL bar"
-    assert "calls went unanswered: dead" in chart
+    assert "too few calls to compare: dead" in chart
 
 
 def test_the_soak_report_cannot_pass_off_a_dead_backend():
@@ -392,7 +392,7 @@ def test_the_soak_report_cannot_pass_off_a_dead_backend():
     text = build_diff_soak_report({"gemini-dead": rows})
     verdict = text.split("## Verdict")[1]
     assert "PASS" not in verdict, "a dead backend must never pass the soak gate"
-    assert "NO VERDICT — nothing was measured" in verdict
+    assert "NO VERDICT — nothing was scored" in verdict
     assert "| n/a | n/a | n/a |" in text
     assert "calls lost" in text
 
