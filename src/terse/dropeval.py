@@ -367,6 +367,17 @@ def _questions_and_staging(
         return [], None, None
     ri, field_name, value, handle = hit
 
+    # Same bug class as the text path's ordinal-guessing and arithmetic/count leaks
+    # (#327): the dropped field's OWN instance is fully replaced by its marker, so any
+    # occurrence of the value's JSON form elsewhere in `applied.text` is a duplicate —
+    # a different field, a different record, or the same field under the size floor —
+    # that makes the recall question answerable straight from the visible payload, no
+    # retrieve call needed. Skip it, matching the fail-closed "nothing to test" pattern
+    # every other unanswerable/leaky construction in this module already uses.
+    needle = json.dumps(value, ensure_ascii=False)
+    if needle in applied.text:
+        return [], None, None
+
     recall_q = DropQuestion(
         qid="drop-recall",
         kind="recall",
