@@ -160,6 +160,55 @@ def test_require_server_name_rejects_a_non_bool(tmp_path, bad):
         load_policy(p)
 
 
+@pytest.mark.parametrize("bad_fields", ["drop-to-retrieve", 0, 1, None, []])
+def test_fields_rejects_a_non_dict_value_rather_than_loading_silently(tmp_path, bad_fields):
+    # #328: 'fields' is the highest-stakes key (marks data lossy/critical) but was the
+    # only sibling key with no load-time shape check at all — it either silently never
+    # fired or crashed Rule.lossy_fields() downstream. Fail at load, like every other key.
+    p = tmp_path / "policy.json"
+    p.write_text(json.dumps({"version": 1,
+                             "policies": [{"match": {"tool": "x.*"}, "tiers": [],
+                                           "fields": bad_fields}]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="'fields' must be an object"):
+        load_policy(p)
+
+
+@pytest.mark.parametrize("bad_spec", ["drop-to-retrieve", 0, None, []])
+def test_fields_rejects_a_non_dict_per_path_spec(tmp_path, bad_spec):
+    # The manifestation in the issue's repro: {"fields": {"result[].body":
+    # "drop-to-retrieve"}} instead of {"result[].body": {"lossy": "drop-to-retrieve"}}.
+    # This loaded with zero error/warning and silently never dropped the field, or — on a
+    # never_lossy server — crashed Rule.lossy_fields()'s unguarded `v.get("lossy")`.
+    p = tmp_path / "policy.json"
+    p.write_text(json.dumps({"version": 1,
+                             "policies": [{"match": {"tool": "x.*"}, "tiers": [],
+                                           "fields": {"result[].body": bad_spec}}]}),
+                 encoding="utf-8")
+    with pytest.raises(ValueError, match=r"'fields' spec for \['result\[\]\.body'\]"):
+        load_policy(p)
+
+
+def test_fields_accepts_a_well_formed_spec(tmp_path):
+    p = tmp_path / "policy.json"
+    p.write_text(json.dumps({"version": 1,
+                             "policies": [{"match": {"tool": "x.*"}, "tiers": [],
+                                           "fields": {"result[].body":
+                                                      {"lossy": "drop-to-retrieve"}}}]}),
+                 encoding="utf-8")
+    pol = load_policy(p)
+    rule = pol.select("x.y")
+    assert rule.fields == {"result[].body": {"lossy": "drop-to-retrieve"}}
+    assert rule.lossy_fields() == ["result[].body"]
+
+
+def test_lossy_fields_ignores_a_non_dict_spec_built_directly():
+    # Defense in depth (#328): a Rule constructed directly (bypassing load_policy's
+    # _coerce_fields — a test, dropeval.py, or any other direct caller) must not crash
+    # lossy_fields() the way the never-lossy/credential-server path did before this fix.
+    rule = Rule("x.*", (), fields={"result[].body": "drop-to-retrieve"})
+    assert rule.lossy_fields() == []
+
+
 def test_require_server_name_is_a_registered_rule_key():
     from terse.policy import _RULE_KEYS
     assert "require_server_name" in _RULE_KEYS
