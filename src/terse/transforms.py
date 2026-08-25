@@ -511,20 +511,31 @@ def _node_tok(key: tuple) -> int:
     return _tok(payload) if kind == "s" else _tok_text(payload)
 
 
-def _count_value_nodes(node: Any, counter: Counter, memo: dict[int, str]) -> None:
+def _count_value_nodes(node: Any, counter: Counter, memo: dict[int, str],
+                       skip: frozenset[str] = frozenset()) -> None:
     """Count VALUE-position nodes (not dict keys) by canonical form, recursively.
     Strings count as ("s", str); dicts/lists count as ("j", canonical) AND recurse,
-    so a repeated whole subtree and a repeated string inside it are both seen."""
+    so a repeated whole subtree and a repeated string inside it are both seen.
+
+    `skip`: canonical forms that will be replaced WHOLESALE by `_replace_nodes` (a
+    locked-in subtree alias) and so are never descended into at replace time. Passing
+    the final `alias_for_json` keys here (#326) makes the count match what will
+    actually be reachable after subtree folding, instead of the pre-fold global count
+    that also credits occurrences nested inside a to-be-swallowed subtree."""
     if isinstance(node, str):
         counter[("s", node)] += 1
     elif isinstance(node, list):
         counter[("j", memo[id(node)])] += 1
+        if memo[id(node)] in skip:
+            return
         for x in node:
-            _count_value_nodes(x, counter, memo)
+            _count_value_nodes(x, counter, memo, skip)
     elif isinstance(node, dict):
         counter[("j", memo[id(node)])] += 1
+        if memo[id(node)] in skip:
+            return
         for v in node.values():
-            _count_value_nodes(v, counter, memo)
+            _count_value_nodes(v, counter, memo, skip)
     # scalars (int/float/bool/None) are too cheap to alias
 
 
@@ -644,6 +655,27 @@ def dict_encode(structure: Any, memo: dict[int, str] | None = None) -> tuple[Any
 
     if not (alias_for_str or alias_for_json):
         return structure, {}
+
+    # Re-validate string aliases against the LOCKED-IN subtree selection (#326). The
+    # loop above computed each string's `saving` from the global pre-fold count, which
+    # over-counts: `_replace_nodes` folds a matched subtree wholesale and never
+    # descends into it, so a string occurrence inside a swallowed subtree is never
+    # actually replaced there. Recount with those subtrees excluded from the walk, and
+    # drop any string alias whose real, reachable saving no longer clears zero.
+    if alias_for_str and alias_for_json:
+        skip = frozenset(alias_for_json)
+        real_counts: Counter = Counter()
+        _count_value_nodes(structure, real_counts, memo, skip)
+        for payload, alias in list(alias_for_str.items()):
+            n = real_counts[("s", payload)]
+            t = _tok(payload)
+            saving = (n * t) - (n * _tok(alias) + _tok(alias) + t)
+            if n < 2 or saving <= 0:
+                del alias_for_str[payload]
+                del legend[alias]
+        if not (alias_for_str or alias_for_json):
+            return structure, {}
+
     data = _replace_nodes(structure, alias_for_str, alias_for_json, memo)
     used: set = set()
     _collect_used_aliases(data, legend, used)
