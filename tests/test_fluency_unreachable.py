@@ -117,8 +117,8 @@ def test_a_partially_failing_model_cannot_force_a_regression_verdict():
     A partial rate limit leaves `raw` non-zero (control never fires) while depressing the
     terse arms. Gated, that is a worst-model regression and the whole panel returns FAIL on
     a backend that was simply half down."""
-    healthy = [_row() for _ in range(4)]                       # 100% everywhere
-    flaky = [_row(raw_ok=1, terse_ok=0, primer_ok=0, inline_ok=0, fails=2) for _ in range(4)]
+    healthy = [_row() for _ in range(20)]                       # 100% everywhere
+    flaky = [_row(raw_ok=1, terse_ok=0, primer_ok=0, inline_ok=0, fails=2) for _ in range(20)]
     text = _report({"good": healthy, "flaky": flaky})
     verdict = text.split("## Verdict")[1]
     assert "Excluded (too few calls to compare — not measured)" in verdict
@@ -142,7 +142,7 @@ def test_a_run_where_every_model_failed_states_a_NON_verdict_rather_than_staying
 def test_a_healthy_panel_is_unaffected():
     """The guard must not swallow a real result: with no failures the report still
     publishes percentages and reaches a verdict."""
-    text = _report({"good": [_row() for _ in range(4)]})
+    text = _report({"good": [_row() for _ in range(20)]})
     assert "n/a | n/a" not in text
     assert "Not measured" not in text
     assert "NO VERDICT" not in text
@@ -151,7 +151,7 @@ def test_a_healthy_panel_is_unaffected():
 
 def test_a_healthy_model_is_still_gated_alongside_an_unreachable_one():
     """A broken backend must not take a working model's verdict down with it."""
-    text = _report({"good": [_row() for _ in range(4)],
+    text = _report({"good": [_row() for _ in range(20)],
                     "dead": [_row(raw_ok=0, terse_ok=0, primer_ok=0, inline_ok=0, fails=4)]})
     verdict = text.split("## Verdict")[1]
     assert "NO VERDICT" not in verdict, "one dead model must not void a measured one"
@@ -211,8 +211,8 @@ def test_the_terminal_chart_excludes_the_same_models_the_markdown_does():
     # this test against either implementation and so would pin nothing.
     flaky = [_row(raw_ok=1, terse_ok=0, primer_ok=0, inline_ok=0, fails=3, attempts=4,
                   raw_trials=1, terse_trials=0, primer_trials=0, inline_trials=0)
-             for _ in range(4)]
-    gap_rows, excluded = fluency_gap_rows({"good": [_row() for _ in range(4)],
+             for _ in range(20)]
+    gap_rows, excluded = fluency_gap_rows({"good": [_row() for _ in range(20)],
                                            "flaky": flaky})
     assert _form_stats(flaky, "raw_ok")[0] > 0, "must not be caught by the raw==0 guard"
     assert "flaky" not in gap_rows, "the chart would plot a FAIL bar for a dead backend"
@@ -226,12 +226,13 @@ def test_the_per_transform_table_drops_unmeasured_models():
     reader uses to decide 'restrict the policy to the transforms that held'."""
     dead = [_row(transform="table", raw_ok=0, terse_ok=0, primer_ok=0, inline_ok=0,
                  fails=4, attempts=4, raw_trials=0, terse_trials=0,
-                 primer_trials=0, inline_trials=0) for _ in range(8)]
-    good = [_row(transform="table") for _ in range(2)]
+                 primer_trials=0, inline_trials=0) for _ in range(20)]
+    good = [_row(transform="table") for _ in range(20)]
     text = _report({"good": good, "dead": dead})
     section = text.split("by stressed transform")[1].split("## Verdict")[0]
-    # Pooling 8 zero rows with 2 perfect ones would read 20%; excluding them reads 100%.
-    assert "| table | 2 | 100% | 100% |" in section
+    # Pooling the 20 zero rows with the 20 perfect ones would read 50%; excluding them
+    # reads 100% over the 20 that were actually scored.
+    assert "| table | 20 | 100% | 100% |" in section
 
 
 def test_a_few_transient_failures_do_not_void_an_otherwise_complete_run():
@@ -241,17 +242,19 @@ def test_a_few_transient_failures_do_not_void_an_otherwise_complete_run():
 
     A failed call is now removed from its arm's DENOMINATOR instead, so the surviving
     sample stays honest and only a substantially-down backend is withheld."""
-    # 20 rows, 4 arms x 1 trial = 80 attempts; 2 lost = 2.5%, well under the bar.
+    # 24 rows, 4 arms x 1 trial = 96 attempts; 2 lost = 2.1%, well under the bar. 24 rather
+    # than 20 so the ONE question pairing drops still leaves 23 — clear of #334's floor,
+    # which is about too little evidence, not about a transient loss.
     rows = [_row(attempts=4, raw_trials=1, terse_trials=1, primer_trials=1, inline_trials=1)
-            for _ in range(20)]
+            for _ in range(24)]
     rows[0].update(fails=2, terse_trials=0, terse_ok=0)   # one question's terse arm lost
     text = _report({"flaky": rows})
     assert "NO VERDICT" not in text
-    assert "Partially degraded" in text and "2/80" in text
+    assert "Partially degraded" in text and "2/96" in text
     # terse is still 100%, and `q` is 19 — the PAIRED exam these percentages are actually
     # over. It used to print 20, the number of questions generated, next to accuracies
     # computed from 19 of them (#280): one line stating two different denominators.
-    assert "| `flaky` | 19 | 100% ±0 | 100% ±0" in text
+    assert "| `flaky` | 23 | 100% ±0 | 100% ±0" in text
 
 
 def test_a_mostly_dead_backend_is_still_withheld():
@@ -363,10 +366,10 @@ def test_the_diff_forest_plot_excludes_the_same_models_the_diff_markdown_does():
     from terse.terminal_report import build_terminal_diff_report
     dead = [{"qid": f"q{i}", "qtype": "count", "transform": "table", "trials": 2,
              "terse_ok": 0, "terse_trials": 0, "diff_ok": 0, "diff_trials": 0,
-             "fails": 4, "attempts": 4} for i in range(4)]
+             "fails": 4, "attempts": 4} for i in range(20)]
     good = [{"qid": f"q{i}", "qtype": "count", "transform": "table", "trials": 2,
              "terse_ok": 2, "terse_trials": 2, "diff_ok": 2, "diff_trials": 2,
-             "fails": 0, "attempts": 4} for i in range(4)]
+             "fails": 0, "attempts": 4} for i in range(20)]
     gap_rows, excluded = diff_gap_rows({"good": good, "dead": dead})
     assert "dead" not in gap_rows and "dead" in excluded
     assert "good" in gap_rows
@@ -501,20 +504,20 @@ def _diff_rows(*, degraded: bool):
     if not degraded:
         return [{"qid": f"q{i}", "qtype": "count", "transform": "table", "trials": 2,
                  "terse_ok": 2, "terse_trials": 2, "diff_ok": 2, "diff_trials": 2,
-                 "fails": 0, "attempts": 4} for i in range(4)]
+                 "fails": 0, "attempts": 4} for i in range(20)]
     return [{"qid": f"q{i}", "qtype": "count", "transform": "table", "trials": 2,
              "terse_ok": 2, "terse_trials": 2,      # control survived, looks fine
              "diff_ok": 0, "diff_trials": 1,        # one diff call lost, the other wrong
-             "fails": 1, "attempts": 4} for i in range(4)]
+             "fails": 1, "attempts": 4} for i in range(20)]
 
 
 def _payload_rows(*, degraded: bool):
     """Payload-harness row shape (raw/terse/primer/inline), same construction."""
     if not degraded:
-        return [_row() for _ in range(4)]
+        return [_row() for _ in range(20)]
     return [_row(raw_ok=2, raw_trials=2, terse_ok=0, terse_trials=1,
                  primer_ok=0, primer_trials=1, inline_ok=0, inline_trials=1,
-                 trials=2, fails=2, attempts=8) for _ in range(4)]
+                 trials=2, fails=2, attempts=8) for _ in range(20)]
 
 
 def test_an_unmeasured_model_changes_no_renderers_verdict():

@@ -245,8 +245,33 @@ class ArmGap(NamedTuple):
     arms: Mapping[str, tuple[float, float]] = MappingProxyType({})
 
 
+# How many PAIRED questions a PASS needs before "no regression observed" means anything
+# (#334). A floor on the evidence behind a NEGATIVE result, not a tolerance for a positive
+# one — the same shape and the same statistics as `_CODEC_MIN_TRIALS` below, and cited from
+# there rather than invented again: Clopper-Pearson bounds the true regression rate below
+# `1 - 0.05 ** (1/n)` at 95% confidence when n questions show zero regressions. At n=20
+# that is ~14pp; at n=3 it is 63pp, which is why the reported #334 case (a `+0% ±0pt` PASS
+# off ONE surviving question, at 15% call loss) could print maximum confidence off nothing.
+#
+# QUESTIONS, not trials, unlike `_CODEC_MIN_TRIALS`. #297 established that trials within a
+# question are correlated — at temperature 0 a question is nearly always all-right or
+# all-wrong — which is why `_form_stats` clusters its SE on the question. Counting trials
+# here would multiply the apparent evidence by `--trials` without adding any.
+#
+# ASYMMETRIC, and that is the whole design. #332's first attempt was a symmetric survival
+# floor that withheld models regardless of what they showed; because an exclusion drops a
+# model from the gate entirely, it was measured turning a demonstrated -100% regression
+# into "safe to enable `proxy --diff`". This floor can only ever withhold a model whose
+# form arm is NOT behind its control, so what it removes from `_worst_case_gap` is always a
+# non-negative gap — which cannot be the worst case unless every model is non-negative, and
+# then the run is a PASS or a NO VERDICT either way. An exclusion can never improve a
+# verdict here. Pinned by `test_a_demonstrated_regression_is_never_withheld_as_unmeasured`
+# and `test_a_small_but_failing_arm_still_publishes_its_FAIL`.
+_MIN_PAIRED_QUESTIONS = 20
+
+
 def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
-         display: tuple[str, ...] = ()) -> ArmGap:
+         display: tuple[str, ...] = (), min_paired: int | None = None) -> ArmGap:
     """Shared body of `arm_gap`/`best_arm_gap`. Gates, pairs, then computes every arm.
 
     Order matters: `_unmeasured` first (the backend was down — nothing here is measurable),
@@ -289,14 +314,21 @@ def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
         # verdict and the forest plot cannot disagree about it.
         return ArmGap(0.0, 0.0, cacc, cse, pr, "broken control", arms)
     best = max((arms[f] for f in gating), key=lambda s: s[0])
+    floor = _MIN_PAIRED_QUESTIONS if min_paired is None else min_paired
+    if len(pr) < floor and best[0] >= cacc:
+        # Not enough paired questions to support a PASS, and nothing here contradicts one.
+        # The `best[0] >= cacc` half is load-bearing, not an optimization: see
+        # `_MIN_PAIRED_QUESTIONS`. A form arm BEHIND its control publishes at any n.
+        return ArmGap(0.0, 0.0, 0.0, 0.0, [], "underpowered")
     return ArmGap(best[0], best[1], cacc, cse, pr, None, arms)
 
 
-def arm_gap(rows: list[dict[str, Any]], form: str, control: str) -> ArmGap:
+def arm_gap(rows: list[dict[str, Any]], form: str, control: str,
+            min_paired: int | None = None) -> ArmGap:
     """`form` vs `control` over the rows BOTH arms completed, or an exclusion reason.
 
     The single chokepoint for every diff-vs-control verdict in terse."""
-    return _gap(rows, [form], control)
+    return _gap(rows, [form], control, min_paired=min_paired)
 
 
 def best_arm_gap(rows: list[dict[str, Any]], forms: list[str], control: str,
@@ -333,6 +365,11 @@ REASON_LABEL = {
     "empty": "no rows",
     "no control arm": "no control arm was run",
     "partial control coverage": "control ran on only some rows",
+    # Distinct from "unmeasured" ON PURPOSE. Nothing failed here: the backend answered, the
+    # arms paired, there were simply too few questions to conclude anything from an absence
+    # of regressions. Folding it into "unmeasured" would print "too few calls to compare"
+    # about a run that lost no calls at all — the #332 mistake, one reason over.
+    "underpowered": f"fewer than {_MIN_PAIRED_QUESTIONS} paired questions",
 }
 
 # The heading each reason gets in prose renderers (markdown, HTML). "Not measured" and
@@ -345,6 +382,8 @@ REASON_HEADING = {
     "empty": "Not measured",
     "no control arm": "Not run",
     "partial control coverage": "Excluded",
+    # Not "Not measured": it WAS measured, and the measurement simply does not reach.
+    "underpowered": "Not concluded",
 }
 
 
@@ -362,41 +401,52 @@ def exclusion_note(reasons: dict[str, str | None]) -> str:
         f"{label}: {', '.join(models)}" for label, models in sorted(by.items()))
 
 
-def _not_measured_lines(withheld: dict[str, tuple[str | None, int, int]]) -> list[str]:
-    """The "**Not measured**" paragraph, with the call counts that justify it.
+def _not_measured_lines(withheld: dict[str, tuple[str | None, int, int, int]]) -> list[str]:
+    """The withheld-models paragraph(s), with the counts that justify each one.
 
-    Still takes the exclusion REASON alongside the counts, and still discards it: both
-    callers are pre-filtered to `"unmeasured"` (`_build_diff_style_report`'s control is
-    `terse_ok`, so `"broken control"` cannot fire there, and `n > 0` excludes `"empty"`;
-    the fluency caller filters explicitly). The parameter is kept, not dropped, because a
-    third caller passing a different reason would otherwise get this paragraph's wording
-    silently — the signature is where that has to be noticed.
+    Grouped BY REASON, and this is the first version where that is more than a promise.
+    The signature has always carried the exclusion reason and the body has always thrown it
+    away, back when `"unmeasured"` was the only reason that reached a report — the docstring
+    said the wording was reason-specific while the code hardcoded one sentence. #334 adds
+    `"underpowered"`, whose counts and whose remedy are both different: no calls were lost,
+    so "calls lost" is the wrong number and "check stderr" is the wrong advice.
 
-    The opening phrase reads from `REASON_LABEL` rather than being written here. This was
-    the one exclusion site that did not, which is exactly how it came to tell readers "too
-    many calls went unanswered" about backends that had answered every call (#332)."""
+    Each model arrives as `(why, fails, attempts, paired)`."""
     if not withheld:
         return []
+    by: dict[str | None, list[tuple[str, int, int, int]]] = {}
+    for m, (why, f, a, paired) in sorted(withheld.items()):
+        by.setdefault(why, []).append((m, f, a, paired))
     out: list[str] = []
-    lost = {m: (f, a) for m, (why, f, a) in withheld.items()}
-    if lost:
-        out.append(
-            # Opens with `REASON_LABEL["unmeasured"]` rather than a fourth hand-written
-            # phrase: this paragraph is the one exclusion site that did NOT read from the
-            # shared vocabulary, so the markdown said "calls went unanswered" while the
-            # html and terminal said something else. Pinned by
-            # `test_every_renderer_describes_an_unanswered_call_the_same_way`.
-            f"**Not measured** — {REASON_LABEL['unmeasured']}, so no accuracy is "
-            "published for: "
-            + ", ".join(f"`{m}` ({f}/{a} calls lost)" for m, (f, a) in sorted(lost.items()))
-            + ". Either too many calls went unanswered, or enough of them did that no "
-              "question completed every trial on BOTH arms, leaving nothing comparable — "
-              "the counts above say which, and a low one means the second. An unanswered "
-              "call is not a wrong answer. Check stderr for a `returned no content` line "
-              "naming a `finish_reason` — `length` means raise max_tokens, "
-              "`content_filter` means the payload tripped a filter. If the backend "
-              "answered most calls, lower `--trials`: each extra trial is another chance "
-              "for a question to lose one and be dropped from both arms.")
+    for why, models in sorted(by.items(), key=lambda kv: str(kv[0])):
+        if why == "underpowered":
+            out.append(
+                f"**{REASON_HEADING['underpowered']}** — "
+                + ", ".join(f"`{m}` ({paired} paired question(s))" for m, _, _, paired in models)
+                + f". These arms are not behind their control, but "
+                  f"{_MIN_PAIRED_QUESTIONS} paired questions are needed before an ABSENCE "
+                  "of regressions supports a PASS, and short of that the run is not "
+                  "evidence either way. Nothing failed here — generate more questions, or "
+                  "recover the questions pairing dropped by lowering `--trials`. A form arm "
+                  "that IS behind its control is published at any question count.")
+        else:
+            # Opens with the shared `REASON_LABEL` rather than a hand-written phrase: this
+            # paragraph was the one exclusion site that did not read from the shared
+            # vocabulary, which is how it came to tell readers "too many calls went
+            # unanswered" about backends that had answered every call (#332).
+            out.append(
+                f"**{REASON_HEADING.get(why or '', 'Not measured')}** — "
+                f"{REASON_LABEL.get(why or '', str(why))}, so no accuracy is published for: "
+                + ", ".join(f"`{m}` ({f}/{a} calls lost)" for m, f, a, _ in models)
+                + ". Either too many calls went unanswered, or enough of them did that no "
+                  "question completed every trial on BOTH arms, leaving nothing comparable "
+                  "— the counts above say which, and a low one means the second. An "
+                  "unanswered call is not a wrong answer. Check stderr for a `returned no "
+                  "content` line naming a `finish_reason` — `length` means raise "
+                  "max_tokens, `content_filter` means the payload tripped a filter. If the "
+                  "backend answered most calls, lower `--trials`: each extra trial is "
+                  "another chance for a question to lose one and be dropped from both "
+                  "arms.")
     out.append("")
     return out
 
@@ -445,7 +495,15 @@ def codec_verdict(rows: list[dict[str, Any]]) -> tuple[str, ArmGap]:
     terse — a stronger signal than two independent accuracy rates"), just kept at
     trial-count granularity instead of a per-row boolean, so it stays comparable to `n` for
     the Clopper-Pearson framing above."""
-    g = arm_gap(rows, "terse_ok", "raw_ok")
+    # `min_paired=0` opts OUT of #334's paired-QUESTION floor, which would otherwise make
+    # SAFE unreachable for this tier: a codec group is characteristically one question run
+    # many times (`test_identical_partial_failure_on_both_arms_at_the_trial_floor_is_SAFE`
+    # is a single row at 25 trials), so it would never reach 20 paired questions. This is
+    # not an exemption from sample-size gating — `_CODEC_MIN_TRIALS` below is the same
+    # Clopper-Pearson floor in the unit this verdict actually counts in. Layering a second
+    # floor in a different unit would silently re-calibrate a tier that already decided
+    # this question, without saying so anywhere near `_CODEC_MIN_TRIALS`.
+    g = arm_gap(rows, "terse_ok", "raw_ok", min_paired=0)
     if g.excluded:
         return "UNRESOLVED", g
     n = sum(r.get("terse_trials", r.get("trials", 1)) for r in g.rows)
@@ -1291,7 +1349,7 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         "|---|---|---|---|---|",
     ]
     gap_rows: dict[str, tuple[float, float, float, float]] = {}
-    unmeasured: dict[str, tuple[str | None, int, int]] = {}  # model -> (why, fails, attempts)
+    unmeasured: dict[str, tuple[str | None, int, int, int]] = {}  # -> (why, fails, attempts, paired)
     for model, rows in results.items():
         n = len(rows)
         if not n:
@@ -1308,7 +1366,8 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         if g.excluded:
             unmeasured[model] = (g.excluded,
                                  sum(int(r.get("fails", 0)) for r in rows),
-                                 sum(int(r.get("attempts", 0)) for r in rows))
+                                 sum(int(r.get("attempts", 0)) for r in rows),
+                                 len(paired_rows(rows, "diff_ok", "terse_ok")))
             out.append(f"| `{model}` | {n} | n/a | n/a | n/a |")
             continue
         facc, fse = g.control_acc, g.control_se
@@ -1953,13 +2012,18 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         # "unmeasured" now covers `unpaired` too — a run where the backend was up but one
         # arm lost too much of the question set is equally unpublishable, and it reaches
         # the reader through the same `n/a` row rather than a second vocabulary.
-        unmeasured = g.excluded == "unmeasured"
+        # Any reason that withholds this model's numbers, not just the transport one:
+        # #334's `"underpowered"` must render the same `n/a` row, or the table prints
+        # percentages the verdict below refuses to use. `reasons[model]` keeps the
+        # distinction for the prose that follows.
+        unmeasured = g.excluded in ("unmeasured", "underpowered")
         reasons[model] = g.excluded
         # "n" is the GENERATED question count; nothing in `src/` reads it (the table
         # prints `len(g.rows)`), kept only because result files carry the shape.
         summary[model] = {"n": n, "raw": racc, "raw_se": rse,
                           "terse": tacc, "terse_se": tse, "primer": pacc, "primer_se": pse,
                           "fails": fails, "attempts": attempts, "unmeasured": unmeasured,
+                          "paired": len(g.rows),
                           "gap_form": g.form_acc, "gap_form_se": g.form_se}
         if has_inline:
             summary[model].update({"inline": iacc, "inline_se": ise})
@@ -1980,7 +2044,7 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     out.append("")
     unreachable = {m: s for m, s in summary.items() if s.get("unmeasured")}
     out += _not_measured_lines({
-        m: (reasons.get(m), int(s["fails"]), int(s["attempts"]))
+        m: (reasons.get(m), int(s["fails"]), int(s["attempts"]), int(s["paired"]))
         for m, s in unreachable.items()})
     # A model that lost SOME calls but stayed under the bar still publishes numbers — say
     # so, because those percentages are over a smaller denominator than the run intended

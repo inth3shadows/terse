@@ -15,6 +15,40 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **A PASS now requires at least 20 paired questions; a FAIL still publishes at any
+  number** (`#334`). `_gap`'s previous gate fired only when *nothing* survived pairing, so
+  a run that kept a single question still printed a confident verdict: at 15% call loss,
+  nine of ten questions voided, the report rendered `✓ PASS — diff-form 100% vs full-terse
+  100% (gap +0% ±0pt)` off that one question, and nothing in the diff-family output
+  disclosed the other nine. The `±0` is not a rounding artifact — at n=1 the SE is exactly
+  zero whenever the single question is all-right or all-wrong, which is the normal case at
+  temperature 0.
+  The floor is **asymmetric**, and that is what makes it safe: it can only withhold a form
+  arm that is *not* behind its control, so what it removes from the worst-case gap is
+  always non-negative and can never be the worst case. An exclusion therefore cannot
+  improve a run's verdict — the defect that sank a symmetric survival floor in `#332`.
+  20 comes from `_CODEC_MIN_TRIALS`'s existing Clopper-Pearson framing rather than a new
+  judgment call: n zero-regression questions bound the true rate below `1 - 0.05 ** (1/n)`,
+  which is ~14pp at 20 and ~63pp at 3. Counted in QUESTIONS, not trials, because `#297`
+  established that trials within a question are correlated.
+  **Operationally this needs a corpus of at least five captured results**: `gen_questions`
+  yields a fixed 4 questions per payload regardless of its size, so a single-tool corpus
+  produces 4 paired questions and will now report `Not concluded` rather than a verdict.
+  `codec_verdict` opts out — it gates its own sample size in trials, the unit its verdict
+  actually counts in, and layering a second floor would silently re-calibrate that tier.
+- **Withheld models are no longer all described as transport failures.** `"underpowered"`
+  is a distinct exclusion reason with its own label and heading, because nothing failed in
+  that case — reusing `"unmeasured"` would have printed "too few calls to compare" about a
+  run that lost no calls at all. `_not_measured_lines` now groups by reason and reports
+  paired-question counts for the new one instead of a "calls lost" figure that would read
+  `0/N`.
+
+_Nothing yet._
+
+## [0.28.5] - 2026-08-25
+
+### Fixed
+
 - **`install-mcp`/`uninstall-mcp` write recovery data before the destructive write, on
   both the single-server install and uninstall paths** (`#329`). A crash between the two
   writes (SIGKILL, OOM, disk full) previously left a wrapped config with no matching

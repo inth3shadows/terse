@@ -136,7 +136,7 @@ def test_build_html_diff_report_renders_verdict_and_forest():
     # + a PASS/FAIL verdict gated on the worst model. This is what `fluency --diff --html`
     # writes; it was built but had no wiring or test until now.
     rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
-             "trials": 1, "terse_ok": 1, "diff_ok": 1} for i in range(10)]
+             "trials": 1, "terse_ok": 1, "diff_ok": 1} for i in range(24)]
     html = build_html_diff_report({"m": rows}, "diff-form", "full-terse")
     assert "<!doctype html>" in html
     assert "diff-form" in html and "full-terse" in html
