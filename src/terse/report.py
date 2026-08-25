@@ -223,6 +223,16 @@ def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
     compare), then pair and compute. A caller that wants the numbers must accept the gate,
     because they arrive together.
 
+    CORRECTION (#332): the `unpaired` stage this paragraph describes was never
+    implemented — there is no code below that checks `len(pr)` or otherwise gates on
+    pairing loss, and `"unpaired"` is not a string this function (or anything calling
+    it) ever produces; `build_dropeval_report`'s `unpaired_models` list is the same
+    unfinished plan, declared and never appended to. A form arm that fails every paired
+    trial without tripping `_unmeasured`'s fail-share threshold gets `excluded=None` and
+    a computed — possibly passing — gap instead of an exclusion. Left as-is (not
+    rewritten to match reality) until #332 either implements the missing gate or
+    formally retires the plan; whichever happens should update this docstring too.
+
     `display` arms are computed over the paired subset but do NOT participate in pairing.
     That is deliberate: `run_payload`'s `inline` arm carries the longest prompt of the four
     and so truncates first under a token-budget stop, while gating nothing — pairing on it

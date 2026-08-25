@@ -99,11 +99,14 @@ def test_forest_plot_pass_fail_badges():
 
 
 def test_build_html_diff_report_unmeasured_verdict_names_both_possible_causes():
-    # #330: report.py folded the old "unpaired"/"exam too small" exclusion reasons into
-    # a single "unmeasured" string; html_report.py still checked for the retired ones, so
-    # the more specific verdict/tail text could never render. Force `arm_gap` to exclude
-    # via `_unmeasured`'s trigger #1 (an arm with zero completed trials) and check the
-    # rendered page names the pairing-loss possibility, not just the dead-backend one.
+    # #330: html_report.py checked for "unpaired"/"exam too small" exclusion reasons that
+    # `ArmGap.excluded` never actually produces — report.py's `_gap` was designed to
+    # distinguish "backend down" from "backend up but too little paired" (see its
+    # docstring), but that pairing-loss detection was never implemented, so the only
+    # reason this code ever sees is "unmeasured". Force `arm_gap` to exclude via
+    # `_unmeasured`'s trigger #1 (an arm with zero completed trials) and check the
+    # rendered page names the pairing-loss possibility, not just the dead-backend one,
+    # since it genuinely can't tell which applies.
     rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
              "trials": 1, "terse_ok": 1, "diff_ok": 1, "attempts": 1, "fails": 0,
              "terse_trials": 1, "diff_trials": 0} for i in range(10)]
@@ -112,6 +115,20 @@ def test_build_html_diff_report_unmeasured_verdict_names_both_possible_causes():
     assert "no model had enough questions completed by both arms" in html
     assert "one lost trial withholds the whole question" in html
     assert "unpaired" not in html and "exam too small" not in html
+
+
+def test_build_html_diff_report_no_calls_claim_only_when_actually_unmeasured():
+    # code-review finding on the #330 fix: the pre-existing fallback message ("nothing
+    # was measured. No model returned enough calls to score") rendered for EVERY
+    # exclusion reason, including "not a diff run" — a row-shape mismatch where every
+    # call was answered fine, there's just no diff arm in the rows. Asserting "no model
+    # returned enough calls" for that case is a claim the code can't back.
+    rows = [{"tool": "t", "sha": "s", "qid": "q0", "terse_ok": 1}]  # no diff_ok key
+    html = build_html_diff_report({"m": rows}, "diff-form", "full-terse")
+    assert "NO VERDICT" in html
+    assert "No model returned enough calls to score, so this run says nothing" not in html
+    assert "see the exclusion list below" in html
+    assert "Not applicable" in html and "no diff arm in these rows" in html
 
 
 def test_build_html_diff_report_renders_verdict_and_forest():

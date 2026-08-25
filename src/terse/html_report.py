@@ -531,18 +531,32 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
         # card on a page titled "comprehension gap" reads as "no gap found". The second
         # sentence is reason-specific: telling a reader to fix a backend that answered 90%
         # of its calls sends them to re-run something that will fail the same way.
-        # `"unmeasured"` now covers what used to be two reasons — a totally unresponsive
-        # backend AND a backend that answered but lost too much of the question set to
-        # pair (report.py's `arm_gap`, #330) — so `g.excluded` alone can no longer tell
-        # them apart. Name both possible causes rather than guess which one applies.
-        only_unmeasured = bool(excluded) and all(w == "unmeasured" for w in excluded.values())
-        why = ("nothing could be compared. Either no model returned enough calls to score, "
-               "or the backend answered but no model had enough questions completed by "
-               "both arms to score a gap — check stderr for a <code>returned no "
-               "content</code> line, and/or lower <code>--trials</code> and re-run."
-               if only_unmeasured else
-               "nothing was measured. No model returned enough calls to score, so this "
-               "run says nothing either way.")
+        # `excluded` can hold "unmeasured" (from `g.excluded`, the ONLY reason `_gap`
+        # itself ever produces — #330 correction: it was never actually two reasons that
+        # got "folded"; `report.py`'s `_gap` docstring and its dead `unpaired_models`
+        # list describe an intent to distinguish "backend down" from "backend up but too
+        # little of the question set paired" that was never implemented — see the issue
+        # filed as #332 for the real gap that leaves: a form arm that fails EVERY
+        # paired trial without tripping `_unmeasured`'s fail-share threshold gets
+        # `excluded=None` and a computed, possibly-passing gap instead of an exclusion at
+        # all), "broken control", "empty" (also from `g.excluded`), or "not a diff run"
+        # (set locally above, never from `_gap`). Only the first of those means calls
+        # went unanswered — the generic fallback below used to assert that for every
+        # case, which is false whenever a model was excluded for one of the other three.
+        reasons_present = set(excluded.values()) if excluded else set()
+        only_unmeasured = reasons_present == {"unmeasured"}
+        if only_unmeasured:
+            why = ("nothing could be compared. Either no model returned enough calls to "
+                   "score, or the backend answered but no model had enough questions "
+                   "completed by both arms to score a gap — check stderr for a <code>"
+                   "returned no content</code> line, and/or lower <code>--trials</code> "
+                   "and re-run.")
+        elif reasons_present:
+            why = ("nothing could be compared — see the exclusion list below for why "
+                   "each model was withheld.")
+        else:
+            why = ("nothing was measured. No model returned enough calls to score, so "
+                   "this run says nothing either way.")
         verdict_html = f'<div class="banner critical">NO VERDICT — {why}</div>'
     if excluded:
         # One vocabulary, shared with the markdown and terminal renderers via
@@ -554,9 +568,9 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
             by_reason.setdefault(reason or "unmeasured", []).append(model)
         for why, models in sorted(by_reason.items()):
             names = ", ".join(f"<code>{_esc(m)}</code>" for m in models)
-            # Same collapse as `only_unmeasured` above (#330): "unmeasured" now covers
-            # both an unanswered call and a paired-trial loss, so the tail names both
-            # possible causes instead of asserting one the code can no longer confirm.
+            # Same reasoning as `only_unmeasured` above: `"unmeasured"` is the only
+            # reason this branch ever sees, and it can mean either an unanswered call or
+            # a paired-trial loss, so the tail names both instead of asserting one.
             tail = (" An unanswered call is not a wrong answer — check stderr for a "
                     "<code>returned no content</code> line. Or, a question counts only "
                     "when every arm answered all of its trials, so one lost trial "

@@ -678,6 +678,18 @@ def dict_encode(structure: Any, memo: dict[int, str] | None = None) -> tuple[Any
     # true count (its occurrences stop being swallowed too) — never lower it below what
     # was already verified here — so a surviving candidate's saving, checked once
     # against this minimum, remains valid however the others resolve.
+    # `< 0`, not `<= 0` like the round-A accept loop above: a real tie here means the
+    # SAVING FORMULA'S estimate is exactly break-even, not that keeping the alias is
+    # provably worse — and the formula itself is an approximation (it doesn't fully
+    # model every token-boundary interaction), so an exact-zero recount tie occasionally
+    # UNDERSTATES the true saving. A 20k-payload adversarial fuzz (code review) measured
+    # `<= 0` pruning 62 cases where keeping the alias was actually 1-4 tokens cheaper,
+    # against `< 0` pruning none of those while still catching every genuine loss —
+    # `compress_with`'s payload-level net-size guard means neither choice can ever
+    # regress a payload below plain minify, so there's no downside to the looser bound
+    # here specifically (round A's own `saving <= 0` bar for ACCEPTING a brand-new
+    # candidate is intentionally left untouched — that's a different, already-validated
+    # decision point, not the one this fix's fuzz measured).
     if alias_for_json:
         skip = frozenset(alias_for_json)
         real_counts: Counter = Counter()
@@ -686,14 +698,14 @@ def dict_encode(structure: Any, memo: dict[int, str] | None = None) -> tuple[Any
             n = real_counts[("j", payload)]
             t = _node_tok(("j", payload))
             saving = (n * t) - (n * _tok(alias) + _tok(alias) + t)
-            if n < 2 or saving <= 0:
+            if n < 2 or saving < 0:
                 del alias_for_json[payload]
                 del legend[alias]
         for payload, alias in list(alias_for_str.items()):
             n = real_counts[("s", payload)]
             t = _tok(payload)
             saving = (n * t) - (n * _tok(alias) + _tok(alias) + t)
-            if n < 2 or saving <= 0:
+            if n < 2 or saving < 0:
                 del alias_for_str[payload]
                 del legend[alias]
         if not (alias_for_str or alias_for_json):
