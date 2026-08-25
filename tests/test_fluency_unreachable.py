@@ -417,7 +417,11 @@ def test_the_html_report_cannot_render_a_green_PASS_banner_for_a_dead_backend():
     html = build_html_diff_report({"gemini-dead": rows})
     assert "banner good" not in html, "a dead backend must never render a green PASS"
     assert "✓ PASS" not in html
-    assert "NO VERDICT — nothing was measured" in html
+    # #330: report.py folded "unpaired"/"exam too small" into "unmeasured", so
+    # `g.excluded` alone can no longer prove this is a totally dead backend rather than
+    # one that answered but lost too much to pairing — the banner names both
+    # possibilities instead of asserting the specific one it can't confirm.
+    assert "NO VERDICT — nothing could be compared" in html
     assert "gemini-dead" in html and "Not measured" in html
 
 
