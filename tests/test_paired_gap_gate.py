@@ -326,7 +326,10 @@ def test_a_withheld_deepest_depth_is_not_reported_as_no_drift():
     assert "No depth-correlated comprehension drift" not in md, md
     assert "NO VERDICT at the deepest tested depth" in md, md
     # And the withheld depth is NAMED, rather than left as an unexplained `n/a`.
-    assert "Depths not compared" in md
+    # Dead backend at this depth, so the TRANSPORT heading is the true one. #332 briefly
+    # collapsed both causes into "not compared" here; the per-depth `_unmeasured` split
+    # restored the distinction, and this is the fixture that proves the right half fires.
+    assert "Depths not measured" in md
     assert "depth 5" in md
 
 
@@ -607,6 +610,9 @@ def test_a_withheld_model_is_not_told_its_backend_was_unreachable():
     # distinguish this, because the markdown's (legitimate) hedge "either too many calls
     # went unanswered, or..." contains the bad phrase as a substring.
     from terse.report import REASON_LABEL
+    assert REASON_LABEL["unmeasured"] == "too few calls to compare", (
+        f"the shared label is {REASON_LABEL['unmeasured']!r}; the renderers spell this "
+        f"phrase literally in their own tests, so changing it here alone splits them")
     assert "unanswered" not in REASON_LABEL["unmeasured"], (
         f"REASON_LABEL['unmeasured'] is {REASON_LABEL['unmeasured']!r}, which asserts a "
         f"cause that is false whenever the arms merely failed to pair")
@@ -622,3 +628,31 @@ def test_a_withheld_model_is_not_told_its_backend_was_unreachable():
     assert "Fix the backend(s) and re-run" not in md
     # ...and the cause that DID apply has to be named where the reader is looking.
     assert "no question completed every trial on BOTH arms" in md
+
+
+def test_the_fluency_verdict_does_not_assert_a_dead_backend():
+    """The seventh renderer. `REASON_LABEL`'s note claims a seventh phrasing is impossible
+    and cites `test_every_renderer_names_the_right_exclusion_reason` as the loop that makes
+    it so — that test does not exist anywhere in the repo, which is how
+    `build_fluency_report`'s verdict bullet kept hardcoding "calls went unanswered" through
+    the #332 sweep that hedged every other site.
+
+    Here the backend answers 88.9% of its calls; the one it loses per question is a
+    `primer` trial, so `paired_rows` voids every row and the model is withheld. The
+    document must not contain a bullet asserting its calls went unanswered."""
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
+        "raw_ok": TRIALS, "raw_trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS,
+        "primer_ok": 0, "primer_trials": TRIALS - 1,
+        "attempts": TRIALS * 3, "fails": 1,
+    } for i in range(10)]
+    lost = sum(r["fails"] for r in rows) / sum(r["attempts"] for r in rows)
+    assert lost < UNMEASURED_FAIL_SHARE, f"pooled loss {lost:.1%} trips `_unmeasured` alone"
+    assert paired_rows(rows, "terse_ok", "primer_ok", "raw_ok") == []
+
+    md = build_fluency_report({"m": rows}, [])
+    assert "`m`" in md, "the withheld model must still be named"
+    assert "Excluded (calls went unanswered" not in md, (
+        f"the fluency verdict asserts an unreachable backend for a model whose backend "
+        f"answered {1 - lost:.1%} of its calls")

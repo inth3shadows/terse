@@ -67,6 +67,8 @@ fails that pull request until the section has moved.
   gate entirely, withholding a small subset can *improve* a run's verdict — an earlier
   version of this fix used a 50%-survival floor and was measured turning a demonstrated
   −100% regression into "safe to enable `proxy --diff`" at 10% call loss.
+  **This therefore does not cover a small-but-nonempty subset**: a run where one question
+  of ten survives still publishes a `±0` PASS off that single question. Tracked as `#334`.
 - **The reports no longer tell you your backend was unreachable when it answered almost
   every call** (`#332`). The `unmeasured` exclusion now covers two causes — a dead backend,
   and a live one whose losses left no question complete on both arms — so the prose that

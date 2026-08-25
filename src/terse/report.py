@@ -365,11 +365,16 @@ def exclusion_note(reasons: dict[str, str | None]) -> str:
 def _not_measured_lines(withheld: dict[str, tuple[str | None, int, int]]) -> list[str]:
     """The "**Not measured**" paragraph, with the call counts that justify it.
 
-    Takes the exclusion REASON alongside the counts even though only one reason reaches the
-    reports today, because the wording is reason-specific and the previous version of this
-    function proved that a single hardcoded sentence drifts the moment a second reason
-    exists — it told readers "too many calls went unanswered" about backends that had
-    answered every call."""
+    Still takes the exclusion REASON alongside the counts, and still discards it: both
+    callers are pre-filtered to `"unmeasured"` (`_build_diff_style_report`'s control is
+    `terse_ok`, so `"broken control"` cannot fire there, and `n > 0` excludes `"empty"`;
+    the fluency caller filters explicitly). The parameter is kept, not dropped, because a
+    third caller passing a different reason would otherwise get this paragraph's wording
+    silently — the signature is where that has to be noticed.
+
+    The opening phrase reads from `REASON_LABEL` rather than being written here. This was
+    the one exclusion site that did not, which is exactly how it came to tell readers "too
+    many calls went unanswered" about backends that had answered every call (#332)."""
     if not withheld:
         return []
     out: list[str] = []
@@ -1337,11 +1342,13 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         # read as a go/no-go on `proxy --diff`, and an empty one reads as "no objection".
         # Reason-specific advice: "fix the backend" is wrong guidance for a run whose
         # backend answered every call and whose arms merely could not be paired.
-        out.append("- **NO VERDICT — nothing was measured.** No model left a question "
-                   "both arms completed, so this run says nothing about the diff form "
-                   "either way. See **Not measured** above for whether the backend was "
-                   "unreachable or merely lost enough calls to break the pairing; re-run "
-                   "accordingly before enabling `proxy --diff`.")
+        # Not "no model left a question both arms completed": `_unmeasured` gates on
+        # transport BEFORE pairing, so a model withheld by it can still have questions
+        # that pair cleanly. Says what is true of every withheld model instead.
+        out.append("- **NO VERDICT — nothing was scored.** Every model was withheld, so "
+                   "this run says nothing about the diff form either way. See **Not "
+                   "measured** above for whether the backend was unreachable or merely "
+                   "lost enough calls to break the pairing; the remedies differ.")
     out.append("")
     return "\n".join(out)
 
@@ -1445,6 +1452,12 @@ def build_diff_soak_report(results: dict) -> str:
             # invariance test's `_gate_signature` never saw it either (#280 F2).
             dg = arm_gap(drows, "diff_ok", "terse_ok")
             if model in unmeasured or dg.excluded:
+                # Both causes share the `"unmeasured"` reason since #332, so `dg.excluded`
+                # cannot tell them apart — but `_unmeasured` can, and it is the transport
+                # half by definition. Keyed on that instead so the heading stays true:
+                # "not measured" for a slice whose calls failed, "not compared" for one
+                # whose calls landed but left no shared question.
+                dg = dg._replace(excluded=("unmeasured" if _unmeasured(drows) else "unpaired"))
                 out.append(f"| `{model}` | {depth} | {len(drows)} | n/a | n/a | n/a |")
                 # Recorded, because an `n/a` in this table with no prose anywhere is how a
                 # withheld DEEPEST depth turned into a green "no drift" conclusion below.
@@ -1482,14 +1495,14 @@ def build_diff_soak_report(results: dict) -> str:
             at = ", ".join(
                 f"`{m}` (depth {', '.join(str(d) for d in sorted(ds[why]))})"
                 for m, ds in sorted(withheld_depths.items()) if why in ds)
-            # One lead, not a ternary on `why`. The old branch tested `why == "x"` — a
-            # reason string nothing in this codebase produces — so the specific wording it
-            # guarded was unreachable and every withheld depth got the generic one (#284).
-            # #332 settled that both causes share the `"unmeasured"` reason, which means no
-            # `why` value can ever distinguish them here; the lead states both instead.
-            lead = ("**Depths not compared** — too few calls to compare, because the "
-                    "backend went unanswered or the losses left no question complete on "
-                    "both arms, at: ")
+            # The old branch tested `why == "x"`, a reason string nothing produces, so
+            # the specific wording it guarded had been unreachable since #284 and every
+            # withheld depth got the generic one. `"unpaired"` is set just above from
+            # `_unmeasured(drows)` — local to this table, not an `ArmGap` reason — which
+            # makes the precise branch reachable for the first time.
+            lead = ("**Depths not compared** — the backend answered, but one arm did not "
+                    "complete enough of the same questions at: " if why == "unpaired" else
+                    "**Depths not measured** — too many calls went unanswered at: ")
             out += [lead + at + ". Those depths are excluded from the verdict below rather "
                     "than scored on a question set the two arms did not share (#280).", ""]
 
@@ -1523,10 +1536,10 @@ def build_diff_soak_report(results: dict) -> str:
         # The advice has to match the cause. "Fix the backend(s) and re-run" sends a reader
         # to re-run something that will fail identically when the backend answered fine and
         # the arms simply could not be paired.
-        out.append("- **NO VERDICT — nothing was measured.** No model left a question "
-                   "both arms completed, so this run says nothing about diff-chain drift "
-                   "either way. See **Not measured** above for which cause applies before "
-                   "deciding what to re-run.")
+        out.append("- **NO VERDICT — nothing was scored.** Every model was withheld, so "
+                   "this run says nothing about diff-chain drift either way. The lines "
+                   "above name each model and say whether its calls failed or merely left "
+                   "no question the two arms both completed — the remedies differ.")
     if worst:
         out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "chain-form",
                                            "full-terse"))
@@ -2009,7 +2022,12 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         out.append(f"- Excluded (raw control failed — backend/config error, not comprehension): "
                    f"{', '.join(f'`{m}`' for m in broken)}.")
     if unmeasured_models:
-        out.append(f"- Excluded (calls went unanswered — not measured): "
+        # Reads the shared label rather than restating it: this line asserted "calls
+        # went unanswered" as the settled cause, which #332 made false — the reason now
+        # also covers a backend that answered nearly everything but whose losses left no
+        # question complete on both arms. Pinned by
+        # `test_the_fluency_verdict_does_not_assert_a_dead_backend`.
+        out.append(f"- Excluded ({REASON_LABEL['unmeasured']} — not measured): "
                    f"{', '.join(f'`{m}`' for m in unmeasured_models)}.")
     # best terse-side form per model, carrying its own SE for the gap's confidence interval.
     # gap CI: raw and the best form are over the same questions (not independent), so

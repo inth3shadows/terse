@@ -169,7 +169,7 @@ def test_a_no_content_model_cannot_produce_a_PASS_on_the_diff_ship_gate():
     verdict = text.split("## Verdict")[1]
     assert "safe to enable" not in verdict, \
         "a model that answered nothing must never green-light --diff"
-    assert "NO VERDICT — nothing was measured" in verdict
+    assert "NO VERDICT — nothing was scored" in verdict
 
 
 def test_an_unanswerable_question_is_never_generated():
@@ -246,6 +246,10 @@ def test_every_renderer_describes_an_unanswered_call_the_same_way():
         # not merely that each says something similar. Before #332 the markdown paragraph
         # was the one site that did not read from it, and this test passed anyway because
         # the word it happened to grep for appeared in both wordings.
-        from terse.report import REASON_LABEL
-        assert REASON_LABEL["unmeasured"] in text, name
+        # The phrase is spelled out, NOT read from `REASON_LABEL`. An earlier version of
+        # this assertion did read it from the source under test, which made it vacuous
+        # about content: blanking the label to "" passed all 1693 tests while every
+        # renderer printed "(excluded — : dead-model)". A literal is the only form that
+        # asserts the shared vocabulary says anything at all.
+        assert "too few calls to compare" in text, name
         assert "dead-model" in text, name
