@@ -1736,11 +1736,22 @@ def do_uninstall(servers: list[str] | None, *, all_: bool = False,
         result["router_ambiguous"] = all_routers
     if not dry_run and any(c.get("restored") for c in changes):
         result["backup"] = str(_backup(target.cfg))
-        # Same recovery-data-first ordering as the install path (#329): a crash here is
-        # more benign (a stale stash entry after an unwrap, not a double-wrap) but there's
-        # no reason to keep the asymmetric, less-safe order.
-        _write_json(stash_path(target.cfg), full_stash)
+        # CONFIG first, stash last — the OPPOSITE of the install path, because `unwrap()`
+        # inverts which side is "recovery" and which is "destructive" (code-review catch
+        # on the first version of this fix, which wrongly copied install's order here
+        # without re-tracing what unwrap() actually mutates): `unwrap()` does
+        # `servers[server] = stash.pop(server)` — the original moves OUT of `stash` and
+        # INTO `config`, in memory, before either write happens. So `config` here carries
+        # the RESTORED original (the recovery state) and `stash` is what's being erased
+        # (the destructive step, since the popped entry has nowhere else to go once this
+        # write lands). Writing stash first would erase the on-disk record of the
+        # original while the config on disk was still wrapped — a crash in that window
+        # would leave NEITHER file able to recover it, worse than either order in the
+        # original code. Config-first means a crash before the stash write leaves the
+        # original live in config AND still recorded (now redundantly) in stash — always
+        # recoverable.
         _write_json(target.cfg, config, trailing_newline=had_nl)
+        _write_json(stash_path(target.cfg), full_stash)
         if peers_doc is not None:
             if peers_downstreams(peers_doc) or len(all_routers) > 1:
                 _write_json(peers_p, peers_doc)

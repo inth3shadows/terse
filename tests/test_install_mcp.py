@@ -170,6 +170,57 @@ def test_do_install_writes_stash_before_config_crash_safe(tmp_path, monkeypatch)
     assert args.count("proxy") == 1
 
 
+def test_do_uninstall_writes_config_before_stash_crash_safe(tmp_path, monkeypatch):
+    """Regression for a code-review catch on the first version of the #329 fix: unwrap()
+    inverts which side is recovery data vs. destructive write relative to wrap(), so
+    copying install's stash-first order onto uninstall was wrong, not merely redundant.
+
+    `unwrap()` does `servers[server] = stash.pop(server)` — the original moves OUT of
+    `stash` and INTO `config` in memory before either write happens. So on uninstall,
+    CONFIG carries the recovery state (the restored original) and STASH is what's being
+    erased. Writing stash first would persist the erasure while the config on disk was
+    still wrapped — a crash in that window leaves the original nowhere recoverable on
+    disk at all, strictly worse than either naive order. Config-first means a crash
+    before the stash write leaves the original live in config AND still (redundantly)
+    recorded in stash on disk — always recoverable."""
+    cfg = tmp_path / ".claude.json"
+    original_entry = {"command": "uvx", "args": ["runecho-mcp"]}
+    cfg.write_text(json.dumps(_cfg(runecho=dict(original_entry))))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+    im.do_install(["runecho"], str(policy), cfg=cfg)
+    wrapped = json.loads(cfg.read_text())["mcpServers"]["runecho"]
+    assert wrapped != original_entry  # sanity: install actually wrapped it
+
+    calls: list[Path] = []
+    real_write_json = im._write_json
+
+    def crash_on_second_write(path, obj, **kw):
+        calls.append(path)
+        if len(calls) == 2:
+            raise OSError("simulated crash (SIGKILL/OOM/disk full)")
+        real_write_json(path, obj, **kw)
+
+    monkeypatch.setattr(im, "_write_json", crash_on_second_write)
+    with pytest.raises(OSError):
+        im.do_uninstall(["runecho"], cfg=cfg)
+
+    # Recovery data (config, now restored) must be written first, the destructive
+    # erasure (stash) last — the OPPOSITE order from install.
+    assert calls[0] == cfg
+    assert calls[1] == im.stash_path(cfg)
+
+    # The crash landed before the stash write, so the original must be recoverable from
+    # BOTH files on disk: config already shows the true original (the fix landed)...
+    on_disk_cfg = json.loads(cfg.read_text())
+    assert on_disk_cfg["mcpServers"]["runecho"] == original_entry
+    # ...and the stash on disk still (redundantly, harmlessly) carries the same record,
+    # since its own write never happened.
+    on_disk_stash = json.loads(im.stash_path(cfg).read_text())
+    assert on_disk_stash["user"]["runecho"] == original_entry
+
+
 def test_do_install_capture_dir_adds_proxy_flag(tmp_path, monkeypatch):
     cfg = tmp_path / ".claude.json"
     cfg.write_text(json.dumps(_cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})))
