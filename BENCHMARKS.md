@@ -121,8 +121,8 @@ single-shot codec all pay the full column every call. Modeling one repeat call p
 |---|--:|--:|--:|
 | gh_commits_flat | 10,681 | 812 | **92.4%** |
 | gh_issues | 29,611 | 4,448 | **85.0%** |
-| gh_pulls | 37,752 | 15,292 | **59.5%** |
-| **weighted total** | 149,776 | 40,138 | **73.2%** |
+| gh_pulls | 37,746 | 15,292 | **59.5%** |
+| **weighted total** | 149,741 | 40,138 | **73.2%** |
 
 **Honest caveat (read this):** these are *modeled* repeat-call savings. How *often* the
 pattern occurs in a real agent loop is workload-dependent and is being measured directly (the

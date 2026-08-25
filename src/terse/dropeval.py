@@ -374,7 +374,13 @@ def _questions_and_staging(
     # that makes the recall question answerable straight from the visible payload, no
     # retrieve call needed. Skip it, matching the fail-closed "nothing to test" pattern
     # every other unanswerable/leaky construction in this module already uses.
-    needle = json.dumps(value, ensure_ascii=False)
+    #
+    # COMPACT separators, matching `minify`/`_replace_nodes`'s actual wire format
+    # exactly (code-review finding): `json.dumps`'s default separators insert a space
+    # after `,`/`:`, so for a dict/list value the needle never matched the compact text
+    # `applied.text` actually contains, and the leak went undetected for any non-string
+    # dropped value.
+    needle = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
     if needle in applied.text:
         return [], None, None
 

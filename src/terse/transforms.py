@@ -656,16 +656,39 @@ def dict_encode(structure: Any, memo: dict[int, str] | None = None) -> tuple[Any
     if not (alias_for_str or alias_for_json):
         return structure, {}
 
-    # Re-validate string aliases against the LOCKED-IN subtree selection (#326). The
-    # loop above computed each string's `saving` from the global pre-fold count, which
-    # over-counts: `_replace_nodes` folds a matched subtree wholesale and never
-    # descends into it, so a string occurrence inside a swallowed subtree is never
-    # actually replaced there. Recount with those subtrees excluded from the walk, and
-    # drop any string alias whose real, reachable saving no longer clears zero.
-    if alias_for_str and alias_for_json:
+    # Re-validate BOTH string and subtree aliases against the LOCKED-IN subtree
+    # selection (#326). The loop above computed every candidate's `saving` from the
+    # global pre-fold count, which over-counts: `_replace_nodes` folds a matched
+    # subtree wholesale and never descends into it, so an occurrence nested inside a
+    # swallowed subtree is never actually replaced there. That applies just as much to
+    # a subtree candidate nested inside ANOTHER accepted subtree candidate as it does
+    # to a string (code-review finding on the first version of this fix, which only
+    # re-validated `alias_for_str` — a subtree alias used only once after a sibling
+    # subtree swallows its other copies is the same net-token-loss bug, just for
+    # kind="j" instead of kind="s"). Recount with every accepted subtree excluded from
+    # the walk, and drop any alias — string or subtree — whose real, reachable saving
+    # no longer clears zero.
+    #
+    # One pass, not a fixed point: `skip` is the FULL initial `alias_for_json` set, so
+    # every candidate's recount here is against the walk's minimum possible reachable
+    # count (excluding every other locked-in subtree, including itself as a no-op —
+    # `_count_value_nodes` counts a node's own occurrence before checking `skip`, so a
+    # candidate's own top-level occurrences are never miscounted by its own presence in
+    # `skip`). Removing an over-counted alias can only ever RAISE another candidate's
+    # true count (its occurrences stop being swallowed too) — never lower it below what
+    # was already verified here — so a surviving candidate's saving, checked once
+    # against this minimum, remains valid however the others resolve.
+    if alias_for_json:
         skip = frozenset(alias_for_json)
         real_counts: Counter = Counter()
         _count_value_nodes(structure, real_counts, memo, skip)
+        for payload, alias in list(alias_for_json.items()):
+            n = real_counts[("j", payload)]
+            t = _node_tok(("j", payload))
+            saving = (n * t) - (n * _tok(alias) + _tok(alias) + t)
+            if n < 2 or saving <= 0:
+                del alias_for_json[payload]
+                del legend[alias]
         for payload, alias in list(alias_for_str.items()):
             n = real_counts[("s", payload)]
             t = _tok(payload)

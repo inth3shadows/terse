@@ -93,6 +93,30 @@ def test_dict_encode_drops_a_string_alias_swallowed_by_a_subtree_alias():
     assert data["s"] == long_string  # never got aliased; still the literal value
 
 
+def test_dict_encode_drops_a_subtree_alias_swallowed_by_a_sibling_subtree_alias():
+    # code-review finding on the #326 fix: the first version only re-validated STRING
+    # aliases against the locked-in subtree selection, but a subtree candidate nested
+    # inside a DIFFERENT accepted subtree candidate suffers the identical over-count —
+    # B occurs 1x standalone + 2x nested inside A (itself aliased 3x); B's pre-fold
+    # global count is 3, but `_replace_nodes` swallows A's three copies whole, so B's
+    # only real, reachable occurrence is the standalone one. A subtree alias used once
+    # is always a net token loss (one legend entry + one use costs strictly more than
+    # the inline value: saving = t - 2*tok(alias), and tok(alias) > 0), so it must be
+    # pruned exactly like the string case is. This exact shape (verified live against
+    # the pre-fix code, not hand-derived) reproduces with the real cl100k tokenizer;
+    # nearby sizes DON'T all reproduce it — the alias-cost growth from `_alias_gen`'s
+    # b36 counter and the greedy biggest-potential-first ordering make the failure
+    # window narrow, so don't "simplify" these exact literals without re-verifying.
+    b = {"k": "y" * 9}
+    a = {"outer": b, "z": 1, "extra": "padding-value-3"}
+    obj = {"a0": dict(a), "a1": dict(a), "a2": dict(a), "b0": dict(b)}
+    data, legend = transforms.dict_encode(obj)
+    assert transforms.dict_decode(data, legend) == obj
+    assert transforms.roundtrip_ok(obj)
+    assert list(legend.values()) == [a]   # only the subtree alias for A survives
+    assert data["b0"] == b                # B never got aliased; still the literal value
+
+
 def test_dict_encode_serializes_scalars_only_not_per_level(monkeypatch):
     # Pre-#79, _count_value_nodes and _replace_nodes each called minify() at every
     # container level (>= 2*depth full re-serializations on a deep chain). The memo

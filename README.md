@@ -322,9 +322,9 @@ changed, one appended — the poll-again pattern), the **second** call costs
 | gh_commits | 30 | 51,603 | 6,273 | **87.8%** |
 | gh_issues | 30 | 29,611 | 4,448 | **85.0%** |
 | gh_dir_listing | 24 | 4,779 | 977 | **79.6%** |
-| gh_pulls | 30 | 37,752 | 15,292 | **59.5%** |
-| gh_workflow_runs | 20 | 15,350 | 12,336 | 19.6% |
-| **weighted total** | | 149,776 | 40,138 | **73.2%** |
+| gh_pulls | 30 | 37,746 | 15,292 | **59.5%** |
+| gh_workflow_runs | 20 | 15,321 | 12,336 | 19.5% |
+| **weighted total** | | 149,741 | 40,138 | **73.2%** |
 
 The diff cost scales with *what changed*, not with payload size — so its win compounds
 exactly where token cost otherwise does: a long agent loop re-fetching mostly-unchanged
