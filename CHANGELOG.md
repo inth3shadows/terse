@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.28.4] - 2026-08-21
+
 ### Fixed
 
 - **`terse fluency`'s reported `±` no longer collapses to a false `±0` at realistic trial
@@ -25,6 +29,22 @@ fails that pull request until the section has moved.
   more questions tighten it without limit, while more trials tighten it only down to a
   between-question floor they can't cross. Every report's `±` column, the `--trials` help
   text, and a stale "raise `--trials` to tighten" remediation line are updated to match.
+
+## [0.28.3] - 2026-08-20
+
+### Fixed
+
+- **`terse tune` cross-checks passthrough tools against the live ledger before
+  recommending they stay uncompressed** (`#274`). `tune`'s corpus is idempotent by sha
+  (holds each payload's first sighting, not every call) and capped at 200 samples/tool —
+  structurally blind to call frequency. Measured case: `kb.read.list_principles` scored
+  4.5% (passthrough) from the corpus while the live ledger measured 15.1% over 881 blocks
+  and 2.19M raw tokens; applying `tune`'s own `--out` policy would have silently disabled
+  compression on the fleet's single largest source of savings. Added `--ledger` to `tune`,
+  reusing the same `_resolve_ledger`/`_ledger_traffic` cross-check `policy autotune`
+  already applies to its downgrade warning — any passthrough row whose ledger traffic
+  clears `--threshold` is flagged with block counts and raw tokens before the policy
+  prints or writes. Advisory only: `--out` still writes, the operator decides.
 
 ## [0.28.2] - 2026-08-20
 
