@@ -367,6 +367,23 @@ def _questions_and_staging(
         return [], None, None
     ri, field_name, value, handle = hit
 
+    # Same bug class as the text path's ordinal-guessing and arithmetic/count leaks
+    # (#327): the dropped field's OWN instance is fully replaced by its marker, so any
+    # occurrence of the value's JSON form elsewhere in `applied.text` is a duplicate —
+    # a different field, a different record, or the same field under the size floor —
+    # that makes the recall question answerable straight from the visible payload, no
+    # retrieve call needed. Skip it, matching the fail-closed "nothing to test" pattern
+    # every other unanswerable/leaky construction in this module already uses.
+    #
+    # COMPACT separators, matching `minify`/`_replace_nodes`'s actual wire format
+    # exactly (code-review finding): `json.dumps`'s default separators insert a space
+    # after `,`/`:`, so for a dict/list value the needle never matched the compact text
+    # `applied.text` actually contains, and the leak went undetected for any non-string
+    # dropped value.
+    needle = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    if needle in applied.text:
+        return [], None, None
+
     recall_q = DropQuestion(
         qid="drop-recall",
         kind="recall",

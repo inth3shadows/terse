@@ -1192,8 +1192,13 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
               "launcher": " ".join(terse_cmd), "launcher_skew": launcher_skew(terse_cmd)}
     if not dry_run and changes:
         result["backup"] = str(_backup(target.cfg))
-        _write_json(target.cfg, config, trailing_newline=had_nl)
+        # RECOVERY DATA FIRST, then the destructive write (#329) — same ordering and
+        # rationale as `_install_multiproxy` below: a crash between the two writes must
+        # leave the original config untouched with a matching stash, never a wrapped
+        # config with no stash entry (which `wrap()`'s fallback branch would silently
+        # treat as "unwrapped" on the next run, nesting a double wrap).
         _write_json(stash_path(target.cfg), full_stash)
+        _write_json(target.cfg, config, trailing_newline=had_nl)
 
     # --never-lossy: bake the wrapped server(s) into the POLICY file's never_lossy_servers
     # (a separate file from the Claude config above), so lossy transforms are structurally
@@ -1731,6 +1736,20 @@ def do_uninstall(servers: list[str] | None, *, all_: bool = False,
         result["router_ambiguous"] = all_routers
     if not dry_run and any(c.get("restored") for c in changes):
         result["backup"] = str(_backup(target.cfg))
+        # CONFIG first, stash last — the OPPOSITE of the install path, because `unwrap()`
+        # inverts which side is "recovery" and which is "destructive" (code-review catch
+        # on the first version of this fix, which wrongly copied install's order here
+        # without re-tracing what unwrap() actually mutates): `unwrap()` does
+        # `servers[server] = stash.pop(server)` — the original moves OUT of `stash` and
+        # INTO `config`, in memory, before either write happens. So `config` here carries
+        # the RESTORED original (the recovery state) and `stash` is what's being erased
+        # (the destructive step, since the popped entry has nowhere else to go once this
+        # write lands). Writing stash first would erase the on-disk record of the
+        # original while the config on disk was still wrapped — a crash in that window
+        # would leave NEITHER file able to recover it, worse than either order in the
+        # original code. Config-first means a crash before the stash write leaves the
+        # original live in config AND still recorded (now redundantly) in stash — always
+        # recoverable.
         _write_json(target.cfg, config, trailing_newline=had_nl)
         _write_json(stash_path(target.cfg), full_stash)
         if peers_doc is not None:

@@ -87,6 +87,54 @@ def test_no_questions_for_a_no_drop_policy():
     assert dropeval.gen_drop_questions(PAYLOAD, NO_DROP_RULE, TOOL) == []
 
 
+def test_no_recall_question_when_the_dropped_value_leaks_elsewhere_in_the_payload():
+    # #327: the dropped field's own instance is fully replaced by its marker, so a
+    # duplicate of the same value under a DIFFERENT field name (not covered by the drop
+    # rule) makes the recall question answerable straight from the visible text, no
+    # retrieve call needed. Same bug class as the text path's ordinal/arithmetic leaks —
+    # skip the question entirely rather than emit a compromised one.
+    secret = "S3CRET-PAYLOAD-VALUE-" + ("x" * 40)
+    leaky_payload = {"results": [
+        {"id": 1, "body": secret, "note": "unrelated filler text"},
+        {"id": 2, "body": "short", "leak": secret},
+    ]}
+    rule = Rule(TOOL, ("minify", "tabularize", "dictionary"),
+               fields={"results[].body": {"lossy": "drop-to-retrieve", "min": 20}})
+    assert dropeval.gen_drop_questions(leaky_payload, rule, TOOL) == []
+
+
+def test_no_recall_question_when_a_dict_value_leaks_elsewhere_with_compact_json():
+    # code-review finding on the #327 fix: the leak check built its needle with
+    # json.dumps's default (spaced) separators, but `applied.text` is COMPACT
+    # (minify's separators=(",", ":")) — so a dict/list dropped value's leak never
+    # matched and the question was emitted anyway. Only a scalar string value happened
+    # to dodge this (no separators to differ on), which is why the string-leak test
+    # above didn't catch it.
+    leaked_dict = {"foo": "bar and some padding to clear the min length floor here"}
+    leaky_payload = {"results": [
+        {"id": 1, "body": leaked_dict, "note": "unrelated filler"},
+        {"id": 2, "body": "short", "leak": dict(leaked_dict)},
+    ]}
+    rule = Rule(TOOL, ("minify", "tabularize", "dictionary"),
+               fields={"results[].body": {"lossy": "drop-to-retrieve", "min": 10}})
+    assert dropeval.gen_drop_questions(leaky_payload, rule, TOOL) == []
+
+
+def test_recall_question_still_generated_when_the_value_is_not_duplicated():
+    # Sanity check for the #327 fix: it must not over-trigger and suppress every
+    # question, only the ones with an actual duplicate elsewhere in the payload.
+    secret = "S3CRET-PAYLOAD-VALUE-" + ("x" * 40)
+    clean_payload = {"results": [
+        {"id": 1, "body": secret, "note": "unrelated filler text"},
+        {"id": 2, "body": "short", "note": "also unrelated"},
+    ]}
+    rule = Rule(TOOL, ("minify", "tabularize", "dictionary"),
+               fields={"results[].body": {"lossy": "drop-to-retrieve", "min": 20}})
+    qs = {q.kind: q for q in dropeval.gen_drop_questions(clean_payload, rule, TOOL)}
+    assert set(qs) == {"recall", "precision"}
+    assert qs["recall"].expected == secret
+
+
 # --------------------------------------------------------------------------- #
 # run_drop_payload — recall question forces a real retrieve to be correct
 # --------------------------------------------------------------------------- #

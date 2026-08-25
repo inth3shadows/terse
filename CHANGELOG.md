@@ -15,6 +15,57 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **`install-mcp`/`uninstall-mcp` write recovery data before the destructive write, on
+  both the single-server install and uninstall paths** (`#329`). A crash between the two
+  writes (SIGKILL, OOM, disk full) previously left a wrapped config with no matching
+  stash entry after install — `wrap()`'s fallback branch then silently treated the
+  already-wrapped entry as the original on the next run, nesting a double wrap
+  (`terse proxy ... -- terse proxy ... -- <server>`). Install now writes stash before
+  config, matching `_install_multiproxy`'s existing order. Uninstall writes the OPPOSITE
+  order (config before stash): `unwrap()` moves the original from stash into config in
+  memory before either write lands, so config is the recovery write and stash is the
+  destructive one there — copying install's order onto uninstall (an intermediate
+  version of this fix) would have erased the on-disk stash record while the config was
+  still wrapped, a worse crash window than either original order.
+- **`load_policy` validates the `fields` rule key's shape**; a malformed spec (a bare
+  string instead of `{"lossy": ...}`) now fails to load with a clear error instead of
+  silently never firing, or crashing `Rule.lossy_fields()` later on a never-lossy/
+  credential server (`#328`). **If your policy file has a `fields` entry shaped like
+  `{"path": "drop-to-retrieve"}` instead of `{"path": {"lossy": "drop-to-retrieve"}}`,
+  the proxy will now refuse to start until it's corrected** — this closes a case that
+  previously ran with the field silently uncompressed.
+- **A drop-to-retrieve recall question is no longer generated when the dropped value is
+  also visible elsewhere in the compressed payload** (`#327`), which made the question
+  answerable without a retrieve call and inflated recall-accuracy scores. Applies to
+  both scalar and dict/list dropped values (the needle now uses the same compact
+  separators the wire format itself uses).
+- **`terse fluency --diff --html` no longer checks retired `"unpaired"`/`"exam too
+  small"` exclusion reasons** that `report.py`'s `_gap` never actually produces — the
+  distinction was designed (see `_gap`'s docstring) but never implemented, so the more
+  specific verdict/tail text could never render, and every exclusion reason got a
+  generic tail that was sometimes factually wrong (e.g. claiming "no model returned
+  enough calls" for a model excluded because its rows had no diff arm at all) (`#330`).
+- **`dict_encode` no longer overestimates a repeated value's alias savings when its
+  occurrences are swallowed by a bigger repeated-subtree alias chosen in the same pass**
+  (`#326`) — applies to both a repeated string and a repeated subtree nested inside
+  another aliased subtree. Compression-quality only (round-trip losslessness was never
+  at risk); leaves a small amount of achievable compression on the table in the affected
+  cases, now recovered.
+
+### Known issue (not fixed here — filed separately)
+
+- `report.py`'s `_gap` (the shared gate behind every diff-family verdict — markdown,
+  terminal, and HTML) can report `excluded=None` and compute a passing gap for a model
+  whose form arm failed every paired trial, when the failure rate stays under
+  `_unmeasured`'s fail-share threshold. A totally-failed diff arm can render a green
+  "✓ PASS" banner. Found during review of the `#330` fix above; needs its own design
+  work on what the missing pairing-loss gate should actually check — tracked as `#332`
+  rather than folded into this fix.
+
+## [0.28.4] - 2026-08-21
+
+### Fixed
+
 - **`terse fluency`'s reported `±` no longer collapses to a false `±0` at realistic trial
   counts** (`#297`). The old pooled-binomial SE measured within-question consistency, not
   question-sampling variance: at temperature 0 a question is nearly always all-right or
@@ -25,6 +76,22 @@ fails that pull request until the section has moved.
   more questions tighten it without limit, while more trials tighten it only down to a
   between-question floor they can't cross. Every report's `±` column, the `--trials` help
   text, and a stale "raise `--trials` to tighten" remediation line are updated to match.
+
+## [0.28.3] - 2026-08-20
+
+### Fixed
+
+- **`terse tune` cross-checks passthrough tools against the live ledger before
+  recommending they stay uncompressed** (`#274`). `tune`'s corpus is idempotent by sha
+  (holds each payload's first sighting, not every call) and capped at 200 samples/tool —
+  structurally blind to call frequency. Measured case: `kb.read.list_principles` scored
+  4.5% (passthrough) from the corpus while the live ledger measured 15.1% over 881 blocks
+  and 2.19M raw tokens; applying `tune`'s own `--out` policy would have silently disabled
+  compression on the fleet's single largest source of savings. Added `--ledger` to `tune`,
+  reusing the same `_resolve_ledger`/`_ledger_traffic` cross-check `policy autotune`
+  already applies to its downgrade warning — any passthrough row whose ledger traffic
+  clears `--threshold` is flagged with block counts and raw tokens before the policy
+  prints or writes. Advisory only: `--out` still writes, the operator decides.
 
 ## [0.28.2] - 2026-08-20
 

@@ -173,7 +173,12 @@ class Rule:
     structured: str = "auto"
 
     def lossy_fields(self) -> list[str]:
-        return [k for k, v in self.fields.items() if v.get("lossy")]
+        # isinstance guard as defense in depth (#328): load_policy's _coerce_fields
+        # already rejects a non-dict spec at load time, but a Rule built directly
+        # (a test, dropeval.py, or any other caller that bypasses load_policy) has no
+        # such gate, and this is the one `fields` consumer in the module that didn't
+        # already guard the way lossy.py's and _lossy_warnings' readers do.
+        return [k for k, v in self.fields.items() if isinstance(v, dict) and v.get("lossy")]
 
 
 @dataclass
@@ -484,6 +489,23 @@ def _coerce_strict_bool(raw: Any, where: str, key: str) -> bool:
     return raw
 
 
+def _coerce_fields(raw: Any, where: str) -> dict:
+    """Strict, for the same reason `tiers`/`capture`/`structured` are (#328): `fields` is
+    what marks data lossy/critical, arguably the highest-stakes key in the file, and was
+    the one key `load_policy` let through with no shape check at all — a typo'd spec
+    (e.g. a bare string instead of `{"lossy": ...}`) either silently never fired (an
+    ordinary server) or crashed `Rule.lossy_fields()` later, out from under proxy.py's
+    fail-open wrapper, on a never-lossy/credential server. Reject both shapes at load,
+    same as every sibling key, instead of discovering either downstream."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where}: 'fields' must be an object, got {type(raw).__name__}")
+    bad = sorted(k for k, v in raw.items() if not isinstance(v, dict))
+    if bad:
+        raise ValueError(f"{where}: 'fields' spec for {bad} must be an object "
+                         f"(e.g. {{\"lossy\": \"drop-to-retrieve\"}}), not a bare value")
+    return raw
+
+
 VALID_STRUCTURED = ("auto", "leave", "compress", "replace")
 
 # The modes under which `structuredContent` is run through the codec. `replace` does that
@@ -571,7 +593,7 @@ def load_policy(path: str | Path) -> Policy:
         _reject_unknown_keys(match, _MATCH_KEYS, f"policies[{i}].match")
         glob = match.get("tool", "*")
         rules.append(Rule(tool_glob=glob, tiers=_coerce_tiers(r.get("tiers", []), f"policies[{i}]"),
-                          fields=r.get("fields", {}),
+                          fields=_coerce_fields(r.get("fields", {}), f"policies[{i}]"),
                           capture=_coerce_strict_bool(r.get("capture", True),
                                                       f"policies[{i}]", "capture"),
                           require_server_name=_coerce_strict_bool(

@@ -59,7 +59,7 @@ stood unchanged from `v0.5.1` to `v0.17.0`.
 | payload | records | raw tok | **terse** | TOON |
 |---|--:|--:|--:|--:|
 | gh_pulls | 30 | 151,165 | **76.1%** | −8.4% |
-| gh_workflow_runs | 20 | 76,032 | **80.3%** | −7.5% |
+| gh_workflow_runs | 20 | 76,032 | **80.4%** | −7.5% |
 | gh_issues | 30 | 48,032 | **38.8%** | −8.0% |
 | gh_commits | 30 | 69,652 | **26.5%** | −4.5% |
 | gh_dir_listing | 24 | 6,736 | **31.4%** | −7.7% |
@@ -121,8 +121,8 @@ single-shot codec all pay the full column every call. Modeling one repeat call p
 |---|--:|--:|--:|
 | gh_commits_flat | 10,681 | 812 | **92.4%** |
 | gh_issues | 29,611 | 4,448 | **85.0%** |
-| gh_pulls | 37,776 | 15,292 | **59.5%** |
-| **weighted total** | 149,840 | 40,138 | **73.2%** |
+| gh_pulls | 37,746 | 15,292 | **59.5%** |
+| **weighted total** | 149,741 | 40,138 | **73.2%** |
 
 **Honest caveat (read this):** these are *modeled* repeat-call savings. How *often* the
 pattern occurs in a real agent loop is workload-dependent and is being measured directly (the
