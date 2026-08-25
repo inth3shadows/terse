@@ -531,12 +531,16 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
         # card on a page titled "comprehension gap" reads as "no gap found". The second
         # sentence is reason-specific: telling a reader to fix a backend that answered 90%
         # of its calls sends them to re-run something that will fail the same way.
-        only_unpaired = bool(excluded) and all(w in ("unpaired", "exam too small") for w in excluded.values())
-        why = ("nothing could be compared. The backend answered, but no model had enough "
-               "questions completed by both arms to score a gap, so this run says nothing "
-               "either way. Lower <code>--trials</code>, or re-run once the backend stops "
-               "truncating."
-               if only_unpaired else
+        # `"unmeasured"` now covers what used to be two reasons — a totally unresponsive
+        # backend AND a backend that answered but lost too much of the question set to
+        # pair (report.py's `arm_gap`, #330) — so `g.excluded` alone can no longer tell
+        # them apart. Name both possible causes rather than guess which one applies.
+        only_unmeasured = bool(excluded) and all(w == "unmeasured" for w in excluded.values())
+        why = ("nothing could be compared. Either no model returned enough calls to score, "
+               "or the backend answered but no model had enough questions completed by "
+               "both arms to score a gap — check stderr for a <code>returned no "
+               "content</code> line, and/or lower <code>--trials</code> and re-run."
+               if only_unmeasured else
                "nothing was measured. No model returned enough calls to score, so this "
                "run says nothing either way.")
         verdict_html = f'<div class="banner critical">NO VERDICT — {why}</div>'
@@ -550,11 +554,13 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
             by_reason.setdefault(reason or "unmeasured", []).append(model)
         for why, models in sorted(by_reason.items()):
             names = ", ".join(f"<code>{_esc(m)}</code>" for m in models)
-            tail = (" An unanswered call is not a wrong answer; check stderr for a "
-                    "<code>returned no content</code> line." if why == "unmeasured" else
-                    " A question counts only when every arm answered all of its trials, so "
-                    "one lost trial withholds the whole question." if why in ("unpaired", "exam too small")
-                    else "")
+            # Same collapse as `only_unmeasured` above (#330): "unmeasured" now covers
+            # both an unanswered call and a paired-trial loss, so the tail names both
+            # possible causes instead of asserting one the code can no longer confirm.
+            tail = (" An unanswered call is not a wrong answer — check stderr for a "
+                    "<code>returned no content</code> line. Or, a question counts only "
+                    "when every arm answered all of its trials, so one lost trial "
+                    "withholds the whole question." if why == "unmeasured" else "")
             verdict_html += (f'<p>{_esc(REASON_HEADING.get(why, "Excluded"))} — '
                              f'{_esc(REASON_LABEL.get(why, why))} for: {names}.{tail}</p>')
 

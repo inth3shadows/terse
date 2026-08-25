@@ -98,6 +98,22 @@ def test_forest_plot_pass_fail_badges():
     assert svg.count("<circle") >= 4  # 2 models x 2 series
 
 
+def test_build_html_diff_report_unmeasured_verdict_names_both_possible_causes():
+    # #330: report.py folded the old "unpaired"/"exam too small" exclusion reasons into
+    # a single "unmeasured" string; html_report.py still checked for the retired ones, so
+    # the more specific verdict/tail text could never render. Force `arm_gap` to exclude
+    # via `_unmeasured`'s trigger #1 (an arm with zero completed trials) and check the
+    # rendered page names the pairing-loss possibility, not just the dead-backend one.
+    rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
+             "trials": 1, "terse_ok": 1, "diff_ok": 1, "attempts": 1, "fails": 0,
+             "terse_trials": 1, "diff_trials": 0} for i in range(10)]
+    html = build_html_diff_report({"m": rows}, "diff-form", "full-terse")
+    assert "NO VERDICT" in html
+    assert "no model had enough questions completed by both arms" in html
+    assert "one lost trial withholds the whole question" in html
+    assert "unpaired" not in html and "exam too small" not in html
+
+
 def test_build_html_diff_report_renders_verdict_and_forest():
     # Paired diff-family results (terse_ok = control, diff_ok = form) -> a forest plot
     # + a PASS/FAIL verdict gated on the worst model. This is what `fluency --diff --html`
