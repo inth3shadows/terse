@@ -531,15 +531,14 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
         # card on a page titled "comprehension gap" reads as "no gap found". The second
         # sentence is reason-specific: telling a reader to fix a backend that answered 90%
         # of its calls sends them to re-run something that will fail the same way.
-        # `excluded` can hold "unmeasured" (from `g.excluded`, the ONLY reason `_gap`
-        # itself ever produces — #330 correction: it was never actually two reasons that
-        # got "folded"; `report.py`'s `_gap` docstring and its dead `unpaired_models`
-        # list describe an intent to distinguish "backend down" from "backend up but too
-        # little of the question set paired" that was never implemented — see the issue
-        # filed as #332 for the real gap that leaves: a form arm that fails EVERY
-        # paired trial without tripping `_unmeasured`'s fail-share threshold gets
-        # `excluded=None` and a computed, possibly-passing gap instead of an exclusion at
-        # all), "broken control", "empty" (also from `g.excluded`), or "not a diff run"
+        # `excluded` can hold "unmeasured" (from `g.excluded`, and now genuinely two
+        # causes wearing one reason: the backend was down, OR it was up and the calls it
+        # did lose left NO question complete on both arms. #330's correction was right
+        # that no folding had happened yet — the second cause was an unimplemented intent,
+        # filed as #332 — and #332 implemented it under this same reason rather than the
+        # distinct `"unpaired"` the old docstring described, so the hedge below is now
+        # load-bearing instead of aspirational), "broken control", "empty" (also from
+        # `g.excluded`), or "not a diff run"
         # (set locally above, never from `_gap`). Only the first of those means calls
         # went unanswered — the generic fallback below used to assert that for every
         # case, which is false whenever a model was excluded for one of the other three.

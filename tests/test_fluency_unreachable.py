@@ -372,7 +372,9 @@ def test_the_diff_forest_plot_excludes_the_same_models_the_diff_markdown_does():
     assert "good" in gap_rows
     chart = build_terminal_diff_report({"good": good, "dead": dead}, color=False)
     assert "FAIL" not in chart, "a dead backend must not render a FAIL bar"
-    assert "calls went unanswered: dead" in chart
+    from terse.report import REASON_LABEL
+
+    assert f"{REASON_LABEL['unmeasured']}: dead" in chart
 
 
 def test_the_soak_report_cannot_pass_off_a_dead_backend():

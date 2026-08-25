@@ -51,16 +51,32 @@ fails that pull request until the section has moved.
   another aliased subtree. Compression-quality only (round-trip losslessness was never
   at risk); leaves a small amount of achievable compression on the table in the affected
   cases, now recovered.
-
-### Known issue (not fixed here — filed separately)
-
-- `report.py`'s `_gap` (the shared gate behind every diff-family verdict — markdown,
-  terminal, and HTML) can report `excluded=None` and compute a passing gap for a model
-  whose form arm failed every paired trial, when the failure rate stays under
-  `_unmeasured`'s fail-share threshold. A totally-failed diff arm can render a green
-  "✓ PASS" banner. Found during review of the `#330` fix above; needs its own design
-  work on what the missing pairing-loss gate should actually check — tracked as `#332`
-  rather than folded into this fix.
+- **A verdict is withheld when NO question survived pairing, instead of being published as
+  a confident zero** (`#332`). `_gap` — the shared gate behind `arm_gap` and `best_arm_gap`,
+  and so behind the diff, fluency, dropeval and soak reports in markdown, terminal and HTML
+  alike — gated on transport failure but never on whether anything was left to compare
+  afterwards. Because `paired_rows` voids a whole question when either arm loses one trial
+  of it, loss is amplified from the call level to the question level: at three trials an
+  arm, one lost call per question is 16.7% of the calls (under `UNMEASURED_FAIL_SHARE`) and
+  100% of the questions. Nothing survived, `_form_stats` scored both arms a flat 0.0 with an
+  SE of 0.0, and the HTML banner rendered a green **✓ PASS** reading `+0% ±0pt` — maximum
+  confidence from no evidence. Such a run is now withheld as `unmeasured`.
+  **The gate is deliberately narrow: it fires only on an EMPTY paired subset, never on a
+  small one.** The rows that survive pairing are the strongest evidence a run produces
+  (every arm completed every trial of them), and because an exclusion drops a model from the
+  gate entirely, withholding a small subset can *improve* a run's verdict — an earlier
+  version of this fix used a 50%-survival floor and was measured turning a demonstrated
+  −100% regression into "safe to enable `proxy --diff`" at 10% call loss.
+- **The reports no longer tell you your backend was unreachable when it answered almost
+  every call** (`#332`). The `unmeasured` exclusion now covers two causes — a dead backend,
+  and a live one whose losses left no question complete on both arms — so the prose that
+  named only the first was false for the second, and pointed at the wrong remedy. The shared
+  `REASON_LABEL` is now "too few calls to compare"; the "**Not measured**" paragraph reads
+  from that label (it was the one exclusion site that did not, and had drifted from the
+  other renderers), states both causes, and suggests lowering `--trials` — each extra trial
+  is another chance for a question to lose one and be dropped from both arms. Also fixes a
+  by-depth soak lead that branched on `why == "x"`, a reason string nothing produces, so the
+  specific wording it guarded had been unreachable since `#284`.
 
 ## [0.28.4] - 2026-08-21
 

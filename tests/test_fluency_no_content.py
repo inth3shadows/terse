@@ -240,4 +240,12 @@ def test_every_renderer_describes_an_unanswered_call_the_same_way():
             f"content, for which that is the wrong remedy")
         # ...and it must still NAME the excluded model. A sweep that deleted the line
         # entirely would satisfy the assertion above and say less than before.
-        assert "unanswered" in text and "dead-model" in text, name
+        #
+        # The phrase is `REASON_LABEL["unmeasured"]`, read from the source rather than
+        # spelled here, so this asserts all three renderers use the SHARED vocabulary and
+        # not merely that each says something similar. Before #332 the markdown paragraph
+        # was the one site that did not read from it, and this test passed anyway because
+        # the word it happened to grep for appeared in both wordings.
+        from terse.report import REASON_LABEL
+        assert REASON_LABEL["unmeasured"] in text, name
+        assert "dead-model" in text, name
