@@ -128,6 +128,48 @@ def test_do_install_writes_config_stash_and_backup(tmp_path, monkeypatch):
     assert back["mcpServers"]["runecho"] == {"command": "uvx", "args": ["runecho-mcp"]}
 
 
+def test_do_install_writes_stash_before_config_crash_safe(tmp_path, monkeypatch):
+    """Regression for #329: a crash between the two writes must leave the config
+    untouched with a matching (unwritten) stash, never a wrapped config with no stash
+    entry — which `wrap()`'s fallback branch would silently treat as "unwrapped" on the
+    next run, nesting a double wrap."""
+    cfg = tmp_path / ".claude.json"
+    original_entry = {"command": "uvx", "args": ["runecho-mcp"]}
+    cfg.write_text(json.dumps(_cfg(runecho=dict(original_entry))))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+
+    calls: list[Path] = []
+    real_write_json = im._write_json
+
+    def crash_on_second_write(path, obj, **kw):
+        calls.append(path)
+        if len(calls) == 2:
+            raise OSError("simulated crash (SIGKILL/OOM/disk full)")
+        real_write_json(path, obj, **kw)
+
+    monkeypatch.setattr(im, "_write_json", crash_on_second_write)
+    with pytest.raises(OSError):
+        im.do_install(["runecho"], str(policy), cfg=cfg)
+
+    # Recovery data (stash) must be written first, the destructive change (config) last.
+    assert calls[0] == im.stash_path(cfg)
+    assert calls[1] == cfg
+
+    # The crash landed before the config write, so the config on disk must still be the
+    # untouched original.
+    on_disk = json.loads(cfg.read_text())
+    assert on_disk["mcpServers"]["runecho"] == original_entry
+
+    # Re-running install after "recovery" must produce a clean single wrap, never a
+    # nested double-wrap.
+    monkeypatch.setattr(im, "_write_json", real_write_json)
+    im.do_install(["runecho"], str(policy), cfg=cfg)
+    args = json.loads(cfg.read_text())["mcpServers"]["runecho"]["args"]
+    assert args.count("proxy") == 1
+
+
 def test_do_install_capture_dir_adds_proxy_flag(tmp_path, monkeypatch):
     cfg = tmp_path / ".claude.json"
     cfg.write_text(json.dumps(_cfg(runecho={"command": "uvx", "args": ["runecho-mcp"]})))

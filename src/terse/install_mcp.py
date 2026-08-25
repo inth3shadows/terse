@@ -1192,8 +1192,13 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
               "launcher": " ".join(terse_cmd), "launcher_skew": launcher_skew(terse_cmd)}
     if not dry_run and changes:
         result["backup"] = str(_backup(target.cfg))
-        _write_json(target.cfg, config, trailing_newline=had_nl)
+        # RECOVERY DATA FIRST, then the destructive write (#329) — same ordering and
+        # rationale as `_install_multiproxy` below: a crash between the two writes must
+        # leave the original config untouched with a matching stash, never a wrapped
+        # config with no stash entry (which `wrap()`'s fallback branch would silently
+        # treat as "unwrapped" on the next run, nesting a double wrap).
         _write_json(stash_path(target.cfg), full_stash)
+        _write_json(target.cfg, config, trailing_newline=had_nl)
 
     # --never-lossy: bake the wrapped server(s) into the POLICY file's never_lossy_servers
     # (a separate file from the Claude config above), so lossy transforms are structurally
@@ -1731,8 +1736,11 @@ def do_uninstall(servers: list[str] | None, *, all_: bool = False,
         result["router_ambiguous"] = all_routers
     if not dry_run and any(c.get("restored") for c in changes):
         result["backup"] = str(_backup(target.cfg))
-        _write_json(target.cfg, config, trailing_newline=had_nl)
+        # Same recovery-data-first ordering as the install path (#329): a crash here is
+        # more benign (a stale stash entry after an unwrap, not a double-wrap) but there's
+        # no reason to keep the asymmetric, less-safe order.
         _write_json(stash_path(target.cfg), full_stash)
+        _write_json(target.cfg, config, trailing_newline=had_nl)
         if peers_doc is not None:
             if peers_downstreams(peers_doc) or len(all_routers) > 1:
                 _write_json(peers_p, peers_doc)
