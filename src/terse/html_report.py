@@ -22,7 +22,6 @@ from collections.abc import Sequence
 from typing import Any
 
 from .report import (
-    _GAP_TOLERANCE,
     REASON_HEADING,
     REASON_LABEL,
     _ci,
@@ -30,6 +29,7 @@ from .report import (
     _sum,
     _worst_case_gap,
     arm_gap,
+    passes_tolerance,
 )
 
 # --- palette (dataviz skill reference instance) ---------------------------------
@@ -515,7 +515,7 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
     for model, (facc, fse, cacc, cse) in gap_rows.items():
         gap = facc - cacc
         # `_GAP_TOLERANCE`, not a second hardcoded 0.05 that has to be remembered.
-        passed = gap >= -_GAP_TOLERANCE - 1e-9
+        passed = passes_tolerance(gap)
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
                            "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
 

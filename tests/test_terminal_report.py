@@ -138,7 +138,7 @@ def test_track_whisker_spans_the_confidence_interval():
 
 def test_build_terminal_diff_report_matches_markdown_verdict():
     rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
-             "trials": 1, "terse_ok": 1, "diff_ok": 1} for i in range(10)]
+             "trials": 1, "terse_ok": 1, "diff_ok": 1} for i in range(24)]
     text = build_terminal_diff_report({"m": rows}, color=False)
     assert "PASS" in text and "FAIL" not in text
     assert "diff-form" in text and "full-terse" in text

@@ -15,6 +15,67 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **A PASS now requires at least 20 paired questions; a FAIL still publishes at any
+  number** (`#334`). `_gap`'s previous gate fired only when *nothing* survived pairing, so
+  a run that kept a single question still printed a confident verdict: at 15% call loss,
+  nine of ten questions voided, the report rendered `✓ PASS — diff-form 100% vs full-terse
+  100% (gap +0% ±0pt)` off that one question, and nothing in the diff-family output
+  disclosed the other nine. The `±0` is not a rounding artifact — at n=1 the SE is exactly
+  zero whenever the single question is all-right or all-wrong, which is the normal case at
+  temperature 0.
+  The floor is **asymmetric**, and that is what makes it safe: it withholds only a gap that
+  would have PASSED (`best >= control - tolerance`), so what it removes from the worst case
+  is never the failing model. An exclusion therefore cannot improve a run's verdict — the
+  defect that sank a symmetric survival floor in `#332`. The cut is the tolerance line and
+  not exact equality: drawn at equality, the whole `[-5%, 0)` band escaped both gates at
+  once — behind its control so the floor let it through, inside tolerance so the verdict
+  passed it — and one paired question at 19/20 vs 20/20 still printed
+  `gap -5% ±10 pts **PASS** … safe to enable proxy --diff`.
+  20 comes from `_CODEC_MIN_TRIALS`'s existing Clopper-Pearson framing rather than a new
+  judgment call: n zero-regression questions bound the true rate below `1 - 0.05 ** (1/n)`,
+  which is ~14pp at 20 and ~63pp at 3. Counted in QUESTIONS, not trials, because `#297`
+  established that trials within a question are correlated.
+  **Operationally this needs a corpus of at least five captured results**: `gen_questions`
+  yields a fixed 4 questions per payload regardless of its size, so a single-tool corpus
+  produces 4 paired questions and will now report `Not concluded` rather than a verdict.
+  `codec_verdict` opts out — it gates its own sample size in trials, the unit its verdict
+  actually counts in, and layering a second floor would silently re-calibrate that tier.
+  That opt-out is keyword-only and AST-pinned to a one-name allowlist.
+  **The soak's per-depth slices inherit this floor**, and `--soak-windows` (default 6) caps
+  a slice at roughly 24 questions, so a deepest depth with few available windows will report
+  `NO VERDICT at the deepest tested depth` rather than a passing one. Raise `--soak-windows`
+  to restore it. A depth slice that shows real drift still publishes at any question count.
+- **`passes_tolerance` is now the single definition of "within tolerance".** The floor and
+  the verdicts each spelled the comparison out, as `facc >= cacc - tol` and
+  `gap >= -tol - 1e-9`, and binary float makes those disagree on 122 exact-boundary
+  accuracy pairs — `0.40 - 0.05` is `0.35000000000000003`. Those pairs landed in neither
+  set: not withheld (the floor read the arm as behind its control) and not failed (the
+  verdict read the gap as inside tolerance). Measured on `35% vs 40%` over 10 paired
+  questions — a green "safe to enable `proxy --diff`" with `±0 pts`, the exact symptom
+  `#334` was filed on, surviving inside its own fix. Five sites across the three renderers
+  now share one function.
+- **The soak's deepest-depth verdict no longer depends on the pooled one.** It was nested
+  inside the pooled `if worst:`, so a withheld pooled gap skipped the depth analysis
+  entirely — and `#334` made that reachable for a run that lost zero calls. Measured: a
+  fully-paired −100% collapse at the deepest depth disappeared from the verdict, under a
+  line promising "depth slices that pair cleanly are still scored below". An exclusion must
+  never remove a demonstrated regression from a verdict.
+- **An underpowered model's rows still pool into the per-transform table.** Dropping them
+  moved that table's `table` row from 72% to 90% — an exclusion improving the figure the
+  verdict tells the reader to use when restricting policy by transform. Only the per-model
+  conclusion is unsupported; the rows themselves are fully paired.
+- **Withheld models are no longer all described as transport failures.** `"underpowered"`
+  is a distinct exclusion reason with its own label and heading, because nothing failed in
+  that case — reusing `"unmeasured"` would have printed "too few calls to compare" about a
+  run that lost no calls at all. `_not_measured_lines` now groups by reason and reports
+  paired-question counts for the new one instead of a "calls lost" figure that would read
+  `0/N`.
+
+
+## [0.28.5] - 2026-08-25
+
+### Fixed
+
 - **`install-mcp`/`uninstall-mcp` write recovery data before the destructive write, on
   both the single-server install and uninstall paths** (`#329`). A crash between the two
   writes (SIGKILL, OOM, disk full) previously left a wrapped config with no matching

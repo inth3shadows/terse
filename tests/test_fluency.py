@@ -289,7 +289,7 @@ def test_multi_trial_report_shows_bound():
     from terse.report import build_fluency_report
     # 10 questions, 4 trials each; terse a touch noisier than raw
     rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
-             "trials": 4, "raw_ok": 4, "terse_ok": 3, "primer_ok": 4} for i in range(10)]
+             "trials": 4, "raw_ok": 4, "terse_ok": 3, "primer_ok": 4} for i in range(24)]
     report = build_fluency_report({"m": rows}, [])
     assert "Trials per question: **4**" in report
     assert "±" in report
@@ -303,7 +303,7 @@ def test_fluency_report_renders_inline_column_when_rows_carry_it():
     # a real accuracy figure in the terse+inline column, not the "not measured" fallback
     rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
              "trials": 1, "raw_ok": 1, "terse_ok": 1, "primer_ok": 1, "inline_ok": 1}
-            for i in range(10)]
+            for i in range(24)]
     report = build_fluency_report({"m": rows}, [])
     assert "terse+inline" in report
     assert "n/a" not in report
@@ -316,7 +316,7 @@ def test_fluency_report_renders_na_for_inline_when_rows_predate_the_arm():
     # inline_ok key at all. That must render as "n/a" (not measured), never as "0%"
     # (which would misread as "inline comprehension collapsed").
     rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
-             "trials": 1, "raw_ok": 1, "terse_ok": 1, "primer_ok": 1} for i in range(10)]
+             "trials": 1, "raw_ok": 1, "terse_ok": 1, "primer_ok": 1} for i in range(24)]
     report = build_fluency_report({"m": rows}, [])
     row_line = next(line for line in report.splitlines() if line.startswith("| `m`"))
     cells = [c.strip() for c in row_line.split("|")]
@@ -415,7 +415,7 @@ def test_build_diff_report_verdict_and_empty():
     from terse.report import build_diff_report
     assert "No model answers" in build_diff_report({})
     rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
-             "trials": 1, "terse_ok": 1, "diff_ok": 1} for i in range(10)]
+             "trials": 1, "terse_ok": 1, "diff_ok": 1} for i in range(24)]
     report = build_diff_report({"m": rows})
     verdict = report.split("## Verdict", 1)[1]
     assert "PASS" in verdict and "FAIL" not in verdict
@@ -427,7 +427,7 @@ def test_diff_gap_rows_matches_build_diff_report_verdict():
     from terse.report import diff_gap_rows
 
     rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
-             "trials": 1, "terse_ok": 1, "diff_ok": 1 if i < 8 else 0} for i in range(10)]
+             "trials": 1, "terse_ok": 1, "diff_ok": 1 if i < 20 else 0} for i in range(25)]
     gap_rows, excluded = diff_gap_rows({"m": rows})
     facc, _, cacc, _ = gap_rows["m"]
     assert facc == 0.8 and cacc == 1.0
@@ -560,7 +560,7 @@ def test_build_text_diff_report_verdict_and_empty():
     from terse.report import build_text_diff_report
     assert "No model answers" in build_text_diff_report({})
     rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "text-diff",
-             "trials": 1, "terse_ok": 1, "diff_ok": 1} for i in range(10)]
+             "trials": 1, "terse_ok": 1, "diff_ok": 1} for i in range(24)]
     report = build_text_diff_report({"m": rows})
     assert "raw text" in report
     verdict = report.split("## Verdict", 1)[1]
@@ -686,7 +686,7 @@ def test_build_diff_soak_report_by_depth_table_and_verdicts():
 
     rows = [{"tool": "gh.items", "sha": "s", "qid": "count", "qtype": "count",
              "transform": "tabularize", "trials": 1, "depth": d,
-             "terse_ok": 1, "diff_ok": 1} for d in (1, 2, 3) for _ in range(4)]
+             "terse_ok": 1, "diff_ok": 1} for d in (1, 2, 3) for _ in range(20)]
     report = build_diff_soak_report({"m1": rows})
     assert "## Accuracy by chain depth" in report
     assert "At the deepest tested depth (3)" in report

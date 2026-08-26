@@ -245,8 +245,48 @@ class ArmGap(NamedTuple):
     arms: Mapping[str, tuple[float, float]] = MappingProxyType({})
 
 
+# How many PAIRED questions a PASS needs before "no regression observed" means anything
+# (#334). A floor on the evidence behind a NEGATIVE result, not a tolerance for a positive
+# one — the same shape and the same statistics as `_CODEC_MIN_TRIALS` below, and cited from
+# there rather than invented again: Clopper-Pearson bounds the true regression rate below
+# `1 - 0.05 ** (1/n)` at 95% confidence when n questions show zero regressions. At n=20
+# that is ~14pp; at n=3 it is 63pp, which is why the reported #334 case (a `+0% ±0pt` PASS
+# off ONE surviving question, at 15% call loss) could print maximum confidence off nothing.
+#
+# QUESTIONS, not trials, unlike `_CODEC_MIN_TRIALS`. #297 established that trials within a
+# question are correlated — at temperature 0 a question is nearly always all-right or
+# all-wrong — which is why `_form_stats` clusters its SE on the question. Counting trials
+# here would multiply the apparent evidence by `--trials` without adding any.
+#
+# ASYMMETRIC, and that is the whole design. #332's first attempt was a symmetric survival
+# floor that withheld models regardless of what they showed; because an exclusion drops a
+# model from the gate entirely, it was measured turning a demonstrated -100% regression
+# into "safe to enable `proxy --diff`". This floor can only ever withhold a model whose
+# form arm is NOT behind its control, so what it removes from `_worst_case_gap` is always a
+# non-negative gap — which cannot be the worst case unless every model is non-negative, and
+# then the run is a PASS or a NO VERDICT either way. An exclusion can never improve a
+# verdict here. Pinned by `test_a_demonstrated_regression_is_never_withheld_as_unmeasured`
+# and `test_a_small_but_failing_arm_still_publishes_its_FAIL`.
+_MIN_PAIRED_QUESTIONS = 20
+
+
+def passes_tolerance(gap: float, tol: float = _GAP_TOLERANCE) -> bool:
+    """Is `gap` within `tol`? THE definition — every verdict and the #334 floor share it.
+
+    The epsilon is not decoration. `0.40 - 0.05` is `0.35000000000000003` in binary float,
+    so `facc >= cacc - tol` and `gap >= -tol` disagree on 122 distinct exact-boundary
+    accuracy pairs. #334's floor was written the first way and the verdicts the second,
+    which put those pairs in neither set: not withheld (the floor thought the arm was
+    behind), not failed (the verdict thought it was inside tolerance). Measured on
+    `35% vs 40%` over 10 paired questions — a green "safe to enable `proxy --diff`" with
+    `±0 pts`, the exact symptom #334 was filed on, surviving inside its own fix.
+
+    Callers must pass a GAP (form minus control), never compare accuracies directly."""
+    return gap >= -tol - 1e-9
+
+
 def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
-         display: tuple[str, ...] = ()) -> ArmGap:
+         display: tuple[str, ...] = (), *, min_paired: int | None = None) -> ArmGap:
     """Shared body of `arm_gap`/`best_arm_gap`. Gates, pairs, then computes every arm.
 
     Order matters: `_unmeasured` first (the backend was down — nothing here is measurable),
@@ -289,14 +329,31 @@ def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
         # verdict and the forest plot cannot disagree about it.
         return ArmGap(0.0, 0.0, cacc, cse, pr, "broken control", arms)
     best = max((arms[f] for f in gating), key=lambda s: s[0])
+    floor = _MIN_PAIRED_QUESTIONS if min_paired is None else min_paired
+    # The cut is the TOLERANCE line, not exact equality. Withholding only `best >= cacc`
+    # left the whole `[-_GAP_TOLERANCE, 0)` band escaping both gates at once: such a gap is
+    # behind its control, so the floor let it through, and inside tolerance, so the verdict
+    # passed it. Measured: one paired question at 19/20 vs 20/20 published
+    # `gap -5% ±10 pts  **PASS** ... safe to enable proxy --diff` at 90% pairing loss.
+    #
+    # Drawn here, the withheld set is exactly the gaps that would have PASSED — literally
+    # so, via the shared `passes_tolerance`, because writing the comparison twice is what
+    # leaked a false green through the first version of this floor. That is what
+    # what keeps the asymmetry argument in `_MIN_PAIRED_QUESTIONS` intact: removing a
+    # would-be PASS from `_worst_case_gap` cannot turn a FAIL into a PASS, because the
+    # failing model is still in the set. A form arm genuinely BEHIND its control by more
+    # than tolerance publishes at any question count.
+    if len(pr) < floor and passes_tolerance(best[0] - cacc):
+        return ArmGap(0.0, 0.0, 0.0, 0.0, [], "underpowered")
     return ArmGap(best[0], best[1], cacc, cse, pr, None, arms)
 
 
-def arm_gap(rows: list[dict[str, Any]], form: str, control: str) -> ArmGap:
+def arm_gap(rows: list[dict[str, Any]], form: str, control: str, *,
+            min_paired: int | None = None) -> ArmGap:
     """`form` vs `control` over the rows BOTH arms completed, or an exclusion reason.
 
     The single chokepoint for every diff-vs-control verdict in terse."""
-    return _gap(rows, [form], control)
+    return _gap(rows, [form], control, min_paired=min_paired)
 
 
 def best_arm_gap(rows: list[dict[str, Any]], forms: list[str], control: str,
@@ -333,6 +390,11 @@ REASON_LABEL = {
     "empty": "no rows",
     "no control arm": "no control arm was run",
     "partial control coverage": "control ran on only some rows",
+    # Distinct from "unmeasured" ON PURPOSE. Nothing failed here: the backend answered, the
+    # arms paired, there were simply too few questions to conclude anything from an absence
+    # of regressions. Folding it into "unmeasured" would print "too few calls to compare"
+    # about a run that lost no calls at all — the #332 mistake, one reason over.
+    "underpowered": f"fewer than {_MIN_PAIRED_QUESTIONS} paired questions",
 }
 
 # The heading each reason gets in prose renderers (markdown, HTML). "Not measured" and
@@ -345,6 +407,8 @@ REASON_HEADING = {
     "empty": "Not measured",
     "no control arm": "Not run",
     "partial control coverage": "Excluded",
+    # Not "Not measured": it WAS measured, and the measurement simply does not reach.
+    "underpowered": "Not concluded",
 }
 
 
@@ -362,41 +426,61 @@ def exclusion_note(reasons: dict[str, str | None]) -> str:
         f"{label}: {', '.join(models)}" for label, models in sorted(by.items()))
 
 
-def _not_measured_lines(withheld: dict[str, tuple[str | None, int, int]]) -> list[str]:
-    """The "**Not measured**" paragraph, with the call counts that justify it.
+def _not_measured_lines(withheld: dict[str, tuple[str | None, int, int, int]]) -> list[str]:
+    """The withheld-models paragraph(s), with the counts that justify each one.
 
-    Still takes the exclusion REASON alongside the counts, and still discards it: both
-    callers are pre-filtered to `"unmeasured"` (`_build_diff_style_report`'s control is
-    `terse_ok`, so `"broken control"` cannot fire there, and `n > 0` excludes `"empty"`;
-    the fluency caller filters explicitly). The parameter is kept, not dropped, because a
-    third caller passing a different reason would otherwise get this paragraph's wording
-    silently — the signature is where that has to be noticed.
+    Grouped BY REASON, and this is the first version where that is more than a promise.
+    The signature has always carried the exclusion reason and the body has always thrown it
+    away, back when `"unmeasured"` was the only reason that reached a report — the docstring
+    said the wording was reason-specific while the code hardcoded one sentence. #334 adds
+    `"underpowered"`, whose counts and whose remedy are both different: no calls were lost,
+    so "calls lost" is the wrong number and "check stderr" is the wrong advice.
 
-    The opening phrase reads from `REASON_LABEL` rather than being written here. This was
-    the one exclusion site that did not, which is exactly how it came to tell readers "too
-    many calls went unanswered" about backends that had answered every call (#332)."""
+    Each model arrives as `(why, fails, attempts, paired)`."""
     if not withheld:
         return []
+    by: dict[str | None, list[tuple[str, int, int, int]]] = {}
+    for m, (why, f, a, paired) in sorted(withheld.items()):
+        by.setdefault(why, []).append((m, f, a, paired))
     out: list[str] = []
-    lost = {m: (f, a) for m, (why, f, a) in withheld.items()}
-    if lost:
-        out.append(
-            # Opens with `REASON_LABEL["unmeasured"]` rather than a fourth hand-written
-            # phrase: this paragraph is the one exclusion site that did NOT read from the
-            # shared vocabulary, so the markdown said "calls went unanswered" while the
-            # html and terminal said something else. Pinned by
-            # `test_every_renderer_describes_an_unanswered_call_the_same_way`.
-            f"**Not measured** — {REASON_LABEL['unmeasured']}, so no accuracy is "
-            "published for: "
-            + ", ".join(f"`{m}` ({f}/{a} calls lost)" for m, (f, a) in sorted(lost.items()))
-            + ". Either too many calls went unanswered, or enough of them did that no "
-              "question completed every trial on BOTH arms, leaving nothing comparable — "
-              "the counts above say which, and a low one means the second. An unanswered "
-              "call is not a wrong answer. Check stderr for a `returned no content` line "
-              "naming a `finish_reason` — `length` means raise max_tokens, "
-              "`content_filter` means the payload tripped a filter. If the backend "
-              "answered most calls, lower `--trials`: each extra trial is another chance "
-              "for a question to lose one and be dropped from both arms.")
+    for why, models in sorted(by.items(), key=lambda kv: str(kv[0])):
+        if why == "underpowered":
+            out.append("") if out else None
+            out.append(
+                f"**{REASON_HEADING['underpowered']}** — "
+                # Carries the call-loss count too when there is one. `unmeasured` is True
+                # for an underpowered model, and the "Partially degraded" paragraph is
+                # gated on `not unmeasured`, so without this a run that lost calls AND
+                # fell short of the floor disclosed its losses in no line of the report.
+                + ", ".join(
+                    f"`{m}` ({paired} paired question(s)"
+                    + (f", {f}/{a} calls lost)" if f else ")")
+                    for m, f, a, paired in models)
+                + f". These arms are not failing, but "
+                  f"{_MIN_PAIRED_QUESTIONS} paired questions are needed before an ABSENCE "
+                  "of regressions supports a PASS, and short of that the run is not "
+                  "evidence either way. Generate more questions, or — if the counts "
+                  "above show calls were lost — recover the ones pairing dropped by "
+                  "lowering `--trials`. A form arm that IS failing publishes at any "
+                  "question count.")
+        else:
+            # Opens with the shared `REASON_LABEL` rather than a hand-written phrase: this
+            # paragraph was the one exclusion site that did not read from the shared
+            # vocabulary, which is how it came to tell readers "too many calls went
+            # unanswered" about backends that had answered every call (#332).
+            out.append(
+                f"**{REASON_HEADING.get(why or '', 'Not measured')}** — "
+                f"{REASON_LABEL.get(why or '', str(why))}, so no accuracy is published for: "
+                + ", ".join(f"`{m}` ({f}/{a} calls lost)" for m, f, a, _ in models)
+                + ". Either too many calls went unanswered, or enough of them did that no "
+                  "question completed every trial on BOTH arms, leaving nothing comparable "
+                  "— the counts above say which, and a low one means the second. An "
+                  "unanswered call is not a wrong answer. Check stderr for a `returned no "
+                  "content` line naming a `finish_reason` — `length` means raise "
+                  "max_tokens, `content_filter` means the payload tripped a filter. If the "
+                  "backend answered most calls, lower `--trials`: each extra trial is "
+                  "another chance for a question to lose one and be dropped from both "
+                  "arms.")
     out.append("")
     return out
 
@@ -445,7 +529,15 @@ def codec_verdict(rows: list[dict[str, Any]]) -> tuple[str, ArmGap]:
     terse — a stronger signal than two independent accuracy rates"), just kept at
     trial-count granularity instead of a per-row boolean, so it stays comparable to `n` for
     the Clopper-Pearson framing above."""
-    g = arm_gap(rows, "terse_ok", "raw_ok")
+    # `min_paired=0` opts OUT of #334's paired-QUESTION floor, which would otherwise make
+    # SAFE unreachable for this tier: a codec group is characteristically one question run
+    # many times (`test_identical_partial_failure_on_both_arms_at_the_trial_floor_is_SAFE`
+    # is a single row at 25 trials), so it would never reach 20 paired questions. This is
+    # not an exemption from sample-size gating — `_CODEC_MIN_TRIALS` below is the same
+    # Clopper-Pearson floor in the unit this verdict actually counts in. Layering a second
+    # floor in a different unit would silently re-calibrate a tier that already decided
+    # this question, without saying so anywhere near `_CODEC_MIN_TRIALS`.
+    g = arm_gap(rows, "terse_ok", "raw_ok", min_paired=0)
     if g.excluded:
         return "UNRESOLVED", g
     n = sum(r.get("terse_trials", r.get("trials", 1)) for r in g.rows)
@@ -579,7 +671,7 @@ def _worst_case_gap(
     if worst is None:
         return None
     model, gap, facc, cacc, gap_ci = worst
-    passed = gap >= -tol - 1e-9
+    passed = passes_tolerance(gap, tol)
     return GapVerdict(model, gap, facc, cacc, gap_ci, passed)
 
 
@@ -1291,7 +1383,7 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         "|---|---|---|---|---|",
     ]
     gap_rows: dict[str, tuple[float, float, float, float]] = {}
-    unmeasured: dict[str, tuple[str | None, int, int]] = {}  # model -> (why, fails, attempts)
+    unmeasured: dict[str, tuple[str | None, int, int, int]] = {}  # -> (why, fails, attempts, paired)
     for model, rows in results.items():
         n = len(rows)
         if not n:
@@ -1308,7 +1400,8 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         if g.excluded:
             unmeasured[model] = (g.excluded,
                                  sum(int(r.get("fails", 0)) for r in rows),
-                                 sum(int(r.get("attempts", 0)) for r in rows))
+                                 sum(int(r.get("attempts", 0)) for r in rows),
+                                 len(paired_rows(rows, "diff_ok", "terse_ok")))
             out.append(f"| `{model}` | {n} | n/a | n/a | n/a |")
             continue
         facc, fse = g.control_acc, g.control_se
@@ -1346,9 +1439,10 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         # transport BEFORE pairing, so a model withheld by it can still have questions
         # that pair cleanly. Says what is true of every withheld model instead.
         out.append("- **NO VERDICT — nothing was scored.** Every model was withheld, so "
-                   "this run says nothing about the diff form either way. See **Not "
-                   "measured** above for whether the backend was unreachable or merely "
-                   "lost enough calls to break the pairing; the remedies differ.")
+                   "this run says nothing about the diff form either way. The paragraph "
+                   "above names each model and its reason — an unreachable backend, calls "
+                   "lost until nothing paired, or too few questions to conclude from. The "
+                   "remedies differ, and only the first is a backend problem.")
     out.append("")
     return "\n".join(out)
 
@@ -1457,7 +1551,13 @@ def build_diff_soak_report(results: dict) -> str:
                 # half by definition. Keyed on that instead so the heading stays true:
                 # "not measured" for a slice whose calls failed, "not compared" for one
                 # whose calls landed but left no shared question.
-                dg = dg._replace(excluded=("unmeasured" if _unmeasured(drows) else "unpaired"))
+                # Keep the reason `_gap` decided; only SPLIT the one it cannot tell apart.
+                # Substituting a string here discarded `"underpowered"` and rendered it as
+                # "the backend answered, but one arm did not complete enough of the same
+                # questions" — about slices where both arms completed everything.
+                if dg.excluded in (None, "unmeasured"):
+                    dg = dg._replace(
+                        excluded=("unmeasured" if _unmeasured(drows) else "unpaired"))
                 out.append(f"| `{model}` | {depth} | {len(drows)} | n/a | n/a | n/a |")
                 # Recorded, because an `n/a` in this table with no prose anywhere is how a
                 # withheld DEEPEST depth turned into a green "no drift" conclusion below.
@@ -1500,11 +1600,20 @@ def build_diff_soak_report(results: dict) -> str:
             # withheld depth got the generic one. `"unpaired"` is set just above from
             # `_unmeasured(drows)` — local to this table, not an `ArmGap` reason — which
             # makes the precise branch reachable for the first time.
-            lead = ("**Depths not compared** — the backend answered, but one arm did not "
-                    "complete enough of the same questions at: " if why == "unpaired" else
-                    "**Depths not measured** — too many calls went unanswered at: ")
-            out += [lead + at + ". Those depths are excluded from the verdict below rather "
-                    "than scored on a question set the two arms did not share (#280).", ""]
+            lead = {
+                "unpaired": "**Depths not compared** — the backend answered, but one arm "
+                            "did not complete enough of the same questions at: ",
+                "unmeasured": "**Depths not measured** — too many calls went unanswered "
+                              "at: ",
+            }.get(why, f"**{REASON_HEADING.get(why, 'Excluded')}** — "
+                       f"{REASON_LABEL.get(why, why)} at: ")
+            tail = (". Those depths are excluded from the verdict below rather than "
+                    "scored on a question set the two arms did not share (#280)."
+                    if why in ("unpaired", "unmeasured") else
+                    ". Too few questions survived pairing at that depth for an absence "
+                    "of drift to mean anything — check the `q` column against the "
+                    "generated count before assuming none were lost.")
+            out += [lead + at + tail, ""]
 
     gap_rows: dict[str, tuple[float, float, float, float]] = {}
     pooled_out: dict[str, str | None] = {}
@@ -1536,13 +1645,25 @@ def build_diff_soak_report(results: dict) -> str:
         # The advice has to match the cause. "Fix the backend(s) and re-run" sends a reader
         # to re-run something that will fail identically when the backend answered fine and
         # the arms simply could not be paired.
-        out.append("- **NO VERDICT — nothing was scored.** Every model was withheld, so "
-                   "this run says nothing about diff-chain drift either way. The lines "
-                   "above name each model and say whether its calls failed or merely left "
-                   "no question the two arms both completed — the remedies differ.")
+        out.append("- **No pooled verdict** — every model's POOLED gap was withheld, so "
+                   "the pooled line says nothing about drift either way. Scoped to the "
+                   "pooled comparison on purpose: a depth slice can still be scored below, "
+                   "and since #334 often is, so claiming the run measured nothing would "
+                   "contradict a verdict printed two lines further down. The paragraphs "
+                   "above name each model and its reason — an unreachable backend, calls "
+                   "lost until nothing paired, or too few questions to conclude from.")
     if worst:
         out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "chain-form",
                                            "full-terse"))
+    # DELIBERATELY NOT nested under `if worst:`. This block's own comments below insist it
+    # is independent of the POOLED exclusion — and it was not: being inside that branch
+    # meant a withheld pooled gap skipped the deepest-depth analysis entirely. #334 made
+    # that state reachable for a model that lost zero calls (a pooled subset under the
+    # question floor), and it was measured dropping a fully-paired -100% collapse at the
+    # deepest depth out of the verdict, under a line promising "depth slices that pair
+    # cleanly are still scored below". An exclusion must never remove a demonstrated
+    # regression from a verdict; nesting made the pooled gate decide the depth question.
+    if True:
         # The soak-specific signal on top of the overall gate: the worst model's gap
         # at the DEEPEST depth, since a clean average can hide a depth-correlated slide.
         deep = depths[-1] if depths else 0
@@ -1587,14 +1708,26 @@ def build_diff_soak_report(results: dict) -> str:
         elif deep_withheld:
             out.append(f"- **NO VERDICT at the deepest tested depth ({deep})** — every "
                        f"model's deepest slice was withheld, so the depth this soak exists "
-                       f"to probe was not scored. The overall line above is pooled across "
-                       f"shallower depths and says nothing about drift at {deep}.")
-        if worst.passed and not deep_withheld and (deepest is None or deepest.passed):
+                       f"to probe was not scored."
+                       + (f" The overall line above is pooled across shallower depths and "
+                          f"says nothing about drift at {deep}." if worst else
+                          " The pooled gap was withheld too, so this run has no verdict at "
+                          "any depth."))
+        if worst and worst.passed and not deep_withheld and (
+                deepest is None or deepest.passed):
             out.append("- No depth-correlated comprehension drift within tolerance — "
                        "chained diffs up to the tested depth read as well as fulls.")
-        elif not deep_withheld:
+        elif not deep_withheld and (worst or deepest):
+            # `worst or deepest` is the guard un-nesting this block made necessary: with
+            # neither, NOTHING was scored, and "comprehension drifts beyond tolerance" is a
+            # finding rather than the absence of one. The NO VERDICT line above already
+            # said what happened; a conclusion here would contradict it.
+            passing = [d for d in depths if d != deep] if worst and worst.passed else []
             out.append("- Comprehension drifts beyond tolerance somewhere in the chain — "
-                       "keep the keyframe interval at or below the deepest PASSING depth.")
+                       + ("keep the keyframe interval at or below the deepest PASSING "
+                          "depth." if passing else
+                          "no tested depth published a passing gap, so this run does not "
+                          "identify a safe keyframe interval."))
     out.append("")
     return "\n".join(out)
 
@@ -1613,7 +1746,7 @@ def _per_transform_table(results: dict, summary: dict[str, dict[str, float]]) ->
         # just refused to show — and this is the table a reader uses to decide "restrict
         # the policy to the transforms that held", so a depressed row here becomes a
         # policy change made on a backend outage.
-        if summary.get(model, {}).get("unmeasured"):
+        if summary.get(model, {}).get("rows_untrustworthy"):
             continue
         # PAIRED rows only. These columns pool one arm at a time — so they are not a gap
         # and stay on the `_form_stats` allowlist — but pooling UNPAIRED rows reintroduced
@@ -1774,6 +1907,11 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
             g = _accuracy_gate(rows)
             if not g.excluded:
                 surviving.append(f"`{model}` {len(g.rows)}/{len(rows)}")
+            elif g.excluded == "underpowered":
+                # `g.rows` is empty for every exclusion, so recompute: this is the one
+                # reason whose entire remedy is a NUMBER, and the reader was given none.
+                pr = paired_rows(rows, "answer_ok", "control_ok")
+                surviving.append(f"`{model}` {len(pr)}/{len(rows)}")
         if surviving:
             out += ["> **Questions surviving the pairing**: " + ", ".join(surviving)
                     + ". The gap is computed over these only — read it as accuracy among "
@@ -1827,11 +1965,21 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
             # DID run, and the "Where they failed" paragraph above already says how many
             # of its calls it lost. Name the real reason instead of contradicting that
             # paragraph two sentences later (review finding 2 on #300).
+            # The tail has to match the reason too, not just the opening. #300's finding 2
+            # stopped this branch claiming "no control was run" — and the sentence it kept
+            # still asserts an "unrun 100%", which is the same claim, and is false whenever
+            # the control ran and the exclusion was about sample size instead.
+            underpowered = set(accuracy_excluded.values()) == {"underpowered"}
             out.append("- **final-accuracy: not gated** — " + exclusion_note(accuracy_excluded)
-                       + ". It is scored by JSON value-equality against the full original "
-                       "value, and a model given the UN-dropped payload does not reproduce "
-                       "a long prose field verbatim either — gating that against an unrun "
-                       "100% measures verbatim reproduction and bills it to the drop (#269).")
+                       + (". The control arm ran; there were simply too few paired "
+                          "questions for an absence of drop-caused loss to mean anything. "
+                          "Generate more questions and re-run — this is not evidence "
+                          "either way." if underpowered else
+                          ". It is scored by JSON value-equality against the full original "
+                          "value, and a model given the UN-dropped payload does not "
+                          "reproduce a long prose field verbatim either — gating that "
+                          "against an unrun 100% measures verbatim reproduction and bills "
+                          "it to the drop (#269)."))
         else:
             out.append("- **final-accuracy: not gated** — no no-drop control arm was run, "
                        "so there is nothing to compare the drop against. It is scored by "
@@ -1851,11 +1999,21 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
                 # nothing about whether the answer it ends up with is right. Calling that
                 # "safe" is the same over-claim in the opposite direction to the one #269
                 # opened for.
-                out.append("- **INCONCLUSIVE for enabling** — recall and no-overfetch clear "
-                           "tolerance for the worst model, so the mechanism works, but final "
-                           "accuracy was not gated: the OUTCOME impact of dropping is "
-                           "unmeasured. Re-run with the no-drop control arm before enabling "
-                           "drop-to-retrieve on this evidence.")
+                # Reason-aware for the same reason the line above it is: telling an
+                # operator to add a control arm that is already running is #300's finding
+                # 2, one paragraph further down. Membership, not set-equality: a MIXED
+                # exclusion set still contains an underpowered model whose control ran,
+                # so the blanket "re-run with a control" is false for that half.
+                has_underpowered = "underpowered" in set(accuracy_excluded.values())
+                out.append(
+                    "- **INCONCLUSIVE for enabling** — recall and no-overfetch clear "
+                    "tolerance for the worst model, so the mechanism works, but final "
+                    "accuracy was not gated: the OUTCOME impact of dropping is "
+                    "unmeasured. "
+                    + ("Generate more questions and re-run — the control arm is "
+                       "already on." if has_underpowered else
+                       "Re-run with the no-drop control arm before enabling "
+                       "drop-to-retrieve on this evidence."))
         else:
             out.append("- At least one metric misses tolerance for its worst model — keep "
                        "drop-to-retrieve off until this improves.")
@@ -1953,13 +2111,30 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         # "unmeasured" now covers `unpaired` too — a run where the backend was up but one
         # arm lost too much of the question set is equally unpublishable, and it reaches
         # the reader through the same `n/a` row rather than a second vocabulary.
-        unmeasured = g.excluded == "unmeasured"
+        # Any reason that withholds this model's numbers, not just the transport one:
+        # #334's `"underpowered"` must render the same `n/a` row, or the table prints
+        # percentages the verdict below refuses to use. `reasons[model]` keeps the
+        # distinction for the prose that follows.
+        # Two different questions, and conflating them let an exclusion flatter a pooled
+        # number. `unmeasured` decides whether this model gets percentages of its own;
+        # `rows_untrustworthy` decides whether its ROWS may be pooled with other models'
+        # in `_per_transform_table`. An underpowered model's rows are fully paired and
+        # perfectly good evidence — it is the per-model CONCLUSION that is unsupported,
+        # not the measurements, and that table is not a conclusion. Dropping it moved a
+        # published, decision-bearing figure from 72% to 90% in the flattering direction.
+        unmeasured = g.excluded in ("unmeasured", "underpowered")
         reasons[model] = g.excluded
         # "n" is the GENERATED question count; nothing in `src/` reads it (the table
         # prints `len(g.rows)`), kept only because result files carry the shape.
         summary[model] = {"n": n, "raw": racc, "raw_se": rse,
                           "terse": tacc, "terse_se": tse, "primer": pacc, "primer_se": pse,
                           "fails": fails, "attempts": attempts, "unmeasured": unmeasured,
+                          "rows_untrustworthy": g.excluded == "unmeasured",
+                          # NOT `len(g.rows)`: `_gap` returns `rows=[]` for every
+                          # exclusion, and only excluded models reach the paragraph that
+                          # prints this, so that read was a dead constant 0 — which reads
+                          # as "nothing paired at all", the OTHER reason.
+                          "paired": len(paired_rows(rows, "terse_ok", "primer_ok", "raw_ok")),
                           "gap_form": g.form_acc, "gap_form_se": g.form_se}
         if has_inline:
             summary[model].update({"inline": iacc, "inline_se": ise})
@@ -1980,7 +2155,7 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     out.append("")
     unreachable = {m: s for m, s in summary.items() if s.get("unmeasured")}
     out += _not_measured_lines({
-        m: (reasons.get(m), int(s["fails"]), int(s["attempts"]))
+        m: (reasons.get(m), int(s["fails"]), int(s["attempts"]), int(s["paired"]))
         for m, s in unreachable.items()})
     # A model that lost SOME calls but stayed under the bar still publishes numbers — say
     # so, because those percentages are over a smaller denominator than the run intended
@@ -2017,6 +2192,7 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     # withheld model, which contradicted the "**Not compared** — the backend answered"
     # paragraph printed ten lines above it in the same document.
     unmeasured_models = [m for m, r in reasons.items() if r == "unmeasured"]
+    underpowered_models = [m for m, r in reasons.items() if r == "underpowered"]
     gated = {m: s for m, s in summary.items() if reasons.get(m) is None}
     if broken:
         out.append(f"- Excluded (raw control failed — backend/config error, not comprehension): "
@@ -2029,6 +2205,12 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         # `test_the_fluency_verdict_does_not_assert_a_dead_backend`.
         out.append(f"- Excluded ({REASON_LABEL['unmeasured']} — not measured): "
                    f"{', '.join(f'`{m}`' for m in unmeasured_models)}.")
+    if underpowered_models:
+        # Its own line. Folded into the one above it would tell a reader whose backend
+        # answered every call that its calls went unanswered; omitted — which is what
+        # happened until this review — the model vanishes from the verdict unnamed.
+        out.append(f"- Excluded ({REASON_LABEL['underpowered']} — not concluded): "
+                   f"{', '.join(f'`{m}`' for m in underpowered_models)}.")
     # best terse-side form per model, carrying its own SE for the gap's confidence interval.
     # gap CI: raw and the best form are over the same questions (not independent), so
     # √(se_raw²+se_best²) is a conservative over-estimate of the gap's SE — the honest
@@ -2082,7 +2264,12 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         # when the exclusion lists are empty (every model simply produced zero rows, e.g.
         # a corpus that generated no questions) sends the reader hunting for a backend
         # failure that never happened.
-        why = ("Every model was excluded above" if (broken or unmeasured_models)
+        # `underpowered_models` belongs in this test: without it, a run whose models were
+        # all fully scored and fully paired — merely short of the question floor — printed
+        # "did the corpus generate questions?" about a corpus that generated them and
+        # answered every one, contradicting the paragraph four lines above.
+        why = ("Every model was excluded above"
+               if (broken or unmeasured_models or underpowered_models)
                else "No model produced any scored rows (did the corpus generate questions?)")
         out.append(f"- **NO VERDICT — nothing was measured.** {why}, so this run says "
                    "nothing about comprehension either way. Fix that and re-run before "

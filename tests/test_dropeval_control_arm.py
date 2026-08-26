@@ -90,7 +90,9 @@ def test_control_text_on_the_non_json_path_also_carries_no_drop_markers():
 # --------------------------------------------------------------------------- #
 
 
-def _rows(n=6, *, answer, control=None, kind="recall", trials=1, errors=0):
+# n=24, not 6: #334 withholds a non-failing arm under `_MIN_PAIRED_QUESTIONS` paired
+# questions, and every ratio these fixtures pin is a proportion, not a count.
+def _rows(n=24, *, answer, control=None, kind="recall", trials=1, errors=0):
     row = {"kind": kind, "trials": trials, "retrieve_ok": trials, "handle_ok": trials,
            "answer_ok": answer, "answer_trials": trials - errors,
            "retrieve_trials": trials - errors, "handle_trials": trials - errors,
@@ -112,7 +114,7 @@ def test_a_control_arm_makes_final_accuracy_a_gap_between_two_measured_arms():
     all-zero. An all-zero control is a different, and more suspicious, case: see
     `test_an_all_zero_control_is_excluded_as_broken_not_scored_as_a_free_pass` below
     (review finding 3 on #300)."""
-    rows = _rows(n=3, answer=1, control=1) + _rows(n=3, answer=0, control=0)
+    rows = _rows(n=12, answer=1, control=1) + _rows(n=12, answer=0, control=0)
     g = _accuracy_gate(rows)
     assert not g.excluded
     # Both arms tie at 50% -> the DROP costs nothing, which the old fixed-100% control
@@ -144,8 +146,8 @@ def test_the_metric_that_used_to_fail_now_passes_when_the_drop_is_blameless():
     nothing — which is the entire point of running a control. Mixed 50/50 rather than an
     all-zero control, which is excluded as broken rather than scored as a free pass (see
     `test_an_all_zero_control_is_excluded_as_broken_not_scored_as_a_free_pass`)."""
-    rows = (_both_kinds(n=3, answer=1, control=1, trials=1)
-            + _both_kinds(n=3, answer=0, control=0, trials=1))
+    rows = (_both_kinds(n=12, answer=1, control=1, trials=1)
+            + _both_kinds(n=12, answer=0, control=0, trials=1))
     report = build_dropeval_report({"m": rows})
     assert "no-drop control" in report
     assert "safe to enable drop-to-retrieve" in report
@@ -370,8 +372,11 @@ def test_the_report_says_how_many_questions_survived_the_pairing():
     `test_an_all_zero_control_is_excluded_as_broken_not_scored_as_a_free_pass` now
     excludes (review finding 3 on #300), which would make the accuracy gate excluded here
     too and this message never print."""
-    rows = _both_kinds(n=5, answer=1, control=1, trials=3, errors=0)
-    for r in rows[:5]:
+    # 48 rows, half of them damaged: the same 50% loss the docstring is about, over a
+    # surviving half that clears `_MIN_PAIRED_QUESTIONS` (#334) so the model is scored and
+    # the line under test actually renders.
+    rows = _both_kinds(n=24, answer=1, control=1, trials=3, errors=0)
+    for r in rows[:24]:
         r["control_trials"], r["control_errors"], r["errors"] = 2, 1, 1
     report = build_dropeval_report({"m": rows}, accept_degraded=True)
     assert "Questions surviving the pairing" in report
@@ -383,12 +388,12 @@ def test_the_surviving_count_uses_the_paired_subset_not_the_full_row_count():
     reading the raw count for the numerator too) would still print a "Questions surviving"
     line and survived review (finding 6 on #300). One row is forced to miss a control
     trial (`control_trials=2` of `trials=3`), which drops it from `paired_rows` while it
-    still counts toward the raw `len(rows)` — so the paired subset (9) is strictly smaller
-    than the raw count (10), and only the correct denominator prints "9/10"."""
-    rows = _both_kinds(n=5, answer=1, control=1, trials=3, errors=0)
+    still counts toward the raw `len(rows)` — so the paired subset (47) is strictly smaller
+    than the raw count (48), and only the correct denominator prints "47/48"."""
+    rows = _both_kinds(n=24, answer=1, control=1, trials=3, errors=0)
     rows[0] = dict(rows[0], control_trials=2, control_errors=1, errors=1)
     report = build_dropeval_report({"m": rows})
-    assert "9/10" in report
+    assert "47/48" in report
 
 
 def test_the_report_names_which_arm_lost_the_calls():
@@ -444,11 +449,12 @@ def test_a_question_whose_call_failed_is_dropped_from_BOTH_arms_not_scored_wrong
     The fix is `paired_rows`' rule (#280), which is stricter than re-basing the denominator:
     a question that did not complete every trial on BOTH arms is excluded outright, because
     the row counts say how many trials survived, not WHICH."""
-    incomplete = _rows(n=2, answer=0, control=4, trials=4, errors=2)
+    incomplete = _rows(n=20, answer=0, control=4, trials=4, errors=2)
     complete = [dict(r, qid=f"ok{i}") for i, r in
-                enumerate(_rows(n=2, answer=4, control=4, trials=4))]
+                enumerate(_rows(n=20, answer=4, control=4, trials=4))]
     g = _accuracy_gate(incomplete + complete)
-    assert [r["qid"] for r in g.rows] == ["ok0", "ok1"], "incomplete rows must not be scored"
+    assert [r["qid"] for r in g.rows] == [f"ok{i}" for i in range(20)], (
+        "incomplete rows must not be scored")
     # Scored over the surviving pair only: both arms right -> no gap, and crucially the
     # errored rows did NOT drag the treatment arm to 0%.
     assert g.form_acc == 1.0 and g.control_acc == 1.0

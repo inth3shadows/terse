@@ -35,7 +35,10 @@ import pytest
 
 from terse.html_report import build_html_diff_report
 from terse.report import (
+    _GAP_TOLERANCE,
+    _MIN_PAIRED_QUESTIONS,
     UNMEASURED_FAIL_SHARE,
+    _form_stats,
     _unmeasured,
     arm_gap,
     build_diff_report,
@@ -44,6 +47,7 @@ from terse.report import (
     diff_gap_rows,
     fluency_gap_rows,
     paired_rows,
+    passes_tolerance,
 )
 from terse.terminal_report import (
     build_terminal_diff_report,
@@ -51,10 +55,14 @@ from terse.terminal_report import (
 )
 
 TRIALS = 3
+# Clean-row fixtures must also clear #334's floor to stay SCORED rather than withheld.
+_CLEAN_N = 20
 # Per-row form successes across the five questions BOTH arms answered: 12 of 15 = 80%. The
 # control answers all fifteen. A real, ordinary regression — the point is that it is
 # invisible until the arms are paired.
-FORM_OK = [3, 3, 3, 2, 1]
+# Repeated x4 so the paired subset clears `_MIN_PAIRED_QUESTIONS` (#334) while every ratio
+# these tests assert is untouched: 4x[3,3,3,2,1] = 48/60, the same 80%.
+FORM_OK = [3, 3, 3, 2, 1] * 4
 
 
 def _correlated_loss_rows(depth: int | None = None) -> list[dict]:
@@ -63,12 +71,14 @@ def _correlated_loss_rows(depth: int | None = None) -> list[dict]:
     rows = [{
         # The hard question. The control scores 0 on it — so dropping it from the control's
         # denominator is what inflates the control-relative comparison — and the form arm
-        # never answered it at all (`diff_trials` 0).
-        "qid": "hard", "qtype": "deref", "transform": "table", "trials": TRIALS,
+        # never answered it at all (`diff_trials` 0). One per five paired rows: the whole
+        # file rests on "unpaired reads -3.3%, paired reads -20%", and that ratio is a
+        # property of hard:paired, not of either count, so #334's x4 applies to both.
+        "qid": f"hard{h}", "qtype": "deref", "transform": "table", "trials": TRIALS,
         "terse_ok": 0, "terse_trials": TRIALS, "diff_ok": 0, "diff_trials": 0,
         "fails": TRIALS, "attempts": TRIALS * 2,
-    }]
-    for qid, ok in zip("BCDEF", FORM_OK, strict=True):
+    } for h in range(len(FORM_OK) // 5)]
+    for qid, ok in zip([f"p{i}" for i in range(len(FORM_OK))], FORM_OK, strict=True):
         rows.append({
             "qid": qid, "qtype": "lookup", "transform": "table", "trials": TRIALS,
             "terse_ok": TRIALS, "terse_trials": TRIALS, "diff_ok": ok, "diff_trials": TRIALS,
@@ -86,7 +96,7 @@ def _clean_rows(depth: int | None = None) -> list[dict]:
         "qid": f"clean{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
         "terse_ok": TRIALS, "terse_trials": TRIALS, "diff_ok": TRIALS, "diff_trials": TRIALS,
         "fails": 0, "attempts": TRIALS * 2,
-    } for i in range(6)]
+    } for i in range(_CLEAN_N)]
     if depth is not None:
         for r in rows:
             r["depth"] = depth
@@ -100,12 +110,12 @@ def _payload_correlated_loss_rows() -> list[dict]:
     prompt of the four), and leaving it out keeps this fixture about the gated arms.
     """
     rows = [{
-        "qid": "hard", "qtype": "deref", "transform": "table", "trials": TRIALS,
+        "qid": f"hard{h}", "qtype": "deref", "transform": "table", "trials": TRIALS,
         "raw_ok": 0, "raw_trials": TRIALS,
         "terse_ok": 0, "terse_trials": 0, "primer_ok": 0, "primer_trials": 0,
         "fails": TRIALS * 2, "attempts": TRIALS * 3,
-    }]
-    for qid, ok in zip("BCDEF", FORM_OK, strict=True):
+    } for h in range(len(FORM_OK) // 5)]
+    for qid, ok in zip([f"p{i}" for i in range(len(FORM_OK))], FORM_OK, strict=True):
         rows.append({
             "qid": qid, "qtype": "lookup", "transform": "table", "trials": TRIALS,
             "raw_ok": TRIALS, "raw_trials": TRIALS,
@@ -255,7 +265,7 @@ def test_the_fluency_table_counts_regressions_over_the_paired_subset():
         "terse_ok": TRIALS, "terse_trials": TRIALS,
         "primer_ok": TRIALS, "primer_trials": TRIALS,
         "fails": 0, "attempts": TRIALS * 3,
-    } for i in range(5)]
+    } for i in range(20)]
     # Same preconditions as the main fixture: neither pre-existing gate may fire.
     assert not _unmeasured(rows)
 
@@ -286,7 +296,7 @@ def test_an_uneven_score_pack_still_publishes():
         "raw_ok": 3, "raw_trials": 3,
         "terse_ok": 2, "terse_trials": 2,   # only two replies collected for this form
         "primer_ok": 3, "primer_trials": 3,
-    } for i in range(6)]
+    } for i in range(_CLEAN_N)]
     assert paired_rows(rows, "terse_ok", "raw_ok") == rows
 
     md = build_fluency_report({"m": rows}, [])
@@ -355,7 +365,7 @@ def test_the_per_transform_table_pools_only_paired_rows():
         "terse_ok": 1, "terse_trials": 3,     # genuinely poor: 1 of 3
         "primer_ok": 3, "primer_trials": 3,
         "fails": 0, "attempts": 9,
-    } for i in range(7)]
+    } for i in range(22)]
     # The model itself must still publish, or the table never renders.
     assert not _unmeasured(rows)
 
@@ -385,7 +395,7 @@ def test_the_diff_table_counts_regressions_over_the_paired_subset():
         "qid": f"ok{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
         "terse_ok": TRIALS, "terse_trials": TRIALS, "diff_ok": TRIALS, "diff_trials": TRIALS,
         "fails": 0, "attempts": TRIALS * 2,
-    } for i in range(5)]
+    } for i in range(20)]
     assert not _unmeasured(rows)
 
     md = build_diff_report({"m": rows})
@@ -416,7 +426,7 @@ def test_the_fluency_table_counts_primer_recoveries_over_the_paired_subset():
         "terse_ok": TRIALS, "terse_trials": TRIALS,
         "primer_ok": TRIALS, "primer_trials": TRIALS,
         "fails": 0, "attempts": TRIALS * 3,
-    } for i in range(5)]
+    } for i in range(20)]
     assert not _unmeasured(rows)
 
     md = build_fluency_report({"m": rows}, [])
@@ -456,21 +466,22 @@ def test_the_question_column_reports_the_exam_that_was_actually_sat():
     one section below already pools the paired rows, so one document showed two exam sizes
     for one model with no explanation.
     """
-    # 6 of 20 questions lost outright — 3 by each arm — so 14 are comparable.
+    # 6 of 30 questions lost outright — 3 by each arm — so 24 are comparable
+    # (and 24 clears `_MIN_PAIRED_QUESTIONS`, so the row is scored, not withheld).
     rows = [{
         "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 5,
         "terse_ok": 0 if 3 <= i < 6 else 5, "terse_trials": 0 if 3 <= i < 6 else 5,
         "diff_ok": 0 if i < 3 else 5, "diff_trials": 0 if i < 3 else 5,
         "fails": 5 if i < 6 else 0, "attempts": 10,
-    } for i in range(20)]
+    } for i in range(30)]
     assert not _unmeasured(rows), "the transport gate must not be what withholds this"
     scored = len(paired_rows(rows, "diff_ok", "terse_ok"))
-    assert scored == 14
+    assert scored == 24
 
     md = build_diff_report({"m": rows})
     row = [ln for ln in md.splitlines() if ln.startswith("| `m` |")]
     assert row and f"| `m` | {scored} |" in row[0], (
-        f"q column should be the paired {scored}, not 20: {row}")
+        f"q column should be the paired {scored}, not 30: {row}")
 
 # --------------------------------------------------------------------------------------
 # Site 6 — the pairing-loss floor itself (#332).
@@ -569,13 +580,55 @@ def test_a_demonstrated_regression_is_never_withheld_as_unmeasured():
     assert "safe to enable" not in md
 
 
-def test_a_minority_paired_subset_still_publishes():
-    """No survival threshold. Two of ten questions surviving is a small sample, not an
-    unmeasured one — the reader weighs `n`, the gate does not withhold it."""
-    rows = _pairing_wipeout_rows(n=10, lost=8)
+def test_a_small_but_failing_arm_still_publishes_its_FAIL():
+    """The asymmetry, on the side that makes #334's floor safe (see `_MIN_PAIRED_QUESTIONS`).
+
+    #332's first attempt was a SYMMETRIC survival floor and was measured turning a
+    demonstrated -100% regression into "safe to enable `proxy --diff`", because an exclusion
+    drops a model from the gate entirely. #334's floor may only ever withhold a form arm
+    that is NOT behind its control, so the removed gap is always non-negative and cannot be
+    the worst case. Two paired questions, both lost by the form arm, must still FAIL."""
+    # Eight questions voided by pairing; the two that survive are complete on BOTH arms and
+    # the form arm got neither of them right. Written out rather than reusing
+    # `_pairing_wipeout_rows`, whose survivors are clean by construction.
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS,
+        "diff_ok": 0, "diff_trials": TRIALS - 1 if i < 8 else TRIALS,
+        "attempts": TRIALS * 2, "fails": 1 if i < 8 else 0,
+    } for i in range(10)]
+    assert len(paired_rows(rows, "diff_ok", "terse_ok")) == 2 < _MIN_PAIRED_QUESTIONS
+
     g = arm_gap(rows, "diff_ok", "terse_ok")
-    assert g.excluded is None
-    assert len(g.rows) == 2
+    assert g.excluded is None, "a form arm behind its control publishes at any question count"
+    assert g.form_acc < g.control_acc
+
+    md = build_diff_report({"m": rows})
+    assert "**FAIL**" in md
+    assert "safe to enable" not in md
+
+
+def test_a_small_and_passing_arm_is_withheld_as_underpowered():
+    """The other side: the same two questions, both arms perfect. Nothing failed, and that
+    is exactly the problem — two questions cannot support "no regression". Withheld under
+    its OWN reason, not `"unmeasured"`, whose label would claim calls were lost."""
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS,
+        "diff_ok": TRIALS, "diff_trials": TRIALS - 1 if i < 8 else TRIALS,
+        "attempts": TRIALS * 2, "fails": 1 if i < 8 else 0,
+    } for i in range(10)]
+    assert len(paired_rows(rows, "diff_ok", "terse_ok")) == 2 < _MIN_PAIRED_QUESTIONS
+
+    g = arm_gap(rows, "diff_ok", "terse_ok")
+    assert g.excluded == "underpowered"
+
+    md = build_diff_report({"m": rows})
+    assert "**PASS**" not in md and "safe to enable" not in md
+    # Withheld is not the same as unmentioned, and the reason must not blame the backend.
+    assert "`m`" in md
+    assert "too few calls to compare" not in md, (
+        "no calls were lost here; the transport wording would be a fabricated cause")
 
 
 def test_the_canonical_correlated_loss_fixture_is_still_scored():
@@ -656,3 +709,195 @@ def test_the_fluency_verdict_does_not_assert_a_dead_backend():
     assert "Excluded (calls went unanswered" not in md, (
         f"the fluency verdict asserts an unreachable backend for a model whose backend "
         f"answered {1 - lost:.1%} of its calls")
+
+
+# --------------------------------------------------------------------------------------
+# Site 7 — `"underpowered"` through every consumer (#334).
+#
+# The first version of this reason was exercised end to end through `build_diff_report`
+# ALONE, and four separate defects lived in the renderers it did not reach: the soak
+# relabelled it as a pairing failure, the fluency verdict never named the model at all and
+# then blamed the corpus, and the fluency paragraph printed a dead-constant "0 paired
+# question(s)". One renderer's worth of coverage is what let a shared reason drift again.
+# --------------------------------------------------------------------------------------
+
+def _underpowered_rows(n: int = 10) -> list[dict]:
+    """Fully paired, nothing lost, both arms perfect — just too few questions."""
+    return [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS, "diff_ok": TRIALS, "diff_trials": TRIALS,
+        "attempts": TRIALS * 2, "fails": 0,
+    } for i in range(n)]
+
+
+def test_an_underpowered_model_is_named_in_every_renderer():
+    rows = _underpowered_rows()
+    assert len(paired_rows(rows, "diff_ok", "terse_ok")) == 10 < _MIN_PAIRED_QUESTIONS
+    rendered = {
+        "markdown": build_diff_report({"m": rows}),
+        "html": build_html_diff_report({"m": rows}, "diff-form", "full-terse"),
+        "terminal": build_terminal_diff_report({"m": rows}, color=False),
+    }
+    # Each renderer's OWN spelling of the name and of a pass. `"m" in text` matched the
+    # letter m in "model" and "comprehension", so it pinned nothing; `"**PASS**"` and
+    # `"✓ PASS"` are markdown and HTML tokens the terminal plot never emits, so its leg of
+    # this test could not fail either. Both were caught by review of this very file.
+    named = {"markdown": "`m`", "html": "<code>m</code>", "terminal": "excluded"}
+    passes = {"markdown": "**PASS**", "html": "✓ PASS", "terminal": "PASS"}
+    for name, text in rendered.items():
+        assert named[name] in text, f"{name} does not name the withheld model"
+        assert passes[name] not in text, f"{name} published a PASS off 10 questions"
+        # Nothing was lost. No renderer may say otherwise.
+        assert "too few calls to compare" not in text, name
+        assert "went unanswered" not in text, name
+
+
+def test_the_fluency_verdict_names_an_underpowered_model_and_counts_its_questions():
+    """Findings 3 and 4 of #334's review, in one fixture: the count was a dead constant 0
+    (read from `g.rows`, which `_gap` empties on every exclusion), and the model appeared
+    in no exclusion line — so a run of fully-answered, fully-paired questions reported
+    "did the corpus generate questions?" about a corpus that generated fifteen."""
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
+        "raw_ok": TRIALS, "raw_trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS,
+        "primer_ok": TRIALS, "primer_trials": TRIALS,
+        "attempts": TRIALS * 3, "fails": 0,
+    } for i in range(15)]
+    md = build_fluency_report({"m": rows}, [])
+    assert "15 paired question(s)" in md, (
+        "the paragraph's only actionable content is how many questions are short")
+    assert "0 paired question(s)" not in md
+    assert "did the corpus generate questions?" not in md, (
+        "the corpus generated 15 questions and every one of them was answered")
+    assert "not concluded" in md.lower()
+
+
+def test_the_soak_reports_a_deepest_depth_FAIL_even_when_the_pooled_gap_is_withheld():
+    """The severest finding of #334's review, and the one the asymmetry proof missed.
+
+    The proof covers `_worst_case_gap`. The deepest-depth analysis is a SECOND verdict, and
+    it was nested inside `if worst:` — the pooled result — so withholding the pooled gap
+    silently skipped it. #334 made that state reachable for a model that lost zero calls.
+
+    Depth 1 runs +50 (chain ahead), depth 5 runs -100 (chain collapsed). Pooled they cancel
+    to exactly 0 over 15 paired questions, which is under the floor and not behind control,
+    so the pooled gap is withheld — and the -100% collapse at the depth a soak exists to
+    probe must still reach the reader."""
+    rows = ([{"qid": f"d1q{i}", "qtype": "lookup", "transform": "table", "depth": 1,
+              "trials": 1, "terse_ok": 1 if i < 4 else 0, "terse_trials": 1,
+              "diff_ok": 1 if i < 9 else 0, "diff_trials": 1,
+              "attempts": 2, "fails": 0} for i in range(10)]
+            + [{"qid": f"d5q{i}", "qtype": "lookup", "transform": "table", "depth": 5,
+                "trials": 1, "terse_ok": 1, "terse_trials": 1,
+                "diff_ok": 0, "diff_trials": 1,
+                "attempts": 2, "fails": 0} for i in range(5)])
+    assert arm_gap(rows, "diff_ok", "terse_ok").excluded == "underpowered", (
+        "fixture must exercise the withheld-pooled path, or this proves nothing")
+
+    md = build_diff_soak_report({"m": rows})
+    assert "deepest tested depth (5)" in md, f"the deepest-depth verdict vanished:\n{md}"
+    assert "-100%" in md
+    assert "**FAIL**" in md
+    assert "No depth-correlated comprehension drift" not in md
+
+
+def test_a_depth_slice_that_paired_cleanly_is_not_called_unpaired():
+    """The by-depth table substituted one of two hardcoded reasons for whatever `_gap`
+    decided, so `"underpowered"` rendered as "one arm did not complete enough of the same
+    questions" — about a slice where both arms completed every question."""
+    rows = [{"qid": f"d{d}q{i}", "qtype": "lookup", "transform": "table", "depth": d,
+             "trials": 1, "terse_ok": 1, "terse_trials": 1, "diff_ok": 1, "diff_trials": 1,
+             "attempts": 2, "fails": 0}
+            for d in (1, 2) for i in range(25 if d == 1 else 10)]
+    md = build_diff_soak_report({"m": rows})
+    assert "one arm did not complete enough of the same questions" not in md, (
+        "every arm completed every question at both depths")
+    assert "too many calls went unanswered" not in md
+    # ...and the RIGHT wording is present. Without this the block could be deleted whole
+    # and both assertions above would still hold — an absence-only test pins nothing.
+    assert "Not concluded" in md and "fewer than 20 paired questions" in md, (
+        f"the withheld depth must still be named, with its real reason:\n{md}")
+
+
+def test_an_underpowered_models_rows_still_pool_into_the_per_transform_table():
+    """An exclusion moved a published number in the flattering direction: dropping the
+    underpowered model took its bad `table` rows out of the pooled average with it, and the
+    verdict tells the reader to use that table to 'restrict the policy to the transforms
+    that held'. The per-model CONCLUSION is unsupported; the rows are fully paired."""
+    big = [{"qid": f"a{i}", "qtype": "lookup", "transform": "table", "trials": 1,
+            "raw_ok": 1, "raw_trials": 1, "terse_ok": 1, "terse_trials": 1,
+            "primer_ok": 1, "primer_trials": 1, "attempts": 3, "fails": 0}
+           for i in range(30)]
+    small = [{"qid": f"b{i}", "qtype": "lookup", "transform": "table", "trials": 1,
+              "raw_ok": 1, "raw_trials": 1, "terse_ok": 0, "terse_trials": 1,
+              "primer_ok": 1, "primer_trials": 1, "attempts": 3, "fails": 0}
+             for i in range(10)]
+    md = build_fluency_report({"A": big, "B": small}, [])
+    section = md.split("by stressed transform")[1].split("## Verdict")[0]
+    assert "| table | 40 |" in section, (
+        f"B's 10 paired rows must still pool; excluding them flatters the figure:\n{section}")
+
+
+def test_a_gap_inside_tolerance_is_withheld_not_published_as_a_PASS():
+    """The band between "behind its control" and "failing" — where #334's first cut leaked.
+
+    The floor withheld only `best >= cacc`, but the verdict PASSES at
+    `gap >= -_GAP_TOLERANCE`. A gap of -3% is therefore behind its control (so the floor
+    let it through) AND inside tolerance (so the verdict passed it) — a green PASS off one
+    paired question, which is the exact symptom #334 was filed about. Reverting the cut to
+    exact equality must redden this test; it is the only thing pinning that boundary.
+
+    One question, 100 trials, 97/100 against 100/100. `_form_stats` clusters on the
+    QUESTION, so a hundred trials of one question is still n=1 evidence."""
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 100,
+        "terse_ok": 100, "terse_trials": 100,
+        "diff_ok": 97 if i == 9 else 0, "diff_trials": 100 if i == 9 else 99,
+        "attempts": 200, "fails": 0 if i == 9 else 1,
+    } for i in range(10)]
+    pr = paired_rows(rows, "diff_ok", "terse_ok")
+    assert len(pr) == 1
+    assert _form_stats(pr, "diff_ok")[0] == pytest.approx(0.97)
+    assert _form_stats(pr, "terse_ok")[0] == pytest.approx(1.0)
+    # Behind its control, but by less than tolerance — so nothing else would withhold it.
+    assert -_GAP_TOLERANCE < 0.97 - 1.0 < 0
+
+    assert arm_gap(rows, "diff_ok", "terse_ok").excluded == "underpowered"
+    md = build_diff_report({"m": rows})
+    assert "**PASS**" not in md, f"a -3% gap off ONE question published as a PASS:\n{md}"
+    assert "safe to enable" not in md
+
+
+@pytest.mark.parametrize("form_ok,control_ok", [
+    # Exact-boundary pairs where `facc >= cacc - tol` and `gap >= -tol` disagree in binary
+    # float. `0.40 - 0.05` is `0.35000000000000003`, so the first form said "behind its
+    # control" (no withhold) while the second said "inside tolerance" (PASS) — the gap
+    # between two spellings of one predicate, and a green "safe to enable" fell through it.
+    (35, 40), (15, 20), (475, 525), (47, 52),
+])
+def test_the_floor_and_the_verdict_agree_on_the_exact_tolerance_boundary(form_ok, control_ok):
+    """The first fix for the tolerance band wrote the comparison a second way instead of
+    sharing it, and `test_a_gap_inside_tolerance_is_withheld_not_published_as_a_PASS`
+    happened to pick a pair that rounds the lucky way, so it stayed green over the hole.
+
+    Parametrised over pairs that round the OTHER way. Ten paired questions — under the
+    floor — so whatever the verdict would have called a PASS must be withheld instead."""
+    trials = control_ok * 2 if control_ok < 100 else control_ok
+    trials = 1000 if control_ok > 100 else 100
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": trials,
+        "terse_ok": control_ok, "terse_trials": trials,
+        "diff_ok": form_ok, "diff_trials": trials,
+        "attempts": trials * 2, "fails": 0,
+    } for i in range(10)]
+    assert len(paired_rows(rows, "diff_ok", "terse_ok")) == 10 < _MIN_PAIRED_QUESTIONS
+
+    facc, cacc = form_ok / trials, control_ok / trials
+    assert passes_tolerance(facc - cacc), "fixture must sit inside tolerance, or it FAILs"
+
+    assert arm_gap(rows, "diff_ok", "terse_ok").excluded == "underpowered"
+    md = build_diff_report({"m": rows})
+    assert "**PASS**" not in md, (
+        f"{facc:.1%} vs {cacc:.1%} published a PASS off 10 questions:\n{md}")
+    assert "safe to enable" not in md

@@ -832,10 +832,16 @@ def test_fluency_diff_html_writes_forest_plot(tmp_path, monkeypatch, capsys):
     curr = json.dumps([{"id": i, "status": "active-long-status-value", "score": i}
                        for i in range(8)] + [{"id": 8, "status": "active-long-status-value",
                                               "score": 99}])
-    assert main(["capture", str(_write(tmp_path, "prev.json", prev)),
-                 "--tool", "demo", "--corpus", str(corpus)]) == 0
-    assert main(["capture", str(_write(tmp_path, "curr.json", curr)),
-                 "--tool", "demo", "--corpus", str(corpus)]) == 0
+    # Six tools, not one. `gen_questions` yields a FIXED 4 questions per captured payload
+    # regardless of how many records it holds, so a single-tool corpus produces 4 paired
+    # questions — under #334's `_MIN_PAIRED_QUESTIONS`, which withholds the model and
+    # renders no forest plot at all. Six tools is 24 questions: a corpus the size a real
+    # run needs, which is the thing this end-to-end test should be exercising anyway.
+    for tool in ("demo", "demo2", "demo3", "demo4", "demo5", "demo6"):
+        assert main(["capture", str(_write(tmp_path, f"prev-{tool}.json", prev)),
+                     "--tool", tool, "--corpus", str(corpus)]) == 0
+        assert main(["capture", str(_write(tmp_path, f"curr-{tool}.json", curr)),
+                     "--tool", tool, "--corpus", str(corpus)]) == 0
     capsys.readouterr()
 
     out_md = tmp_path / "rep" / "diff.md"
