@@ -16,7 +16,11 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
-_GAP_TOLERANCE = 0.05  # shared pass/fail tolerance for both worst-case verdict gates below
+# Shared pass/fail tolerance for both worst-case verdict gates below — the number behind
+# "safe to enable `proxy --diff`". Pinned to its VALUE, in both directions, by
+# `tests/test_ship_policy_constants.py`: every other test reads it out of the source and
+# asserts a relative inequality, so raising it to 0.06 left all 1706 green (#337).
+_GAP_TOLERANCE = 0.05
 
 
 def _form_stats(rows: list[dict[str, Any]], form: str) -> tuple[float, float]:
@@ -143,6 +147,11 @@ def paired_rows(rows: list[dict[str, Any]], *forms: str) -> list[dict[str, Any]]
 # otherwise-complete multi-hour run, which is its own kind of wrong answer. What a
 # threshold still has to catch is the backend that was substantially down, where the
 # surviving sample is small and self-selected rather than merely smaller.
+#
+# Value and the strictness of `_unmeasured`'s comparison are both pinned by
+# `test_a_model_exactly_at_the_loss_share_is_still_measured` (#337) — `>` -> `>=`
+# used to survive a full-suite mutation, and `paired_rows`' docstring reasons from
+# the boundary landing where it does.
 UNMEASURED_FAIL_SHARE = 0.20
 
 # WHY THE PAIRING-LOSS GATE IS `not pr` AND NOT A SHARE (#332).
@@ -500,7 +509,9 @@ def _not_measured_lines(withheld: dict[str, tuple[str | None, int, int, int]]) -
 # `1 - 0.05 ** (1/n)` at 95% confidence. At n=20 that is ~14pp — loose, but this is the
 # single most contestable number in this module; it wants explicit sign-off before it is
 # trusted at scale, not a mechanical tuning pass. Raise it once real panels show it holding
-# up, rather than lowering the bar to make an early run print SAFE.
+# up, rather than lowering the bar to make an early run print SAFE. That sign-off is
+# `test_the_codec_trial_floor_is_twenty` (#337), which pins the value, the
+# Clopper-Pearson bound quoted above, and — with its 19/20 pair — the inclusive `>=`.
 _CODEC_MIN_TRIALS = 20
 
 _VERDICT_RANK = {"SAFE": 0, "UNRESOLVED": 1, "UNSAFE": 2}  # worst wins when grouping models
