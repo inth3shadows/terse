@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.28.6] - 2026-08-25
+
 ### Fixed
 
 - **A PASS now requires at least 20 paired questions; a FAIL still publishes at any
@@ -70,7 +74,6 @@ fails that pull request until the section has moved.
   run that lost no calls at all. `_not_measured_lines` now groups by reason and reports
   paired-question counts for the new one instead of a "calls lost" figure that would read
   `0/N`.
-
 
 ## [0.28.5] - 2026-08-25
 
