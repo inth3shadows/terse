@@ -23,10 +23,14 @@ fails that pull request until the section has moved.
   disclosed the other nine. The `±0` is not a rounding artifact — at n=1 the SE is exactly
   zero whenever the single question is all-right or all-wrong, which is the normal case at
   temperature 0.
-  The floor is **asymmetric**, and that is what makes it safe: it can only withhold a form
-  arm that is *not* behind its control, so what it removes from the worst-case gap is
-  always non-negative and can never be the worst case. An exclusion therefore cannot
-  improve a run's verdict — the defect that sank a symmetric survival floor in `#332`.
+  The floor is **asymmetric**, and that is what makes it safe: it withholds only a gap that
+  would have PASSED (`best >= control - tolerance`), so what it removes from the worst case
+  is never the failing model. An exclusion therefore cannot improve a run's verdict — the
+  defect that sank a symmetric survival floor in `#332`. The cut is the tolerance line and
+  not exact equality: drawn at equality, the whole `[-5%, 0)` band escaped both gates at
+  once — behind its control so the floor let it through, inside tolerance so the verdict
+  passed it — and one paired question at 19/20 vs 20/20 still printed
+  `gap -5% ±10 pts **PASS** … safe to enable proxy --diff`.
   20 comes from `_CODEC_MIN_TRIALS`'s existing Clopper-Pearson framing rather than a new
   judgment call: n zero-regression questions bound the true rate below `1 - 0.05 ** (1/n)`,
   which is ~14pp at 20 and ~63pp at 3. Counted in QUESTIONS, not trials, because `#297`
@@ -36,6 +40,18 @@ fails that pull request until the section has moved.
   produces 4 paired questions and will now report `Not concluded` rather than a verdict.
   `codec_verdict` opts out — it gates its own sample size in trials, the unit its verdict
   actually counts in, and layering a second floor would silently re-calibrate that tier.
+  That opt-out is an AST-pinned allowlist, so a future gap site cannot quietly disable the
+  floor in one keyword argument.
+- **The soak's deepest-depth verdict no longer depends on the pooled one.** It was nested
+  inside the pooled `if worst:`, so a withheld pooled gap skipped the depth analysis
+  entirely — and `#334` made that reachable for a run that lost zero calls. Measured: a
+  fully-paired −100% collapse at the deepest depth disappeared from the verdict, under a
+  line promising "depth slices that pair cleanly are still scored below". An exclusion must
+  never remove a demonstrated regression from a verdict.
+- **An underpowered model's rows still pool into the per-transform table.** Dropping them
+  moved that table's `table` row from 72% to 90% — an exclusion improving the figure the
+  verdict tells the reader to use when restricting policy by transform. Only the per-model
+  conclusion is unsupported; the rows themselves are fully paired.
 - **Withheld models are no longer all described as transport failures.** `"underpowered"`
   is a distinct exclusion reason with its own label and heading, because nothing failed in
   that case — reusing `"unmeasured"` would have printed "too few calls to compare" about a
@@ -43,7 +59,6 @@ fails that pull request until the section has moved.
   paired-question counts for the new one instead of a "calls lost" figure that would read
   `0/N`.
 
-_Nothing yet._
 
 ## [0.28.5] - 2026-08-25
 

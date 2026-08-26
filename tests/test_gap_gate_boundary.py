@@ -216,3 +216,41 @@ def test_the_detector_is_blind_to_indirection():
     # under its own name, which is how all seven real sites were written.
     plain = "def build_new_report(rows):\n    return _form_stats(rows, 'diff_ok')\n"
     assert _calls_by_enclosing_function(plain) == [("build_new_report", GATED)]
+
+
+def test_min_paired_is_bypassed_only_by_codec_verdict():
+    """`min_paired=0` disables #334's question floor in one keyword token.
+
+    Same hazard this file already guards for `_form_stats`: a future gap site can opt out
+    of a gate in a single argument that no test notices. `codec_verdict` is the one
+    legitimate caller — its groups are characteristically one question at many trials, and
+    it gates its own sample size in trials via `_CODEC_MIN_TRIALS`. Anything else passing
+    this argument is re-opening the hole #334 closed, and has to edit this list to do it.
+    """
+    import ast
+    import pathlib
+
+    allowed = {"codec_verdict"}
+    src = pathlib.Path("src/terse/report.py").read_text()
+    tree = ast.parse(src)
+
+    enclosing: dict[int, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            for child in ast.walk(node):
+                enclosing.setdefault(id(child), node.name)
+
+    offenders = []
+    for node in ast.walk(tree):
+        # A LITERAL value is a bypass; forwarding the parameter (`min_paired=min_paired`,
+        # how `arm_gap` plumbs it through to `_gap`) is not — that call site still obeys
+        # whatever its own caller asked for.
+        if isinstance(node, ast.Call) and any(
+                kw.arg == "min_paired" and isinstance(kw.value, ast.Constant)
+                for kw in node.keywords):
+            fn = enclosing.get(id(node), "<module>")
+            if fn not in allowed:
+                offenders.append(f"{fn} (line {node.lineno})")
+    assert not offenders, (
+        f"min_paired passed outside the allowlist {sorted(allowed)}: {offenders}. "
+        f"Bypassing the question floor is a deliberate act; add the caller here and say why.")

@@ -35,8 +35,10 @@ import pytest
 
 from terse.html_report import build_html_diff_report
 from terse.report import (
+    _GAP_TOLERANCE,
     _MIN_PAIRED_QUESTIONS,
     UNMEASURED_FAIL_SHARE,
+    _form_stats,
     _unmeasured,
     arm_gap,
     build_diff_report,
@@ -706,3 +708,151 @@ def test_the_fluency_verdict_does_not_assert_a_dead_backend():
     assert "Excluded (calls went unanswered" not in md, (
         f"the fluency verdict asserts an unreachable backend for a model whose backend "
         f"answered {1 - lost:.1%} of its calls")
+
+
+# --------------------------------------------------------------------------------------
+# Site 7 — `"underpowered"` through every consumer (#334).
+#
+# The first version of this reason was exercised end to end through `build_diff_report`
+# ALONE, and four separate defects lived in the renderers it did not reach: the soak
+# relabelled it as a pairing failure, the fluency verdict never named the model at all and
+# then blamed the corpus, and the fluency paragraph printed a dead-constant "0 paired
+# question(s)". One renderer's worth of coverage is what let a shared reason drift again.
+# --------------------------------------------------------------------------------------
+
+def _underpowered_rows(n: int = 10) -> list[dict]:
+    """Fully paired, nothing lost, both arms perfect — just too few questions."""
+    return [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS, "diff_ok": TRIALS, "diff_trials": TRIALS,
+        "attempts": TRIALS * 2, "fails": 0,
+    } for i in range(n)]
+
+
+def test_an_underpowered_model_is_named_in_every_renderer():
+    rows = _underpowered_rows()
+    assert len(paired_rows(rows, "diff_ok", "terse_ok")) == 10 < _MIN_PAIRED_QUESTIONS
+    rendered = {
+        "markdown": build_diff_report({"m": rows}),
+        "html": build_html_diff_report({"m": rows}, "diff-form", "full-terse"),
+        "terminal": build_terminal_diff_report({"m": rows}, color=False),
+    }
+    for name, text in rendered.items():
+        assert "m" in text, name
+        assert "✓ PASS" not in text and "**PASS**" not in text, name
+        # Nothing was lost. No renderer may say otherwise.
+        assert "too few calls to compare" not in text, name
+        assert "went unanswered" not in text, name
+
+
+def test_the_fluency_verdict_names_an_underpowered_model_and_counts_its_questions():
+    """Findings 3 and 4 of #334's review, in one fixture: the count was a dead constant 0
+    (read from `g.rows`, which `_gap` empties on every exclusion), and the model appeared
+    in no exclusion line — so a run of fully-answered, fully-paired questions reported
+    "did the corpus generate questions?" about a corpus that generated fifteen."""
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
+        "raw_ok": TRIALS, "raw_trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS,
+        "primer_ok": TRIALS, "primer_trials": TRIALS,
+        "attempts": TRIALS * 3, "fails": 0,
+    } for i in range(15)]
+    md = build_fluency_report({"m": rows}, [])
+    assert "15 paired question(s)" in md, (
+        "the paragraph's only actionable content is how many questions are short")
+    assert "0 paired question(s)" not in md
+    assert "did the corpus generate questions?" not in md, (
+        "the corpus generated 15 questions and every one of them was answered")
+    assert "not concluded" in md.lower()
+
+
+def test_the_soak_reports_a_deepest_depth_FAIL_even_when_the_pooled_gap_is_withheld():
+    """The severest finding of #334's review, and the one the asymmetry proof missed.
+
+    The proof covers `_worst_case_gap`. The deepest-depth analysis is a SECOND verdict, and
+    it was nested inside `if worst:` — the pooled result — so withholding the pooled gap
+    silently skipped it. #334 made that state reachable for a model that lost zero calls.
+
+    Depth 1 runs +50 (chain ahead), depth 5 runs -100 (chain collapsed). Pooled they cancel
+    to exactly 0 over 15 paired questions, which is under the floor and not behind control,
+    so the pooled gap is withheld — and the -100% collapse at the depth a soak exists to
+    probe must still reach the reader."""
+    rows = ([{"qid": f"d1q{i}", "qtype": "lookup", "transform": "table", "depth": 1,
+              "trials": 1, "terse_ok": 1 if i < 4 else 0, "terse_trials": 1,
+              "diff_ok": 1 if i < 9 else 0, "diff_trials": 1,
+              "attempts": 2, "fails": 0} for i in range(10)]
+            + [{"qid": f"d5q{i}", "qtype": "lookup", "transform": "table", "depth": 5,
+                "trials": 1, "terse_ok": 1, "terse_trials": 1,
+                "diff_ok": 0, "diff_trials": 1,
+                "attempts": 2, "fails": 0} for i in range(5)])
+    assert arm_gap(rows, "diff_ok", "terse_ok").excluded == "underpowered", (
+        "fixture must exercise the withheld-pooled path, or this proves nothing")
+
+    md = build_diff_soak_report({"m": rows})
+    assert "deepest tested depth (5)" in md, f"the deepest-depth verdict vanished:\n{md}"
+    assert "-100%" in md
+    assert "**FAIL**" in md
+    assert "No depth-correlated comprehension drift" not in md
+
+
+def test_a_depth_slice_that_paired_cleanly_is_not_called_unpaired():
+    """The by-depth table substituted one of two hardcoded reasons for whatever `_gap`
+    decided, so `"underpowered"` rendered as "one arm did not complete enough of the same
+    questions" — about a slice where both arms completed every question."""
+    rows = [{"qid": f"d{d}q{i}", "qtype": "lookup", "transform": "table", "depth": d,
+             "trials": 1, "terse_ok": 1, "terse_trials": 1, "diff_ok": 1, "diff_trials": 1,
+             "attempts": 2, "fails": 0}
+            for d in (1, 2) for i in range(25 if d == 1 else 10)]
+    md = build_diff_soak_report({"m": rows})
+    assert "one arm did not complete enough of the same questions" not in md, (
+        "every arm completed every question at both depths")
+    assert "too many calls went unanswered" not in md
+
+
+def test_an_underpowered_models_rows_still_pool_into_the_per_transform_table():
+    """An exclusion moved a published number in the flattering direction: dropping the
+    underpowered model took its bad `table` rows out of the pooled average with it, and the
+    verdict tells the reader to use that table to 'restrict the policy to the transforms
+    that held'. The per-model CONCLUSION is unsupported; the rows are fully paired."""
+    big = [{"qid": f"a{i}", "qtype": "lookup", "transform": "table", "trials": 1,
+            "raw_ok": 1, "raw_trials": 1, "terse_ok": 1, "terse_trials": 1,
+            "primer_ok": 1, "primer_trials": 1, "attempts": 3, "fails": 0}
+           for i in range(30)]
+    small = [{"qid": f"b{i}", "qtype": "lookup", "transform": "table", "trials": 1,
+              "raw_ok": 1, "raw_trials": 1, "terse_ok": 0, "terse_trials": 1,
+              "primer_ok": 1, "primer_trials": 1, "attempts": 3, "fails": 0}
+             for i in range(10)]
+    md = build_fluency_report({"A": big, "B": small}, [])
+    section = md.split("by stressed transform")[1].split("## Verdict")[0]
+    assert "| table | 40 |" in section, (
+        f"B's 10 paired rows must still pool; excluding them flatters the figure:\n{section}")
+
+
+def test_a_gap_inside_tolerance_is_withheld_not_published_as_a_PASS():
+    """The band between "behind its control" and "failing" — where #334's first cut leaked.
+
+    The floor withheld only `best >= cacc`, but the verdict PASSES at
+    `gap >= -_GAP_TOLERANCE`. A gap of -3% is therefore behind its control (so the floor
+    let it through) AND inside tolerance (so the verdict passed it) — a green PASS off one
+    paired question, which is the exact symptom #334 was filed about. Reverting the cut to
+    exact equality must redden this test; it is the only thing pinning that boundary.
+
+    One question, 100 trials, 97/100 against 100/100. `_form_stats` clusters on the
+    QUESTION, so a hundred trials of one question is still n=1 evidence."""
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 100,
+        "terse_ok": 100, "terse_trials": 100,
+        "diff_ok": 97 if i == 9 else 0, "diff_trials": 100 if i == 9 else 99,
+        "attempts": 200, "fails": 0 if i == 9 else 1,
+    } for i in range(10)]
+    pr = paired_rows(rows, "diff_ok", "terse_ok")
+    assert len(pr) == 1
+    assert _form_stats(pr, "diff_ok")[0] == pytest.approx(0.97)
+    assert _form_stats(pr, "terse_ok")[0] == pytest.approx(1.0)
+    # Behind its control, but by less than tolerance — so nothing else would withhold it.
+    assert -_GAP_TOLERANCE < 0.97 - 1.0 < 0
+
+    assert arm_gap(rows, "diff_ok", "terse_ok").excluded == "underpowered"
+    md = build_diff_report({"m": rows})
+    assert "**PASS**" not in md, f"a -3% gap off ONE question published as a PASS:\n{md}"
+    assert "safe to enable" not in md
