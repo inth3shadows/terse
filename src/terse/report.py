@@ -430,7 +430,7 @@ REASON_HEADING = {
 }
 
 
-def exclusion_note(reasons: dict[str, str | None]) -> str:
+def exclusion_note(reasons: Mapping[str, str | None]) -> str:
     """`(excluded — <why>: a, b; <why>: c)`, grouped by reason. "" when nothing was cut.
 
     One line, because its consumers are a terminal plot footer and an HTML paragraph that
@@ -526,6 +526,27 @@ def _not_measured_lines(withheld: dict[str, tuple[str | None, int, int, int]]) -
 # argument for it cannot drift apart. (The inclusive `>=` was already pinned, by
 # `tests/test_codec_verdict.py`; #337 added the VALUE, which nothing held.)
 _CODEC_MIN_TRIALS = 20
+
+# Below this many questions, a fixed-ideal metric prints INSUFFICIENT instead of PASS
+# (#335). A DISCLOSURE THRESHOLD, NOT A STATISTICAL FLOOR — deliberately, and the
+# distinction is the whole design:
+#
+# `_MIN_PAIRED_QUESTIONS` and `_CODEC_MIN_TRIALS` are Clopper-Pearson numbers; each says
+# what a zero-failure run bounds the true failure rate to. This one cannot be, because
+# there is nothing to calibrate against. Measured 2026-08-26 on a live 1,524-payload
+# capture corpus across 39 tools: **zero** payloads had a drop rule selected, so
+# `gen_drop_questions` produced zero recall questions and this metric has never run on
+# real data. Deriving a bound from a distribution that does not exist would be a
+# fabricated justification, which is worse than an admitted convention (#337's lesson).
+#
+# So this does not WITHHOLD. The measured percentage and its question count are both
+# published; what a thin sample cannot buy is the word PASS. A FAIL always publishes at
+# any n — the asymmetry `_MIN_PAIRED_QUESTIONS`' comment argues for at length, because an
+# exclusion must never be able to improve a verdict.
+#
+# Calibrate this into a real floor once a live policy actually configures a drop rule
+# (#271, #273) and the metric produces its first real question count.
+_FIXED_IDEAL_MIN_QUESTIONS = 5
 
 _VERDICT_RANK = {"SAFE": 0, "UNRESOLVED": 1, "UNSAFE": 2}  # worst wins when grouping models
 
@@ -699,10 +720,30 @@ def _worst_case_gap(
     return GapVerdict(model, gap, facc, cacc, gap_ci, passed)
 
 
-def _format_worst_case_line(verdict: GapVerdict, tol: float, form_label: str, control_label: str) -> str:
+def _format_worst_case_line(verdict: GapVerdict, tol: float, form_label: str,
+                            control_label: str, n: int | None = None) -> str:
+    """The shared worst-case verdict line. `n` discloses the question count behind it.
+
+    Passed only by the fixed-ideal metrics (#335), which have no other evidence gate. When
+    it is supplied and thin, a PASS becomes INSUFFICIENT: the number and its sample size
+    are still published, but a green badge is not. A FAIL is never downgraded — an
+    exclusion that could improve a verdict is the #332 defect.
+
+    `n` counts ROWS, which is what this report's own "questions" column prints two tables
+    up. That is a deliberate consistency choice, not a claim they are distinct questions:
+    a caller may hand several rows carrying one `qid`, and then `n` overstates the
+    diversity behind the number. It is also why `_FIXED_IDEAL_MIN_QUESTIONS` is a
+    disclosure convention rather than a statistical bound.
+    """
+    badge = "PASS" if verdict.passed else "FAIL"
+    tail = ""
+    if n is not None:
+        tail = f", n={n} question{'' if n == 1 else 's'}"
+        if verdict.passed and n < _FIXED_IDEAL_MIN_QUESTIONS:
+            badge = "INSUFFICIENT"
     return (f"- Worst-case model `{verdict.model}`: {form_label} {verdict.form_acc:.0%} vs "
             f"{control_label} {verdict.control_acc:.0%} (gap {verdict.gap:+.0%} "
-            f"±{verdict.gap_ci * 100:.0f} pts). **{'PASS' if verdict.passed else 'FAIL'}** "
+            f"±{verdict.gap_ci * 100:.0f} pts{tail}). **{badge}** "
             f"at {tol:.0%} tolerance.")
 
 
@@ -779,6 +820,32 @@ def inconclusive_models(results: dict) -> dict[str, tuple[int, int]]:
     return out
 
 
+def _fixed_ideal_gate(rows: list[dict[str, Any]], key: str) -> ArmGap:
+    """A metric gated against a FIXED 100% ideal — recall and no-overfetch (#335).
+
+    These two have no second arm and correctly should not get one: a tool call either
+    happened or it did not, so 100% IS the target and there is nothing to pair against.
+    That is why they never went through `_gap`. The cost was that `_gap` is also where
+    every evidence gate lives, so they inherited none, and a single question at 100%
+    published `+0% ±0 pts` **PASS** at 5% tolerance. Reproduced end to end before this fix.
+
+    The fix is disclosure at the render site, not exclusion here — see
+    `_FIXED_IDEAL_MIN_QUESTIONS`. This function exists to make the 4-tuple in ONE place:
+    it was built inline at two sites whose own docstring promises the markdown verdict and
+    the terminal chart "can never disagree", which is the promise a second copy breaks.
+
+    Deliberately NOT gating on `_unmeasured`. dropeval has its own transport gate,
+    `inconclusive_models`, at `errs * 2 >= attempts`, with a documented reason (a failed
+    call scores identically to a model that declined to retrieve). Layering
+    `UNMEASURED_FAIL_SHARE` on top would silently re-calibrate a tier that already decided
+    this question, in a second unit — the move `_CODEC_MIN_TRIALS`' comment argues against.
+    """
+    if not rows:
+        return ArmGap(0.0, 0.0, 0.0, 0.0, [], "empty")
+    acc, se = _form_stats(rows, key)
+    return ArmGap(acc, se, 1.0, 0.0, rows, None)
+
+
 def _accuracy_gate(rows: list[dict[str, Any]]) -> ArmGap:
     """final-accuracy as a gap against the MEASURED no-drop control arm (#269).
 
@@ -820,7 +887,7 @@ def _accuracy_gate(rows: list[dict[str, Any]]) -> ArmGap:
 
 
 def dropeval_gap_rows(results: dict) -> tuple[dict[str, dict[str, tuple[float, float, float, float]]],
-                                              dict[str, str | None]]:
+                                              dict[str, dict[str, str]]]:
     """Per-model (recall, precision, accuracy) gap-row tuples for build_dropeval_report
     and its terminal-bar companion. Recall and precision keep a fixed 100% ideal (se=0),
     which is correct for them — a tool call either happens or it doesn't, so neither is
@@ -837,25 +904,29 @@ def dropeval_gap_rows(results: dict) -> tuple[dict[str, dict[str, tuple[float, f
     no note, while the verdict text still said "the worst model" as if every model had
     been considered for every metric (review finding 5 on #300)."""
     out: dict[str, dict[str, tuple[float, float, float, float]]] = {}
-    excluded: dict[str, str | None] = {}
+    # PER-METRIC since #335. A flat {model: reason} could only ever describe one of the
+    # three, and it described accuracy — so an exclusion on either fixed-ideal metric had
+    # nowhere to go, and the chart would drop a bar with no note under it.
+    excluded: dict[str, dict[str, str]] = {}
     for model, rows in results.items():
         if not rows:
             continue
-        recall_rows = [r for r in rows if r["kind"] == "recall"]
-        precision_rows = [r for r in rows if r["kind"] == "precision"]
-        racc, rse = _form_stats(recall_rows, "retrieve_ok") if recall_rows else (0.0, 0.0)
-        pacc, pse = _form_stats(precision_rows, "retrieve_ok") if precision_rows else (0.0, 0.0)
-        out[model] = {
-            "recall": (racc, rse, 1.0, 0.0),
-            "precision": (pacc, pse, 1.0, 0.0),
+        by_metric = {
+            "recall": _fixed_ideal_gate(
+                [r for r in rows if r["kind"] == "recall"], "retrieve_ok"),
+            "precision": _fixed_ideal_gate(
+                [r for r in rows if r["kind"] == "precision"], "retrieve_ok"),
+            # "accuracy" is ABSENT rather than zeroed when no control ran — a renderer that
+            # iterates the metrics it finds then cannot draw a bar for a gap nobody
+            # measured. Every metric is absent-when-excluded now, for the same reason.
+            "accuracy": _accuracy_gate(rows),
         }
-        # "accuracy" is ABSENT rather than zeroed when no control ran — a renderer that
-        # iterates the metrics it finds then cannot draw a bar for a gap nobody measured.
-        g = _accuracy_gate(rows)
-        if not g.excluded:
-            out[model]["accuracy"] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
-        else:
-            excluded[model] = g.excluded
+        out[model] = {}
+        for metric, g in by_metric.items():
+            if g.excluded:
+                excluded.setdefault(metric, {})[model] = g.excluded
+            else:
+                out[model][metric] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
     return out, excluded
 
 
@@ -1858,20 +1929,35 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
     # `--accept-degraded`), which made the report assert a control was never run in the
     # same breath as reporting how many of its calls it lost (review finding 2 on #300).
     accuracy_excluded: dict[str, str | None] = {}
+    # {metric: {model: question count}} — the sample size behind each fixed-ideal verdict,
+    # disclosed in its line rather than used to withhold it (#335).
+    fixed_ideal_n: dict[str, dict[str, int]] = {"recall": {}, "precision": {}}
     for model, rows in results.items():
         if not rows:
             continue
         recall_rows = [r for r in rows if r["kind"] == "recall"]
         precision_rows = [r for r in rows if r["kind"] == "precision"]
-        racc, rse = _form_stats(recall_rows, "retrieve_ok") if recall_rows else (0.0, 0.0)
-        pacc, pse = _form_stats(precision_rows, "retrieve_ok") if precision_rows else (0.0, 0.0)
-        hacc, hse = _form_stats(recall_rows, "handle_ok") if recall_rows else (0.0, 0.0)
         # Recall/precision keep the fixed 100% ideal — for them it is the right control, a
         # tool call either happens or it doesn't. Accuracy pairs against the measured
         # control arm when one ran (#269); `_accuracy_gate` owns that choice so the table
         # and the verdict cannot disagree about which control they used.
-        recall_gate[model] = (racc, rse, 1.0, 0.0)
-        precision_gate[model] = (pacc, pse, 1.0, 0.0)
+        #
+        # ONE `_fixed_ideal_gate` call per metric feeds BOTH the table cell and the gate.
+        # They used to be separate `_form_stats` calls with the same arguments — harmless
+        # today, and precisely the shape (`one fact, computed at N sites`) that #280 and
+        # #332 were each filed about after one copy drifted.
+        r_g = _fixed_ideal_gate(recall_rows, "retrieve_ok")
+        p_g = _fixed_ideal_gate(precision_rows, "retrieve_ok")
+        racc, rse = r_g.form_acc, r_g.form_se
+        pacc, pse = p_g.form_acc, p_g.form_se
+        # Display-only, and the last direct `_form_stats` call in this function: the
+        # handle column is a single pooled arm against a fixed ideal that gates nothing.
+        hacc, hse = _form_stats(recall_rows, "handle_ok") if recall_rows else (0.0, 0.0)
+        for metric, gate, g_m, mrows in (("recall", recall_gate, r_g, recall_rows),
+                                         ("precision", precision_gate, p_g, precision_rows)):
+            if not g_m.excluded:
+                gate[model] = (g_m.form_acc, g_m.form_se, g_m.control_acc, g_m.control_se)
+                fixed_ideal_n[metric][model] = len(mrows)
         g = _accuracy_gate(rows)
         if not g.excluded:
             accuracy_gate[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
@@ -1971,76 +2057,96 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
     precision_worst = _worst_case_gap(precision_gate)
     accuracy_worst = _worst_case_gap(accuracy_gate)
     if recall_worst and precision_worst:
-        out.append(_format_worst_case_line(recall_worst, _GAP_TOLERANCE, "retrieve-recall",
-                                           "ideal (100%)"))
-        out.append(_format_worst_case_line(precision_worst, _GAP_TOLERANCE, "no-overfetch",
-                                           "ideal (100%)"))
+        out.append(_format_worst_case_line(
+            recall_worst, _GAP_TOLERANCE, "retrieve-recall", "ideal (100%)",
+            n=fixed_ideal_n["recall"].get(recall_worst.model)))
+        out.append(_format_worst_case_line(
+            precision_worst, _GAP_TOLERANCE, "no-overfetch", "ideal (100%)",
+            n=fixed_ideal_n["precision"].get(precision_worst.model)))
+    # NOT nested under the mechanism metrics. final-accuracy has its own gate and its own
+    # evidence, and it is the one that decides "safe to enable" — letting a missing recall
+    # arm silence it would publish a dropeval report whose headline verdict is simply
+    # absent, which reads as "nothing was wrong". The nesting was unreachable while both
+    # fixed-ideal gates were always populated; `"empty"` makes it reachable.
+    if accuracy_worst:
+        # The control label is not cosmetic: "vs ideal (100%)" and "vs no-drop control"
+        # are different claims, and #269 exists because a reader could not tell which
+        # one the verdict was making.
+        out.append(_format_worst_case_line(accuracy_worst, _GAP_TOLERANCE,
+                                           "final-accuracy", "no-drop control"))
+    elif accuracy_excluded and set(accuracy_excluded.values()) != {"no control arm"}:
+        # At least one model was excluded for a reason OTHER than "a control never
+        # ran" — e.g. "broken control", when `--accept-degraded` accepted a run whose
+        # control arm errored out entirely. The old fallback said "no no-drop control
+        # arm was run" unconditionally here, which is false in that case: the control
+        # DID run, and the "Where they failed" paragraph above already says how many
+        # of its calls it lost. Name the real reason instead of contradicting that
+        # paragraph two sentences later (review finding 2 on #300).
+        # The tail has to match the reason too, not just the opening. #300's finding 2
+        # stopped this branch claiming "no control was run" — and the sentence it kept
+        # still asserts an "unrun 100%", which is the same claim, and is false whenever
+        # the control ran and the exclusion was about sample size instead.
+        underpowered = set(accuracy_excluded.values()) == {"underpowered"}
+        out.append("- **final-accuracy: not gated** — " + exclusion_note(accuracy_excluded)
+                   + (". The control arm ran; there were simply too few paired "
+                      "questions for an absence of drop-caused loss to mean anything. "
+                      "Generate more questions and re-run — this is not evidence "
+                      "either way." if underpowered else
+                      ". It is scored by JSON value-equality against the full original "
+                      "value, and a model given the UN-dropped payload does not "
+                      "reproduce a long prose field verbatim either — gating that "
+                      "against an unrun 100% measures verbatim reproduction and bills "
+                      "it to the drop (#269)."))
+    else:
+        out.append("- **final-accuracy: not gated** — no no-drop control arm was run, "
+                   "so there is nothing to compare the drop against. It is scored by "
+                   "JSON value-equality against the full original value, and a model "
+                   "given the UN-dropped payload does not reproduce a long prose field "
+                   "verbatim either — gating that against an unrun 100% measures "
+                   "verbatim reproduction and bills it to the drop (#269). Re-run "
+                   "without `--no-control` to gate it.")
+    # `.passed` on each, guarded: a mechanism metric with no rows leaves its worst-case
+    # None, and "safe to enable" cannot be claimed from a metric that was never scored.
+    # Reading `.passed` off None was the crash this guard replaces.
+    mechanism_ok = (recall_worst is not None and recall_worst.passed
+                    and precision_worst is not None and precision_worst.passed)
+    if mechanism_ok and (accuracy_worst is None or accuracy_worst.passed):
         if accuracy_worst:
-            # The control label is not cosmetic: "vs ideal (100%)" and "vs no-drop control"
-            # are different claims, and #269 exists because a reader could not tell which
-            # one the verdict was making.
-            out.append(_format_worst_case_line(accuracy_worst, _GAP_TOLERANCE,
-                                               "final-accuracy", "no-drop control"))
-        elif accuracy_excluded and set(accuracy_excluded.values()) != {"no control arm"}:
-            # At least one model was excluded for a reason OTHER than "a control never
-            # ran" — e.g. "broken control", when `--accept-degraded` accepted a run whose
-            # control arm errored out entirely. The old fallback said "no no-drop control
-            # arm was run" unconditionally here, which is false in that case: the control
-            # DID run, and the "Where they failed" paragraph above already says how many
-            # of its calls it lost. Name the real reason instead of contradicting that
-            # paragraph two sentences later (review finding 2 on #300).
-            # The tail has to match the reason too, not just the opening. #300's finding 2
-            # stopped this branch claiming "no control was run" — and the sentence it kept
-            # still asserts an "unrun 100%", which is the same claim, and is false whenever
-            # the control ran and the exclusion was about sample size instead.
-            underpowered = set(accuracy_excluded.values()) == {"underpowered"}
-            out.append("- **final-accuracy: not gated** — " + exclusion_note(accuracy_excluded)
-                       + (". The control arm ran; there were simply too few paired "
-                          "questions for an absence of drop-caused loss to mean anything. "
-                          "Generate more questions and re-run — this is not evidence "
-                          "either way." if underpowered else
-                          ". It is scored by JSON value-equality against the full original "
-                          "value, and a model given the UN-dropped payload does not "
-                          "reproduce a long prose field verbatim either — gating that "
-                          "against an unrun 100% measures verbatim reproduction and bills "
-                          "it to the drop (#269)."))
+            out.append("- Recall, precision, and final accuracy all clear tolerance for "
+                       "the worst model — safe to enable drop-to-retrieve.")
         else:
-            out.append("- **final-accuracy: not gated** — no no-drop control arm was run, "
-                       "so there is nothing to compare the drop against. It is scored by "
-                       "JSON value-equality against the full original value, and a model "
-                       "given the UN-dropped payload does not reproduce a long prose field "
-                       "verbatim either — gating that against an unrun 100% measures "
-                       "verbatim reproduction and bills it to the drop (#269). Re-run "
-                       "without `--no-control` to gate it.")
-        if recall_worst.passed and precision_worst.passed and (
-                accuracy_worst is None or accuracy_worst.passed):
-            if accuracy_worst:
-                out.append("- Recall, precision, and final accuracy all clear tolerance for "
-                           "the worst model — safe to enable drop-to-retrieve.")
-            else:
-                # "safe to enable" is not supported by mechanism metrics alone. Recall and
-                # no-overfetch say the model OPERATES the protocol correctly; they say
-                # nothing about whether the answer it ends up with is right. Calling that
-                # "safe" is the same over-claim in the opposite direction to the one #269
-                # opened for.
-                # Reason-aware for the same reason the line above it is: telling an
-                # operator to add a control arm that is already running is #300's finding
-                # 2, one paragraph further down. Membership, not set-equality: a MIXED
-                # exclusion set still contains an underpowered model whose control ran,
-                # so the blanket "re-run with a control" is false for that half.
-                has_underpowered = "underpowered" in set(accuracy_excluded.values())
-                out.append(
-                    "- **INCONCLUSIVE for enabling** — recall and no-overfetch clear "
-                    "tolerance for the worst model, so the mechanism works, but final "
-                    "accuracy was not gated: the OUTCOME impact of dropping is "
-                    "unmeasured. "
-                    + ("Generate more questions and re-run — the control arm is "
-                       "already on." if has_underpowered else
-                       "Re-run with the no-drop control arm before enabling "
-                       "drop-to-retrieve on this evidence."))
-        else:
-            out.append("- At least one metric misses tolerance for its worst model — keep "
-                       "drop-to-retrieve off until this improves.")
+            # "safe to enable" is not supported by mechanism metrics alone. Recall and
+            # no-overfetch say the model OPERATES the protocol correctly; they say
+            # nothing about whether the answer it ends up with is right. Calling that
+            # "safe" is the same over-claim in the opposite direction to the one #269
+            # opened for.
+            # Reason-aware for the same reason the line above it is: telling an
+            # operator to add a control arm that is already running is #300's finding
+            # 2, one paragraph further down. Membership, not set-equality: a MIXED
+            # exclusion set still contains an underpowered model whose control ran,
+            # so the blanket "re-run with a control" is false for that half.
+            has_underpowered = "underpowered" in set(accuracy_excluded.values())
+            out.append(
+                "- **INCONCLUSIVE for enabling** — recall and no-overfetch clear "
+                "tolerance for the worst model, so the mechanism works, but final "
+                "accuracy was not gated: the OUTCOME impact of dropping is "
+                "unmeasured. "
+                + ("Generate more questions and re-run — the control arm is "
+                   "already on." if has_underpowered else
+                   "Re-run with the no-drop control arm before enabling "
+                   "drop-to-retrieve on this evidence."))
+    elif recall_worst is None or precision_worst is None:
+        # Neither "safe" nor "a metric missed tolerance": a metric that produced no rows
+        # was not measured, and saying it failed would be the same false-cause defect
+        # #332 removed from the fluency reports' exclusion prose.
+        missing = [label for label, w in (("retrieve-recall", recall_worst),
+                                          ("no-overfetch", precision_worst)) if w is None]
+        out.append(f"- **Not concluded** — no questions carried "
+                   f"{' or '.join(f'`{m}`' for m in missing)}, so the mechanism was not "
+                   f"measured and enabling drop-to-retrieve is not supported either way.")
+    else:
+        out.append("- At least one metric misses tolerance for its worst model — keep "
+                   "drop-to-retrieve off until this improves.")
     out.append("")
     return "\n".join(out)
 

@@ -298,7 +298,9 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None,
         # are gated against a fixed ideal, so they must not share a label.
         control_label = "no-drop control" if key == "accuracy" else "ideal (100%)"
         section = f"{label}:\n" + forest_bar_lines(plot_rows, label, control_label, color=color)
-        if key == "accuracy" and excluded:
-            section += f"\n  ({exclusion_note(excluded)})"
+        # Per-metric since #335: `excluded` used to be a flat {model: reason} that only
+        # ever described accuracy, so a withheld recall bar would vanish with no note.
+        if excluded.get(key):
+            section += f"\n  ({exclusion_note(excluded[key])})"
         sections.append(section)
     return "\n\n".join(sections)

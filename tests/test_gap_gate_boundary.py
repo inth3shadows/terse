@@ -55,7 +55,20 @@ ALLOWED = {
     # make are the retrieve-recall / no-overfetch / handle-accuracy columns, which really
     # are single pooled arms against a fixed ideal: a tool call either happened or it did
     # not, so 100% IS the target and there is no second arm by construction.
-    "dropeval_gap_rows",
+    # The two fixed-ideal metrics' single construction site (#335). Allowed under the
+    # same rule as `_gap`: it IS the gate for those metrics. It computes no form-vs-control
+    # gap in the sense this file polices — recall and no-overfetch have no second arm and
+    # correctly should not get one, so there is nothing to pair. What it does own is the
+    # evidence disclosure (`n=`, and `_FIXED_IDEAL_MIN_QUESTIONS`) they had none of.
+    "_fixed_ideal_gate",
+    # `dropeval_gap_rows` came OFF this list in #335: every `_form_stats` call it made
+    # moved into `_fixed_ideal_gate` / `_accuracy_gate`, so it no longer touches it at all.
+    # That is the direction this allowlist is meant to push, and the list shrinking is the
+    # evidence it worked.
+    #
+    # `build_dropeval_report` stays, for ONE remaining call: the handle-accuracy display
+    # column. Its recall/no-overfetch columns now read `_fixed_ideal_gate`'s result rather
+    # than recomputing it, so the table and the verdict cannot disagree.
     "build_dropeval_report",
 }
 

@@ -211,12 +211,26 @@ def test_mechanism_metrics_alone_do_not_license_enabling_the_drop():
 
 
 def test_gap_rows_omit_accuracy_entirely_without_a_control():
+    """`excluded` is keyed BY METRIC since #335.
+
+    It used to be a flat `{model: reason}`, which could only ever describe one of the
+    three metrics this function returns — and it described accuracy, because accuracy was
+    the only one that could be excluded. `_fixed_ideal_gate` gave recall and no-overfetch
+    an `"empty"` exclusion of their own, and under the old shape those reasons had nowhere
+    to go: the terminal chart drops a bar for any metric missing from `gaps` and printed
+    its note only for accuracy, so a withheld recall bar would have vanished silently.
+    """
     gaps, excluded = dropeval_gap_rows({"m": _rows(answer=1)})
     assert "accuracy" not in gaps["m"]
-    assert excluded == {"m": "no control arm"}
+    assert excluded["accuracy"] == {"m": "no control arm"}
+    # `_rows` builds recall rows only, so no-overfetch really has nothing to report and
+    # says so by name rather than publishing a 0% bar for a metric that never ran.
+    assert excluded["precision"] == {"m": "empty"}
+    assert "recall" not in excluded
+
     gaps2, excluded2 = dropeval_gap_rows({"m": _rows(answer=1, control=1)})
     assert "accuracy" in gaps2["m"]
-    assert excluded2 == {}
+    assert "accuracy" not in excluded2
 
 
 # --------------------------------------------------------------------------- #
