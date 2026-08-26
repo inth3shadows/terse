@@ -40,8 +40,20 @@ fails that pull request until the section has moved.
   produces 4 paired questions and will now report `Not concluded` rather than a verdict.
   `codec_verdict` opts out — it gates its own sample size in trials, the unit its verdict
   actually counts in, and layering a second floor would silently re-calibrate that tier.
-  That opt-out is an AST-pinned allowlist, so a future gap site cannot quietly disable the
-  floor in one keyword argument.
+  That opt-out is keyword-only and AST-pinned to a one-name allowlist.
+  **The soak's per-depth slices inherit this floor**, and `--soak-windows` (default 6) caps
+  a slice at roughly 24 questions, so a deepest depth with few available windows will report
+  `NO VERDICT at the deepest tested depth` rather than a passing one. Raise `--soak-windows`
+  to restore it. A depth slice that shows real drift still publishes at any question count.
+- **`passes_tolerance` is now the single definition of "within tolerance".** The floor and
+  the verdicts each spelled the comparison out, as `facc >= cacc - tol` and
+  `gap >= -tol - 1e-9`, and binary float makes those disagree on 122 exact-boundary
+  accuracy pairs — `0.40 - 0.05` is `0.35000000000000003`. Those pairs landed in neither
+  set: not withheld (the floor read the arm as behind its control) and not failed (the
+  verdict read the gap as inside tolerance). Measured on `35% vs 40%` over 10 paired
+  questions — a green "safe to enable `proxy --diff`" with `±0 pts`, the exact symptom
+  `#334` was filed on, surviving inside its own fix. Five sites across the three renderers
+  now share one function.
 - **The soak's deepest-depth verdict no longer depends on the pooled one.** It was nested
   inside the pooled `if worst:`, so a withheld pooled gap skipped the depth analysis
   entirely — and `#334` made that reachable for a run that lost zero calls. Measured: a

@@ -395,7 +395,10 @@ def test_the_soak_report_cannot_pass_off_a_dead_backend():
     text = build_diff_soak_report({"gemini-dead": rows})
     verdict = text.split("## Verdict")[1]
     assert "PASS" not in verdict, "a dead backend must never pass the soak gate"
-    assert "NO VERDICT — nothing was scored" in verdict
+    # Scoped to the POOLED gap since #334: the deepest-depth block now runs even
+    # when the pooled gap is withheld, so claiming the whole run scored nothing
+    # would contradict a depth verdict printed below it.
+    assert "No pooled verdict" in verdict
     assert "| n/a | n/a | n/a |" in text
     assert "calls lost" in text
 

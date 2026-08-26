@@ -270,8 +270,23 @@ class ArmGap(NamedTuple):
 _MIN_PAIRED_QUESTIONS = 20
 
 
+def passes_tolerance(gap: float, tol: float = _GAP_TOLERANCE) -> bool:
+    """Is `gap` within `tol`? THE definition — every verdict and the #334 floor share it.
+
+    The epsilon is not decoration. `0.40 - 0.05` is `0.35000000000000003` in binary float,
+    so `facc >= cacc - tol` and `gap >= -tol` disagree on 122 distinct exact-boundary
+    accuracy pairs. #334's floor was written the first way and the verdicts the second,
+    which put those pairs in neither set: not withheld (the floor thought the arm was
+    behind), not failed (the verdict thought it was inside tolerance). Measured on
+    `35% vs 40%` over 10 paired questions — a green "safe to enable `proxy --diff`" with
+    `±0 pts`, the exact symptom #334 was filed on, surviving inside its own fix.
+
+    Callers must pass a GAP (form minus control), never compare accuracies directly."""
+    return gap >= -tol - 1e-9
+
+
 def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
-         display: tuple[str, ...] = (), min_paired: int | None = None) -> ArmGap:
+         display: tuple[str, ...] = (), *, min_paired: int | None = None) -> ArmGap:
     """Shared body of `arm_gap`/`best_arm_gap`. Gates, pairs, then computes every arm.
 
     Order matters: `_unmeasured` first (the backend was down — nothing here is measurable),
@@ -321,17 +336,19 @@ def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
     # passed it. Measured: one paired question at 19/20 vs 20/20 published
     # `gap -5% ±10 pts  **PASS** ... safe to enable proxy --diff` at 90% pairing loss.
     #
-    # Drawn here, the withheld set is exactly the gaps that would have PASSED, which is
+    # Drawn here, the withheld set is exactly the gaps that would have PASSED — literally
+    # so, via the shared `passes_tolerance`, because writing the comparison twice is what
+    # leaked a false green through the first version of this floor. That is what
     # what keeps the asymmetry argument in `_MIN_PAIRED_QUESTIONS` intact: removing a
     # would-be PASS from `_worst_case_gap` cannot turn a FAIL into a PASS, because the
     # failing model is still in the set. A form arm genuinely BEHIND its control by more
     # than tolerance publishes at any question count.
-    if len(pr) < floor and best[0] >= cacc - _GAP_TOLERANCE:
+    if len(pr) < floor and passes_tolerance(best[0] - cacc):
         return ArmGap(0.0, 0.0, 0.0, 0.0, [], "underpowered")
     return ArmGap(best[0], best[1], cacc, cse, pr, None, arms)
 
 
-def arm_gap(rows: list[dict[str, Any]], form: str, control: str,
+def arm_gap(rows: list[dict[str, Any]], form: str, control: str, *,
             min_paired: int | None = None) -> ArmGap:
     """`form` vs `control` over the rows BOTH arms completed, or an exclusion reason.
 
@@ -428,15 +445,24 @@ def _not_measured_lines(withheld: dict[str, tuple[str | None, int, int, int]]) -
     out: list[str] = []
     for why, models in sorted(by.items(), key=lambda kv: str(kv[0])):
         if why == "underpowered":
+            out.append("") if out else None
             out.append(
                 f"**{REASON_HEADING['underpowered']}** — "
-                + ", ".join(f"`{m}` ({paired} paired question(s))" for m, _, _, paired in models)
-                + f". These arms are not behind their control, but "
+                # Carries the call-loss count too when there is one. `unmeasured` is True
+                # for an underpowered model, and the "Partially degraded" paragraph is
+                # gated on `not unmeasured`, so without this a run that lost calls AND
+                # fell short of the floor disclosed its losses in no line of the report.
+                + ", ".join(
+                    f"`{m}` ({paired} paired question(s)"
+                    + (f", {f}/{a} calls lost)" if f else ")")
+                    for m, f, a, paired in models)
+                + f". These arms are not failing, but "
                   f"{_MIN_PAIRED_QUESTIONS} paired questions are needed before an ABSENCE "
                   "of regressions supports a PASS, and short of that the run is not "
-                  "evidence either way. Nothing failed here — generate more questions, or "
-                  "recover the questions pairing dropped by lowering `--trials`. A form arm "
-                  "that IS behind its control is published at any question count.")
+                  "evidence either way. Generate more questions, or — if the counts "
+                  "above show calls were lost — recover the ones pairing dropped by "
+                  "lowering `--trials`. A form arm that IS failing publishes at any "
+                  "question count.")
         else:
             # Opens with the shared `REASON_LABEL` rather than a hand-written phrase: this
             # paragraph was the one exclusion site that did not read from the shared
@@ -645,7 +671,7 @@ def _worst_case_gap(
     if worst is None:
         return None
     model, gap, facc, cacc, gap_ci = worst
-    passed = gap >= -tol - 1e-9
+    passed = passes_tolerance(gap, tol)
     return GapVerdict(model, gap, facc, cacc, gap_ci, passed)
 
 
@@ -1584,8 +1610,9 @@ def build_diff_soak_report(results: dict) -> str:
             tail = (". Those depths are excluded from the verdict below rather than "
                     "scored on a question set the two arms did not share (#280)."
                     if why in ("unpaired", "unmeasured") else
-                    ". Those depths paired cleanly; there were simply too few questions "
-                    "at that depth for an absence of drift to mean anything.")
+                    ". Too few questions survived pairing at that depth for an absence "
+                    "of drift to mean anything — check the `q` column against the "
+                    "generated count before assuming none were lost.")
             out += [lead + at + tail, ""]
 
     gap_rows: dict[str, tuple[float, float, float, float]] = {}
@@ -1618,10 +1645,13 @@ def build_diff_soak_report(results: dict) -> str:
         # The advice has to match the cause. "Fix the backend(s) and re-run" sends a reader
         # to re-run something that will fail identically when the backend answered fine and
         # the arms simply could not be paired.
-        out.append("- **NO VERDICT — nothing was scored.** Every model was withheld, so "
-                   "this run says nothing about diff-chain drift either way. The lines "
-                   "above name each model and say whether its calls failed or merely left "
-                   "no question the two arms both completed — the remedies differ.")
+        out.append("- **No pooled verdict** — every model's POOLED gap was withheld, so "
+                   "the pooled line says nothing about drift either way. Scoped to the "
+                   "pooled comparison on purpose: a depth slice can still be scored below, "
+                   "and since #334 often is, so claiming the run measured nothing would "
+                   "contradict a verdict printed two lines further down. The paragraphs "
+                   "above name each model and its reason — an unreachable backend, calls "
+                   "lost until nothing paired, or too few questions to conclude from.")
     if worst:
         out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "chain-form",
                                            "full-terse"))
@@ -1678,8 +1708,11 @@ def build_diff_soak_report(results: dict) -> str:
         elif deep_withheld:
             out.append(f"- **NO VERDICT at the deepest tested depth ({deep})** — every "
                        f"model's deepest slice was withheld, so the depth this soak exists "
-                       f"to probe was not scored. The overall line above is pooled across "
-                       f"shallower depths and says nothing about drift at {deep}.")
+                       f"to probe was not scored."
+                       + (f" The overall line above is pooled across shallower depths and "
+                          f"says nothing about drift at {deep}." if worst else
+                          " The pooled gap was withheld too, so this run has no verdict at "
+                          "any depth."))
         if worst and worst.passed and not deep_withheld and (
                 deepest is None or deepest.passed):
             out.append("- No depth-correlated comprehension drift within tolerance — "
@@ -1689,8 +1722,12 @@ def build_diff_soak_report(results: dict) -> str:
             # neither, NOTHING was scored, and "comprehension drifts beyond tolerance" is a
             # finding rather than the absence of one. The NO VERDICT line above already
             # said what happened; a conclusion here would contradict it.
+            passing = [d for d in depths if d != deep] if worst and worst.passed else []
             out.append("- Comprehension drifts beyond tolerance somewhere in the chain — "
-                       "keep the keyframe interval at or below the deepest PASSING depth.")
+                       + ("keep the keyframe interval at or below the deepest PASSING "
+                          "depth." if passing else
+                          "no tested depth published a passing gap, so this run does not "
+                          "identify a safe keyframe interval."))
     out.append("")
     return "\n".join(out)
 
@@ -1870,6 +1907,11 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
             g = _accuracy_gate(rows)
             if not g.excluded:
                 surviving.append(f"`{model}` {len(g.rows)}/{len(rows)}")
+            elif g.excluded == "underpowered":
+                # `g.rows` is empty for every exclusion, so recompute: this is the one
+                # reason whose entire remedy is a NUMBER, and the reader was given none.
+                pr = paired_rows(rows, "answer_ok", "control_ok")
+                surviving.append(f"`{model}` {len(pr)}/{len(rows)}")
         if surviving:
             out += ["> **Questions surviving the pairing**: " + ", ".join(surviving)
                     + ". The gap is computed over these only — read it as accuracy among "
@@ -1957,11 +1999,21 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
                 # nothing about whether the answer it ends up with is right. Calling that
                 # "safe" is the same over-claim in the opposite direction to the one #269
                 # opened for.
-                out.append("- **INCONCLUSIVE for enabling** — recall and no-overfetch clear "
-                           "tolerance for the worst model, so the mechanism works, but final "
-                           "accuracy was not gated: the OUTCOME impact of dropping is "
-                           "unmeasured. Re-run with the no-drop control arm before enabling "
-                           "drop-to-retrieve on this evidence.")
+                # Reason-aware for the same reason the line above it is: telling an
+                # operator to add a control arm that is already running is #300's finding
+                # 2, one paragraph further down. Membership, not set-equality: a MIXED
+                # exclusion set still contains an underpowered model whose control ran,
+                # so the blanket "re-run with a control" is false for that half.
+                has_underpowered = "underpowered" in set(accuracy_excluded.values())
+                out.append(
+                    "- **INCONCLUSIVE for enabling** — recall and no-overfetch clear "
+                    "tolerance for the worst model, so the mechanism works, but final "
+                    "accuracy was not gated: the OUTCOME impact of dropping is "
+                    "unmeasured. "
+                    + ("Generate more questions and re-run — the control arm is "
+                       "already on." if has_underpowered else
+                       "Re-run with the no-drop control arm before enabling "
+                       "drop-to-retrieve on this evidence."))
         else:
             out.append("- At least one metric misses tolerance for its worst model — keep "
                        "drop-to-retrieve off until this improves.")

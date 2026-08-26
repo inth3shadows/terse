@@ -17,7 +17,6 @@ from collections.abc import Sequence
 from typing import Any
 
 from .report import (
-    _GAP_TOLERANCE,
     _ci,
     _sum,
     diff_gap_rows,
@@ -25,6 +24,7 @@ from .report import (
     exclusion_note,
     fluency_gap_rows,
     inconclusive_models,
+    passes_tolerance,
 )
 
 _BAR_WIDTH = 24
@@ -218,7 +218,7 @@ def build_terminal_diff_report(results: dict, form_label: str = "diff-form",
     plot_rows = []
     for model, (facc, fse, cacc, cse) in gap_rows.items():
         gap = facc - cacc
-        passed = gap >= -_GAP_TOLERANCE - 1e-9
+        passed = passes_tolerance(gap)
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
                            "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
     text = forest_bar_lines(plot_rows, form_label, control_label, color=color)
@@ -238,7 +238,7 @@ def build_terminal_fluency_report(results: dict, color: bool | None = None) -> s
     plot_rows = []
     for model, (facc, fse, cacc, cse) in gap_rows.items():
         gap = facc - cacc
-        passed = gap >= -_GAP_TOLERANCE - 1e-9
+        passed = passes_tolerance(gap)
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
                            "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
     text = forest_bar_lines(plot_rows, "best terse-form", "raw", color=color)
@@ -289,7 +289,7 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None,
                 continue
             facc, fse, cacc, cse = metric
             gap = facc - cacc
-            passed = gap >= -_GAP_TOLERANCE - 1e-9
+            passed = passes_tolerance(gap)
             plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
                                "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
         if not plot_rows:

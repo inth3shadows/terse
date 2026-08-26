@@ -47,6 +47,7 @@ from terse.report import (
     diff_gap_rows,
     fluency_gap_rows,
     paired_rows,
+    passes_tolerance,
 )
 from terse.terminal_report import (
     build_terminal_diff_report,
@@ -737,9 +738,15 @@ def test_an_underpowered_model_is_named_in_every_renderer():
         "html": build_html_diff_report({"m": rows}, "diff-form", "full-terse"),
         "terminal": build_terminal_diff_report({"m": rows}, color=False),
     }
+    # Each renderer's OWN spelling of the name and of a pass. `"m" in text` matched the
+    # letter m in "model" and "comprehension", so it pinned nothing; `"**PASS**"` and
+    # `"✓ PASS"` are markdown and HTML tokens the terminal plot never emits, so its leg of
+    # this test could not fail either. Both were caught by review of this very file.
+    named = {"markdown": "`m`", "html": "<code>m</code>", "terminal": "excluded"}
+    passes = {"markdown": "**PASS**", "html": "✓ PASS", "terminal": "PASS"}
     for name, text in rendered.items():
-        assert "m" in text, name
-        assert "✓ PASS" not in text and "**PASS**" not in text, name
+        assert named[name] in text, f"{name} does not name the withheld model"
+        assert passes[name] not in text, f"{name} published a PASS off 10 questions"
         # Nothing was lost. No renderer may say otherwise.
         assert "too few calls to compare" not in text, name
         assert "went unanswered" not in text, name
@@ -807,6 +814,10 @@ def test_a_depth_slice_that_paired_cleanly_is_not_called_unpaired():
     assert "one arm did not complete enough of the same questions" not in md, (
         "every arm completed every question at both depths")
     assert "too many calls went unanswered" not in md
+    # ...and the RIGHT wording is present. Without this the block could be deleted whole
+    # and both assertions above would still hold — an absence-only test pins nothing.
+    assert "Not concluded" in md and "fewer than 20 paired questions" in md, (
+        f"the withheld depth must still be named, with its real reason:\n{md}")
 
 
 def test_an_underpowered_models_rows_still_pool_into_the_per_transform_table():
@@ -855,4 +866,38 @@ def test_a_gap_inside_tolerance_is_withheld_not_published_as_a_PASS():
     assert arm_gap(rows, "diff_ok", "terse_ok").excluded == "underpowered"
     md = build_diff_report({"m": rows})
     assert "**PASS**" not in md, f"a -3% gap off ONE question published as a PASS:\n{md}"
+    assert "safe to enable" not in md
+
+
+@pytest.mark.parametrize("form_ok,control_ok", [
+    # Exact-boundary pairs where `facc >= cacc - tol` and `gap >= -tol` disagree in binary
+    # float. `0.40 - 0.05` is `0.35000000000000003`, so the first form said "behind its
+    # control" (no withhold) while the second said "inside tolerance" (PASS) — the gap
+    # between two spellings of one predicate, and a green "safe to enable" fell through it.
+    (35, 40), (15, 20), (475, 525), (47, 52),
+])
+def test_the_floor_and_the_verdict_agree_on_the_exact_tolerance_boundary(form_ok, control_ok):
+    """The first fix for the tolerance band wrote the comparison a second way instead of
+    sharing it, and `test_a_gap_inside_tolerance_is_withheld_not_published_as_a_PASS`
+    happened to pick a pair that rounds the lucky way, so it stayed green over the hole.
+
+    Parametrised over pairs that round the OTHER way. Ten paired questions — under the
+    floor — so whatever the verdict would have called a PASS must be withheld instead."""
+    trials = control_ok * 2 if control_ok < 100 else control_ok
+    trials = 1000 if control_ok > 100 else 100
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": trials,
+        "terse_ok": control_ok, "terse_trials": trials,
+        "diff_ok": form_ok, "diff_trials": trials,
+        "attempts": trials * 2, "fails": 0,
+    } for i in range(10)]
+    assert len(paired_rows(rows, "diff_ok", "terse_ok")) == 10 < _MIN_PAIRED_QUESTIONS
+
+    facc, cacc = form_ok / trials, control_ok / trials
+    assert passes_tolerance(facc - cacc), "fixture must sit inside tolerance, or it FAILs"
+
+    assert arm_gap(rows, "diff_ok", "terse_ok").excluded == "underpowered"
+    md = build_diff_report({"m": rows})
+    assert "**PASS**" not in md, (
+        f"{facc:.1%} vs {cacc:.1%} published a PASS off 10 questions:\n{md}")
     assert "safe to enable" not in md

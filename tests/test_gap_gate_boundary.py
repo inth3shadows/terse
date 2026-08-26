@@ -226,12 +226,17 @@ def test_min_paired_is_bypassed_only_by_codec_verdict():
     legitimate caller — its groups are characteristically one question at many trials, and
     it gates its own sample size in trials via `_CODEC_MIN_TRIALS`. Anything else passing
     this argument is re-opening the hole #334 closed, and has to edit this list to do it.
+
+    Blind spot, stated rather than claimed away — the same honesty
+    `test_the_detector_is_blind_to_indirection` applies to `_form_stats`: this reads
+    LITERAL keyword values, so `min_paired=int(0)` would slip past. The POSITIONAL form
+    cannot: `_gap` and `arm_gap` both take `min_paired` keyword-only, so
+    `arm_gap(rows, f, c, 0)` is a TypeError rather than a silent bypass.
     """
     import ast
-    import pathlib
 
     allowed = {"codec_verdict"}
-    src = pathlib.Path("src/terse/report.py").read_text()
+    src = (SRC / "report.py").read_text()
     tree = ast.parse(src)
 
     enclosing: dict[int, str] = {}
