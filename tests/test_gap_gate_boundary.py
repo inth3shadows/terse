@@ -52,7 +52,7 @@ ALLOWED = {
     # to pair with. #269 gave it a measured no-drop control arm, they moved behind
     # `arm_gap` (via `_accuracy_gate`), and they came off this list — which is exactly what
     # the note that used to sit here said would happen. The `_form_stats` calls they still
-    # make are the retrieve-recall / no-overfetch / handle-accuracy columns, which really
+    # `_form_stats` call it still makes is the handle-accuracy column alone (#335 moved
     # are single pooled arms against a fixed ideal: a tool call either happened or it did
     # not, so 100% IS the target and there is no second arm by construction.
     # The two fixed-ideal metrics' single construction site (#335). Allowed under the

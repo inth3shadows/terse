@@ -22,6 +22,7 @@ from .report import (
     diff_gap_rows,
     dropeval_gap_rows,
     exclusion_note,
+    fixed_ideal_sufficient,
     fluency_gap_rows,
     inconclusive_models,
     passes_tolerance,
@@ -298,6 +299,18 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None,
         # are gated against a fixed ideal, so they must not share a label.
         control_label = "no-drop control" if key == "accuracy" else "ideal (100%)"
         section = f"{label}:\n" + forest_bar_lines(plot_rows, label, control_label, color=color)
+        # The SAME disclosure the markdown carries (#335). Without it the two disagreed in
+        # the direction that matters: `build_dropeval_report` printed **INSUFFICIENT** for
+        # a 1-question metric while this chart printed a green PASS beside it — the exact
+        # badge #335 exists to stop publishing, on the surface a reader sees first, under a
+        # docstring promising the two "can never disagree".
+        if key in ("recall", "precision"):
+            counts = [sum(1 for r in rows if r.get("kind") == key)
+                      for m, rows in results.items() if m in gaps and key in gaps[m]]
+            n = min(counts) if counts else None
+            if not fixed_ideal_sufficient(n) and any(r["passed"] for r in plot_rows):
+                section += (f"\n  (n={n} question{'' if n == 1 else 's'} — too few to "
+                            f"publish a PASS; the bar is the measurement, not a verdict)")
         # Per-metric since #335: `excluded` used to be a flat {model: reason} that only
         # ever described accuracy, so a withheld recall bar would vanish with no note.
         if excluded.get(key):

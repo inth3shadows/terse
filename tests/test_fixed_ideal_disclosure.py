@@ -125,7 +125,119 @@ def test_a_withheld_mechanism_metric_does_not_silence_the_final_accuracy_verdict
     rows = [dict(r, control_ok=r["trials"], control_trials=r["trials"])
             for r in _rows(20) if r["kind"] == "recall"]
     md = build_dropeval_report({"m": rows})
-    assert "no-overfetch" not in md or "Worst-case" not in md.split("no-overfetch")[0][-200:]
+    # The precondition, asserted directly. An earlier spelling was
+    #   `"no-overfetch" not in md or "Worst-case" not in md.split("no-overfetch")[0][-200:]`
+    # which can never be False: `split` cuts at the FIRST occurrence, the report preamble
+    # ~30 lines above any verdict, so `[0][-200:]` is always prose. Review found it.
+    assert not any("Worst-case" in line and "no-overfetch" in line
+                   for line in md.splitlines()), "no-overfetch should not have been scored"
     assert any("final-accuracy" in line and "Worst-case" in line
                for line in md.splitlines()), (
         f"the final-accuracy verdict vanished when no-overfetch had no rows:\n{md}")
+
+
+# --------------------------------------------------------------------------------------
+# Regressions from the #335 review. Every one of these was live in the first cut, and the
+# first three are the defect the fix itself introduced or failed to remove.
+# --------------------------------------------------------------------------------------
+
+def _mixed(n_recall: int, n_precision: int, *, recall_ok: int = 3, trials: int = 3,
+           control: bool = True) -> list[dict]:
+    out = []
+    for kind, count in (("recall", n_recall), ("precision", n_precision)):
+        for i in range(count):
+            r = {"qid": f"{kind}{i}", "kind": kind, "trials": trials,
+                 "retrieve_ok": recall_ok if kind == "recall" else trials,
+                 "answer_ok": trials, "handle_ok": trials, "errors": 0,
+                 "treatment_errors": 0, "control_errors": 0, "attempts": trials}
+            if control:
+                r |= {"control_ok": trials, "control_trials": trials}
+            out.append(r)
+    return out
+
+
+def test_an_insufficient_metric_cannot_authorize_enabling_the_drop():
+    """The badge is not the decision. The first cut downgraded only the rendered word.
+
+    `_format_worst_case_line` never mutates `verdict.passed`, so the "safe to enable"
+    summary four lines below still read a 2-question sample as a pass: the report printed
+    `**INSUFFICIENT**` and then "safe to enable drop-to-retrieve". A cosmetic fix that
+    leaves the authorization intact is worse than none — it reads as handled."""
+    md = build_dropeval_report({"m": _mixed(2, 22)})
+    assert "**INSUFFICIENT**" in md
+    assert "safe to enable drop-to-retrieve" not in md, md.split("## Verdict", 1)[1]
+    # ...and it must not claim a failure that did not happen. Both arms are at 100%.
+    assert "misses tolerance" not in md
+    assert "INSUFFICIENT for enabling" in md
+
+
+def test_a_failing_metric_publishes_even_when_its_partner_has_no_rows():
+    """25 questions at 0% recall published NOWHERE in the first cut.
+
+    The two fixed-ideal lines were jointly gated on `if recall_worst and precision_worst:`,
+    which was safe only while neither could be None. `_fixed_ideal_gate`'s `"empty"` broke
+    that, so a run with no precision rows silently dropped a demonstrated -100% recall
+    failure — strictly worse than the false PASS #335 was filed about."""
+    md = build_dropeval_report({"m": _mixed(25, 0, recall_ok=0)})
+    line = _recall_line(md)
+    assert "**FAIL**" in line, line
+    assert "-100%" in line, line
+    assert "n=25 questions" in line, line
+
+
+def test_a_model_the_gate_could_not_score_is_named_in_the_markdown():
+    """`dropeval_gap_rows` recorded the reason for the chart; the markdown discarded it.
+
+    A model dropped from the recall gate left no trace while the verdict still said "the
+    worst model" as if every model had been considered — review finding 5 on #300, whose
+    fix landed only on the chart path."""
+    md = build_dropeval_report({"A": _mixed(20, 20), "B": _mixed(0, 20)})
+    assert "not scored" in md, md.split("## Verdict", 1)[1]
+    assert "B" in md.split("## Verdict", 1)[1].split("not scored")[1][:120]
+
+
+def test_an_unscored_metric_is_n_a_in_the_table_not_zero_percent():
+    """An excluded `ArmGap` carries `form_acc == 0.0`; printing it renders a metric that
+    never ran as a total failure of it."""
+    md = build_dropeval_report({"m": _mixed(20, 0)})
+    row = next(line for line in md.splitlines() if line.startswith("| `m`"))
+    assert "| n/a |" in row, row
+    assert "| 0% ±0 |" not in row, row
+
+
+def test_a_thin_model_cannot_hide_behind_a_gap_tie():
+    """`n` is the fleet minimum, not the worst-gap model's own count.
+
+    `_worst_case_gap` breaks ties by insertion order, and a 100% tie is the normal outcome
+    for a fixed-ideal metric — so keying the disclosure on the winner let model `A` with 11
+    questions publish `n=11 **PASS**` while `B`'s single observation went undisclosed."""
+    md = build_dropeval_report({"A": _mixed(11, 11), "B": _mixed(1, 11)})
+    line = _recall_line(md)
+    assert "n=1 question" in line, line
+    assert "**INSUFFICIENT**" in line, line
+
+
+def test_the_chart_carries_the_same_disclosure_as_the_markdown():
+    """`dropeval_gap_rows`' docstring promises the two "can never disagree".
+
+    The first cut put the disclosure only in `_format_worst_case_line`, which the terminal
+    chart never calls — so the markdown printed **INSUFFICIENT** for a one-question metric
+    while the chart printed a green PASS beside it, on the surface a reader sees first."""
+    from terse.terminal_report import build_terminal_dropeval_report
+    md = build_dropeval_report({"m": _mixed(1, 1, control=False)})
+    chart = build_terminal_dropeval_report({"m": _mixed(1, 1, control=False)}, color=False)
+    assert "**INSUFFICIENT**" in md
+    assert "too few to publish a PASS" in chart, chart
+
+
+def test_a_failing_accuracy_is_not_reported_as_a_thin_sample():
+    """The `INSUFFICIENT for enabling` branch must not swallow a demonstrated failure.
+
+    Mechanism metrics thin but passing, final-accuracy at -100%: the run cannot ship
+    because the drop HURT, not because the sample was small, and saying otherwise asserts
+    a cause the run does not show (#332's defect, one report over)."""
+    rows = [dict(r, answer_ok=0, control_ok=r["trials"], control_trials=r["trials"])
+            for r in _mixed(2, 2)]
+    md = build_dropeval_report({"m": rows})
+    assert "INSUFFICIENT for enabling" not in md, md.split("## Verdict", 1)[1]
+    assert "keep drop-to-retrieve off" in md
