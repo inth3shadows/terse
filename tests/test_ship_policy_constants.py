@@ -32,6 +32,9 @@ accident.
 """
 from __future__ import annotations
 
+import pathlib
+import re
+
 import pytest
 
 from terse.report import (
@@ -71,17 +74,21 @@ def test_the_ship_tolerance_is_five_points():
     assert _GAP_TOLERANCE == 0.05, (
         f"the ship tolerance is {_GAP_TOLERANCE}, not 0.05. This is the gap at which a "
         f"comprehension regression stops blocking a release — if the change is intended, "
-        f"update this test and say why in the commit; the two boundary tests below will "
-        f"redden with it")
+        f"update this test and say why in the commit. Drift past half a point reddens "
+        f"the boundary tests below too; anything smaller reaches only this line, which "
+        f"is why the literal exists")
 
 
 def test_a_gap_inside_the_ship_tolerance_publishes_a_PASS():
     """-4.5%: inside 5%, outside 4%. Reddens if the tolerance is tightened."""
     rows = _diff_rows(9)
     g = arm_gap(rows, "diff_ok", "terse_ok")
-    # Fixture integrity: a boundary test proves nothing if the fixture is not ON the
-    # boundary. Asserted before the verdict, so a broken fixture reads as a broken
-    # fixture rather than as a tolerance regression.
+    # Fixture integrity, asserted before the verdict so a broken fixture reads as a
+    # broken fixture rather than as a tolerance regression. The gap sits half a point
+    # INSIDE the line rather than on it: an exactly--5% gap is decided by
+    # `passes_tolerance`'s 1e-9 epsilon, which `test_gap_gate_boundary.py` and #332 own.
+    # This pair brackets the tolerance to +/-0.005, so it catches a re-calibration and
+    # leaves the epsilon's boundary to the tests written for it.
     assert g.excluded is None
     assert g.form_acc - g.control_acc == pytest.approx(-0.045)
 
@@ -121,11 +128,32 @@ def test_the_codec_trial_floor_is_twenty():
         f"the codec trial floor is {_CODEC_MIN_TRIALS}, not 20. Its definition calls it "
         f"'the single most contestable number in this module' and asks for explicit "
         f"sign-off before it is trusted at scale — this test is that sign-off")
-    # The Clopper-Pearson bound the constant's comment claims for n=20. Pinning the
-    # derivation as well as the value keeps the two from drifting apart: the comment is
-    # the argument FOR the number, and a number whose stated justification no longer
-    # computes is worse than one with none.
-    assert pytest.approx(0.139, abs=0.001) == 1 - 0.05 ** (1 / _CODEC_MIN_TRIALS)
+
+
+
+def test_the_quoted_clopper_pearson_bound_still_computes():
+    """The constant's comment quotes the bound its value buys. This reads that number
+    back out of the source and recomputes it.
+
+    An earlier draft asserted `1 - 0.05 ** (1 / _CODEC_MIN_TRIALS) == approx(0.139)`
+    inside the test above, which was ceremony twice over: the literal assert eight lines
+    earlier aborts first, so it never ran on the mutation it claimed to guard, and with
+    the constant pinned it is an arithmetic identity over a literal. Neither half touched
+    the COMMENT, which is the thing that drifts — changing `~14pp` to `~99pp` left the
+    whole file green.
+
+    So the bound is parsed out of `report.py`. Now a re-calibration that updates the
+    constant and forgets the sentence justifying it reddens here."""
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "src" / "terse" / "report.py").read_text()
+    quoted = re.search(r"At n=(\d+) that is ~(\d+)pp", src)
+    assert quoted, "the Clopper-Pearson sentence next to `_CODEC_MIN_TRIALS` is gone"
+    n, pp = int(quoted.group(1)), int(quoted.group(2))
+    assert n == _CODEC_MIN_TRIALS, (
+        f"the comment reasons about n={n} but the floor is {_CODEC_MIN_TRIALS}")
+    assert round((1 - 0.05 ** (1 / n)) * 100) == pp, (
+        f"the comment claims ~{pp}pp at n={n}; Clopper-Pearson gives "
+        f"{(1 - 0.05 ** (1 / n)) * 100:.1f}pp")
 
 
 def test_nineteen_zero_failure_trials_are_UNRESOLVED():
@@ -141,10 +169,19 @@ def test_nineteen_zero_failure_trials_are_UNRESOLVED():
 
 
 def test_twenty_zero_failure_trials_are_SAFE():
-    """`test_identical_partial_failure_on_both_arms_at_the_trial_floor_is_SAFE` already
-    covers a SAFE verdict, but at 25 trials — which clears a floor of 19, 20 or 21 alike,
-    and is why lowering the floor survived mutation. Only the exact boundary separates
-    them."""
+    """Why the existing SAFE coverage did not stop the floor from moving.
+
+    `tests/test_codec_verdict.py` has two. `test_identical_partial_failure_on_both_arms_
+    at_the_trial_floor_is_SAFE` is one row at 25 trials, which clears a floor of 19, 20 or
+    21 alike. `test_zero_failures_at_exactly_the_trial_floor_is_SAFE` sits exactly ON the
+    floor — and is spelled `range(_CODEC_MIN_TRIALS)`, so the fixture slid with the
+    mutation and stayed green. That one is the more direct reason 20 -> 19 survived, and
+    it is the anti-pattern this module's docstring describes, living in the file this test
+    is meant to reinforce.
+
+    The inclusive `>=` is NOT this test's contribution: mutating `n >= _CODEC_MIN_TRIALS`
+    to `n >` reddens both `test_codec_verdict.py` tests as well. What is new here is the
+    floor's VALUE, held by a literal 20 that cannot slide."""
     assert codec_verdict(_codec_row(20))[0] == "SAFE"
 
 
@@ -157,16 +194,21 @@ def test_the_unmeasured_loss_share_is_twenty_percent():
 def test_a_model_exactly_at_the_loss_share_is_still_measured():
     """The comparison is strictly `>`, and that is deliberate — pinning the OPERATOR.
 
-    `paired_rows`' docstring works through the case: a model losing exactly one of five
-    question types loses 20.0% of an arm, lands ON the threshold, and `_unmeasured` stays
-    quiet. That is a known permissive edge, left permissive on purpose because
-    `paired_rows` — not this threshold — is the control that catches it; voiding a whole
-    multi-hour run for a handful of transient 429s is its own kind of wrong answer.
+    The threshold is deliberately permissive: a failed call is already excluded from its
+    arm's denominator, so voiding a whole multi-hour run over a handful of transient 429s
+    would be its own kind of wrong answer. `paired_rows`, not this threshold, is the
+    control that catches arm-correlated loss.
 
-    So this test does not assert the boundary is in the right place. It asserts that the
-    argument written in `paired_rows` still describes the code, because `>` -> `>=`
-    survived a full-suite mutation: nothing anywhere noticed which side of the threshold
-    a model at exactly 20% loss falls on.
+    The fixture is built to land the RATIO exactly on the line, which is the only thing
+    the operator can be observed through. It is deliberately not the scenario
+    `paired_rows`' docstring describes — that one does not reach the boundary at all,
+    because `_unmeasured` divides by total `attempts` across every arm while the docstring
+    reasons about one arm's own calls. Filed separately; see the note beside
+    `UNMEASURED_FAIL_SHARE` in `report.py`.
+
+    So this test does not assert the boundary is in the right place. It asserts that which
+    side of it a model falls on is observed by something, because `>` -> `>=` survived a
+    full-suite mutation of all 1706 tests.
     """
     # Internally coherent, not just arithmetically convenient: each row runs 10 trials on
     # each of two arms (20 attempts), loses 2 per arm, and reports the surviving counts.
