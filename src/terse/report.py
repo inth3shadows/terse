@@ -746,7 +746,8 @@ def fixed_ideal_sufficient(n: int | None) -> bool:
 
 
 def _format_worst_case_line(verdict: GapVerdict, tol: float, form_label: str,
-                            control_label: str, n: int | None = None) -> str:
+                            control_label: str, n: int | None = None,
+                            n_is_worst_models_own: bool = True) -> str:
     """The shared worst-case verdict line. `n` discloses the question count behind it.
 
     Passed only by the fixed-ideal metrics (#335), which have no other evidence gate. When
@@ -754,17 +755,24 @@ def _format_worst_case_line(verdict: GapVerdict, tol: float, form_label: str,
     are still published, but a green badge is not. A FAIL is never downgraded — an
     exclusion that could improve a verdict is the #332 defect.
 
+    `n_is_worst_models_own` is False when `n` is the FLEET MINIMUM and that minimum came
+    from a different model than the one this line names. The sentence's subject is the
+    worst-GAP model, so a bare "n=1" beside a line naming model A reads as A's own count
+    when it may be B's — review found it stating 1 for a model the table says has 11.
+
     `n` counts ROWS, not distinct `qid`s: a caller may hand several rows carrying one
     question, and then `n` overstates the diversity behind the number. The report's single
-    table has a `recall q` column (`len(recall_rows)`) which agrees with this line for
-    recall; there is no corresponding column for no-overfetch, so its `n=` is the only
-    place that count appears. Both are reasons `_FIXED_IDEAL_MIN_QUESTIONS` is a disclosure
-    convention rather than a statistical bound.
+    table has a per-model `recall q` column, which does NOT generally agree with this line:
+    that column is one model's own count while `n` is the fleet minimum, so they differ
+    exactly when `n_is_worst_models_own` is False. There is no column at all for
+    no-overfetch. Both are reasons `_FIXED_IDEAL_MIN_QUESTIONS` is a disclosure convention
+    rather than a statistical bound.
     """
     badge = "PASS" if verdict.passed else "FAIL"
     tail = ""
     if n is not None:
-        tail = f", n={n} question{'' if n == 1 else 's'}"
+        tail = (f", n={n} question{'' if n == 1 else 's'}"
+                + ("" if n_is_worst_models_own else " for the thinnest model"))
         if verdict.passed and not fixed_ideal_sufficient(n):
             badge = "INSUFFICIENT"
     return (f"- Worst-case model `{verdict.model}`: {form_label} {verdict.form_acc:.0%} vs "
@@ -2108,11 +2116,15 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
     if recall_worst:
         out.append(_format_worst_case_line(
             recall_worst, _GAP_TOLERANCE, "retrieve-recall", "ideal (100%)",
-            n=_fleet_min_n(fixed_ideal_n["recall"])))
+            n=_fleet_min_n(fixed_ideal_n["recall"]),
+            n_is_worst_models_own=(fixed_ideal_n["recall"].get(recall_worst.model)
+                                   == _fleet_min_n(fixed_ideal_n["recall"]))))
     if precision_worst:
         out.append(_format_worst_case_line(
             precision_worst, _GAP_TOLERANCE, "no-overfetch", "ideal (100%)",
-            n=_fleet_min_n(fixed_ideal_n["precision"])))
+            n=_fleet_min_n(fixed_ideal_n["precision"]),
+            n_is_worst_models_own=(fixed_ideal_n["precision"].get(precision_worst.model)
+                                   == _fleet_min_n(fixed_ideal_n["precision"]))))
     # NOT nested under the mechanism metrics. final-accuracy has its own gate and its own
     # evidence, and it is the one that decides "safe to enable" — letting a missing recall
     # arm silence it would publish a dropeval report whose headline verdict is simply
@@ -2157,10 +2169,22 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
                    "without `--no-control` to gate it.")
     # `.passed` on each, guarded: a mechanism metric with no rows leaves its worst-case
     # None, and "safe to enable" cannot be claimed from a metric that was never scored.
-    # This guard replaces a NESTING, not a crash — on the previous revision the same
-    # expression sat inside `if recall_worst and precision_worst:`, so neither operand
-    # could be None and no crash was reachable. Said precisely because an invented failure
-    # history is the #338 defect.
+    # No crash ever existed here, and the `is not None` checks are not new either: they
+    # were added alongside the de-nesting. Two revisions back (`origin/main`) this whole
+    # block sat inside `if recall_worst and precision_worst:`, where neither operand could
+    # be None; once `"empty"` made them nullable the guards became load-bearing. Stated
+    # this precisely on the second attempt — the first version of this comment claimed it
+    # "replaces a crash", and the correction then mis-named which revision it replaced.
+    # Inventing a failure history is the #338 defect, and it is easy to do twice.
+    # A metric that WAS scored and missed tolerance outranks every "we could not conclude"
+    # branch below. Without this, an absent no-overfetch arm improved the headline from
+    # "keep drop-to-retrieve off" to "not supported either way" — an exclusion improving a
+    # verdict, which is the one thing #332 established may never happen. Found three times
+    # in two review rounds, each time in a different branch, which is the signal that the
+    # ORDER is the defect and not any single branch: the failure case is now a precondition
+    # of the others rather than their fallthrough.
+    measured_failed = any(w is not None and not w.passed
+                          for w in (recall_worst, precision_worst, accuracy_worst))
     # Reads `fixed_ideal_sufficient`, the SAME predicate as the badge — a metric that
     # rendered INSUFFICIENT must not authorize the policy four lines below.
     mechanism_ok = (
@@ -2193,7 +2217,7 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
                    "already on." if has_underpowered else
                    "Re-run with the no-drop control arm before enabling "
                    "drop-to-retrieve on this evidence."))
-    elif recall_worst is None or precision_worst is None:
+    elif not measured_failed and (recall_worst is None or precision_worst is None):
         # Neither "safe" nor "a metric missed tolerance": a metric that produced no rows
         # was not measured, and saying it failed would be the same false-cause defect
         # #332 removed from the fluency reports' exclusion prose.
@@ -2216,11 +2240,24 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
         thin = [label for label, metric in (("retrieve-recall", "recall"),
                                             ("no-overfetch", "precision"))
                 if not fixed_ideal_sufficient(_fleet_min_n(fixed_ideal_n[metric]))]
+        # "every metric cleared tolerance" is FALSE when final-accuracy was never gated —
+        # it did not clear anything, it was not measured, as the line above already says.
+        # And the remedy has to match the cause: this branch took over the state that used
+        # to reach "Re-run with the no-drop control arm", so telling an operator with no
+        # control to "generate more questions" points at work that can never make the run
+        # shippable. Both causes, or the wrong one wins.
+        scored = ("every metric cleared tolerance" if accuracy_worst is not None
+                  else "the mechanism metrics cleared tolerance and final-accuracy was "
+                       "never gated")
+        remedy = ("Generate more questions and re-run."
+                  if accuracy_worst is not None else
+                  "Generate more questions AND re-run with the no-drop control arm — "
+                  "more questions alone leaves final-accuracy ungated at any n.")
         out.append(
-            f"- **INSUFFICIENT for enabling** — every metric cleared tolerance, but "
+            f"- **INSUFFICIENT for enabling** — {scored}, but "
             f"{' and '.join(f'`{lb}`' for lb in thin)} rested on fewer than "
             f"{_FIXED_IDEAL_MIN_QUESTIONS} questions. Nothing here failed; there is simply "
-            f"not enough evidence to enable drop-to-retrieve on it.")
+            f"not enough evidence to enable drop-to-retrieve on it. {remedy}")
     else:
         out.append("- At least one metric misses tolerance for its worst model — keep "
                    "drop-to-retrieve off until this improves.")

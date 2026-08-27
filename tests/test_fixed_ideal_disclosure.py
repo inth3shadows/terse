@@ -241,3 +241,108 @@ def test_a_failing_accuracy_is_not_reported_as_a_thin_sample():
     md = build_dropeval_report({"m": rows})
     assert "INSUFFICIENT for enabling" not in md, md.split("## Verdict", 1)[1]
     assert "keep drop-to-retrieve off" in md
+
+
+def test_a_measured_failure_outranks_a_missing_arm_in_the_SUMMARY():
+    """Not just the per-metric line — the headline directive too.
+
+    `test_a_failing_metric_publishes_even_when_its_partner_has_no_rows` asserts the
+    `**FAIL**` line and passes straight over the summary, where the real defect lived: the
+    "Not concluded" branch sat above the failure branch, so an ABSENT no-overfetch arm
+    improved the headline from "keep drop-to-retrieve off" to "not supported either way".
+    An exclusion improving a verdict is the one thing #332 established may never happen."""
+    # The mirror case is built by hand, NOT `_mixed(0, 25, recall_ok=0)`: `recall_ok` only
+    # touches recall rows, so that fixture has a PASSING no-overfetch arm and cannot
+    # express the failure it claims to. A fixture unable to fail is this repo's most
+    # frequent way of shipping a test that pins nothing.
+    failing_precision = [dict(r, retrieve_ok=0) for r in _mixed(0, 25)]
+    assert all(r["retrieve_ok"] == 0 for r in failing_precision), "fixture is not failing"
+    for rows, what in (
+            (_mixed(25, 0, recall_ok=0), "recall failing, no-overfetch absent"),
+            (failing_precision, "no-overfetch failing, recall absent")):
+        md = build_dropeval_report({"m": rows})
+        verdict = md.split("## Verdict", 1)[1]
+        assert "keep drop-to-retrieve off" in verdict, f"{what}:\n{verdict}"
+        assert "not supported either way" not in verdict, f"{what}:\n{verdict}"
+
+
+def test_a_failing_accuracy_outranks_a_missing_mechanism_arm():
+    """final-accuracy owns the "safe to enable" decision, so its FAIL outranks hardest."""
+    rows = [dict(r, answer_ok=0, control_ok=r["trials"], control_trials=r["trials"])
+            for r in _mixed(25, 0)]
+    verdict = build_dropeval_report({"m": rows}).split("## Verdict", 1)[1]
+    assert "**FAIL**" in verdict
+    assert "keep drop-to-retrieve off" in verdict, verdict
+    assert "not supported either way" not in verdict, verdict
+
+
+def test_insufficient_for_enabling_names_an_ungated_accuracy_and_its_real_remedy():
+    """Thin mechanism metrics AND no control arm — two causes, both must survive.
+
+    This branch took over a state that previously reached "Re-run with the no-drop control
+    arm before enabling". Saying "every metric cleared tolerance" is false (final-accuracy
+    cleared nothing; it was never gated), and "generate more questions" alone points an
+    operator at work that can never make the run shippable — without a control, accuracy
+    stays ungated at any n."""
+    md = build_dropeval_report({"m": _mixed(2, 2, control=False)})
+    verdict = md.split("## Verdict", 1)[1]
+    assert "INSUFFICIENT for enabling" in verdict, verdict
+    assert "every metric cleared tolerance" not in verdict, verdict
+    assert "never gated" in verdict, verdict
+    # The REMEDY sentence specifically, not the phrase "no-drop control arm" — that also
+    # appears in the "final-accuracy: not gated" line above, so asserting it alone passed
+    # even with the remedy hardcoded to the wrong branch. Caught by mutation.
+    assert "more questions alone leaves final-accuracy ungated" in verdict, verdict
+
+
+def test_insufficient_for_enabling_keeps_the_simple_remedy_when_accuracy_was_gated():
+    """The mirror: a control DID run and accuracy passed, so questions are the only gap.
+
+    ASYMMETRIC on purpose. `_mixed(2, 2)` cannot reach this branch: `_accuracy_gate` pairs
+    over ALL rows and needs `_MIN_PAIRED_QUESTIONS`, so four rows leave accuracy
+    underpowered and it lands in the other branch instead. 2 recall + 30 precision keeps
+    recall thin (the mechanism gap) while giving accuracy the 20 paired rows it needs."""
+    verdict = build_dropeval_report(
+        {"m": _mixed(2, 30)}).split("## Verdict", 1)[1]
+    assert "INSUFFICIENT for enabling" in verdict, verdict
+    assert "every metric cleared tolerance" in verdict, verdict
+    assert "more questions alone leaves final-accuracy ungated" not in verdict, verdict
+
+
+def test_a_fleet_minimum_from_another_model_says_so():
+    """`n` is the fleet minimum, but the sentence names the worst-GAP model.
+
+    With `A` at 11 questions and `B` at 1, both 100%, the line reads `Worst-case model
+    \\`A\\` ... n=1 question` — and a reader attributes B's count to A. It has to say which."""
+    line = _recall_line(build_dropeval_report({"A": _mixed(11, 11), "B": _mixed(1, 11)}))
+    assert "n=1 question for the thinnest model" in line, line
+    # ...and when the minimum IS the named model's own count, no qualifier is added.
+    solo = _recall_line(build_dropeval_report({"A": _mixed(2, 11)}))
+    assert "n=2 questions)" in solo, solo
+    assert "thinnest model" not in solo, solo
+
+
+def test_the_chart_names_a_metric_no_model_could_score():
+    """A metric where EVERY model is excluded vanished from the chart entirely.
+
+    The per-metric note ran only after `if not plot_rows: continue`, so it fired only when
+    some OTHER model still drew a bar for that metric. With no recall questions at all, the
+    chart rendered an all-green run for a mechanism nobody measured — while the markdown
+    said `**retrieve-recall: not scored**` and `**Not concluded**`. The chart is the
+    surface a reader sees first."""
+    from terse.terminal_report import build_terminal_dropeval_report
+    rows = _mixed(0, 20)
+    chart = build_terminal_dropeval_report({"m": rows}, color=False)
+    assert "retrieve-recall" in chart, chart
+    assert "no rows" in chart, chart
+    assert "**Not concluded**" in build_dropeval_report({"m": rows})
+
+
+def test_an_unscorable_run_says_no_data_rather_than_nothing():
+    """Every model now gets a dict from `dropeval_gap_rows`, empty when nothing scored, so
+    a truthy `gaps` stopped meaning "something was measured" and the chart returned ""."""
+    from terse.terminal_report import build_terminal_dropeval_report
+    nothing = [{"qid": "q0", "kind": "other", "trials": 3, "retrieve_ok": 3,
+                "answer_ok": 3, "handle_ok": 3, "errors": 0, "treatment_errors": 0,
+                "control_errors": 0, "attempts": 3}]
+    assert "no data" in build_terminal_dropeval_report({"m": nothing}, color=False)

@@ -51,10 +51,14 @@ ALLOWED = {
     # because final-accuracy was scored against a fixed 100% ideal and so had no second arm
     # to pair with. #269 gave it a measured no-drop control arm, they moved behind
     # `arm_gap` (via `_accuracy_gate`), and they came off this list — which is exactly what
-    # the note that used to sit here said would happen. The `_form_stats` calls they still
-    # `_form_stats` call it still makes is the handle-accuracy column alone (#335 moved
-    # are single pooled arms against a fixed ideal: a tool call either happened or it did
-    # not, so 100% IS the target and there is no second arm by construction.
+    # the note that used to sit here said would happen.
+    #
+    # #335 finished the job for `dropeval_gap_rows`: every `_form_stats` call it made moved
+    # behind `_fixed_ideal_gate` / `_accuracy_gate`, so it no longer touches it at all and
+    # came off this list. `build_dropeval_report` stays for exactly ONE remaining call, the
+    # handle-accuracy display column — a single pooled arm against a fixed ideal that gates
+    # nothing. Its recall / no-overfetch columns now read `_fixed_ideal_gate`'s result
+    # instead of recomputing it, so the table and the verdict cannot disagree.
     # The two fixed-ideal metrics' single construction site (#335). Allowed under the
     # same rule as `_gap`: it IS the gate for those metrics. It computes no form-vs-control
     # gap in the sense this file polices — recall and no-overfetch have no second arm and

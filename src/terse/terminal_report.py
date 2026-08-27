@@ -272,7 +272,10 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None,
         return "  INCONCLUSIVE — " + ", ".join(
             f"{m} failed {e}/{a} model calls" for m, (e, a) in sorted(dead.items()))
     gaps, excluded = dropeval_gap_rows(results)
-    if not gaps:
+    # `any(...)`, not `gaps`: since #335 every model gets a dict, empty when no metric
+    # could be scored, so a truthy `gaps` no longer means anything was measured. Without
+    # this a fully unscorable run returned "" and `cli` printed a bare blank line.
+    if not any(gaps.values()):
         return "  (no data)"
     sections = []
     if dead and accept_degraded:
@@ -294,6 +297,19 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None,
             plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
                                "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
         if not plot_rows:
+            # A metric where EVERY model was excluded still has to say so. The note below
+            # only ever ran when SOME model drew a bar, so a run with no recall questions
+            # rendered an all-green chart for an unmeasured mechanism — on the surface a
+            # reader sees before the markdown.
+            #
+            # EXCEPT "no control arm", which #269 settled deliberately: without a control
+            # the chart draws nothing rather than imply a comparison it never made, and
+            # the markdown carries the full paragraph. Pinned by
+            # `test_final_accuracy_is_omitted_when_no_control_arm_ran`.
+            reasons = {m: r for m, r in excluded.get(key, {}).items()
+                       if r != "no control arm"}
+            if reasons:
+                sections.append(f"{label}:\n  ({exclusion_note(reasons)})")
             continue
         # final-accuracy is the one metric with a measured control; the other two really
         # are gated against a fixed ideal, so they must not share a label.
