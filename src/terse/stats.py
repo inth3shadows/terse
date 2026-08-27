@@ -1335,7 +1335,8 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
     # NEGATIVE on any multi-session window, which is the normal case (`terse stats` with no
     # `--since` reads all history). That is the same mis-denomination #312 was closed for,
     # one layer down, and it made the "measured" figure WORSE than the estimate it replaced
-    # (caught in review before merge; see `test_a_multi_session_window_reports_one_primer`).
+    # (caught in review before merge; see
+    # `test_a_multi_session_window_reports_ONE_primer_not_the_windows_sum`).
     #
     # The divisor is TOKENIZED emissions, not `emissions`: `tokens` only accumulates rows
     # where `count_cl100k` returned an int, so dividing by a count that also includes

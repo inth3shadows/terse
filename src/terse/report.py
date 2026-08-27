@@ -2077,15 +2077,18 @@ def build_diff_soak_report(results: dict) -> str:
     out.append("")
     if unmeasured:
         out += [
-            "**Not measured** — too many calls went unanswered, so no accuracy "
-            "is published for: "
+            f"**{REASON_HEADING['unmeasured']}** — {REASON_LABEL['unmeasured']}, so no "
+            "accuracy is published for: "
             + ", ".join(
                 f"`{m}` ({sum(int(r.get('fails', 0)) for r in rs)}/"
                 f"{sum(int(r.get('attempts', 0)) for r in rs)} calls lost)"
                 for m, rs in sorted(unmeasured.items()))
-            + ". An unanswered call is not a wrong answer. Check stderr for a "
-              "`returned no content` line naming a `finish_reason` — `length` means "
-              "raise max_tokens, `content_filter` means the payload tripped a filter; "
+            + ". Either too many calls went unanswered, or enough of them did that no "
+              "question completed every trial on BOTH arms, leaving nothing comparable "
+              "— the counts above say which, and a low one means the second. An "
+              "unanswered call is not a wrong answer. Check stderr for a `returned no "
+              "content` line naming a `finish_reason` — `length` means raise "
+              "max_tokens, `content_filter` means the payload tripped a filter; "
               "otherwise re-run once the backend is reachable.",
             "",
         ]
@@ -2107,8 +2110,9 @@ def build_diff_soak_report(results: dict) -> str:
             lead = {
                 "unpaired": "**Depths not compared** — the backend answered, but one arm "
                             "did not complete enough of the same questions at: ",
-                "unmeasured": "**Depths not measured** — too many calls went unanswered "
-                              "at: ",
+                "unmeasured": "**Depths not measured** — either too many calls went "
+                              "unanswered, or enough of them did that no question "
+                              "completed every trial on both arms, at: ",
             }.get(why, f"**{REASON_HEADING.get(why, 'Excluded')}** — "
                        f"{REASON_LABEL.get(why, why)} at: ")
             tail = (". Those depths are excluded from the verdict below rather than "

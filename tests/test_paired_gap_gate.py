@@ -684,11 +684,10 @@ def test_a_withheld_model_is_not_told_its_backend_was_unreachable():
 
 
 def test_the_fluency_verdict_does_not_assert_a_dead_backend():
-    """The seventh renderer. `REASON_LABEL`'s note claims a seventh phrasing is impossible
-    and cites `test_every_renderer_names_the_right_exclusion_reason` as the loop that makes
-    it so — that test does not exist anywhere in the repo, which is how
-    `build_fluency_report`'s verdict bullet kept hardcoding "calls went unanswered" through
-    the #332 sweep that hedged every other site.
+    """`build_fluency_report`'s verdict bullet kept hardcoding "calls went unanswered"
+    through the #332 sweep that hedged every other site — before #338 wrote the
+    `test_every_renderer_names_the_right_exclusion_reason` loop `REASON_LABEL`'s note
+    cites, nothing exercised this renderer against the wording it asserted.
 
     Here the backend answers 88.9% of its calls; the one it loses per question is a
     `primer` trial, so `paired_rows` voids every row and the model is withheld. The
@@ -709,6 +708,76 @@ def test_the_fluency_verdict_does_not_assert_a_dead_backend():
     assert "Excluded (calls went unanswered" not in md, (
         f"the fluency verdict asserts an unreachable backend for a model whose backend "
         f"answered {1 - lost:.1%} of its calls")
+
+
+def test_every_renderer_names_the_right_exclusion_reason():
+    """#338: `REASON_LABEL`'s note in `report.py` cites this test as the loop that makes a
+    seventh hardcoded phrasing impossible. It did not exist — `build_diff_soak_report` was
+    the seventh renderer, hardcoding "too many calls went unanswered" as settled fact at
+    two sites (the pooled paragraph and the by-depth `lead` dict) for a reason that also
+    covers a backend that answered every call and simply could not pair (#332). Reproduced
+    here with a TRIGGER-1 fixture — one arm with zero completed trials — that loses ZERO
+    calls, so an unhedged "calls went unanswered" is provably false: the counts printed
+    right next to it say `0/... calls lost`.
+
+    Every renderer that can withhold a model as `"unmeasured"`, plus dropeval's analogous
+    `"broken control"` (already covered end to end by
+    `test_the_report_names_the_real_exclusion_reason_not_a_hardcoded_one`, included here so
+    the loop this comment promises actually spans all six), is exercised."""
+    from terse.report import build_dropeval_report
+
+    diff_rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "depth": (i % 3) + 1,
+        "trials": TRIALS, "terse_ok": TRIALS, "terse_trials": TRIALS,
+        "diff_ok": 0, "diff_trials": 0,
+        "attempts": TRIALS, "fails": 0,
+    } for i in range(12)]
+    assert _unmeasured(diff_rows), "fixture must trip trigger 1 (a zero-trial arm)"
+    assert sum(r["fails"] for r in diff_rows) == 0, "fixture must lose zero calls"
+
+    fluency_rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
+        "raw_ok": TRIALS, "raw_trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS,
+        "primer_ok": 0, "primer_trials": 0,
+        "attempts": TRIALS, "fails": 0,
+    } for i in range(12)]
+    assert _unmeasured(fluency_rows)
+    assert sum(r["fails"] for r in fluency_rows) == 0
+
+    # dropeval's row shape (mirrors `_both_kinds`/`_rows` in test_dropeval_control_arm.py):
+    # a control that ran and scored 0% on every trial, which `_accuracy_gate` excludes as
+    # `"broken control"`.
+    def _dropeval_row(kind: str, qid: str) -> dict:
+        return {"qid": qid, "kind": kind, "trials": 1, "retrieve_ok": 1, "handle_ok": 1,
+                "answer_ok": 0, "answer_trials": 1, "retrieve_trials": 1, "handle_trials": 1,
+                "errors": 0, "attempts": 2, "control_ok": 0, "control_trials": 1}
+    dropeval_rows = ([_dropeval_row("recall", f"r{i}") for i in range(5)]
+                      + [_dropeval_row("precision", f"p{i}") for i in range(5)])
+
+    rendered = {
+        "markdown": build_diff_report({"m": diff_rows}),
+        "html": build_html_diff_report({"m": diff_rows}, "diff-form", "full-terse"),
+        "terminal": build_terminal_diff_report({"m": diff_rows}, color=False),
+        "diff-soak": build_diff_soak_report({"m": diff_rows}),
+        "fluency": build_fluency_report({"m": fluency_rows}, []),
+    }
+    for name, text in rendered.items():
+        # The unhedged claim: stating the backend went unreachable as the settled,
+        # sole cause. The hedged form ("Either too many calls went unanswered, or
+        # enough of them did that no question completed every trial on BOTH arms")
+        # is fine — it names the SECOND cause too, which is what actually happened.
+        assert "too many calls went unanswered, so" not in text, (
+            f"{name} states an unreachable backend as the settled cause for a model that "
+            f"lost zero calls")
+        assert "too many calls went unanswered at:" not in text, (
+            f"{name} states an unreachable backend as the settled cause for a model that "
+            f"lost zero calls")
+
+    dropeval_report = build_dropeval_report({"m": dropeval_rows})
+    assert "control arm failed" in dropeval_report
+    assert "too many calls went unanswered" not in dropeval_report
+    assert "no no-drop control arm was run" not in dropeval_report
 
 
 # --------------------------------------------------------------------------------------
