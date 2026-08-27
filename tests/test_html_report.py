@@ -98,23 +98,47 @@ def test_forest_plot_pass_fail_badges():
     assert svg.count("<circle") >= 4  # 2 models x 2 series
 
 
-def test_build_html_diff_report_unmeasured_verdict_names_both_possible_causes():
+def test_build_html_diff_report_unmeasured_verdict_blames_no_cause_it_cannot_show():
     # #330: html_report.py checked for "unpaired"/"exam too small" exclusion reasons that
-    # `ArmGap.excluded` never actually produces — report.py's `_gap` was designed to
-    # distinguish "backend down" from "backend up but too little paired" (see its
-    # docstring), but that pairing-loss detection was never implemented, so the only
-    # reason this code ever sees is "unmeasured". Force `arm_gap` to exclude via
-    # `_unmeasured`'s trigger #1 (an arm with zero completed trials) and check the
-    # rendered page names the pairing-loss possibility, not just the dead-backend one,
-    # since it genuinely can't tell which applies.
+    # `ArmGap.excluded` never actually produces, so the only reason this code ever sees is
+    # "unmeasured". Force `arm_gap` to exclude via `_unmeasured`'s trigger #1 (an arm with
+    # zero completed trials).
+    #
+    # #338 REPLACES what this asserts. The old version pinned the #332 hedge — "no model
+    # had enough questions completed by both arms ... one lost trial withholds the whole
+    # question" — on the premise that the renderer "genuinely can't tell which applies".
+    # It can: this fixture loses ZERO calls (`fails: 0`), so BOTH halves of that hedge
+    # were false, and the page said so beside a `0/10` count. `unmeasured_cause` picks the
+    # sentence from the loss total, and at zero loss it emits no transport claim at all.
     rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
              "trials": 1, "terse_ok": 1, "diff_ok": 1, "attempts": 1, "fails": 0,
              "terse_trials": 1, "diff_trials": 0} for i in range(10)]
     html = build_html_diff_report({"m": rows}, "diff-form", "full-terse")
     assert "NO VERDICT" in html
-    assert "no model had enough questions completed by both arms" in html
-    assert "one lost trial withholds the whole question" in html
+    assert "No calls were lost, so transport is not the cause" in html
+    assert "an arm completed zero trials" in html
+    # The claims that are false at zero loss, in this renderer's own spellings.
+    for phrase in ("unanswered", "returned no content", "unreachable"):
+        assert phrase not in html.casefold(), (
+            f"the page blames transport ({phrase!r}) for a run that lost no calls")
     assert "unpaired" not in html and "exam too small" not in html
+    # The markdown code span the shared vocabulary carries must render as markup, not as
+    # a literal backtick — `_esc_md` is the reason this renderer can borrow that prose.
+    assert "<code>--trials</code>" in html and "`--trials`" not in html
+
+
+def test_build_html_diff_report_names_transport_when_calls_actually_were_lost():
+    """The other side of the branch: `unmeasured_cause` must still say so when the run DID
+    lose calls, or #338's fix would have replaced one false sentence with a different one.
+    Trips `_unmeasured` trigger 2 — 50% loss, over `UNMEASURED_FAIL_SHARE`."""
+    rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
+             "trials": 2, "terse_ok": 1, "diff_ok": 1, "attempts": 2, "fails": 1,
+             "terse_trials": 1, "diff_trials": 1} for i in range(10)]
+    html = build_html_diff_report({"m": rows}, "diff-form", "full-terse")
+    assert "NO VERDICT" in html
+    assert "unanswered" in html, "a run that lost half its calls must say so"
+    assert "<code>returned no content</code>" in html
+    assert "No calls were lost" not in html
 
 
 def test_build_html_diff_report_no_calls_claim_only_when_actually_unmeasured():

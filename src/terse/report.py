@@ -269,7 +269,7 @@ ExclusionReason = Literal[
     "no control arm",
     "partial control coverage",
     "underpowered",
-    # Set by `_build_diff_style_report`'s per-depth table via `ArmGap._replace`, splitting
+    # Set by `build_diff_soak_report`'s per-depth table via `ArmGap._replace`, splitting
     # the transport half of "unmeasured" from the pairing half for that table only. It is a
     # real inhabitant of this type even though `_gap` never returns it, so leaving it out
     # would make the Literal a lie in exactly the direction it exists to prevent.
@@ -502,6 +502,46 @@ def exclusion_note(reasons: Mapping[str, ExclusionReason | None]) -> str:
         f"{label}: {', '.join(models)}" for label, models in sorted(by.items()))
 
 
+def unmeasured_cause(fails: int) -> str:
+    """The cause-and-remedy sentence for an `"unmeasured"` exclusion, CHOSEN BY THE COUNTS.
+
+    `"unmeasured"` has THREE producers, not the two every prose site named before #338:
+
+      1. `_unmeasured` trigger 1 — an arm whose `<form>_trials` sum to ZERO. It never ran,
+         or a merged/replayed pack carries rows that lack its key. Fires at `fails == 0`.
+      2. `_unmeasured` trigger 2 — loss share over `UNMEASURED_FAIL_SHARE`. Always `fails > 0`.
+      3. `_gap`'s `not pr` — the calls landed but left no question complete on both arms.
+
+    #332 hedged the prose across (2) and (3) — "either too many calls went unanswered, or
+    enough of them did that no question completed on BOTH arms". Both disjuncts name lost
+    calls, so the hedge is FALSE for (1), which is reachable with nothing lost at all: the
+    #338 reproduction renders `(0/36 calls lost)` and a sentence asserting calls went
+    unanswered six words later, plus a remedy pointing at a backend that answered
+    everything. A disjunction of two false claims is not a smaller version of one false
+    claim.
+
+    So the sentence is chosen by the only evidence that separates them — whether any call
+    was actually lost — and at zero loss no transport vocabulary is emitted at all. That is
+    what `test_every_renderer_names_the_right_exclusion_reason` greps for: at `fails == 0`
+    no renderer may say "unanswered", "unreachable", or "fix the backend"."""
+    if fails:
+        return (
+            " Either too many calls went unanswered, or enough of them did that no "
+            "question completed every trial on BOTH arms, leaving nothing comparable — "
+            "the counts above say which, and a low one means the second. An unanswered "
+            "call is not a wrong answer. Check stderr for a `returned no content` line "
+            "naming a `finish_reason` — `length` means raise max_tokens, "
+            "`content_filter` means the payload tripped a filter. If most calls were "
+            "answered, lower `--trials`: each extra trial is another chance for a "
+            "question to lose one and be dropped from both arms.")
+    return (
+        " No calls were lost, so transport is not the cause: either an arm completed zero "
+        "trials — it was never run, or a merged pack carries rows without its "
+        "`<form>_trials` key — or the trials that did run left no question complete on "
+        "both arms. Check that every arm named above actually ran, and lower `--trials` "
+        "if the rows show one arm short of the others.")
+
+
 def _not_measured_lines(
         withheld: dict[str, tuple[ExclusionReason | None, int, int, int]]) -> list[str]:
     """The withheld-models paragraph(s), with the counts that justify each one.
@@ -549,15 +589,11 @@ def _not_measured_lines(
                 f"**{REASON_HEADING.get(why or '', 'Not measured')}** — "
                 f"{REASON_LABEL.get(why or '', str(why))}, so no accuracy is published for: "
                 + ", ".join(f"`{m}` ({f}/{a} calls lost)" for m, f, a, _ in models)
-                + ". Either too many calls went unanswered, or enough of them did that no "
-                  "question completed every trial on BOTH arms, leaving nothing comparable "
-                  "— the counts above say which, and a low one means the second. An "
-                  "unanswered call is not a wrong answer. Check stderr for a `returned no "
-                  "content` line naming a `finish_reason` — `length` means raise "
-                  "max_tokens, `content_filter` means the payload tripped a filter. If the "
-                  "backend answered most calls, lower `--trials`: each extra trial is "
-                  "another chance for a question to lose one and be dropped from both "
-                  "arms.")
+                + "."
+                # Chosen by the counts, not hardcoded: this paragraph is reachable with
+                # ZERO calls lost (`_unmeasured` trigger 1), where every transport claim
+                # in the #332 hedge is false. See `unmeasured_cause`.
+                + unmeasured_cause(sum(f for _, f, _, _ in models)))
     out.append("")
     return out
 
@@ -1038,9 +1074,22 @@ def _exclusion_remedy(reason: ExclusionReason) -> str:
                     "compute it over a subset the reader was never told about. Re-run the "
                     "whole question set with the control on rather than merging packs.")
         case "unmeasured" | "unpaired":
-            return ("Too few calls completed on BOTH arms to compare — see the per-arm "
-                    "failure split above for which side lost them. Fix the backend and "
-                    "re-run.")
+            # This sentence asserts NOTHING about the present run, and that is the whole
+            # design. The other five exclusion sites pick their cause from the loss count
+            # (`unmeasured_cause`); this one is handed a reason and no counts —
+            # `dropeval_exclusion_bullets` receives a `DropevalVerdict`, which carries no
+            # per-arm failure totals — so it teaches the reader to read the split that is
+            # printed directly above instead. It previously said "Fix the backend and
+            # re-run" unconditionally, which neither reason licenses: `unpaired` means
+            # literally "no question completed on both arms" (so the backend answered),
+            # and `unmeasured` fires at zero calls lost whenever an arm completed no
+            # trials (#338). Threading the counts in here is the better end state and is
+            # deliberately NOT done in this change: it means widening `DropevalVerdict`,
+            # which is a wider blast radius than the false sentence justifies.
+            return ("Too few calls completed on BOTH arms to compare. Read the per-arm "
+                    "failure split above: a non-zero loss there is a transport problem "
+                    "and the run needs repeating; a zero means an arm completed no trials "
+                    "at all, so check that every arm named actually ran.")
         case "empty":
             return ("No rows of this kind were scored for this model — the pack carries "
                     "none, or a merged run lost them. Re-generate the question set for "
@@ -1942,11 +1991,17 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         # Not "no model left a question both arms completed": `_unmeasured` gates on
         # transport BEFORE pairing, so a model withheld by it can still have questions
         # that pair cleanly. Says what is true of every withheld model instead.
+        # It POINTS at the paragraph rather than re-listing the reasons. The old wording
+        # enumerated three ("an unreachable backend, calls lost until nothing paired, or
+        # too few questions"), which made this a FOURTH copy of the reason vocabulary —
+        # already drifted, since it had no entry for the producer that loses no calls at
+        # all (an arm with zero completed trials). The paragraph above states the reason
+        # and its remedy together, chosen from the counts; restating it here can only
+        # disagree with it (#338).
         out.append("- **NO VERDICT — nothing was scored.** Every model was withheld, so "
                    "this run says nothing about the diff form either way. The paragraph "
-                   "above names each model and its reason — an unreachable backend, calls "
-                   "lost until nothing paired, or too few questions to conclude from. The "
-                   "remedies differ, and only the first is a backend problem.")
+                   "above names each model, its reason, and the remedy that reason "
+                   "licenses; they are not the same remedy, so read it before re-running.")
     out.append("")
     return "\n".join(out)
 
@@ -2077,16 +2132,15 @@ def build_diff_soak_report(results: dict) -> str:
     out.append("")
     if unmeasured:
         out += [
-            "**Not measured** — too many calls went unanswered, so no accuracy "
-            "is published for: "
+            f"**{REASON_HEADING['unmeasured']}** — {REASON_LABEL['unmeasured']}, so no "
+            "accuracy is published for: "
             + ", ".join(
                 f"`{m}` ({sum(int(r.get('fails', 0)) for r in rs)}/"
                 f"{sum(int(r.get('attempts', 0)) for r in rs)} calls lost)"
                 for m, rs in sorted(unmeasured.items()))
-            + ". An unanswered call is not a wrong answer. Check stderr for a "
-              "`returned no content` line naming a `finish_reason` — `length` means "
-              "raise max_tokens, `content_filter` means the payload tripped a filter; "
-              "otherwise re-run once the backend is reachable.",
+            + "."
+            + unmeasured_cause(
+                sum(int(r.get("fails", 0)) for rs in unmeasured.values() for r in rs)),
             "",
         ]
     if withheld_depths:
@@ -2096,9 +2150,23 @@ def build_diff_soak_report(results: dict) -> str:
         # Grouped by reason: a slice withheld because its calls FAILED must not be
         # described as one where "the backend answered".
         for why in sorted({w for d in withheld_depths.values() for w in d}):
-            at = ", ".join(
-                f"`{m}` (depth {', '.join(str(d) for d in sorted(ds[why]))})"
-                for m, ds in sorted(withheld_depths.items()) if why in ds)
+            # Counts PER WITHHELD SLICE, not per model. They are the same disclosure the
+            # pooled paragraph makes, and they are what settles the reason for the reader:
+            # a slice at `0/20 calls lost` was not withheld by an unreachable backend, so
+            # the remedy `unmeasured_cause` picks below is checkable against the number
+            # printed beside it rather than taken on trust (#338).
+            per_model = []
+            slice_fails = slice_attempts = 0
+            for m, ds in sorted(withheld_depths.items()):
+                if why not in ds:
+                    continue
+                sl = [r for r in results[m] if r["depth"] in ds[why]]
+                f = sum(int(r.get("fails", 0)) for r in sl)
+                a = sum(int(r.get("attempts", 0)) for r in sl)
+                slice_fails, slice_attempts = slice_fails + f, slice_attempts + a
+                depths_txt = ", ".join(str(d) for d in sorted(ds[why]))
+                per_model.append(f"`{m}` (depth {depths_txt}; {f}/{a} calls lost)")
+            at = ", ".join(per_model)
             # The old branch tested `why == "x"`, a reason string nothing produces, so
             # the specific wording it guarded had been unreachable since #284 and every
             # withheld depth got the generic one. `"unpaired"` is set just above from
@@ -2107,8 +2175,7 @@ def build_diff_soak_report(results: dict) -> str:
             lead = {
                 "unpaired": "**Depths not compared** — the backend answered, but one arm "
                             "did not complete enough of the same questions at: ",
-                "unmeasured": "**Depths not measured** — too many calls went unanswered "
-                              "at: ",
+                "unmeasured": f"**Depths not measured** — {REASON_LABEL['unmeasured']} at: ",
             }.get(why, f"**{REASON_HEADING.get(why, 'Excluded')}** — "
                        f"{REASON_LABEL.get(why, why)} at: ")
             tail = (". Those depths are excluded from the verdict below rather than "
@@ -2117,6 +2184,14 @@ def build_diff_soak_report(results: dict) -> str:
                     ". Too few questions survived pairing at that depth for an absence "
                     "of drift to mean anything — check the `q` column against the "
                     "generated count before assuming none were lost.")
+            if why == "unmeasured":
+                # Over exactly the withheld slices, not the whole model: a depth withheld
+                # by a zero-trial arm can sit beside depths that lost calls, and the two
+                # licence different sentences. Before #338 this site asserted the
+                # transport cause unconditionally, and no test reached it — the pooled
+                # gate short-circuits `withheld_depths` (`model not in unmeasured` above),
+                # so a fixture that trips `_unmeasured` renders no by-depth prose at all.
+                tail += unmeasured_cause(slice_fails)
             out += [lead + at + tail, ""]
 
     gap_rows: dict[str, tuple[float, float, float, float]] = {}
@@ -2154,8 +2229,9 @@ def build_diff_soak_report(results: dict) -> str:
                    "pooled comparison on purpose: a depth slice can still be scored below, "
                    "and since #334 often is, so claiming the run measured nothing would "
                    "contradict a verdict printed two lines further down. The paragraphs "
-                   "above name each model and its reason — an unreachable backend, calls "
-                   "lost until nothing paired, or too few questions to conclude from.")
+                   "above name each model, its reason, and the remedy that reason "
+                   "licenses — see the note on the sibling line in `build_diff_report` for "
+                   "why they are not re-listed here.")
     if worst:
         out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "chain-form",
                                            "full-terse"))

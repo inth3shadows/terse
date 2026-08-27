@@ -684,11 +684,10 @@ def test_a_withheld_model_is_not_told_its_backend_was_unreachable():
 
 
 def test_the_fluency_verdict_does_not_assert_a_dead_backend():
-    """The seventh renderer. `REASON_LABEL`'s note claims a seventh phrasing is impossible
-    and cites `test_every_renderer_names_the_right_exclusion_reason` as the loop that makes
-    it so — that test does not exist anywhere in the repo, which is how
-    `build_fluency_report`'s verdict bullet kept hardcoding "calls went unanswered" through
-    the #332 sweep that hedged every other site.
+    """`build_fluency_report`'s verdict bullet kept hardcoding "calls went unanswered"
+    through the #332 sweep that hedged every other site — before #338 wrote the
+    `test_every_renderer_names_the_right_exclusion_reason` loop `REASON_LABEL`'s note
+    cites, nothing exercised this renderer against the wording it asserted.
 
     Here the backend answers 88.9% of its calls; the one it loses per question is a
     `primer` trial, so `paired_rows` voids every row and the model is withheld. The
@@ -709,6 +708,125 @@ def test_the_fluency_verdict_does_not_assert_a_dead_backend():
     assert "Excluded (calls went unanswered" not in md, (
         f"the fluency verdict asserts an unreachable backend for a model whose backend "
         f"answered {1 - lost:.1%} of its calls")
+
+
+def test_every_renderer_names_the_right_exclusion_reason():
+    """#338: `REASON_LABEL`'s note in `report.py` cites this test as the loop that makes a
+    seventh hardcoded phrasing impossible. It did not exist — `build_diff_soak_report` was
+    the seventh renderer, hardcoding "too many calls went unanswered" as settled fact at
+    two sites (the pooled paragraph and the by-depth `lead` dict) for a reason that also
+    covers a backend that answered every call and simply could not pair (#332). Reproduced
+    here with a TRIGGER-1 fixture — one arm with zero completed trials — that loses ZERO
+    calls, so an unhedged "calls went unanswered" is provably false: the counts printed
+    right next to it say `0/... calls lost`.
+
+    WHY THE ASSERTION IS A VOCABULARY BAN AND NOT A SUBSTRING MATCH. The first version of
+    this test grepped for two literal spellings (`"...unanswered, so"`, `"...unanswered
+    at:"`), and review mutated three separate reintroductions straight through it: the same
+    claim capitalised at a sentence start, the same claim ending in a period, and a
+    reworded one ("the backend went unreachable and too many calls were lost"). A test that
+    can only recognise the exact sentence it was written against does not stop a SEVENTH
+    phrasing — it stops a seventh copy of the sixth phrasing.
+
+    So the fixtures lose ZERO calls, and the ban is on the whole transport vocabulary,
+    case-insensitively. At zero loss there is no wording of "the calls did not come back"
+    that is true, so any renderer reaching for one is wrong however it spells it. The
+    literal `0/N calls lost` COUNT is deliberately not banned: it is the evidence that
+    disproves the claim, and it must keep printing.
+
+    WHY THERE ARE TWO DIFF-SOAK FIXTURES. `build_diff_soak_report` has two independent
+    exclusion paragraphs, and the pooled gate short-circuits the other: `withheld_depths`
+    is only populated `if model not in unmeasured` (report.py), so a fixture that trips
+    `_unmeasured` renders NO by-depth prose at all. Reviewing the first version caught
+    exactly this — its by-depth assertion was dead, and reverting that site left the suite
+    green. `soak_depth_rows` keeps the pooled gate quiet so the by-depth branch is reached.
+
+    Renderers covered: markdown, html, terminal, diff-soak (both paragraphs), fluency, and
+    dropeval — the six the `REASON_LABEL` note's claim ranges over."""
+    import re
+
+    from terse.report import build_dropeval_report
+
+    # Every way a renderer has said, or could say, that the calls did not come back. All
+    # false at zero loss. `returned no content` is a stderr diagnostic that only exists for
+    # a call that failed, so pointing at it is the same claim wearing a filename.
+    # `"many calls were lost"`, not `"calls were lost"`: the zero-loss sentence has to be
+    # able to say "No calls were lost", which is the disclosure, not the claim.
+    banned = ("unanswered", "unreachable", "fix the backend", "backend is reachable",
+              "returned no content", "many calls were lost", "calls did not")
+
+    def assert_no_transport_claim(name: str, text: str) -> None:
+        low = text.casefold()
+        for phrase in banned:
+            assert phrase not in low, (
+                f"{name} blames transport ({phrase!r}) for a model that lost zero calls; "
+                f"the counts it prints alongside say so")
+        # The counts must survive the ban — an exclusion with no numbers is not a
+        # disclosure, and a test that only forbids words would pass on an empty string.
+        assert re.search(r"\b0\s*/\s*\d+", text) or "0/0" in text or name in (
+            "terminal", "html"), f"{name} withheld a model without printing its counts"
+
+    diff_rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "depth": (i % 3) + 1,
+        "trials": TRIALS, "terse_ok": TRIALS, "terse_trials": TRIALS,
+        "diff_ok": 0, "diff_trials": 0,
+        "attempts": TRIALS, "fails": 0,
+    } for i in range(12)]
+    assert _unmeasured(diff_rows), "fixture must trip trigger 1 (a zero-trial arm)"
+    assert sum(r["fails"] for r in diff_rows) == 0, "fixture must lose zero calls"
+
+    # Pooled gate QUIET (depth 1 pairs cleanly and clears the floor), one depth slice
+    # withheld by a zero-trial arm — the only shape that reaches the by-depth paragraph.
+    soak_depth_rows = (
+        [{"qid": f"d1q{i}", "qtype": "lookup", "transform": "table", "depth": 1,
+          "trials": 1, "terse_ok": 1, "terse_trials": 1, "diff_ok": 1, "diff_trials": 1,
+          "attempts": 2, "fails": 0} for i in range(25)]
+        + [{"qid": f"d3q{i}", "qtype": "lookup", "transform": "table", "depth": 3,
+            "trials": 1, "terse_ok": 1, "terse_trials": 1, "diff_ok": 0, "diff_trials": 0,
+            "attempts": 2, "fails": 0} for i in range(10)])
+    assert not _unmeasured(soak_depth_rows), (
+        "the pooled gate must stay quiet, or `withheld_depths` is never populated and the "
+        "by-depth leg of this test is dead — the defect review found in its first version")
+
+    fluency_rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
+        "raw_ok": TRIALS, "raw_trials": TRIALS,
+        "terse_ok": TRIALS, "terse_trials": TRIALS,
+        "primer_ok": 0, "primer_trials": 0,
+        "attempts": TRIALS, "fails": 0,
+    } for i in range(12)]
+    assert _unmeasured(fluency_rows)
+    assert sum(r["fails"] for r in fluency_rows) == 0
+
+    # dropeval's `"unmeasured"`/`"unpaired"` remedy (`_exclusion_remedy`), which said "Fix
+    # the backend and re-run" for a reason whose own label is "no question completed on
+    # both arms". Rows: a control arm that completed ZERO trials, nothing lost.
+    dropeval_rows = [
+        {"qid": f"{k}{i}", "kind": k, "trials": 1, "retrieve_ok": 1, "handle_ok": 1,
+         "answer_ok": 1, "answer_trials": 1, "retrieve_trials": 1, "handle_trials": 1,
+         "errors": 0, "attempts": 2, "control_ok": 0, "control_trials": 0}
+        for k in ("recall", "precision") for i in range(5)]
+
+    rendered = {
+        "markdown": build_diff_report({"m": diff_rows}),
+        "html": build_html_diff_report({"m": diff_rows}, "diff-form", "full-terse"),
+        "terminal": build_terminal_diff_report({"m": diff_rows}, color=False),
+        "diff-soak": build_diff_soak_report({"m": diff_rows}),
+        "diff-soak-by-depth": build_diff_soak_report({"m": soak_depth_rows}),
+        "fluency": build_fluency_report({"m": fluency_rows}, []),
+        "dropeval": build_dropeval_report({"m": dropeval_rows}),
+    }
+    # Each leg must actually REACH its exclusion prose, or banning words from it proves
+    # nothing. Asserted per renderer with that renderer's own spelling of "withheld".
+    reached = {
+        "markdown": "Not measured", "html": "Not measured", "terminal": "excluded",
+        "diff-soak": "Not measured", "diff-soak-by-depth": "Depths not measured",
+        "fluency": "Excluded", "dropeval": "not gated",
+    }
+    for name, text in rendered.items():
+        assert reached[name] in text, (
+            f"{name} never reached its exclusion paragraph, so this leg pins nothing:\n{text}")
+        assert_no_transport_claim(name, text)
 
 
 # --------------------------------------------------------------------------------------
