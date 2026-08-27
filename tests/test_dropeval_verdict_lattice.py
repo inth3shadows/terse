@@ -20,6 +20,7 @@ import itertools
 import typing
 
 from terse.report import (
+    _FIXED_IDEAL_MIN_QUESTIONS,
     DROPEVAL_METRICS,
     REASON_HEADING,
     REASON_LABEL,
@@ -32,6 +33,7 @@ from terse.report import (
     dropeval_exclusion_bullets,
     dropeval_next_step_line,
     dropeval_verdict,
+    fixed_ideal_sufficient,
 )
 from terse.terminal_report import build_terminal_dropeval_report
 
@@ -301,7 +303,11 @@ def test_each_exclusion_reason_gets_its_own_bullet_naming_its_own_models():
     v = dropeval_verdict(fleet)
     assert v.metrics["accuracy"].excluded == {"nocontrol": "no control arm",
                                               "thin": "underpowered"}
-    bullets = dropeval_exclusion_bullets(v)
+    # Scoped to the accuracy bullets: since #335 the `thin` model also picks up a
+    # "measured, not concluded" bullet on each mechanism metric, which is a different fact
+    # and not what this test is about.
+    bullets = [b for b in dropeval_exclusion_bullets(v)
+               if b.startswith("- **final-accuracy: not gated")]
     assert len(bullets) == 2, bullets
     by_model = {b.split("`")[1]: b for b in bullets}
     assert "Re-run without `--no-control`" in by_model["nocontrol"]
@@ -410,3 +416,77 @@ def test_only_final_accuracy_claims_a_measured_control():
         "precision": "ideal (100%)",
         "accuracy": "no-drop control",
     }
+
+
+# --------------------------------------------------------------------------- #
+# 5. The fixed-ideal disclosure floor (#335)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_fixed_ideal_disclosure_threshold_is_five():
+    """Pinned to its VALUE, in both directions, for the reason #337 gives: every other test
+    here reads the constant and asserts a relative fact, so raising it to 6 would leave them
+    all green while changing what the tool publishes.
+
+    Its comment claims it is a DISCLOSURE convention rather than a Clopper-Pearson bound —
+    a comment that asserts a fact about the code is a test, so the absence of a derivation
+    is asserted too. Do not "improve" this into a statistical floor: `gen_drop_questions`
+    emits one recall and one precision question per drop-marked payload, and zero of 1,524
+    captured payloads carry a drop rule, so there is no distribution to calibrate against."""
+    assert _FIXED_IDEAL_MIN_QUESTIONS == 5
+    assert fixed_ideal_sufficient(5) and not fixed_ideal_sufficient(4)
+    assert not fixed_ideal_sufficient(None), "an unknown sample size is not a demonstrated one"
+
+
+def test_a_one_question_perfect_recall_run_does_not_authorize_a_ship():
+    """#335's reported symptom, end to end. `100% ±0 pts **PASS**` off ONE question used to
+    print `safe to enable drop-to-retrieve` — the `±0` is exact, not rounding: the SE of a
+    single all-right question is zero."""
+    v = dropeval_verdict({"m": _model(answer=1, retrieve=1, control=1, n=1)})
+    assert v.metrics["recall"].thin == {"m": 1}
+    assert v.metrics["recall"].directive is Directive.INSUFFICIENT
+    assert v.directive is Directive.INSUFFICIENT
+    md = build_dropeval_report({"m": _model(answer=1, retrieve=1, control=1, n=1)})
+    verdict = md.split("## Verdict", 1)[1]
+    assert "safe to enable drop-to-retrieve" not in verdict, verdict
+    assert "**INSUFFICIENT for enabling**" in verdict, verdict
+    assert "measured, not concluded for `m` (1 question)" in verdict, verdict
+
+
+def test_a_thin_sample_publishes_its_number_rather_than_withholding_it():
+    """The design decision the #335 branch argued at length: this is a DISCLOSURE floor, so
+    the measured percentage and its question count are both published and the model stays in
+    `gates` — the table and the chart still show it. Withholding would hide a real
+    measurement; only the word PASS is withheld."""
+    fleet = {"m": _model(answer=1, retrieve=1, control=1, n=1)}
+    v = dropeval_verdict(fleet)
+    assert "recall" in v.gates["m"], "a thin model must stay in the gates, not be excluded"
+    assert v.metrics["recall"].excluded == {}, "thin is not an exclusion"
+    assert v.metrics["recall"].worst is not None
+    table = build_dropeval_report(fleet).split("## Verdict", 1)[0]
+    assert "| 100% ±0 " in table, table
+    assert "measured, not concluded" in build_terminal_dropeval_report(fleet, color=False)
+
+
+def test_a_demonstrated_FAIL_publishes_at_any_question_count():
+    """The asymmetry, and the reason the floor cannot improve a verdict. One question,
+    `retrieve_ok=0`: a -100% gap is a demonstrated regression, and withholding it would let
+    a thin sample turn a FAIL into a non-verdict — the #332 defect this floor is written to
+    avoid reproducing."""
+    fleet = {"m": _model(answer=1, retrieve=0, control=1, n=1)}
+    v = dropeval_verdict(fleet)
+    assert v.metrics["recall"].thin == {}, "a FAIL is never recorded as merely thin"
+    assert v.directive is Directive.BLOCK
+    verdict = build_dropeval_report(fleet).split("## Verdict", 1)[1]
+    assert "**FAIL**" in verdict and "keep drop-to-retrieve off" in verdict
+
+
+def test_the_floor_never_moves_a_verdict_toward_SHIP():
+    """The #335 floor swept against the monotonicity ordering: over every 2-model fleet,
+    lowering a model to one question per kind can only hold the directive still or raise
+    it. A floor that could lower it would be the #332 defect, one metric over."""
+    for fleet in _fleets(2):
+        before = dropeval_verdict(fleet).directive
+        thin = {m: [r for r in rows if r["qid"].endswith("-q0")] for m, rows in fleet.items()}
+        after = dropeval_verdict(thin).directive
+        assert after >= before or before is Directive.BLOCK, (before, after)
