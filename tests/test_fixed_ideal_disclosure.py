@@ -286,13 +286,17 @@ def test_insufficient_for_enabling_names_an_ungated_accuracy_and_its_real_remedy
     stays ungated at any n."""
     md = build_dropeval_report({"m": _mixed(2, 2, control=False)})
     verdict = md.split("## Verdict", 1)[1]
-    assert "INSUFFICIENT for enabling" in verdict, verdict
-    assert "every metric cleared tolerance" not in verdict, verdict
-    assert "never gated" in verdict, verdict
+    # Scoped to the INSUFFICIENT bullet: "not gated" is also the heading of the
+    # `final-accuracy: not gated` line above, so a whole-section search would match that
+    # instead and pass whatever this branch says.
+    bullet = next(line for line in verdict.splitlines()
+                  if "INSUFFICIENT for enabling" in line)
+    assert "every metric cleared tolerance" not in bullet, bullet
+    assert "final-accuracy was not gated" in bullet, bullet
     # The REMEDY sentence specifically, not the phrase "no-drop control arm" — that also
     # appears in the "final-accuracy: not gated" line above, so asserting it alone passed
     # even with the remedy hardcoded to the wrong branch. Caught by mutation.
-    assert "more questions alone leaves final-accuracy ungated" in verdict, verdict
+    assert "more questions alone leaves final-accuracy ungated" in bullet, bullet
 
 
 def test_insufficient_for_enabling_keeps_the_simple_remedy_when_accuracy_was_gated():
@@ -346,3 +350,155 @@ def test_an_unscorable_run_says_no_data_rather_than_nothing():
                 "answer_ok": 3, "handle_ok": 3, "errors": 0, "treatment_errors": 0,
                 "control_errors": 0, "attempts": 3}]
     assert "no data" in build_terminal_dropeval_report({"m": nothing}, color=False)
+
+
+def test_a_model_no_gate_could_score_blocks_the_ship_decision():
+    """`_worst_case_gap` only sees models that WERE scored, so an unscored one vanished.
+
+    With `A` fully measured and `B` carrying no recall questions, the report printed
+    "`B` ... absent from the verdict below, not passing it" and then, four lines later,
+    "safe to enable drop-to-retrieve" — the bullet and the directive contradicting each
+    other in the same section. An exclusion moving a verdict from blocking to authorizing
+    is the one thing #332 forbids."""
+    md = build_dropeval_report({"A": _mixed(20, 20), "B": _mixed(0, 20)})
+    verdict = md.split("## Verdict", 1)[1]
+    assert "safe to enable drop-to-retrieve" not in verdict, verdict
+    assert "Not concluded" in verdict, verdict
+    assert "`B`" in verdict, verdict
+    # ...and the whole-fleet case still ships.
+    ok = build_dropeval_report({"A": _mixed(20, 20), "B": _mixed(20, 20)})
+    assert "safe to enable drop-to-retrieve" in ok.split("## Verdict", 1)[1]
+
+
+def test_the_insufficient_remedy_reads_the_accuracy_exclusion_reason():
+    """Three accuracy states, three different remedies — and none may contradict the
+    "final-accuracy: not gated" line printed directly above it.
+
+    Keyed on `accuracy_worst is not None` alone, an `"underpowered"` exclusion (control arm
+    running, just too few paired questions) was told to "re-run with the no-drop control
+    arm" — sending an operator to switch on something already on, two lines under a
+    sentence saying it ran. Review finding 2 on #300, in a third branch."""
+    # (a) control ran, accuracy underpowered -> questions only, and say the control is on.
+    v = build_dropeval_report({"m": _mixed(2, 2)}).split("## Verdict", 1)[1]
+    assert "control arm is already on" in v, v
+    assert "re-run with the no-drop control arm" not in v, v
+    # (d) control ran and its calls failed -> fixing it, not adding it.
+    broken = [dict(r, control_ok=0, control_trials=0) for r in _mixed(2, 2)]
+    v4 = build_dropeval_report({"m": broken}).split("## Verdict", 1)[1]
+    assert "re-run with the no-drop control arm" not in v4, v4
+    # (e) control on only some rows -> coverage, not addition. Asserted strictly: the
+    # first spelling used `A not in v or B in v`, which is satisfied by B alone and so
+    # passed with the wrong remedy in place. Mutation caught it.
+    partial = [dict(r, qid=f"x{i}") for i, r in enumerate(_mixed(2, 2, control=False))]
+    partial += [dict(r, qid=f"y{i}") for i, r in enumerate(_mixed(2, 2))]
+    b5 = next(line for line in build_dropeval_report({"m": partial}).splitlines()
+              if "INSUFFICIENT for enabling" in line)
+    assert "every question carries the control arm" in b5, b5
+    assert "re-run with the no-drop control arm" not in b5, b5
+    # (b) no control at all -> the control remedy is the load-bearing half.
+    v2 = build_dropeval_report({"m": _mixed(2, 2, control=False)}).split("## Verdict", 1)[1]
+    assert "more questions alone leaves final-accuracy ungated" in v2, v2
+    # (c) accuracy gated and passing -> neither qualifier.
+    v3 = build_dropeval_report({"m": _mixed(2, 30)}).split("## Verdict", 1)[1]
+    assert "every metric cleared tolerance" in v3, v3
+    assert "control arm is already on" not in v3, v3
+
+
+def test_the_chart_badge_itself_is_downgraded_not_merely_annotated():
+    """A caveat beside a green PASS does not unsay it.
+
+    The first cut appended "(too few to publish a PASS)" under a bar whose badge still read
+    `PASS`, while the markdown read `**INSUFFICIENT**` for the same run. A badge is what a
+    reader takes away, so the disclosure has to BE the badge."""
+    from terse.terminal_report import build_terminal_dropeval_report
+    chart = build_terminal_dropeval_report({"A": _mixed(1, 1, control=False)}, color=False)
+    recall_section = chart.split("no-overfetch:")[0]
+    # The BADGE line, not the section: the note text itself contains the words "publish a
+    # PASS", so `"PASS" not in section` collides with it and would pass either way. This
+    # file has now shipped two assertions that matched an unrelated line; check the token
+    # where it is actually rendered.
+    badges = [ln.split()[-1] for ln in recall_section.splitlines()
+              if ln.strip().endswith(("PASS", "FAIL", "INSUFFICIENT"))
+              and "publish" not in ln]
+    assert badges == ["INSUFFICIENT"], f"{badges}\n{chart}"
+
+
+def test_only_the_thin_model_loses_its_badge():
+    """Per model, matching the markdown — not a section-wide caveat.
+
+    A fleet-wide note put a caveat on an ample model's PASS that was not about it."""
+    from terse.terminal_report import build_terminal_dropeval_report
+    chart = build_terminal_dropeval_report(
+        {"ample": _mixed(20, 20, control=False), "thin": _mixed(1, 20, control=False)},
+        color=False)
+    recall = chart.split("no-overfetch:")[0]
+    badges = [ln.split()[-1] for ln in recall.splitlines() if ln.strip().endswith(
+        ("PASS", "FAIL", "INSUFFICIENT"))]
+    assert badges == ["PASS", "INSUFFICIENT"], f"{badges}\n{recall}"
+
+
+def test_a_failing_bar_is_never_relabelled_INSUFFICIENT():
+    """The badge override only ever weakens a PASS. A FAIL at any n stays a FAIL."""
+    from terse.terminal_report import build_terminal_dropeval_report
+    rows = [dict(r, retrieve_ok=0) for r in _mixed(1, 0, control=False)]
+    chart = build_terminal_dropeval_report({"m": rows}, color=False)
+    assert "FAIL" in chart, chart
+    assert "INSUFFICIENT" not in chart.split("no-overfetch:")[0], chart
+
+
+def test_handle_accuracy_is_n_a_when_no_recall_rows_carried_it():
+    """The sibling cells were changed to `n/a` and this one was missed.
+
+    `handle-accuracy` is computed from `recall_rows`, so a run with none printed `0% ±0` —
+    a metric that never ran rendered as a total failure of it, in a row whose neighbouring
+    cells already said `n/a` for exactly that reason."""
+    row = next(line for line in
+               build_dropeval_report({"m": _mixed(0, 20)}).splitlines()
+               if line.startswith("| `m`"))
+    assert row.count("| n/a ") == 2, row      # retrieve-recall AND handle-accuracy
+    assert "| 0% ±0 |" not in row, row
+
+
+def test_the_docstring_claims_about_the_table_match_the_rendered_table():
+    """Three rounds, three false comment claims — so this one is checked by execution.
+
+    `_format_worst_case_line`'s docstring reasons about which columns the dropeval table
+    has. The round-2 rewrite over-tightened "no CORRESPONDING column for no-overfetch"
+    into "no column at all", which the header contradicts. #338 is open for this class;
+    the durable fix is to assert the claim rather than restate it."""
+    import inspect
+
+    from terse import report
+    doc = inspect.getdoc(report._format_worst_case_line)
+    header = next(line for line in
+                  build_dropeval_report({"m": _mixed(1, 1)}).splitlines()
+                  if line.startswith("| Model"))
+    cols = [c.strip() for c in header.strip("|").split("|")]
+    assert "recall q" in cols, cols
+    assert "precision (no-overfetch)" in cols, cols
+    assert not any(c.startswith("no-overfetch q") or c == "precision q" for c in cols), cols
+    assert "`recall q` column" in doc
+    assert "no question-COUNT column for it" in doc, doc
+
+
+def test_every_accuracy_exclusion_reason_has_a_remedy():
+    """Coverage as an INVARIANT, not a fixture per reason.
+
+    Three of these reasons got the wrong remedy because the branch keyed on "is there an
+    exclusion" and let everything else fall through to one default. Two of them are also
+    awkward to reach through `build_dropeval_report` — `"broken control"` in particular —
+    so a per-reason fixture suite would have silently skipped them. Asserting the map
+    covers every reason `_accuracy_gate` can return catches the NEXT new reason too, which
+    a fixture suite by construction cannot."""
+    from terse.report import _ACCURACY_REMEDY_BY_REASON, REASON_LABEL
+
+    # Reasons `_accuracy_gate` / `_gap` can return for the accuracy metric.
+    reachable = {"no control arm", "partial control coverage", "broken control",
+                 "underpowered", "unmeasured", "empty"}
+    assert reachable <= set(REASON_LABEL), reachable - set(REASON_LABEL)
+    missing = reachable - set(_ACCURACY_REMEDY_BY_REASON)
+    assert not missing, f"no remedy for accuracy exclusion reason(s): {sorted(missing)}"
+    # ...and no remedy tells an operator to ADD a control arm that already ran.
+    for reason in ("broken control", "partial control coverage", "underpowered"):
+        assert "re-run with the no-drop control arm" not in _ACCURACY_REMEDY_BY_REASON[reason], (
+            f"{reason!r}'s remedy says to add a control arm, but one already ran")

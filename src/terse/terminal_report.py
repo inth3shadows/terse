@@ -189,7 +189,13 @@ def forest_bar_lines(rows: list[dict[str, Any]], form_label: str, control_label:
     """Two-line-per-model forest plot: a 0%-100% track per series (point + 95% CI
     whisker), plus a pass/fail badge on the form-series line. `rows`: dicts with
     model/form_acc/form_ci/control_acc/control_ci/passed — same shape as
-    html_report.forest_plot's input, so the two stay easy to keep in sync."""
+    html_report.forest_plot's input, so the two stay easy to keep in sync.
+
+    An optional `badge` on a row REPLACES the one derived from `passed` (#335). Appending a
+    caveat beside a green PASS does not unsay it: the chart printed `PASS` and, on the next
+    line, "too few to publish a PASS", while the markdown printed **INSUFFICIENT** for the
+    same run. A badge is what a reader takes away, so the disclosure has to be the badge.
+    Only ever used to WEAKEN a PASS — a FAIL is never overridden."""
     if not rows:
         return "  (no data)"
     enabled = _color_enabled() if color is None else color
@@ -199,6 +205,8 @@ def forest_bar_lines(rows: list[dict[str, Any]], form_label: str, control_label:
     for r in rows:
         badge = "PASS" if r["passed"] else "FAIL"
         badge_sgr = "32" if r["passed"] else "31"
+        if r["passed"] and r.get("badge"):
+            badge, badge_sgr = r["badge"], "33"   # amber: neither a pass nor a failure
         c_track = _c("36", _track(r["control_acc"], r["control_ci"], "○"), enabled)
         f_track = _c("35", _track(r["form_acc"], r["form_ci"], "●"), enabled)
         lines.append(f"  {r['model'][:label_w]:<{label_w}}  {c_track}")
@@ -321,12 +329,21 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None,
         # badge #335 exists to stop publishing, on the surface a reader sees first, under a
         # docstring promising the two "can never disagree".
         if key in ("recall", "precision"):
-            counts = [sum(1 for r in rows if r.get("kind") == key)
-                      for m, rows in results.items() if m in gaps and key in gaps[m]]
-            n = min(counts) if counts else None
-            if not fixed_ideal_sufficient(n) and any(r["passed"] for r in plot_rows):
-                section += (f"\n  (n={n} question{'' if n == 1 else 's'} — too few to "
-                            f"publish a PASS; the bar is the measurement, not a verdict)")
+            per_model = {m: sum(1 for r in rows if r.get("kind") == key)
+                         for m, rows in results.items() if m in gaps and key in gaps[m]}
+            n = min(per_model.values()) if per_model else None
+            # PER MODEL, matching the markdown's per-model badge rather than a fleet-wide
+            # note: a run with one thin model and one ample one used to annotate the whole
+            # section, so the ample model's PASS carried a caveat that was not about it.
+            for row in plot_rows:
+                if not fixed_ideal_sufficient(per_model.get(row["model"])):
+                    row["badge"] = "INSUFFICIENT"
+            if not fixed_ideal_sufficient(n):
+                section = f"{label}:\n" + forest_bar_lines(
+                    plot_rows, label, control_label, color=color)
+                section += (f"\n  (fewest n={n} question{'' if n == 1 else 's'} — too few "
+                            f"to publish a PASS; the bars are the measurement, not a "
+                            f"verdict)")
         # Per-metric since #335: `excluded` used to be a flat {model: reason} that only
         # ever described accuracy, so a withheld recall bar would vanish with no note.
         if excluded.get(key):
