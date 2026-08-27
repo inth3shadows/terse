@@ -31,6 +31,7 @@ from .report import (
     _worst_case_gap,
     arm_gap,
     passes_tolerance,
+    unmeasured_cause,
 )
 
 # --- palette (dataviz skill reference instance) ---------------------------------
@@ -103,6 +104,20 @@ _GAP = 2  # surface-gap between touching/stacked marks
 
 def _esc(s: Any) -> str:
     return _html.escape(str(s))
+
+
+def _esc_md(s: str) -> str:
+    """Escape, then render the shared vocabulary's markdown `code` spans as `<code>`.
+
+    The exclusion prose lives in one place (`report.unmeasured_cause`) so the six renderers
+    cannot drift apart on the CLAIM (#338); this is the markup half of borrowing it, and it
+    runs after escaping so a backtick cannot smuggle a tag through."""
+    out, parts = "", _esc(s).split("`")
+    for i, part in enumerate(parts):
+        # Odd indices are between a pair of backticks. A trailing unpaired one stays
+        # literal rather than opening a tag that never closes.
+        out += f"<code>{part}</code>" if i % 2 and i < len(parts) - 1 else part
+    return out
 
 
 def _rounded_end_path(x_from: float, x_to: float, y: float, h: float, r: float = 4) -> str:
@@ -546,11 +561,11 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
         reasons_present = set(excluded.values()) if excluded else set()
         only_unmeasured = reasons_present == {"unmeasured"}
         if only_unmeasured:
-            why = ("nothing could be compared. Either no model returned enough calls to "
-                   "score, or the backend answered but no model had enough questions "
-                   "completed by both arms to score a gap — check stderr for a <code>"
-                   "returned no content</code> line, and/or lower <code>--trials</code> "
-                   "and re-run.")
+            # Chosen by the counts for the same reason as the per-reason tail below: this
+            # banner is the most-quoted artifact of a run, and at zero calls lost every
+            # transport clause of the old hedge was false (#338).
+            why = "nothing could be compared." + _esc_md(unmeasured_cause(sum(
+                int(r.get("fails", 0)) for m in excluded for r in results.get(m, []))))
         elif reasons_present:
             why = ("nothing could be compared — see the exclusion list below for why "
                    "each model was withheld.")
@@ -568,13 +583,14 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
             by_reason.setdefault(reason or "unmeasured", []).append(model)
         for why, models in sorted(by_reason.items()):
             names = ", ".join(f"<code>{_esc(m)}</code>" for m in models)
-            # Same reasoning as `only_unmeasured` above: `"unmeasured"` is the only
-            # reason this branch ever sees, and it can mean either an unanswered call or
-            # a paired-trial loss, so the tail names both instead of asserting one.
-            tail = (" An unanswered call is not a wrong answer — check stderr for a "
-                    "<code>returned no content</code> line. Or, a question counts only "
-                    "when every arm answered all of its trials, so one lost trial "
-                    "withholds the whole question." if why == "unmeasured" else "")
+            # Same reasoning as `only_unmeasured` above, but chosen by the COUNTS rather
+            # than hedged: naming both lost-call causes is still false for the third
+            # producer, an arm that completed zero trials with nothing lost (#338). The
+            # shared helper emits no transport vocabulary at all in that case.
+            tail = ""
+            if why == "unmeasured":
+                tail = _esc_md(unmeasured_cause(sum(
+                    int(r.get("fails", 0)) for m in models for r in results.get(m, []))))
             verdict_html += (f'<p>{_esc(REASON_HEADING.get(why, "Excluded"))} — '
                              f'{_esc(REASON_LABEL.get(why, why))} for: {names}.{tail}</p>')
 
