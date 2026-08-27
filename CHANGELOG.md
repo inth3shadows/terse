@@ -13,6 +13,30 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [Unreleased]
+
+### Fixed
+
+- **A fixed-ideal metric can no longer print PASS off a handful of questions** (`#335`).
+  Recall and no-overfetch gate against a fixed 100% ideal, so they never pair — which meant
+  `_MIN_PAIRED_QUESTIONS`, whose whole job is to stop a thin sample buying a PASS, counts
+  PAIRED questions and so had never applied to either of them. A one-question recall run
+  printed `100% ±0 pts **PASS**` and `safe to enable drop-to-retrieve`: maximum confidence
+  off a single question, with the `±0` not a rounding artifact but the exact SE of a sample
+  that is all-right or all-wrong.
+  `_FIXED_IDEAL_MIN_QUESTIONS = 5` is a **disclosure threshold, not a statistical floor**,
+  and the distinction is deliberate: the metric has never run on real data (zero of 1,524
+  captured payloads have a drop rule selected), so there is no distribution to calibrate a
+  Clopper-Pearson bound against, and inventing one would be a fabricated justification
+  rather than an admitted convention. Nothing is withheld — the percentage and its question
+  count are both published, and the model stays in the chart. What a thin sample cannot buy
+  is the word PASS. A FAIL still publishes at any `n`, because an exclusion must never be
+  able to improve a verdict.
+
+## [0.28.7] - 2026-08-27
+
 ### Fixed
 
 - **Withholding a model from a gate can no longer authorize a ship** (`#342`, `#344`).

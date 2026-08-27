@@ -1,0 +1,11 @@
+# Per-repo config for `mutate` (~/.local/bin/mutate). The RUNNER and its mutation
+# patterns are shared; only this file is repo-specific.
+test = "uv run --quiet python -m pytest -q -p no:randomly"
+
+# Proves the mutant is what the interpreter actually loaded. Without it a stale .pyc
+# yields a FALSE "survived" — a same-size edit (0.05 -> 0.06) keeps (mtime, size)
+# valid, so CPython reuses bytecode from the previous revision.
+verify = "uv run --quiet python -c 'import terse.report'"
+
+[known_gap]
+# label = "why this mutant is equivalent / not worth pinning"

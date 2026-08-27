@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from .report import (
+    _FIXED_IDEAL_MIN_QUESTIONS,
     DROPEVAL_METRICS,
     _ci,
     _sum,
@@ -312,7 +313,17 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None,
         # markdown. One sentence consumed by two renderers only removes disagreement if
         # both renderers carry what it refers to.
         excluded = v.metrics[key].excluded
-        note = f"  ({exclusion_note(excluded)})" if excluded else ""
+        parts = [exclusion_note(excluded)] if excluded else []
+        # Thin samples get named here too, for the same reason the exclusions do: the
+        # shared directive sentence ends "Each model above is named with the reason its
+        # metric did not conclude", and a referent the chart does not carry makes that
+        # sentence false in the chart and true in the markdown.
+        thin = v.metrics[key].thin
+        if thin:
+            parts.append("measured, not concluded — fewer than "
+                         f"{_FIXED_IDEAL_MIN_QUESTIONS} questions: "
+                         + ", ".join(f"{m} (n={n})" for m, n in sorted(thin.items())))
+        note = f"  ({'; '.join(parts)})" if parts else ""
         if not plot_rows:
             if note:
                 sections.append(f"{label}:\n{note}")

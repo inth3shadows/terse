@@ -586,6 +586,43 @@ def _not_measured_lines(
 # `tests/test_codec_verdict.py`; #337 added the VALUE, which nothing held.)
 _CODEC_MIN_TRIALS = 20
 
+# Below this many questions, a fixed-ideal metric prints INSUFFICIENT instead of PASS
+# (#335). A DISCLOSURE THRESHOLD, NOT A STATISTICAL FLOOR — deliberately, and the
+# distinction is the whole design:
+#
+# `_MIN_PAIRED_QUESTIONS` and `_CODEC_MIN_TRIALS` are Clopper-Pearson numbers; each says
+# what a zero-failure run bounds the true failure rate to. This one cannot be, because
+# there is nothing to calibrate against. Measured 2026-08-26 on a live 1,524-payload
+# capture corpus across 39 tools: **zero** payloads had a drop rule selected, so
+# `gen_drop_questions` produced zero recall questions and this metric has never run on
+# real data. Deriving a bound from a distribution that does not exist would be a
+# fabricated justification, which is worse than an admitted convention (#337's lesson).
+#
+# So this does not WITHHOLD. The measured percentage and its question count are both
+# published; what a thin sample cannot buy is the word PASS. A FAIL always publishes at
+# any n — the asymmetry `_MIN_PAIRED_QUESTIONS`' comment argues for at length, because an
+# exclusion must never be able to improve a verdict.
+#
+# Calibrate this into a real floor once a live policy actually configures a drop rule
+# (#271, #273) and the metric produces its first real question count.
+_FIXED_IDEAL_MIN_QUESTIONS = 5
+
+
+def fixed_ideal_sufficient(n: int | None) -> bool:
+    """Is `n` questions enough for a fixed-ideal metric to publish a PASS? (#335)
+
+    THE predicate, in one place. The first cut of #335 downgraded only the BADGE, inside
+    `_format_worst_case_line`, and review found the decision four lines below still reading
+    `verdict.passed`: a 2-question run printed `**INSUFFICIENT**` and then "safe to enable
+    drop-to-retrieve". A cosmetic fix that leaves the authorization intact is worse than
+    none — it reads as handled. On the lattice there is only one decision point, so the
+    predicate now feeds `Directive.INSUFFICIENT` and every renderer inherits it.
+
+    `None` is NOT sufficient: a metric whose sample size could not be determined has not
+    demonstrated one."""
+    return n is not None and n >= _FIXED_IDEAL_MIN_QUESTIONS
+
+
 _VERDICT_RANK = {"SAFE": 0, "UNRESOLVED": 1, "UNSAFE": 2}  # worst wins when grouping models
 
 
@@ -1014,11 +1051,22 @@ def _exclusion_remedy(reason: ExclusionReason) -> str:
 
 
 class MetricVerdict(NamedTuple):
-    """One gate's outcome: the worst SCORED model, who was withheld and why, and where
-    the two together put the metric on the lattice."""
+    """One gate's outcome: the worst SCORED model, who was withheld and why, who was
+    measured on too thin a sample to buy a PASS, and where all three put the metric on the
+    lattice."""
     metric: Metric
     worst: GapVerdict | None
     excluded: dict[str, ExclusionReason]
+    # model -> question count, for models scored on fewer than `_FIXED_IDEAL_MIN_QUESTIONS`
+    # questions whose gap nonetheless CLEARS tolerance (#335). Deliberately NOT an
+    # exclusion: the measured percentage and its question count are both published, and the
+    # model stays in `gates` so the table and the chart still show it. What a thin sample
+    # cannot buy is the word PASS.
+    #
+    # Only ever populated for a would-be PASS, which is what keeps the #335 floor from
+    # being able to improve a verdict — the same asymmetry `_MIN_PAIRED_QUESTIONS` argues
+    # for, and the reason a demonstrated FAIL publishes at any n.
+    thin: dict[str, int]
     directive: Directive
 
 
@@ -1057,6 +1105,7 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
     gates: dict[str, dict[Metric, tuple[float, float, float, float]]] = {}
     excluded_by_metric: dict[Metric, dict[str, ExclusionReason]] = {
         m: {} for m, _, _ in DROPEVAL_METRICS}
+    thin_by_metric: dict[Metric, dict[str, int]] = {m: {} for m, _, _ in DROPEVAL_METRICS}
     for model, rows in results.items():
         if not rows:
             # WITHHELD, not skipped. `continue` here dropped the model out of `gates` AND
@@ -1093,6 +1142,14 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
                 continue
             acc, se = _form_stats(kind_rows, "retrieve_ok")
             gates[model][mech] = (acc, se, 1.0, 0.0)
+            # #335. Recall and no-overfetch gate against a FIXED 100% ideal, so they never
+            # pair, so `_MIN_PAIRED_QUESTIONS` — which counts PAIRED questions — never
+            # applied to them at all. A one-question recall run printed `100% ±0 pts
+            # **PASS**` and `safe to enable drop-to-retrieve`: maximum confidence off a
+            # single question, with the `±0` not a rounding artifact but the exact SE of a
+            # sample that is all-right or all-wrong.
+            if not fixed_ideal_sufficient(len(kind_rows)) and passes_tolerance(acc - 1.0):
+                thin_by_metric[mech][model] = len(kind_rows)
         g = _accuracy_gate(rows)
         if g.excluded:
             excluded_by_metric["accuracy"][model] = g.excluded
@@ -1113,7 +1170,12 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
         # SCORED model contributes SHIP or BLOCK. `max()` over both — so a withheld model
         # can only ever make the verdict stricter, and a demonstrated FAIL is never
         # displaced by one. `default` covers a metric no model reached at all.
+        thin = thin_by_metric[metric]
         outcomes = [_reason_directive(r) for r in excluded.values()]
+        # A thin would-be PASS joins the lattice as INSUFFICIENT rather than being removed
+        # from the gate. `max()` then does the asymmetry for free: if any model actually
+        # FAILS, `worst` contributes BLOCK and outranks every one of these.
+        outcomes += [Directive.INSUFFICIENT] * len(thin)
         if worst is not None:
             outcomes.append(Directive.SHIP if worst.passed else Directive.BLOCK)
         # `default` fires for an empty fleet — no model scored, none withheld, nothing
@@ -1123,7 +1185,7 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
         # stop before reading it today, and a value nothing reads today is read by the next
         # consumer.
         metrics[metric] = MetricVerdict(
-            metric, worst, excluded, max(outcomes, default=Directive.NOT_CONCLUDED))
+            metric, worst, excluded, thin, max(outcomes, default=Directive.NOT_CONCLUDED))
 
     # A dead backend is NOT_CONCLUDED outright rather than `max()`-ed with the metrics: the
     # numbers a half-failed run produces are counting transport errors, so promoting one of
@@ -1151,13 +1213,26 @@ def _by_reason(excluded: dict[str, ExclusionReason]) -> list[tuple[ExclusionReas
 
 
 def dropeval_exclusion_bullets(v: DropevalVerdict) -> list[str]:
-    """The `not gated` bullets, one per (metric, reason), shared by both renderers."""
+    """The `not gated` / `not concluded` bullets, one per (metric, reason), shared by both
+    renderers. Thin samples get their own bullet because they are a different fact: the
+    model WAS measured and the number IS published — see `MetricVerdict.thin`."""
     out = []
     for metric, label, _ in DROPEVAL_METRICS:
         for reason, models in _by_reason(v.metrics[metric].excluded):
             names = ", ".join(f"`{m}`" for m in models)
             out.append(f"- **{label}: not gated for {names}** — {REASON_LABEL[reason]}. "
                        + _exclusion_remedy(reason))
+        thin = v.metrics[metric].thin
+        if thin:
+            names = ", ".join(f"`{m}` ({n} question{'' if n == 1 else 's'})"
+                              for m, n in sorted(thin.items()))
+            out.append(
+                f"- **{label}: measured, not concluded for {names}** — fewer than "
+                f"{_FIXED_IDEAL_MIN_QUESTIONS} questions (#335). The percentage above is "
+                "real and is not withheld; what this many questions cannot buy is the word "
+                "PASS, because a fixed-ideal metric never pairs and so never met the "
+                "paired-question floor the other gates use. Generate more questions and "
+                "re-run. A FAIL still publishes at any n.")
     return out
 
 
@@ -1211,7 +1286,7 @@ def dropeval_directive_line(v: DropevalVerdict) -> str:
         # of a kind was withheld from that kind's gate instead of scored at a fabricated
         # 0%, and the sentence would then have asserted a pass for a metric that was never
         # measured — the same over-claim, in the metric it was written to avoid.
-        withheld = {label: sorted(v.metrics[m].excluded)
+        withheld = {label: sorted(set(v.metrics[m].excluded) | set(v.metrics[m].thin))
                     for m, label, _ in DROPEVAL_METRICS
                     if v.metrics[m].directive is not Directive.SHIP}
         if not withheld:
@@ -1237,6 +1312,13 @@ def dropeval_directive_line(v: DropevalVerdict) -> str:
         if mech_ok:
             lead = ("recall and no-overfetch clear tolerance for the worst model, so the "
                     "mechanism works, but the OUTCOME impact of dropping is unmeasured")
+        elif any(v.metrics[m].thin and not v.metrics[m].excluded
+                 for m in ("recall", "precision")):
+            # Measured, not missing. Saying "not gated" here would be the #335 defect
+            # inverted: the numbers ARE published and the reader can see them, so the
+            # sentence has to be about their weight, not their absence.
+            lead = ("the drop-to-retrieve mechanism was measured on too few questions to "
+                    "conclude anything from a clean result — not concluded")
         else:
             lead = ("the drop-to-retrieve MECHANISM itself was not gated, so nothing "
                     "downstream of it means anything — not gated")
@@ -1253,8 +1335,8 @@ def dropeval_directive_line(v: DropevalVerdict) -> str:
                       f"`{acc.worst.model}` at {acc.worst.gap:+.0%} — but a policy that is "
                       "unsafe for one model in the fleet is unsafe (#24), so the verdict "
                       "cannot rest on the models that happened to be measurable.")
-        return (f"{head} — {lead}: {detail}.{scoped} Each withheld model is named above "
-                "with the reason it was withheld.")
+        return (f"{head} — {lead}: {detail}.{scoped} Each model above is named with the "
+                "reason its metric did not conclude.")
     assert_never(v.directive)
 
 def _pct(saved: int, base: int) -> str:
