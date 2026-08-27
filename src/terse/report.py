@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from enum import IntEnum
 from types import MappingProxyType
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple, assert_never
 
 # Shared pass/fail tolerance for both worst-case verdict gates below — the number behind
 # "safe to enable `proxy --diff`". Pinned to its VALUE, in both directions, by
@@ -238,6 +239,44 @@ def _unmeasured(rows: list[dict]) -> bool:
 # `tests/test_gap_gate_boundary.py` asserts by AST that `_form_stats` is called from
 # nowhere else but an explicit allowlist. Adding a seventh gap site cannot skip the gate
 # silently; it has to edit that list, in a diff a reviewer sees.
+# The CLOSED set of reasons a model can be withheld from a gate. A `Literal`, not `str`,
+# and that is the single most load-bearing type in this file.
+#
+# `excluded: str | None` said "some string". Nothing anywhere knew there were exactly
+# eight, so every consumer was a site where a programmer had to REMEMBER the list — and
+# across four review rounds on #335, four separate sites forgot: a reason was added and the
+# next consumer over kept its old fallthrough. Ten of that batch's 27 findings are that one
+# shape. With a `Literal`, a ninth reason plus a consumer that does not handle it is a mypy
+# error at the consumer, at edit time, instead of a review finding four rounds later.
+#
+# What the `Literal` actually buys, precisely — the looser claim ("mypy rejects a consumer
+# that misses a reason") is only true of some of them:
+#   - PRODUCERS: every dict that carries a reason is annotated `ExclusionReason | None`
+#     (`_gap`, `_accuracy_gate`, `dropeval_verdict`, `diff_gap_rows`, `fluency_gap_rows`,
+#     `_not_measured_lines`, `html_report`'s `excluded`), so a typo'd or invented reason is
+#     a mypy error at the assignment. Verified by injecting one.
+#   - CONSUMERS that switch on the reason (`_reason_directive`, `_exclusion_remedy`) end in
+#     `assert_never`, so a new member with no arm is a mypy error at the switch.
+#   - CONSUMERS that look the reason up with a FALLBACK (`REASON_LABEL.get(why, why)` and
+#     friends, six sites) cannot be checked by mypy at all — a dict is not exhaustive-
+#     checkable. `test_every_exclusion_reason_has_a_label_a_heading_a_directive_and_a_remedy`
+#     covers those by asserting both maps are total over `typing.get_args(ExclusionReason)`.
+ExclusionReason = Literal[
+    "unmeasured",
+    "broken control",
+    "not a diff run",
+    "empty",
+    "no control arm",
+    "partial control coverage",
+    "underpowered",
+    # Set by `_build_diff_style_report`'s per-depth table via `ArmGap._replace`, splitting
+    # the transport half of "unmeasured" from the pairing half for that table only. It is a
+    # real inhabitant of this type even though `_gap` never returns it, so leaving it out
+    # would make the Literal a lie in exactly the direction it exists to prevent.
+    "unpaired",
+]
+
+
 class ArmGap(NamedTuple):
     """One model's form-vs-control numbers, or why it was withheld.
 
@@ -250,7 +289,7 @@ class ArmGap(NamedTuple):
     control_acc: float
     control_se: float
     rows: list[dict[str, Any]]  # the PAIRED subset the numbers above were computed over
-    excluded: str | None
+    excluded: ExclusionReason | None
     # Per-arm (accuracy, se) over that same paired subset, for the table columns beside the
     # verdict. Carried here rather than left to callers so a report cannot print a column
     # computed over a different question set than the gap printed next to it — which is the
@@ -313,10 +352,14 @@ def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
     accept the gate, because they arrive together.
 
     Both gates report the SAME reason, `"unmeasured"` — one vocabulary for the reader, as
-    `REASON_LABEL`'s note explains. #332 originally planned a distinct `"unpaired"` reason
-    and never built it; that plan is retired rather than finished, because the two causes
-    reach the reader as the same fact ("calls went unanswered, so there is no verdict")
-    and a second vocabulary is one more thing six renderers can disagree about.
+    `REASON_LABEL`'s note explains. #332 planned a distinct `"unpaired"` reason and it is
+    NOT built here: the two causes reach the reader as the same fact ("calls went
+    unanswered, so there is no verdict") and a second vocabulary is one more thing six
+    renderers can disagree about. (`"unpaired"` does exist as an `ExclusionReason`, set by
+    the diff-soak per-depth table via `_replace` for its own prose — that table draws the
+    distinction locally, at one site, which is a different thing from `_gap` minting it for
+    every renderer. An earlier version of this paragraph said the reason was "retired",
+    which contradicted the `ExclusionReason` list 200 lines above it.)
 
     `display` arms are computed over the paired subset but do NOT participate in pairing.
     That is deliberate: `run_payload`'s `inline` arm carries the longest prompt of the four
@@ -413,6 +456,17 @@ REASON_LABEL = {
     # of regressions. Folding it into "unmeasured" would print "too few calls to compare"
     # about a run that lost no calls at all — the #332 mistake, one reason over.
     "underpowered": f"fewer than {_MIN_PAIRED_QUESTIONS} paired questions",
+    # Set only by the diff-soak per-depth table, whose own `lead` dict already carries a
+    # phrasing for it — so as of today this entry renders NOWHERE, and replacing its value
+    # with garbage leaves the suite green. It is here for TOTALITY, not to fix a live
+    # misrender: every other reason is reachable through `exclusion_note` and
+    # `REASON_HEADING.get(why, ...)`, both of which fall back silently on a missing key, so
+    # the next site that hands a reason to either has no protection unless the map covers
+    # the whole `Literal`. (An earlier version of this comment claimed the raw token was
+    # already leaking to a reader. It was not — the one producer's value reaches only
+    # `withheld_depths`. Recorded rather than deleted because a false comment written while
+    # closing a real gap is the exact failure #342 counts five of.)
+    "unpaired": "no question completed on both arms",
 }
 
 # The heading each reason gets in prose renderers (markdown, HTML). "Not measured" and
@@ -427,10 +481,14 @@ REASON_HEADING = {
     "partial control coverage": "Excluded",
     # Not "Not measured": it WAS measured, and the measurement simply does not reach.
     "underpowered": "Not concluded",
+    # Unrendered today for the same reason as `REASON_LABEL["unpaired"]` — see the note
+    # there. The wording follows the distinction the diff-soak table already draws in its
+    # own prose: the backend ANSWERED, the two arms simply share no question.
+    "unpaired": "Not compared",
 }
 
 
-def exclusion_note(reasons: dict[str, str | None]) -> str:
+def exclusion_note(reasons: Mapping[str, ExclusionReason | None]) -> str:
     """`(excluded — <why>: a, b; <why>: c)`, grouped by reason. "" when nothing was cut.
 
     One line, because its consumers are a terminal plot footer and an HTML paragraph that
@@ -444,7 +502,8 @@ def exclusion_note(reasons: dict[str, str | None]) -> str:
         f"{label}: {', '.join(models)}" for label, models in sorted(by.items()))
 
 
-def _not_measured_lines(withheld: dict[str, tuple[str | None, int, int, int]]) -> list[str]:
+def _not_measured_lines(
+        withheld: dict[str, tuple[ExclusionReason | None, int, int, int]]) -> list[str]:
     """The withheld-models paragraph(s), with the counts that justify each one.
 
     Grouped BY REASON, and this is the first version where that is more than a promise.
@@ -457,7 +516,7 @@ def _not_measured_lines(withheld: dict[str, tuple[str | None, int, int, int]]) -
     Each model arrives as `(why, fails, attempts, paired)`."""
     if not withheld:
         return []
-    by: dict[str | None, list[tuple[str, int, int, int]]] = {}
+    by: dict[ExclusionReason | None, list[tuple[str, int, int, int]]] = {}
     for m, (why, f, a, paired) in sorted(withheld.items()):
         by.setdefault(why, []).append((m, f, a, paired))
     out: list[str] = []
@@ -707,7 +766,7 @@ def _format_worst_case_line(verdict: GapVerdict, tol: float, form_label: str, co
 
 
 def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, float]],
-                                          dict[str, str | None]]:
+                                          dict[str, ExclusionReason | None]]:
     """(form=diff_ok, control=terse_ok) gap-row tuples per model — the same shape
     `_worst_case_gap` and the bar-chart renderers (html/terminal) consume, computed
     once here so a chart's gap can never read differently than build_diff_report's.
@@ -720,7 +779,7 @@ def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, f
     off the same rows. `cli` prints both together for all three diff paths (`--diff`,
     `--diff-soak`, `--text-diff-eval`), and the chart is what a reader sees first."""
     out: dict[str, tuple[float, float, float, float]] = {}
-    excluded: dict[str, str | None] = {}
+    excluded: dict[str, ExclusionReason | None] = {}
     for model, rows in results.items():
         if not rows:
             continue
@@ -735,7 +794,7 @@ def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, f
 
 
 def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, float]],
-                                             dict[str, str | None]]:
+                                             dict[str, ExclusionReason | None]]:
     """(form=best of terse/primer, control=raw) gap-row tuples per model, for the bar-
     chart renderers. Excludes any model whose raw control failed (0% — a backend/config
     error, not a comprehension result) AND any model too degraded by transport failures to
@@ -748,7 +807,7 @@ def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float
     false verdict #263 exists to kill, surviving in the renderer the reader looks at
     first."""
     out: dict[str, tuple[float, float, float, float]] = {}
-    broken: dict[str, str | None] = {}
+    broken: dict[str, ExclusionReason | None] = {}
     for model, rows in results.items():
         if not rows:
             continue
@@ -819,45 +878,384 @@ def _accuracy_gate(rows: list[dict[str, Any]]) -> ArmGap:
     return arm_gap(rows, "answer_ok", "control_ok")
 
 
-def dropeval_gap_rows(results: dict) -> tuple[dict[str, dict[str, tuple[float, float, float, float]]],
-                                              dict[str, str | None]]:
-    """Per-model (recall, precision, accuracy) gap-row tuples for build_dropeval_report
-    and its terminal-bar companion. Recall and precision keep a fixed 100% ideal (se=0),
-    which is correct for them — a tool call either happens or it doesn't, so neither is
-    ever excluded. Accuracy routes through `_accuracy_gate`, which pairs against a
-    measured control arm when one ran (#269). Same per-model math build_dropeval_report's
-    own table loop uses, kept in one place so the two verdicts (markdown table, terminal
-    chart) can never disagree.
+def dropeval_gap_rows(results: dict) -> tuple[dict[str, dict[Metric, tuple[float, float, float, float]]],
+                                              dict[str, ExclusionReason]]:
+    """(gap_rows, accuracy_excluded) — the `diff_gap_rows`/`fluency_gap_rows` shape, now a
+    projection of `dropeval_verdict` rather than a second copy of its math.
 
-    Returns (gap_rows, accuracy_excluded) — mirroring `diff_gap_rows`/`fluency_gap_rows`,
-    unlike which this function's `out` is never itself empty for an excluded model (recall
-    and precision still render); only the "accuracy" key is missing, and
-    `accuracy_excluded` names why. `build_terminal_dropeval_report` used to swallow that
-    reason — a model excluded from the accuracy gate vanished from the accuracy plot with
-    no note, while the verdict text still said "the worst model" as if every model had
-    been considered for every metric (review finding 5 on #300)."""
-    out: dict[str, dict[str, tuple[float, float, float, float]]] = {}
-    excluded: dict[str, str | None] = {}
+    It used to compute the per-model gates itself, alongside a third copy inside
+    `build_dropeval_report`'s table loop, with a docstring promising the two verdicts "can
+    never disagree". Kept as a function because it is the shape the other two gap-row
+    helpers expose and `tests/test_gap_gate_boundary.py` allowlists by name; the verdict
+    itself now travels as a `DropevalVerdict`, which carries the exclusion reasons the
+    renderers used to re-derive.
+
+    `out` is never itself empty for an excluded model — recall and precision still render;
+    only the "accuracy" key is missing, and `accuracy_excluded` names why."""
+    v = dropeval_verdict(results)
+    return v.gates, v.metrics["accuracy"].excluded
+
+
+# --------------------------------------------------------------------------- #
+# The dropeval verdict: decided once, rendered twice.
+# --------------------------------------------------------------------------- #
+
+
+class Directive(IntEnum):
+    """What the dropeval report tells an operator to DO, as a lattice (#342).
+
+    ORDERED BY STRICTNESS, and the order is the whole mechanism: the verdict is
+    `max()` over the per-metric outcomes, never an `if/elif` chain over them. Four review
+    rounds on this path produced four separate precedence bugs — an absent arm outranking
+    a measured `-100%` FAIL, a branch added in one round shadowing the branch below it —
+    and every one of them is a question about which arm of a chain runs first. `max()` has
+    no arms. `BLOCK` is the top, so a demonstrated regression is never displaced by a
+    missing measurement, whichever order the metrics happen to be visited in.
+
+    `SHIP` is the bottom, which is the safety-relevant half: it is reached only when NO
+    metric contributed anything else, so a model that left a gate — for want of a control
+    arm, for a control that failed, for too few paired questions — raises the verdict off
+    `SHIP` by construction instead of silently vanishing from `_worst_case_gap` and leaving
+    the survivors to authorize the ship. That is #344's critical finding, and
+    `tests/test_dropeval_monotonicity.py` is the property that pins it.
+    """
+
+    SHIP = 0
+    INSUFFICIENT = 1
+    NOT_CONCLUDED = 2
+    BLOCK = 3
+
+
+# The three gates. `Metric` is a `Literal` for the same reason `ExclusionReason` is: these
+# keys index the gate dicts every renderer reads, and a typo'd key used to be a silent
+# missing bar. The label and control-label ride along here rather than being re-typed in
+# each renderer — "vs ideal (100%)" and "vs no-drop control" are DIFFERENT CLAIMS, and #269
+# exists because a reader could not tell which one the verdict was making.
+Metric = Literal["recall", "precision", "accuracy"]
+
+DROPEVAL_METRICS: tuple[tuple[Metric, str, str], ...] = (
+    ("recall", "retrieve-recall", "ideal (100%)"),
+    ("precision", "no-overfetch", "ideal (100%)"),
+    ("accuracy", "final-accuracy", "no-drop control"),
+)
+
+
+def _reason_directive(reason: ExclusionReason) -> Directive:
+    """Where a withheld model lands on the lattice. TOTAL over `ExclusionReason`.
+
+    `assert_never` is the point: add a ninth reason and mypy fails HERE, at the consumer,
+    rather than letting it fall through to whatever the last `elif` happened to be.
+
+    The `INSUFFICIENT`/`NOT_CONCLUDED` split is the one #334 drew: "underpowered" means the
+    backend answered, both arms paired, and there were simply too few questions for an
+    absence of regressions to mean anything — a measurement that does not reach. Every
+    other reason means the comparison was never made at all. Both refuse to authorize;
+    they differ in what the operator has to go fix, and `_accuracy_remedy` is where that
+    difference is spent."""
+    match reason:
+        case "underpowered":
+            return Directive.INSUFFICIENT
+        case ("unmeasured" | "unpaired" | "broken control" | "empty"
+              | "no control arm" | "partial control coverage" | "not a diff run"):
+            return Directive.NOT_CONCLUDED
+    assert_never(reason)
+
+
+def _exclusion_remedy(reason: ExclusionReason) -> str:
+    """What the operator has to do to turn a withheld metric into a gated one.
+
+    Keyed on the REASON, not the metric — but every reason here is about a paired
+    form-vs-control comparison, and final-accuracy is dropeval's only metric that has one.
+    `dropeval_exclusion_bullets` nevertheless loops all three, so a recall exclusion (which
+    `test_only_accuracy_is_ever_withheld` says cannot happen) would render a control-arm
+    remedy under a metric with no control arm. That is the lesser of two evils on purpose:
+    the alternative — looping only "accuracy" — would make a future recall exclusion vanish
+    from the report entirely, and a wrong-but-visible sentence is recoverable where a
+    silent omission is the #300-finding-5 defect this whole path exists to prevent.
+
+    TOTAL over `ExclusionReason` via `assert_never`, and that totality is load-bearing
+    rather than tidy: the verdict used to pick its remedy sentence with a set-equality test
+    over the exclusion reasons present, so a MIXED set fell through to whichever sentence
+    the test did not match — telling an operator to switch on a control arm that was
+    already running (#300 finding 2), and, once both halves were handled, printing both
+    sentences joined into a single self-contradicting bullet. Rendering one bullet PER
+    REASON, each naming its own models, is what makes that unconstructible; this function
+    is the per-reason half of it."""
+    match reason:
+        case "no control arm":
+            return ("It is scored by JSON value-equality against the full original value, "
+                    "and a model given the UN-dropped payload does not reproduce a long "
+                    "prose field verbatim either — gating that against an unrun 100% "
+                    "measures verbatim reproduction and bills it to the drop (#269). "
+                    "Re-run without `--no-control` to gate it.")
+        case "underpowered":
+            return ("The control arm ran; there were simply too few paired questions for "
+                    "an absence of drop-caused loss to mean anything. Generate more "
+                    "questions and re-run — this is not evidence either way.")
+        case "broken control":
+            return ("The control answers a question with the value sitting verbatim in "
+                    "its payload, so a 0% control is a grader or backend fault, not a "
+                    "blameless drop (#300). Fix the control arm and re-run.")
+        case "partial control coverage":
+            return ("Only some rows carry a control arm, so scoring the metric would "
+                    "compute it over a subset the reader was never told about. Re-run the "
+                    "whole question set with the control on rather than merging packs.")
+        case "unmeasured" | "unpaired":
+            return ("Too few calls completed on BOTH arms to compare — see the per-arm "
+                    "failure split above for which side lost them. Fix the backend and "
+                    "re-run.")
+        case "empty":
+            return ("No rows of this kind were scored for this model — the pack carries "
+                    "none, or a merged run lost them. Re-generate the question set for "
+                    "this model before reading anything into the metrics that did run.")
+        case "not a diff run":
+            return "These rows carry no diff arm, so this gate does not apply to them."
+    assert_never(reason)
+
+
+class MetricVerdict(NamedTuple):
+    """One gate's outcome: the worst SCORED model, who was withheld and why, and where
+    the two together put the metric on the lattice."""
+    metric: Metric
+    worst: GapVerdict | None
+    excluded: dict[str, ExclusionReason]
+    directive: Directive
+
+
+class DropevalVerdict(NamedTuple):
+    """Everything both renderers need, decided once.
+
+    `dropeval_gap_rows`' docstring has always promised that the markdown and the terminal
+    chart "can never disagree". Before #342 that was a promise about two functions reading
+    the same NUMBERS while deciding their own verdicts, and they disagreed three times
+    across four review rounds — on badge scope, on exclusion notes, and on whether a
+    demonstrated FAIL deserved a thin-sample caveat. Here the decision itself is the shared
+    value, so a disagreement is not caught by a test, it is unconstructible."""
+    directive: Directive
+    metrics: dict[Metric, MetricVerdict]
+    # model -> metric -> (form_acc, form_se, control_acc, control_se), for the table and
+    # the forest plots. "accuracy" is ABSENT rather than zeroed for a withheld model, so a
+    # renderer that iterates what it finds cannot draw a bar for a gap nobody measured.
+    gates: dict[str, dict[Metric, tuple[float, float, float, float]]]
+    # Transport failure past the INCONCLUSIVE threshold. Non-empty means the run measures
+    # the harness, not the model, and no behavioral claim survives.
+    inconclusive: dict[str, tuple[int, int]]
+    # The same models, when `--accept-degraded` moved them out of `inconclusive`. Recorded
+    # rather than silently honoured: the operator's "the cause was model-independent" is a
+    # claim the harness cannot verify.
+    degraded_accepted: dict[str, tuple[int, int]]
+
+
+def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVerdict:
+    """Decide the drop-to-retrieve verdict. Pure: no strings, no formatting, no I/O.
+
+    Split out from rendering (#342) for two reasons. The first is that markdown and chart
+    now consume one decision instead of re-deriving two. The second is that a pure function
+    over a small input space can be swept EXHAUSTIVELY in seconds — which is how
+    `tests/test_dropeval_monotonicity.py` covers a cross product that 29 hand-written
+    examples left a hole in, and how the same sweep can be a gate rather than a review."""
+    gates: dict[str, dict[Metric, tuple[float, float, float, float]]] = {}
+    excluded_by_metric: dict[Metric, dict[str, ExclusionReason]] = {
+        m: {} for m, _, _ in DROPEVAL_METRICS}
     for model, rows in results.items():
         if not rows:
+            # WITHHELD, not skipped. `continue` here dropped the model out of `gates` AND
+            # out of every `excluded` dict, so `max()` never saw it and the survivors
+            # decided the verdict alone — #344's critical shape, routing around the lattice
+            # instead of through it. Measured: of the 144 two-model fleets that do not ship,
+            # 22 started shipping when one model's rows were emptied, and the CLI's policy
+            # instruction said "the verdict authorizes it". `"empty"` was already in
+            # `ExclusionReason` with a directive and a remedy; nothing could reach them.
+            for m, _, _ in DROPEVAL_METRICS:
+                excluded_by_metric[m][model] = "empty"
             continue
-        recall_rows = [r for r in rows if r["kind"] == "recall"]
-        precision_rows = [r for r in rows if r["kind"] == "precision"]
-        racc, rse = _form_stats(recall_rows, "retrieve_ok") if recall_rows else (0.0, 0.0)
-        pacc, pse = _form_stats(precision_rows, "retrieve_ok") if precision_rows else (0.0, 0.0)
-        out[model] = {
-            "recall": (racc, rse, 1.0, 0.0),
-            "precision": (pacc, pse, 1.0, 0.0),
+        # Recall/precision keep the fixed 100% ideal — for them it IS the right control, a
+        # tool call either happens or it doesn't. Accuracy pairs against the measured
+        # control arm when one ran (#269); `_accuracy_gate` owns that choice so the table
+        # and the verdict cannot disagree about which control they used.
+        #
+        # A model with NO rows of a kind is WITHHELD from that gate, not scored at 0%.
+        # `_form_stats([], f)` is `(0.0, 0.0)`, which against the fixed 100% ideal reads as
+        # a `-100%` gap and publishes `**FAIL** ... keep drop-to-retrieve off` — a BLOCK
+        # whose failing evidence does not exist, printed on the same line as `recall q` of
+        # literally 0. Reached by a precision-only pack, a merged run, or a generator that
+        # emitted one kind. It is the mirror of the empty-`rows` bug above: both substituted
+        # a number for an absence and routed around the lattice rather than through it.
+        gates[model] = {}
+        by_kind: dict[Metric, list[dict[str, Any]]] = {
+            "recall": [r for r in rows if r["kind"] == "recall"],
+            "precision": [r for r in rows if r["kind"] == "precision"],
         }
-        # "accuracy" is ABSENT rather than zeroed when no control ran — a renderer that
-        # iterates the metrics it finds then cannot draw a bar for a gap nobody measured.
+        for mech in ("recall", "precision"):
+            kind_rows = by_kind[mech]
+            if not kind_rows:
+                excluded_by_metric[mech][model] = "empty"
+                continue
+            acc, se = _form_stats(kind_rows, "retrieve_ok")
+            gates[model][mech] = (acc, se, 1.0, 0.0)
         g = _accuracy_gate(rows)
-        if not g.excluded:
-            out[model]["accuracy"] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
+        if g.excluded:
+            excluded_by_metric["accuracy"][model] = g.excluded
         else:
-            excluded[model] = g.excluded
-    return out, excluded
+            gates[model]["accuracy"] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
 
+    inconclusive = inconclusive_models(results)
+    degraded_accepted: dict[str, tuple[int, int]] = {}
+    if inconclusive and accept_degraded:
+        inconclusive, degraded_accepted = {}, inconclusive
+
+    metrics: dict[Metric, MetricVerdict] = {}
+    for metric, _, _ in DROPEVAL_METRICS:
+        scored = {model: g[metric] for model, g in gates.items() if metric in g}
+        worst = _worst_case_gap(scored)
+        excluded = excluded_by_metric[metric]
+        # The lattice. A withheld model contributes its reason's directive; the worst
+        # SCORED model contributes SHIP or BLOCK. `max()` over both — so a withheld model
+        # can only ever make the verdict stricter, and a demonstrated FAIL is never
+        # displaced by one. `default` covers a metric no model reached at all.
+        outcomes = [_reason_directive(r) for r in excluded.values()]
+        if worst is not None:
+            outcomes.append(Directive.SHIP if worst.passed else Directive.BLOCK)
+        # `default` fires for an empty fleet — no model scored, none withheld, nothing
+        # known. It must not be SHIP, and it is the one place in this function where that
+        # is a choice rather than a consequence, so
+        # `test_an_empty_fleet_is_not_concluded_rather_than_shipped` pins it: both renderers
+        # stop before reading it today, and a value nothing reads today is read by the next
+        # consumer.
+        metrics[metric] = MetricVerdict(
+            metric, worst, excluded, max(outcomes, default=Directive.NOT_CONCLUDED))
+
+    # A dead backend is NOT_CONCLUDED outright rather than `max()`-ed with the metrics: the
+    # numbers a half-failed run produces are counting transport errors, so promoting one of
+    # them to BLOCK would be asserting a behavioral conclusion from a broken harness — the
+    # exact over-claim `test_report_refuses_a_verdict_when_the_calls_failed` pins. It is
+    # still non-authorizing, which is what the monotonicity property requires.
+    # No `default=`: `metrics` has exactly one entry per `DROPEVAL_METRICS`, always, so an
+    # empty `max()` here is unreachable — and a `default` on an unreachable path is a value
+    # no test can pin and no reader can check. If that loop ever stops running, the
+    # `ValueError` is the correct outcome.
+    directive = (Directive.NOT_CONCLUDED if inconclusive
+                 else max(mv.directive for mv in metrics.values()))
+    return DropevalVerdict(directive, metrics, gates, inconclusive, degraded_accepted)
+
+
+def _by_reason(excluded: dict[str, ExclusionReason]) -> list[tuple[ExclusionReason, list[str]]]:
+    """Models grouped by why they were withheld, so one bullet can be emitted per reason
+    NAMING ITS OWN MODELS. Joining remedies across reasons instead is how the verdict came
+    to tell an operator, in one sentence, both to switch the control arm on and that it was
+    already on."""
+    by: dict[ExclusionReason, list[str]] = {}
+    for model, reason in sorted(excluded.items()):
+        by.setdefault(reason, []).append(model)
+    return sorted(by.items())
+
+
+def dropeval_exclusion_bullets(v: DropevalVerdict) -> list[str]:
+    """The `not gated` bullets, one per (metric, reason), shared by both renderers."""
+    out = []
+    for metric, label, _ in DROPEVAL_METRICS:
+        for reason, models in _by_reason(v.metrics[metric].excluded):
+            names = ", ".join(f"`{m}`" for m in models)
+            out.append(f"- **{label}: not gated for {names}** — {REASON_LABEL[reason]}. "
+                       + _exclusion_remedy(reason))
+    return out
+
+
+def dropeval_next_step_line(v: DropevalVerdict) -> str:
+    """What `terse tune --drop-eval` should tell the operator to do with the policy.
+
+    A separate sentence from `dropeval_directive_line` because it is about the POLICY FILE,
+    not the measurement — but it reads the same `directive`, and that is the point. `cli`
+    used to print "If the worst-case model PASSES, enable the verified fields" and leave the
+    reader to apply that rule by eye to the three worst-case lines. Those lines report the
+    worst SCORED model, so a fleet with one model scored and one withheld prints three
+    `**PASS**` headlines under a verdict that authorizes nothing — and the reader following
+    the instruction enables the drops the report just refused. That is #344's critical
+    finding wearing a renderer's clothes, and no property could catch it here, because the
+    sentence was not derived from the verdict at all."""
+    if v.directive is Directive.SHIP:
+        return ("The verdict authorizes it: enable the verified fields by renaming that "
+                "tool's '_suggested_fields' -> 'fields' in the policy.")
+    return ("The verdict does NOT authorize enabling these drops — see the last bullet "
+            "above for what is missing. Leave '_suggested_fields' as it is until it does.")
+
+
+def dropeval_directive_line(v: DropevalVerdict) -> str:
+    """The one sentence that says what to do. TOTAL over `Directive` via `assert_never`.
+
+    Both renderers print this string, so the chart and the markdown cannot reach opposite
+    conclusions about the same run — which they did three times across #335's review
+    rounds, back when each of them decided for itself."""
+    if v.inconclusive:
+        # Handled HERE, not left to the callers. `dropeval_verdict` forces NOT_CONCLUDED
+        # for a dead backend regardless of what the metrics say, so a caller that printed
+        # this line without its own early return would have got "recall and no-overfetch
+        # clear tolerance for the worst model" over a fleet whose recall metric is BLOCK.
+        # Both renderers do early-return today, which made the old comment ("reachable ONLY
+        # with recall and precision passing") true of the CALLERS and false of the
+        # function — and `dropeval_next_step_line` is already a third consumer.
+        return ("**INCONCLUSIVE** — " + ", ".join(
+            f"`{m}` failed {e}/{a} model calls" for m, (e, a) in sorted(v.inconclusive.items()))
+            + ". Fix the backend and re-run; no behavioral claim can be made from this.")
+    if v.directive is Directive.SHIP:
+        return ("Recall, precision, and final accuracy all clear tolerance for the worst "
+                "model — safe to enable drop-to-retrieve.")
+    if v.directive is Directive.BLOCK:
+        return ("At least one metric misses tolerance for its worst model — keep "
+                "drop-to-retrieve off until this improves.")
+    if v.directive in (Directive.INSUFFICIENT, Directive.NOT_CONCLUDED):
+        # WHICH metrics failed to conclude, read off the lattice — not assumed. The first
+        # version of this branch hardcoded "recall and no-overfetch clear tolerance for the
+        # worst model, so the mechanism works", licensed by the claim that only accuracy
+        # could ever be withheld. That stopped being true the moment a model with no rows
+        # of a kind was withheld from that kind's gate instead of scored at a fabricated
+        # 0%, and the sentence would then have asserted a pass for a metric that was never
+        # measured — the same over-claim, in the metric it was written to avoid.
+        withheld = {label: sorted(v.metrics[m].excluded)
+                    for m, label, _ in DROPEVAL_METRICS
+                    if v.metrics[m].directive is not Directive.SHIP}
+        if not withheld:
+            # No metric reached its gate at all — only `dropeval_verdict({})`, since both
+            # renderers stop before this on an empty fleet. Spelled out rather than folded
+            # into the sentence below with an `or "this fleet"`, which would have claimed
+            # models were withheld when none existed.
+            return ("**INCONCLUSIVE for enabling** — no model reached a gate, so there is "
+                    "nothing to conclude about enabling the drop.")
+        # INSUFFICIENT is the max only when EVERY withheld model is underpowered — the
+        # arms paired and showed no loss, over too few questions to mean anything. A
+        # different headline because it is a different next action: generate questions,
+        # versus go find out why the comparison never happened. Before this the two
+        # rendered identically, which made `INSUFFICIENT` a lattice member with no
+        # observable behaviour — a distinction the code drew and the reader never saw.
+        head = ("**INSUFFICIENT for enabling**" if v.directive is Directive.INSUFFICIENT
+                else "**INCONCLUSIVE for enabling**")
+        detail = "; ".join(
+            f"{label} for " + (", ".join(f"`{m}`" for m in models) if models else "this fleet")
+            for label, models in withheld.items())
+        mech_ok = all(v.metrics[m].directive is Directive.SHIP
+                      for m in ("recall", "precision"))
+        if mech_ok:
+            lead = ("recall and no-overfetch clear tolerance for the worst model, so the "
+                    "mechanism works, but the OUTCOME impact of dropping is unmeasured")
+        else:
+            lead = ("the drop-to-retrieve MECHANISM itself was not gated, so nothing "
+                    "downstream of it means anything — not gated")
+        # SCOPED to the withheld models. The unscoped form of this sentence ("the OUTCOME
+        # impact of dropping is unmeasured") was true on the old code, where it could only
+        # fire when NO model was scored on accuracy. The lattice reaches here whenever ANY
+        # model is withheld, so the unscoped claim now prints two lines under a measured
+        # `**PASS**` for the models that were gated — a false statement about the report's
+        # own contents.
+        acc = v.metrics["accuracy"]
+        scoped = ""
+        if mech_ok and acc.worst is not None:
+            scoped = (f" It WAS gated for the rest of the fleet — worst-case "
+                      f"`{acc.worst.model}` at {acc.worst.gap:+.0%} — but a policy that is "
+                      "unsafe for one model in the fleet is unsafe (#24), so the verdict "
+                      "cannot rest on the models that happened to be measurable.")
+        return (f"{head} — {lead}: {detail}.{scoped} Each withheld model is named above "
+                "with the reason it was withheld.")
+    assert_never(v.directive)
 
 def _pct(saved: int, base: int) -> str:
     return f"{(saved / base * 100):+.1f}%" if base else "n/a"
@@ -1407,7 +1805,7 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         "|---|---|---|---|---|",
     ]
     gap_rows: dict[str, tuple[float, float, float, float]] = {}
-    unmeasured: dict[str, tuple[str | None, int, int, int]] = {}  # -> (why, fails, attempts, paired)
+    unmeasured: dict[str, tuple[ExclusionReason | None, int, int, int]] = {}  # (why, fails, attempts, paired)
     for model, rows in results.items():
         n = len(rows)
         if not n:
@@ -1640,7 +2038,7 @@ def build_diff_soak_report(results: dict) -> str:
             out += [lead + at + tail, ""]
 
     gap_rows: dict[str, tuple[float, float, float, float]] = {}
-    pooled_out: dict[str, str | None] = {}
+    pooled_out: dict[str, ExclusionReason | None] = {}
     for model, rows in results.items():
         if not rows or model in unmeasured:
             continue
@@ -1848,36 +2246,37 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
     # readable as a behavioral result (this is exactly how the `terse.retrieve` tool-name
     # 400 produced a clean 0%-recall FAIL for every model, see dropeval._oai_name).
     err_by_model: dict[str, tuple[int, int]] = {}
-    recall_gate: dict[str, tuple[float, float, float, float]] = {}
-    precision_gate: dict[str, tuple[float, float, float, float]] = {}
-    accuracy_gate: dict[str, tuple[float, float, float, float]] = {}
-    # Populated only for EXCLUDED models, and only with the reason `_accuracy_gate`
-    # actually returned. The verdict's "not gated" fallback used to say "no no-drop
-    # control arm was run" unconditionally — true for "no control arm", false for e.g.
-    # "broken control" (a control that ran, and whose entire arm errored out under
-    # `--accept-degraded`), which made the report assert a control was never run in the
-    # same breath as reporting how many of its calls it lost (review finding 2 on #300).
-    accuracy_excluded: dict[str, str | None] = {}
+    # The table READS the decision; it does not recompute it. It used to hold a third copy
+    # of the per-model gate math (`dropeval_gap_rows` had the second), under a comment
+    # promising "the table and the verdict cannot disagree about which control they used" —
+    # a promise two independent copies were in no position to keep.
+    #
+    # Two things are still computed here rather than read. `handle_ok` is a display column
+    # no gate reads. `errs`/`attempts` are NOT: the same two sums are computed again inside
+    # `inconclusive_models`, which is a gate, so the "failed calls" column and the
+    # INCONCLUSIVE threshold rest on two independent copies of one expression. Pre-existing
+    # on `main` and left alone here rather than claimed away — folding it in means the
+    # verdict carrying a per-model error count, which is a wider change than #342's scope.
+    v = dropeval_verdict(results, accept_degraded=accept_degraded)
     for model, rows in results.items():
         if not rows:
+            # A row of `n/a`, not a skipped line. The verdict now WITHHOLDS this model
+            # rather than dropping it, so omitting it from the table would leave a model
+            # named in the verdict bullets and absent from the numbers above them — the
+            # #300-finding-5 defect, one cause over.
+            out.append(f"| `{model}` | 0 | n/a | n/a | n/a "
+                       f"| {REASON_LABEL['empty']} | n/a | 0/0 |")
             continue
         recall_rows = [r for r in rows if r["kind"] == "recall"]
-        precision_rows = [r for r in rows if r["kind"] == "precision"]
-        racc, rse = _form_stats(recall_rows, "retrieve_ok") if recall_rows else (0.0, 0.0)
-        pacc, pse = _form_stats(precision_rows, "retrieve_ok") if precision_rows else (0.0, 0.0)
         hacc, hse = _form_stats(recall_rows, "handle_ok") if recall_rows else (0.0, 0.0)
-        # Recall/precision keep the fixed 100% ideal — for them it is the right control, a
-        # tool call either happens or it doesn't. Accuracy pairs against the measured
-        # control arm when one ran (#269); `_accuracy_gate` owns that choice so the table
-        # and the verdict cannot disagree about which control they used.
-        recall_gate[model] = (racc, rse, 1.0, 0.0)
-        precision_gate[model] = (pacc, pse, 1.0, 0.0)
-        g = _accuracy_gate(rows)
-        if not g.excluded:
-            accuracy_gate[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
-        else:
-            accuracy_excluded[model] = g.excluded
-        aacc, ase, cacc = g.form_acc, g.form_se, g.control_acc
+        # `.get`: a model with no rows of a kind is withheld from that gate, not scored at
+        # a fabricated 0% (see `dropeval_verdict`). The cell says so rather than printing a
+        # number the verdict declined to publish.
+        cells = {}
+        for mech in ("recall", "precision"):
+            gate = v.gates[model].get(mech)
+            cells[mech] = (f"{gate[0]:.0%} ±{_ci(gate[1]) * 100:.0f}" if gate
+                           else "not gated")
         errs = sum(r.get("errors", 0) for r in rows)
         attempts = sum(r.get("attempts", r.get("trials", 1)) for r in rows)
         err_by_model[model] = (errs, attempts)
@@ -1887,15 +2286,17 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
         # set than the one the column header implies. Printing a bare 100% under "control
         # (no drop)" is precisely the misreading #269 is about — and printing "not run" for
         # a control that ran and errored out is a different misreading #300 is about.
-        if g.excluded:
+        scored = v.gates[model].get("accuracy")
+        if scored is None:
+            reason = v.metrics["accuracy"].excluded[model]
             acc_cell = "not gated"
-            ctl_cell = "not run" if g.excluded == "no control arm" \
-                else REASON_LABEL.get(g.excluded, g.excluded)
+            ctl_cell = "not run" if reason == "no control arm" else REASON_LABEL[reason]
         else:
+            aacc, ase, cacc, _ = scored
             acc_cell = f"{aacc:.0%} ±{_ci(ase) * 100:.0f}"
             ctl_cell = f"{cacc:.0%}"
-        out.append(f"| `{model}` | {len(recall_rows)} | {racc:.0%} ±{_ci(rse) * 100:.0f} "
-                   f"| {pacc:.0%} ±{_ci(pse) * 100:.0f} | {acc_cell} "
+        out.append(f"| `{model}` | {len(recall_rows)} | {cells['recall']} "
+                   f"| {cells['precision']} | {acc_cell} "
                    f"| {ctl_cell} | {hacc:.0%} ±{_ci(hse) * 100:.0f} "
                    f"| {errs}/{attempts} |")
     out.append("")
@@ -1943,10 +2344,9 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
                     "moves it a long way (#297).", ""]
 
     out += ["## Verdict", ""]
-    # Half of a model's calls failing means its accuracy columns are mostly counting
-    # transport errors. Refuse to render a pass/fail rather than let the run be cited.
-    inconclusive = inconclusive_models(results)
-    if inconclusive and accept_degraded:
+    # ONE decision, rendered here and by `build_terminal_dropeval_report` — see
+    # `DropevalVerdict`. This block chooses words; it does not choose a verdict.
+    if v.degraded_accepted:
         # The operator has asserted the losses have a known, model-independent cause (a
         # gateway restart, a local rate limit). That is a claim the harness cannot verify,
         # so it is recorded in the verdict rather than silently honoured — and the arm
@@ -1954,93 +2354,29 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
         # losses leave the survivors an approximately random sample, a skew does not.
         out += ["> **Degraded run accepted** (`--accept-degraded`) — "
                 + ", ".join(f"`{m}` failed {e}/{a} calls" for m, (e, a) in
-                            sorted(inconclusive.items()))
+                            sorted(v.degraded_accepted.items()))
                 + ". The verdict below is computed over the surviving questions only. It is "
                 "valid ONLY if the failures were independent of the model and of the arm; "
                 "check the per-arm split and the surviving-question counts above before "
                 "citing it.", ""]
-        inconclusive = {}
-    if inconclusive:
-        out += ["- **INCONCLUSIVE** — "
-                + ", ".join(f"`{m}` failed {e}/{a} model calls" for m, (e, a) in
-                            sorted(inconclusive.items()))
-                + ". Fix the backend and re-run; no behavioral claim can be made from this.",
-                ""]
+    if v.inconclusive:
+        # Half of a model's calls failing means its accuracy columns are mostly counting
+        # transport errors. Refuse to render a pass/fail rather than let the run be cited.
+        # The sentence comes from the shared `dropeval_directive_line`, like every other
+        # verdict sentence — the chart used to word this one itself, so the one case an
+        # operator reaches on a broken backend was the one case the two renderers did not
+        # share a string.
+        out += ["- " + dropeval_directive_line(v), ""]
         return "\n".join(out)
-    recall_worst = _worst_case_gap(recall_gate)
-    precision_worst = _worst_case_gap(precision_gate)
-    accuracy_worst = _worst_case_gap(accuracy_gate)
-    if recall_worst and precision_worst:
-        out.append(_format_worst_case_line(recall_worst, _GAP_TOLERANCE, "retrieve-recall",
-                                           "ideal (100%)"))
-        out.append(_format_worst_case_line(precision_worst, _GAP_TOLERANCE, "no-overfetch",
-                                           "ideal (100%)"))
-        if accuracy_worst:
-            # The control label is not cosmetic: "vs ideal (100%)" and "vs no-drop control"
-            # are different claims, and #269 exists because a reader could not tell which
-            # one the verdict was making.
-            out.append(_format_worst_case_line(accuracy_worst, _GAP_TOLERANCE,
-                                               "final-accuracy", "no-drop control"))
-        elif accuracy_excluded and set(accuracy_excluded.values()) != {"no control arm"}:
-            # At least one model was excluded for a reason OTHER than "a control never
-            # ran" — e.g. "broken control", when `--accept-degraded` accepted a run whose
-            # control arm errored out entirely. The old fallback said "no no-drop control
-            # arm was run" unconditionally here, which is false in that case: the control
-            # DID run, and the "Where they failed" paragraph above already says how many
-            # of its calls it lost. Name the real reason instead of contradicting that
-            # paragraph two sentences later (review finding 2 on #300).
-            # The tail has to match the reason too, not just the opening. #300's finding 2
-            # stopped this branch claiming "no control was run" — and the sentence it kept
-            # still asserts an "unrun 100%", which is the same claim, and is false whenever
-            # the control ran and the exclusion was about sample size instead.
-            underpowered = set(accuracy_excluded.values()) == {"underpowered"}
-            out.append("- **final-accuracy: not gated** — " + exclusion_note(accuracy_excluded)
-                       + (". The control arm ran; there were simply too few paired "
-                          "questions for an absence of drop-caused loss to mean anything. "
-                          "Generate more questions and re-run — this is not evidence "
-                          "either way." if underpowered else
-                          ". It is scored by JSON value-equality against the full original "
-                          "value, and a model given the UN-dropped payload does not "
-                          "reproduce a long prose field verbatim either — gating that "
-                          "against an unrun 100% measures verbatim reproduction and bills "
-                          "it to the drop (#269)."))
-        else:
-            out.append("- **final-accuracy: not gated** — no no-drop control arm was run, "
-                       "so there is nothing to compare the drop against. It is scored by "
-                       "JSON value-equality against the full original value, and a model "
-                       "given the UN-dropped payload does not reproduce a long prose field "
-                       "verbatim either — gating that against an unrun 100% measures "
-                       "verbatim reproduction and bills it to the drop (#269). Re-run "
-                       "without `--no-control` to gate it.")
-        if recall_worst.passed and precision_worst.passed and (
-                accuracy_worst is None or accuracy_worst.passed):
-            if accuracy_worst:
-                out.append("- Recall, precision, and final accuracy all clear tolerance for "
-                           "the worst model — safe to enable drop-to-retrieve.")
-            else:
-                # "safe to enable" is not supported by mechanism metrics alone. Recall and
-                # no-overfetch say the model OPERATES the protocol correctly; they say
-                # nothing about whether the answer it ends up with is right. Calling that
-                # "safe" is the same over-claim in the opposite direction to the one #269
-                # opened for.
-                # Reason-aware for the same reason the line above it is: telling an
-                # operator to add a control arm that is already running is #300's finding
-                # 2, one paragraph further down. Membership, not set-equality: a MIXED
-                # exclusion set still contains an underpowered model whose control ran,
-                # so the blanket "re-run with a control" is false for that half.
-                has_underpowered = "underpowered" in set(accuracy_excluded.values())
-                out.append(
-                    "- **INCONCLUSIVE for enabling** — recall and no-overfetch clear "
-                    "tolerance for the worst model, so the mechanism works, but final "
-                    "accuracy was not gated: the OUTCOME impact of dropping is "
-                    "unmeasured. "
-                    + ("Generate more questions and re-run — the control arm is "
-                       "already on." if has_underpowered else
-                       "Re-run with the no-drop control arm before enabling "
-                       "drop-to-retrieve on this evidence."))
-        else:
-            out.append("- At least one metric misses tolerance for its worst model — keep "
-                       "drop-to-retrieve off until this improves.")
+    for metric, label, control_label in DROPEVAL_METRICS:
+        worst = v.metrics[metric].worst
+        if worst is not None:
+            out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, label, control_label))
+    # One bullet per (metric, reason), each naming its own models. A withheld model is
+    # named here AND has already raised `v.directive` off SHIP, so the two halves of
+    # "excluded" — the prose and the gate — cannot drift apart.
+    out += dropeval_exclusion_bullets(v)
+    out.append("- " + dropeval_directive_line(v))
     out.append("")
     return "\n".join(out)
 
@@ -2096,7 +2432,7 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         "|---|---|---|---|---|---|---|---|",
     ]
     summary: dict[str, dict[str, float]] = {}
-    reasons: dict[str, str | None] = {}  # model -> `ArmGap.excluded`, for the verdict split
+    reasons: dict[str, ExclusionReason | None] = {}  # model -> `ArmGap.excluded`, for the verdict split
     for model, rows in results.items():
         n = len(rows)
         if not n:

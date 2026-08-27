@@ -24,6 +24,7 @@ from typing import Any
 from .report import (
     REASON_HEADING,
     REASON_LABEL,
+    ExclusionReason,
     _ci,
     _pct,
     _sum,
@@ -477,7 +478,7 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
     """HTML counterpart to report.build_diff_report / build_fluency_report's gap
     section: a forest plot of per-model accuracy with 95% CI, gated on the worst model."""
     plot_rows, gap_rows = [], {}
-    excluded: dict[str, str | None] = {}
+    excluded: dict[str, ExclusionReason | None] = {}
     for model, rows in results.items():
         n = len(rows)
         if not n:

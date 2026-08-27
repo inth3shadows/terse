@@ -129,3 +129,12 @@ run_sink
 # typo instantly — this file is exercised on every run.
 _FakeTransport
 _saved
+# `match`/`case` soft keywords in report.py's `_reason_directive` / `_exclusion_remedy`
+# (#342). `case "underpowered":` reads as a bare `case(...)` call to the guard's pattern
+# match. Not a call at all — and a mistyped case arm is caught by mypy, which is the whole
+# reason these two switch on a `Literal` and end in `assert_never`.
+case
+# test_dropeval_monotonicity.py's `for name, perturb in _WITHHOLDING.items()` — a local
+# holding a perturbation FUNCTION, invoked bare as `perturb(rows)`. Same local-variable
+# false-positive class as real/orig_send/run_sink above.
+perturb
