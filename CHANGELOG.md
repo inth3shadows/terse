@@ -15,7 +15,7 @@ fails that pull request until the section has moved.
 
 _Nothing yet._
 
-## [Unreleased]
+## [0.28.8] - 2026-08-27
 
 ### Fixed
 
