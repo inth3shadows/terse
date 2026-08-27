@@ -177,13 +177,23 @@ def test_build_terminal_dropeval_report_renders_three_metrics():
     assert "PASS" in text and "FAIL" not in text
 
 
-def test_final_accuracy_is_omitted_when_no_control_arm_ran():
+def test_no_final_accuracy_bar_is_drawn_when_no_control_arm_ran():
     """Without a control there is nothing to compare the drop against, so the chart must
-    draw nothing rather than plot the gap against a 100% nobody measured (#269)."""
+    draw no BAR rather than plot the gap against a 100% nobody measured (#269).
+
+    It used to assert the string "final-accuracy" was absent entirely, which also swallowed
+    the DISCLOSURE: #342 made the chart print the metric's exclusion note even when no model
+    survived to be plotted, because the directive sentence both renderers share ends "Each
+    withheld model is named above" and the chart carried nothing to name. Absence of a bar
+    is the claim; absence of the word was a proxy for it that also forbade the fix."""
     text = build_terminal_dropeval_report({"m": _dropeval_rows(control=False)}, color=False)
     assert "retrieve-recall" in text
     assert "no-overfetch" in text
-    assert "final-accuracy" not in text
+    # The bar's own legend — drawn once per plotted metric, and only for a plotted metric.
+    assert "● final-accuracy" not in text
+    assert "no-drop control" not in text
+    # ...but the reason it is missing must be stated.
+    assert "no control arm was run" in text
 
 
 def test_build_terminal_dropeval_report_empty():

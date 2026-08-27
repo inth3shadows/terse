@@ -13,7 +13,38 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **Withholding a model from a gate can no longer authorize a ship** (`#342`, `#344`).
+  Excluding a model removed it from `_worst_case_gap` entirely, so the verdict computed
+  over what remained came back cleaner than the verdict over everything. Stripping one
+  model's no-drop control arm — strictly *less* evidence, no other change — turned
+  `keep drop-to-retrieve off` into `safe to enable drop-to-retrieve`, with the failing
+  model named nowhere. Two more routes around the same gate are closed with it: a model
+  present in `results` with no rows was skipped rather than withheld (22 of 144
+  non-shipping two-model fleets started shipping when one model's rows were emptied), and
+  a model with no rows of a `kind` was scored at a fabricated `0%` against the fixed 100%
+  ideal, publishing a `-100%` **FAIL** and `keep drop-to-retrieve off` beside a `recall q`
+  column of literally `0`.
+  `terse tune --drop-eval` printed `If the worst-case model PASSES, enable the verified
+  fields` under the report — a rule the reader applied by eye to lines that report the
+  worst *scored* model, so a fleet with one model withheld showed three `**PASS**`
+  headlines above an instruction to enable what the verdict had just declined. It now
+  reads the directive.
+
+### Changed
+
+- **The dropeval verdict is computed, not branched** (`#342`). Four review rounds on one
+  ~200-line change to this path produced 7, 6, 5 then 9 findings and never converged; every
+  round found a defect inside the previous round's fix. `ArmGap.excluded` is now a closed
+  `Literal` rather than `str | None`, so a new reason with an unhandled consumer is a mypy
+  error at the consumer; the directive is `max()` over a `SHIP < INSUFFICIENT <
+  NOT_CONCLUDED < BLOCK` lattice, so branch-precedence bugs are unconstructible; and
+  `dropeval_verdict()` decides once for both renderers, so the markdown and the terminal
+  chart cannot reach different conclusions — a docstring promise they had broken three
+  times. `tests/test_dropeval_monotonicity.py` sweeps the metamorphic invariant over the
+  full cross product in seconds, and reproduces 20 violating input pairs against the code
+  it replaces.
 
 ## [0.28.6] - 2026-08-25
 

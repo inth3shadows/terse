@@ -17,15 +17,22 @@ from collections.abc import Sequence
 from typing import Any
 
 from .report import (
+    DROPEVAL_METRICS,
     _ci,
     _sum,
     diff_gap_rows,
-    dropeval_gap_rows,
+    dropeval_directive_line,
+    dropeval_verdict,
     exclusion_note,
     fluency_gap_rows,
-    inconclusive_models,
     passes_tolerance,
 )
+
+
+def _plain(markdown: str) -> str:
+    """`**bold**` and `` `code` `` stripped — the terminal's copy of a shared sentence."""
+    return markdown.replace("**", "").replace("`", "")
+
 
 _BAR_WIDTH = 24
 _BLOCK = "█"
@@ -247,43 +254,48 @@ def build_terminal_fluency_report(results: dict, color: bool | None = None) -> s
     return text
 
 
-_DROPEVAL_METRICS = (("recall", "retrieve-recall"), ("precision", "no-overfetch"),
-                     ("accuracy", "final-accuracy"))
+# The metric names, their labels, and — the half that used to live only here — their
+# CONTROL labels now come from `report.DROPEVAL_METRICS`. "vs ideal (100%)" and "vs
+# no-drop control" are different claims (#269), and this file used to re-derive which one
+# each metric got from a `key == "accuracy"` test written beside a two-column table.
 
 
 def build_terminal_dropeval_report(results: dict, color: bool | None = None,
                                    accept_degraded: bool = False) -> str:
     """Terminal counterpart to report.build_dropeval_report's verdict section — three
-    forest plots (retrieve-recall, no-overfetch, final-accuracy), each vs a fixed
-    100%-ideal control, gated on the worst model per metric. Fed by report.py's
-    dropeval_gap_rows so the gap a chart shows can never diverge from the markdown.
+    forest plots (retrieve-recall, no-overfetch, final-accuracy), then the same one-line
+    directive the markdown prints.
+
+    Both renderers consume ONE `DropevalVerdict` (#342), so "the chart and the markdown can
+    never disagree" is a property of the data flow rather than a promise a test has to
+    re-check. It was a promise, and they disagreed three times across #335's review rounds:
+    on badge scope, on which models the exclusion note covered, and on whether a
+    demonstrated FAIL deserved a thin-sample caveat. Each of those was two functions
+    deciding the same thing separately.
 
     `accept_degraded` must mirror build_dropeval_report's own flag: without it, this used
     to refuse unconditionally on ANY transport-error rate past the INCONCLUSIVE threshold,
     while the markdown — given the same flag by `cli` — rendered a full verdict over the
-    surviving questions right below it (review finding 4 on #300, "so chart and markdown
-    cannot disagree" holding for every case except the one operators reach for it)."""
-    dead = inconclusive_models(results)
-    if dead and not accept_degraded:
+    surviving questions right below it (review finding 4 on #300)."""
+    v = dropeval_verdict(results, accept_degraded=accept_degraded)
+    if v.inconclusive:
         # Never draw a forest plot from transport errors: the bars would be indistinguishable
         # from a model that answered and got it wrong. Same refusal build_dropeval_report
-        # renders, from the same helper, so chart and markdown cannot disagree.
-        return "  INCONCLUSIVE — " + ", ".join(
-            f"{m} failed {e}/{a} model calls" for m, (e, a) in sorted(dead.items()))
-    gaps, excluded = dropeval_gap_rows(results)
-    if not gaps:
+        # renders, from the same decision, so chart and markdown cannot disagree.
+        return "  " + _plain(dropeval_directive_line(v))
+    if not v.gates:
         return "  (no data)"
     sections = []
-    if dead and accept_degraded:
+    if v.degraded_accepted:
         sections.append("  (degraded run accepted --accept-degraded; see the markdown "
                         "report for the per-arm failure split before trusting this)")
-    for key, label in _DROPEVAL_METRICS:
+    for key, label, control_label in DROPEVAL_METRICS:
         plot_rows = []
-        for model, metrics in gaps.items():
-            # `.get`: dropeval_gap_rows omits "accuracy" entirely when no no-drop control
-            # arm ran (#269). Drawing it against a 100% that was never measured is the
-            # thing that issue exists to stop, and a KeyError here would be the renderer
-            # insisting on a number the report declined to publish.
+        for model, metrics in v.gates.items():
+            # `.get`: the gates omit "accuracy" entirely for a withheld model (#269).
+            # Drawing it against a 100% that was never measured is the thing that issue
+            # exists to stop, and a KeyError here would be the renderer insisting on a
+            # number the verdict declined to publish.
             metric = metrics.get(key)
             if metric is None:
                 continue
@@ -292,13 +304,31 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None,
             passed = passes_tolerance(gap)
             plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
                                "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
+        # The note comes FIRST, and is emitted even when there is nothing to plot. The
+        # `continue` used to sit above it, so a metric from which EVERY model was withheld
+        # lost its disclosure along with its empty chart — and `dropeval_directive_line`,
+        # shared with the markdown, ends "Each withheld model is named above with the
+        # reason it was withheld", which was then false in the terminal and true in the
+        # markdown. One sentence consumed by two renderers only removes disagreement if
+        # both renderers carry what it refers to.
+        excluded = v.metrics[key].excluded
+        note = f"  ({exclusion_note(excluded)})" if excluded else ""
         if not plot_rows:
+            if note:
+                sections.append(f"{label}:\n{note}")
             continue
-        # final-accuracy is the one metric with a measured control; the other two really
-        # are gated against a fixed ideal, so they must not share a label.
-        control_label = "no-drop control" if key == "accuracy" else "ideal (100%)"
         section = f"{label}:\n" + forest_bar_lines(plot_rows, label, control_label, color=color)
-        if key == "accuracy" and excluded:
-            section += f"\n  ({exclusion_note(excluded)})"
+        if note:
+            section += "\n" + note
         sections.append(section)
+    # The directive, from the shared decision. Without it the chart showed bars and let the
+    # reader infer the conclusion — which is how a per-model PASS badge came to sit under a
+    # fleet verdict that said the opposite.
+    #
+    # De-emphasised MECHANICALLY rather than rewritten: `**bold**` and backticks are noise
+    # in a terminal, but a second hand-written copy of the sentence is how the chart and the
+    # markdown came to disagree three times over #335's review rounds. Stripping the markup
+    # off the one string keeps them the same sentence by construction, and
+    # `test_the_chart_and_the_markdown_reach_the_same_directive` pins the relation.
+    sections.append("  " + _plain(dropeval_directive_line(v)))
     return "\n\n".join(sections)

@@ -995,7 +995,7 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
     from .policy import load_policy
     from .policy_gen import activate_suggestions
     from .proxy import RETRIEVE_TOOL_DEF
-    from .report import build_dropeval_report
+    from .report import build_dropeval_report, dropeval_next_step_line, dropeval_verdict
 
     answerers = _build_answerers(
         args,
@@ -1026,8 +1026,10 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
                                         trials=args.trials,
                                         control=not args.no_control)
     print("\n" + build_dropeval_report(results, accept_degraded=args.accept_degraded))
-    print("If the worst-case model PASSES, enable the verified fields by renaming that tool's "
-          "'_suggested_fields' -> 'fields' in the policy.")
+    # Read the DIRECTIVE, never re-derive it from the PASS lines above — see
+    # `dropeval_next_step_line`, which owns the sentence and the reason.
+    print(dropeval_next_step_line(dropeval_verdict(
+        results, accept_degraded=args.accept_degraded)))
     return 0
 
 

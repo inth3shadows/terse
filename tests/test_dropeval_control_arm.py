@@ -135,7 +135,12 @@ def test_an_all_zero_control_is_excluded_as_broken_not_scored_as_a_free_pass():
 
 
 def _both_kinds(**kw):
-    """A verdict needs recall AND precision rows — a missing kind scores that gate 0%."""
+    """A verdict needs recall AND precision rows.
+
+    A missing kind used to score that gate at a fabricated 0% — `_form_stats([], f)` is
+    `(0.0, 0.0)`, which against the fixed 100% ideal published a `-100%` **FAIL**. Since
+    #342 it withholds the metric as `"empty"` instead, so a one-kind fixture now produces
+    NO verdict rather than a wrong one."""
     return _rows(kind="recall", **kw) + _rows(kind="precision", **kw)
 
 
