@@ -176,6 +176,26 @@ def test_sections_are_ordered_newest_first_and_unique(text):
         f"first break at {found[next(i for i in range(1, len(keyed)) if keyed[i] > keyed[i-1])]}")
 
 
+def test_there_is_exactly_one_unreleased_section(text):
+    """`test_sections_are_ordered_newest_first_and_unique` checks VERSIONED sections, and
+    `_SECTION` does not match `[Unreleased]` — so the one heading every release passes
+    through was the one heading nothing checked for duplicates.
+
+    It happened: the graduation of `v0.28.7` re-inserted an empty `[Unreleased]` at the top,
+    and the same pull request then added its own `[Unreleased]` below it. Both landed on
+    `main`. Nothing went red, because `test_unreleased_does_not_describe_work_that_already_
+    shipped` reads the FIRST section — which was the empty one — and so was satisfied while
+    a second section sat under it holding unshipped notes.
+
+    The consequence is not cosmetic. `scripts/release/graduate_changelog.py` also reads the
+    first `[Unreleased]`, found it empty, and refused to graduate: the mechanism that exists
+    to be a red reminder was silently a no-op, which is the one failure mode a
+    reminder-shaped test cannot afford."""
+    assert text.count("## [Unreleased]") == 1, (
+        f"{text.count('## [Unreleased]')} `## [Unreleased]` headings — graduation reads the "
+        "first one, so a second silently holds notes that never graduate")
+
+
 def test_every_section_carries_the_release_date_git_records(text):
     """A hand-typed date drifts from the tag. Checked against `git log` on the tag itself so
     the two cannot disagree — the same read-both-and-compare rule the primer-size and
