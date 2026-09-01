@@ -15,6 +15,18 @@ fails that pull request until the section has moved.
 
 _Nothing yet._
 
+## [0.28.9] - 2026-08-27
+
+### Fixed
+
+- **`build_diff_soak_report` hardcoded a transport cause the reason didn't license** (`#338`).
+  It was the seventh renderer with its own hardcoded phrasing: two sites asserted "too many
+  calls went unanswered" as settled fact for the `"unmeasured"` reason, which since `#332`
+  also covers a backend that answered every call but simply couldn't pair. Both sites now
+  route through the same hedge every other renderer already uses. Adds
+  `test_every_renderer_names_the_right_exclusion_reason`, the test `REASON_LABEL`'s note in
+  `report.py` cited but which did not exist.
+
 ## [0.28.8] - 2026-08-27
 
 ### Fixed
