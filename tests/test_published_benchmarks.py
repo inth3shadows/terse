@@ -9,9 +9,18 @@ because nothing was checking; the first pass at #206 then missed §3 for exactly
 reason. That is principle #134's argument: two things that must stay in step need a test,
 not a note asking people to remember.
 
-Covered here: §1 (terse column, both docs), §3 (the diff table, both docs), and §4's terse
-column, which is §1's number reprinted in a differently-shaped table and so drifts
-independently.
+BENCHMARKS.md is the single source of truth for full tables (every payload, every section);
+README.md carries only a short, honest excerpt that links out to it (#259/#260 argued the
+README's job is positioning, not a second copy of the data — see the doc-shortening commit).
+So the two docs are no longer held to full row-for-row equality: BENCHMARKS.md is checked
+for complete coverage, README.md's excerpt is checked only for internal correctness (every
+row it *does* publish must still match the codec) plus the weighted total, which is the one
+number expected to appear in both places.
+
+Covered here: §1 (terse column: full coverage in BENCHMARKS.md, weighted total in both,
+whatever rows README excerpts), §3 (the diff table: BENCHMARKS.md only, README no longer
+carries this table), and §4's terse column, which is §1's number reprinted in a
+differently-shaped table and so drifts independently.
 
 NOT covered, deliberately:
   * §1's TOON column — a pinned npm encoder CI has no node to run, and it cannot move
@@ -143,10 +152,7 @@ def _measure_s3() -> tuple[dict[str, tuple[int, int, float]], int, int, float]:
     return per, full_sum, diff_sum, 100.0 * (1 - diff_sum / full_sum)
 
 
-@pytest.mark.parametrize("doc", DOCS)
-def test_s1_rows_match_the_codec(doc):
-    per, _, _ = _measure_s1()
-    table = _table(doc, _S1_HEADER[doc])
+def _check_s1_rows(doc: str, per: dict, table: str, *, require_full_coverage: bool) -> None:
     rows = _S1.findall(table)
     assert rows, f"{doc}: parsed no §1 rows — did the table format change?"
 
@@ -167,8 +173,25 @@ def test_s1_rows_match_the_codec(doc):
         assert int(records) == expected, (
             f"{doc}: §1 {name} publishes {records} records, corpus has {expected}")
 
-    # A payload silently dropped from the table is the same defect as a stale cell.
-    assert seen == set(per), f"{doc}: §1 covers {sorted(seen)}, corpus has {sorted(per)}"
+    if require_full_coverage:
+        # A payload silently dropped from the table is the same defect as a stale cell.
+        assert seen == set(per), f"{doc}: §1 covers {sorted(seen)}, corpus has {sorted(per)}"
+
+
+def test_s1_rows_match_the_codec_in_benchmarks():
+    """BENCHMARKS.md is the single source of truth: every corpus payload must appear,
+    and every published cell must match the codec."""
+    per, _, _ = _measure_s1()
+    table = _table("BENCHMARKS.md", _S1_HEADER["BENCHMARKS.md"])
+    _check_s1_rows("BENCHMARKS.md", per, table, require_full_coverage=True)
+
+
+def test_s1_excerpt_matches_the_codec_in_readme():
+    """README.md carries a short excerpt, not the full table (see module docstring) — every
+    row it chooses to show must still be correct, but it need not cover every payload."""
+    per, _, _ = _measure_s1()
+    table = _table("README.md", _S1_HEADER["README.md"])
+    _check_s1_rows("README.md", per, table, require_full_coverage=False)
 
 
 @pytest.mark.parametrize("doc", DOCS)
@@ -182,10 +205,12 @@ def test_s1_weighted_total_matches_the_codec(doc):
         f"{doc}: §1 weighted total published {m[2]}%, measured {total_pct:.4f}%")
 
 
-@pytest.mark.parametrize("doc", DOCS)
-def test_s3_diff_table_matches_diff_demo(doc):
+def test_s3_diff_table_matches_diff_demo():
     """§3's "full re-send" column is the single-shot codec, so it moves with every codec
-    change exactly as §1 does — and it was missed on the first pass at #206."""
+    change exactly as §1 does — and it was missed on the first pass at #206.
+
+    BENCHMARKS.md only: README no longer carries a §3 table (see module docstring)."""
+    doc = "BENCHMARKS.md"
     per, full_sum, diff_sum, total_pct = _measure_s3()
     table = _table(doc, _S3_HEADER[doc])
     rows = _S3.findall(table)
@@ -234,19 +259,17 @@ def test_the_two_documents_agree_where_they_overlap():
     without this it is invisible — each file would still agree with the codec on the rows
     it happens to publish.
 
-    §1 is a straight copy, so require full equality. §3 is not: README prints all six
-    diffable payloads, BENCHMARKS prints a three-row excerpt of the same run (its totals
-    still cover all six, which the §3 test above checks against `diff_demo`). So compare
-    the intersection there, and assert the intersection is non-empty so an editorial change
-    that leaves them disjoint can't turn this into a no-op.
+    README.md now carries only a §1 excerpt (see module docstring), not the full table, so
+    this checks README's rows are a *subset* of BENCHMARKS.md's — same values, fewer rows —
+    rather than full equality. Also asserts the excerpt is non-empty, so an editorial change
+    that empties it can't turn this into a no-op. README no longer has a §3 table at all, so
+    there is nothing to cross-check there; §3 correctness is covered BENCHMARKS-only above.
     """
     s1 = {doc: {r[0]: r[1:] for r in _S1.findall(_table(doc, _S1_HEADER[doc]))}
           for doc in DOCS}
-    assert s1["README.md"] == s1["BENCHMARKS.md"], "§1 differs between the documents"
-
-    s3 = {doc: {r[0]: r[1:] for r in _S3.findall(_table(doc, _S3_HEADER[doc]))}
-          for doc in DOCS}
-    shared = set(s3["README.md"]) & set(s3["BENCHMARKS.md"])
-    assert shared, "§3 tables share no rows — one of them is no longer being checked"
-    for name in sorted(shared):
-        assert s3["README.md"][name] == s3["BENCHMARKS.md"][name], f"§3 {name} differs"
+    assert s1["README.md"], "README §1 excerpt is empty"
+    assert set(s1["README.md"]) <= set(s1["BENCHMARKS.md"]), (
+        "README §1 rows aren't a subset of BENCHMARKS.md's")
+    for name in s1["README.md"]:
+        assert s1["README.md"][name] == s1["BENCHMARKS.md"][name], (
+            f"§1 {name} differs between the documents")
