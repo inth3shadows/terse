@@ -891,9 +891,12 @@ def _codec_savings_section(
       it risks multiplying a payload's tokens by its question count, and defaulting it to a
       shared placeholder key (the first cut of this function used `str(r.get("sha", "?"))`)
       silently COLLAPSES every such payload in a group into whichever one was seen first —
-      wrong count, wrong sums, wrong percentage, and no disclosure. Review found that;
-      `capture.record` always writes `sha`, so it is unreachable from a natively captured
-      corpus and live only for merged or foreign result files.
+      wrong count, wrong sums, wrong percentage, and no disclosure. Two rounds of review
+      found this: the first found the placeholder here, the second found `run_codec_fluency`
+      still emitting its own `env.get("sha", "?")` one call upstream, which walked straight
+      past this guard because `"?"` is a non-empty `str`. Both are fixed. `capture.record`
+      always writes `sha`, but `capture.load_corpus` does not REQUIRE it, so the reachable
+      path is a foreign or hand-built corpus, not only a merged result file.
 
     The counted/uncounted split is per `(tool, shape)` group, not global, because the sums it
     qualifies are per-group: the same payload can be counted in one group and uncounted in
@@ -906,8 +909,9 @@ def _codec_savings_section(
         "UNSAFE group still prints what it saves. Decide correctness from the table above",
         "first; this one only says what the tier costs or buys once that is settled.",
         "cl100k tokens, over the payloads the verdict above was computed on — raw payload vs",
-        "the same compressed form the terse arm was fed. Any payload the sums could not",
-        "cover is disclosed beneath the table, never quietly dropped.",
+        "the same compressed form the terse arm was fed. Whatever the sums could not cover is",
+        "disclosed beneath the table, never quietly dropped — as payloads where the rows",
+        "identify one, and as rows where they do not.",
         "",
         "| Tool | Shape | payloads | raw tok | terse tok | saved | % |",
         "|---|---|---|---|---|---|---|",
@@ -972,13 +976,25 @@ def _codec_savings_section(
 
 
 def _is_token_count(v: object) -> TypeGuard[int]:
-    """A usable token count: a real `int`, never a `bool` and never a string spelling of one.
+    """A usable token count: a real, non-negative `int`. Never a `bool`, a string spelling of
+    one, or a negative sentinel.
 
-    `isinstance(True, int)` is `True` in Python, so a JSON `true` would otherwise sum as one
-    token; a stored `"1000"` would reach `sum()` and `{:+d}` and raise. Both were surviving
-    mutations in #303's review — neither is reachable from `_payload_tokens`, which emits
-    `int` or nothing, and both are reachable from a hand-written or foreign result file."""
-    return isinstance(v, int) and not isinstance(v, bool)
+    Three exclusions, each for a different reason, and none reachable from `_payload_tokens`
+    (which emits `int` or nothing) — all three are reachable from a hand-written or foreign
+    result file:
+
+    - **`bool`**: `isinstance(True, int)` is `True` in Python, so a JSON `true` would sum as
+      one token and render a saving. A surviving mutation in #303's second review.
+    - **`str`**: `"1000"` would reach `sum()` and `{:+d}` and raise. The first cut already
+      excluded this via a bare `isinstance(v, int)`; it is pinned here so a later widening
+      of the check (`v is not None`) cannot reintroduce it, NOT because it ever shipped
+      broken. An earlier version of this docstring claimed it had, which was wrong.
+    - **negative**: a token count cannot be negative, and `_pct` has no guard for a negative
+      BASE — only for a zero one. Executed: `raw=-1, terse=1` renders `-2` saved at
+      `+200.0%`, a saving reported for a payload that expanded. Excluding it here is the
+      targeted fix; `_pct`'s zero-guard is shared with six other renderers and is not
+      widened from this call site."""
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
 def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:

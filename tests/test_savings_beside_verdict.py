@@ -261,13 +261,43 @@ def test_a_sha_that_is_not_a_usable_string_is_treated_the_same_way():
 # What counts as a token count
 # --------------------------------------------------------------------------- #
 def test_a_string_token_count_is_uncounted_rather_than_summed():
-    # A stored "1000" would reach sum() and the {:+d} format and raise. Excluded, and the
-    # payload is disclosed — the same treatment as an absent count.
+    # A stored "1000" would reach sum() and the {:+d} format and raise. Never shipped
+    # broken — the first cut's bare `isinstance(v, int)` already excluded it — but pinned
+    # so a later widening of the check cannot reintroduce it. Excluded, and the payload is
+    # disclosed: the same treatment as an absent count.
     rows = _tagged([_row("q1", 1, 1, sha="s")], "tool-a", "array-of-records")
     rows[0] |= {"raw_tokens": "1000", "terse_tokens": "400"}
     _, savings = _sections(build_codec_verdict_report({"m1": rows}))
     assert "| `tool-a` | array-of-records | 0 | n/a | n/a | n/a | n/a |" in savings
     assert "1 payload(s)" in savings
+
+
+def test_one_usable_count_beside_one_unusable_one_counts_as_neither():
+    # The mutation that survived all 26 tests of the previous round: `and` -> `or` at the
+    # token-count check. Every fixture set BOTH counts or NEITHER, so the operator was
+    # unpinned — and under `or` this row reaches `counted` as `(1000, None)`, then `sum()`
+    # raises TypeError. A half-measured payload is an unmeasured payload.
+    for present, absent in (("raw_tokens", "terse_tokens"), ("terse_tokens", "raw_tokens")):
+        rows = _tagged([_row("q1", 1, 1, sha="s")], "tool-a", "array-of-records")
+        del rows[0][absent]
+        rows[0][present] = 1000
+        _, savings = _sections(build_codec_verdict_report({"m1": rows}))
+        assert "| `tool-a` | array-of-records | 0 | n/a | n/a | n/a | n/a |" in savings, absent
+        assert "1000" not in savings, present
+        assert "1 payload(s)" in savings
+
+
+def test_a_negative_token_count_cannot_render_a_saving():
+    # A token count cannot be negative, and `_pct` guards a zero base but not a negative
+    # one. Executed on the unguarded code: raw=-1, terse=1 renders -2 saved at +200.0% —
+    # a saving reported for a payload that expanded. The guard belongs at the gate, not in
+    # `_pct`, which six other renderers share.
+    for raw_t, terse_t in ((-1, 1), (-100, 50), (1000, -400)):
+        rows = _tagged([_row("q1", 1, 1, sha="s")], "tool-a", "array-of-records")
+        rows[0] |= {"raw_tokens": raw_t, "terse_tokens": terse_t}
+        _, savings = _sections(build_codec_verdict_report({"m1": rows}))
+        assert "| `tool-a` | array-of-records | 0 | n/a | n/a | n/a | n/a |" in savings
+        assert "%" not in savings.split("|---|---|---|---|---|---|---|")[1].split("\n\n")[0]
 
 
 def test_a_boolean_token_count_does_not_sum_as_one_token():
@@ -375,6 +405,38 @@ def test_payload_tokens_emits_nothing_when_the_tokenizer_is_unavailable(monkeypa
     assert _payload_tokens('{"a": 1}', {"a": 1}) == {}
 
 
+def test_run_codec_fluency_omits_sha_rather_than_defaulting_it_to_a_placeholder():
+    # The defect the SECOND review found: the renderer stopped defaulting a missing sha to
+    # "?", but this emitter did not — and "?" is a non-empty str, so it walked past the
+    # renderer's guard and collapsed every sha-less payload in a group into the first one.
+    # `capture.load_corpus` does not require `sha`, so a foreign corpus reaches here.
+    import json
+
+    from terse import codeceval
+    from terse.dropeval import ToolCall, Turn
+
+    def answerer(_messages, **_kw):
+        return Turn(content=None,
+                    tool_calls=[ToolCall(name=codeceval.RECORD_VALUE_TOOL,
+                                         arguments={"value": {"k": [1, 2, 3]}})])
+
+    def env_for(blob, **extra):
+        obj = [{"id": 1, "blob": blob}, {"id": 2, "blob": {"k": [9]}}]
+        return {"tool": "t", "shape": "array-of-records", "raw": json.dumps(obj), **extra}
+
+    rows = codeceval.run_codec_fluency([env_for({"k": [1, 2, 3]})], {"m": answerer})["m"]
+    assert rows, "fixture produced no deref questions — it cannot fail"
+    assert all("sha" not in r for r in rows), "a placeholder sha was emitted"
+
+    # And the end-to-end consequence: two distinct sha-less payloads stay two, disclosed as
+    # rows, rather than collapsing into one payload's token counts.
+    envs = [env_for({"k": [1, 2, 3]}), env_for({"k": [7, 7, 7]})]
+    allrows = codeceval.run_codec_fluency(envs, {"m": answerer})["m"]
+    _, savings = _sections(build_codec_verdict_report({"m": allrows}))
+    assert "| `t` | array-of-records | 0 | n/a | n/a | n/a | n/a |" in savings
+    assert f"{len(allrows)} row(s) carry no `sha`" in savings
+
+
 def test_run_codec_fluency_stamps_the_counts_on_every_row_of_a_payload():
     import json
 
@@ -402,10 +464,11 @@ def test_run_codec_fluency_stamps_the_counts_on_every_row_of_a_payload():
 
 # --------------------------------------------------------------------------- #
 # Mutation catalogue — every entry was applied to the source, this file re-run, and the
-# named test confirmed to redden. 22 mutations, zero SURVIVED. Entries 14-22 were added
-# after adversarial review of the first cut, which found FOUR of them surviving all 15
-# tests it then had. That is the record this file should be read against: the mutations you
-# think of yourself are the ones your fixtures were already shaped around.
+# named test confirmed to redden. 26 mutations, zero SURVIVED. Entries 14-22 came from an
+# adversarial review of the first cut, which found FOUR of them surviving all 15 tests it
+# then had; 23-26 came from a second review OF THAT FIX, which found three more plus the
+# defect at entry 25. That is the record this file should be read against: the mutations
+# you think of yourself are the ones your fixtures were already shaped around.
 #
 # The renderer (report.py `_codec_savings_section`):
 #   1. never call `_codec_savings_section` -> reddens 10 tests.
@@ -473,7 +536,25 @@ def test_run_codec_fluency_stamps_the_counts_on_every_row_of_a_payload():
 #   9. drop `**toks` from the emitted row ->
 #      `test_run_codec_fluency_stamps_the_counts_on_every_row_of_a_payload`.
 #
+# Added after the SECOND review, which found a defect inside the first round's fix — the
+# outcome this repo keeps producing, and the reason a fix round gets its own review:
+#  23. `_is_token_count(raw_t) and ...` -> `or`. SURVIVED all 26 tests of the previous
+#      round: every fixture set BOTH counts or NEITHER, so the operator was never pinned.
+#      Under `or` a half-measured row reaches `counted` as `(1000, None)` and `sum()`
+#      raises. -> `test_one_usable_count_beside_one_unusable_one_counts_as_neither`.
+#  24. drop `v >= 0` from `_is_token_count`. `_pct` guards a zero base, not a negative one:
+#      executed, `raw=-1, terse=1` renders `-2` saved at `+200.0%`, a saving for a payload
+#      that expanded. -> `test_a_negative_token_count_cannot_render_a_saving`.
+#  25. restore `"sha": env.get("sha", "?")` in `run_codec_fluency`. THE defect of the second
+#      review: the renderer's guard was hardened while the emitter one call upstream still
+#      wrote the placeholder, and `"?"` is a non-empty `str`, so it walked straight past.
+#      On the only production path this made the whole sha fix inert. ->
+#      `test_run_codec_fluency_omits_sha_rather_than_defaulting_it_to_a_placeholder`.
+#  26. omit `sha` from the emitted row even when the envelope has one -> the stamping test.
+#      The opposite direction from 25, and without it 25's fix could be "never emit a sha".
+#
 # Known EQUIVALENT mutant, recorded rather than fixed: none. The first cut had one — the
-# `elif sha not in counted` guard, dead given `uncounted -= set(counted)` two lines below —
-# and it was deleted rather than catalogued, since dead code that looks load-bearing is
-# worse than either a test or an honest note.
+# `elif sha not in counted` guard, redundant given `uncounted -= set(counted)` two lines
+# below (executed on every input, but with no effect the subtraction did not already have)
+# — and it was deleted rather than catalogued, since a redundant guard that looks
+# load-bearing is worse than either a test or an honest note.

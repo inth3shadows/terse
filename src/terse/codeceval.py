@@ -263,13 +263,22 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
         if not gen_codec_questions(obj):
             continue
         toks = _payload_tokens(env["raw"], obj)
+        # `sha` is OMITTED, never defaulted, when the envelope has no usable one. `tool` and
+        # `shape` default because they are LABELS — a group headed `?` is legible. `sha` is
+        # an IDENTITY: `report._codec_savings_section` de-duplicates payloads by it, so a
+        # shared `"?"` placeholder silently collapses every sha-less payload in a group into
+        # whichever was seen first, and reports the survivor's tokens as the group's total.
+        # That is exactly the defect the renderer's own guard was added to catch, and a
+        # placeholder here walks straight past it: `"?"` is a non-empty `str`. Second review
+        # of #303 found the renderer hardened and this line still emitting the placeholder.
+        # `capture.record` always writes `sha`, but `capture.load_corpus` does not require
+        # it, so a foreign or hand-built corpus reaches here without one.
+        sha = env.get("sha")
+        tags: dict[str, Any] = {"tool": env.get("tool", "?"),
+                                "shape": env.get("shape", "unknown")}
+        if isinstance(sha, str) and sha:
+            tags["sha"] = sha
         for name, answerer in answerers.items():
             for row in run_codec_payload(obj, env["raw"], answerer, trials=trials):
-                results[name].append({
-                    "tool": env.get("tool", "?"),
-                    "shape": env.get("shape", "unknown"),
-                    "sha": env.get("sha", "?"),
-                    **toks,
-                    **row,
-                })
+                results[name].append({**tags, **toks, **row})
     return results
