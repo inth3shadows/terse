@@ -403,7 +403,7 @@ def run_corpus(corpus: Path, pol: policy_mod.Policy) -> dict:
         if raw_t < MIN_SCORED_TOKENS:
             infl["below_floor"] += 1
             continue
-        shape = env.get("shape") or capture.classify_shape(raw)
+        shape = capture.envelope_shape(env)   # live, never the stored cache (#355)
         a_raw, how = best(raw)
         a_post, _ = best(prod)
         winners[how] += 1
