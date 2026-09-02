@@ -79,6 +79,7 @@ from typing import Any
 
 from . import fluency
 from .dropeval import ToolAnswerer, Turn, _safe_call
+from .tokenize import count_cl100k
 
 # OpenAI function-calling schemas can't cleanly express "any JSON type" — see the module
 # docstring's spike note. `{"description": ...}` with no `"type"` is the untyped form that
@@ -202,6 +203,39 @@ def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
     return out
 
 
+def _payload_tokens(raw_text: str, obj: Any) -> dict[str, int]:
+    """cl100k token counts for one payload's two arms, stamped onto every row that payload
+    produces (#303). Empty when tiktoken is unavailable — `count_cl100k` returns `None`
+    there, and a savings table that silently reads a missing count as zero would print a
+    100% saving for an unmeasured run.
+
+    Measured on the FORM THE MODEL ACTUALLY READ: `raw_text` is the same string
+    `run_codec_payload` puts on the raw arm, and `fluency.compress(obj)` is byte-identical
+    to the terse arm's payload. Recomputing the corpus-wide savings from `measure` instead
+    would report a different number against the same verdict, for two reasons — both
+    MEASURED ONCE, on 2026-09-01, against the 1,524-envelope corpus at
+    `~/.config/terse/session-corpus`, and neither one an invariant:
+
+    - `run_codec_fluency` only emits rows for payloads that yield a `deref` question. 8 of
+      1,524 did, so the corpus-wide table would cover 190x the payloads the verdict does.
+    - 36 of those 1,524 envelopes carried a stored `shape` that `classify_shape(raw)` no
+      longer agreed with, so the two tables would not bucket the same payload the same way.
+      Filed as `#355`; if it is fixed, that second reason goes away and the first does not.
+
+    Both figures will drift as the corpus grows and as `classify_shape` changes. They are
+    cited as the evidence for a design choice already made, not as facts anything reads.
+
+    Per PAYLOAD, not per row: one payload yields one row per question, and every one of
+    them carries these same two counts. `build_codec_verdict_report` de-duplicates by
+    `sha` before summing — summing the rows directly would multiply a payload's tokens by
+    its question count, and again by the number of models that answered it."""
+    raw_tok = count_cl100k(raw_text)
+    terse_tok = count_cl100k(fluency.compress(obj))
+    if raw_tok is None or terse_tok is None:
+        return {}
+    return {"raw_tokens": raw_tok, "terse_tokens": terse_tok}
+
+
 def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                       trials: int = 1) -> dict[str, list[dict]]:
     """Run the codec-tier eval for each named tool-capable answerer over every payload in
@@ -214,7 +248,12 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
     capture time by `capture.record` — `capture.py`'s `classify_shape` call). No existing
     harness stamps `shape` onto its rows; it is the one field #295's per-`(tool, shape)`
     verdict needs that the comprehension harness never needed, because the comprehension
-    report has always pooled globally rather than per shape bucket."""
+    report has always pooled globally rather than per shape bucket.
+
+    Rows also carry `sha` and, when a tokenizer is available, the payload's `raw_tokens` /
+    `terse_tokens` (`_payload_tokens`) — PER PAYLOAD, repeated on each of its question rows,
+    for `report._codec_savings_section` to de-duplicate by `sha` and report beside the
+    verdict."""
     results: dict[str, list[dict]] = {name: [] for name in answerers}
     for env in envelopes:
         try:
@@ -223,12 +262,23 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
             continue  # deref needs parsed JSON structure; a non-JSON/text payload has none
         if not gen_codec_questions(obj):
             continue
+        toks = _payload_tokens(env["raw"], obj)
+        # `sha` is OMITTED, never defaulted, when the envelope has no usable one. `tool` and
+        # `shape` default because they are LABELS — a group headed `?` is legible. `sha` is
+        # an IDENTITY: `report._codec_savings_section` de-duplicates payloads by it, so a
+        # shared `"?"` placeholder silently collapses every sha-less payload in a group into
+        # whichever was seen first, and reports the survivor's tokens as the group's total.
+        # That is exactly the defect the renderer's own guard was added to catch, and a
+        # placeholder here walks straight past it: `"?"` is a non-empty `str`. Second review
+        # of #303 found the renderer hardened and this line still emitting the placeholder.
+        # `capture.record` always writes `sha`, but `capture.load_corpus` does not require
+        # it, so a foreign or hand-built corpus reaches here without one.
+        sha = env.get("sha")
+        tags: dict[str, Any] = {"tool": env.get("tool", "?"),
+                                "shape": env.get("shape", "unknown")}
+        if isinstance(sha, str) and sha:
+            tags["sha"] = sha
         for name, answerer in answerers.items():
             for row in run_codec_payload(obj, env["raw"], answerer, trials=trials):
-                results[name].append({
-                    "tool": env.get("tool", "?"),
-                    "shape": env.get("shape", "unknown"),
-                    "sha": env.get("sha", "?"),
-                    **row,
-                })
+                results[name].append({**tags, **toks, **row})
     return results

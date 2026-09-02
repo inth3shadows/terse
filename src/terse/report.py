@@ -15,7 +15,7 @@ import math
 from collections.abc import Mapping
 from enum import IntEnum
 from types import MappingProxyType
-from typing import Any, Literal, NamedTuple, assert_never
+from typing import Any, Literal, NamedTuple, TypeGuard, assert_never
 
 # Shared pass/fail tolerance for both worst-case verdict gates below — the number behind
 # "safe to enable `proxy --diff`". Pinned to its VALUE, in both directions, by
@@ -859,6 +859,144 @@ def codec_verdict(rows: list[dict[str, Any]]) -> tuple[str, ArmGap]:
     return "UNRESOLVED", g
 
 
+def _codec_savings_section(
+    groups: dict[tuple[str, str], dict[str, list[dict]]],
+) -> list[str]:
+    """The economics, rendered BESIDE the verdict and never inside it (#303, #295 DoD 4).
+
+    A SIBLING section over the same `(tool, shape)` groups — a peer `##` heading, not a
+    `###` nested under the verdict, which is as close to "folded into it" as markdown gets
+    (`test_the_savings_heading_is_a_sibling_not_a_subsection` pins the level, not just the
+    text). Deliberately not a column of the verdict table and deliberately not combined with
+    it by any arithmetic. The ordering is the argument: correctness is decided first, on its
+    own table, and the savings number is what you consult AFTER it — because a cell that
+    multiplies a saving by a verdict is how a savings argument ends up licensing a
+    correctness loss.
+
+    An UNSAFE group still prints its savings. Withholding it would be its own editorialising
+    in the other direction: "this shape saves 61% and is UNSAFE" is the true and useful
+    statement, and suppressing half of it does not make the tier safer, only less legible.
+    The two facts are independent measurements of the same group; neither gates the other.
+
+    Two ways a row can fail to contribute, and BOTH are disclosed rather than silently
+    dropped — the sums must never be a subset presented as a total:
+
+    - **No token counts** (`raw_tokens`/`terse_tokens` absent, `None`, a string, or a bool —
+      `isinstance(True, int)` is `True`, so bools are excluded explicitly). A run with no
+      tokenizer, or a stored result predating #303. Read as `0/0` these would print a
+      perfect saving off a measurement that never happened.
+    - **No usable `sha`.** De-duplication is BY `sha`, because `run_codec_fluency` stamps the
+      same per-payload counts onto every question row a payload produces, for every model
+      that answered it. A row without one cannot be attributed to a payload at all: summing
+      it risks multiplying a payload's tokens by its question count, and defaulting it to a
+      shared placeholder key (the first cut of this function used `str(r.get("sha", "?"))`)
+      silently COLLAPSES every such payload in a group into whichever one was seen first —
+      wrong count, wrong sums, wrong percentage, and no disclosure. Two rounds of review
+      found this: the first found the placeholder here, the second found `run_codec_fluency`
+      still emitting its own `env.get("sha", "?")` one call upstream, which walked straight
+      past this guard because `"?"` is a non-empty `str`. Both are fixed. `capture.record`
+      always writes `sha`, but `capture.load_corpus` does not REQUIRE it, so the reachable
+      path is a foreign or hand-built corpus, not only a merged result file.
+
+    The counted/uncounted split is per `(tool, shape)` group, not global, because the sums it
+    qualifies are per-group: the same payload can be counted in one group and uncounted in
+    another (reachable via the stored-`shape` drift of `#355`), and the note below says so."""
+    out = [
+        "## Savings by tool and shape",
+        "",
+        "Reported BESIDE the verdict above, never folded into it: no figure here is",
+        "weighted by, multiplied into, or gated on a SAFE/UNSAFE/UNRESOLVED result, and an",
+        "UNSAFE group still prints what it saves. Decide correctness from the table above",
+        "first; this one only says what the tier costs or buys once that is settled.",
+        "cl100k tokens, over the payloads the verdict above was computed on — raw payload vs",
+        "the same compressed form the terse arm was fed. Whatever the sums could not cover is",
+        "disclosed beneath the table, never quietly dropped — as payloads where the rows",
+        "identify one, and as rows where they do not.",
+        "",
+        "| Tool | Shape | payloads | raw tok | terse tok | saved | % |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    uncounted_total = 0
+    unattributable_total = 0
+    # `sorted` on BOTH loops, and it is the same expression as the verdict table's (#303
+    # review): two tables a reader is asked to line up row-for-row must not order their rows
+    # independently. `test_both_tables_list_their_groups_in_the_same_order` holds the pair.
+    for (tool, shape), by_model in sorted(groups.items()):
+        counted: dict[str, tuple[int, int]] = {}
+        uncounted: set[str] = set()
+        for mrows in by_model.values():
+            for r in mrows:
+                sha = r.get("sha")
+                if not isinstance(sha, str) or not sha:
+                    unattributable_total += 1   # counted in ROWS: without a sha there is no
+                    continue                    # payload identity to count in
+                raw_t, terse_t = r.get("raw_tokens"), r.get("terse_tokens")
+                if _is_token_count(raw_t) and _is_token_count(terse_t):
+                    # First-wins. Every row of a payload carries the same two counts, so the
+                    # choice is only visible for a merged result set whose runs disagree —
+                    # in which case the EARLIER run's measurement is the one already cited
+                    # in whatever report it produced, and re-reading it keeps the two
+                    # agreeing rather than silently superseding one with the other.
+                    counted.setdefault(sha, (raw_t, terse_t))
+                else:
+                    uncounted.add(sha)
+        uncounted -= set(counted)
+        uncounted_total += len(uncounted)
+        if not counted:
+            out.append(f"| `{tool}` | {shape} | 0 | n/a | n/a | n/a | n/a |")
+            continue
+        raw = sum(v[0] for v in counted.values())
+        cmp_ = sum(v[1] for v in counted.values())
+        out.append(f"| `{tool}` | {shape} | {len(counted)} | {raw} | {cmp_} | "
+                   f"{raw - cmp_:+d} | {_pct(raw - cmp_, raw)} |")
+    out.append("")
+    if uncounted_total:
+        out += [
+            f"{uncounted_total} payload(s) — counted once per `(tool, shape)` group, so a "
+            "payload measured in one",
+            "group can still be uncounted in another — carry no token counts and are "
+            "excluded from the",
+            "sums above (no tokenizer available at run time, or a result file predating "
+            "`#303`).",
+            "Excluded, not counted as zero.",
+            "",
+        ]
+    if unattributable_total:
+        out += [
+            f"{unattributable_total} row(s) carry no `sha` and are excluded from the sums "
+            "above: without a payload",
+            "identity they cannot be de-duplicated, and counting them would multiply a "
+            "payload's tokens by",
+            "its question count. `capture.record` always writes one, so this indicates a "
+            "merged or foreign",
+            "result file rather than a corpus this build captured.",
+            "",
+        ]
+    return out
+
+
+def _is_token_count(v: object) -> TypeGuard[int]:
+    """A usable token count: a real, non-negative `int`. Never a `bool`, a string spelling of
+    one, or a negative sentinel.
+
+    Three exclusions, each for a different reason, and none reachable from `_payload_tokens`
+    (which emits `int` or nothing) — all three are reachable from a hand-written or foreign
+    result file:
+
+    - **`bool`**: `isinstance(True, int)` is `True` in Python, so a JSON `true` would sum as
+      one token and render a saving. A surviving mutation in #303's second review.
+    - **`str`**: `"1000"` would reach `sum()` and `{:+d}` and raise. The first cut already
+      excluded this via a bare `isinstance(v, int)`; it is pinned here so a later widening
+      of the check (`v is not None`) cannot reintroduce it, NOT because it ever shipped
+      broken. An earlier version of this docstring claimed it had, which was wrong.
+    - **negative**: a token count cannot be negative, and `_pct` has no guard for a negative
+      BASE — only for a zero one. Executed: `raw=-1, terse=1` renders `-2` saved at
+      `+200.0%`, a saving reported for a payload that expanded. Excluding it here is the
+      targeted fix; `_pct`'s zero-guard is shared with six other renderers and is not
+      widened from this call site."""
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
 def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
     """Render the codec-tier material-preservation eval, grouped by `(tool, shape)` — never
     as one global number (#295's explicit non-goal). `results` is
@@ -870,7 +1008,11 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
     `build_fluency_report` both pool a model's rows across the whole corpus. Per-shape
     grouping matters here because the product ships per-tool policy; a single global verdict
     can't answer "compress THIS shape, for THIS tool, by default?", which is the question
-    #295 says the eval must be able to answer."""
+    #295 says the eval must be able to answer.
+
+    Token savings render as a SIBLING section over the same groups (`_codec_savings_section`,
+    #303), never as a column of the verdict table and never combined with a verdict by any
+    arithmetic — see that function for why the ordering is the argument."""
     out = ["# terse codec-tier material-preservation eval", ""]
     out += [
         "Does a real tool-calling model's downstream tool-call argument stay structurally",
@@ -929,6 +1071,7 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
         out.append(f"| `{tool}` | {shape} | {n} | **{worst_verdict}** | `{worst_model}` | "
                    f"{why} |")
     out.append("")
+    out += _codec_savings_section(groups)
     return "\n".join(out)
 
 

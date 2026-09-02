@@ -13,7 +13,46 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Codec-tier token savings are reported beside the verdict, never inside it** (`#303`).
+  `build_codec_verdict_report` gains a sibling `## Savings by tool and shape` section over
+  the same `(tool, shape)` groups as the SAFE/UNSAFE/UNRESOLVED table, so the two read
+  against each other with no combined score anywhere — the ordering is the argument, since
+  a cell that folds a saving into a verdict is how a savings number ends up licensing a
+  correctness loss (`#295` DoD 4). An UNSAFE group still prints what it saves; suppressing
+  that would be its own editorialising. `run_codec_fluency` now stamps each payload's
+  `raw_tokens`/`terse_tokens` (cl100k, over exactly the two forms the model was fed) onto
+  its rows, and the renderer de-duplicates by `sha` before summing. A payload with no token
+  counts — no tokenizer at run time, or a result file predating this — is excluded from the
+  sums and reported as uncounted, never as a zero saving.
+
+## [0.28.11] - 2026-09-01
+
+### Fixed
+
+- **A non-answer was scored as a wrong answer** (`#279`, `#283`). `fluency`'s scorer divided
+  by `len(replies)`, so a reply the backend never produced — `None`, a non-string, or a
+  blank — landed in the denominator as a miss, and a model that answered correctly every
+  time it answered at all reported degraded accuracy. `_score_form` now leaves a non-answer
+  out of both the numerator and the denominator (the discipline `harnesses._ask_n` already
+  followed), and a new `MISSING` sentinel separates "this form was never collected" from
+  "the reply came back empty". Emitted rows carry per-arm `<arm>_attempts` plus pooled
+  `fails`/`attempts`, so `--responses` runs are gated by the same transport check as every
+  live harness instead of publishing a verdict off whatever survived (`#283`).
+
+## [0.28.10] - 2026-09-01
+
+### Fixed
+
+- **`_unmeasured` divided transport loss across the pooled sample, not per arm** (`#339`).
+  The 20% call-loss gate's comment claimed it withheld a verdict when an arm lost more than
+  a fifth of its calls; the arithmetic divided by BOTH arms' attempts, so the real threshold
+  was 40% of one arm — a factor of the arm count away from the number the comment argued
+  for, and it had already been mis-cited in that comment. `_unmeasured` now reads each arm's
+  own `<arm>_attempts` (falling back to the shared `trials` where a row does not carry
+  them, so every legacy result file renders byte-identically), and `paired_rows` gates on
+  the same per-arm counts.
 
 ## [0.28.9] - 2026-08-27
 
