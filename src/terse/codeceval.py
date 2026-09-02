@@ -212,11 +212,18 @@ def _payload_tokens(raw_text: str, obj: Any) -> dict[str, int]:
     Measured on the FORM THE MODEL ACTUALLY READ: `raw_text` is the same string
     `run_codec_payload` puts on the raw arm, and `fluency.compress(obj)` is byte-identical
     to the terse arm's payload. Recomputing the corpus-wide savings from `measure` instead
-    would report a different number against the same verdict — `run_codec_fluency` only
-    emits rows for payloads that yield a `deref` question (8 of 1524 on the live corpus,
-    measured 2026-09-02), and 36 of those 1524 envelopes carry a stored `shape` that
-    today's `classify_shape` no longer agrees with, so the two tables would neither cover
-    the same payloads nor bucket them the same way.
+    would report a different number against the same verdict, for two reasons — both
+    MEASURED ONCE, on 2026-09-01, against the 1,524-envelope corpus at
+    `~/.config/terse/session-corpus`, and neither one an invariant:
+
+    - `run_codec_fluency` only emits rows for payloads that yield a `deref` question. 8 of
+      1,524 did, so the corpus-wide table would cover 190x the payloads the verdict does.
+    - 36 of those 1,524 envelopes carried a stored `shape` that `classify_shape(raw)` no
+      longer agreed with, so the two tables would not bucket the same payload the same way.
+      Filed as `#355`; if it is fixed, that second reason goes away and the first does not.
+
+    Both figures will drift as the corpus grows and as `classify_shape` changes. They are
+    cited as the evidence for a design choice already made, not as facts anything reads.
 
     Per PAYLOAD, not per row: one payload yields one row per question, and every one of
     them carries these same two counts. `build_codec_verdict_report` de-duplicates by

@@ -15,7 +15,7 @@ import math
 from collections.abc import Mapping
 from enum import IntEnum
 from types import MappingProxyType
-from typing import Any, Literal, NamedTuple, assert_never
+from typing import Any, Literal, NamedTuple, TypeGuard, assert_never
 
 # Shared pass/fail tolerance for both worst-case verdict gates below — the number behind
 # "safe to enable `proxy --diff`". Pinned to its VALUE, in both directions, by
@@ -864,22 +864,40 @@ def _codec_savings_section(
 ) -> list[str]:
     """The economics, rendered BESIDE the verdict and never inside it (#303, #295 DoD 4).
 
-    A SIBLING section over the same `(tool, shape)` groups, deliberately not a column of
-    the verdict table and deliberately not combined with it by any arithmetic. The ordering
-    is the argument: correctness is decided first, on its own table, and the savings number
-    is what you consult AFTER it — because a cell that multiplies a saving by a verdict is
-    how a savings argument ends up licensing a correctness loss.
+    A SIBLING section over the same `(tool, shape)` groups — a peer `##` heading, not a
+    `###` nested under the verdict, which is as close to "folded into it" as markdown gets
+    (`test_the_savings_heading_is_a_sibling_not_a_subsection` pins the level, not just the
+    text). Deliberately not a column of the verdict table and deliberately not combined with
+    it by any arithmetic. The ordering is the argument: correctness is decided first, on its
+    own table, and the savings number is what you consult AFTER it — because a cell that
+    multiplies a saving by a verdict is how a savings argument ends up licensing a
+    correctness loss.
 
     An UNSAFE group still prints its savings. Withholding it would be its own editorialising
     in the other direction: "this shape saves 61% and is UNSAFE" is the true and useful
     statement, and suppressing half of it does not make the tier safer, only less legible.
     The two facts are independent measurements of the same group; neither gates the other.
 
-    De-duplicates by `sha` because `run_codec_fluency` stamps the same per-payload counts
-    onto every question row a payload produces, for every model that answered it. Rows from
-    a run that could not tokenize (or from a stored result predating #303) carry no counts;
-    those payloads are excluded from the sums and reported as uncounted rather than as zero
-    savings, so a missing measurement can never read as a perfect one."""
+    Two ways a row can fail to contribute, and BOTH are disclosed rather than silently
+    dropped — the sums must never be a subset presented as a total:
+
+    - **No token counts** (`raw_tokens`/`terse_tokens` absent, `None`, a string, or a bool —
+      `isinstance(True, int)` is `True`, so bools are excluded explicitly). A run with no
+      tokenizer, or a stored result predating #303. Read as `0/0` these would print a
+      perfect saving off a measurement that never happened.
+    - **No usable `sha`.** De-duplication is BY `sha`, because `run_codec_fluency` stamps the
+      same per-payload counts onto every question row a payload produces, for every model
+      that answered it. A row without one cannot be attributed to a payload at all: summing
+      it risks multiplying a payload's tokens by its question count, and defaulting it to a
+      shared placeholder key (the first cut of this function used `str(r.get("sha", "?"))`)
+      silently COLLAPSES every such payload in a group into whichever one was seen first —
+      wrong count, wrong sums, wrong percentage, and no disclosure. Review found that;
+      `capture.record` always writes `sha`, so it is unreachable from a natively captured
+      corpus and live only for merged or foreign result files.
+
+    The counted/uncounted split is per `(tool, shape)` group, not global, because the sums it
+    qualifies are per-group: the same payload can be counted in one group and uncounted in
+    another (reachable via the stored-`shape` drift of `#355`), and the note below says so."""
     out = [
         "## Savings by tool and shape",
         "",
@@ -887,23 +905,36 @@ def _codec_savings_section(
         "weighted by, multiplied into, or gated on a SAFE/UNSAFE/UNRESOLVED result, and an",
         "UNSAFE group still prints what it saves. Decide correctness from the table above",
         "first; this one only says what the tier costs or buys once that is settled.",
-        "cl100k tokens, over exactly the payloads the verdict above was computed on —",
-        "raw payload vs the same compressed form the terse arm was fed.",
+        "cl100k tokens, over the payloads the verdict above was computed on — raw payload vs",
+        "the same compressed form the terse arm was fed. Any payload the sums could not",
+        "cover is disclosed beneath the table, never quietly dropped.",
         "",
         "| Tool | Shape | payloads | raw tok | terse tok | saved | % |",
         "|---|---|---|---|---|---|---|",
     ]
     uncounted_total = 0
+    unattributable_total = 0
+    # `sorted` on BOTH loops, and it is the same expression as the verdict table's (#303
+    # review): two tables a reader is asked to line up row-for-row must not order their rows
+    # independently. `test_both_tables_list_their_groups_in_the_same_order` holds the pair.
     for (tool, shape), by_model in sorted(groups.items()):
         counted: dict[str, tuple[int, int]] = {}
         uncounted: set[str] = set()
         for mrows in by_model.values():
             for r in mrows:
-                sha = str(r.get("sha", "?"))
+                sha = r.get("sha")
+                if not isinstance(sha, str) or not sha:
+                    unattributable_total += 1   # counted in ROWS: without a sha there is no
+                    continue                    # payload identity to count in
                 raw_t, terse_t = r.get("raw_tokens"), r.get("terse_tokens")
-                if isinstance(raw_t, int) and isinstance(terse_t, int):
+                if _is_token_count(raw_t) and _is_token_count(terse_t):
+                    # First-wins. Every row of a payload carries the same two counts, so the
+                    # choice is only visible for a merged result set whose runs disagree —
+                    # in which case the EARLIER run's measurement is the one already cited
+                    # in whatever report it produced, and re-reading it keeps the two
+                    # agreeing rather than silently superseding one with the other.
                     counted.setdefault(sha, (raw_t, terse_t))
-                elif sha not in counted:
+                else:
                     uncounted.add(sha)
         uncounted -= set(counted)
         uncounted_total += len(uncounted)
@@ -917,13 +948,37 @@ def _codec_savings_section(
     out.append("")
     if uncounted_total:
         out += [
-            f"{uncounted_total} payload(s) carry no token counts and are excluded from the "
-            "sums above",
-            "(no tokenizer available at run time, or a result file predating `#303`) — "
-            "excluded, not counted as zero.",
+            f"{uncounted_total} payload(s) — counted once per `(tool, shape)` group, so a "
+            "payload measured in one",
+            "group can still be uncounted in another — carry no token counts and are "
+            "excluded from the",
+            "sums above (no tokenizer available at run time, or a result file predating "
+            "`#303`).",
+            "Excluded, not counted as zero.",
+            "",
+        ]
+    if unattributable_total:
+        out += [
+            f"{unattributable_total} row(s) carry no `sha` and are excluded from the sums "
+            "above: without a payload",
+            "identity they cannot be de-duplicated, and counting them would multiply a "
+            "payload's tokens by",
+            "its question count. `capture.record` always writes one, so this indicates a "
+            "merged or foreign",
+            "result file rather than a corpus this build captured.",
             "",
         ]
     return out
+
+
+def _is_token_count(v: object) -> TypeGuard[int]:
+    """A usable token count: a real `int`, never a `bool` and never a string spelling of one.
+
+    `isinstance(True, int)` is `True` in Python, so a JSON `true` would otherwise sum as one
+    token; a stored `"1000"` would reach `sum()` and `{:+d}` and raise. Both were surviving
+    mutations in #303's review — neither is reachable from `_payload_tokens`, which emits
+    `int` or nothing, and both are reachable from a hand-written or foreign result file."""
+    return isinstance(v, int) and not isinstance(v, bool)
 
 
 def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:

@@ -60,9 +60,7 @@ def test_an_unsafe_group_still_renders_its_savings_number():
     # One demonstrated excess terse miss -> UNSAFE, full stop. The savings figure is an
     # independent measurement of the same payload and must survive that verdict.
     results = {"m1": _tagged([_row("q1", 1, 0)], "tool-a", "array-of-records")}
-    report = build_codec_verdict_report(results)
-    assert "**UNSAFE**" in report
-    verdict, savings = _sections(report)
+    verdict, savings = _sections(build_codec_verdict_report(results))
     assert "**UNSAFE**" in verdict
     assert _SAVED in savings and _SAVED_PCT in savings
     assert str(_RAW_TOK) in savings and str(_TERSE_TOK) in savings
@@ -104,15 +102,40 @@ def test_no_rendered_line_carries_both_a_verdict_and_a_savings_figure():
     assert not offenders, f"a cell combined a verdict with a savings figure: {offenders}"
 
 
+# The two sentences that carry the invariant in prose, pinned VERBATIM. Substring probes
+# for "never" / "beside" / "unsafe group still prints" are not enough: review found that
+# "Savings are never reported beside an UNSAFE verdict; an UNSAFE group still prints
+# nothing." satisfies all three while asserting the exact negation. A negation is built by
+# inserting words, so only an exact match excludes one.
+_INDEPENDENCE_PROSE = (
+    "Reported BESIDE the verdict above, never folded into it: no figure here is\n"
+    "weighted by, multiplied into, or gated on a SAFE/UNSAFE/UNRESOLVED result, and an\n"
+    "UNSAFE group still prints what it saves."
+)
+
+
 def test_the_savings_table_declares_its_own_independence_in_prose():
     # The narrative around the numbers is half of this invariant: a reader who takes the
     # savings figure as a mitigation of an UNSAFE verdict has read the report wrong, and
     # the report is what has to say so.
     _, savings = _sections(build_codec_verdict_report(
         {"m1": _tagged([_row("q1", 1, 0)], "tool-a", "array-of-records")}))
-    lowered = savings.lower()
-    assert "never" in lowered and "beside" in lowered
-    assert "unsafe group still prints" in lowered
+    assert _INDEPENDENCE_PROSE in savings
+
+
+def test_the_savings_heading_is_a_sibling_not_a_subsection():
+    # `###` would nest the economics UNDER the verdict, which is as close to "folded into
+    # it" as markdown gets — and it survives every substring probe, because "### Savings"
+    # contains "## Savings". The heading LEVEL is the structural half of "sibling", so it
+    # is pinned line-anchored and against the verdict heading it must be a peer of.
+    report = build_codec_verdict_report(
+        {"m1": _tagged([_row("q1", 1, 0)], "tool-a", "array-of-records")})
+    headings = [ln for ln in report.splitlines() if ln.startswith("#")]
+    assert "## Savings by tool and shape" in headings
+    assert "### Savings by tool and shape" not in headings
+    verdict_h = "## Verdict by tool and shape"
+    assert verdict_h in headings
+    assert headings.index("## Savings by tool and shape") == headings.index(verdict_h) + 1
 
 
 def test_the_verdict_table_comes_first():
@@ -167,7 +190,7 @@ def test_a_row_without_token_counts_is_excluded_not_counted_as_zero_saving():
                    "tool-a", "array-of-records")
     _, savings = _sections(build_codec_verdict_report({"m1": rows}))
     assert f"| 1 | {_RAW_TOK} | {_TERSE_TOK} |" in savings  # one payload, not two
-    assert "1 payload(s) carry no token counts" in savings
+    assert "1 payload(s)" in savings and "carry no token counts" in savings
     assert "+100.0%" not in savings
 
 
@@ -177,9 +200,13 @@ def test_a_group_with_no_token_counts_at_all_prints_na_rather_than_a_saving():
     _, savings = _sections(report)
     assert "| `tool-a` | array-of-records | 0 | n/a | n/a | n/a | n/a |" in savings
     assert "**SAFE**" not in savings   # the verdict does not leak into the savings section
-    assert "1 payload(s) carry no token counts" in savings
-    # No saving of ANY sign is claimed for a group nothing measured.
-    assert "%" not in savings.split("|---|---|---|---|---|---|---|")[1].split("\n\n")[0]
+    assert "1 payload(s)" in savings and "carry no token counts" in savings
+    # No saving of ANY sign is claimed for a group nothing measured. Scoped to the table
+    # BODY: the header row carries a literal "%", and the disclosure note below it may
+    # carry digits. `[1]` raises IndexError if the column count ever changes — a loud
+    # failure rather than a silently widened scan.
+    body = savings.split("|---|---|---|---|---|---|---|")[1].split("\n\n")[0]
+    assert "%" not in body and "+" not in body
 
 
 def test_a_payload_counted_by_a_later_model_is_not_also_reported_as_uncounted():
@@ -199,6 +226,129 @@ def test_the_uncounted_note_is_absent_when_every_payload_was_measured():
     rows = _tagged([_row("q1", 1, 1, sha="s")], "tool-a", "array-of-records")
     _, savings = _sections(build_codec_verdict_report({"m1": rows}))
     assert "carry no token counts" not in savings
+
+
+# --------------------------------------------------------------------------- #
+# A row that cannot be attributed to a payload (#303 review, Q1)
+# --------------------------------------------------------------------------- #
+def test_rows_without_a_sha_are_excluded_and_disclosed_not_collapsed_into_one():
+    # The defect review found: `str(r.get("sha", "?"))` mapped every sha-less row to one
+    # shared key, so N distinct payloads collapsed into whichever was seen first — wrong
+    # count, wrong sums, wrong percentage — and because "?" landed in `counted`, the
+    # disclosure note stayed silent about it. All five wrong at once, in silence.
+    rows = _tagged([_row("q1", 1, 1), _row("q1", 1, 1)], "tool-a", "array-of-records")
+    for r in rows:
+        del r["sha"]
+    rows[1] |= {"raw_tokens": 50, "terse_tokens": 45}
+    _, savings = _sections(build_codec_verdict_report({"m1": rows}))
+    assert "| `tool-a` | array-of-records | 0 | n/a | n/a | n/a | n/a |" in savings
+    assert "2 row(s) carry no `sha`" in savings
+    # Specifically NOT the first row's numbers standing in for both payloads.
+    assert _SAVED not in savings and str(_RAW_TOK) not in savings
+
+
+def test_a_sha_that_is_not_a_usable_string_is_treated_the_same_way():
+    rows = _tagged([_row("q1", 1, 1, sha="ok"), _row("q2", 1, 1), _row("q3", 1, 1)],
+                   "tool-a", "array-of-records")
+    rows[1]["sha"] = ""      # present but empty
+    rows[2]["sha"] = 12345   # present but not a string
+    _, savings = _sections(build_codec_verdict_report({"m1": rows}))
+    assert f"| 1 | {_RAW_TOK} | {_TERSE_TOK} |" in savings   # only the usable one
+    assert "2 row(s) carry no `sha`" in savings
+
+
+# --------------------------------------------------------------------------- #
+# What counts as a token count
+# --------------------------------------------------------------------------- #
+def test_a_string_token_count_is_uncounted_rather_than_summed():
+    # A stored "1000" would reach sum() and the {:+d} format and raise. Excluded, and the
+    # payload is disclosed — the same treatment as an absent count.
+    rows = _tagged([_row("q1", 1, 1, sha="s")], "tool-a", "array-of-records")
+    rows[0] |= {"raw_tokens": "1000", "terse_tokens": "400"}
+    _, savings = _sections(build_codec_verdict_report({"m1": rows}))
+    assert "| `tool-a` | array-of-records | 0 | n/a | n/a | n/a | n/a |" in savings
+    assert "1 payload(s)" in savings
+
+
+def test_a_boolean_token_count_does_not_sum_as_one_token():
+    # `isinstance(True, int)` is True in Python, so a JSON `true` would otherwise be
+    # counted as a 1-token payload and print a saving.
+    rows = _tagged([_row("q1", 1, 1, sha="s")], "tool-a", "array-of-records")
+    rows[0] |= {"raw_tokens": True, "terse_tokens": True}
+    _, savings = _sections(build_codec_verdict_report({"m1": rows}))
+    assert "| `tool-a` | array-of-records | 0 | n/a | n/a | n/a | n/a |" in savings
+
+
+# --------------------------------------------------------------------------- #
+# Signs, zeroes, ordering, and cross-group accounting
+# --------------------------------------------------------------------------- #
+def test_a_payload_that_terse_expands_reports_a_negative_saving():
+    # The sign path was never exercised: every fixture compressed. A codec that grew a
+    # payload must print that, not hide behind an unsigned number.
+    rows = _tagged([_row("q1", 1, 1, sha="s")], "tool-a", "compact-json")
+    rows[0] |= {"raw_tokens": 400, "terse_tokens": 1000}
+    _, savings = _sections(build_codec_verdict_report({"m1": rows}))
+    assert "| `tool-a` | compact-json | 1 | 400 | 1000 | -600 | -150.0% |" in savings
+
+
+def test_a_zero_token_payload_prints_na_percent_rather_than_dividing_by_zero():
+    rows = _tagged([_row("q1", 1, 1, sha="s")], "tool-a", "other")
+    rows[0] |= {"raw_tokens": 0, "terse_tokens": 0}
+    _, savings = _sections(build_codec_verdict_report({"m1": rows}))
+    assert "| `tool-a` | other | 1 | 0 | 0 | +0 | n/a |" in savings
+
+
+def test_both_tables_list_their_groups_in_the_same_order():
+    # The report asks a reader to line row X of one table up against row X of the other.
+    # Ordering the two loops independently survives every presence-only assertion.
+    rows: list[dict] = []
+    for tool in ("z-tool", "a-tool", "m-tool"):
+        rows += _tagged([_row("q1", 1, 1, sha=f"sha-{tool}")], tool, "array-of-records")
+    report = build_codec_verdict_report({"m1": rows})
+    verdict, savings = _sections(report)
+
+    def order(section: str) -> list[str]:
+        return [ln.split("|")[1].strip() for ln in section.splitlines()
+                if ln.startswith("| `")]
+
+    assert order(verdict) == order(savings) == ["`a-tool`", "`m-tool`", "`z-tool`"]
+
+
+def test_uncounted_payloads_accumulate_across_groups():
+    # `uncounted_total += len(uncounted)` was only ever exercised with a single group, so
+    # `+=` vs `=` was unpinned — a report with uncounted payloads in three groups would
+    # have disclosed only the last one.
+    rows: list[dict] = []
+    for tool in ("t1", "t2", "t3"):
+        rows += _tagged([_row("q1", 1, 1, sha=f"sha-{tool}", tokens=False)],
+                        tool, "array-of-records")
+    _, savings = _sections(build_codec_verdict_report({"m1": rows}))
+    assert "3 payload(s)" in savings
+
+
+def test_merged_runs_that_disagree_keep_the_first_reading_of_a_payload():
+    # `setdefault` is first-wins, and which arm wins is only visible for a merged result
+    # set whose runs measured the same sha differently. Pinned because it is a decision,
+    # not an accident: the earlier run's number is the one already cited in whatever report
+    # it produced, so re-reading it keeps the two agreeing.
+    first = _tagged([_row("q1", 1, 1, sha="shared")], "tool-a", "array-of-records")
+    second = _tagged([_row("q1", 1, 1, sha="shared")], "tool-a", "array-of-records")
+    second[0] |= {"raw_tokens": 77, "terse_tokens": 11}
+    _, savings = _sections(build_codec_verdict_report({"run-a": first, "run-b": second}))
+    assert f"| 1 | {_RAW_TOK} | {_TERSE_TOK} | {_SAVED} | {_SAVED_PCT} |" in savings
+    assert "77" not in savings
+
+
+def test_the_note_says_the_count_is_per_group_not_per_payload():
+    # A payload counted in one group can still be uncounted in another — reachable via the
+    # stored-`shape` drift of #355. The note must not claim a payload-level total it does
+    # not have.
+    rows = (_tagged([_row("q1", 1, 1, sha="shared")], "tool-a", "array-of-records")
+            + _tagged([_row("q1", 1, 1, sha="shared", tokens=False)],
+                      "tool-a", "compact-json"))
+    _, savings = _sections(build_codec_verdict_report({"m1": rows}))
+    assert "1 payload(s)" in savings
+    assert "counted once per `(tool, shape)` group" in savings
 
 
 # --------------------------------------------------------------------------- #
@@ -251,49 +401,79 @@ def test_run_codec_fluency_stamps_the_counts_on_every_row_of_a_payload():
 
 
 # --------------------------------------------------------------------------- #
-# Mutation catalogue — every entry was applied to the source, the suite re-run, and the
-# named test confirmed to redden. Zero SURVIVED. Entry 13 is why
-# `test_a_payload_counted_by_a_later_model_is_not_also_reported_as_uncounted` exists: the
-# first cut of this file did not have it, and 13 survived all 14 other tests.
+# Mutation catalogue — every entry was applied to the source, this file re-run, and the
+# named test confirmed to redden. 22 mutations, zero SURVIVED. Entries 14-22 were added
+# after adversarial review of the first cut, which found FOUR of them surviving all 15
+# tests it then had. That is the record this file should be read against: the mutations you
+# think of yourself are the ones your fixtures were already shaped around.
 #
 # The renderer (report.py `_codec_savings_section`):
-#   1. never call `_codec_savings_section` -> reddens 10 tests, including the two that hold
-#      #303's actual requirement.
-#   2. `continue` past any group with a demonstrated excess terse miss (i.e. suppress
-#      savings on UNSAFE) -> reddens `test_an_unsafe_group_still_renders_its_savings_number`
-#      and `test_every_verdict_grade_gets_a_savings_row`. This is the failure #303 forbids
-#      in the OTHER direction from the one people expect.
+#   1. never call `_codec_savings_section` -> reddens 10 tests.
+#   2. `continue` past any group with a demonstrated excess terse miss (suppress savings on
+#      UNSAFE) -> `test_an_unsafe_group_still_renders_its_savings_number`,
+#      `test_every_verdict_grade_gets_a_savings_row`. The failure #303 forbids in the
+#      direction people do not expect.
 #   3. append the payload's token counts to the verdict table's `Why` cell -> reddens
-#      `test_no_rendered_line_carries_both_a_verdict_and_a_savings_figure` alone. That test
-#      is the whole presentation invariant; nothing else catches this.
-#   4. `counted[sha + str(len(counted))] = ...` (sum rows instead of de-duplicating by sha)
-#      -> reddens `test_a_payloads_tokens_are_counted_once_across_its_questions_and_models`.
-#      At the fixture's numbers this prints 6000 raw tokens for a 1000-token payload.
-#   5. `counted.setdefault("_", ...)` (collapse the group to one payload) -> reddens
-#      `test_two_distinct_payloads_in_a_group_are_both_counted`. The opposite direction from
-#      4, and a fixture with one payload per group would miss it.
-#   6. treat a missing/None count as 0 -> reddens the two n/a tests. Read as 0/0 an
-#      unmeasured payload prints a perfect saving.
-#  12. emit the uncounted note unconditionally -> reddens
+#      `test_no_rendered_line_carries_both_a_verdict_and_a_savings_figure` ALONE.
+#   4. `counted[sha + str(len(counted))]` (sum rows instead of de-duplicating by sha) ->
+#      `test_a_payloads_tokens_are_counted_once_across_its_questions_and_models`. At the
+#      fixture's numbers this prints 6000 raw tokens for a 1000-token payload.
+#   5. `counted.setdefault("_", ...)` (collapse the group to one payload) ->
+#      `test_two_distinct_payloads_in_a_group_are_both_counted`.
+#   6. treat a missing/None count as 0 -> the two n/a tests.
+#  12. emit the uncounted note unconditionally ->
 #      `test_the_uncounted_note_is_absent_when_every_payload_was_measured`.
-#  13. drop `uncounted -= set(counted)` -> reddens
-#      `test_a_payload_counted_by_a_later_model_is_not_also_reported_as_uncounted` ALONE.
-#      SURVIVED every other test here: the ordering it depends on (a sha's uncounted row
-#      seen before its counted one) only arises from result files merged across runs.
+#  13. drop `uncounted -= set(counted)` ->
+#      `test_a_payload_counted_by_a_later_model_is_not_also_reported_as_uncounted` alone.
+#      SURVIVED the other fourteen tests of the first cut: the ordering it needs (a sha's
+#      uncounted row seen before its counted one) only arises from merged result files.
 #
-# Ordering (report.py `build_codec_verdict_report`):
-#  10. render the savings section BEFORE the verdict table -> reddens
-#      `test_the_verdict_table_comes_first` plus the two `_sections`-splitting tests.
+# Ordering and structure (report.py `build_codec_verdict_report`):
+#  10. render the savings section BEFORE the verdict table ->
+#      `test_the_verdict_table_comes_first` plus the `_sections`-splitting tests.
 #  11. replace the independence prose with a bare "Token savings for each group." ->
-#      reddens `test_the_savings_table_declares_its_own_independence_in_prose`. The prose
-#      is load-bearing: the numbers alone do not tell a reader not to trade them off.
+#      `test_the_savings_table_declares_its_own_independence_in_prose`.
+#  14. `## Savings...` -> `### Savings...`, nesting the economics UNDER the verdict —
+#      as close to "folded into it" as markdown gets. SURVIVED the first cut entirely,
+#      because every check was a substring match and "### Savings" CONTAINS "## Savings".
+#      -> `test_the_savings_heading_is_a_sibling_not_a_subsection`.
+#  15. invert the prose while keeping its words ("Savings are never reported beside an
+#      UNSAFE verdict... an UNSAFE group still prints nothing") -> reddens the prose test
+#      only since it pins the sentences VERBATIM. SURVIVED the first cut, whose substring
+#      probes for "never"/"beside"/"unsafe group still prints" all passed on the negation.
+#  17. iterate the savings groups in the reverse order of the verdict table's ->
+#      `test_both_tables_list_their_groups_in_the_same_order`. SURVIVED the first cut: every
+#      assertion tested presence, in a report whose premise is reading row X against row X.
+#
+# Attribution and accounting (added after review question Q1):
+#  16. `uncounted_total = len(uncounted)` instead of `+=` ->
+#      `test_uncounted_payloads_accumulate_across_groups`. SURVIVED the first cut, which
+#      never had uncounted payloads in more than one group.
+#  18. `counted[sha] = ...` (last-wins) ->
+#      `test_merged_runs_that_disagree_keep_the_first_reading_of_a_payload`. SURVIVED the
+#      first cut, whose every fixture gave identical counts per sha.
+#  19. `_is_token_count` -> `v is not None` -> the string- and bool-count tests. A stored
+#      "1000" would reach `sum()` and `{:+d}` and raise.
+#  20. `sha = str(r.get("sha", "?"))` — the first cut's actual line. Every sha-less payload
+#      in a group collapses onto one key AND is excluded from the disclosure note: wrong
+#      count, wrong sums, wrong saved, wrong percentage, in silence. ->
+#      `test_rows_without_a_sha_are_excluded_and_disclosed_not_collapsed_into_one`.
+#  21. exclude sha-less rows but never disclose them -> same test. Excluding without saying
+#      so presents a subset as a total, which is the failure the whole section guards.
+#  22. `isinstance(v, int)` without the bool guard -> `test_a_boolean_token_count_does_not_
+#      sum_as_one_token`. `isinstance(True, int)` is True, so a JSON `true` renders as a
+#      1-token payload with a saving.
 #
 # The emitter (codeceval.py `_payload_tokens` / `run_codec_fluency`):
-#   7. return `{"raw_tokens": 0, "terse_tokens": 0}` when the tokenizer is unavailable ->
-#      reddens `test_payload_tokens_emits_nothing_when_the_tokenizer_is_unavailable`.
-#   8. swap the two counts -> reddens
-#      `test_payload_tokens_measures_the_two_forms_the_model_was_actually_fed`, and only
-#      because that test asserts `terse < raw` on a genuinely record-shaped fixture. A
-#      fixture that did not compress would make the swap undetectable.
-#   9. drop `**toks` from the emitted row -> reddens
+#   7. return zeros when the tokenizer is unavailable ->
+#      `test_payload_tokens_emits_nothing_when_the_tokenizer_is_unavailable`.
+#   8. swap the two counts -> `test_payload_tokens_measures_the_two_forms_the_model_was_
+#      actually_fed`, and only because it asserts `terse < raw` on a genuinely
+#      record-shaped fixture. A fixture that did not compress would hide the swap.
+#   9. drop `**toks` from the emitted row ->
 #      `test_run_codec_fluency_stamps_the_counts_on_every_row_of_a_payload`.
+#
+# Known EQUIVALENT mutant, recorded rather than fixed: none. The first cut had one — the
+# `elif sha not in counted` guard, dead given `uncounted -= set(counted)` two lines below —
+# and it was deleted rather than catalogued, since dead code that looks load-bearing is
+# worse than either a test or an honest note.
