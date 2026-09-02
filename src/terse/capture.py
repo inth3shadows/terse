@@ -156,6 +156,39 @@ def classify_shape(raw: str) -> str:
     return COMPACT_JSON
 
 
+def envelope_shape(env: dict[str, Any], default: str = "?") -> str:
+    """The shape bucket for one captured envelope, classified LIVE from its `raw` (#355).
+
+    `shape` is written onto the envelope at capture time, but it is a pure function of
+    `raw` — so the stored field is a CACHE, not a fact, and it goes stale the moment
+    `classify_shape` changes. It did: `7be9d41` (#208/#204) relaxed `_find_record_list`
+    from an identical-keyset rule to the codec's union-schema `is_tabularizable`, and 36
+    of the live corpus's 1524 envelopes kept a `compact-json` bucket for a payload the
+    codec tabularizes. That put `terse measure`'s two shape tables 36 payloads apart in
+    ONE report (Coverage reads the stored field; the savings table re-classifies), and
+    filed the codec's per-`(tool, shape)` verdict under a shape the codec never sees.
+
+    Every consumer of an envelope's bucket reads it through here — that is the WHOLE
+    mechanism, deliberately, so there is one place a stale bucket can be stopped and one
+    place to change when `classify_shape` next moves. `load_corpus` does NOT rewrite the
+    stored field: the read is what re-derives, and the stored value stays as evidence of
+    what the capturing version thought. It is used only when there is no `raw` string to
+    classify — a hand-built envelope or a foreign corpus — and `default` only when there
+    is neither.
+
+    Consumers, verified by grepping every `["shape"]` / `.get("shape"` in `src/` and
+    `scripts/`: `coverage`, `codeceval.run_codec_fluency` (the `(tool, shape)` key of the
+    codec verdict), and `scripts/bench/text_alias_ceiling.py`. Every OTHER `"shape"` read
+    in the tree is on a MEASURED ROW from `measure.measure_payload`, which has always
+    classified live — a row's shape and an envelope's are different values and only the
+    latter was ever stored."""
+    raw = env.get("raw")
+    if isinstance(raw, str):
+        return classify_shape(raw)
+    stored = env.get("shape")
+    return stored if isinstance(stored, str) and stored else default
+
+
 def _sha8(raw: str) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
 
@@ -305,6 +338,11 @@ def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
             skipped += 1
             continue
         if isinstance(env, dict) and "raw" in env and "tool" in env:
+            # The stored `shape` is deliberately left ALONE, stale or not. Re-classification
+            # belongs at the READ (`envelope_shape`), not here: rewriting it would mutate a
+            # dict the caller owns and would destroy the one signal that a corpus predates a
+            # classifier change — which is what a "N envelopes carry a stale bucket, re-capture
+            # them" diagnostic would have to read (#355).
             seq = env["captured_at"] if isinstance(env.get("captured_at"), int) else 0
             loaded.append((seq, path.name, env))
     if skipped:
@@ -367,5 +405,6 @@ def coverage(envelopes: list[dict[str, Any]]) -> dict[str, Any]:
     for env in envelopes:
         name = qualified_tool(env)
         by_tool[name] = by_tool.get(name, 0) + 1
-        by_shape[env.get("shape", "?")] = by_shape.get(env.get("shape", "?"), 0) + 1
+        shape = envelope_shape(env)
+        by_shape[shape] = by_shape.get(shape, 0) + 1
     return {"total": len(envelopes), "by_tool": by_tool, "by_shape": by_shape}

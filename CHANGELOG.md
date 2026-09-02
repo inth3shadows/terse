@@ -13,7 +13,26 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **An envelope's `shape` is re-classified at read time, so two tables in one report cannot
+  disagree** (`#355`). `shape` is a pure function of `raw`, but it was stored at capture time
+  and read back as ground truth — so `7be9d41` (`#208`/`#204`), which relaxed
+  `_find_record_list` from an identical-keyset rule to the codec's union-schema
+  `is_tabularizable`, silently left every pre-existing envelope in its old bucket. Measured on
+  the live 1524-envelope corpus: `terse measure`'s **Coverage** table said 56 `array-of-records`
+  / 77 `compact-json` while its **Tier-0 savings by shape bucket** table, a few lines below in
+  the same report, said 92 / 41 — 36 payloads apart, all drifting one way, all qualifying only
+  under the union-schema rule. New `capture.envelope_shape` classifies from `raw` and is the
+  one accessor every consumer reads the bucket through (`capture.coverage`,
+  `codeceval.run_codec_fluency`'s per-`(tool, shape)` verdict key, `text_alias_ceiling`). The
+  read is the whole mechanism: `load_corpus` deliberately leaves the stored field alone, so it
+  stays readable as evidence that a corpus predates a classifier change. The stored value is
+  now a cache, used only when there is no `raw` to classify. Both tables now read 92 / 41.
+  Cost is one `classify_shape` — a `json.loads` plus a record-list walk, not just the parse —
+  at each read: for `terse measure` that is one added pass over the corpus, since `coverage`
+  used to read the stored field and `measure_payload` already classified live. Measured 0.021s
+  for a pass over those 1524 payloads.
 
 ## [0.29.0] - 2026-09-02
 

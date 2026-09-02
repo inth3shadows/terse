@@ -900,7 +900,11 @@ def _codec_savings_section(
 
     The counted/uncounted split is per `(tool, shape)` group, not global, because the sums it
     qualifies are per-group: the same payload can be counted in one group and uncounted in
-    another (reachable via the stored-`shape` drift of `#355`), and the note below says so."""
+    another, and the note below says so. This cited `#355`'s stored-`shape` drift as the way
+    one sha reached two groups; that is fixed — `capture.envelope_shape` re-classifies at the
+    read, so within one run a sha has exactly one shape. The surviving reach is rows MERGED
+    across runs (a result file from a terse whose `classify_shape` bucketed it differently,
+    or two tools' rows over the same payload), which is rarer but not closable from here."""
     out = [
         "## Savings by tool and shape",
         "",

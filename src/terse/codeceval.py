@@ -77,7 +77,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from . import fluency
+from . import capture, fluency
 from .dropeval import ToolAnswerer, Turn, _safe_call
 from .tokenize import count_cl100k
 
@@ -244,8 +244,10 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
     derived once per envelope, not once per (model, envelope)) and `fluency.run_fluency`'s
     row-tagging convention.
 
-    Each row additionally carries `"tool"` AND `"shape"` (`env["shape"]`, already written at
-    capture time by `capture.record` — `capture.py`'s `classify_shape` call). No existing
+    Each row additionally carries `"tool"` AND `"shape"` (`capture.envelope_shape`, which
+    classifies the envelope's `raw` LIVE rather than trusting the bucket stored at capture
+    time — a per-`(tool, shape)` verdict filed under a shape the codec no longer assigns
+    answers the wrong question, #355). No existing
     harness stamps `shape` onto its rows; it is the one field #295's per-`(tool, shape)`
     verdict needs that the comprehension harness never needed, because the comprehension
     report has always pooled globally rather than per shape bucket.
@@ -275,7 +277,7 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
         # it, so a foreign or hand-built corpus reaches here without one.
         sha = env.get("sha")
         tags: dict[str, Any] = {"tool": env.get("tool", "?"),
-                                "shape": env.get("shape", "unknown")}
+                                "shape": capture.envelope_shape(env, "unknown")}
         if isinstance(sha, str) and sha:
             tags["sha"] = sha
         for name, answerer in answerers.items():
