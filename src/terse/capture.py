@@ -178,10 +178,19 @@ def envelope_shape(env: dict[str, Any], default: str = "?") -> str:
 
     Consumers, verified by grepping every `["shape"]` / `.get("shape"` in `src/` and
     `scripts/`: `coverage`, `codeceval.run_codec_fluency` (the `(tool, shape)` key of the
-    codec verdict), and `scripts/bench/text_alias_ceiling.py`. Every OTHER `"shape"` read
-    in the tree is on a MEASURED ROW from `measure.measure_payload`, which has always
-    classified live — a row's shape and an envelope's are different values and only the
-    latter was ever stored."""
+    codec verdict), and `scripts/bench/text_alias_ceiling.py`. Those three are the whole
+    list.
+
+    `"shape"` names THREE different values in this tree and only this one was ever stored,
+    so a grep for the key is not a grep for the bug:
+
+    - an ENVELOPE's bucket — here, and only at the three sites above;
+    - a MEASURED ROW's, from `measure.measure_payload` (`report.py`, `html_report.py`,
+      `terminal_report.py`, `toon_column.py`) — always classified live, never stored. The
+      exception that looks like one and is not: `report.py`'s `(tool, shape)` codec key
+      reads a `codeceval` row, whose shape came from THIS function;
+    - a DIFF MARKER's (`transforms.py`), which is `"rows"`/`"keys"` — a different
+      vocabulary entirely, unrelated to `classify_shape`."""
     raw = env.get("raw")
     if isinstance(raw, str):
         return classify_shape(raw)
@@ -339,10 +348,10 @@ def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
             continue
         if isinstance(env, dict) and "raw" in env and "tool" in env:
             # The stored `shape` is deliberately left ALONE, stale or not. Re-classification
-            # belongs at the READ (`envelope_shape`), not here: rewriting it would mutate a
-            # dict the caller owns and would destroy the one signal that a corpus predates a
-            # classifier change — which is what a "N envelopes carry a stale bucket, re-capture
-            # them" diagnostic would have to read (#355).
+            # belongs at the READ (`envelope_shape`), not here: rewriting it would destroy the
+            # one signal that a corpus predates a classifier change — which is what a
+            # "N envelopes carry a stale bucket, re-capture them" diagnostic would have to
+            # read (#355). Pinned by test_load_corpus_leaves_the_stale_stored_field_alone.
             seq = env["captured_at"] if isinstance(env.get("captured_at"), int) else 0
             loaded.append((seq, path.name, env))
     if skipped:

@@ -220,7 +220,8 @@ def _payload_tokens(raw_text: str, obj: Any) -> dict[str, int]:
       1,524 did, so the corpus-wide table would cover 190x the payloads the verdict does.
     - 36 of those 1,524 envelopes carried a stored `shape` that `classify_shape(raw)` no
       longer agreed with, so the two tables would not bucket the same payload the same way.
-      Filed as `#355`; if it is fixed, that second reason goes away and the first does not.
+      That was `#355`, FIXED — `capture.envelope_shape` re-classifies at the read, so this
+      second reason is gone. The first stands on its own and is why the split remains.
 
     Both figures will drift as the corpus grows and as `classify_shape` changes. They are
     cited as the evidence for a design choice already made, not as facts anything reads.
@@ -265,8 +266,12 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
         if not gen_codec_questions(obj):
             continue
         toks = _payload_tokens(env["raw"], obj)
-        # `sha` is OMITTED, never defaulted, when the envelope has no usable one. `tool` and
-        # `shape` default because they are LABELS — a group headed `?` is legible. `sha` is
+        # `sha` is OMITTED, never defaulted, when the envelope has no usable one. `tool`
+        # defaults because it is a LABEL — a group headed `?` is legible. `shape` carries a
+        # label default too, but nothing can reach it: `json.loads(env["raw"])` above already
+        # `continue`d on a non-str `raw`, and `envelope_shape` only falls back to the stored
+        # value when there is no `raw` string to classify. It is kept as the signature's own
+        # documented behaviour rather than as a live branch. `sha` is
         # an IDENTITY: `report._codec_savings_section` de-duplicates payloads by it, so a
         # shared `"?"` placeholder silently collapses every sha-less payload in a group into
         # whichever was seen first, and reports the survivor's tokens as the group's total.
