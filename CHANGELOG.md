@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.29.1] - 2026-09-02
+
 ### Fixed
 
 - **An envelope's `shape` is re-classified at read time, so two tables in one report cannot
@@ -32,7 +36,12 @@ fails that pull request until the section has moved.
   Cost is one `classify_shape` — a `json.loads` plus a record-list walk, not just the parse —
   at each read: for `terse measure` that is one added pass over the corpus, since `coverage`
   used to read the stored field and `measure_payload` already classified live. Measured 0.021s
-  for a pass over those 1524 payloads.
+  for a pass over those 1524 payloads. **Correction to `#358`'s own description:** it claimed
+  the codec verdict was the one consumer the drift could not reach in practice, on the ground
+  that a non-uniform payload yields no `deref` question. That is wrong — `gen_questions` picks
+  its `blobcol` out of the key INTERSECTION, so a drifted payload can and does produce one.
+  Two of the 36, both `kb.read.list_nodes`, were being filed under `compact-json` for a payload
+  the codec tabularizes. The fix was worth more than the pull request said it was.
 
 ## [0.29.0] - 2026-09-02
 
