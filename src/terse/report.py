@@ -94,6 +94,39 @@ def _ci(se: float) -> float:
 
 
 
+def _arm_attempts(r: dict[str, Any], trials_key: str, default: int) -> int:
+    """How many calls THIS arm was asked to make on this row.
+
+    `<arm>_trials` says how many it completed — except in `codeceval.py`, whose docstring
+    (`src/terse/codeceval.py`) records that it keeps the key FIXED at `trials` on purpose and
+    reports its loss only through `fails`/`attempts`, which is why `_unmeasured` keeps a
+    pooled trigger. The attempt count `<arm>_trials` should be read against is the row's
+    shared `trials` for every live harness — every arm is put the same question
+    the same number of times — but NOT for `score_pack`, whose per-form counts differ by
+    collection design and whose `trials` is a `max(...)` across forms (#91). Those rows state
+    `<arm>_attempts` explicitly, and both `paired_rows` and `_unmeasured` read it here so
+    that a design-uneven form is not counted as a lost call (#283)."""
+    arm = trials_key[:-len("_trials")] if trials_key.endswith("_trials") else trials_key
+    return int(r.get(arm + "_attempts", default))
+
+
+def arm_measured(rows: list[dict[str, Any]], form: str) -> bool:
+    """Did this run collect ANY calls for `form`? False means the arm is absent, not failing.
+
+    `_form_stats` returns a flat `(0.0, 0.0)` for an arm with no completed trials, which
+    renders as a confident `0% ±0` — indistinguishable from "comprehension collapsed" and
+    exactly the unknown-is-not-zero mistake the inline arm's `n/a` already avoids one
+    function down. Only `<arm>_attempts` can tell the two apart, so a row set that does not
+    carry it (every live harness, where all arms are always attempted) answers True.
+
+    NOT filtered to rows that carry the key: a row set predating the counters has no
+    `<arm>_trials` at all, and skipping those rows would leave nothing to check and report
+    a fully-measured arm as absent — which is how the first cut of this rendered `n/a` for
+    the primer column of every legacy result file."""
+    key = form[:-3] + "_trials" if form.endswith("_ok") else form
+    return any(_arm_attempts(r, key, int(r.get("trials", 1))) for r in rows)
+
+
 def paired_rows(rows: list[dict[str, Any]], *forms: str) -> list[dict[str, Any]]:
     """The subset of `rows` on which every one of `forms` completed ALL of its trials.
 
@@ -121,24 +154,75 @@ def paired_rows(rows: list[dict[str, Any]], *forms: str) -> list[dict[str, Any]]
       - rows with no `<form>_trials` key at all (result files predating #263). `.get(k, t)`
         reads those as complete, which is the same "absent is not evidence of failure" rule
         `_unmeasured` applies to its own counters;
-      - rows with no `attempts` key. `score_pack` (`fluency/pack.py`) emits per-form counts
-        that differ by COLLECTION DESIGN: an uneven hand-built pack may carry 3 raw replies
-        and 2 terse ones for the same question, and #91 added those counters precisely so
-        the sparser form is scored over its own denominator instead of being understated.
-        Its `trials` is `max(...)` of the forms, not an attempt count, so every uneven row
-        looks like a loss here. Voiding them would delete a documented collection mode to
-        defend against a failure it cannot have — `score_pack` never calls a backend, so it
-        has no transport to lose calls to.
+      - rows with no `attempts` key: legacy result files, and hand-built #91 rows. HISTORICAL
+        NOTE, because this bullet used to read "`score_pack` never calls a backend, so it has
+        no transport to lose calls to" and #283 falsified that: `score_pack` now DOES emit
+        `fails`/`attempts` (a stored empty reply is a call that produced no answer, and
+        without the counters `--responses` had no transport gate at all). It no longer takes
+        this escape. What remains true is the reason the escape existed — an uneven per-form
+        count is COLLECTION DESIGN, not loss: an uneven hand-built pack may carry 3 raw
+        replies and 2 terse ones for the same question, and #91 added those counters
+        precisely so the sparser form is scored over its own denominator instead of being
+        understated. Its `trials` is `max(...)` of the forms, not an attempt count.
 
-    Pinned by `test_rows_without_per_form_counters_are_treated_as_fully_paired` and
-    `test_an_uneven_score_pack_still_publishes`."""
+    So that reason is now served by a counter rather than by an absence. An arm's attempt
+    count is `<arm>_attempts` WHERE THE ROW STATES ONE, and the shared `trials` only where it
+    does not (#283) — inferring one arm's attempts from the row `max(...)` would read the
+    design as loss. `<arm>_attempts` is a fact the emitter knows and this function cannot
+    derive. Absent, as in every live-harness row, the fallback is the previous behaviour
+    exactly.
+
+    ZERO attempts for an arm on a row is decided at the RUN level, not the row level,
+    because within a single row the two cases are indistinguishable and they are opposites:
+
+      - an arm collected on NO row (a responses file that ran raw and terse but never the
+        primer arm) is an ABSENT arm. Voiding every row for it would empty the paired subset
+        and withhold a perfectly good pack — the same "absent is not evidence of failure"
+        rule as the two bullets above, and the same distinction `build_fluency_report` draws
+        with `has_inline`;
+      - an arm collected on SOME rows is a LOST question wherever it is missing. Keeping
+        those rows re-bases that arm onto the subset it happens to have been collected on
+        while the control keeps every question — which is precisely the failure this
+        function's first paragraph exists to prevent, arriving through a different door.
+
+    That second case is not hypothetical: measured on a 24-question pack whose terse arm was
+    collected only for the six `count` questions (the easiest type) and answered them
+    perfectly, the report rendered `best terse-form 100% vs raw 100% ... **PASS**` with `18
+    regressions` printed in the same row. Scoring an uncollected form as a miss — the #279
+    defect — had been hiding it behind a terse arm of 6/24 = 25% and a loud FAIL, so fixing
+    #279 without this is a strict regression from a conservative wrong answer to a false
+    green. Both numbers are executed, not estimated.
+
+    Pinned by `test_rows_without_per_form_counters_are_treated_as_fully_paired`,
+    `test_an_uneven_score_pack_still_publishes`,
+    `test_a_real_uneven_score_pack_with_counters_still_publishes` and
+    `test_an_arm_collected_for_only_some_questions_cannot_publish_against_a_full_control`."""
     keys = [f[:-3] + "_trials" if f.endswith("_ok") else f for f in forms]
+    # Which of the requested arms this run collected anything for at all. Computed over the
+    # whole row set because that is the only place the fact exists — see the docstring.
+    collected = {k for k in keys if arm_measured(rows, k)}
     out = []
     for r in rows:
         t = int(r.get("trials", 1))
-        if "attempts" not in r or all(int(r.get(k, t)) == t for k in keys):
+        if "attempts" not in r:
+            out.append(r)
+            continue
+        if all(_paired_arm(r, k, t, k in collected) for k in keys):
             out.append(r)
     return out
+
+
+def _paired_arm(r: dict[str, Any], trials_key: str, trials: int, collected: bool) -> bool:
+    """Did this row's arm complete every call it was asked to make?
+
+    `collected` is the run-level fact from `paired_rows`: True when SOME row of this run has
+    attempts for the arm. An arm with zero attempts on this row is then a question it did not
+    answer while its neighbours did — unpaired. When `collected` is False the arm is absent
+    from the whole run, which is not a loss, and the row stands."""
+    a = _arm_attempts(r, trials_key, trials)
+    if a == 0:
+        return not collected
+    return int(r.get(trials_key, trials)) == a
 
 
 # Share of a model's calls that may fail before its numbers stop meaning anything (#263).
@@ -150,9 +234,11 @@ def paired_rows(rows: list[dict[str, Any]], *forms: str) -> list[dict[str, Any]]
 # surviving sample is small and self-selected rather than merely smaller.
 #
 # THE DENOMINATOR IS PER ARM (#339), NOT POOLED ACROSS EVERY ARM. `_unmeasured` finds each
-# arm's own `<arm>_trials` counter, sums `trials - <arm>_trials` over the rows that carry
-# that key for that arm's loss, and `trials` over the same rows for that arm's attempts —
-# then fires if ANY single arm exceeds `UNMEASURED_FAIL_SHARE` of its own calls. Before
+# arm's own `<arm>_trials` counter and sums, over the rows that carry that key, its loss as
+# `<arm>_attempts - <arm>_trials` and its attempts as `<arm>_attempts` — where
+# `<arm>_attempts` is the row's shared `trials` for every live harness and an explicit
+# per-arm count for `score_pack` (#283, see `_arm_attempts`) — then fires if ANY single arm
+# exceeds `UNMEASURED_FAIL_SHARE` of its own calls. Before
 # #339 the denominator was pooled `attempts` (= trials * arm_count), which let a single
 # arm lose over 40% of ITS calls in a two-arm run, or over 80% in a four-arm one, before
 # this fired — the threshold read as "20% of calls" and behaved as "20% of all arms'
@@ -210,8 +296,10 @@ def _unmeasured(rows: list[dict]) -> bool:
     """True when transport failures make this model's numbers untrustworthy.
 
     THREE independent triggers, because they fail differently:
-      1. any arm with ZERO completed trials — that arm cannot be computed at all, and
-         `_form_stats` would report it as a flat 0.0 indistinguishable from real failure;
+      1. any arm with ZERO completed trials THAT WAS ACTUALLY ATTEMPTED — that arm cannot
+         be computed at all, and `_form_stats` would report it as a flat 0.0 indistinguishable
+         from real failure. An arm nobody collected (a `score_pack` responses file with no
+         primer replies) is absence, not failure, and does not fire it (#283);
       2. more than `UNMEASURED_FAIL_SHARE` of ONE arm's own calls lost (#339) — the sample
          that survived is both small and selected by which calls happened to get through,
          and the share has to be read against that arm's own denominator or a loss
@@ -238,7 +326,15 @@ def _unmeasured(rows: list[dict]) -> bool:
     # publishing a verdict off a dead backend after the payload side stopped.
     arm_keys = sorted({k for r in rows for k in r if k.endswith("_trials")})
     for key in arm_keys:
-        if sum(int(r.get(key, 0)) for r in rows) == 0:
+        if sum(int(r.get(key, 0)) for r in rows) != 0:
+            continue
+        # Zero completed trials is only a FAILURE where the arm was actually attempted.
+        # `score_pack` emits a full set of arm keys whether or not the responses file
+        # collected that form, so a pack that simply never ran the primer arm would
+        # otherwise withhold the whole model on the strength of a question nobody asked
+        # (#283). `<arm>_attempts` is how a row says which it is; absent — every live
+        # harness — the shared `trials` stands in and this reads exactly as before.
+        if any(_arm_attempts(r, key, int(r.get("trials", 1))) for r in rows if key in r):
             return True
     fails = sum(int(r.get("fails", 0)) for r in rows)
     if fails / attempts > UNMEASURED_FAIL_SHARE:
@@ -248,19 +344,26 @@ def _unmeasured(rows: list[dict]) -> bool:
     # a single arm lose over 40% of its own calls in a two-arm run, or over 80% in a
     # four-arm one, before this fired — see `UNMEASURED_FAIL_SHARE`'s comment. Only rows
     # that CARRY both an arm's key AND `attempts` count toward that arm's loss/attempts —
-    # matching `paired_rows`' own per-row `"attempts" not in r` escape — so a row belonging
-    # to a collection mode that never calls a backend (`score_pack`, #91, no `attempts` key
-    # at all) contributes nothing either way, even when merged into a row set that also has
-    # `attempts`-carrying rows (review finding on #339: checking only `key in r` let one
-    # such merged row swing the whole model to withheld with zero calls actually lost).
+    # matching `paired_rows`' own per-row `"attempts" not in r` escape — so a row from a
+    # collection mode carrying no `attempts` key at all (a legacy result file, or a
+    # hand-built #91 row) contributes nothing either way, even when merged into a row set
+    # that does have them (review finding on #339: checking only `key in r` let one such
+    # merged row swing the whole model to withheld with zero calls actually lost).
     for key in arm_keys:
         carrying = [r for r in rows if key in r and "attempts" in r]
         if not carrying:
             continue
-        arm_attempts = sum(int(r.get("trials", 1)) for r in carrying)
+        # Per row, this arm's OWN attempt count — `<arm>_attempts` where the emitter states
+        # one, else the shared `trials` (#283, see `_arm_attempts`). Without that, a
+        # `score_pack` row's `trials` (a `max(...)` across forms) would make an
+        # uneven-BY-DESIGN form look like a lost call, which is the same class of error as
+        # the pooled denominator #339 removed — just one level down.
+        per_row = [(_arm_attempts(r, key, int(r.get("trials", 1))), int(r[key]))
+                   for r in carrying]
+        arm_attempts = sum(a for a, _ in per_row)
         if not arm_attempts:
             continue
-        lost = sum(max(0, int(r.get("trials", 1)) - int(r[key])) for r in carrying)
+        lost = sum(max(0, a - t) for a, t in per_row)
         if lost / arm_attempts > UNMEASURED_FAIL_SHARE:
             return True
     return False
@@ -2402,7 +2505,12 @@ def _per_transform_table(results: dict, summary: dict[str, dict[str, float]]) ->
     for tf, rs in sorted(by_tf.items()):
         tacc, _ = _form_stats(rs, "terse_ok")
         pacc, _ = _form_stats(rs, "primer_ok")
-        out.append(f"| {tf} | {len(rs)} | {tacc:.0%} | {pacc:.0%} |")
+        # `n/a`, not 0%, for an arm this responses file never collected (#283) — the same
+        # rule the model table applies to its own primer/inline cells. This is the table a
+        # reader uses to "restrict the policy to the transforms that held", so a 0% here for
+        # a question nobody asked is a policy change made on an absence.
+        p_cell = f"{pacc:.0%}" if arm_measured(rs, "primer_ok") else "n/a"
+        out.append(f"| {tf} | {len(rs)} | {tacc:.0%} | {p_cell} |")
     out.append("")
     return out
 
@@ -2708,6 +2816,14 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         if has_inline:
             summary[model].update({"inline": iacc, "inline_se": ise})
         inline_cell = (f"{iacc:.0%} ±{_ci(ise) * 100:.0f}" if has_inline else "n/a")
+        # Same rule for the primer arm, which `score_pack` can now report as never collected
+        # (#283): `_form_stats` would render its empty sample as a confident `0% ±0`, and
+        # "primer recovers" would silently mean "recovered none of them" for an arm that was
+        # never asked. Live-harness rows always answer True here, so this is `n/a` only where
+        # a responses file really did omit the form.
+        has_primer = arm_measured(rows, "primer_ok")
+        primer_cell = (f"{pacc:.0%} ±{_ci(pse) * 100:.0f}" if has_primer else "n/a")
+        rec_cell = str(rec) if has_primer else "n/a"
         if unmeasured:
             # No percentages at all for a model that did not answer. A number here would
             # be read as comprehension no matter how it is footnoted — the same reason the
@@ -2719,7 +2835,7 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
                 # `len(g.rows)` — the paired exam these percentages are actually over.
                 f"| `{model}` | {len(g.rows)} | {racc:.0%} ±{_ci(rse) * 100:.0f} "
                 f"| {tacc:.0%} ±{_ci(tse) * 100:.0f} "
-                f"| {pacc:.0%} ±{_ci(pse) * 100:.0f} | {inline_cell} | {regr} | {rec} |"
+                f"| {primer_cell} | {inline_cell} | {regr} | {rec_cell} |"
             )
     out.append("")
     unreachable = {m: s for m, s in summary.items() if s.get("unmeasured")}
