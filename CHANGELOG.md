@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.29.0] - 2026-09-02
+
 ### Added
 
 - **Codec-tier token savings are reported beside the verdict, never inside it** (`#303`).
