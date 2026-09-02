@@ -18,21 +18,33 @@ from typing import Any
 
 from .report import (
     _FIXED_IDEAL_MIN_QUESTIONS,
+    ATTRITION_NOTE,
+    DIFF_ARMS,
     DROPEVAL_METRICS,
+    FLUENCY_CONTROL,
+    FLUENCY_GATING,
     _ci,
     _sum,
+    attrition,
+    attrition_block,
     diff_gap_rows,
+    dropeval_attrition_note,
     dropeval_directive_line,
     dropeval_verdict,
     exclusion_note,
     fluency_gap_rows,
+    is_diff_run,
     passes_tolerance,
+    strip_markup,
 )
 
 
 def _plain(markdown: str) -> str:
-    """`**bold**` and `` `code` `` stripped — the terminal's copy of a shared sentence."""
-    return markdown.replace("**", "").replace("`", "")
+    """`**bold**` and `` `code` `` stripped — the terminal's copy of a shared sentence.
+
+    Delegates to `report.strip_markup` so two terminal renderers cannot strip different
+    markup off the same shared string."""
+    return strip_markup(markdown)
 
 
 _BAR_WIDTH = 24
@@ -230,12 +242,18 @@ def build_terminal_diff_report(results: dict, form_label: str = "diff-form",
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
                            "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
     text = forest_bar_lines(plot_rows, form_label, control_label, color=color)
+    # THIS chart is the one an operator sees without `--html`: `cli` prints the markdown
+    # and this plot on every diff path and writes the HTML page only under `--html`, so
+    # leaving it silent meant the disclosure existed exactly where it was least read
+    # (#299). All three diff modes route here.
+    attr = attrition_block({m: attrition(rows, *DIFF_ARMS) for m, rows in results.items()
+                            if is_diff_run(rows)}, ATTRITION_NOTE)
     # `exclusion_note` rather than a hardcoded phrase: this line said "calls went
     # unanswered" for every exclusion, including a model whose calls were all answered and
     # whose arms simply could not be paired (#280).
     if excluded:
         text += f"\n  ({exclusion_note(excluded)})"
-    return text
+    return text + attr
 
 
 def build_terminal_fluency_report(results: dict, color: bool | None = None) -> str:
@@ -252,6 +270,15 @@ def build_terminal_fluency_report(results: dict, color: bool | None = None) -> s
     text = forest_bar_lines(plot_rows, "best terse-form", "raw", color=color)
     if broken:
         text += f"\n  ({exclusion_note(broken)})"
+    # The bars are drawn over the PAIRED subset, and a chart that does not say what was
+    # removed from it is the same silent exclusion the markdown stopped printing (#299).
+    # Same arms as the gap: `fluency_gap_rows`, which feeds the bars above, now reads
+    # `FLUENCY_GATING`/`FLUENCY_CONTROL` too, so the chart and its annotation cannot
+    # describe different exams. It used to hardcode `["terse_ok", "primer_ok"], "raw_ok"`
+    # and this comment was false when written.
+    text += attrition_block(
+        {m: attrition(rows, *FLUENCY_GATING, FLUENCY_CONTROL)
+         for m, rows in results.items() if rows}, ATTRITION_NOTE)
     return text
 
 
@@ -279,12 +306,28 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None,
     while the markdown — given the same flag by `cli` — rendered a full verdict over the
     surviving questions right below it (review finding 4 on #300)."""
     v = dropeval_verdict(results, accept_degraded=accept_degraded)
+    # Computed BEFORE the inconclusive early return. That return fires on the runs with
+    # the MOST attrition — a 12/24 failure rate is exactly when a reader needs to know
+    # which arm lost the calls — and it used to drop the disclosure on the floor while
+    # the markdown printed it. The new test only passed because it set
+    # `accept_degraded=True` and so never took this branch.
+    attr = attrition_block(
+        {m: attrition(rows, "answer_ok", "control_ok", kind_key="kind")
+         for m, rows in results.items() if rows}, dropeval_attrition_note(results),
+        extra={m: sum(r.get("treatment_errors", 0) for r in rows)
+               for m, rows in results.items() if rows}).strip("\n")
     if v.inconclusive:
         # Never draw a forest plot from transport errors: the bars would be indistinguishable
         # from a model that answered and got it wrong. Same refusal build_dropeval_report
         # renders, from the same decision, so chart and markdown cannot disagree.
-        return "  " + _plain(dropeval_directive_line(v))
+        return "  " + _plain(dropeval_directive_line(v)) + (f"\n\n{attr}" if attr else "")
     if not v.gates:
+        # NOT `+ attr`: `dropeval_verdict` sets `gates[model] = {}` for every model with
+        # rows, so `not v.gates` holds only when NO model has rows — and `attr` is built
+        # from `... if rows`, so it is "" in exactly that case. The append was a branch no
+        # run could reach, which is the thing `attrition_line`'s own docstring refuses to
+        # ship. The `v.inconclusive` return above is different: that one is reachable and
+        # is the whole point of moving the computation up.
         return "  (no data)"
     sections = []
     if v.degraded_accepted:
@@ -342,4 +385,6 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None,
     # off the one string keeps them the same sentence by construction, and
     # `test_the_chart_and_the_markdown_reach_the_same_directive` pins the relation.
     sections.append("  " + _plain(dropeval_directive_line(v)))
+    if attr:
+        sections.append(attr)
     return "\n\n".join(sections)

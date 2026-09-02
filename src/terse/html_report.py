@@ -22,6 +22,8 @@ from collections.abc import Sequence
 from typing import Any
 
 from .report import (
+    ATTRITION_NOTE,
+    DIFF_ARMS,
     REASON_HEADING,
     REASON_LABEL,
     ExclusionReason,
@@ -30,6 +32,9 @@ from .report import (
     _sum,
     _worst_case_gap,
     arm_gap,
+    attrition,
+    attrition_block,
+    is_diff_run,
     passes_tolerance,
     unmeasured_cause,
 )
@@ -518,10 +523,10 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
         # `diff_ok`) would pass a first-row check and then hit `int(r[form])` in
         # `_form_stats` — a KeyError instead of an exclusion. Same defence `has_inline`
         # already uses one file over.
-        if not all("diff_ok" in r and "terse_ok" in r for r in rows):
+        if not is_diff_run(rows):
             excluded[model] = "not a diff run"
             continue
-        g = arm_gap(rows, "diff_ok", "terse_ok")
+        g = arm_gap(rows, *DIFF_ARMS)
         if g.excluded:
             excluded[model] = g.excluded
             continue
@@ -593,6 +598,22 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
                     int(r.get("fails", 0)) for m in models for r in results.get(m, []))))
             verdict_html += (f'<p>{_esc(REASON_HEADING.get(why, "Excluded"))} — '
                              f'{_esc(REASON_LABEL.get(why, why))} for: {names}.{tail}</p>')
+
+    # The page's forest plot is drawn over the paired subset like every other renderer,
+    # so it carries the same disclosure (#299). Arms are this page's OWN pair
+    # (`diff_ok` vs `terse_ok`, see `arm_gap` above), not fluency's — annotating a chart
+    # with the attrition of a different pairing is worse than annotating nothing.
+    # `excluded[m] == "not a diff run"` is the loop's OWN verdict on row shape, 80 lines
+    # up. Re-testing the shape here was a second copy of that predicate which nothing
+    # could catch disagreeing: deleting its guard left 226 tests green. One decision, read
+    # back rather than recomputed — and the predicate itself now lives in `is_diff_run`,
+    # pinned by `test_all_three_diff_renderers_share_ONE_shape_predicate`.
+    attr_text = attrition_block(
+        {m: attrition(rows, *DIFF_ARMS) for m, rows in results.items()
+         if rows and excluded.get(m) != "not a diff run"}, ATTRITION_NOTE,
+        style="html")
+    if attr_text:
+        verdict_html += f"<p>{_esc_md(attr_text.strip())}</p>"
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">

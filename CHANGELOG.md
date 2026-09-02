@@ -13,7 +13,91 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **The fluency and dropeval reports publish the attrition of their paired exam, per arm and
+  per question kind** (`#299`). `paired_rows` (`#280`) drops a question from every gated arm
+  unless all of them completed all of its trials. That makes the surviving arms comparable; it
+  does not make the SELECTION ignorable, because which questions survive is decided by the arm
+  most likely to fail — and that arm is not random. dropeval's treatment runs a two-turn
+  retrieve protocol against the control's one turn, and fluency's longest prompts are also its
+  hardest questions, so under a token-budget stop the arm under test thins out first and on
+  exactly the questions that discriminate. A run that loses its five hardest questions from one
+  arm and none from the other still produces a perfectly paired comparison over the twenty easy
+  ones, reports a tiny gap with a tight interval, and is wrong. It was excluded **silently**:
+  the reports printed a pooled `errors`/`attempts` and an INCONCLUSIVE gate, neither of them
+  per-arm and neither per-question-kind. dropeval already reported the arm split and the
+  surviving-question count (`#300`); what NO report had, on either harness, is the
+  per-question-KIND axis — whether the removed questions were the hard ones — and the fluency
+  report had none of the three. New `report.attrition` reports all three, and it
+  reads the excluded set out of `paired_rows`' own body (`_paired_partition`) rather than
+  re-deriving the rule — a reporter that re-implemented the escapes for an absent `attempts`,
+  an absent `<arm>_trials`, and the run-level `collected` fact would be free to contradict the
+  pairing it annotates. Kinds print worst-share-first and carry their denominator, because
+  `deref 5/5` beside `count 0/25` is the concentration signal and a bare `deref 5` is not.
+  `inline_ok` is deliberately excluded: it is display-only and outside the pairing by design,
+  so counting its losses would report an exclusion that never happened (that arm's lack of
+  protection is `#292`). This is Option 1 of the issue and nothing more — the bias is made
+  visible, not corrected, because no run in the repo can currently say whether it is large or
+  negligible, and a threshold picked before looking at one would be invented rather than
+  measured. **dropeval's arms are asymmetric by design and its note says so**: the treatment
+  carries no `answer_trials`, because removing a failed treatment call from its own
+  denominator turned a 33% recall FAIL into a 100% PASS at an 11% error rate (`#300`), so a
+  failed treatment call is scored a MISS and `_paired_arm` is unconditionally true for
+  `answer_ok` — the pairing can only ever exclude on the CONTROL side. Both consequences are
+  executed, and both were review findings against the first cut of this change: a run whose
+  two-turn treatment lost every call while the one-turn control lost none reported
+  `excluded 0` and rendered nothing at all (the motivating case, reading as "the exam was not
+  selected"), and a run where both arms lost everything attributed 100% of the exclusion to
+  the control while the generic note invited that to be read as bias in the control's favour.
+  The dropeval line now carries the treatment's own loss from `treatment_errors` — labelled
+  as misses, not exclusions, because those questions are IN the paired exam depressing the
+  treatment's accuracy rather than removed from it — and its note states the asymmetry
+  instead of the generic reading rule.
+
+  **Every renderer drawn over the paired subset carries it**, through one
+  `attrition_block`: the fluency, dropeval and diff-family markdown reports, all three
+  terminal forest-plot charts, and the HTML page. A chart drawn over the paired subset that
+  does not say what left it is the same silent exclusion the markdown stopped printing — and
+  the chart is the artifact people quote. The diff family is why that sentence had to be
+  taken literally: `cli` prints the diff markdown and its terminal chart on EVERY diff path
+  and writes the HTML page only under `--html`, so wiring the page alone would have put the
+  disclosure exactly where it is least read — an operator running `--diff --bars` would see
+  `PASS` over 20 questions and never learn the diff arm removed all five `deref` ones. The
+  diff renderers annotate their OWN pairing (`diff_ok` vs `terse_ok`, the arms their
+  `arm_gap` is given), not fluency's four — including the diff-SOAK markdown, which does
+  not route through the shared diff body and is the artifact `--out` keeps, so leaving it
+  silent had its own chart disclosing `deref 15/15` beside a file that said nothing. One
+  helper rather than eight copies because
+  `#335`'s review rounds are the record of what happens otherwise: two renderers deciding the
+  same thing separately disagreed three times. The heading is a single constant with a
+  markdown and a plain spelling — the markdown sites first bolted the bold on afterwards
+  with a `.replace()` keyed on the heading text, a second copy of the literal that silently
+  no-ops (emitting an unclosed `**` into both reports) the moment the heading is edited, and
+  that survived 226 tests. The helper spells the block three ways — markdown, HTML and
+  plain — because block markup and INLINE markup are separate questions: folding them into
+  one flag cost the HTML page its `<code>` spans, leaving one paragraph in plain text beside
+  a verdict banner two lines up that still rendered them.
+
+  **The enumeration is computed, not written down.** "Every renderer carries it" was
+  claimed three times and was false three times — first the HTML page while `cli` printed
+  two other renderers, then the diff family, then the diff soak — because each fix listed
+  the renderers by hand and the next one was missed the same way.
+  `test_every_renderer_drawn_over_a_paired_subset_discloses_its_attrition` walks the call
+  graph of the whole package instead: any `build_*` function that transitively
+  reaches `paired_rows` must transitively reach `attrition_block`. A renderer added later
+  inherits the requirement, and adding one without a disclosure fails CI rather than waiting
+  for a reviewer. It found a tenth renderer nobody had named — `build_codec_verdict_report`
+  — which is exempt because `codeceval` pins `raw_trials`/`terse_trials` to `trials` on
+  purpose, so its pairing can never exclude anything; that exemption's premise is proven by
+  execution, so it goes red if `codeceval` ever starts emitting real per-arm denominators.
+  `DIFF_ARMS` is threaded through every diff-family `arm_gap`/`paired_rows` call, not only
+  the `attrition` ones — for one round the constant was read by four sites while seven
+  others still spelled the pair literally, so its own comment claimed a sharing that did
+  not exist. A dropeval run started with `--no-control` gets its own note: the standard one
+  explains why exclusion can only land on the control side and points at a **Where they
+  failed** split, both meaningless without a control arm and the second a markdown-only
+  section absent from the two-line terminal chart.
 
 ## [0.29.1] - 2026-09-02
 
