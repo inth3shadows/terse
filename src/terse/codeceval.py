@@ -79,6 +79,7 @@ from typing import Any
 
 from . import fluency
 from .dropeval import ToolAnswerer, Turn, _safe_call
+from .tokenize import count_cl100k
 
 # OpenAI function-calling schemas can't cleanly express "any JSON type" — see the module
 # docstring's spike note. `{"description": ...}` with no `"type"` is the untyped form that
@@ -202,6 +203,32 @@ def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
     return out
 
 
+def _payload_tokens(raw_text: str, obj: Any) -> dict[str, int]:
+    """cl100k token counts for one payload's two arms, stamped onto every row that payload
+    produces (#303). Empty when tiktoken is unavailable — `count_cl100k` returns `None`
+    there, and a savings table that silently reads a missing count as zero would print a
+    100% saving for an unmeasured run.
+
+    Measured on the FORM THE MODEL ACTUALLY READ: `raw_text` is the same string
+    `run_codec_payload` puts on the raw arm, and `fluency.compress(obj)` is byte-identical
+    to the terse arm's payload. Recomputing the corpus-wide savings from `measure` instead
+    would report a different number against the same verdict — `run_codec_fluency` only
+    emits rows for payloads that yield a `deref` question (8 of 1524 on the live corpus,
+    measured 2026-09-02), and 36 of those 1524 envelopes carry a stored `shape` that
+    today's `classify_shape` no longer agrees with, so the two tables would neither cover
+    the same payloads nor bucket them the same way.
+
+    Per PAYLOAD, not per row: one payload yields one row per question, and every one of
+    them carries these same two counts. `build_codec_verdict_report` de-duplicates by
+    `sha` before summing — summing the rows directly would multiply a payload's tokens by
+    its question count, and again by the number of models that answered it."""
+    raw_tok = count_cl100k(raw_text)
+    terse_tok = count_cl100k(fluency.compress(obj))
+    if raw_tok is None or terse_tok is None:
+        return {}
+    return {"raw_tokens": raw_tok, "terse_tokens": terse_tok}
+
+
 def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                       trials: int = 1) -> dict[str, list[dict]]:
     """Run the codec-tier eval for each named tool-capable answerer over every payload in
@@ -214,7 +241,12 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
     capture time by `capture.record` — `capture.py`'s `classify_shape` call). No existing
     harness stamps `shape` onto its rows; it is the one field #295's per-`(tool, shape)`
     verdict needs that the comprehension harness never needed, because the comprehension
-    report has always pooled globally rather than per shape bucket."""
+    report has always pooled globally rather than per shape bucket.
+
+    Rows also carry `sha` and, when a tokenizer is available, the payload's `raw_tokens` /
+    `terse_tokens` (`_payload_tokens`) — PER PAYLOAD, repeated on each of its question rows,
+    for `report._codec_savings_section` to de-duplicate by `sha` and report beside the
+    verdict."""
     results: dict[str, list[dict]] = {name: [] for name in answerers}
     for env in envelopes:
         try:
@@ -223,12 +255,14 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
             continue  # deref needs parsed JSON structure; a non-JSON/text payload has none
         if not gen_codec_questions(obj):
             continue
+        toks = _payload_tokens(env["raw"], obj)
         for name, answerer in answerers.items():
             for row in run_codec_payload(obj, env["raw"], answerer, trials=trials):
                 results[name].append({
                     "tool": env.get("tool", "?"),
                     "shape": env.get("shape", "unknown"),
                     "sha": env.get("sha", "?"),
+                    **toks,
                     **row,
                 })
     return results

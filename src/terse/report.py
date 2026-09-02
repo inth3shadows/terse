@@ -859,6 +859,73 @@ def codec_verdict(rows: list[dict[str, Any]]) -> tuple[str, ArmGap]:
     return "UNRESOLVED", g
 
 
+def _codec_savings_section(
+    groups: dict[tuple[str, str], dict[str, list[dict]]],
+) -> list[str]:
+    """The economics, rendered BESIDE the verdict and never inside it (#303, #295 DoD 4).
+
+    A SIBLING section over the same `(tool, shape)` groups, deliberately not a column of
+    the verdict table and deliberately not combined with it by any arithmetic. The ordering
+    is the argument: correctness is decided first, on its own table, and the savings number
+    is what you consult AFTER it — because a cell that multiplies a saving by a verdict is
+    how a savings argument ends up licensing a correctness loss.
+
+    An UNSAFE group still prints its savings. Withholding it would be its own editorialising
+    in the other direction: "this shape saves 61% and is UNSAFE" is the true and useful
+    statement, and suppressing half of it does not make the tier safer, only less legible.
+    The two facts are independent measurements of the same group; neither gates the other.
+
+    De-duplicates by `sha` because `run_codec_fluency` stamps the same per-payload counts
+    onto every question row a payload produces, for every model that answered it. Rows from
+    a run that could not tokenize (or from a stored result predating #303) carry no counts;
+    those payloads are excluded from the sums and reported as uncounted rather than as zero
+    savings, so a missing measurement can never read as a perfect one."""
+    out = [
+        "## Savings by tool and shape",
+        "",
+        "Reported BESIDE the verdict above, never folded into it: no figure here is",
+        "weighted by, multiplied into, or gated on a SAFE/UNSAFE/UNRESOLVED result, and an",
+        "UNSAFE group still prints what it saves. Decide correctness from the table above",
+        "first; this one only says what the tier costs or buys once that is settled.",
+        "cl100k tokens, over exactly the payloads the verdict above was computed on —",
+        "raw payload vs the same compressed form the terse arm was fed.",
+        "",
+        "| Tool | Shape | payloads | raw tok | terse tok | saved | % |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    uncounted_total = 0
+    for (tool, shape), by_model in sorted(groups.items()):
+        counted: dict[str, tuple[int, int]] = {}
+        uncounted: set[str] = set()
+        for mrows in by_model.values():
+            for r in mrows:
+                sha = str(r.get("sha", "?"))
+                raw_t, terse_t = r.get("raw_tokens"), r.get("terse_tokens")
+                if isinstance(raw_t, int) and isinstance(terse_t, int):
+                    counted.setdefault(sha, (raw_t, terse_t))
+                elif sha not in counted:
+                    uncounted.add(sha)
+        uncounted -= set(counted)
+        uncounted_total += len(uncounted)
+        if not counted:
+            out.append(f"| `{tool}` | {shape} | 0 | n/a | n/a | n/a | n/a |")
+            continue
+        raw = sum(v[0] for v in counted.values())
+        cmp_ = sum(v[1] for v in counted.values())
+        out.append(f"| `{tool}` | {shape} | {len(counted)} | {raw} | {cmp_} | "
+                   f"{raw - cmp_:+d} | {_pct(raw - cmp_, raw)} |")
+    out.append("")
+    if uncounted_total:
+        out += [
+            f"{uncounted_total} payload(s) carry no token counts and are excluded from the "
+            "sums above",
+            "(no tokenizer available at run time, or a result file predating `#303`) — "
+            "excluded, not counted as zero.",
+            "",
+        ]
+    return out
+
+
 def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
     """Render the codec-tier material-preservation eval, grouped by `(tool, shape)` — never
     as one global number (#295's explicit non-goal). `results` is
@@ -870,7 +937,11 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
     `build_fluency_report` both pool a model's rows across the whole corpus. Per-shape
     grouping matters here because the product ships per-tool policy; a single global verdict
     can't answer "compress THIS shape, for THIS tool, by default?", which is the question
-    #295 says the eval must be able to answer."""
+    #295 says the eval must be able to answer.
+
+    Token savings render as a SIBLING section over the same groups (`_codec_savings_section`,
+    #303), never as a column of the verdict table and never combined with a verdict by any
+    arithmetic — see that function for why the ordering is the argument."""
     out = ["# terse codec-tier material-preservation eval", ""]
     out += [
         "Does a real tool-calling model's downstream tool-call argument stay structurally",
@@ -929,6 +1000,7 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
         out.append(f"| `{tool}` | {shape} | {n} | **{worst_verdict}** | `{worst_model}` | "
                    f"{why} |")
     out.append("")
+    out += _codec_savings_section(groups)
     return "\n".join(out)
 
 
