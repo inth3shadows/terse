@@ -100,12 +100,34 @@ def score(qtype: str, expected: Any, reply: str) -> bool:
     return _norm_scalar(reply) == _norm_scalar(str(expected))
 
 
-def _score_form(qtype: str, expected: Any, form_val: Any) -> tuple[int, int]:
-    """(successes, trials) for one form's collected reply(s). A single string is one
-    trial; a list of strings is N trials (the multi-trial pack form). Returns (0, 1)
-    for a missing/empty single reply, matching the prior single-trial behaviour."""
+# A form absent from a responses file. NOT the same fact as a reply that came back empty,
+# and the whole of #279 is that the two were indistinguishable: `forms.get("raw", "")` fed
+# a never-collected form to the scorer as `""`, which then scored as a wrong answer. Pass
+# this sentinel for "the key is not in the file" and a real value (including `None`) for
+# "the driver recorded something for this form".
+MISSING: Any = object()
+
+
+def _score_form(qtype: str, expected: Any, form_val: Any) -> tuple[int, int, int]:
+    """(successes, scored, collected) for one form's collected reply(s).
+
+    A single value is one collected reply; a list is N. `collected` counts every reply the
+    driver recorded; `scored` counts only the ones that are actually answers. A reply that
+    is `None`, non-str, or blank is a NON-ANSWER and leaves BOTH the numerator and the
+    denominator (#279) — it is not evidence the model got the question wrong.
+
+    This is parity with the live path, not a new rule: `answerers.openai_answerer` already
+    returns `None` for a blank reply (`questions._answerable`'s docstring names that as the
+    premise it defends), and `harnesses._ask_n` already answers it with `fails += 1;
+    continue`. Only the offline `score_pack` path scored a non-answer as a miss — executed
+    before this fix, `_score_form("lookup", "x", [None, None, "x"])` returned `(1, 3)`: a
+    model right on every reply it actually produced, reported at 33%.
+
+    A form that is `MISSING` yields `(0, 0, 0)` — nothing was collected, so there is neither
+    an answer nor a lost call to count."""
+    if form_val is MISSING:
+        return 0, 0, 0
     replies = form_val if isinstance(form_val, list) else [form_val]
-    if not replies:
-        return 0, 0
-    successes = sum(score(qtype, expected, r) for r in replies if isinstance(r, str))
-    return successes, len(replies)
+    answered = [r for r in replies if isinstance(r, str) and r.strip()]
+    successes = sum(score(qtype, expected, r) for r in answered)
+    return successes, len(answered), len(replies)

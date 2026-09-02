@@ -13,7 +13,7 @@ from ..capture import extract_records
 from ..tokenize import count_cl100k
 from ..transforms import compress
 from .questions import gen_questions
-from .scoring import _score_form
+from .scoring import MISSING, _score_form
 
 # One-time format primer. Deliberately short — in deployment it would be a single
 # system note, not a per-call preamble (which would cost tokens on every call).
@@ -74,6 +74,13 @@ def score_pack(pack: dict, responses: dict) -> dict:
     responses: {model: {sha: {qid: {"raw": str|[str], "terse": ..., "primer": ...}}}}.
     A list value is multi-trial (N replies for that form). Returns the same
     {model: [scored_row,...]} shape as `run_fluency`, with per-form success counts.
+
+    A form's value may be `null`, `""`, or absent. Those are NOT the same fact and are no
+    longer scored as if they were (#279): an absent form was never collected and costs
+    nothing, while a recorded empty/null reply is a call that produced no answer — counted
+    as a lost call, never as a wrong one. The per-arm `<arm>_attempts`/`<arm>_trials` pair
+    plus the pooled `fails`/`attempts` is what gives `terse fluency --responses` a transport
+    gate through `report._unmeasured` at all (#283).
     """
     index: dict[tuple, dict] = {}
     for p in pack["payloads"]:
@@ -88,9 +95,12 @@ def score_pack(pack: dict, responses: dict) -> dict:
                 if meta is None:
                     continue
                 qtype, expected = meta["qtype"], meta["expected"]
-                raw_k, raw_t = _score_form(qtype, expected, forms.get("raw", ""))
-                terse_k, terse_t = _score_form(qtype, expected, forms.get("terse", ""))
-                primer_k, primer_t = _score_form(qtype, expected, forms.get("primer", ""))
+                # `MISSING`, not `""` (#279): a form the responses file never collected is
+                # not a reply that came back empty, and defaulting to `""` scored the first
+                # as the second.
+                raw_k, raw_t, raw_a = _score_form(qtype, expected, forms.get("raw", MISSING))
+                terse_k, terse_t, terse_a = _score_form(qtype, expected, forms.get("terse", MISSING))
+                primer_k, primer_t, primer_a = _score_form(qtype, expected, forms.get("primer", MISSING))
                 rows.append({
                     "tool": meta["tool"], "sha": sha, "qid": qid,
                     "qtype": qtype, "transform": meta["transform"],
@@ -99,9 +109,30 @@ def score_pack(pack: dict, responses: dict) -> dict:
                     # hand-built pack (one form collected fewer replies), dividing a
                     # sparser form's successes by the shared max understates it. Each form
                     # is scored over its OWN trial count instead (see _form_stats).
-                    "trials": max(raw_t, terse_t, primer_t, 1),
+                    "trials": max(raw_a, terse_a, primer_a, 1),
                     "raw_ok": raw_k, "terse_ok": terse_k, "primer_ok": primer_k,
                     "raw_trials": raw_t, "terse_trials": terse_t, "primer_trials": primer_t,
+                    # THE PER-ARM ATTEMPT COUNTS ARE WHAT MAKE THE COUNTERS BELOW SAFE (#283).
+                    #
+                    # `fails`/`attempts` are what `report._unmeasured` gates on, and without
+                    # them `fluency --responses` published a verdict with no transport gate at
+                    # all — its `if not attempts: return False` short-circuited on every row
+                    # this function emits. But adding the pooled pair ALONE would have armed
+                    # the trap `paired_rows`' docstring names: both `paired_rows` and
+                    # `_unmeasured`'s per-arm trigger fall back to the shared `trials` as an
+                    # arm's attempt count, and here `trials` is a `max(...)` across forms — so
+                    # an uneven-BY-DESIGN pack (#91: 3 raw replies, 2 terse ones for the same
+                    # question) would read as the terse arm losing a call it was never asked
+                    # to make, and a documented collection mode would start being withheld.
+                    #
+                    # So each arm states its own attempt count instead of having one inferred
+                    # from its neighbours. `<arm>_attempts - <arm>_trials` is then exactly the
+                    # non-answers for that arm and nothing else, which is the only loss a
+                    # keyless scorer can actually observe.
+                    "raw_attempts": raw_a, "terse_attempts": terse_a,
+                    "primer_attempts": primer_a,
+                    "fails": (raw_a - raw_t) + (terse_a - terse_t) + (primer_a - primer_t),
+                    "attempts": raw_a + terse_a + primer_a,
                 })
         results[model] = rows
     return results
