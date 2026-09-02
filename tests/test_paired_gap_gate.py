@@ -493,25 +493,34 @@ def test_the_question_column_reports_the_exam_that_was_actually_sat():
 # a green PASS.
 #
 # Why the fail-share gate cannot catch it: `paired_rows` voids a WHOLE ROW for ONE lost
-# trial, so loss is amplified from the call level to the question level. At 3 trials per
-# arm, one lost call per row is 1-in-6 of the calls (16.7%, under `UNMEASURED_FAIL_SHARE`)
-# and 6-in-6 of the questions. The two gates measure different quantities; the second one
-# is not redundant with the first at any threshold.
+# trial, so loss is amplified from the call level to the question level. At `_WIPEOUT_TRIALS`
+# (10) trials per arm, one lost call per row is 1-in-10 of that arm's own calls (10%, under
+# `UNMEASURED_FAIL_SHARE` even after #339 moved the denominator to per-arm) and 10-in-10 of
+# the questions. The two gates measure different quantities; the second one is not redundant
+# with the first at any threshold. (Verbatim shape from #332 used 3 trials per arm, giving
+# 33.3% per-arm loss — since #339 that alone trips `_unmeasured`, which would make this
+# fixture prove nothing about the pairing floor. 10 trials keeps the per-arm share under the
+# line while every other property — one lost trial voids the row regardless of magnitude —
+# is unchanged.)
 # --------------------------------------------------------------------------------------
+
+_WIPEOUT_TRIALS = 10
+
 
 def _pairing_wipeout_rows(n: int = 10, lost: int | None = None) -> list[dict]:
     """`lost` of `n` questions lose one diff trial apiece — enough to void them entirely.
 
-    Verbatim shape from #332: the control answers all three trials of every question, and
-    the form arm is one trial short on the damaged ones. Overall fail share stays at
-    16.7%, so `_unmeasured` never fires."""
+    The control answers every trial of every question, and the form arm is one trial short
+    on the damaged ones. Overall fail share stays at 5% pooled / 10% per-arm, both under
+    `UNMEASURED_FAIL_SHARE`, so `_unmeasured` never fires — see the module note above."""
+    t = _WIPEOUT_TRIALS
     lost = n if lost is None else lost
     return [{
-        "qid": f"q{i}", "qtype": "count", "transform": "table", "trials": TRIALS,
-        "terse_ok": TRIALS, "terse_trials": TRIALS,
-        "diff_ok": 0 if i < lost else TRIALS,
-        "diff_trials": TRIALS - 1 if i < lost else TRIALS,
-        "attempts": TRIALS * 2, "fails": 1 if i < lost else 0,
+        "qid": f"q{i}", "qtype": "count", "transform": "table", "trials": t,
+        "terse_ok": t, "terse_trials": t,
+        "diff_ok": 0 if i < lost else t,
+        "diff_trials": t - 1 if i < lost else t,
+        "attempts": t * 2, "fails": 1 if i < lost else 0,
     } for i in range(n)]
 
 
@@ -591,11 +600,19 @@ def test_a_small_but_failing_arm_still_publishes_its_FAIL():
     # Eight questions voided by pairing; the two that survive are complete on BOTH arms and
     # the form arm got neither of them right. Written out rather than reusing
     # `_pairing_wipeout_rows`, whose survivors are clean by construction.
+    #
+    # `t=10` (not the shared `TRIALS=3`): pairing voids a row on ANY loss regardless of
+    # magnitude, but #339's per-arm `_unmeasured` share is not — at 3 trials, one lost call
+    # per row on 8 of 10 rows is 26.7% of the diff arm's own calls, over
+    # `UNMEASURED_FAIL_SHARE`, which would withhold this fixture via the transport gate
+    # before pairing gets a chance to. 10 trials keeps the same one-lost-call-per-row shape
+    # at 8%, comfortably under the line, so this stays a test of the pairing floor alone.
+    t = 10
     rows = [{
-        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
-        "terse_ok": TRIALS, "terse_trials": TRIALS,
-        "diff_ok": 0, "diff_trials": TRIALS - 1 if i < 8 else TRIALS,
-        "attempts": TRIALS * 2, "fails": 1 if i < 8 else 0,
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": t,
+        "terse_ok": t, "terse_trials": t,
+        "diff_ok": 0, "diff_trials": t - 1 if i < 8 else t,
+        "attempts": t * 2, "fails": 1 if i < 8 else 0,
     } for i in range(10)]
     assert len(paired_rows(rows, "diff_ok", "terse_ok")) == 2 < _MIN_PAIRED_QUESTIONS
 
@@ -612,11 +629,15 @@ def test_a_small_and_passing_arm_is_withheld_as_underpowered():
     """The other side: the same two questions, both arms perfect. Nothing failed, and that
     is exactly the problem — two questions cannot support "no regression". Withheld under
     its OWN reason, not `"unmeasured"`, whose label would claim calls were lost."""
+    # `t=10`, same reason as the sibling test above: keeps the per-arm loss (8%) under
+    # `UNMEASURED_FAIL_SHARE` so this stays a test of the underpowered-pairing floor, not
+    # the transport gate.
+    t = 10
     rows = [{
-        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": TRIALS,
-        "terse_ok": TRIALS, "terse_trials": TRIALS,
-        "diff_ok": TRIALS, "diff_trials": TRIALS - 1 if i < 8 else TRIALS,
-        "attempts": TRIALS * 2, "fails": 1 if i < 8 else 0,
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": t,
+        "terse_ok": t, "terse_trials": t,
+        "diff_ok": t, "diff_trials": t - 1 if i < 8 else t,
+        "attempts": t * 2, "fails": 1 if i < 8 else 0,
     } for i in range(10)]
     assert len(paired_rows(rows, "diff_ok", "terse_ok")) == 2 < _MIN_PAIRED_QUESTIONS
 
@@ -648,8 +669,9 @@ def test_a_withheld_model_is_not_told_its_backend_was_unreachable():
     is silent on whether they are right — reverting the label to its pre-#332 wording
     ("calls went unanswered") leaves it green. That is a real mutation this file has to
     catch, because the second cause reaches a reader whose backend answered almost
-    everything: here 16.7% of calls are lost and the losses simply land so that no question
-    survives on both arms.
+    everything: here 5% of calls are lost (10% of the diff arm's own calls, still under
+    `UNMEASURED_FAIL_SHARE`) and the losses simply land so that no question survives on
+    both arms.
 
     So this asserts the CLAIM, not the vocabulary: nothing may state that the calls went
     unanswered as the settled cause, and the pairing cause must be offered."""
@@ -777,10 +799,17 @@ def test_every_renderer_names_the_right_exclusion_reason():
 
     # Pooled gate QUIET (depth 1 pairs cleanly and clears the floor), one depth slice
     # withheld by a zero-trial arm — the only shape that reaches the by-depth paragraph.
+    #
+    # depth 1 runs 20 trials/row (not 1): #339 makes `_unmeasured` sum loss/attempts PER
+    # ARM across the whole model, so depth 3's total wipeout (10 rows, 100% of the diff
+    # arm's own calls there) has to be diluted by depth 1's clean volume to stay under
+    # `UNMEASURED_FAIL_SHARE` overall — 10 lost of (25*20 + 10*1) = 1.9% model-wide, vs.
+    # 100% within the depth-3 slice alone, which is what the by-depth paragraph still
+    # needs to find withheld.
     soak_depth_rows = (
         [{"qid": f"d1q{i}", "qtype": "lookup", "transform": "table", "depth": 1,
-          "trials": 1, "terse_ok": 1, "terse_trials": 1, "diff_ok": 1, "diff_trials": 1,
-          "attempts": 2, "fails": 0} for i in range(25)]
+          "trials": 20, "terse_ok": 20, "terse_trials": 20, "diff_ok": 20, "diff_trials": 20,
+          "attempts": 40, "fails": 0} for i in range(25)]
         + [{"qid": f"d3q{i}", "qtype": "lookup", "transform": "table", "depth": 3,
             "trials": 1, "terse_ok": 1, "terse_trials": 1, "diff_ok": 0, "diff_trials": 0,
             "attempts": 2, "fails": 0} for i in range(10)])
@@ -1019,3 +1048,112 @@ def test_the_floor_and_the_verdict_agree_on_the_exact_tolerance_boundary(form_ok
     assert "**PASS**" not in md, (
         f"{facc:.1%} vs {cacc:.1%} published a PASS off 10 questions:\n{md}")
     assert "safe to enable" not in md
+
+
+# --------------------------------------------------------------------------------------
+# Site 8 — #339: `_unmeasured` divides by the ARM, not by the pool.
+#
+# The transport gate's denominator used to be pooled `attempts` (= trials * arm_count), so
+# a single arm could lose over 40% of ITS OWN calls in a two-arm run, or over 80% in a
+# four-arm one, before this fired — the threshold read as "20% of calls" and behaved as
+# "20% of all arms' calls pooled". Fixed to find each arm's own `<arm>_trials` counter and
+# fire when ANY arm alone exceeds `UNMEASURED_FAIL_SHARE` of its own calls.
+# --------------------------------------------------------------------------------------
+
+def test_a_single_arm_losing_30_percent_is_unmeasured_even_though_pooled_reads_15_percent():
+    """Two arms, one loses 30% of its own calls, the other loses none. Pooled that is 15%
+    (under `UNMEASURED_FAIL_SHARE`) — before #339 this model still published."""
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 10,
+        "terse_ok": 10, "terse_trials": 10,           # control: zero loss
+        "diff_ok": 7, "diff_trials": 7,                # form: 30% of ITS calls lost
+        "attempts": 20, "fails": 3,
+    } for i in range(10)]
+    pooled = sum(r["fails"] for r in rows) / sum(r["attempts"] for r in rows)
+    assert pooled == pytest.approx(0.15), f"pooled loss must read 15%, got {pooled:.1%}"
+    assert _unmeasured(rows), "a single arm losing 30% of its own calls must be unmeasured"
+
+
+def test_a_single_arm_of_four_losing_50_percent_is_unmeasured_even_though_pooled_reads_12_5():
+    """Four arms (the payload shape), one loses 50% of its own calls, the other three lose
+    none. Pooled that is 12.5% — before #339 this model still published."""
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 10,
+        "raw_ok": 10, "raw_trials": 10,
+        "terse_ok": 5, "terse_trials": 5,              # 50% of ITS OWN calls lost
+        "primer_ok": 10, "primer_trials": 10,
+        "inline_ok": 10, "inline_trials": 10,
+        "attempts": 40, "fails": 5,
+    } for i in range(10)]
+    pooled = sum(r["fails"] for r in rows) / sum(r["attempts"] for r in rows)
+    assert pooled == pytest.approx(0.125), f"pooled loss must read 12.5%, got {pooled:.1%}"
+    assert _unmeasured(rows), "a single arm losing 50% of its own calls must be unmeasured"
+
+
+def test_loss_spread_evenly_under_the_line_on_every_arm_still_publishes():
+    """The fix must not become 'any loss anywhere': both arms losing 15% of their OWN
+    calls — each individually under `UNMEASURED_FAIL_SHARE` — must stay measured, even
+    though the pooled total (also 15%) is the same shape #339 exists to catch when it
+    concentrates on one arm."""
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 20,
+        "terse_ok": 17, "terse_trials": 17,            # 15% of ITS OWN calls lost
+        "diff_ok": 17, "diff_trials": 17,               # 15% of ITS OWN calls lost too
+        "attempts": 40, "fails": 6,
+    } for i in range(10)]
+    assert not _unmeasured(rows), (
+        "both arms individually under the line must not trip the gate")
+
+
+def test_legacy_rows_with_no_attempts_key_stay_measured_regardless_of_trials():
+    """Rows predating the counters carry neither `attempts` nor `fails`. That is not
+    zero-failures, but it is also not evidence of failure — the absent-counters escape
+    must still short-circuit BEFORE the per-arm ratio is computed, even where the
+    `<arm>_trials` fields would otherwise read as total loss."""
+    rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "transform": "table", "trials": 10,
+        "terse_ok": 10, "terse_trials": 10,
+        "diff_ok": 0, "diff_trials": 0,                 # would read as 100% loss if reached
+    } for i in range(10)]
+    assert not _unmeasured(rows), "the legacy no-`attempts` escape must still apply"
+
+
+def test_an_arm_absent_from_some_rows_is_not_counted_as_loss_on_those_rows():
+    """A collection mode where only SOME rows carry a given arm's counter (`score_pack`'s
+    per-form counts, #91) must not have the missing rows read as 100% loss for that arm —
+    only rows that CARRY the key contribute to its loss/attempts."""
+    rows = (
+        [{"qid": f"has{i}", "qtype": "lookup", "transform": "table", "trials": 10,
+          "terse_ok": 10, "terse_trials": 10,
+          "diff_ok": 10, "diff_trials": 10,             # the arm, fully clean where present
+          "attempts": 20, "fails": 0} for i in range(10)]
+        + [{"qid": f"missing{i}", "qtype": "lookup", "transform": "table", "trials": 10,
+            "terse_ok": 10, "terse_trials": 10,          # no `diff_ok`/`diff_trials` at all
+            "attempts": 10, "fails": 0} for i in range(10)])
+    assert not _unmeasured(rows), (
+        "rows that never carried the diff arm's key must not be read as that arm losing "
+        "every one of them")
+
+
+# --------------------------------------------------------------------------------------
+# Mutation checks (per memory `mutate-the-fix-to-test-the-test`): each mutation below was
+# applied by hand to `_unmeasured` in `report.py` and confirmed to redden the named test
+# before being reverted — not asserted here (there is no hook to mutate source at test
+# time), but recorded so the next person does not have to rediscover which test catches
+# which mutation.
+#
+#   1. revert the per-arm loop to the old pooled `fails / attempts` ratio
+#      -> reddens `test_a_single_arm_losing_30_percent_is_unmeasured_even_though_pooled_
+#         reads_15_percent` and its four-arm sibling (both fixtures are built so pooled
+#         reads under the line and only the per-arm reading catches them).
+#   2. change `lost / arm_attempts > UNMEASURED_FAIL_SHARE` to use `min` instead of a
+#      per-arm `return True` on the first arm over the line (i.e. require ALL arms over
+#      the line rather than ANY)
+#      -> reddens the four-arm 50%-on-one-arm test: the other three arms lose nothing, so
+#         an all-arms-must-agree gate stays quiet where a some-arm-suffices gate must not.
+#   3. flip `lost / arm_attempts > UNMEASURED_FAIL_SHARE` to `>=`
+#      -> reddens `test_a_model_exactly_at_the_loss_share_is_still_measured`
+#         (`tests/test_ship_policy_constants.py`), whose fixture lands the per-arm ratio
+#         exactly on the line for both arms (#337's known weak point, still the boundary
+#         after #339 moved the denominator).
+# --------------------------------------------------------------------------------------

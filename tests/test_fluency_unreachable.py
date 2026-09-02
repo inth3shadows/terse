@@ -102,8 +102,9 @@ def _row(**kw):
 def test_an_unreachable_model_publishes_no_accuracy_at_all():
     """Not a footnoted 0% — no number. A percentage beside a model name is read as
     comprehension however it is annotated."""
-    text = _report({"dead-model": [_row(raw_ok=0, terse_ok=0, primer_ok=0,
-                                        inline_ok=0, fails=4)]})
+    text = _report({"dead-model": [_row(raw_ok=0, terse_ok=0, primer_ok=0, inline_ok=0,
+                                        fails=4, raw_trials=0, terse_trials=0,
+                                        primer_trials=0, inline_trials=0)]})
     assert "| `dead-model` | 1 | n/a | n/a | n/a | n/a | n/a | n/a |" in text
     assert "0%" not in text.split("## Verdict")[0].split("| `dead-model`")[1][:60]
     assert "Not measured" in text and "4/4 calls lost" in text
@@ -118,7 +119,8 @@ def test_a_partially_failing_model_cannot_force_a_regression_verdict():
     terse arms. Gated, that is a worst-model regression and the whole panel returns FAIL on
     a backend that was simply half down."""
     healthy = [_row() for _ in range(20)]                       # 100% everywhere
-    flaky = [_row(raw_ok=1, terse_ok=0, primer_ok=0, inline_ok=0, fails=2) for _ in range(20)]
+    flaky = [_row(raw_ok=1, terse_ok=0, primer_ok=0, inline_ok=0, fails=2,
+                  terse_trials=0, primer_trials=0, inline_trials=0) for _ in range(20)]
     text = _report({"good": healthy, "flaky": flaky})
     verdict = text.split("## Verdict")[1]
     assert "Excluded (too few calls to compare — not measured)" in verdict
@@ -152,7 +154,9 @@ def test_a_healthy_panel_is_unaffected():
 def test_a_healthy_model_is_still_gated_alongside_an_unreachable_one():
     """A broken backend must not take a working model's verdict down with it."""
     text = _report({"good": [_row() for _ in range(20)],
-                    "dead": [_row(raw_ok=0, terse_ok=0, primer_ok=0, inline_ok=0, fails=4)]})
+                    "dead": [_row(raw_ok=0, terse_ok=0, primer_ok=0, inline_ok=0, fails=4,
+                                 raw_trials=0, terse_trials=0, primer_trials=0,
+                                 inline_trials=0)]})
     verdict = text.split("## Verdict")[1]
     assert "NO VERDICT" not in verdict, "one dead model must not void a measured one"
     assert "`dead`" in verdict and "not measured" in verdict

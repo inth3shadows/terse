@@ -453,10 +453,15 @@ def test_a_question_whose_call_failed_is_dropped_from_BOTH_arms_not_scored_wrong
 
     The fix is `paired_rows`' rule (#280), which is stricter than re-basing the denominator:
     a question that did not complete every trial on BOTH arms is excluded outright, because
-    the row counts say how many trials survived, not WHICH."""
-    incomplete = _rows(n=20, answer=0, control=4, trials=4, errors=2)
+    the row counts say how many trials survived, not WHICH.
+
+    `trials=20` (not #269's literal 4) so the 20 errored questions' per-arm loss (#339's
+    per-arm `_unmeasured` share) stays under `UNMEASURED_FAIL_SHARE` and this fixture keeps
+    isolating pairing — `errors=2` per row is still nonzero, which is what pairing acts on,
+    independent of magnitude."""
+    incomplete = _rows(n=20, answer=0, control=20, trials=20, errors=2)
     complete = [dict(r, qid=f"ok{i}") for i, r in
-                enumerate(_rows(n=20, answer=4, control=4, trials=4))]
+                enumerate(_rows(n=20, answer=20, control=20, trials=20))]
     g = _accuracy_gate(incomplete + complete)
     assert [r["qid"] for r in g.rows] == [f"ok{i}" for i in range(20)], (
         "incomplete rows must not be scored")

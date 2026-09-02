@@ -200,11 +200,11 @@ def test_a_model_exactly_at_the_loss_share_is_still_measured():
     control that catches arm-correlated loss.
 
     The fixture is built to land the RATIO exactly on the line, which is the only thing
-    the operator can be observed through. It is deliberately not the scenario
-    `paired_rows`' docstring describes — that one does not reach the boundary at all,
-    because `_unmeasured` divides by total `attempts` across every arm while the docstring
-    reasons about one arm's own calls. Filed separately; see the note beside
-    `UNMEASURED_FAIL_SHARE` in `report.py`.
+    the operator can be observed through. Since #339, `_unmeasured` divides by each arm's
+    OWN `attempts`, the same quantity `paired_rows`' docstring reasons about — so this
+    fixture is built with both arms losing the SAME 20% share, which lands on the line
+    whichever denominator is read. See the note beside `UNMEASURED_FAIL_SHARE` in
+    `report.py`.
 
     So this test does not assert the boundary is in the right place. It asserts that which
     side of it a model falls on is observed by something, because `>` -> `>=` survived a

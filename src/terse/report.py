@@ -149,15 +149,16 @@ def paired_rows(rows: list[dict[str, Any]], *forms: str) -> list[dict[str, Any]]
 # threshold still has to catch is the backend that was substantially down, where the
 # surviving sample is small and self-selected rather than merely smaller.
 #
-# THE DENOMINATOR IS TOTAL `attempts`, ACROSS EVERY ARM — not one arm's own calls. Every
-# emitter sets `attempts = trials * <arm count>` (2 for the diff/codec harnesses, 4 for
-# the payload one), so a single arm can lose over 40% of ITS calls in a two-arm run, or
-# over 80% in a four-arm one, before this fires. `paired_rows`' docstring below works
-# through "one of five question types lost" and calls it "20.0% of the arm — on the
-# threshold": true of the arm, but it reaches this gate as 10% of attempts, nowhere near
-# the line. The conclusion there still holds (the gate stays quiet, and `paired_rows` is
-# what catches it) — the arithmetic offered for it does not. Tracked separately; do not
-# reason about this gate's permissiveness from that paragraph.
+# THE DENOMINATOR IS PER ARM (#339), NOT POOLED ACROSS EVERY ARM. `_unmeasured` finds each
+# arm's own `<arm>_trials` counter, sums `trials - <arm>_trials` over the rows that carry
+# that key for that arm's loss, and `trials` over the same rows for that arm's attempts —
+# then fires if ANY single arm exceeds `UNMEASURED_FAIL_SHARE` of its own calls. Before
+# #339 the denominator was pooled `attempts` (= trials * arm_count), which let a single
+# arm lose over 40% of ITS calls in a two-arm run, or over 80% in a four-arm one, before
+# this fired — the threshold read as "20% of calls" and behaved as "20% of all arms'
+# calls pooled". `paired_rows`' docstring below works through "one of five question types
+# lost" and calls it "20.0% of the arm — on the threshold": that arithmetic is now what
+# this gate itself computes, not a separate concern it stays quiet about.
 #
 # Value and the strictness of the comparison are pinned by
 # `test_a_model_exactly_at_the_loss_share_is_still_measured` (#337): `>` -> `>=` survived
@@ -168,10 +169,19 @@ UNMEASURED_FAIL_SHARE = 0.20
 #
 # The bug: `paired_rows` voids a whole ROW when either arm loses one trial of it, so loss
 # is amplified from the call level to the question level. At three trials an arm, one lost
-# call per question is 16.7% of the calls — under `UNMEASURED_FAIL_SHARE` — and 100% of the
-# questions. `_unmeasured` stayed quiet, nothing was left to compare, both arms scored a
-# flat 0.0 with an SE of 0.0, and the HTML banner rendered a green PASS reading `+0% ±0pt`:
-# maximum confidence from no evidence at all.
+# call per question is 16.7% of the calls pooled — under `UNMEASURED_FAIL_SHARE` at the time
+# — and 100% of the questions. `_unmeasured` stayed quiet, nothing was left to compare, both
+# arms scored a flat 0.0 with an SE of 0.0, and the HTML banner rendered a green PASS reading
+# `+0% ±0pt`: maximum confidence from no evidence at all.
+#
+# NOTE post-#339: if every question loses one of the SAME arm's trials (as in this
+# paragraph's example, repeated across the whole set), that arm's own share is 33.3%, not
+# 16.7%, and the per-arm `_unmeasured` trigger now catches it before pairing does — this
+# paragraph is describing the pre-#339 gate that made the bug reachable, not today's. The
+# case this file's fixtures still need (and still reach the pairing floor without tripping
+# `_unmeasured`) is more trials per arm with the SAME one-lost-trial-per-row shape, which
+# dilutes the per-arm share under the line while still voiding every row — see
+# `_pairing_wipeout_rows`.
 #
 # The first fix withheld any model under a `PAIRED_KEEP_SHARE = 0.50` survival floor. Review
 # killed it, and the reason is worth keeping because it inverts the intuition: the rows that
@@ -199,16 +209,24 @@ UNMEASURED_FAIL_SHARE = 0.20
 def _unmeasured(rows: list[dict]) -> bool:
     """True when transport failures make this model's numbers untrustworthy.
 
-    Two independent triggers, because they fail differently:
+    THREE independent triggers, because they fail differently:
       1. any arm with ZERO completed trials — that arm cannot be computed at all, and
          `_form_stats` would report it as a flat 0.0 indistinguishable from real failure;
-      2. more than `UNMEASURED_FAIL_SHARE` of calls lost — the sample that survived is
-         both small and selected by which calls happened to get through.
+      2. more than `UNMEASURED_FAIL_SHARE` of ONE arm's own calls lost (#339) — the sample
+         that survived is both small and selected by which calls happened to get through,
+         and the share has to be read against that arm's own denominator or a loss
+         concentrated on one arm hides behind the others' clean numbers;
+      3. the pooled fallback: more than `UNMEASURED_FAIL_SHARE` of TOTAL `attempts` lost.
+         Needed because not every harness's `<arm>_trials` shrinks on a failed call —
+         `codeceval.py` deliberately keeps it FIXED at `trials` and tracks loss only
+         through `fails`/`attempts` (see its module docstring), so trigger 2 alone is
+         permanently blind to that harness and a substantially-down codec backend would
+         publish a confident SAFE. Review finding on #339 (verified by execution:
+         `codec_verdict` returned SAFE at 68% call-loss without this trigger).
     """
     if not rows:
         return False
     attempts = sum(int(r.get("attempts", 0)) for r in rows)
-    fails = sum(int(r.get("fails", 0)) for r in rows)
     if not attempts:
         # Rows predating the counters (older result files) carry neither key. Absent is
         # not zero-failures, but it is also not evidence of failure — treat as measured,
@@ -218,10 +236,34 @@ def _unmeasured(rows: list[dict]) -> bool:
     # raw/terse/primer/inline; the diff harnesses emit terse/diff. A fixed list would
     # silently skip every arm it did not name — which is how the diff-side report kept
     # publishing a verdict off a dead backend after the payload side stopped.
-    for key in sorted({k for r in rows for k in r if k.endswith("_trials")}):
+    arm_keys = sorted({k for r in rows for k in r if k.endswith("_trials")})
+    for key in arm_keys:
         if sum(int(r.get(key, 0)) for r in rows) == 0:
             return True
-    return fails / attempts > UNMEASURED_FAIL_SHARE
+    fails = sum(int(r.get("fails", 0)) for r in rows)
+    if fails / attempts > UNMEASURED_FAIL_SHARE:
+        return True
+    # #339: the threshold is documented and tested as a share of ONE arm's own calls, not
+    # of every arm's calls pooled. Dividing by pooled `attempts` (= trials * arm_count) let
+    # a single arm lose over 40% of its own calls in a two-arm run, or over 80% in a
+    # four-arm one, before this fired — see `UNMEASURED_FAIL_SHARE`'s comment. Only rows
+    # that CARRY both an arm's key AND `attempts` count toward that arm's loss/attempts —
+    # matching `paired_rows`' own per-row `"attempts" not in r` escape — so a row belonging
+    # to a collection mode that never calls a backend (`score_pack`, #91, no `attempts` key
+    # at all) contributes nothing either way, even when merged into a row set that also has
+    # `attempts`-carrying rows (review finding on #339: checking only `key in r` let one
+    # such merged row swing the whole model to withheld with zero calls actually lost).
+    for key in arm_keys:
+        carrying = [r for r in rows if key in r and "attempts" in r]
+        if not carrying:
+            continue
+        arm_attempts = sum(int(r.get("trials", 1)) for r in carrying)
+        if not arm_attempts:
+            continue
+        lost = sum(max(0, int(r.get("trials", 1)) - int(r[key])) for r in carrying)
+        if lost / arm_attempts > UNMEASURED_FAIL_SHARE:
+            return True
+    return False
 
 
 # Why a gap is never computed from two bare `_form_stats` calls again (#280).
@@ -505,14 +547,23 @@ def exclusion_note(reasons: Mapping[str, ExclusionReason | None]) -> str:
 def unmeasured_cause(fails: int) -> str:
     """The cause-and-remedy sentence for an `"unmeasured"` exclusion, CHOSEN BY THE COUNTS.
 
-    `"unmeasured"` has THREE producers, not the two every prose site named before #338:
+    `"unmeasured"` has FOUR producers now (#339 split the old trigger 2 in two), not the
+    two every prose site named before #338:
 
       1. `_unmeasured` trigger 1 — an arm whose `<form>_trials` sum to ZERO. It never ran,
          or a merged/replayed pack carries rows that lack its key. Fires at `fails == 0`.
-      2. `_unmeasured` trigger 2 — loss share over `UNMEASURED_FAIL_SHARE`. Always `fails > 0`.
-      3. `_gap`'s `not pr` — the calls landed but left no question complete on both arms.
+      2. `_unmeasured` trigger 2 — pooled loss share over `UNMEASURED_FAIL_SHARE`. Always
+         `fails > 0` (it IS `fails / attempts`).
+      3. `_unmeasured` trigger 3 (#339) — ONE arm's own loss share over
+         `UNMEASURED_FAIL_SHARE`, read from `trials - <arm>_trials`, independent of
+         `fails`. NOT guaranteed `fails > 0`: a harness whose `<arm>_trials` reflects real
+         loss but whose `fails` counter undercounts it (a coupling nothing enforces — see
+         the caution on `_unmeasured` above) would fire this trigger while `fails == 0`,
+         which would wrongly render this function's zero-loss branch below. No known
+         harness does this today; flagged as a maintenance trap, not a live bug.
+      4. `_gap`'s `not pr` — the calls landed but left no question complete on both arms.
 
-    #332 hedged the prose across (2) and (3) — "either too many calls went unanswered, or
+    #332 hedged the prose across (2)/(3) and (4) — "either too many calls went unanswered, or
     enough of them did that no question completed on BOTH arms". Both disjuncts name lost
     calls, so the hedge is FALSE for (1), which is reachable with nothing lost at all: the
     #338 reproduction renders `(0/36 calls lost)` and a sentence asserting calls went
