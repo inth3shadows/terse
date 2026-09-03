@@ -15,6 +15,49 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **A scope flag that does not apply to the active scope is now refused, not silently
+  ignored** (`#366`). `resolve_target` read `--file` only for `--scope project` and
+  `--repo-path` only for `--scope local`, dropping either one elsewhere without a word. So
+  `install-mcp kb --file /tmp/x.json` — at the **default** scope, which is `user` — named
+  one file, created no `/tmp/x.json`, and rewrote `~/.claude.json` instead. The behaviour
+  was documented (`--file` was helped as "--scope project: …"), which is what made it
+  dangerous rather than merely surprising: a flag that accepts a path, ignores it, and
+  writes somewhere else reads as correct right up until it isn't.
+
+  Not theoretical. It fired while developing `#277`'s own tests, rewriting a live router's
+  `command` to a pytest temp binary that pytest then deleted — killing that router and
+  every peer behind it until it was noticed and repaired by hand. The symptom is a server
+  with no tools, days later: precisely the failure class `#277` exists to disclose.
+
+  Both flags now raise at `resolve_target`, naming the scope they belong to **and the
+  concrete consequence of ignoring them**, which is the half that conveys the danger:
+
+  ```
+  install-mcp: --file applies only to --scope project, but this is --scope user.
+  Ignoring it would have written /home/u/.claude.json instead of the file --file names —
+  pass --scope project, or drop --file.
+  ```
+
+  The consequence is spelled per flag, because the two do not name the same kind of thing:
+  `--file` names a write **target**, while `--repo-path` names a **key inside** one — user
+  and local scope write the same physical file, differing only in whether the entry lands
+  at the top level or under `projects.<key>`. A single shared template got that wrong in
+  half the four mismatch pairs, printing a literal `?` at project scope and, at user scope,
+  asserting a difference between two identical paths.
+
+  `install-mcp` and `uninstall-mcp` both exit 2. An empty value counts as passed —
+  `--file "$CFG"` with an unset `$CFG` is the shell foot-gun that produces this — so the
+  check is `is not None`, not truthiness. `mcp-status` is unaffected: it has no `--scope`
+  and scans every scope, calling `resolve_target` once per scope with only that scope's
+  own flag, which is why the check lives where scope and flag are both known rather than
+  in argument parsing. A 9-mutation sweep leaves no survivors, including one per message
+  branch — the placeholder arm had survived the first sweep because only the
+  `--file`/user pair was ever exercised.
+
+## [0.30.4] - 2026-09-03
+
+### Fixed
+
 - **`install-mcp --print` did not disclose that it was CHANGING an existing command**
   (`#277`, the second ask of `#275`). The dry-run rendered a `before:`/`after:` pair per
   server, but three shapes of change were invisible in it. An **already-folded peer**

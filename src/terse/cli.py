@@ -2045,9 +2045,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="MCP config scope (#58): user = ~/.claude.json top-level "
                          "(default), project = a .mcp.json file, local = this repo's "
                          "nested block in ~/.claude.json")
-    im.add_argument("--file", help="--scope project: path to the .mcp.json to wrap "
-                                   "(default: ./.mcp.json)")
-    im.add_argument("--repo-path", help="--scope local: the projects.<repo-path> key "
+    im.add_argument("--file", help="REQUIRES --scope project: path to the .mcp.json to "
+                                   "wrap (default: ./.mcp.json). Rejected at any other "
+                                   "scope rather than ignored (#366)")
+    im.add_argument("--repo-path", help="REQUIRES --scope local: the "
+                                        "projects.<repo-path> key "
                                         "to wrap inside ~/.claude.json (default: "
                                         "resolved via `git rev-parse --git-common-dir`, "
                                         "the bare-repo root for claudew/codexw worktrees)")
@@ -2099,9 +2101,11 @@ def main(argv: list[str] | None = None) -> int:
     um.add_argument("--all", action="store_true", help="restore every terse-managed server")
     um.add_argument("--scope", choices=("user", "project", "local"), default="user",
                     help="MCP config scope to restore (#58) — see install-mcp --scope")
-    um.add_argument("--file", help="--scope project: path to the .mcp.json to restore "
-                                   "(default: ./.mcp.json)")
-    um.add_argument("--repo-path", help="--scope local: the projects.<repo-path> key "
+    um.add_argument("--file", help="REQUIRES --scope project: path to the .mcp.json to "
+                                   "restore (default: ./.mcp.json). Rejected at any "
+                                   "other scope rather than ignored (#366)")
+    um.add_argument("--repo-path", help="REQUIRES --scope local: the "
+                                        "projects.<repo-path> key "
                                         "to restore (default: resolved via git)")
     um.add_argument("--print", action="store_true",
                     help="dry-run: show what would be restored without writing")
