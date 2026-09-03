@@ -15,6 +15,51 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **`fetch_corpus.sh` overwrote the committed snapshot in place, so a measurement taken
+  after a re-fetch was unreproducible** (`#341`). The script's own header states the
+  invariant — "the committed corpus/ snapshot is what the published numbers were measured
+  on" — and then broke it silently: no cleanliness check, and a closing `wc -c` that
+  reported byte sizes without ever saying whether anything had MOVED relative to `HEAD`.
+  Eight of the nine payloads come from live endpoints (`pulls`, `issues`, `commits`,
+  `actions/runs`, `labels`, `contents`, the repo object, `rate_limit`) that return
+  different content week to week, and a run left the working tree holding un-committed API
+  output that `terse measure --corpus`, `benchmark.py` and
+  `tests/test_published_benchmarks.py` would all happily measure — the last of those
+  compares the docs against a live re-measurement, so on a dirty tree it measured content
+  that never entered git. That is not hypothetical: `#293` was investigated off figures —
+  `#249`'s — recording 491 tokens for `gh_rate_limit.json`, a file byte-identical since
+  `267af9e` (2026-07-17) that measures 357 today. Identical bytes cannot produce different
+  counts. A dirty tree explains the **eight** payloads this script writes; it does not
+  explain `gh_commits_flat.json`, which moved in the same table and has no producer in the
+  repo at all. Something else is also in play there — this closes the half that is ours.
+
+  The script now refuses to run when `corpus/` is dirty relative to `HEAD` — untracked
+  payloads included, since anything sitting in that directory is measured by everything
+  that globs it — and names what is dirty. `--force` overrides and says that it did. The
+  check runs **before** the first API call, so a refusal is a guard rather than a report.
+  After a fetch the run states its own outcome: `identical to HEAD` when nothing moved, or
+  the changed files (porcelain status **and** diffstat, because `--stat` cannot see an
+  untracked file) plus the reason it matters. Neither guard changes what is fetched.
+
+  A `gh` that dies partway — expired token, 403 rate limit — used to abort under `set -e`
+  before any report, leaving some payloads on today's API content, one truncated to zero
+  bytes by its own redirect, and the rest on the committed content: a tree in a state that
+  never existed at any point in time, and the ONE path where the script said nothing. The
+  report now runs from an `EXIT` trap, so the failure path is the loudest rather than the
+  quietest. The refusal's remedy also prints both `restore --source=HEAD --staged
+  --worktree` and `clean -fd`, because `restore` alone fixes neither a staged change nor
+  an untracked payload and exits 0 regardless — the guard used to repeat itself verbatim
+  with `--force` as the only way out.
+
+  Pinned by `tests/test_fetch_corpus_guard.py` — the first test in this repo to execute a
+  shell script, running it against a throwaway git checkout with stubbed `gh`/`jq`, so
+  nothing reaches the network. One test runs the printed remedy verbatim and requires the
+  next invocation to proceed. A 19-mutation sweep over the script leaves no survivors.
+
+## [0.30.2] - 2026-09-03
+
+### Fixed
+
 - **The `regressions` and `recovered` columns divided by a denominator none of the
   accuracies beside them use** (`#353`). Both compared `<arm>_ok` to the row's shared
   `trials`, which for a `score_pack` row is `max(...)` across forms (`fluency/pack.py`) —
