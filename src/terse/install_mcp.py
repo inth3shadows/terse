@@ -1301,7 +1301,33 @@ def _install_multiproxy(target, config: dict, full_stash: dict, stash: dict, nod
             f"and the router entry is written over rather than stashed — folding here "
             f"would destroy it with nothing to restore from. Pick another name with "
             f"--router-name.")
-    before = {s: (node.get("mcpServers") or {}).get(s) for s in servers}
+    # A peer folded by an EARLIER run has no live entry by construction — it lives in the
+    # peers file — so reading only `mcpServers` reported `before: (absent)` for it, and a
+    # re-run that rewrites its launcher showed nothing changing at all (#277). The peers
+    # file IS its before-state, so read it from there and say which source it came from.
+    folded_now_spec = {d["name"]: d for d in peers_downstreams(existing_peers)}
+    before, before_source = {}, {}
+    for s in servers:
+        live = (node.get("mcpServers") or {}).get(s)
+        # `_entry_from_peer_spec` is the EXISTING inverse of `_peer_spec` (used by the
+        # partial-restore path), not a second one written for this. A first cut added a
+        # near-duplicate that dropped `env`/`cwd` and had no type guard on `command[0]`,
+        # so a hand-edited peers file raised TypeError out of the renderer and aborted
+        # `--print` after one line (#277 review). This one returns None for a record that
+        # cannot launch anything, which is the case below.
+        rebuilt = _entry_from_peer_spec(folded_now_spec[s]) if s in folded_now_spec else None
+        if live is not None:
+            before[s], before_source[s] = live, "config"
+        elif rebuilt:
+            before[s], before_source[s] = rebuilt, "peers-file"
+        else:
+            # Including a folded peer whose record is malformed. Claiming `(from peers
+            # file)` beside an `(absent)` value would assert a provenance for a value that
+            # was never recovered.
+            before[s], before_source[s] = None, "absent"
+    # The router's own command changes on every re-run that picks a different launcher,
+    # and `--print` rendered only the NEW value with no `before:` counterpart at all.
+    router_before = (node.get("mcpServers") or {}).get(current_router or router)
     # The router honors every runtime flag `wrap` bakes onto a single-server entry —
     # `terse proxy` accepts them with `--config` too — so they must ride along here or
     # `--capture-dir`/`--no-stats`/`--diff` would be silently dropped by the very switch
@@ -1328,6 +1354,7 @@ def _install_multiproxy(target, config: dict, full_stash: dict, stash: dict, nod
                                  router=router, peers_file=peers_file,
                                  proxy_opts=proxy_opts, existing_peers=existing_peers)
     changes: list[dict] = [{"server": s, "before": before[s], "after": None,
+                            "before_source": before_source[s],
                             "preserved": [], "folded_into": router} for s in servers]
     fleet = [d.get("name") for d in peers_doc["downstreams"]]
     result = {"config": str(target.cfg), "scope": scope, "policy": policy_abs,
@@ -1340,7 +1367,8 @@ def _install_multiproxy(target, config: dict, full_stash: dict, stash: dict, nod
               "diff": effective["diff"], "no_stats": effective["no_stats"],
               "never_lossy_added": [], "multiproxy": True, "router": router,
               "launcher": " ".join(terse_cmd), "launcher_skew": launcher_skew(terse_cmd),
-              "router_entry": node["mcpServers"][router], "peers_file": peers_file,
+              "router_entry": node["mcpServers"][router], "router_before": router_before,
+                            "peers_file": peers_file,
               "peers": peers_doc, "fleet": fleet,
               # The permission rewrite covers the WHOLE fleet, not just this run's
               # servers: a peer folded in by an earlier run keeps needing its

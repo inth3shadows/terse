@@ -1383,9 +1383,10 @@ def _redact_args(args: list) -> list:
     return out
 
 
-def _short_cmd(entry) -> str:
+def _full_cmd(entry) -> str:
+    """The whole rendered command, untruncated. `_short_cmd` is the display form."""
     if not entry:
-        return "(absent)"
+        return ""
     if "url" in entry:
         # A url/headers-shaped entry (#5 HTTP downstream) has no "command"/"args" at
         # all — falling through to entry.get("command", "?") used to print just "?",
@@ -1393,9 +1394,67 @@ def _short_cmd(entry) -> str:
         parts = [entry.get("url", "?")]
         for k, v in (entry.get("headers") or {}).items():
             parts += ["--header", _redact_header_value(f"{k}={v}")]
-        return " ".join(parts)[:100]
-    args = _redact_args(entry.get("args", []))
-    return " ".join([entry.get("command", "?"), *args])[:100]
+        return " ".join(parts)
+    # `str()` every token. A hand-edited config or peers file can hold a non-string
+    # `command` (a nested list, a number), and `" ".join` raised TypeError on it — which
+    # aborted `--print` after one line, destroying the whole disclosure on exactly the
+    # malformed state where the operator most needs it. `peers_downstreams` validates only
+    # `name` and its docstring is explicit that malformed entries are expected input.
+    # Coerce BEFORE redaction, not after: `_redact_args` splits each token on "=", so a
+    # non-string reaches `.split` and raises there instead. Both halves have to be
+    # string-safe or the crash just moves one frame.
+    args = _redact_args([str(a) for a in (entry.get("args") or [])])
+    return " ".join(str(t) for t in [entry.get("command", "?"), *args])
+
+
+def _short_cmd(entry, limit: int = 100) -> str:
+    if not entry:
+        return "(absent)"
+    full = _full_cmd(entry)
+    # Mark the cut. A bare slice ended mid-token and read as the whole value, so a reader
+    # diffing two `before:`/`after:` lines by eye could not tell a short command from a
+    # truncated one (#277).
+    return full if len(full) <= limit else full[:limit - 1] + "…"
+
+
+def _entry_change_lines(before, after, indent: str = "    ") -> list[str]:
+    """The explicit statement of WHAT changed, for the fields whose change is both
+    invisible in a truncated pair and fatal (#277).
+
+    A bad launcher means the client cannot spawn the entry, the server appears with no
+    tools, and nothing says why — days later. That is the whole reason #275 was hard to
+    diagnose. Saying "this used to be X" costs one line and removes the diagnosis.
+
+    `args` is on this list too, and the issue's framing that `command` is "the one field
+    whose change is both invisible and fatal" is wrong (#277 review). A moved `--policy`
+    path exits 2 at spawn — `proxy: [Errno 2] No such file or directory` — which reaches
+    the operator as the identical symptom, a server with no tools. It is also MORE likely
+    to be hidden than the command: the launcher sits at the head of the rendered line and
+    the policy path sits past the 100-char cut, so a before/after pair can be
+    byte-identical on screen while the policy moved. Rendered as the differing tokens
+    rather than two whole arg lists, since the lists are long and mostly identical."""
+    if not before or not after:
+        return []
+    lines = []
+    for field, label in (("command", "command"), ("url", "url")):
+        old, new = before.get(field), after.get(field)
+        if old is not None and new is not None and old != new:
+            lines += [f"{indent}{label} CHANGED — the client spawns a different "
+                      f"target than before:",
+                      f"{indent}  from: {old}",
+                      f"{indent}  to:   {new}"]
+    # Coerced, for the same reason `_full_cmd` coerces: `_redact_args` splits each token.
+    old_args = _redact_args([str(a) for a in (before.get("args") or [])])
+    new_args = _redact_args([str(a) for a in (after.get("args") or [])])
+    if old_args != new_args:
+        moved = [(o, n) for o, n in zip(old_args, new_args, strict=False) if o != n]
+        lines.append(f"{indent}args CHANGED — a bad path here fails at spawn exactly "
+                     f"like a bad launcher:")
+        for o, n in moved:
+            lines += [f"{indent}  from: {o}", f"{indent}  to:   {n}"]
+        if len(old_args) != len(new_args):
+            lines.append(f"{indent}  ({len(old_args)} arg(s) -> {len(new_args)})")
+    return lines
 
 
 def _cmd_install_mcp(args: argparse.Namespace) -> int:
@@ -1419,14 +1478,28 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
     tag = "[dry-run] would wrap" if res["dry_run"] else "wrapped"
     for c in res["changes"]:
         print(f"{tag} {c['server']}:")
-        print(f"    before: {_short_cmd(c['before'])}")
+        # Say WHERE the before-state came from when it is not the live config. A peer
+        # folded by an earlier run legitimately has no standalone entry, and rendering
+        # that as a bare `(absent)` made a launcher rewrite on it look like a first-time
+        # install rather than a change (#277).
+        via = " (from peers file)" if c.get("before_source") == "peers-file" else ""
+        print(f"    before:{via} {_short_cmd(c['before'])}")
         print(f"    after:  {_short_cmd(c['after'])}")
+        for line in _entry_change_lines(c["before"], c["after"]):
+            print(line)
         if c.get("preserved"):
             print(f"    kept hand-edited key(s) from the live entry: "
                   f"{', '.join(c['preserved'])} (note: uninstall restores the "
                   f"pre-terse original, which does NOT carry them)")
     if res.get("multiproxy"):
-        print(f"\nrouter: {res['router']}  ->  {_short_cmd(res['router_entry'])}")
+        # A before/after pair like any other change. This printed the NEW value alone, so
+        # a re-run that rewrote the router's launcher — the entry every folded peer is
+        # reached through — showed nothing changing (#277).
+        print(f"\nrouter: {res['router']}")
+        print(f"    before: {_short_cmd(res.get('router_before'))}")
+        print(f"    after:  {_short_cmd(res['router_entry'])}")
+        for line in _entry_change_lines(res.get("router_before"), res["router_entry"]):
+            print(line)
         print(f"peers:  {res['peers_file']}  ({len(res['peers']['downstreams'])} peer(s): "
               f"{', '.join(d['name'] for d in res['peers']['downstreams'])})")
         print("\npermission entries to update — the SERVER segment changes for every "
