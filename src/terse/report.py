@@ -197,19 +197,48 @@ def paired_rows(rows: list[dict[str, Any]], *forms: str) -> list[dict[str, Any]]
     `test_an_uneven_score_pack_still_publishes`,
     `test_a_real_uneven_score_pack_with_counters_still_publishes` and
     `test_an_arm_collected_for_only_some_questions_cannot_publish_against_a_full_control`."""
-    keys = [f[:-3] + "_trials" if f.endswith("_ok") else f for f in forms]
-    # Which of the requested arms this run collected anything for at all. Computed over the
-    # whole row set because that is the only place the fact exists — see the docstring.
-    collected = {k for k in keys if arm_measured(rows, k)}
-    out = []
+    return _paired_partition(rows, forms)[0]
+
+
+def _trials_keys(forms: tuple[str, ...]) -> list[str]:
+    """`("terse_ok",)` -> `["terse_trials"]`. The one place that mapping is written."""
+    return [f[:-3] + "_trials" if f.endswith("_ok") else f for f in forms]
+
+
+def _collected_arms(rows: list[dict[str, Any]], keys: list[str]) -> set[str]:
+    """Which of these arms the run collected anything for at all — the run-level fact
+    `_paired_arm` needs to tell an ABSENT arm from a LOST question.
+
+    One computation, two callers (`_paired_partition` and `attrition`), because the
+    invariant that every excluded row has a losing arm holds only while they agree. Two
+    copies is a divergence no fixture without a zero-attempt arm can produce: replacing
+    `attrition`'s copy with `set()` survived 383 tests. Pinned by
+    `test_attrition_and_the_pairing_share_one_collected_arms_fact`."""
+    return {k for k in keys if arm_measured(rows, k)}
+
+
+def _paired_partition(rows: list[dict[str, Any]],
+                      forms: tuple[str, ...]) -> tuple[list[dict[str, Any]],
+                                                       list[dict[str, Any]]]:
+    """`(kept, dropped)` under `paired_rows`' rule — the body of `paired_rows` itself.
+
+    Split out so `attrition` can report WHICH rows the pairing removed without a second
+    implementation of the rule. Every escape here (an absent `attempts`, an absent
+    `<arm>_trials`, the run-level `collected` fact) is a reason a row is NOT evidence of
+    loss, and a reporter that re-derived them would be free to disagree with the pairing it
+    claims to describe. Pinned by `test_attrition_excludes_exactly_what_pairing_drops`."""
+    keys = _trials_keys(forms)
+    collected = _collected_arms(rows, keys)
+    kept: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
     for r in rows:
         t = int(r.get("trials", 1))
         if "attempts" not in r:
-            out.append(r)
+            kept.append(r)
             continue
-        if all(_paired_arm(r, k, t, k in collected) for k in keys):
-            out.append(r)
-    return out
+        (kept if all(_paired_arm(r, k, t, k in collected) for k in keys)
+         else dropped).append(r)
+    return kept, dropped
 
 
 def _paired_arm(r: dict[str, Any], trials_key: str, trials: int, collected: bool) -> bool:
@@ -223,6 +252,169 @@ def _paired_arm(r: dict[str, Any], trials_key: str, trials: int, collected: bool
     if a == 0:
         return not collected
     return int(r.get(trials_key, trials)) == a
+
+
+class Attrition(NamedTuple):
+    """What `paired_rows` removed, and how it was distributed (#299).
+
+    Pairing makes the surviving arms COMPARABLE; it does not make the selection
+    IGNORABLE. Which questions survive is decided by the arm most likely to fail, and
+    that arm is not random — dropeval's treatment runs two turns to the control's one,
+    fluency's longest prompts are also its hardest questions. A run that loses its five
+    hardest questions from one arm and none from the other still produces a perfectly
+    paired comparison over the twenty easy ones, reports a tiny gap with a tight
+    interval, and is wrong. Nothing in the reports said so, because `paired_rows`
+    excludes silently.
+
+    This is the measurement of that hazard, not a fix for it: the fields say how much
+    was excluded, whether exclusion differed BY ARM, and whether it concentrated in one
+    QUESTION KIND. The last is the signal: `codeceval`'s module docstring records that
+    comprehension failures CONCENTRATE in the `deref` question, so an exclusion that
+    lands there removes the discriminating questions from the exam. No stronger claim
+    is available — nothing in the repo publishes a per-qtype result, which is the same
+    ignorance this reporting exists to end.
+
+      excluded/total  the rows `paired_rows` dropped, out of those considered.
+      by_arm          form -> rows this arm failed to complete. These sum to MORE than
+                      `excluded` when one row was lost by several arms, so they are a
+                      per-arm attribution, NOT a partition of `excluded`.
+      by_kind         kind -> (excluded, total). The denominator is carried because the
+                      concentration is what matters: "deref 5/5" beside "count 0/6"
+                      reads instantly and a bare "deref 5" does not.
+    """
+
+    total: int
+    excluded: int
+    by_arm: dict[str, int]
+    by_kind: dict[str, tuple[int, int]]
+
+
+def attrition(rows: list[dict[str, Any]], *forms: str, kind_key: str = "qtype") -> Attrition:
+    """Which rows `paired_rows(rows, *forms)` removed, attributed by arm and by kind.
+
+    The excluded SET comes from `_paired_partition` — the same call `paired_rows` makes
+    — so this cannot report an exclusion the pairing did not perform, or miss one it did.
+    Only the ATTRIBUTION is computed here, and it re-reads `_paired_arm` per arm rather
+    than guessing from the counters.
+
+    `kind_key` is `"qtype"` for the fluency harnesses and `"kind"` for dropeval. A row
+    that carries neither is filed under `"?"` rather than dropped: an unlabelled question
+    still left the paired subset, and silently omitting it would understate the very
+    total this exists to publish."""
+    kept, dropped = _paired_partition(rows, forms)
+    keys = _trials_keys(forms)
+    collected = _collected_arms(rows, keys)
+    by_arm = {}
+    for form, key in zip(forms, keys, strict=True):
+        # Attributed over the DROPPED rows only. Counting every row that lost a call
+        # would fold in the rows that survived pairing anyway (an arm can lose a trial of
+        # a row another escape keeps), which is a different quantity from "who removed
+        # these questions".
+        lost = sum(1 for r in dropped
+                   if not _paired_arm(r, key, int(r.get("trials", 1)), key in collected))
+        if lost:
+            by_arm[form] = lost
+    by_kind: dict[str, tuple[int, int]] = {}
+    for r in rows:
+        k = str(r.get(kind_key, "?"))
+        exc, tot = by_kind.get(k, (0, 0))
+        by_kind[k] = (exc, tot + 1)
+    for r in dropped:
+        k = str(r.get(kind_key, "?"))
+        exc, tot = by_kind[k]
+        by_kind[k] = (exc + 1, tot)
+    return Attrition(len(rows), len(dropped), by_arm, by_kind)
+
+
+# The reading rule for every rendered `Attrition`, written once so the fluency and
+# dropeval reports cannot state it two different ways. It asserts NO conclusion — a
+# threshold picked before a real run has been looked at would be a number invented
+# rather than measured (#299 asks for visibility first, a design change second).
+ATTRITION_NOTE = (
+    "The arm NAMED is the arm that LOST the question, and it is the one the exclusion "
+    "flatters: the questions it could not answer leave the exam for every arm, so the "
+    "gap above is measured over whatever it managed to survive. Concentration in one arm "
+    "or one kind therefore means the paired subset was selected, and selected in the "
+    "named arm's favour; a flat spread is what infrastructure failure looks like and "
+    "leaves the survivors an approximately random sample. Per-arm counts can exceed the "
+    "excluded total — one question can be lost by several arms."
+)
+
+
+# dropeval's arms are asymmetric BY DESIGN, so the generic note above would be read
+# backwards there. `run_drop_payload` deliberately emits no `answer_trials` for the
+# treatment: a failed treatment call stays in its denominator and is scored a MISS, because
+# removing it turned a 33% recall FAIL into a 100% PASS at an 11% error rate (#300). With no
+# per-arm denominator, `_paired_arm` is unconditionally True for `answer_ok`, so the pairing
+# can only ever exclude on the CONTROL side — `by arm: control_ok` is a property of the
+# emitter, not evidence the control was the fragile arm. Both failure modes are executed:
+# a run whose treatment lost every call and whose control lost none reports `excluded 0` and
+# renders nothing at all, and a run where BOTH arms lost everything attributes 100% of the
+# exclusion to the control. Found by review, not by the first cut of the tests.
+DROPEVAL_ATTRITION_NOTE = (
+    "Read the ARMS here asymmetrically. dropeval's treatment carries no per-arm denominator "
+    "by design — a failed treatment call is scored a MISS, not excluded — so the pairing can "
+    "only ever exclude on the CONTROL side, and `control_ok` appearing alone is a property "
+    "of that design rather than evidence the control was the fragile arm. The treatment's "
+    "own losses are the `treatment` count here and the split in **Where they failed** above; "
+    "read the two together, never the exclusion alone. Concentration by KIND is read as "
+    "usual: it means the paired exam kept the easy questions, whichever arm removed the "
+    "hard ones."
+)
+
+
+# `--no-control` is a live flag, and `run_drop_payload` then emits no `control_ok` /
+# `control_trials` at all. The note above explains why exclusion can only land on the
+# CONTROL side and points at a **Where they failed** split — both meaningless for a run
+# with no control arm, and the second is a markdown-only section that does not exist in
+# the two-line terminal chart at all. Moving the attrition above the terminal's
+# `v.inconclusive` return made that prose newly reachable there, so the choice is made
+# from the rows rather than assumed.
+NO_CONTROL_ATTRITION_NOTE = (
+    "This run had NO control arm (`--no-control`), so there is no pairing to be selected "
+    "and no exclusion to attribute: the count above is the treatment's own lost calls, "
+    "scored as misses. A drop verdict from this run compares the treatment against a "
+    "fixed ideal rather than a measured no-drop arm — see `#269` for why that is the "
+    "weaker claim."
+)
+
+
+def dropeval_attrition_note(results: Mapping[str, list[dict[str, Any]]]) -> str:
+    """Which reading rule this run's attrition gets. See `NO_CONTROL_ATTRITION_NOTE`."""
+    # The KEY's presence, not `arm_measured`: that helper answers True for an absent
+    # counter on purpose (an unknown arm is not a failed one), so it cannot tell a control
+    # that ran from one that was never asked. `run_drop_payload` emits `control_ok` only
+    # under `control=True`, which is exactly the fact needed here.
+    ran_control = any("control_ok" in r for rows in results.values() for r in rows)
+    return DROPEVAL_ATTRITION_NOTE if ran_control else NO_CONTROL_ATTRITION_NOTE
+
+
+def attrition_line(label: str, a: Attrition, *, always: bool = False) -> str:
+    """One `model` clause of the rendered attrition, or "" when nothing was excluded.
+
+    Kinds are printed WORST FIRST (by excluded share, then by count) because the reader
+    is looking for concentration and a corpus can carry a dozen kinds; alphabetical
+    order would bury the finding in the middle of the list. Kinds that lost nothing are
+    still printed — "deref 5/5" only means something beside a "count 0/6".
+
+    `by_arm` is non-empty whenever `excluded` is, by construction: `_paired_partition`
+    drops a row only when some arm's `_paired_arm` returned False, and `attrition` asks
+    the same question of the same arms. Pinned by
+    `test_every_excluded_row_is_attributed_to_at_least_one_arm` rather than guarded by a
+    fallback string here, which would be a branch no run can reach."""
+    if not a.excluded:
+        # `always` is dropeval's case: its treatment CANNOT be excluded (no per-arm
+        # denominator, by design), so `excluded 0` is a real and reportable state there
+        # whenever the treatment lost calls. The prefix is built here rather than at that
+        # call site, which had a second copy of this f-string — the duplication this
+        # function's own header rejects.
+        return f"`{label}` excluded 0/{a.total} question(s)" if always else ""
+    arms = ", ".join(f"{f} {n}" for f, n in sorted(a.by_arm.items()))
+    kinds = ", ".join(
+        f"{k} {exc}/{tot}" for k, (exc, tot) in
+        sorted(a.by_kind.items(), key=lambda kv: (-kv[1][0] / kv[1][1], -kv[1][0], kv[0])))
+    return (f"`{label}` excluded {a.excluded}/{a.total} question(s) — "
+            f"by arm: {arms}; by kind: {kinds}")
 
 
 # Share of a model's calls that may fail before its numbers stop meaning anything (#263).
@@ -1157,7 +1349,7 @@ def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, f
     for model, rows in results.items():
         if not rows:
             continue
-        g = arm_gap(rows, "diff_ok", "terse_ok")
+        g = arm_gap(rows, *DIFF_ARMS)
         if g.excluded:
             # The REASON, not just the name. The terminal plot used to render every
             # exclusion as "calls went unanswered", which is false for an `unpaired` model.
@@ -1185,7 +1377,7 @@ def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float
     for model, rows in results.items():
         if not rows:
             continue
-        g = best_arm_gap(rows, ["terse_ok", "primer_ok"], "raw_ok")
+        g = best_arm_gap(rows, list(FLUENCY_GATING), FLUENCY_CONTROL)
         if g.excluded:
             broken[model] = g.excluded
             continue
@@ -2250,12 +2442,12 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         # Same rule the forest plot applies (`diff_gap_rows`), from the same function, or
         # the chart printed beneath this table draws a bar for a model the table just
         # declined to score.
-        g = arm_gap(rows, "diff_ok", "terse_ok")
+        g = arm_gap(rows, *DIFF_ARMS)
         if g.excluded:
             unmeasured[model] = (g.excluded,
                                  sum(int(r.get("fails", 0)) for r in rows),
                                  sum(int(r.get("attempts", 0)) for r in rows),
-                                 len(paired_rows(rows, "diff_ok", "terse_ok")))
+                                 len(paired_rows(rows, *DIFF_ARMS)))
             out.append(f"| `{model}` | {n} | n/a | n/a | n/a |")
             continue
         facc, fse = g.control_acc, g.control_se
@@ -2273,6 +2465,14 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
                    f"| {dacc:.0%} ±{_ci(dse) * 100:.0f} | {regr} |")
     out.append("")
     out += _not_measured_lines(unmeasured)
+
+    # The diff family pairs too, so it discloses too (#299). Its arms are `diff_ok` vs
+    # `terse_ok` — the pair `arm_gap` is given here — not fluency's four.
+    attr_text = attrition_block(
+        {m: attrition(rows, *DIFF_ARMS) for m, rows in results.items()
+         if is_diff_run(rows)}, ATTRITION_NOTE, style="markdown")
+    if attr_text:
+        out += [attr_text, ""]
 
     out += ["## Verdict", ""]
     worst = _worst_case_gap(gap_rows)
@@ -2404,7 +2604,7 @@ def build_diff_soak_report(results: dict) -> str:
             # own gap, and an arm that lost calls only at depth 5 was invisible to a gate
             # computed over the whole model. This table sits outside `## Verdict`, so the
             # invariance test's `_gate_signature` never saw it either (#280 F2).
-            dg = arm_gap(drows, "diff_ok", "terse_ok")
+            dg = arm_gap(drows, *DIFF_ARMS)
             if model in unmeasured or dg.excluded:
                 # Both causes share the `"unmeasured"` reason since #332, so `dg.excluded`
                 # cannot tell them apart — but `_unmeasured` can, and it is the transport
@@ -2500,7 +2700,7 @@ def build_diff_soak_report(results: dict) -> str:
     for model, rows in results.items():
         if not rows or model in unmeasured:
             continue
-        g = arm_gap(rows, "diff_ok", "terse_ok")
+        g = arm_gap(rows, *DIFF_ARMS)
         if g.excluded:
             # Recorded and named below. Dropping a model from the ship gate with no trace
             # anywhere let a soak print "Worst-case model `N` ... PASS" while `M`'s pooled
@@ -2516,6 +2716,18 @@ def build_diff_soak_report(results: dict) -> str:
         note = exclusion_note(pooled_out).removeprefix("excluded — ")
         out += [f"**Excluded from the pooled verdict** — {note}. Depth slices that pair "
                 f"cleanly are still scored below.", ""]
+
+    # The soak's markdown is the artifact that gets KEPT — `cli` writes it to `--out`.
+    # Under `--bars` it also prints `build_terminal_diff_report`, and THAT is the
+    # two-renderers-disagree case: the chart disclosed `deref 15/15` while the file on
+    # disk said nothing. Without `--bars` the soak was simply silent in both, which is the
+    # same defect with no witness rather than a milder one. Every depth slice is gated by its own `arm_gap(drows, "diff_ok",
+    # "terse_ok")`, so this is drawn over a paired subset like the rest.
+    attr_text = attrition_block(
+        {m: attrition(rows, *DIFF_ARMS) for m, rows in results.items()
+         if is_diff_run(rows)}, ATTRITION_NOTE, style="markdown")
+    if attr_text:
+        out += [attr_text, ""]
 
     out += ["## Verdict", ""]
     worst = _worst_case_gap(gap_rows)
@@ -2566,7 +2778,7 @@ def build_diff_soak_report(results: dict) -> str:
                       for m, rs in results.items() if m not in unmeasured) if r}
         deep_gaps = {}
         for m, rs in deep_rows.items():
-            dg = arm_gap(rs, "diff_ok", "terse_ok")
+            dg = arm_gap(rs, *DIFF_ARMS)
             if dg.excluded:
                 continue
             deep_gaps[m] = (dg.form_acc, dg.form_se, dg.control_acc, dg.control_se)
@@ -2806,6 +3018,18 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
                     + ". The gap is computed over these only — read it as accuracy among "
                     "jointly-completed questions, and note that at small n one question "
                     "moves it a long way (#297).", ""]
+        # ...and WHICH questions did not survive. The two lines above answer "how many
+        # failed calls, on which arm" and "how many questions are left"; neither answers
+        # whether the missing questions were the HARD ones, which is the bias #299 is
+        # about. `kind` here is recall/precision, not fluency's `qtype`.
+        attr_text = attrition_block(
+            {m: attrition(rows, "answer_ok", "control_ok", kind_key="kind")
+             for m, rows in sorted(results.items()) if rows},
+            dropeval_attrition_note(results),
+            extra={m: sum(r.get("treatment_errors", 0) for r in rows)
+                   for m, rows in results.items() if rows}, style="markdown")
+        if attr_text:
+            out += [attr_text, ""]
 
     out += ["## Verdict", ""]
     # ONE decision, rendered here and by `build_terminal_dropeval_report` — see
@@ -2843,6 +3067,109 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
     out.append("- " + dropeval_directive_line(v))
     out.append("")
     return "\n".join(out)
+
+
+ATTRITION_HEADING = "**Attrition of the paired exam** (#299)"
+
+def is_diff_run(rows: list[dict[str, Any]]) -> bool:
+    """Does every row of this set carry BOTH diff-family arms?
+
+    One spelling, four sites. The HTML page tested `diff_ok` and `terse_ok`; the two sites
+    added with the diff wiring tested only `diff_ok` — a weaker third copy of a predicate,
+    which is how "one decision, read back rather than recomputed" becomes untrue while
+    still being written in the comments.
+
+    It does NOT stop the KeyError a mixed-shape row set causes. That crash comes from the
+    unguarded `arm_gap` in the markdown and terminal loops, it predates these attrition
+    sites (measured identically on `61d08ba`, before they existed), and it survives this
+    function — out of scope here and deliberately not papered over. An earlier version of
+    this docstring said the weak predicate was why the two renderers crashed while the HTML
+    withheld, which execution falsifies; the test that covers this says so correctly and
+    the two statements disagreed."""
+    return bool(rows) and all("diff_ok" in r and "terse_ok" in r for r in rows)
+
+
+# The diff family's arms — `arm_gap(rows, *DIFF_ARMS)`, what
+# `_build_diff_style_report`, the terminal chart and the HTML page all pair on.
+DIFF_ARMS = ("diff_ok", "terse_ok")
+
+
+def strip_markup(markdown: str, *, code: bool = True) -> str:
+    """`**bold**` removed, and `` `code` `` too unless `code=False`.
+
+    Two different questions, and folding them into one flag cost the HTML page its
+    `<code>` spans: `_esc_md` exists to turn backtick spans into `<code>`, so handing it a
+    string with the backticks already stripped left one paragraph in plain text beside a
+    verdict banner two lines up that still rendered them. `terminal_report._plain`
+    delegates here so two terminal renderers cannot strip different markup off one shared
+    string."""
+    out = markdown.replace("**", "")
+    return out.replace("`", "") if code else out
+
+
+def attrition_block(attr: Mapping[str, Attrition], note: str,
+                    extra: Mapping[str, int] | None = None, *,
+                    style: Literal["markdown", "html", "text"] = "text") -> str:
+    """The whole rendered attrition for a run, or "" when there is nothing to say.
+
+    EIGHT call sites now carry this — the fluency, dropeval, diff-family and diff-soak
+    markdown reports, all three terminal forest-plot charts, and the HTML page — so the
+    joining, the model separator, the heading and the choice of note live here rather than
+    being written out eight times. The count is pinned by
+    `test_the_docstring_call_site_count_matches_the_source`, because it was wrong twice
+    (`FOUR` for five, then `SIX` for seven) in the header of the very helper whose thesis
+    is that a restated fact drifts. A chart drawn over
+    the paired subset that does not say what was removed from it is the same silent
+    exclusion the markdown stopped printing, and #335's review rounds are the record of
+    what happens when two renderers decide the same thing separately: they disagreed
+    three times.
+
+    `extra` is dropeval's treatment loss — calls scored as MISSES, never excluded, because
+    that arm carries no per-arm denominator by design. A model appears whenever it has
+    exclusions OR a non-zero `extra`, which is why `extra` cannot be folded into
+    `Attrition`: `excluded 0` with a treatment that lost every call is a real and
+    reportable state, and it is the motivating case of #299.
+
+    Models are separated by ` · `, not `; `, because `; ` already separates the clauses
+    WITHIN one model's line and the reader had no way to see where one model ended."""
+    lines = []
+    for label in sorted(attr):
+        t = (extra or {}).get(label, 0)
+        line = attrition_line(label, attr[label], always=bool(t))
+        if t and line:
+            line += f"; treatment lost {t} call(s), scored as misses and never excluded"
+        if line:
+            lines.append(line)
+    if not lines:
+        return ""
+    body = f"{ATTRITION_HEADING} — " + " · ".join(lines) + ". " + note
+    # ONE heading string, spelled two ways here rather than bolted on afterwards by the
+    # caller. The markdown sites used to post-process this return value with a
+    # `.replace()` keyed on the heading text — a second copy of the literal, 200 lines
+    # away, which silently no-ops if the heading is ever edited and emits an UNCLOSED
+    # `**` into both reports. That survived 226 tests.
+    if style == "markdown":
+        return f"> {body}"
+    # `html`: no blockquote and no bold, but the backticks STAY — `_esc_md` renders them
+    # as `<code>`, which is how every other paragraph on that page names a model.
+    if style == "html" or style == "text":  # noqa: PLR1714 - narrows for `assert_never`
+        return "\n\n  " + strip_markup(body, code=(style == "text"))
+    # Exhaustive, like `ExclusionReason` and `Metric` in this file. A fourth style added
+    # to the `Literal` would otherwise fall through to HTML semantics silently — one more
+    # renderer disagreeing with the others about a shared string, which is the failure
+    # this helper exists to close.
+    assert_never(style)
+
+
+# The arms `build_fluency_report` gates on, named once. The attrition block and the gap it
+# annotates MUST pair on the same arms: hardcoding a second copy let them drift, and a copy
+# that drops an arm makes the report render NOTHING for questions that arm removed —
+# silently, which is the whole defect #299 is about. Dropping `raw_ok` from the second copy
+# survived 383 tests. `inline_ok` is deliberately absent: it is a DISPLAY arm (see `_gap`),
+# outside the pairing by design, so counting its losses would report an exclusion that never
+# happened. Pinned by `test_the_attrition_pairs_on_exactly_the_arms_the_gap_pairs_on`.
+FLUENCY_GATING = ("terse_ok", "primer_ok")
+FLUENCY_CONTROL = "raw_ok"
 
 
 def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str:
@@ -2912,7 +3239,7 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         # One paired subset for the whole row: the columns and the gap are computed over
         # the same questions, or the table argues against its own verdict (#280 F3).
         # `inline` is display-only — see `_gap`.
-        g = best_arm_gap(rows, ["terse_ok", "primer_ok"], "raw_ok",
+        g = best_arm_gap(rows, list(FLUENCY_GATING), FLUENCY_CONTROL,
                          ("inline_ok",) if has_inline else ())
         racc, rse = g.arms.get("raw_ok", (0.0, 0.0))
         tacc, tse = g.arms.get("terse_ok", (0.0, 0.0))
@@ -3006,6 +3333,19 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
             + ".",
             "",
         ]
+
+    # WHICH questions the pairing removed, and from which arm (#299). The paragraph above
+    # counts lost CALLS; this counts lost QUESTIONS and says who lost them, which is the
+    # only thing that can tell a selected paired subset from an unselected one. Over the
+    # three arms the pairing actually covers — `inline_ok` is display-only and outside it
+    # by design (see `_gap`), so folding it in here would report an exclusion that never
+    # happened. Printed for EVERY model with exclusions, including the ones withheld
+    # above: an unpublishable model's attrition is still the evidence for why.
+    attr_text = attrition_block(
+        {m: attrition(rows, *FLUENCY_GATING, FLUENCY_CONTROL)
+         for m, rows in results.items() if rows}, ATTRITION_NOTE, style="markdown")
+    if attr_text:
+        out += [attr_text, ""]
 
     out += _per_transform_table(results, summary)
 
