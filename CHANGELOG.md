@@ -37,6 +37,25 @@ fails that pull request until the section has moved.
   it is true (measured `excluded 15/75 — by arm: diff_ok 15; by kind: deref 15/15,
   count 0/60`) and is now produced by a fixture instead of remembered.
 
+  The hardening itself is pinned on a **synthetic package**, via `_call_graph(root=)`.
+  It cannot be pinned on `src/terse`: there is not one `async def` in the package and no
+  renderer that pairs through an attribute call, so reverting both branches leaves all
+  1853 tests green — the fix was correct and completely inert against the live tree, and
+  the only thing that had exercised it was a throwaway probe that writes a module into
+  `src/` and deletes it. A probe that runs nowhere is not a test. Keying the graph on the
+  relative path turned out to be necessary and NOT sufficient: the check still collapsed
+  to bare function names, so a silent `build_diff_report` in `src/terse/fluency/report.py`
+  was scored compliant by `report.py`'s disclosing one of the same name. It now works in
+  qualified keys, and the check lives in one helper both the live and synthetic tests
+  drive rather than a copy each. **What the guard still cannot see is now written down**
+  rather than implied away — a symbol alias (`from .report import paired_rows as _pr`,
+  which `lossy.py` already does for another name; a MODULE alias is caught, which is the
+  surprising asymmetry), `build_x = _impl`, a module-level lambda, `functools.partial`,
+  `getattr` dispatch, a renderer outside `src/terse`, and one not named `build_*`. Each
+  was demonstrated evading the full suite. Closing the first three needs a name-resolving
+  import graph, which is a bigger tool than this test; the honest claim is that it catches
+  the mistakes people actually make here, not that it is airtight.
+
 ## [0.30.0] - 2026-09-02
 
 ### Added
