@@ -57,8 +57,7 @@ def _form_stats(rows: list[dict[str, Any]], form: str) -> tuple[float, float]:
         # and dividing that form's successes by the shared per-row `trials` would
         # understate it. Falls back to the shared count, so the live/uniform path (no
         # per-form keys) reports exactly as before.
-        t_key = form[:-3] + "_trials" if form.endswith("_ok") else ""
-        t = r.get(t_key, r.get("trials", 1))
+        t = _arm_trials(r, form)
         k = int(r[form])
         # Every emitter is responsible for its own k<=t invariant (dropeval's is pinned
         # by test_no_success_count_can_exceed_its_own_trial_count) — this is the
@@ -123,7 +122,7 @@ def arm_measured(rows: list[dict[str, Any]], form: str) -> bool:
     `<arm>_trials` at all, and skipping those rows would leave nothing to check and report
     a fully-measured arm as absent — which is how the first cut of this rendered `n/a` for
     the primer column of every legacy result file."""
-    key = form[:-3] + "_trials" if form.endswith("_ok") else form
+    key = _trials_key(form)
     return any(_arm_attempts(r, key, int(r.get("trials", 1))) for r in rows)
 
 
@@ -200,9 +199,70 @@ def paired_rows(rows: list[dict[str, Any]], *forms: str) -> list[dict[str, Any]]
     return _paired_partition(rows, forms)[0]
 
 
+def _trials_key(form: str) -> str:
+    """`"terse_ok"` -> `"terse_trials"`. The one place that mapping is written.
+
+    Meaning the SUFFIX SWAP, which is what this is: an earlier revision put the claim on
+    `_trials_keys` while `_form_stats` and `arm_measured` both still spelled it inline —
+    and a third pair of sites, the `regressions`/`recovered` columns, never derived the
+    per-arm key at all and divided by the shared `trials` instead. That is #353: a row
+    whose arms were collected unevenly reported every question as a regression beside a
+    100% accuracy computed on the other denominator.
+
+    It is NOT the only place a `<arm>_trials` key is named — `"terse_trials"` is written
+    as a literal wherever one specific arm's count is summed, and consolidating those
+    would say less than it hides. `_arm_trials` is the helper to reach for there; the
+    guard in `tests/test_regression_denominator.py` is what keeps the derivation itself
+    from being re-spelled."""
+    return form[:-3] + "_trials" if form.endswith("_ok") else form
+
+
+def _arm_trials(row: dict[str, Any], form: str) -> int:
+    """How many trials THIS arm was actually given on this question.
+
+    Falls back to the row's shared `trials` when the per-arm counter is absent, so a
+    result file predating the counters reads exactly as it did before — absent is not
+    zero, the same rule `_form_stats` and `_paired_arm` already follow.
+
+    A form that is NOT `<arm>_ok` reads the shared `trials` outright. `_trials_key`
+    returns such a form unchanged (that is what `arm_measured` needs), so looking it up
+    here would use the row's SUCCESS count as its own denominator and report a confident
+    100% — the exact false-green this module is built to refuse. The two sites this
+    helper consolidated disagreed on precisely this branch: `_form_stats` fell back to
+    the shared count, `arm_measured` did not, and only `_form_stats` divides by what
+    comes back. No caller reaches it with a non-`_ok` form today; it is guarded because
+    the failure is silent, not because it is live."""
+    if not form.endswith("_ok"):
+        return int(row.get("trials", 1))
+    return int(row.get(_trials_key(form), row.get("trials", 1)))
+
+
+def _arm_full(row: dict[str, Any], form: str) -> bool:
+    """Did this arm answer every trial it was given? The predicate behind both the
+    `regressions` and `recovered` columns.
+
+    Against `<arm>_trials`, NOT the row's shared `trials`. For a `score_pack` row the
+    shared count is `max(...)` across forms (`fluency/pack.py`) — the documented #91
+    uneven-collection mode — so comparing an arm's successes to it asks whether that arm
+    matched the BEST-collected arm's reply count, which is not a question about
+    comprehension at all.
+
+    ZERO collected trials is not "answered them all". `0 == 0` is the reading that makes
+    an arm nobody asked anything look complete, and `regr` counts a question whenever the
+    CONTROL arm looks complete and terse does not — so a responses file with no `raw`
+    replies at all (`fluency/scoring.py` maps a missing form to `(0, 0, 0)`) would have
+    reported every question as a regression against a control that never ran. The old
+    shared-`trials` comparison was accidentally immune: `score_pack` floors that count at
+    `max(..., 1)`, so `0 == 3` was already False. `recovered` has a separate guard —
+    `arm_measured(rows, "primer_ok")` renders `n/a` — and `regr`'s control arm has none,
+    which is why this has to live in the predicate."""
+    t = _arm_trials(row, form)
+    return t > 0 and int(row[form]) == t
+
+
 def _trials_keys(forms: tuple[str, ...]) -> list[str]:
-    """`("terse_ok",)` -> `["terse_trials"]`. The one place that mapping is written."""
-    return [f[:-3] + "_trials" if f.endswith("_ok") else f for f in forms]
+    """`("terse_ok",)` -> `["terse_trials"]`, for a whole tuple of forms."""
+    return [_trials_key(f) for f in forms]
 
 
 def _collected_arms(rows: list[dict[str, Any]], keys: list[str]) -> set[str]:
@@ -1042,7 +1102,7 @@ def codec_verdict(rows: list[dict[str, Any]]) -> tuple[str, ArmGap]:
     g = arm_gap(rows, "terse_ok", "raw_ok", min_paired=0)
     if g.excluded:
         return "UNRESOLVED", g
-    n = sum(r.get("terse_trials", r.get("trials", 1)) for r in g.rows)
+    n = sum(_arm_trials(r, "terse_ok") for r in g.rows)
     excess_terse_misses = sum(max(0, int(r["raw_ok"]) - int(r["terse_ok"])) for r in g.rows)
     if excess_terse_misses > 0:
         return "UNSAFE", g
@@ -1252,7 +1312,7 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
             if worst_gap is None or _VERDICT_RANK[v] > _VERDICT_RANK[worst_verdict]:
                 worst_verdict, worst_model, worst_gap = v, model, g
         assert worst_gap is not None  # by_model is never empty — every group has >=1 model
-        n = sum(r.get("terse_trials", r.get("trials", 1)) for r in worst_gap.rows)
+        n = sum(_arm_trials(r, "terse_ok") for r in worst_gap.rows)
         if worst_verdict == "UNSAFE":
             excess = sum(max(0, int(r["raw_ok"]) - int(r["terse_ok"]))
                         for r in worst_gap.rows)
@@ -2455,8 +2515,11 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         # Counted over the PAIRED subset, not `rows` (#280 F5): a row the diff arm never
         # answered is not a regression, and counting it as one made the column contradict
         # the gap printed beside it.
-        regr = sum(1 for r in g.rows if int(r["terse_ok"]) == r.get("trials", 1)
-                   and int(r["diff_ok"]) < r.get("trials", 1))
+        # Per-arm denominator, same as the fluency table's pair (#353). This site was a
+        # second hardcoded copy of that arithmetic and carried the identical defect; the
+        # issue named only the fluency one.
+        regr = sum(1 for r in g.rows
+                   if _arm_full(r, "terse_ok") and not _arm_full(r, "diff_ok"))
         gap_rows[model] = (dacc, dse, facc, fse)  # form=diff, control=control_label
         # `len(g.rows)`, not `len(rows)`: every accuracy on this line is computed over the
         # PAIRED subset, so printing the full question count beside them states a
@@ -3250,10 +3313,14 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         # Counted over the PAIRED subset (#280 F5): a question one arm never answered is
         # neither a regression nor a primer recovery, and counting it as one made these
         # columns disagree with the gap beside them.
-        regr = sum(1 for r in g.rows if int(r["raw_ok"]) == r.get("trials", 1)
-                   and int(r["terse_ok"]) < r.get("trials", 1))
-        rec = sum(1 for r in g.rows if int(r["terse_ok"]) < r.get("trials", 1)
-                  and int(r["primer_ok"]) == r.get("trials", 1))
+        # Each arm against its OWN `<arm>_trials` (#353), the denominator every accuracy
+        # column beside these two already uses via `_form_stats`. Against the shared
+        # `trials` an uneven-by-design pack read as 24 regressions out of 24 questions on
+        # the same line as a 100% terse accuracy.
+        regr = sum(1 for r in g.rows
+                   if _arm_full(r, "raw_ok") and not _arm_full(r, "terse_ok"))
+        rec = sum(1 for r in g.rows
+                  if not _arm_full(r, "terse_ok") and _arm_full(r, "primer_ok"))
         # Transport failures (#263): calls that never reached the model. Distinct from a
         # wrong answer, and NOT the same test as the raw==0 control below — a partial
         # rate limit lets some calls through, so it depresses every arm's accuracy while
