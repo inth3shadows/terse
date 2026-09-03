@@ -15,6 +15,54 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **`install-mcp --print` did not disclose that it was CHANGING an existing command**
+  (`#277`, the second ask of `#275`). The dry-run rendered a `before:`/`after:` pair per
+  server, but three shapes of change were invisible in it. An **already-folded peer**
+  showed `before: (absent)` — its entry legitimately no longer exists standalone, it lives
+  in the peers file — so its prior command was not shown at all, and `(absent)` is also
+  what a genuinely new server renders, leaving the two indistinguishable. The peers file
+  is now read as that peer's before-state, labelled `(from peers file)` so the provenance
+  is stated rather than implied; a malformed record still renders `(absent)` **without**
+  that label, rather than claiming a provenance for a value never recovered. (The
+  launcher rewrite itself is disclosed in the router block, which is where a folded peer's
+  launcher actually lives.) The **router's own
+  command** had no `before:` at all (`router: <name> -> <command>` printed the new value
+  only), and the router is the single entry every folded peer is reached through, so a
+  rewrite there breaks the whole fleet at once; it gets a `before:`/`after:` pair like any
+  other change. And `_short_cmd` **truncated at 100 chars with no marker**, so a long
+  policy path pushed the launcher off the end and a reader could not tell a short command
+  from a cut one — the cut is now marked, and the field that changed is stated outright:
+
+  ```
+  command CHANGED — the client spawns a different binary than before:
+    from: /home/u/.local/bin/terse
+    to:   /home/u/.pyenv/shims/terse
+  ```
+
+  printed from the raw field rather than the truncated render, and only when the value
+  actually differs. **`args` is on that list too**, against the issue's own framing that
+  `command` is "the one field whose change is both invisible and fatal": a moved
+  `--policy` path exits 2 at spawn with the identical symptom, and is *more* likely to be
+  hidden, since the launcher sits at the head of the rendered line and the policy path
+  sits past the 100-char cut. A before/after pair can be byte-identical on screen while
+  the policy moved. This matters because the failure is silent by construction: the MCP
+  client cannot spawn a bad entry, so the server appears with no tools and nothing says
+  why, days later. The distance between the config change and the symptom is the whole
+  reason `#275` was hard to diagnose.
+
+  Pinned by `tests/test_install_print_discloses_changes.py`, whose fixtures run at
+  **project** scope under a redirected `HOME`, with an autouse canary asserting the real
+  `~/.claude.json` did not move. An earlier draft did not, and a non-dry-run setup call
+  rewrote the developer's live router to a pytest temp binary — the exact failure this
+  issue exists to disclose. That hazard is filed separately as `#366`. An 18-mutation
+  sweep leaves no survivors, and `--print` no longer aborts on a hand-edited entry whose
+  `command` or `args` hold a non-string — a `TypeError` out of the renderer that killed
+  the whole disclosure on exactly the malformed state where it is most needed.
+
+## [0.30.3] - 2026-09-03
+
+### Fixed
+
 - **`fetch_corpus.sh` overwrote the committed snapshot in place, so a measurement taken
   after a re-fetch was unreproducible** (`#341`). The script's own header states the
   invariant — "the committed corpus/ snapshot is what the published numbers were measured
