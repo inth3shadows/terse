@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
+from collections.abc import Mapping
 from pathlib import Path
 
 from terse import codeceval, dropeval
@@ -546,8 +548,8 @@ def test_the_html_page_reads_the_loops_own_exclusion_rather_than_retesting_row_s
 def test_the_diff_soak_MARKDOWN_discloses_and_not_only_its_chart():
     """The soak's markdown is the artifact that gets KEPT — `cli` writes it to `--out`,
     and under `--bars` prints the terminal chart beside it. Wiring only
-    `_build_diff_style_report` left that chart saying `deref 15/15` while the file on disk
-    said nothing; without `--bars` the soak was silent in both renderers, the same defect
+    `_build_diff_style_report` left that chart saying `deref 15/15` (a number now produced
+    by `test_the_soaks_worked_example_is_produced_by_a_fixture_not_asserted_in_prose`, not quoted) while the file on disk said nothing; without `--bars` the soak was silent in both renderers, the same defect
     with no witness.
     `build_diff_soak_report` does NOT route through `_build_diff_style_report`."""
     rows = [dict(r, depth=1) for r in _diff_rows(20, 5)]
@@ -616,7 +618,7 @@ def test_the_docstring_call_site_count_matches_the_source():
 # can never be excluded by it. Not an allowlist of forgiven omissions: each entry's
 # premise is proven by execution in the test below this one, so an entry whose emitter
 # later starts carrying real per-arm denominators goes red instead of staying quiet.
-_CANNOT_EXCLUDE = {"build_codec_verdict_report"}
+_CANNOT_EXCLUDE = {"report.py:build_codec_verdict_report"}
 
 # Every renderer drawn over a paired subset today. `_build_diff_style_report` is absent
 # on purpose: it is the shared BODY of `build_diff_report` and `build_text_diff_report`,
@@ -625,10 +627,13 @@ _CANNOT_EXCLUDE = {"build_codec_verdict_report"}
 # that is computed — but the record of what is in scope, so a renderer that STOPS being
 # paired shows up as a deliberate edit instead of quietly leaving the set.
 _PAIRED_RENDERERS = {
-    "build_fluency_report", "build_dropeval_report", "build_diff_report",
-    "build_text_diff_report", "build_diff_soak_report",
-    "build_terminal_fluency_report", "build_terminal_dropeval_report",
-    "build_terminal_diff_report", "build_html_diff_report", "build_codec_verdict_report",
+    "report.py:build_fluency_report", "report.py:build_dropeval_report",
+    "report.py:build_diff_report", "report.py:build_text_diff_report",
+    "report.py:build_diff_soak_report", "report.py:build_codec_verdict_report",
+    "terminal_report.py:build_terminal_fluency_report",
+    "terminal_report.py:build_terminal_dropeval_report",
+    "terminal_report.py:build_terminal_diff_report",
+    "html_report.py:build_html_diff_report",
 }
 
 
@@ -636,12 +641,40 @@ def _package() -> Path:
     return Path(inspect.getfile(attrition_block)).parent
 
 
-def _call_graph() -> tuple[dict[str, set[str]], set[str]]:
-    """`({qualified name -> names it calls}, ambiguous names)` over the WHOLE package.
+def _call_graph(root: Path | None = None) -> tuple[dict[str, set[str]], dict[str, set[str]], set[str]]:
+    """`(graph, attribute-only edges, ambiguous names)` over the WHOLE package.
 
     Every `.py` under `src/terse`, not a hand-written file list: a renderer added in a new
     module would never have entered a three-file scan, so "a renderer added later inherits
     the requirement" would have been false for exactly the case nobody thinks of.
+
+    `root` exists so the parsing rules can be pinned on a SYNTHETIC package. They cannot
+    be pinned on `src/terse`: it contains zero `async def` today, so reverting the async
+    and attribute branches leaves every test green and the hardening is inert against the
+    live tree (measured, #361 review). A throwaway probe that writes a module into `src/`
+    and deletes it is not a test — it runs nowhere.
+
+    `async def` counts, and so does an ATTRIBUTE callee (`report.arm_gap(...)`). Matching
+    only `ast.FunctionDef` and only `ast.Name` callees let two silent paired renderers pass
+    the entire suite (#361) — both written in idioms this package already uses.
+
+    WHAT THIS STILL DOES NOT SEE. Recorded rather than implied away, because "adding a
+    renderer without a disclosure fails CI" is only true within these limits. Each was
+    demonstrated evading the full suite (#361 review):
+
+      - a renderer defined outside `src/terse`, or one not named `build_*`;
+      - `from .report import paired_rows as _pr` — a SYMBOL alias. The callee name is
+        `_pr`, so the edge is never drawn. (A MODULE alias, `from . import report as rp`
+        then `rp.paired_rows(...)`, IS caught: the attribute is still `paired_rows`. The
+        asymmetry is the surprising part.) `lossy.py:33` already aliases a symbol this way;
+      - `build_x = _impl`, a module-level lambda, `functools.partial`, or `getattr`
+        dispatch — the `FunctionDef` behind the exported `build_*` name is privately named,
+        so the prefix scan misses it. Arguably the "not named `build_*`" gap, but a reader
+        of that gap would not predict them.
+
+    A name-resolving import graph would close the first three. That is a bigger tool than
+    this test, and the honest position is that this catches the mistakes people actually
+    make here — not that it is airtight.
 
     Calls resolve BY NAME, with no import binding, so a name defined in two modules gets
     edges to both. That over-approximation is the UNSAFE direction for this test's
@@ -652,21 +685,48 @@ def _call_graph() -> tuple[dict[str, set[str]], set[str]]:
     ambiguous names are returned and the caller refuses to traverse one.
     """
     graph: dict[str, set[str]] = {}
+    attr_only: dict[str, set[str]] = {}
     defined: dict[str, set[str]] = {}
-    for f in sorted(_package().rglob("*.py")):
+    pkg = root or _package()
+    for f in sorted(pkg.rglob("*.py")):
+        # The RELATIVE PATH, not `f.name`. Keying on the basename let two modules with the
+        # same filename collide: the later-sorted one silently overwrote the earlier one's
+        # entries, and same-named functions in same-basename modules were never marked
+        # ambiguous. Demonstrated — a silent `build_diff_report` in
+        # `src/terse/fluency/report.py` passed the whole suite, the third evasion of this
+        # class (#361 review). `src/terse/fluency/__init__.py` and `src/terse/__init__.py`
+        # already collide today, harmlessly only because neither defines a function.
+        mod = str(f.relative_to(pkg))
         tree = ast.parse(f.read_text())
         for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                calls = {c.func.id for c in ast.walk(node)
-                         if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
-                graph[f"{f.name}:{node.name}"] = calls
-                defined.setdefault(node.name, set()).add(f.name)
-    return graph, {n for n, mods in defined.items() if len(mods) > 1}
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            key = f"{mod}:{node.name}"
+            calls, attrs = set(), set()
+            for c in ast.walk(node):
+                if not isinstance(c, ast.Call):
+                    continue
+                if isinstance(c.func, ast.Name):
+                    calls.add(c.func.id)
+                elif isinstance(c.func, ast.Attribute):
+                    # `report.arm_gap(...)` after `from . import report` — the idiom this
+                    # package already uses. Dropping attribute callees made a renderer
+                    # written that way invisible to this whole test (#361). Kept SEPARATE
+                    # because `.attr` also matches every `x.get`/`x.append`/`re.sub`, and
+                    # a stdlib method name colliding with a single src function is not
+                    # `ambiguous` and would be traversed — see `_reaches`.
+                    attrs.add(c.func.attr)
+            graph[key] = calls | attrs
+            attr_only[key] = attrs - calls
+            defined.setdefault(node.name, set()).add(mod)
+    return graph, attr_only, {n for n, mods in defined.items() if len(mods) > 1}
 
 
 def _reaches(graph: dict[str, set[str]], start: str, target: str,
-             ambiguous: set[str] = frozenset()) -> bool:
-    """Does `start` transitively call `target`? Names in `ambiguous` are NOT traversed.
+             ambiguous: set[str] = frozenset(),
+             attr_only: Mapping[str, set[str]] | None = None) -> bool:
+    """Does `start` transitively call `target`? Names in `ambiguous` are NOT traversed,
+    and neither are attribute-derived edges when `attr_only` is given.
 
     Which approximation is safe depends on the question, and this is the half the first
     version of this file got backwards:
@@ -689,9 +749,24 @@ def _reaches(graph: dict[str, set[str]], start: str, target: str,
         calls = graph.get(cur, set())
         if target in calls:
             return True
-        for name in calls - ambiguous:
+        skip = ambiguous | ((attr_only or {}).get(cur, set()))
+        for name in calls - skip:
             stack.extend(k for k in graph if k.endswith(f":{name}"))
     return False
+
+
+def _paired_and_silent(graph, attr_only, ambiguous, exempt=frozenset()):
+    """`(paired renderers, the silent ones)` — THE check, in one place.
+
+    Extracted so the synthetic-package tests exercise this body rather than a copy of it.
+    A test that re-implements the logic it covers is the defect this file has already been
+    bitten by twice; mutating the live check then leaves the synthetic test green."""
+    paired = {k for k in graph if k.split(":", 1)[1].startswith("build_")
+              and _reaches(graph, k, "paired_rows")}
+    silent = {k for k in paired
+              if not _reaches(graph, k, "attrition_block", ambiguous, attr_only)
+              and k not in exempt}
+    return paired, silent
 
 
 def test_every_renderer_drawn_over_a_paired_subset_discloses_its_attrition():
@@ -706,38 +781,20 @@ def test_every_renderer_drawn_over_a_paired_subset_discloses_its_attrition():
     reach `attrition_block`. A renderer added later — in any module — inherits the
     requirement, and adding one without a disclosure fails CI rather than waiting for a
     fifth reviewer."""
-    graph, ambiguous = _call_graph()
-    renderers = [k for k in graph if k.split(":")[1].startswith("build_")
-                 and _reaches(graph, k, "paired_rows")]
-    names = {k.split(":")[1] for k in renderers}
-    # The SET, not a count and not a floor. A `>=` floor set one below the true count let
-    # the set shrink by one unnoticed — delete or rename a renderer and it still passed —
-    # and a bare count cannot say WHICH renderer left. The two directions are different
-    # failures and both matter: a renderer ARRIVING must disclose (computed above, no list
-    # needed), and a renderer LEAVING the paired set must be a deliberate edit here rather
-    # than a silent consequence of refactoring its gap out.
-    assert names == _PAIRED_RENDERERS, (
-        f"paired renderers changed: +{sorted(names - _PAIRED_RENDERERS)} "
-        f"-{sorted(_PAIRED_RENDERERS - names)}. A new one must disclose; a departing one "
-        "must be understood, not just removed from this set.")
-    silent = sorted(n for n in names
-                    if not any(_reaches(graph, k, "attrition_block", ambiguous)
-                               for k in renderers if k.endswith(f":{n}"))
-                    # ^ ambiguous names skipped: see `_reaches`. `_tok`, `_pct`, `ask`,
-                    # `close` and `__init__` are each defined in two modules today, none
-                    # on a disclosure path — but the skip is what keeps that from
-                    # mattering rather than a fact anyone has to re-check.
-                    #
-                    # RECORDED EQUIVALENT MUTANT: dropping `ambiguous` from THIS call
-                    # survives the whole suite, and that is honest rather than a hole —
-                    # with no collision on a disclosure path the two answers are
-                    # identical, so no fixture can distinguish them without manufacturing
-                    # a name clash in `src/`. The argument is defensive, and `_reaches`'
-                    # own contract is pinned directly by
-                    # `test_the_disclosure_check_refuses_a_spurious_route_through_an_ambiguous_name`
-                    # on a synthetic graph, which is the only place the difference is
-                    # observable today.
-                    and n not in _CANNOT_EXCLUDE)
+    graph, attr_only, ambiguous = _call_graph()
+    # QUALIFIED keys (`report.py:build_diff_report`), never bare function names. Collapsing
+    # to names let a silent renderer hide behind a compliant NAMESAKE: a
+    # `build_diff_report` in `src/terse/fluency/report.py` was already in the expected set
+    # under that name, and the check scored it disclosing. Keying `_call_graph` on the
+    # relative path was necessary and NOT sufficient — measured, it still evaded.
+    renderers, silent_set = _paired_and_silent(graph, attr_only, ambiguous, _CANNOT_EXCLUDE)
+    assert renderers == _PAIRED_RENDERERS, (
+        f"paired renderers changed: +{sorted(renderers - _PAIRED_RENDERERS)} "
+        f"-{sorted(_PAIRED_RENDERERS - renderers)}. A new one must disclose; a departing "
+        "one must be understood, not just removed from this set.")
+    assert "report.py:build_diff_soak_report" in renderers, (
+        "the soak was the renderer round 4 caught — it must stay in scope")
+    silent = sorted(silent_set)
     assert not silent, (
         f"{silent} are drawn over a paired subset and disclose nothing about what left "
         "it. Wire attrition_block, or add to _CANNOT_EXCLUDE and prove the exemption in "
@@ -755,7 +812,7 @@ def test_the_exempt_renderers_genuinely_cannot_be_excluded_by_the_pairing():
     If `codeceval` ever starts emitting real per-arm denominators, this goes red and the
     exemption has to be revisited — which is the whole point of proving it rather than
     asserting it in a comment."""
-    assert {"build_codec_verdict_report"} == _CANNOT_EXCLUDE
+    assert {"report.py:build_codec_verdict_report"} == _CANNOT_EXCLUDE
     # The codec row shape, with the terse arm losing every one of its calls.
     rows = [{"qid": f"q{i}", "qtype": "deref", "trials": 3, "raw_ok": 3, "terse_ok": 0,
              "raw_trials": 3, "terse_trials": 3, "fails": 3, "attempts": 6}
@@ -764,6 +821,21 @@ def test_the_exempt_renderers_genuinely_cannot_be_excluded_by_the_pairing():
     assert '"raw_trials": trials,' in src and '"terse_trials": trials,' in src, (
         "codeceval no longer pins its per-arm denominators to `trials`; the exemption's "
         "premise is gone and build_codec_verdict_report must now disclose")
+    # The OTHER drift direction, and the one the grep above cannot see (#361):
+    # `_arm_attempts` reads `<arm>_attempts` IN PREFERENCE TO `trials`, so emitting that
+    # key makes exclusion possible with the two `_trials` lines untouched. Measured — with
+    # `"terse_attempts": trials - terse_fail` added, the same row set goes from 5 kept to
+    # 5 excluded while the whole suite stayed green.
+    # An emitted KEY, not a bare substring: `run_codec_payload`'s docstring already
+    # discusses attempts, and a future comment explaining why codeceval deliberately does
+    # NOT emit this counter would redden the test with a message asserting a drift that
+    # did not happen. `run_codec_fluency` is checked too — the row is assembled one frame
+    # up as `{**tags, **toks, **row}`, so a counter introduced through `tags` or
+    # `_payload_tokens` would restore excludability without touching the emitter below.
+    for fn in (codeceval.run_codec_payload, codeceval.run_codec_fluency):
+        assert not re.search(r'"\w+_attempts":', inspect.getsource(fn)), (
+            f"{fn.__name__} now emits a per-arm attempts counter, which `_arm_attempts` "
+            "prefers over `trials`; exclusion is possible again and the exemption is stale")
     assert len(paired_rows(rows, "terse_ok", "raw_ok")) == len(rows)
     assert attrition(rows, "terse_ok", "raw_ok").excluded == 0
 
@@ -813,8 +885,14 @@ def test_the_diff_markdown_and_chart_withhold_a_model_that_is_not_a_diff_run():
     results = {"m": _diff_rows(), "notdiff": _not_a_diff_run_rows()}
     assert attrition(_not_a_diff_run_rows(), *DIFF_ARMS).excluded == 4, (
         "fixture: the unguarded renderer WOULD print a clause for this model")
+    # The SOAK is here because the first version of this test listed three renderers by
+    # hand and missed the fourth (#361) — the same by-hand enumeration this whole file was
+    # written to end, recurring inside the fix for it. `build_diff_soak_report` needs
+    # `depth`, so it gets its own copies.
+    soak = {m: [dict(r, depth=1) for r in rows] for m, rows in results.items()}
     for text in (build_diff_report(results),
                  build_text_diff_report(results),
+                 build_diff_soak_report(soak),
                  build_terminal_diff_report(results, color=False)):
         block = text.split("Attrition of the paired exam", 1)[1]
         assert "diff_ok 5" in block
@@ -881,3 +959,106 @@ def test_a_run_with_no_control_arm_does_not_explain_the_control_arms_role():
         assert strip_markup(NO_CONTROL_ATTRITION_NOTE) in strip_markup(text)
         assert "only ever exclude on the CONTROL side" not in text
         assert "Where they failed** above" not in text
+
+
+def test_the_soaks_worked_example_is_produced_by_a_fixture_not_asserted_in_prose():
+    """`deref 15/15` is quoted as fact in `build_diff_soak_report`'s comment, in a test
+    docstring and in the CHANGELOG — and nothing in the tree produced it (#361). A comment
+    asserting a countable fact is a test, so it is executed here: 3 depths x 5 `deref`
+    questions, all lost by the diff arm, against 3 x 20 clean `count` questions."""
+    rows = []
+    for depth in (1, 3, 5):
+        rows += [{"qid": f"c{depth}_{i}", "qtype": "count", "trials": 3, "attempts": 6,
+                  "depth": depth, "diff_ok": 3, "terse_ok": 3,
+                  "diff_trials": 3, "terse_trials": 3} for i in range(20)]
+        rows += [{"qid": f"d{depth}_{i}", "qtype": "deref", "trials": 3, "attempts": 6,
+                  "depth": depth, "diff_ok": 2, "terse_ok": 3,
+                  "diff_trials": 2, "terse_trials": 3} for i in range(5)]
+    md = build_diff_soak_report({"m": rows})
+    assert "excluded 15/75 question(s)" in md
+    assert "by arm: diff_ok 15" in md
+    assert "deref 15/15, count 0/60" in md
+
+
+# --------------------------------------------------------------------------- #
+# The PARSING RULES, pinned on a synthetic package. `src/terse` cannot pin them:
+# it has zero `async def` and no attribute-paired renderer, so every rule below
+# can be reverted with all 1853 tests green (measured). See `_call_graph(root=)`.
+# --------------------------------------------------------------------------- #
+
+
+def _synthetic(tmp_path, files: dict[str, str]) -> Path:
+    for name, body in files.items():
+        f = tmp_path / name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(body)
+    return tmp_path
+
+
+def test_call_graph_sees_async_defs(tmp_path):
+    """`ast.AsyncFunctionDef` is not an `ast.FunctionDef`. Matching only the latter made an
+    `async def` renderer absent from the graph as BOTH a node and a traversable callee."""
+    root = _synthetic(tmp_path, {"m.py": "async def build_x_report(r):\n    return paired_rows(r)\n"})
+    graph, _, _ = _call_graph(root)
+    assert "m.py:build_x_report" in graph
+    assert "paired_rows" in graph["m.py:build_x_report"]
+
+
+def test_call_graph_sees_attribute_callees(tmp_path):
+    """`report.paired_rows(...)` after `from . import report` — the idiom 11 modules here
+    use. Matching only `ast.Name` callees dropped the edge entirely."""
+    root = _synthetic(tmp_path, {"m.py": "def build_x_report(r):\n    return report.paired_rows(r)\n"})
+    graph, attr_only, _ = _call_graph(root)
+    assert "paired_rows" in graph["m.py:build_x_report"]
+    assert "paired_rows" in attr_only["m.py:build_x_report"], (
+        "attribute edges must be tracked separately — see `_reaches`")
+
+
+def test_call_graph_keys_on_the_relative_path_not_the_basename(tmp_path):
+    """Two modules sharing a basename collided: the later-sorted one silently overwrote
+    the earlier one's entries. `src/terse/fluency/report.py` vs `src/terse/report.py` is
+    the live shape of this, and `__init__.py` already collides today (harmlessly, only
+    because neither defines a function)."""
+    root = _synthetic(tmp_path, {
+        "report.py": "def build_x_report(r):\n    return paired_rows(r)\n",
+        "sub/report.py": "def build_x_report(r):\n    return 1\n"})
+    graph, _, ambiguous = _call_graph(root)
+    assert {"report.py:build_x_report", "sub/report.py:build_x_report"} <= set(graph)
+    assert graph["report.py:build_x_report"] == {"paired_rows"}
+    assert graph["sub/report.py:build_x_report"] == set()
+    assert "build_x_report" in ambiguous, "same name in two modules is ambiguous"
+
+
+def test_a_renderer_cannot_hide_behind_a_COMPLIANT_NAMESAKE(tmp_path):
+    """The check works in qualified keys. Collapsing to bare names let a silent
+    `build_diff_report` in `fluency/report.py` be scored compliant by `report.py`'s
+    disclosing one of the same name — keying `_call_graph` on the relative path was
+    necessary and NOT sufficient, and this is the assertion that caught the difference."""
+    root = _synthetic(tmp_path, {
+        "report.py": ("def build_x_report(r):\n"
+                      "    attrition_block(attrition(r))\n"
+                      "    return paired_rows(r)\n"),
+        "sub/report.py": "def build_x_report(r):\n    return paired_rows(r)\n"})
+    _, silent = _paired_and_silent(*_call_graph(root))
+    assert silent == {"sub/report.py:build_x_report"}, (
+        "the silent namesake must be named, not absorbed by the compliant one")
+
+
+def test_attribute_edges_are_not_traversed_in_the_disclosure_direction(tmp_path):
+    """`.attr` matches every `x.get`/`re.sub` too, and a stdlib method name colliding with
+    a SINGLE src function is not `ambiguous`, so it would be traversed. Here `helper.write`
+    is a method call whose name happens to match a module-level `write` that discloses:
+    traversing it would score a silent renderer compliant. 118 such collisions exist in
+    `src/terse` today; none currently reaches `attrition_block`, so only a synthetic
+    package can pin the rule."""
+    root = _synthetic(tmp_path, {
+        "m.py": ("def build_x_report(r):\n"
+                 "    helper.write(r)\n"          # attribute edge -> `write`
+                 "    return paired_rows(r)\n"
+                 "def write(r):\n"
+                 "    return attrition_block(r)\n")})
+    graph, attr_only, ambiguous = _call_graph(root)
+    assert "write" in attr_only["m.py:build_x_report"], "fixture: the edge must exist"
+    _, silent = _paired_and_silent(graph, attr_only, ambiguous)
+    assert silent == {"m.py:build_x_report"}, (
+        "a method call must not route a silent renderer to a disclosing namesake")

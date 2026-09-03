@@ -2720,7 +2720,9 @@ def build_diff_soak_report(results: dict) -> str:
     # The soak's markdown is the artifact that gets KEPT — `cli` writes it to `--out`.
     # Under `--bars` it also prints `build_terminal_diff_report`, and THAT is the
     # two-renderers-disagree case: the chart disclosed `deref 15/15` while the file on
-    # disk said nothing. Without `--bars` the soak was simply silent in both, which is the
+    # disk said nothing. That number is produced by
+    # `test_the_soaks_worked_example_is_produced_by_a_fixture_not_asserted_in_prose`
+    # rather than quoted from memory (#361). Without `--bars` the soak was simply silent in both, which is the
     # same defect with no witness rather than a milder one. Every depth slice is gated by its own `arm_gap(drows, "diff_ok",
     # "terse_ok")`, so this is drawn over a paired subset like the rest.
     attr_text = attrition_block(

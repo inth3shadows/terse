@@ -13,6 +13,51 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `#299` disclosure guard was evadable by two idioms this package already uses, and
+  its own fix enumerated renderers by hand** (`#361`). No renderer emitted anything wrong —
+  what was wrong is the test meant to keep it that way, and three claims made about it.
+  `_call_graph` matched only `ast.FunctionDef` and only `ast.Name` callees, so a renderer
+  written as `from . import report` + `report.arm_gap(...)` (the idiom in 11 modules here,
+  including `cli.py`'s own `dropeval.run_drop_fluency(...)`) or as an `async def` was
+  invisible to it: both pass the entire suite as silent paired renderers, and both are now
+  caught. What it still cannot see is recorded rather than implied away — a renderer not
+  named `build_*`, and one defined outside `src/terse`. The diff-SOAK's `is_diff_run` guard
+  was pinned by nothing: dropping it survived all 1852 tests and is not an equivalent
+  mutant — with a fluency-shaped model in the same result set it renders a selection-bias
+  clause about a `diff_ok`/`terse_ok` pairing that was never performed. That test had
+  listed three renderers by hand and missed the fourth, which is the failure mode `#360`'s
+  entry claims to have ended, recurring inside the fix for it. `_CANNOT_EXCLUDE`'s premise
+  was guarded in one direction only: `_arm_attempts` prefers `<arm>_attempts` over
+  `trials`, so `codeceval` emitting that key would make exclusion possible with the
+  `_trials` lines untouched and leave `build_codec_verdict_report` a genuinely silent
+  paired renderer still sitting in the exemption. Finally `deref 15/15` was quoted as fact
+  in a comment, a test docstring and this changelog while nothing in the tree produced it;
+  it is true (measured `excluded 15/75 — by arm: diff_ok 15; by kind: deref 15/15,
+  count 0/60`) and is now produced by a fixture instead of remembered.
+
+  The hardening itself is pinned on a **synthetic package**, via `_call_graph(root=)`.
+  It cannot be pinned on `src/terse`: there is not one `async def` in the package and no
+  renderer that pairs through an attribute call, so reverting both branches leaves all
+  1853 tests green — the fix was correct and completely inert against the live tree, and
+  the only thing that had exercised it was a throwaway probe that writes a module into
+  `src/` and deletes it. A probe that runs nowhere is not a test. Keying the graph on the
+  relative path turned out to be necessary and NOT sufficient: the check still collapsed
+  to bare function names, so a silent `build_diff_report` in `src/terse/fluency/report.py`
+  was scored compliant by `report.py`'s disclosing one of the same name. It now works in
+  qualified keys, and the check lives in one helper both the live and synthetic tests
+  drive rather than a copy each. **What the guard still cannot see is now written down**
+  rather than implied away — a symbol alias (`from .report import paired_rows as _pr`,
+  which `lossy.py` already does for another name; a MODULE alias is caught, which is the
+  surprising asymmetry), `build_x = _impl`, a module-level lambda, `functools.partial`,
+  `getattr` dispatch, a renderer outside `src/terse`, and one not named `build_*`. Each
+  was demonstrated evading the full suite. Closing the first three needs a name-resolving
+  import graph, which is a bigger tool than this test; the honest claim is that it catches
+  the mistakes people actually make here, not that it is airtight.
+
+## [0.30.0] - 2026-09-02
+
 ### Added
 
 - **The fluency and dropeval reports publish the attrition of their paired exam, per arm and
