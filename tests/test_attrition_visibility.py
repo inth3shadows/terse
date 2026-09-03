@@ -546,8 +546,8 @@ def test_the_html_page_reads_the_loops_own_exclusion_rather_than_retesting_row_s
 def test_the_diff_soak_MARKDOWN_discloses_and_not_only_its_chart():
     """The soak's markdown is the artifact that gets KEPT — `cli` writes it to `--out`,
     and under `--bars` prints the terminal chart beside it. Wiring only
-    `_build_diff_style_report` left that chart saying `deref 15/15` while the file on disk
-    said nothing; without `--bars` the soak was silent in both renderers, the same defect
+    `_build_diff_style_report` left that chart saying `deref 15/15` (a number now produced
+    by `test_the_soaks_worked_example_...`, not quoted) while the file on disk said nothing; without `--bars` the soak was silent in both renderers, the same defect
     with no witness.
     `build_diff_soak_report` does NOT route through `_build_diff_style_report`."""
     rows = [dict(r, depth=1) for r in _diff_rows(20, 5)]
@@ -643,6 +643,12 @@ def _call_graph() -> tuple[dict[str, set[str]], set[str]]:
     module would never have entered a three-file scan, so "a renderer added later inherits
     the requirement" would have been false for exactly the case nobody thinks of.
 
+    `async def` counts, and so does an ATTRIBUTE callee (`report.arm_gap(...)`). Matching
+    only `ast.FunctionDef` and only `ast.Name` callees let two silent paired renderers pass
+    the entire suite (#361) — both written in idioms this package already uses. What this
+    still does NOT see, recorded rather than implied away: a renderer not named `build_*`,
+    and a renderer defined outside `src/terse`.
+
     Calls resolve BY NAME, with no import binding, so a name defined in two modules gets
     edges to both. That over-approximation is the UNSAFE direction for this test's
     load-bearing assertion — the check is "does this renderer FAIL to reach
@@ -656,11 +662,22 @@ def _call_graph() -> tuple[dict[str, set[str]], set[str]]:
     for f in sorted(_package().rglob("*.py")):
         tree = ast.parse(f.read_text())
         for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                calls = {c.func.id for c in ast.walk(node)
-                         if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)}
-                graph[f"{f.name}:{node.name}"] = calls
-                defined.setdefault(node.name, set()).add(f.name)
+            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            calls = set()
+            for c in ast.walk(node):
+                if not isinstance(c, ast.Call):
+                    continue
+                if isinstance(c.func, ast.Name):
+                    calls.add(c.func.id)
+                elif isinstance(c.func, ast.Attribute):
+                    # `report.arm_gap(...)` after `from . import report` — the idiom 11
+                    # modules here already use, and `cli.py`'s own
+                    # `dropeval.run_drop_fluency(...)`. Dropping attribute callees made a
+                    # renderer written that way invisible to this whole test (#361).
+                    calls.add(c.func.attr)
+            graph[f"{f.name}:{node.name}"] = calls
+            defined.setdefault(node.name, set()).add(f.name)
     return graph, {n for n, mods in defined.items() if len(mods) > 1}
 
 
@@ -764,6 +781,14 @@ def test_the_exempt_renderers_genuinely_cannot_be_excluded_by_the_pairing():
     assert '"raw_trials": trials,' in src and '"terse_trials": trials,' in src, (
         "codeceval no longer pins its per-arm denominators to `trials`; the exemption's "
         "premise is gone and build_codec_verdict_report must now disclose")
+    # The OTHER drift direction, and the one the grep above cannot see (#361):
+    # `_arm_attempts` reads `<arm>_attempts` IN PREFERENCE TO `trials`, so emitting that
+    # key makes exclusion possible with the two `_trials` lines untouched. Measured — with
+    # `"terse_attempts": trials - terse_fail` added, the same row set goes from 5 kept to
+    # 5 excluded while the whole suite stayed green.
+    assert "_attempts" not in src, (
+        "codeceval now emits a per-arm attempts counter, which `_arm_attempts` prefers "
+        "over `trials`; exclusion is possible again and the exemption is stale")
     assert len(paired_rows(rows, "terse_ok", "raw_ok")) == len(rows)
     assert attrition(rows, "terse_ok", "raw_ok").excluded == 0
 
@@ -813,8 +838,14 @@ def test_the_diff_markdown_and_chart_withhold_a_model_that_is_not_a_diff_run():
     results = {"m": _diff_rows(), "notdiff": _not_a_diff_run_rows()}
     assert attrition(_not_a_diff_run_rows(), *DIFF_ARMS).excluded == 4, (
         "fixture: the unguarded renderer WOULD print a clause for this model")
+    # The SOAK is here because the first version of this test listed three renderers by
+    # hand and missed the fourth (#361) — the same by-hand enumeration this whole file was
+    # written to end, recurring inside the fix for it. `build_diff_soak_report` needs
+    # `depth`, so it gets its own copies.
+    soak = {m: [dict(r, depth=1) for r in rows] for m, rows in results.items()}
     for text in (build_diff_report(results),
                  build_text_diff_report(results),
+                 build_diff_soak_report(soak),
                  build_terminal_diff_report(results, color=False)):
         block = text.split("Attrition of the paired exam", 1)[1]
         assert "diff_ok 5" in block
@@ -881,3 +912,22 @@ def test_a_run_with_no_control_arm_does_not_explain_the_control_arms_role():
         assert strip_markup(NO_CONTROL_ATTRITION_NOTE) in strip_markup(text)
         assert "only ever exclude on the CONTROL side" not in text
         assert "Where they failed** above" not in text
+
+
+def test_the_soaks_worked_example_is_produced_by_a_fixture_not_asserted_in_prose():
+    """`deref 15/15` is quoted as fact in `build_diff_soak_report`'s comment, in a test
+    docstring and in the CHANGELOG — and nothing in the tree produced it (#361). A comment
+    asserting a countable fact is a test, so it is executed here: 3 depths x 5 `deref`
+    questions, all lost by the diff arm, against 3 x 20 clean `count` questions."""
+    rows = []
+    for depth in (1, 3, 5):
+        rows += [{"qid": f"c{depth}_{i}", "qtype": "count", "trials": 3, "attempts": 6,
+                  "depth": depth, "diff_ok": 3, "terse_ok": 3,
+                  "diff_trials": 3, "terse_trials": 3} for i in range(20)]
+        rows += [{"qid": f"d{depth}_{i}", "qtype": "deref", "trials": 3, "attempts": 6,
+                  "depth": depth, "diff_ok": 2, "terse_ok": 3,
+                  "diff_trials": 2, "terse_trials": 3} for i in range(5)]
+    md = build_diff_soak_report({"m": rows})
+    assert "excluded 15/75 question(s)" in md
+    assert "by arm: diff_ok 15" in md
+    assert "deref 15/15, count 0/60" in md

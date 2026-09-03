@@ -13,6 +13,32 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `#299` disclosure guard was evadable by two idioms this package already uses, and
+  its own fix enumerated renderers by hand** (`#361`). No renderer emitted anything wrong —
+  what was wrong is the test meant to keep it that way, and three claims made about it.
+  `_call_graph` matched only `ast.FunctionDef` and only `ast.Name` callees, so a renderer
+  written as `from . import report` + `report.arm_gap(...)` (the idiom in 11 modules here,
+  including `cli.py`'s own `dropeval.run_drop_fluency(...)`) or as an `async def` was
+  invisible to it: both pass the entire suite as silent paired renderers, and both are now
+  caught. What it still cannot see is recorded rather than implied away — a renderer not
+  named `build_*`, and one defined outside `src/terse`. The diff-SOAK's `is_diff_run` guard
+  was pinned by nothing: dropping it survived all 1852 tests and is not an equivalent
+  mutant — with a fluency-shaped model in the same result set it renders a selection-bias
+  clause about a `diff_ok`/`terse_ok` pairing that was never performed. That test had
+  listed three renderers by hand and missed the fourth, which is the failure mode `#360`'s
+  entry claims to have ended, recurring inside the fix for it. `_CANNOT_EXCLUDE`'s premise
+  was guarded in one direction only: `_arm_attempts` prefers `<arm>_attempts` over
+  `trials`, so `codeceval` emitting that key would make exclusion possible with the
+  `_trials` lines untouched and leave `build_codec_verdict_report` a genuinely silent
+  paired renderer still sitting in the exemption. Finally `deref 15/15` was quoted as fact
+  in a comment, a test docstring and this changelog while nothing in the tree produced it;
+  it is true (measured `excluded 15/75 — by arm: diff_ok 15; by kind: deref 15/15,
+  count 0/60`) and is now produced by a fixture instead of remembered.
+
+## [0.30.0] - 2026-09-02
+
 ### Added
 
 - **The fluency and dropeval reports publish the attrition of their paired exam, per arm and
