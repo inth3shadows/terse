@@ -15,6 +15,39 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **The `regressions` and `recovered` columns divided by a denominator none of the
+  accuracies beside them use** (`#353`). Both compared `<arm>_ok` to the row's shared
+  `trials`, which for a `score_pack` row is `max(...)` across forms (`fluency/pack.py`) —
+  the documented `#91` uneven-collection mode, where a hand-built pack may carry 3 raw
+  replies and 2 terse ones for the same question. An arm that answered every reply it was
+  actually given then read as incomplete: 24 questions, every arm full, printed **24
+  regressions out of 24 beside a 100% terse accuracy**. `regressions` is the column a
+  reader scans to decide whether the compressed form costs comprehension, so the row
+  argued against itself in the one place it is read. Each arm is now counted against its
+  own `<arm>_trials`, the denominator `_form_stats` and (since `#283`) `paired_rows`
+  already use, falling back to the shared count so result files predating the per-arm
+  counters read as they did. An arm with **zero** collected trials is explicitly not
+  complete: `0 == 0` would report every question as a regression against a control that
+  never ran, which `fluency/scoring.py` produces for a responses file missing a form
+  entirely. The issue named the fluency table; the diff report carried a **second
+  hardcoded copy** of the same arithmetic (`terse_ok`/`diff_ok`) with the identical
+  defect, and it is fixed too — two copies of one rule is the shape that produced `#299`.
+  The suffix-swap derivation, which `_trials_keys` already claimed to be "the one place
+  that mapping is written" while `_form_stats` and `arm_measured` both spelled it inline,
+  now lives only in `_trials_key`, and an AST guard fails if a second copy appears in any
+  spelling — a substring count, the first attempt, both accused docstrings that quote the
+  derivation and missed `f.replace("_ok", "_trials")`.
+
+  Scope of "reads as before": exact for files predating `#263` (no per-arm counters at
+  all). A file written **between** `#263` and `#283` — per-arm counters but no `attempts`
+  key — does change, because `_paired_partition` keeps every such row unconditionally; an
+  arm that lost a call there previously read as a regression and now does not. That is the
+  corrected reading, not a regression: a call that never happened is not a wrong answer.
+
+## [0.30.1] - 2026-09-02
+
+### Fixed
+
 - **The `#299` disclosure guard was evadable by two idioms this package already uses, and
   its own fix enumerated renderers by hand** (`#361`). No renderer emitted anything wrong —
   what was wrong is the test meant to keep it that way, and three claims made about it.
