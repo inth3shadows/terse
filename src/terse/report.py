@@ -3025,35 +3025,52 @@ def render_drop_coverage(coverage: list[dict]) -> str:
     specifically to verify that tool's drop got a clean-looking pass that had never tested
     it, with no way to tell "passed" from "never ran" (#375).
 
+    Only tools that were UNDER test are itemized — those whose rule marks something
+    drop-to-retrieve. A real corpus is overwhelmingly tools that are not (1,092 of 1,515
+    skipped payloads on the session corpus), and itemizing those buries the handful of rows
+    an operator can act on under a wall of "this tool has no drop configured", which is not
+    news. They are still counted, on one line, so the section accounts for every payload.
+
     Rendered as its own section rather than folded into the results table on purpose:
     these rows have no scores, and giving them a 0% would assert a measurement that was
     never taken."""
     if not coverage:
         return ""
-    from .dropeval import DROP_SKIP_REASONS
+    from .dropeval import DROP_SKIP_REASONS, NOT_UNDER_TEST
 
-    grouped: dict[tuple[str, str], int] = {}
-    for row in coverage:
-        key = (row["tool"], row["reason"])
-        grouped[key] = grouped.get(key, 0) + 1
-    out = ["## Not evaluated", "",
-           f"{len(coverage)} payload(s) produced no drop question, so nothing below was",
-           "measured for them. This is NOT a pass — it is an absence of evidence.", ""]
-    width = max(len(t) for t, _ in grouped)
-    # Passthrough first: it is the one reason that means the RULE is wrong rather than the
-    # payload being unsuitable, and the one an operator can act on immediately.
-    order = sorted(grouped.items(),
-                   key=lambda kv: (kv[0][1] != "passthrough_tiers", kv[0][0], kv[0][1]))
-    for (tool, reason), n in order:
-        out.append(f"  {tool:<{width}}  {n:>3} payload(s)  {reason} — "
-                   f"{DROP_SKIP_REASONS.get(reason, '?')}")
-    if any(r == "passthrough_tiers" for _, r in grouped):
-        out += ["",
-                "A `passthrough_tiers` row means the rule under test carries a drop selector",
-                "AND `tiers: []`, which suppresses the drop step entirely — so the selector",
-                "cannot fire as written. Set that rule's tiers (and check `terse stats`: a tool",
-                "with real live traffic may already be compressing under your deployed policy)."]
-    out.append("")
+    under_test = [r for r in coverage if r["reason"] not in NOT_UNDER_TEST]
+    out = ["## Not evaluated", ""]
+    if under_test:
+        out += [f"{len(under_test)} payload(s) carry a drop selector but produced no",
+                "question, so nothing below was measured for them. This is NOT a pass —",
+                "it is an absence of evidence.", ""]
+        grouped: dict[tuple[str, str], int] = {}
+        for row in under_test:
+            key = (row["tool"], row["reason"])
+            grouped[key] = grouped.get(key, 0) + 1
+        width = max(len(t) for t, _ in grouped)
+        # Passthrough first: it is the one reason that means the RULE is wrong rather than
+        # the payload being unsuitable, and the one an operator can act on immediately.
+        order = sorted(grouped.items(),
+                       key=lambda kv: (kv[0][1] != "passthrough_tiers", kv[0][0], kv[0][1]))
+        for (tool, reason), n in order:
+            out.append(f"  {tool:<{width}}  {n:>3} payload(s)  {reason} — "
+                       f"{DROP_SKIP_REASONS.get(reason, '?')}")
+        if any(r == "passthrough_tiers" for _, r in grouped):
+            out += ["",
+                    "A `passthrough_tiers` row means the rule under test carries a drop "
+                    "selector",
+                    "AND `tiers: []`, which suppresses the drop step entirely — so the "
+                    "selector",
+                    "cannot fire as written. Set that rule's tiers (and check `terse stats`: "
+                    "a tool",
+                    "with real live traffic may already be compressing under your deployed "
+                    "policy)."]
+        out.append("")
+    rest = len(coverage) - len(under_test)
+    if rest:
+        out += [f"({rest} further payload(s) were never under test — their rule marks "
+                f"nothing drop-to-retrieve.)", ""]
     return "\n".join(out)
 
 

@@ -13,7 +13,34 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- `tune --drop-eval` evaluated a drop suggestion attached to a `tiers: []` rule to
+  **zero questions, with no disclosure** (#375). `generate_policy` attaches
+  `_suggested_fields` to a tool that scored under `--threshold`, whose `tiers` is
+  therefore `[]`; `activate_suggestions` promoted the fields but left the tiers, and
+  `policy.apply` reads `tiers: []` as an explicit hands-off passthrough and returns
+  before the drop step. The tool appeared nowhere in the report — a run that never
+  tested it read exactly like a run it passed. `activate_suggestions` now restores the
+  doc's `defaults.tiers` on an entry it promotes a suggestion onto (the in-memory eval
+  copy only — the disk path's `_keep_lossy_inert` refusal is unchanged), and the run
+  names the lifted rules before printing its verdict.
+
+### Added
+
+- The drop-eval discloses what it could not measure. Every "nothing to test" exit now
+  carries a `DROP_SKIP_REASONS` key, `tiers: []` is checked at the source instead of
+  hiding inside `policy.apply`'s `skipped` flag alongside a dozen unrelated conditions,
+  and a new **Not evaluated** report section lists the skipped payloads per tool with
+  the reason — the same principle as `_unmeasured` (#352). `run_drop_fluency` and the
+  new `drop_eval_coverage` share one `_probe_envelope`, so they cannot disagree about
+  which payloads were evaluated.
+
+### Changed
+
+- A `_suggested_fields_note` on a passthrough rule now says that renaming the block
+  alone enables nothing, and points at `terse stats` — a tool with real live traffic may
+  already be compressing under the deployed policy (#274's cross-check, #375).
 
 ## [0.30.6] - 2026-09-03
 

@@ -120,6 +120,15 @@ DROP_SKIP_REASONS: dict[str, str] = {
     "no_anchor_line": "no line in the dropped span is unique enough to anchor a question",
 }
 
+# The two reasons that mean the tool was never UNDER test — its rule marks nothing
+# drop-to-retrieve at all — as opposed to "it was under test and yielded nothing", which is
+# what #375 is about. A real corpus is overwhelmingly the former (1,515 of 1,524 envelopes
+# on the session corpus), so a report that itemizes both buries the handful of rows an
+# operator can act on. `report.render_drop_coverage` itemizes the rest and collapses these
+# into one line; `drop_eval_coverage` still returns every row, so the partition is a
+# presentation choice a caller can override rather than data thrown away.
+NOT_UNDER_TEST = ("no_drop_spec", "no_text_drop_spec")
+
 
 class DropProbe(NamedTuple):
     """What a payload yielded when asked for drop questions.

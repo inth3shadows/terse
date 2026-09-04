@@ -188,6 +188,34 @@ def test_the_rendered_section_names_the_tool_the_count_and_the_remedy():
     assert text.index("passthrough_tiers") < text.index("size_floor")
 
 
+def test_a_tool_that_was_never_under_test_is_counted_not_itemized():
+    """The section has to stay readable to stay useful. On the real session corpus 1,092 of
+    1,515 skipped payloads are tools with no drop selector at all — itemizing those buries
+    the handful an operator can act on under a wall of "this tool has no drop configured".
+    They are still COUNTED, so the section accounts for every payload and the collapse
+    cannot be used to hide something."""
+    text = render_drop_coverage(
+        [{"tool": "kb.read.list_principles", "server": "kb", "sha": "a",
+          "reason": "passthrough_tiers"}]
+        + [{"tool": f"boring{i}", "server": None, "sha": str(i), "reason": "no_drop_spec"}
+           for i in range(9)])
+    assert "kb.read.list_principles" in text
+    assert "boring3" not in text                    # collapsed, not itemized
+    assert "9 further payload(s)" in text           # but accounted for
+    assert "1 payload(s) carry a drop selector" in text
+
+
+def test_a_run_whose_every_skip_is_out_of_scope_still_renders_the_count():
+    """The all-collapsed case must not produce a section that claims something was under
+    test when nothing was — the "NOT a pass" sentence is a real claim and belongs only
+    where it is true."""
+    text = render_drop_coverage(
+        [{"tool": "t", "server": None, "sha": "a", "reason": "no_drop_spec"}])
+    assert "1 further payload(s)" in text
+    assert "NOT a pass" not in text
+    assert "carry a drop selector" not in text
+
+
 def test_coverage_and_the_scored_run_never_disagree_about_a_payload():
     """The shared-probe invariant. Two loops deciding "was this evaluated?" independently
     is the defect class this issue is about, so the property is pinned directly: every
