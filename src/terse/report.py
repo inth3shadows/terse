@@ -12,7 +12,7 @@ Honesty requirements (plan Section 7, principle #24):
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from enum import IntEnum
 from types import MappingProxyType
 from typing import Any, Literal, NamedTuple, TypeGuard, assert_never
@@ -1913,7 +1913,8 @@ def dropeval_exclusion_bullets(v: DropevalVerdict) -> list[str]:
     return out
 
 
-def dropeval_next_step_line(v: DropevalVerdict) -> str:
+def dropeval_next_step_line(v: DropevalVerdict,
+                            tiers_restored: Sequence[str] = ()) -> str:
     """What `terse tune --drop-eval` should tell the operator to do with the policy.
 
     A separate sentence from `dropeval_directive_line` because it is about the POLICY FILE,
@@ -1924,12 +1925,27 @@ def dropeval_next_step_line(v: DropevalVerdict) -> str:
     `**PASS**` headlines under a verdict that authorizes nothing — and the reader following
     the instruction enables the drops the report just refused. That is #344's critical
     finding wearing a renderer's clothes, and no property could catch it here, because the
-    sentence was not derived from the verdict at all."""
-    if v.directive is Directive.SHIP:
-        return ("The verdict authorizes it: enable the verified fields by renaming that "
-                "tool's '_suggested_fields' -> 'fields' in the policy.")
-    return ("The verdict does NOT authorize enabling these drops — see the last bullet "
-            "above for what is missing. Leave '_suggested_fields' as it is until it does.")
+    sentence was not derived from the verdict at all.
+
+    `tiers_restored` is `policy_gen.activate_suggestions`'s lifted rules — the ones whose
+    `tiers: []` the eval had to fill in to measure anything (#375). For those, the rename
+    this sentence prescribes is NOT sufficient: `tiers: []` is an explicit passthrough that
+    suppresses the drop step, so renaming alone reproduces the exact defect #375 fixed,
+    restated as an instruction the operator was told to follow. Passed in for the same
+    reason the directive is: a caveat printed once, hundreds of report lines earlier, is
+    not a caveat the reader has when they act on this line."""
+    if v.directive is not Directive.SHIP:
+        return ("The verdict does NOT authorize enabling these drops — see the last bullet "
+                "above for what is missing. Leave '_suggested_fields' as it is until it does.")
+    line = ("The verdict authorizes it: enable the verified fields by renaming that "
+            "tool's '_suggested_fields' -> 'fields' in the policy.")
+    if tiers_restored:
+        line += (" NOT sufficient on its own for " + ", ".join(sorted(tiers_restored))
+                 + ": the eval had to fill in their 'tiers': [] to measure anything, so the "
+                 "rename must be accompanied by setting tiers — otherwise the passthrough "
+                 "suppresses the drop and nothing changes. Check `terse stats` for those "
+                 "tools first; a tool with real live traffic may already be compressing.")
+    return line
 
 
 def dropeval_directive_line(v: DropevalVerdict) -> str:
@@ -3012,6 +3028,74 @@ def _per_transform_table(results: dict, summary: dict[str, dict[str, float]]) ->
         out.append(f"| {tf} | {len(rs)} | {tacc:.0%} | {p_cell} |")
     out.append("")
     return out
+
+
+def render_drop_coverage(coverage: list[dict]) -> str:
+    """Render the payloads the drop-eval could NOT pose a question about, grouped by tool
+    and reason. `coverage` is `dropeval.drop_eval_scope(...)`'s rows. "" when nothing was
+    skipped — a fully-covered run says nothing rather than printing an empty table.
+
+    Same principle as `_unmeasured` (#352): a run that could not measure something must
+    say so rather than omit it. Before this, a tool whose rule was `tiers: []` produced
+    zero questions and appeared NOWHERE in the report — an operator who ran the eval
+    specifically to verify that tool's drop got a clean-looking pass that had never tested
+    it, with no way to tell "passed" from "never ran" (#375).
+
+    Only tools that were UNDER test are itemized — `under_test`, which the probe reads off
+    the RULE. A real corpus is overwhelmingly tools that are not (1,089 of 1,515 skipped
+    payloads on the session corpus), and itemizing those buries the handful of rows an
+    operator can act on under a wall of "this tool has no drop configured", which is not
+    news. They are still counted, on one line, so the section accounts for every payload.
+
+    The partition was originally keyed on the REASON, which printed a false sentence over
+    real rows — see `dropeval.rule_is_under_test`, which now decides it from the rule and
+    stamps `under_test` on every row. Required, not defaulted: a missing key would silently
+    pick a side, and picking the wrong one is exactly the lie this replaced.
+
+    Rendered as its own section rather than folded into the results table on purpose:
+    these rows have no scores, and giving them a 0% would assert a measurement that was
+    never taken."""
+    if not coverage:
+        return ""
+    from .dropeval import DROP_SKIP_REASONS
+
+    under_test = [r for r in coverage if r["under_test"]]
+    out = ["## Not evaluated", ""]
+    if under_test:
+        out += [f"{len(under_test)} payload(s) carry a drop selector but produced no",
+                "question, so nothing below was measured for them. This is NOT a pass —",
+                "it is an absence of evidence.", ""]
+        # Keyed on the DETAIL too, so a reason with more than one cause (`not_compressible`)
+        # renders the specific `policy.apply` warning instead of collapsing two different
+        # structural refusals into one count.
+        grouped: dict[tuple[str, str, str], int] = {}
+        for row in under_test:
+            key = (row["tool"], row["reason"], row.get("detail") or "")
+            grouped[key] = grouped.get(key, 0) + 1
+        width = max(len(t) for t, _, _ in grouped)
+        # Passthrough first: it is the one reason that means the RULE is wrong rather than
+        # the payload being unsuitable, and the one an operator can act on immediately.
+        order = sorted(grouped.items(),
+                       key=lambda kv: (kv[0][1] != "passthrough_tiers", kv[0][0], kv[0][1]))
+        for (tool, reason, detail), n in order:
+            out.append(f"  {tool:<{width}}  {n:>3} payload(s)  {reason} — "
+                       f"{detail or DROP_SKIP_REASONS.get(reason, '?')}")
+        if any(r == "passthrough_tiers" for _, r, _ in grouped):
+            out += ["",
+                    "A `passthrough_tiers` row means the rule under test carries a drop "
+                    "selector",
+                    "AND `tiers: []`, which suppresses the drop step entirely — so the "
+                    "selector",
+                    "cannot fire as written. Set that rule's tiers (and check `terse stats`: "
+                    "a tool",
+                    "with real live traffic may already be compressing under your deployed "
+                    "policy)."]
+        out.append("")
+    rest = len(coverage) - len(under_test)
+    if rest:
+        out += [f"({rest} further payload(s) were never under test — their rule marks "
+                f"nothing drop-to-retrieve.)", ""]
+    return "\n".join(out)
 
 
 def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:

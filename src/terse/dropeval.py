@@ -31,7 +31,7 @@ import urllib.request
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import capture, fluency
 from . import lossy as lossy_mod
@@ -92,6 +92,75 @@ class DropQuestion:
 # answers are the full original value (arbitrary JSON) -> "deref" (JSON value-equality,
 # prose-tolerant). Precision reuses fluency's "count" question verbatim -> "count".
 _QTYPE_FOR_KIND = {"recall": "deref", "precision": "count"}
+
+
+# --------------------------------------------------------------------------- #
+# Why a payload produced no questions — the disclosure half of #375
+# --------------------------------------------------------------------------- #
+# Every "nothing to test" exit below used to be a bare `return [], None, None`, and the
+# caller could not tell them apart. That is the same defect `_unmeasured` exists to close
+# on the reporting side (#352): a run that COULD NOT measure something must say so rather
+# than omit it. Without this, a `tune --drop-eval` on a `tiers: []` rule printed a clean
+# report that mentioned the tool nowhere — indistinguishable from "it passed".
+#
+# The reasons are deliberately a closed vocabulary rather than free text: they are counted
+# and rendered per-tool, and a free-form string would fragment those counts on wording.
+DROP_SKIP_REASONS: dict[str, str] = {
+    "no_drop_spec": "rule marks no field drop-to-retrieve",
+    "passthrough_tiers": "rule is 'tiers': [] (explicit passthrough) — the drop step never runs",
+    "not_record_shaped": "payload has no record list terse would drop into",
+    "size_floor": "every candidate value fell under the drop size floor, or the loss gate failed",
+    "not_compressible": "terse passes this payload through untouched, so no drop step runs",
+    "no_id_column": "no unique scalar id column to address a record by",
+    "no_marker_landed": "no drop-marked field produced a committed handle",
+    "value_visible": "the dropped value also appears in the retained text (question would leak)",
+    "no_count_anchor": "no count question available as the no-over-fetch anchor",
+    "no_text_drop_spec": "rule marks no text span drop-to-retrieve",
+    "no_text_marker": "the text transform emitted no omitted-block marker",
+    "span_too_small": "the dropped span has fewer than 3 readable lines",
+    "no_anchor_line": "no line in the dropped span is unique enough to anchor a question",
+}
+
+
+def rule_is_under_test(rule: Any) -> bool:
+    """Does `rule` mark ANYTHING drop-to-retrieve — a JSON field or a text span?
+
+    The predicate that decides whether a skipped payload is news. Read off the RULE, not
+    off the skip reason (review finding): `no_text_drop_spec` means "no TEXT selector", and
+    a non-JSON payload of a tool whose rule carries `result[].body: drop-to-retrieve` earns
+    exactly that reason while its rule very much does mark something drop-to-retrieve.
+    Classifying by reason therefore printed "their rule marks nothing drop-to-retrieve"
+    over rows where that is false — measured on the session corpus at 3 rows
+    (`kb.read.list_decisions`, `kb.read.list_principles`, `kb.read.similar_sessions`), which
+    the fix moves from the collapsed count into the itemized table: 1,089 of 1,515 skipped
+    payloads are genuinely not under test, not 1,092. A disclosure feature that states a
+    false reason is worse than one that stays quiet."""
+    return bool(lossy_mod._drop_specs(rule) or lossy_mod._text_drop_specs(rule))
+
+
+class DropProbe(NamedTuple):
+    """What a payload yielded when asked for drop questions.
+
+    `applied`/`staging` are meaningful ONLY when `questions` is non-empty; `reason` is the
+    mirror image — a `DROP_SKIP_REASONS` key exactly when `questions` is empty. Replaces a
+    bare 3-tuple whose empty case carried no explanation at all (#375).
+
+    `detail` carries `policy.apply`'s own warning for a reason that has more than one
+    possible cause, so the closed vocabulary stays closed while the operator still gets the
+    specific sentence. Empty for every reason that names its cause exactly."""
+
+    questions: list[DropQuestion]
+    applied: policy_mod.Applied | None
+    staging: dict[str, Any] | None
+    reason: str | None
+    detail: str = ""
+
+
+def _no_probe(reason: str, detail: str = "") -> DropProbe:
+    """A `DropProbe` for a payload with nothing testable, tagged with WHY."""
+    if reason not in DROP_SKIP_REASONS:      # not an `assert`: `python -O` would strip it,
+        raise KeyError(f"unknown drop-skip reason {reason!r}")   # and the table renders "?"
+    return DropProbe([], None, None, reason, detail)
 
 
 def _staged_apply(obj: Any, rule: Any, tool: str) -> tuple[policy_mod.Applied, dict[str, Any]]:
@@ -206,9 +275,7 @@ def _line_recall_question(handle: str, anchor: str, target: str) -> DropQuestion
     )
 
 
-def _text_questions_and_staging(
-    raw: str, rule: Any, tool: str
-) -> tuple[list[DropQuestion], policy_mod.Applied | None, dict[str, Any] | None]:
+def _text_questions_and_staging(raw: str, rule: Any, tool: str) -> DropProbe:
     """The `_questions_and_staging` analogue for a span-addressed text payload.
 
     The stakes differ from the JSON case and the questions are built to match. A dropped
@@ -222,22 +289,28 @@ def _text_questions_and_staging(
     so any retrieve call here is a pure over-fetch). Both come from `apply()`'s own sink.
     """
     if not lossy_mod._text_drop_specs(rule):
-        return [], None, None  # no text selector on this rule -> nothing to test
+        return _no_probe("no_text_drop_spec")
+
+    # Checked BEFORE `_staged_apply_text`, not folded into its `skipped` result: `apply`
+    # returns `skipped=True` for a dozen unrelated reasons, and #375 is precisely the case
+    # where "the operator's rule says passthrough" was invisible inside that bucket.
+    if not getattr(rule, "tiers", ()):
+        return _no_probe("passthrough_tiers")
 
     applied, staging = _staged_apply_text(raw, rule, tool)
     if applied.text == raw or not staging:
-        return [], None, None  # every span was under the size floor, or the gate failed
+        return _no_probe("size_floor")
 
     markers = lossy_mod._TEXT_MARKER_RE.findall(applied.text)
     if not markers:
-        return [], None, None
+        return _no_probe("no_text_marker")
 
     # Pick the LARGEST dropped span: the one whose absence a model is most likely to try
     # to paper over from context instead of retrieving — the hardest honest case.
     handle = max(markers, key=lambda h: len(staging.get(h, "")))
     span = staging.get(handle)
     if not isinstance(span, str):
-        return [], None, None
+        return _no_probe("no_text_marker")
     # The target line is located by an ANCHOR — a line unique within the span — and not by
     # its ordinal. Asking for "non-blank line number 81 of 160" measured the wrong skill:
     # across 4 models and 49 answered questions, EVERY model retrieved the right block with
@@ -256,7 +329,7 @@ def _text_questions_and_staging(
     # deciding, and gutter-only lines stop being eligible as anchor or target as well.
     lines = [ln for ln in span.splitlines() if _GUTTER_RE.sub("", ln).strip()]
     if len(lines) < 3:
-        return [], None, None  # too small to pose a non-trivial recall question
+        return _no_probe("span_too_small")  # too small for a non-trivial recall question
     # Scan from the midpoint (fences and the first source line are the parts most likely to
     # be echoed by the retained prose) for the first line that occurs exactly once and is
     # followed by a different line — both properties are needed for the answer to be
@@ -272,7 +345,7 @@ def _text_questions_and_staging(
     pair = next(((lines[i], lines[i + 1]) for i in order
                  if counts[bare[i]] == 1 and lines[i + 1] != lines[i]), None)
     if pair is None:
-        return [], None, None  # no unambiguous anchor (e.g. every line identical)
+        return _no_probe("no_anchor_line")  # no unambiguous anchor (every line identical)
     anchor, target = pair
     recall_q = _line_recall_question(handle, anchor, target)
     # Anchored on the SUM of the visible markers' `bytes` fields, not the marker count:
@@ -291,44 +364,61 @@ def _text_questions_and_staging(
         needs_retrieve=False,
         expected_handle=None,
     )
-    return [recall_q, precision_q], applied, staging
+    return DropProbe([recall_q, precision_q], applied, staging, None)
 
 
 def gen_text_drop_questions(raw: str, rule: Any, tool: str) -> list[DropQuestion]:
     """One recall + one precision question for a text payload whose rule actually drops
     spans, else [] (nothing to test — same fail-closed honesty bar as the JSON path)."""
-    return _text_questions_and_staging(raw, rule, tool)[0]
+    return _text_questions_and_staging(raw, rule, tool).questions
 
 
 def run_drop_text_payload(raw: str, rule: Any, tool: str, answerer: ToolAnswerer,
                           trials: int = 1) -> list[dict]:
     """`run_drop_payload` for a non-JSON payload. [] when nothing was dropped."""
-    questions, applied, staging = _text_questions_and_staging(raw, rule, tool)
-    if not questions:
+    probe = _text_questions_and_staging(raw, rule, tool)
+    if not probe.questions:
         return []
-    assert applied is not None and staging is not None
-    return _run_questions_against(questions, applied, staging, answerer, trials=trials)
+    assert probe.applied is not None and probe.staging is not None
+    return _run_questions_against(probe.questions, probe.applied, probe.staging, answerer,
+                                  trials=trials)
 
 
-def _questions_and_staging(
-    obj: Any, rule: Any, tool: str
-) -> tuple[list[DropQuestion], policy_mod.Applied | None, dict[str, Any] | None]:
+def _questions_and_staging(obj: Any, rule: Any, tool: str) -> DropProbe:
     """Shared core of `gen_drop_questions`: generates the (recall, precision) question
     pair AND returns the `(applied, staging)` that `_staged_apply` computed along the
     way, so `run_drop_payload` can reuse them instead of a second `policy.apply()` pass
     over the same payload. `applied`/`staging` are only meaningful when the question
     list is non-empty — every early-exit path returns `None` for both instead of
-    fabricating a value the caller has no use for anyway."""
+    fabricating a value the caller has no use for anyway, and tags itself with a
+    `DROP_SKIP_REASONS` key so the caller can DISCLOSE the miss (#375)."""
     if not lossy_mod._drop_specs(rule):
-        return [], None, None  # nothing marked drop-to-retrieve on this rule -> nothing to test
+        return _no_probe("no_drop_spec")
+
+    # Checked BEFORE `_staged_apply`, not read off its `skipped` flag. `policy.apply`
+    # returns `skipped=True` for a dozen unrelated reasons (non-JSON, depth cap, marker
+    # collision, gate failure), and `tiers: []` was one indistinguishable member of that
+    # bucket — which is exactly how a drop suggestion attached to a passthrough rule got
+    # evaluated to zero with no disclosure (#375). Its own reason, checked at the source.
+    if not getattr(rule, "tiers", ()):
+        return _no_probe("passthrough_tiers")
 
     records, list_path = capture.find_record_list_with_path(obj)
     if records is None or list_path is None:
-        return [], None, None  # not record-shaped (or no simple field path) -> terse wouldn't drop here
+        return _no_probe("not_record_shaped")
 
     applied, staging = _staged_apply(obj, rule, tool)
-    if applied.skipped or not staging:
-        return [], None, None  # every candidate field was under the size floor, or the gate failed
+    # `applied.skipped` is NOT the size floor. Past the `tiers` pre-check above, `apply`
+    # still returns skipped for its structural passthrough guards — the depth cap and the
+    # reserved-marker collision (`policy.py`) — and reporting those as "fell under the drop
+    # size floor" tells an operator to lower `min`, which changes nothing on a payload
+    # terse refuses to compress at all (review finding). Same bucket-merging this issue
+    # carves `passthrough_tiers` out of, so it gets the same treatment: its own reason,
+    # carrying `apply`'s own warning as the specific cause.
+    if applied.skipped:
+        return _no_probe("not_compressible", "; ".join(applied.warnings))
+    if not staging:
+        return _no_probe("size_floor")
 
     # Intersection, not `records[0].keys()`: #204 widened `find_record_list_with_path` to
     # whatever the tabularizer folds, so a record may lack a key the first one has, and the
@@ -336,7 +426,7 @@ def _questions_and_staging(
     cols = fluency._intersection_cols(records)
     idcol = fluency._pick_id_col(records, cols)
     if idcol is None:
-        return [], None, None  # can't address a specific record without a unique scalar id column
+        return _no_probe("no_id_column")  # can't address a record without a unique scalar id
 
     # Find the (record, field) whose handle actually landed in `staging` — content-
     # addressed handles are deterministic (sha1 of tool+path+serialized value, no RNG),
@@ -364,7 +454,7 @@ def _questions_and_staging(
         if hit is not None:
             break
     if hit is None:
-        return [], None, None
+        return _no_probe("no_marker_landed")
     ri, field_name, value, handle = hit
 
     # Same bug class as the text path's ordinal-guessing and arithmetic/count leaks
@@ -382,7 +472,7 @@ def _questions_and_staging(
     # dropped value.
     needle = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
     if needle in applied.text:
-        return [], None, None
+        return _no_probe("value_visible")
 
     recall_q = DropQuestion(
         qid="drop-recall",
@@ -401,7 +491,7 @@ def _questions_and_staging(
     # the dropped value — a robust, deterministic no-overfetch probe.
     count_q = next((q for q in fluency.gen_questions(obj) if q.qtype == "count"), None)
     if count_q is None:
-        return [], None, None
+        return _no_probe("no_count_anchor")
     precision_q = DropQuestion(
         qid="drop-precision",
         kind="precision",
@@ -411,7 +501,7 @@ def _questions_and_staging(
         needs_retrieve=False,
         expected_handle=None,
     )
-    return [recall_q, precision_q], applied, staging
+    return DropProbe([recall_q, precision_q], applied, staging, None)
 
 
 def gen_drop_questions(obj: Any, rule: Any, tool: str) -> list[DropQuestion]:
@@ -421,8 +511,7 @@ def gen_drop_questions(obj: Any, rule: Any, tool: str) -> list[DropQuestion]:
     bar). Only a direct scalar field on the record list (e.g. `result[].body`) is
     supported in v1 — matches the drop path shapes exercised in test_proxy.py/#10.
     """
-    questions, _applied, _staging = _questions_and_staging(obj, rule, tool)
-    return questions
+    return _questions_and_staging(obj, rule, tool).questions
 
 
 # --------------------------------------------------------------------------- #
@@ -632,13 +721,42 @@ def run_drop_payload(obj: Any, raw: str, rule: Any, tool: str, answerer: ToolAns
     # questions were derived from, so this reuses _questions_and_staging's own
     # (applied, staging) rather than recomputing them with a second policy.apply() pass,
     # and rather than trusting a possibly-stale `raw`.
-    questions, applied, staging = _questions_and_staging(obj, rule, tool)
-    if not questions:
+    probe = _questions_and_staging(obj, rule, tool)
+    if not probe.questions:
         return []
-    assert applied is not None and staging is not None  # guaranteed when questions is non-empty
+    assert probe.applied is not None and probe.staging is not None  # non-empty questions
     ctl = _control_text(obj, rule, tool, is_json=True) if control else None
-    return _run_questions_against(questions, applied, staging, answerer, trials=trials,
-                                  control_text=ctl)
+    return _run_questions_against(probe.questions, probe.applied, probe.staging, answerer,
+                                  trials=trials, control_text=ctl)
+
+
+def _probe_envelope(env: dict, rule_for: Callable[..., Any]) -> tuple[DropProbe, Any, Any, bool]:
+    """Derive one corpus envelope's drop questions. Returns `(probe, rule, payload,
+    is_json)` — `payload` is the parsed object (JSON path) or the raw text (text path), so
+    a caller can build the control arm from the same value the probe used, and `rule` is
+    returned rather than re-resolved so `rule_for` is called EXACTLY once per envelope
+    (pinned by `test_drop_eval_looks_the_rule_up_the_way_the_proxy_does`).
+
+    The ONE place an envelope becomes a probe. `run_drop_fluency` (which runs models) and
+    `drop_eval_coverage` (which only reports what was skipped) both go through here, so a
+    payload can never be counted as skipped by one and evaluated by the other.
+
+    The rule is looked up the way the PROXY does — bare tool plus the recorded server. A
+    policy generated from a server-tagged corpus carries qualified rule names, so a
+    bare-name lookup falls through to the defaults, finds no `fields`, and the whole eval
+    silently scores nothing while still printing that it verified the drops (the #149
+    failure mode, one lookup removed)."""
+    tool = env["tool"]
+    rule = rule_for(tool, env.get("server"))
+    try:
+        obj = json.loads(env["raw"])
+    except (json.JSONDecodeError, TypeError):
+        # Not JSON: the span-addressed text path is the only one that can drop here. Same
+        # probe shape, so a text payload's results merge into the report exactly like a
+        # JSON one's — and its skip reasons into the coverage table the same way.
+        text_raw = env.get("raw") or ""
+        return _text_questions_and_staging(text_raw, rule, tool), rule, text_raw, False
+    return _questions_and_staging(obj, rule, tool), rule, obj, True
 
 
 def run_drop_fluency(envelopes: list[dict], rule_for: Callable[..., Any],
@@ -655,42 +773,58 @@ def run_drop_fluency(envelopes: list[dict], rule_for: Callable[..., Any],
     avoids M times the redundant parsing/policy.apply() work for M configured models."""
     results: dict[str, list[dict]] = {name: [] for name in answerers}
     for env in envelopes:
+        probe, rule, payload, is_json = _probe_envelope(env, rule_for)
+        if not probe.questions:
+            continue
+        assert probe.applied is not None and probe.staging is not None
         tool = env["tool"]
-        # Look the rule up the way the PROXY does — bare tool plus the recorded server. A
-        # policy generated from a server-tagged corpus carries qualified rule names, so a
-        # bare-name lookup falls through to the defaults, finds no `fields`, and the whole
-        # eval silently scores nothing while still printing that it verified the drops
-        # (the #149 failure mode, one lookup removed).
-        rule = rule_for(tool, env.get("server"))
-        try:
-            obj = json.loads(env["raw"])
-        except (json.JSONDecodeError, TypeError):
-            # Not JSON: the span-addressed text path is the only one that can drop here.
-            # Same envelope-outer/model-inner nesting and the same scored-row shape, so a
-            # text payload's results merge into the report exactly like a JSON one's.
-            text_raw = env.get("raw") or ""
-            questions, applied, staging = _text_questions_and_staging(text_raw, rule, tool)
-            if not questions:
-                continue
-            assert applied is not None and staging is not None
-            ctl = _control_text(text_raw, rule, tool, is_json=False) if control else None
-            for name, fn in answerers.items():
-                for row in _run_questions_against(questions, applied, staging, fn,
-                                                  trials=trials, control_text=ctl):
-                    results[name].append({"tool": tool, "sha": env.get("sha", "?"), **row})
-            continue
-        questions, applied, staging = _questions_and_staging(obj, rule, tool)
-        if not questions:
-            continue
-        assert applied is not None and staging is not None
         # Computed once per envelope, like the questions themselves — the control text is
         # the same regardless of which model answers it.
-        ctl = _control_text(obj, rule, tool, is_json=True) if control else None
+        ctl = _control_text(payload, rule, tool, is_json=is_json) if control else None
         for name, fn in answerers.items():
-            for row in _run_questions_against(questions, applied, staging, fn, trials=trials,
-                                              control_text=ctl):
+            for row in _run_questions_against(probe.questions, probe.applied, probe.staging,
+                                              fn, trials=trials, control_text=ctl):
                 results[name].append({"tool": tool, "sha": env.get("sha", "?"), **row})
     return results
+
+
+def drop_eval_scope(envelopes: list[dict],
+                    rule_for: Callable[..., Any]) -> tuple[set[str], list[dict]]:
+    """One pure pass over the corpus: `(measured_globs, coverage_rows)`.
+
+    `measured_globs` is the `tool_glob` of every RULE that produced at least one question —
+    which rules the eval is actually about to measure. `coverage_rows` is one row per
+    envelope that produced none, as `{"tool", "server", "sha", "reason", "detail",
+    "under_test"}`; `reason` is a `DROP_SKIP_REASONS` key and `under_test` is
+    `rule_is_under_test(rule)`, read off the rule rather than inferred from the reason.
+
+    Runs no model and makes no network call: the same `_probe_envelope` `run_drop_fluency`
+    uses, so the two cannot disagree about which payloads were skipped or why. That is the
+    point of the shared probe — a second hand-written loop here would be free to drift from
+    the one that actually decides, which is the class of defect this whole issue is about.
+
+    `measured_globs` exists because the pre-eval note promised more than the run delivered
+    (review finding): it announced three lifted rules "so the suggestion can actually fire",
+    and one of them (`codegraph.codegraph_explore`) scored ZERO — 61 of its 62 envelopes
+    carry no server, so the qualified rule is never selected for them (#149's class). A note
+    that can name the rules it will actually measure does not have to promise."""
+    measured: set[str] = set()
+    rows: list[dict] = []
+    for env in envelopes:
+        probe, rule, _payload, _is_json = _probe_envelope(env, rule_for)
+        if probe.reason is None:
+            measured.add(getattr(rule, "tool_glob", env["tool"]))
+            continue
+        rows.append({"tool": env["tool"], "server": env.get("server"),
+                     "sha": env.get("sha", "?"), "reason": probe.reason,
+                     "detail": probe.detail, "under_test": rule_is_under_test(rule)})
+    return measured, rows
+
+
+def drop_eval_coverage(envelopes: list[dict], rule_for: Callable[..., Any]) -> list[dict]:
+    """Just the coverage rows of `drop_eval_scope` — the disclosure half, for a caller that
+    does not need to know which rules were measured."""
+    return drop_eval_scope(envelopes, rule_for)[1]
 
 
 # --------------------------------------------------------------------------- #
