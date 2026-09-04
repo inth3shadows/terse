@@ -46,6 +46,19 @@ fails that pull request until the section has moved.
 - A `_suggested_fields_note` on a passthrough rule now says that renaming the block
   alone enables nothing, and points at `terse stats` — a tool with real live traffic may
   already be compressing under the deployed policy (#274's cross-check, #375).
+- `tune --drop-eval`'s pre-eval note no longer promises that lifting a rule's tiers makes
+  its suggestion fire. It separates the rules the corpus actually reaches ("measured
+  below") from the ones it does not ("lifted but STILL unmeasured") — on the session
+  corpus, `codegraph.codegraph_explore` is lifted and then scores zero, because 61 of its
+  62 envelopes carry no server and never select the qualified rule.
+- A payload `policy.apply` refuses structurally — past the depth cap, or carrying a
+  reserved terse marker key — is disclosed as `not_compressible` with `apply`'s own
+  warning, instead of `size_floor`, which told the operator to lower a `min` that changes
+  nothing.
+- The "never under test" collapse is decided from the RULE (`rule_is_under_test`), not
+  from the skip reason. `no_text_drop_spec` means "no *text* selector", so a non-JSON
+  payload of a tool whose rule carries a JSON drop spec was being collapsed under a
+  sentence that is false about it — 3 rows on the session corpus.
 
 ## [0.30.6] - 2026-09-03
 
