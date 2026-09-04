@@ -3014,6 +3014,49 @@ def _per_transform_table(results: dict, summary: dict[str, dict[str, float]]) ->
     return out
 
 
+def render_drop_coverage(coverage: list[dict]) -> str:
+    """Render the payloads the drop-eval could NOT pose a question about, grouped by tool
+    and reason. `coverage` is `dropeval.drop_eval_coverage(...)`'s rows. "" when nothing
+    was skipped — a fully-covered run says nothing rather than printing an empty table.
+
+    Same principle as `_unmeasured` (#352): a run that could not measure something must
+    say so rather than omit it. Before this, a tool whose rule was `tiers: []` produced
+    zero questions and appeared NOWHERE in the report — an operator who ran the eval
+    specifically to verify that tool's drop got a clean-looking pass that had never tested
+    it, with no way to tell "passed" from "never ran" (#375).
+
+    Rendered as its own section rather than folded into the results table on purpose:
+    these rows have no scores, and giving them a 0% would assert a measurement that was
+    never taken."""
+    if not coverage:
+        return ""
+    from .dropeval import DROP_SKIP_REASONS
+
+    grouped: dict[tuple[str, str], int] = {}
+    for row in coverage:
+        key = (row["tool"], row["reason"])
+        grouped[key] = grouped.get(key, 0) + 1
+    out = ["## Not evaluated", "",
+           f"{len(coverage)} payload(s) produced no drop question, so nothing below was",
+           "measured for them. This is NOT a pass — it is an absence of evidence.", ""]
+    width = max(len(t) for t, _ in grouped)
+    # Passthrough first: it is the one reason that means the RULE is wrong rather than the
+    # payload being unsuitable, and the one an operator can act on immediately.
+    order = sorted(grouped.items(),
+                   key=lambda kv: (kv[0][1] != "passthrough_tiers", kv[0][0], kv[0][1]))
+    for (tool, reason), n in order:
+        out.append(f"  {tool:<{width}}  {n:>3} payload(s)  {reason} — "
+                   f"{DROP_SKIP_REASONS.get(reason, '?')}")
+    if any(r == "passthrough_tiers" for _, r in grouped):
+        out += ["",
+                "A `passthrough_tiers` row means the rule under test carries a drop selector",
+                "AND `tiers: []`, which suppresses the drop step entirely — so the selector",
+                "cannot fire as written. Set that rule's tiers (and check `terse stats`: a tool",
+                "with real live traffic may already be compressing under your deployed policy)."]
+    out.append("")
+    return "\n".join(out)
+
+
 def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
     """Render the drop-to-retrieve behavioral eval: does a real tool-calling model call
     `terse.retrieve` when a dropped field is needed (recall), and leave it alone when it

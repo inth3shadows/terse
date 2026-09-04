@@ -993,9 +993,14 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
 
     from . import dropeval
     from .policy import load_policy
-    from .policy_gen import activate_suggestions
+    from .policy_gen import TIERS_RESTORED_KEY, activate_suggestions
     from .proxy import RETRIEVE_TOOL_DEF
-    from .report import build_dropeval_report, dropeval_next_step_line, dropeval_verdict
+    from .report import (
+        build_dropeval_report,
+        dropeval_next_step_line,
+        dropeval_verdict,
+        render_drop_coverage,
+    )
 
     answerers = _build_answerers(
         args,
@@ -1007,6 +1012,19 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
               "_MODELS (or --base-url/--models).", file=sys.stderr)
         return 1
     active = activate_suggestions(doc)
+    # Disclose the lift rather than let it be invisible. `activate_suggestions` restores
+    # default tiers on a `tiers: []` entry it promotes a suggestion onto (#375) — without
+    # that the eval measures nothing at all, but WITH it the eval is answering a slightly
+    # different question than the generated policy asks, and the operator has to be told
+    # which rules that applied to before reading the verdict as an endorsement.
+    lifted = sorted((e.get("match") or {}).get("tool", "?") for e in active.get("policies", [])
+                    if e.get(TIERS_RESTORED_KEY))
+    if lifted:
+        print(f"\nnote: {len(lifted)} rule(s) are 'tiers': [] (passthrough) in the generated "
+              f"policy, which suppresses the drop step entirely — the eval below restores "
+              f"default tiers for them so the suggestion can actually fire: "
+              f"{', '.join(lifted)}.\n      Enabling the suggestion on disk means setting "
+              f"tiers too; check `terse stats` for these tools first.")
     # Write inside the `with` (so the handle is CLOSED after it), then load by name: Windows
     # forbids reopening a temp file whose handle is still open, so a `delete=True` block that
     # loaded inside it would crash there. delete=False keeps the closed file for the reload.
@@ -1026,6 +1044,9 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
                                         trials=args.trials,
                                         control=not args.no_control)
     print("\n" + build_dropeval_report(results, accept_degraded=args.accept_degraded))
+    coverage = render_drop_coverage(dropeval.drop_eval_coverage(envelopes, pol.select))
+    if coverage:
+        print("\n" + coverage)
     # Read the DIRECTIVE, never re-derive it from the PASS lines above — see
     # `dropeval_next_step_line`, which owns the sentence and the reason.
     print(dropeval_next_step_line(dropeval_verdict(
@@ -1196,7 +1217,15 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         results = dropeval.run_drop_fluency(envelopes, pol.select, answerers,
                                             trials=args.trials,
                                             control=not args.no_control)
-        _write_report(build_dropeval_report(results, accept_degraded=args.accept_degraded),
+        # Appended to the SAME report, not printed beside it: a report written to `--out`
+        # and read later must carry its own coverage gaps, or a reader has no way to tell
+        # "this tool passed" from "this tool was never posed a question" (#375).
+        from .report import render_drop_coverage
+
+        coverage = render_drop_coverage(
+            dropeval.drop_eval_coverage(envelopes, pol.select))
+        _write_report(build_dropeval_report(results, accept_degraded=args.accept_degraded)
+                      + ("\n" + coverage if coverage else ""),
                       args.out)
         if args.bars:
             print("\n" + build_terminal_dropeval_report(results,

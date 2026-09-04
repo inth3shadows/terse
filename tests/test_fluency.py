@@ -791,5 +791,5 @@ def test_drop_questions_survive_records_with_differing_key_sets():
 
     rule = Rule(tool_glob="*", tiers=("minify", "tabularize"),
                 fields={"data.result[].body": {"lossy": "drop-to-retrieve", "min": 100}})
-    qs, _applied, _staging = dropeval._questions_and_staging(_NON_UNIFORM, rule, "t.x")
+    qs = dropeval._questions_and_staging(_NON_UNIFORM, rule, "t.x").questions
     assert isinstance(qs, list)   # must not raise; content depends on the drop gate

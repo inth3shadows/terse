@@ -111,20 +111,46 @@ _DROP_MIN_UNIQ_RATIO = 0.9   # near-unique: the dictionary tier can't fold it, s
 _DROP_MIN_SHARE = 0.10       # worth a retrieve round-trip: >=10% of the record list's tokens
 
 
+# Marker left on an eval-only entry whose `tiers: []` this function had to lift. Read by
+# `cli._tune_drop_eval` so the run DISCLOSES that it did not evaluate the rule as written.
+# Underscore-prefixed like every other annotation key, so `load_policy` ignores it.
+TIERS_RESTORED_KEY = "_tiers_restored_for_eval"
+
+
 def activate_suggestions(doc: dict) -> dict:
     """Return a deep COPY of a generated policy doc with every entry's INACTIVE
     `_suggested_fields` promoted to active `fields` (merged over any existing fields), and
     the `_suggested_fields_note` dropped. Used by `terse tune --drop-eval` to verify the
     suggested drops AS IF enabled, without mutating the doc written to disk (which stays
-    inactive until the operator opts in). Pure — no I/O."""
+    inactive until the operator opts in). Pure — no I/O.
+
+    A promoted entry whose `tiers` is EMPTY also gets the doc's `defaults.tiers` restored
+    (#375). `policy.apply` treats `tiers: []` as an explicit hands-off passthrough and
+    returns before any drop runs, so promoting a suggestion onto such an entry produced a
+    rule that drops nothing: the drop-eval posed zero questions for that tool and reported
+    neither a pass nor a failure for it. Promoting the field but not the tiers evaluates a
+    configuration no operator would ever deploy — a lossy selector on a passthrough rule is
+    a contradiction `apply` itself warns about — so the question this eval exists to answer
+    ("if I enabled this drop, does the model still answer?") requires both halves.
+
+    Scoped deliberately to this in-memory eval COPY. The disk-writing path does the
+    opposite on purpose: `_keep_lossy_inert` refuses to let a merge flip `tiers: []` on,
+    because that would put a lossy transform live without the operator asking. Verifying a
+    suggestion and deploying it are different acts; only the second needs that refusal.
+    """
     import copy
 
     out = copy.deepcopy(doc)
+    default_tiers = (doc.get("defaults") or {}).get("tiers") or list(policy_mod.DEFAULT_TIERS)
     for entry in out.get("policies", []):
         sug = entry.pop("_suggested_fields", None)
         entry.pop("_suggested_fields_note", None)
-        if sug:
-            entry["fields"] = {**entry.get("fields", {}), **sug}
+        if not sug:
+            continue
+        entry["fields"] = {**entry.get("fields", {}), **sug}
+        if not entry.get("tiers"):
+            entry[TIERS_RESTORED_KEY] = True
+            entry["tiers"] = list(default_tiers)
     return out
 
 
@@ -789,12 +815,21 @@ def generate_policy(
                        "reveal its role, so dropping it forces the model to call retrieve for "
                        "it; treat [prose] as safer and verify any [unknown] before enabling."
                        if has_unknown else "")
+            # A suggestion on a `tiers: []` rule CANNOT fire by renaming alone: `apply`
+            # reads `tiers: []` as an explicit hands-off passthrough and returns before the
+            # drop step, so the promoted selector would silently never run (#375). Say so
+            # here rather than let the operator discover it as a drop that changes nothing.
+            inert = ("" if r["tiers"] else
+                     " NOTE: this rule is 'tiers': [] (passthrough), so renaming ALONE "
+                     "enables nothing — 'tiers': [] suppresses the drop step entirely. "
+                     "Set tiers as well, and check `terse stats` first: a tool with real "
+                     "live traffic may already be compressing under your deployed policy.")
             entry["_suggested_fields"] = r["drop_suggestion"]
             entry["_suggested_fields_note"] = (
                 f"LOSSY drop-to-retrieve candidates (large + near-unique; safe-first, [role] "
                 f"guessed from the field name): {shares}. Rename '_suggested_fields' -> "
                 f"'fields' to enable, then confirm the model still answers with `terse fluency "
-                f"--drop-eval`. Off until you do.{caution}")
+                f"--drop-eval`. Off until you do.{caution}{inert}")
         policies.append(entry)
 
     any_drops = any(r.get("drop_suggestion") for r in rows)
