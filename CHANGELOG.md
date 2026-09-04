@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.30.6] - 2026-09-03
+
 ### Fixed
 
 - **`_unmeasured` saw dropeval's control arm but not its treatment arm, so the same
