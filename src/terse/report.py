@@ -547,7 +547,7 @@ UNMEASURED_FAIL_SHARE = 0.20
 def _unmeasured(rows: list[dict]) -> bool:
     """True when transport failures make this model's numbers untrustworthy.
 
-    THREE independent triggers, because they fail differently:
+    FOUR independent triggers, because they fail differently:
       1. any arm with ZERO completed trials THAT WAS ACTUALLY ATTEMPTED — that arm cannot
          be computed at all, and `_form_stats` would report it as a flat 0.0 indistinguishable
          from real failure. An arm nobody collected (a `score_pack` responses file with no
@@ -563,6 +563,16 @@ def _unmeasured(rows: list[dict]) -> bool:
          permanently blind to that harness and a substantially-down codec backend would
          publish a confident SAFE. Review finding on #339 (verified by execution:
          `codec_verdict` returned SAFE at 68% call-loss without this trigger).
+      4. more than `UNMEASURED_FAIL_SHARE` of ONE arm's own calls lost, where the emitter
+         states that loss EXPLICITLY as `<arm>_errors` instead of by shrinking
+         `<arm>_trials` (#352). Trigger 2 reads loss as `attempts - <arm>_trials`, so an
+         arm with no `_trials` key of its own is invisible to it — and `dropeval`'s
+         treatment arm is exactly that, deliberately (`dropeval.py:580-600`: errored
+         trials must stay in the accuracy denominator, because scoring them as misses
+         makes the drop rule look worse, which is the conservative direction). The result
+         was one-sided: `_unmeasured` withheld a dropeval run for control-arm loss and
+         stayed silent for the identical loss on the treatment arm, leaving only
+         `inconclusive_models`' arm-blind 50%-pooled gate as cover.
     """
     if not rows:
         return False
@@ -616,6 +626,71 @@ def _unmeasured(rows: list[dict]) -> bool:
         if not arm_attempts:
             continue
         lost = sum(max(0, a - t) for a, t in per_row)
+        if lost / arm_attempts > UNMEASURED_FAIL_SHARE:
+            return True
+    # #352: the same share, for an arm that reports its loss EXPLICITLY rather than by
+    # shrinking its `<arm>_trials`. The loop above can only see loss as
+    # `attempts - <arm>_trials`, so an arm with no `_trials` key of its own contributes
+    # nothing to it at any loss level.
+    #
+    # WHY THIS IS NOT JUST "MAKE DROPEVAL EMIT `fails`". That reaches only the pooled
+    # trigger above, and `attempts` there is `trials * arm_count`: with a control arm
+    # running, a treatment-only loss would have to reach 40% of its OWN calls to fire
+    # while the control still fires at 20%. That is precisely the pooled-denominator
+    # defect #339 removed, reintroduced one harness over.
+    #
+    # WHY NOT "EMIT `answer_trials`" EITHER. `_form_stats` PREFERS `<form>_trials` over the
+    # shared `trials`, so adding one would remove errored trials from the
+    # recall/precision/handle denominators — measured on identical model behaviour, a
+    # recall column of 33% (FAIL) became 100% (PASS) at an 11% error rate. See the long
+    # comment at `dropeval.py`'s row build; that decision is load-bearing and this trigger
+    # exists so the transport question can be answered without disturbing it.
+    #
+    # SYMMETRY RESTS ON ONE EMITTER CONTRACT, AND IT IS NAMED HERE RATHER THAN ASSUMED.
+    # dropeval's `control_trials` is `trials - control_errors`, so the loop above already
+    # computes `lost = control_errors` over this same denominator: on the control arm this
+    # trigger agrees with trigger 2 exactly, and it applies that same expression to the
+    # treatment arm, which is the whole of the fix. But that agreement holds only while
+    # every row that ran an arm carries that arm's counter, zero included — which
+    # `dropeval.py`'s row build does unconditionally and
+    # `test_dropeval_emits_both_per_arm_counters_on_every_row` pins against the harness. A
+    # producer that wrote the key only where it was non-zero would divide a real loss by a
+    # fraction of the calls and read it as several times its true share. An earlier
+    # revision of this comment called the symmetry "a consequence of the shape, not an
+    # extra assertion"; it is an extra assertion, and the fixture that first contradicted
+    # it lived in this repo's own test suite.
+    #
+    # NOTE the deliberate divergence from trigger 2's row filter: that one requires
+    # `key in r AND "attempts" in r`, this one only `err_key in r`. `attempts` is not part
+    # of this trigger's arithmetic — it reads the loss directly instead of inferring it —
+    # so requiring it would exclude informative rows on the strength of a key it never
+    # consults. No emitter has ever produced one and not the other (`treatment_errors`,
+    # `control_errors` and `attempts` all landed in the same commit), so the two filters
+    # have never yet disagreed on real data.
+    #
+    # The bare pooled `errors` key does not match the `_errors` suffix, so it cannot
+    # double-count the two arms it is the sum of.
+    for err_key in sorted({k for r in rows for k in r if k.endswith("_errors")}):
+        arm = err_key[:-len("_errors")]
+        # Rows lacking the key are SKIPPED, not read as zero-loss: a merged set of one
+        # current and one legacy pack would otherwise dilute a real loss share with rows
+        # that never carried a count either way — the same reasoning as the `key in r`
+        # restriction above, one counter over.
+        carrying = [r for r in rows if err_key in r]
+        # The BARE arm name, not a re-spelled `<arm>_trials` — `_arm_attempts` normalizes
+        # either form on its first line, and writing the suffix swap a second time is what
+        # `test_only_one_place_derives_the_arm_to_trials_key` exists to refuse.
+        per_row = [(_arm_attempts(r, arm, int(r.get("trials", 1))), int(r[err_key]))
+                   for r in carrying]
+        arm_attempts = sum(a for a, _ in per_row)
+        if not arm_attempts:
+            continue
+        # No clamp against `a`, unlike trigger 2's `max(0, a - t)`. There the subtraction
+        # can go negative for a legitimate reason (a `score_pack` form whose per-form count
+        # exceeds the shared `trials`); here an arm reporting MORE errors than attempts is
+        # an emitter bug with no benign form, and a share over 1.0 fires this trigger
+        # rather than being quietly rounded down to something that might not.
+        lost = sum(e for _, e in per_row)
         if lost / arm_attempts > UNMEASURED_FAIL_SHARE:
             return True
     return False

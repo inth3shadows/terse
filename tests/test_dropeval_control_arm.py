@@ -96,9 +96,16 @@ def _rows(n=24, *, answer, control=None, kind="recall", trials=1, errors=0):
     row = {"kind": kind, "trials": trials, "retrieve_ok": trials, "handle_ok": trials,
            "answer_ok": answer, "answer_trials": trials - errors,
            "retrieve_trials": trials - errors, "handle_trials": trials - errors,
-           "errors": errors, "attempts": trials * (1 if control is None else 2)}
+           # Per-arm counters on EVERY row, zero included — `dropeval.py`'s row build emits
+           # both unconditionally, so a fixture that writes one only where it is non-zero
+           # states a shape the harness cannot produce. It matters to `_unmeasured`'s #352
+           # trigger, whose denominator is the rows CARRYING the counter: with the zeros
+           # omitted, a loss spread over half the run divided by half the denominator and
+           # read as double its real share.
+           "errors": errors, "treatment_errors": errors,
+           "attempts": trials * (1 if control is None else 2)}
     if control is not None:
-        row |= {"control_ok": control, "control_trials": trials}
+        row |= {"control_ok": control, "control_trials": trials, "control_errors": 0}
     return [dict(row, qid=f"q{i}") for i in range(n)]
 
 
