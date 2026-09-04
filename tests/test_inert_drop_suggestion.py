@@ -228,7 +228,10 @@ def test_coverage_and_the_scored_run_never_disagree_about_a_payload():
     rules = {"yes": Rule(tool_glob="*", tiers=("minify", "tabularize", "dictionary"),
                          fields=dict(DROP_FIELDS)),
              "no": Rule(tool_glob="*", tiers=(), fields=dict(DROP_FIELDS))}
-    rule_for = (lambda t, s=None: rules[t])
+
+    def rule_for(tool, server=None):
+        return rules[tool]
+
 
     results = dropeval.run_drop_fluency(
         envelopes, rule_for,
