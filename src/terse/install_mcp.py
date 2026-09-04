@@ -146,15 +146,52 @@ def resolve_target(scope: str, *, cfg: Path | None = None, file: str | None = No
     physical ~/.claude.json location for user/local scope (tests, $CLAUDE_CONFIG);
     `file` overrides the project-scope .mcp.json path; `repo_path` overrides local
     scope's `projects` key (else `default_repo_path()`)."""
+    if scope not in VALID_SCOPES:
+        raise ValueError(f"unknown scope {scope!r}; must be one of {VALID_SCOPES}")
+    # A scope flag that does not apply to THIS scope is refused, not ignored (#366).
+    # `--file` used to be read only for project scope, so `install-mcp kb --file /tmp/x`
+    # at the default scope named one file and rewrote a different one — creating no
+    # `/tmp/x`, saying nothing, and reaching `~/.claude.json`. That is not theoretical:
+    # it rewrote a live router's `command` to a pytest temp binary during #277's own test
+    # development, killing that router and every peer behind it until repaired by hand.
+    # Naming a path and writing elsewhere is the shape that makes a *documented*
+    # behaviour dangerous rather than merely surprising.
+    #
+    # `mcp-status` is unaffected: it has no `--scope` and scans every scope, calling this
+    # once per scope with only that scope's own flag, so both flags stay meaningful there.
+    # The consequence is spelled PER FLAG, because the two flags do not name the same kind
+    # of thing and one sentence for both was wrong in half the cases (#366 review):
+    # `--file` names a write TARGET, while `--repo-path` names a KEY INSIDE one — user and
+    # local scope write the same physical file, differing only in whether the entry lands
+    # at the top level or under `projects.<key>`. A shared "would have written X instead"
+    # template printed a literal `?` at project scope and, at user scope, asserted a
+    # difference between two paths that were identical.
+    for flag, value, needs in (("--file", file, "project"),
+                               ("--repo-path", repo_path, "local")):
+        if value is None or scope == needs:
+            continue
+        home_cfg = cfg or config_path()
+        would = home_cfg if scope != "project" else (
+            Path(file).expanduser().resolve() if file else Path(".mcp.json").resolve())
+        if flag == "--file":
+            consequence = (f"Ignoring it would have written {would} instead of the file "
+                           f"--file names")
+        elif scope == "project":
+            consequence = (f"Ignoring it would have written {would}; --repo-path names a "
+                           f"key inside {home_cfg}, which is a different file entirely")
+        else:
+            consequence = (f"Ignoring it would have written the top level of {would} "
+                           f"rather than its projects.{repo_path!r} block")
+        raise ValueError(
+            f"{flag} applies only to --scope {needs}, but this is --scope {scope}. "
+            f"{consequence} — pass --scope {needs}, or drop {flag}.")
     if scope == "user":
         return Target(cfg or config_path(), (), "user")
     if scope == "project":
         path = Path(file).expanduser().resolve() if file else Path(".mcp.json").resolve()
         return Target(path, (), "project")
-    if scope == "local":
-        repo = repo_path or default_repo_path()
-        return Target(cfg or config_path(), ("projects", repo), f"local:{repo}")
-    raise ValueError(f"unknown scope {scope!r}; must be one of {VALID_SCOPES}")
+    repo = repo_path or default_repo_path()
+    return Target(cfg or config_path(), ("projects", repo), f"local:{repo}")
 
 
 def _servers_root(config: dict, server_path: tuple[str, ...]) -> dict:
