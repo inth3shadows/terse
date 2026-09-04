@@ -25,6 +25,11 @@ fails that pull request until the section has moved.
   doc's `defaults.tiers` on an entry it promotes a suggestion onto (the in-memory eval
   copy only — the disk path's `_keep_lossy_inert` refusal is unchanged), and the run
   names the lifted rules before printing its verdict.
+- The SHIP directive no longer prescribes the rename that #375 proved is inert. It said
+  "enable the verified fields by renaming `_suggested_fields` -> `fields`"; for a rule
+  whose `tiers: []` the eval had just lifted, that rename alone leaves the passthrough in
+  place and the drop never fires. `dropeval_next_step_line` now takes the lifted rules and
+  says the rename must be accompanied by setting tiers.
 
 ### Added
 

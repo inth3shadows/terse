@@ -329,3 +329,40 @@ def test_a_declined_verdict_says_nothing_about_tiers_either_way():
     line = dropeval_next_step_line(v, tiers_restored=["kb.read.list_principles"])
     assert "does NOT authorize" in line
     assert "NOT sufficient" not in line and "kb.read.list_principles" not in line
+
+
+def test_tune_drop_eval_hands_the_lifted_rules_to_the_directive(monkeypatch, capsys):
+    """The WIRING, not just the sentence. A mutation replacing `_tune_drop_eval`'s
+    `tiers_restored=lifted` with `()` left all 1,982 other tests green — the renderer was
+    pinned and the call site that feeds it was not, so the caveat could be dropped on the
+    only path that ever produces it.
+
+    Spies on the seam rather than driving a live SHIP verdict, deliberately: the sentence
+    itself is pinned by `test_the_ship_directive_names_the_lifted_rules_as_needing_tiers_too`
+    against both branches, so what is left to prove is that the CLI hands over the SAME
+    lifted set it built the pre-eval note from. Reaching SHIP here would need five distinct
+    corpus payloads (`_FIXED_IDEAL_MIN_QUESTIONS`) and a stub model per payload, all to
+    re-assert a string this file already owns."""
+    import argparse
+
+    from terse import cli, dropeval, report
+
+    seen: dict = {}
+
+    def spy(v, tiers_restored=()):
+        seen["tiers_restored"] = list(tiers_restored)
+        return "…"
+
+    monkeypatch.setattr(report, "dropeval_next_step_line", spy)
+    monkeypatch.setattr(cli, "_build_answerers",
+                        lambda args, make: {"m": lambda messages: dropeval.Turn(text="no")})
+
+    doc = _doc([])          # one passthrough rule carrying a suggestion — the #375 shape
+    env = {"tool": "kb.read.list_principles", "server": None, "sha": "a",
+           "raw": json.dumps(PAYLOAD)}
+    args = argparse.Namespace(trials=1, no_control=True, accept_degraded=False)
+    assert cli._tune_drop_eval(args, doc, [env]) == 0
+
+    assert seen["tiers_restored"] == ["kb.read.list_principles"]
+    # ...and the same set reached the pre-eval note, so the two disclosures cannot diverge.
+    assert "kb.read.list_principles" in capsys.readouterr().out
