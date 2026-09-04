@@ -15,6 +15,73 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **Four evasion classes left open in the `paired_rows` disclosure guard, and two false
+  claims it made about itself** (`#363`, following `#361`). No renderer emitted anything
+  wrong — what was wrong is the test meant to keep it that way. Its load-bearing claim is
+  that a `build_*` function reaching `paired_rows` but not `attrition_block` fails CI; each
+  item below was a way to be that function and pass.
+
+  **Graph keys are now qualified by enclosing scope** (`report.py:Outer.build_x`). `ast.walk`
+  is breadth-first, so a nested def OVERWROTE a top-level namesake in the same module and
+  destroyed the renderer's entry — a class method and a `try/except ImportError` pair both
+  demonstrated it. This was already live: **16 of 585 definitions were silently missing from
+  the graph**, none a `build_*` yet, which is one same-named helper away from wrong. All 585
+  are present now, pinned by a test that counts them. Two defs at the *same* scope keep
+  separate nodes and their shared name is marked ambiguous, because which one a caller
+  reaches depends on which ran last — merging their edges would route a silent renderer
+  through its compliant twin.
+
+  Qualification breaks name resolution unless three sites change together, and the other two
+  fail silently: `_reaches` matched `endswith(":" + name)`, and `_paired_and_silent` selected
+  on `startswith("build_")` over the whole qualified tail. Both now match the last segment,
+  each pinned by a synthetic renderer that reaches the pairing through a method and through
+  a same-scope duplicate.
+
+  **Bare decorators and argument defaults now draw edges.** `@paired_rows` is an `ast.Name`
+  in `decorator_list` and `_pair=paired_rows` one in `args.defaults`; neither is ever inside
+  a `Call`, so an edge-scan keyed on `Call` drew nothing for either — while the parenthesised
+  `@deco()` form was caught. Keyword-only defaults are a separate list and are covered too.
+
+  **The codec check covers both spellings and the function the comment already named.**
+  `_payload_tokens` is a separate top-level function, so its body is not inside
+  `inspect.getsource(run_codec_fluency)` — the comment beside the assertion named it as the
+  vector while the check did not reach it. And `tags["terse_attempts"] = v`, the subscript
+  form `codeceval.py` already uses two lines from the emitter, cannot match a colon-anchored
+  pattern. The predicate is now testable against synthetic sources, since widening a guard
+  nothing currently trips is otherwise unfalsifiable.
+
+  **`codeceval`'s hand-built fixture is pinned to its emitter**, the counterpart `dropeval`
+  already had. It immediately found the drift it exists to catch: the fixture was missing
+  `transform`.
+
+  **Two false self-claims removed.** `_call_graph`'s docstring said reverting the async and
+  attribute branches "leaves every test green" — true when written, false by the end of the
+  same commit, since the tests that falsify it were added alongside it (measured: **4**
+  fail — async alone 1, attribute alone 3). And "the idiom in 11 modules here" was called
+  unreproducible and removed; 11 is exactly what the natural rule gives (modules containing
+  a bare `from . import X`), so the rule is now stated alongside the number.
+
+  An adversarial review found the blind spot had **moved rather than closed**: `_defs`
+  split what was one node into several, but resolving a call by bare name traversed the
+  UNION of their edges, so a renderer `main` reported as silent became
+  silent-and-unreported. Ambiguity is now counted over graph NODES rather than modules,
+  which makes different-scope namesakes, same-scope duplicates and cross-module collisions
+  one rule instead of three. The same review found the mirror image of the decorator fix —
+  every bound name became a traversable disclosure edge, so `_unused=attrition_block`
+  scored a silent renderer compliant — so a binding now counts for "drawn over the pairing"
+  and not for "discloses", neither as the target nor onward. The attribute spellings
+  (`@report.paired_rows`) are covered too; closing only the `ast.Name` half had left the
+  same asymmetry one level up. And the drift guard did not guard the fixture it named: it
+  re-declared its own copy of the dict, so deleting `transform` from the real fixture left
+  every test green. Both now come from one builder.
+
+  A 22-mutation sweep leaves one survivor, recorded in the module docstring as an
+  equivalent mutant with the reason it cannot be killed.
+
+## [0.30.5] - 2026-09-03
+
+### Fixed
+
 - **A scope flag that does not apply to the active scope is now refused, not silently
   ignored** (`#366`). `resolve_target` read `--file` only for `--scope project` and
   `--repo-path` only for `--scope local`, dropping either one elsewhere without a word. So

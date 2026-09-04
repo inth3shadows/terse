@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -73,6 +74,24 @@ def _frow(qid: str, qtype: str, *, lost: tuple[str, ...] = ()) -> dict:
 
 def _clean(n: int, qtype: str = "count") -> list[dict]:
     return [_frow(f"c{i}", qtype) for i in range(n)]
+
+
+# Every function whose source can introduce a per-arm attempts counter into a codec row.
+# `_payload_tokens` is a SEPARATE top-level function, so its body is not inside
+# `inspect.getsource(run_codec_fluency)` — and the comment beside the assertion named it as
+# the vector while the check did not cover it (#363).
+_CODEC_EMITTERS = (codeceval.run_codec_payload, codeceval.run_codec_fluency,
+                   codeceval._payload_tokens)
+
+
+def _emits_arm_attempts(src: str) -> bool:
+    """Does this source emit an `<arm>_attempts` key, in EITHER spelling?
+
+    `"terse_attempts": v` inside a dict literal, and `tags["terse_attempts"] = v` — the
+    subscript form `codeceval.py` already uses two lines from the emitter, and which a
+    colon-anchored pattern cannot match at all (#363)."""
+    return bool(re.search(r'"\w+_attempts"\s*(?::|\])', src))
+
 
 
 # --------------------------------------------------------------------------- #
@@ -641,6 +660,64 @@ def _package() -> Path:
     return Path(inspect.getfile(attrition_block)).parent
 
 
+def _defs(tree: ast.AST) -> list[tuple[ast.AST, str]]:
+    """Every function def with its QUALIFIED name (`Outer.inner`), innermost last.
+
+    Replaces `ast.walk`, which is breadth-first and flattens scope: two same-named defs in
+    one module produced the same key and the later one silently won (#363). Walks the body
+    explicitly so nesting is known rather than inferred."""
+    out: list[tuple[ast.AST, str]] = []
+
+    def visit(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+                qual = f"{prefix}{child.name}"
+                out.append((child, qual))
+                visit(child, f"{qual}.")
+            elif isinstance(child, ast.ClassDef):
+                visit(child, f"{prefix}{child.name}.")
+            else:
+                visit(child, prefix)
+
+    visit(tree, "")
+    return out
+
+
+def _edges(fn: ast.AST):
+    """`(kind, node)` for every node that can bind a callee name.
+
+    `("call", <ast.Call>)` for calls anywhere in the body. `("bind", <Name|Attribute>)`
+    for bare decorators and argument defaults — `@paired_rows` is a Name in
+    `decorator_list`, `_pair=paired_rows` a Name in `args.defaults`, and neither is ever
+    inside a `Call`, so a scan keyed on `Call` drew no edge for either while the
+    parenthesised `@deco()` form WAS caught (#363, measured).
+
+    ATTRIBUTE spellings too: `@report.paired_rows` and `_pair=report.paired_rows` are the
+    idiom this package documents for calls, and closing only the `ast.Name` half left the
+    same asymmetry one level up (#363 review).
+
+    The kind matters downstream: a binding is a real edge for "is this drawn over the
+    pairing?" and not a traversable one for "does it disclose?"."""
+    for c in ast.walk(fn):
+        if isinstance(c, ast.Call):
+            yield "call", c
+    binders = list(getattr(fn, "decorator_list", []))
+    a = getattr(fn, "args", None)
+    if a is not None:
+        binders += [*a.defaults, *[k for k in a.kw_defaults if k is not None]]
+    for d in binders:
+        if isinstance(d, ast.Name | ast.Attribute):
+            yield "bind", d
+
+
+def _last_segment(key: str) -> str:
+    """`"report.py:Outer.build_x"` -> `"build_x"`. Calls resolve by BARE name, so both the
+    module and any enclosing scope have to come off. Qualifying the keys without changing
+    this and `_paired_and_silent` would have left the graph resolving nothing while every
+    test stayed green — the failure this file exists to prevent, in the fix for it."""
+    return key.split(":", 1)[1].split("#", 1)[0].rsplit(".", 1)[-1]
+
+
 def _call_graph(root: Path | None = None) -> tuple[dict[str, set[str]], dict[str, set[str]], set[str]]:
     """`(graph, attribute-only edges, ambiguous names)` over the WHOLE package.
 
@@ -648,11 +725,23 @@ def _call_graph(root: Path | None = None) -> tuple[dict[str, set[str]], dict[str
     module would never have entered a three-file scan, so "a renderer added later inherits
     the requirement" would have been false for exactly the case nobody thinks of.
 
+    Two defs in genuinely DIFFERENT scopes can still produce one qualified name —
+    `class A: def b` beside `def A(): def b()` both yield `A.b`. That lands in the safe
+    direction (an extra `#N` node plus an ambiguous name, so noise rather than a miss), but
+    `#N` therefore means "this qualified name was already taken", not strictly "same
+    scope".
+
     `root` exists so the parsing rules can be pinned on a SYNTHETIC package. They cannot
-    be pinned on `src/terse`: it contains zero `async def` today, so reverting the async
-    and attribute branches leaves every test green and the hardening is inert against the
-    live tree (measured, #361 review). A throwaway probe that writes a module into `src/`
-    and deletes it is not a test — it runs nowhere.
+    be pinned on `src/terse` ALONE: it contains zero `async def` today, so the async and
+    attribute branches are inert against the live tree and a revert of them would go
+    unnoticed by any assertion drawn over it. A throwaway probe that writes a module into
+    `src/` and deletes it is not a test — it runs nowhere.
+
+    The synthetic tests below are what makes a revert loud: reverting those two branches
+    now fails 4 of them (measured — async alone 1, attribute alone 3). An earlier revision
+    claimed the revert "leaves every test green", which was true when written and false by
+    the end of the same commit; its replacement then said 3, off by one, in the sentence
+    added to correct the first (#363 review). Hence the arithmetic, not just the total.
 
     `async def` counts, and so does an ATTRIBUTE callee (`report.arm_gap(...)`). Matching
     only `ast.FunctionDef` and only `ast.Name` callees let two silent paired renderers pass
@@ -667,10 +756,22 @@ def _call_graph(root: Path | None = None) -> tuple[dict[str, set[str]], dict[str
         `_pr`, so the edge is never drawn. (A MODULE alias, `from . import report as rp`
         then `rp.paired_rows(...)`, IS caught: the attribute is still `paired_rows`. The
         asymmetry is the surprising part.) `lossy.py:33` already aliases a symbol this way;
-      - `build_x = _impl`, a module-level lambda, `functools.partial`, or `getattr`
-        dispatch — the `FunctionDef` behind the exported `build_*` name is privately named,
-        so the prefix scan misses it. Arguably the "not named `build_*`" gap, but a reader
-        of that gap would not predict them.
+      - `build_x = _impl`, a module-level lambda, `functools.partial`, `getattr` dispatch,
+        or a walrus binding — the `FunctionDef` behind the exported `build_*` name is
+        privately named, so the prefix scan misses it. Arguably the "not named `build_*`"
+        gap, but a reader of that gap would not predict them;
+      - a disclosure the renderer cannot actually reach at runtime, and which is therefore
+        scored compliant anyway: one inside an `if False:` branch, or one in an UNCALLED
+        nested def (`ast.walk(fn)` attributes a child def's edges to its parent). Both are
+        over-approximation in the direction that hides a defect, both are pre-existing, and
+        both would fall to the same fix — attributing a nested def's edges to itself rather
+        than to whatever encloses it (#363 review).
+
+    MUTATION SWEEP: 22 mutants, 21 killed. The survivor is recorded rather than implied
+    away — replacing `_crow(...)` in the exemption fixture with an inline dict of the same
+    content survives, and must: the two are byte-identical today, so no assertion can
+    separate them. The builder exists so they cannot DRIFT apart, and that property is what
+    "the codec fixture silently drops a key" (KILLED) actually pins.
 
     A name-resolving import graph would close the first three. That is a bigger tool than
     this test, and the honest position is that this catches the mistakes people actually
@@ -686,6 +787,7 @@ def _call_graph(root: Path | None = None) -> tuple[dict[str, set[str]], dict[str
     """
     graph: dict[str, set[str]] = {}
     attr_only: dict[str, set[str]] = {}
+    bind_only: dict[str, set[str]] = {}
     defined: dict[str, set[str]] = {}
     pkg = root or _package()
     for f in sorted(pkg.rglob("*.py")):
@@ -698,13 +800,35 @@ def _call_graph(root: Path | None = None) -> tuple[dict[str, set[str]], dict[str
         # already collide today, harmlessly only because neither defines a function.
         mod = str(f.relative_to(pkg))
         tree = ast.parse(f.read_text())
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                continue
-            key = f"{mod}:{node.name}"
-            calls, attrs = set(), set()
-            for c in ast.walk(node):
-                if not isinstance(c, ast.Call):
+        for node, qual in _defs(tree):
+            # QUALIFIED by enclosing class/function, not just by module. `ast.walk` is
+            # breadth-first, so a nested def OVERWROTE a top-level namesake in the same
+            # module and destroyed the renderer's entry — the fourth evasion of this class
+            # (#363). A class method or a `try: from x import build_y / except ImportError:
+            # def build_y` pair both did it. Live on main when this was written: 9 keys
+            # collided and 16 graph nodes were dropped (`transport.py:__init__` x4 among
+            # them), none a `build_*` yet — one same-named helper away from silently wrong.
+            key = f"{mod}:{qual}"
+            # Two defs at the SAME scope with the same name — a `try: ... except
+            # ImportError:` pair is the idiom — still collide after qualification, because
+            # their qualified names are genuinely equal. Each gets its own node rather than
+            # merging their edges: the union would give the silent one the compliant twin's
+            # `attrition_block` edge and score it compliant, which is the over-approximation
+            # `_reaches` documents as the unsafe direction for this question (#363).
+            if key in graph:
+                key = f"{key}#{sum(1 for k in graph if k.split('#')[0] == key) + 1}"
+            calls, attrs, binds = set(), set(), set()
+            for kind, c in _edges(node):
+                if kind == "bind":
+                    # A bare `@paired_rows` decorator or a `_pair=paired_rows` default:
+                    # `ast.Name`s that never appear inside a `Call`, so a scan keyed on
+                    # `Call` drew nothing for either (#363, both measured). They are real
+                    # edges for "is this drawn over the pairing?" and NOT traversable ones
+                    # for "does it disclose?", because binding a name is not calling it —
+                    # a `_unused=attrition_block` default otherwise scored a silent
+                    # renderer compliant, the mirror image of the evasion this closed
+                    # (#363 review). Same treatment as an attribute callee, same reason.
+                    binds.add(c.id if isinstance(c, ast.Name) else c.attr)
                     continue
                 if isinstance(c.func, ast.Name):
                     calls.add(c.func.id)
@@ -716,15 +840,40 @@ def _call_graph(root: Path | None = None) -> tuple[dict[str, set[str]], dict[str
                     # a stdlib method name colliding with a single src function is not
                     # `ambiguous` and would be traversed — see `_reaches`.
                     attrs.add(c.func.attr)
-            graph[key] = calls | attrs
-            attr_only[key] = attrs - calls
-            defined.setdefault(node.name, set()).add(mod)
-    return graph, attr_only, {n for n, mods in defined.items() if len(mods) > 1}
+            graph[key] = calls | attrs | binds
+            # NOT traversed when asking "does this disclose?": attribute callees (a stdlib
+            # `.get`/`.append` colliding with a src function is not `ambiguous` and would
+            # otherwise be traversed) and bindings (binding a name is not calling it). A
+            # name that is ALSO called outright stays traversable — `- calls` is what keeps
+            # a function that both defaults on and calls `attrition_block` compliant.
+            attr_only[key] = (attrs | binds) - calls
+            # BINDINGS are stronger than attribute edges: an attribute callee is a real
+            # call, so reaching `report.attrition_block(...)` IS a disclosure and only its
+            # onward traversal is refused. Binding a name is not calling it, so it is not
+            # a disclosure either — and `_reaches` tests the target BEFORE applying its
+            # skip set, which let `_unused=attrition_block` score a silent renderer
+            # compliant even with the edge marked (#363 review).
+            bind_only[key] = binds - calls - attrs
+            # BARE name: ambiguity is about a call resolving across MODULES, which
+            # qualification does not change.
+            defined.setdefault(_last_segment(key), set()).add(mod)
+    # AMBIGUOUS = any bare name resolving to more than one NODE, not merely to more than
+    # one module. `_defs` splits what was one node into several (`measure_joined._saved`
+    # vs `measure_payload._saved`), and resolving a call by bare name then traversed the
+    # UNION of their edges — re-merging exactly what qualification split apart, in the
+    # direction `_reaches` documents as unsafe. A renderer `main` reported as silent became
+    # silent-and-unreported (#363 review). Counted over graph KEYS, so different-scope
+    # namesakes, same-scope duplicates and cross-module collisions are one rule, not three.
+    by_name: dict[str, int] = {}
+    for k in graph:
+        by_name[_last_segment(k)] = by_name.get(_last_segment(k), 0) + 1
+    return graph, attr_only, {n for n, c in by_name.items() if c > 1}, bind_only
 
 
 def _reaches(graph: dict[str, set[str]], start: str, target: str,
              ambiguous: set[str] = frozenset(),
-             attr_only: Mapping[str, set[str]] | None = None) -> bool:
+             attr_only: Mapping[str, set[str]] | None = None,
+             bind_only: Mapping[str, set[str]] | None = None) -> bool:
     """Does `start` transitively call `target`? Names in `ambiguous` are NOT traversed,
     and neither are attribute-derived edges when `attr_only` is given.
 
@@ -747,24 +896,28 @@ def _reaches(graph: dict[str, set[str]], start: str, target: str,
             continue
         seen.add(cur)
         calls = graph.get(cur, set())
-        if target in calls:
+        # A bind-only edge is not a call, so it cannot satisfy the target either — the
+        # target test runs AFTER that subtraction, unlike the traversal skip below.
+        if target in calls - (bind_only or {}).get(cur, set()):
             return True
         skip = ambiguous | ((attr_only or {}).get(cur, set()))
         for name in calls - skip:
-            stack.extend(k for k in graph if k.endswith(f":{name}"))
+            stack.extend(k for k in graph if _last_segment(k) == name)
     return False
 
 
-def _paired_and_silent(graph, attr_only, ambiguous, exempt=frozenset()):
+def _paired_and_silent(graph, attr_only, ambiguous, bind_only=None,
+                       exempt=frozenset()):
     """`(paired renderers, the silent ones)` — THE check, in one place.
 
     Extracted so the synthetic-package tests exercise this body rather than a copy of it.
     A test that re-implements the logic it covers is the defect this file has already been
     bitten by twice; mutating the live check then leaves the synthetic test green."""
-    paired = {k for k in graph if k.split(":", 1)[1].startswith("build_")
+    paired = {k for k in graph if _last_segment(k).startswith("build_")
               and _reaches(graph, k, "paired_rows")}
     silent = {k for k in paired
-              if not _reaches(graph, k, "attrition_block", ambiguous, attr_only)
+              if not _reaches(graph, k, "attrition_block", ambiguous, attr_only,
+                              bind_only)
               and k not in exempt}
     return paired, silent
 
@@ -781,13 +934,13 @@ def test_every_renderer_drawn_over_a_paired_subset_discloses_its_attrition():
     reach `attrition_block`. A renderer added later — in any module — inherits the
     requirement, and adding one without a disclosure fails CI rather than waiting for a
     fifth reviewer."""
-    graph, attr_only, ambiguous = _call_graph()
+    graph, attr_only, ambiguous, _bo = _call_graph()
     # QUALIFIED keys (`report.py:build_diff_report`), never bare function names. Collapsing
     # to names let a silent renderer hide behind a compliant NAMESAKE: a
     # `build_diff_report` in `src/terse/fluency/report.py` was already in the expected set
     # under that name, and the check scored it disclosing. Keying `_call_graph` on the
     # relative path was necessary and NOT sufficient — measured, it still evaded.
-    renderers, silent_set = _paired_and_silent(graph, attr_only, ambiguous, _CANNOT_EXCLUDE)
+    renderers, silent_set = _paired_and_silent(graph, attr_only, ambiguous, _bo, exempt=_CANNOT_EXCLUDE)
     assert renderers == _PAIRED_RENDERERS, (
         f"paired renderers changed: +{sorted(renderers - _PAIRED_RENDERERS)} "
         f"-{sorted(_PAIRED_RENDERERS - renderers)}. A new one must disclose; a departing "
@@ -814,9 +967,9 @@ def test_the_exempt_renderers_genuinely_cannot_be_excluded_by_the_pairing():
     asserting it in a comment."""
     assert {"report.py:build_codec_verdict_report"} == _CANNOT_EXCLUDE
     # The codec row shape, with the terse arm losing every one of its calls.
-    rows = [{"qid": f"q{i}", "qtype": "deref", "trials": 3, "raw_ok": 3, "terse_ok": 0,
-             "raw_trials": 3, "terse_trials": 3, "fails": 3, "attempts": 6}
-            for i in range(5)]
+    # `transform` included because the emitter emits it — pinned by
+    # `test_the_hand_built_codec_row_matches_the_emitter`, which caught its absence here.
+    rows = [_crow(f"q{i}") for i in range(5)]
     src = inspect.getsource(codeceval.run_codec_payload)
     assert '"raw_trials": trials,' in src and '"terse_trials": trials,' in src, (
         "codeceval no longer pins its per-arm denominators to `trials`; the exemption's "
@@ -832,8 +985,13 @@ def test_the_exempt_renderers_genuinely_cannot_be_excluded_by_the_pairing():
     # did not happen. `run_codec_fluency` is checked too — the row is assembled one frame
     # up as `{**tags, **toks, **row}`, so a counter introduced through `tags` or
     # `_payload_tokens` would restore excludability without touching the emitter below.
-    for fn in (codeceval.run_codec_payload, codeceval.run_codec_fluency):
-        assert not re.search(r'"\w+_attempts":', inspect.getsource(fn)), (
+    # `_payload_tokens` is a SEPARATE top-level function, so its body is not inside
+    # `inspect.getsource(run_codec_fluency)` — and the comment above names it as the
+    # vector while the check did not cover it (#363). Both spellings of the emit, too:
+    # `"k": v` in a literal AND `tags["k"] = v`, the subscript form `codeceval.py` already
+    # uses two lines from the emitter, which a colon-anchored regex cannot match.
+    for fn in _CODEC_EMITTERS:
+        assert not _emits_arm_attempts(inspect.getsource(fn)), (
             f"{fn.__name__} now emits a per-arm attempts counter, which `_arm_attempts` "
             "prefers over `trials`; exclusion is possible again and the exemption is stale")
     assert len(paired_rows(rows, "terse_ok", "raw_ok")) == len(rows)
@@ -981,9 +1139,10 @@ def test_the_soaks_worked_example_is_produced_by_a_fixture_not_asserted_in_prose
 
 
 # --------------------------------------------------------------------------- #
-# The PARSING RULES, pinned on a synthetic package. `src/terse` cannot pin them:
-# it has zero `async def` and no attribute-paired renderer, so every rule below
-# can be reverted with all 1853 tests green (measured). See `_call_graph(root=)`.
+# The PARSING RULES, pinned on a synthetic package. `src/terse` cannot pin them
+# on its own: it has zero `async def` and no attribute-paired renderer, so a
+# revert is invisible to any assertion drawn over the live tree. These tests are
+# what makes it loud. See `_call_graph(root=)`.
 # --------------------------------------------------------------------------- #
 
 
@@ -999,16 +1158,20 @@ def test_call_graph_sees_async_defs(tmp_path):
     """`ast.AsyncFunctionDef` is not an `ast.FunctionDef`. Matching only the latter made an
     `async def` renderer absent from the graph as BOTH a node and a traversable callee."""
     root = _synthetic(tmp_path, {"m.py": "async def build_x_report(r):\n    return paired_rows(r)\n"})
-    graph, _, _ = _call_graph(root)
+    graph, _, _, _bo = _call_graph(root)
     assert "m.py:build_x_report" in graph
     assert "paired_rows" in graph["m.py:build_x_report"]
 
 
 def test_call_graph_sees_attribute_callees(tmp_path):
-    """`report.paired_rows(...)` after `from . import report` — the idiom 11 modules here
-    use. Matching only `ast.Name` callees dropped the edge entirely."""
+    """`x.paired_rows(...)` after `from . import x` — the idiom 11 modules here use
+    (`capture`, `cli`, `codeceval`, `dropeval`, `install_mcp`, `measure`, `multiproxy`,
+    `policy`, `policy_gen`, `proxy`, `stats`), counted as modules containing a bare
+    `from . import X`. A previous revision called 11 unreproducible and removed it; 11 is
+    what that rule gives, so the rule is stated instead of the number being dropped (#363
+    review). Matching only `ast.Name` callees dropped the edge entirely."""
     root = _synthetic(tmp_path, {"m.py": "def build_x_report(r):\n    return report.paired_rows(r)\n"})
-    graph, attr_only, _ = _call_graph(root)
+    graph, attr_only, _, _bo = _call_graph(root)
     assert "paired_rows" in graph["m.py:build_x_report"]
     assert "paired_rows" in attr_only["m.py:build_x_report"], (
         "attribute edges must be tracked separately — see `_reaches`")
@@ -1022,7 +1185,7 @@ def test_call_graph_keys_on_the_relative_path_not_the_basename(tmp_path):
     root = _synthetic(tmp_path, {
         "report.py": "def build_x_report(r):\n    return paired_rows(r)\n",
         "sub/report.py": "def build_x_report(r):\n    return 1\n"})
-    graph, _, ambiguous = _call_graph(root)
+    graph, _, ambiguous, _bo = _call_graph(root)
     assert {"report.py:build_x_report", "sub/report.py:build_x_report"} <= set(graph)
     assert graph["report.py:build_x_report"] == {"paired_rows"}
     assert graph["sub/report.py:build_x_report"] == set()
@@ -1057,8 +1220,404 @@ def test_attribute_edges_are_not_traversed_in_the_disclosure_direction(tmp_path)
                  "    return paired_rows(r)\n"
                  "def write(r):\n"
                  "    return attrition_block(r)\n")})
-    graph, attr_only, ambiguous = _call_graph(root)
+    graph, attr_only, ambiguous, _bo = _call_graph(root)
     assert "write" in attr_only["m.py:build_x_report"], "fixture: the edge must exist"
-    _, silent = _paired_and_silent(graph, attr_only, ambiguous)
+    _, silent = _paired_and_silent(graph, attr_only, ambiguous, _bo)
     assert silent == {"m.py:build_x_report"}, (
         "a method call must not route a silent renderer to a disclosing namesake")
+
+
+# --------------------------------------------------------------------------- #
+# #363 — the four evasion classes #361 left open, each on a synthetic package.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_same_module_namesake_cannot_hide_a_silent_renderer(tmp_path):
+    """`ast.walk` is breadth-first, so a NESTED def overwrote a top-level namesake in the
+    same module and the renderer's entry was the one destroyed. Two shapes did it: a class
+    method, and a `try: from x import build_y / except ImportError: def build_y` pair.
+
+    Live when this was written: 9 colliding keys, 16 graph nodes silently dropped from
+    `src/terse` — none a `build_*` yet, which is one same-named helper away from wrong."""
+    pkg = _synthetic(tmp_path, {"r.py": '''
+def paired_rows(rows, *f): return rows
+def attrition_block(a, n, e=None, *, style="markdown"): return []
+
+class Helper:
+    def build_report(self):          # same name, class scope
+        return attrition_block(None, "")
+
+def build_report(rows):              # SILENT — drawn over the pairing, no disclosure
+    return paired_rows(rows, "a_ok")
+'''})
+    graph, attr_only, amb, _bo = _call_graph(pkg)
+    paired, silent = _paired_and_silent(graph, attr_only, amb, bind_only=_bo)
+    assert "r.py:build_report" in silent, (sorted(paired), sorted(silent))
+    assert "r.py:Helper.build_report" in graph, "the method lost its own entry"
+
+
+def test_a_try_except_import_pair_cannot_hide_a_silent_renderer(tmp_path):
+    """The second demonstrated shape of the same collision."""
+    pkg = _synthetic(tmp_path, {"r.py": '''
+def paired_rows(rows, *f): return rows
+def attrition_block(a, n, e=None, *, style="markdown"): return []
+
+try:
+    def build_x(rows):               # SILENT
+        return paired_rows(rows, "a_ok")
+except ImportError:
+    def build_x(rows):               # compliant twin, never taken
+        return attrition_block(None, "")
+'''})
+    graph, attr_only, amb, _bo = _call_graph(pkg)
+    _, silent = _paired_and_silent(graph, attr_only, amb, bind_only=_bo)
+    assert any(k.endswith("build_x") for k in silent), sorted(silent)
+
+
+def test_a_bare_decorator_draws_an_edge(tmp_path):
+    """`@paired_rows` is an `ast.Name` in `decorator_list`, never inside a `Call`, so a
+    scan keyed on `Call` drew nothing — while `@deco()` WAS caught. Measured (#363)."""
+    pkg = _synthetic(tmp_path, {"r.py": '''
+def paired_rows(rows, *f): return rows
+def attrition_block(a, n, e=None, *, style="markdown"): return []
+
+@paired_rows
+def build_decorated(rows):           # SILENT, drawn over the pairing via a decorator
+    return rows
+'''})
+    graph, attr_only, amb, _bo = _call_graph(pkg)
+    _, silent = _paired_and_silent(graph, attr_only, amb, bind_only=_bo)
+    assert "r.py:build_decorated" in silent, sorted(graph.items())
+
+
+def test_a_default_argument_binding_draws_an_edge(tmp_path):
+    """`def build_x(rows, _pair=paired_rows)` — an `ast.Name` in `args.defaults`. Same
+    root cause as the decorator, listed separately because it is a real idiom."""
+    pkg = _synthetic(tmp_path, {"r.py": '''
+def paired_rows(rows, *f): return rows
+def attrition_block(a, n, e=None, *, style="markdown"): return []
+
+def build_defaulted(rows, _pair=paired_rows):   # SILENT
+    return _pair(rows, "a_ok")
+'''})
+    graph, attr_only, amb, _bo = _call_graph(pkg)
+    _, silent = _paired_and_silent(graph, attr_only, amb, bind_only=_bo)
+    assert "r.py:build_defaulted" in silent, sorted(graph.items())
+
+
+def test_a_keyword_only_default_binding_draws_an_edge_too(tmp_path):
+    """`kw_defaults` is a separate list from `defaults`, and holds `None` for every
+    keyword-only arg without a default — so it needs its own filter."""
+    pkg = _synthetic(tmp_path, {"r.py": '''
+def paired_rows(rows, *f): return rows
+def attrition_block(a, n, e=None, *, style="markdown"): return []
+
+def build_kwonly(rows, *, _pair=paired_rows, _other=None):   # SILENT
+    return _pair(rows, "a_ok")
+'''})
+    graph, attr_only, amb, _bo = _call_graph(pkg)
+    _, silent = _paired_and_silent(graph, attr_only, amb, bind_only=_bo)
+    assert "r.py:build_kwonly" in silent, sorted(graph.items())
+
+
+def test_a_qualified_renderer_that_DOES_disclose_is_not_reported(tmp_path):
+    """The control. Qualification must not make every nested renderer look silent — that
+    would be loud, but it would also be the check reporting noise instead of defects."""
+    pkg = _synthetic(tmp_path, {"r.py": '''
+def paired_rows(rows, *f): return rows
+def attrition_block(a, n, e=None, *, style="markdown"): return []
+
+class Page:
+    def build_ok(self, rows):
+        return paired_rows(rows, "a_ok"), attrition_block(None, "")
+'''})
+    graph, attr_only, amb, _bo = _call_graph(pkg)
+    paired, silent = _paired_and_silent(graph, attr_only, amb, bind_only=_bo)
+    assert "r.py:Page.build_ok" in paired
+    assert not silent, sorted(silent)
+
+
+def test_every_function_in_the_package_has_a_graph_entry():
+    """The collision was invisible because nothing counted. `len(graph)` must equal the
+    number of `def`s in `src/terse`; on main it was 16 short."""
+    pkg = _package()
+    n = sum(1 for f in sorted(pkg.rglob("*.py"))
+            for x in ast.walk(ast.parse(f.read_text()))
+            if isinstance(x, ast.FunctionDef | ast.AsyncFunctionDef))
+    graph, _, _, _bo = _call_graph()
+    assert len(graph) == n, f"{n - len(graph)} definitions dropped from the graph"
+
+
+def _crow(qid: str) -> dict:
+    """THE hand-built codec row. ONE builder, so the drift guard checks the row the
+    exemption fixture actually uses.
+
+    A first version of that guard re-declared its own copy of this dict and therefore
+    pinned nothing: deleting `transform` from the real fixture left all 63 tests green
+    (#363 review). `dropeval`'s counterpart — the one this claims to mirror — calls its
+    shared `_drow` builder, which is exactly what makes it work."""
+    return {"qid": qid, "qtype": "deref", "transform": "table", "trials": 3,
+            "raw_ok": 3, "terse_ok": 0, "raw_trials": 3, "terse_trials": 3,
+            "fails": 3, "attempts": 6}
+
+
+def _live_codec_rows(*, wrong: bool = False, trials: int = 3) -> list[dict]:
+    """Rows from the REAL `run_codec_payload`, with the same scripted-`ToolAnswerer` idiom
+    `test_codeceval.py` uses.
+
+    `dropeval` has `test_the_hand_built_dropeval_row_matches_the_emitter`; `codeceval` had
+    no counterpart, so its hand-built fixture could drift from the emitted shape with
+    nothing noticing — the "fixture that cannot fail" mode (#363)."""
+    from terse.dropeval import ToolCall, Turn
+
+    payload = {"result": [{"id": 1, "meta": {"owner": "alice", "tags": ["x"]}},
+                          {"id": 2, "meta": {"owner": "bob", "tags": []}}]}
+    q = codeceval.gen_codec_questions(payload)[0]
+
+    def answerer(messages):
+        value = {"totally": "different"} if wrong else q.expected
+        return Turn(text="", tool_calls=[
+            ToolCall(call_id="c1", name=codeceval.RECORD_VALUE_TOOL,
+                     arguments={"value": value})])
+
+    return codeceval.run_codec_payload(payload, json.dumps(payload), answerer,
+                                       trials=trials)
+
+
+def test_the_hand_built_codec_row_matches_the_emitter():
+    """The `test_the_codec_verdict_report_is_exempt...` fixture is written by hand. If
+    `run_codec_payload` grows or drops a key, that fixture keeps testing the old shape and
+    the exemption's premise is checked against a row the harness no longer emits."""
+    live = _live_codec_rows()
+    assert live, "the emitter produced no rows — fixture cannot compare shapes"
+    assert set(_crow("q0")) == set(live[0]), (
+        f"hand-built codec row has drifted: only in fixture "
+        f"{set(_crow('q0')) - set(live[0])}, only in emitter "
+        f"{set(live[0]) - set(_crow('q0'))}")
+
+
+def test_the_codec_emitter_still_pins_both_denominators_to_trials():
+    """The exemption for `build_codec_verdict_report` rests on codeceval emitting
+    `<arm>_trials == trials` for BOTH arms, so pairing can never exclude. Asserted on the
+    emitted rows, not only by grepping the source."""
+    for r in _live_codec_rows(wrong=True):
+        assert r["raw_trials"] == r["trials"] == r["terse_trials"], r
+    rows = _live_codec_rows(wrong=True)
+    assert len(paired_rows(rows, "terse_ok", "raw_ok")) == len(rows)
+    assert attrition(rows, "terse_ok", "raw_ok").excluded == 0
+
+
+def test_the_codec_check_catches_both_spellings_of_the_emit():
+    """The predicate, against synthetic sources. Widening a guard that nothing currently
+    trips is untestable through the live tree — the check passes either way — so both the
+    positive and negative cases are asserted directly (#363 mutation sweep)."""
+    assert _emits_arm_attempts('out.append({"terse_attempts": trials})')
+    # The subscript form `codeceval.py:287` already uses two lines from the emitter.
+    assert _emits_arm_attempts('tags["terse_attempts"] = trials - fail')
+    assert not _emits_arm_attempts('"""docstring mentioning attempts and trials"""')
+    assert not _emits_arm_attempts('attempts = trials * 2')
+
+
+def test_every_function_that_can_reach_a_codec_row_is_checked():
+    """`_payload_tokens` was the named vector and was not in the list. Pins the SET, so a
+    future helper that joins the row assembly has to be added here deliberately."""
+    names = {f.__name__ for f in _CODEC_EMITTERS}
+    assert names == {"run_codec_payload", "run_codec_fluency", "_payload_tokens"}, names
+    # And each really does contribute to the emitted row.
+    src = inspect.getsource(codeceval.run_codec_fluency)
+    assert "_payload_tokens" in src, "the row no longer flows through _payload_tokens"
+
+
+def test_a_renderer_reaches_the_pairing_through_a_class_method(tmp_path):
+    """Calls resolve by BARE name, so a qualified key must be matched on its last segment.
+    Reverting to the old `endswith(":" + name)` finds nothing for `mod:Page.helper` — the
+    graph resolves nothing while every test stays green, which is this file's own failure
+    mode reproduced inside its fix (#363 mutation sweep)."""
+    pkg = _synthetic(tmp_path, {"r.py": '''
+def paired_rows(rows, *f): return rows
+def attrition_block(a, n, e=None, *, style="markdown"): return []
+
+class Page:
+    def helper(self, rows):
+        return paired_rows(rows, "a_ok")
+
+def build_via_method(rows):          # SILENT, reaching the pairing through Page.helper
+    return Page().helper(rows)
+'''})
+    graph, attr_only, amb, _bo = _call_graph(pkg)
+    paired, silent = _paired_and_silent(graph, attr_only, amb, bind_only=_bo)
+    assert "r.py:build_via_method" in paired, (
+        "the renderer did not reach paired_rows through a method — name resolution is "
+        "not matching on the last segment")
+    assert "r.py:build_via_method" in silent, sorted(silent)
+
+
+def test_a_renderer_reaches_the_pairing_through_a_same_scope_duplicate(tmp_path):
+    """The dedup suffix (`build_x#2`) must come off before a name is matched, or the
+    second of two same-scope defs becomes unreachable by any caller."""
+    pkg = _synthetic(tmp_path, {"r.py": '''
+def paired_rows(rows, *f): return rows
+def attrition_block(a, n, e=None, *, style="markdown"): return []
+
+def helper(rows):                    # first definition, compliant
+    return attrition_block(None, "")
+
+def helper(rows):                    # SECOND definition at the same scope — the live one
+    return paired_rows(rows, "a_ok")
+
+def build_via_dup(rows):             # SILENT, but only if the #2 node is reachable
+    return helper(rows)
+'''})
+    graph, attr_only, amb, _bo = _call_graph(pkg)
+    assert any("#" in k for k in graph), "fixture no longer produces a duplicate node"
+    paired, silent = _paired_and_silent(graph, attr_only, amb, bind_only=_bo)
+    assert "r.py:build_via_dup" in paired, (
+        "the duplicate node was unreachable — the dedup suffix is not being stripped "
+        "before name resolution")
+    assert "r.py:build_via_dup" in silent, sorted(silent)
+
+
+def test_different_scope_namesakes_are_not_re_merged_by_name(tmp_path):
+    """The blind spot #363's first cut MOVED rather than closed.
+
+    `_defs` splits what was one node into several, but resolution by bare name traversed
+    the UNION of their edges — re-merging exactly what qualification split apart. A
+    renderer `main` reported as silent became silent-and-UNREPORTED, which is strictly
+    worse than the bug being fixed (#363 review)."""
+    pkg = _synthetic(tmp_path, {"r.py": '''
+def paired_rows(rows, *f): return rows
+def attrition_block(a, n, e=None, *, style="markdown"): return []
+
+def render(a, n):                    # top-level: DISCLOSES
+    return attrition_block(a, n)
+
+def unrelated(rows):
+    def render(r):                   # different scope, different binding
+        return paired_rows(r, "a_ok")
+    return render(rows)
+
+def build_r2(rows):                  # SILENT — only ever calls the TOP-LEVEL render
+    return render(rows, "n")
+'''})
+    graph, attr_only, amb, _bo = _call_graph(pkg)
+    paired, silent = _paired_and_silent(graph, attr_only, amb, bind_only=_bo)
+    assert "r.py:build_r2" in silent, (sorted(paired), sorted(silent), sorted(amb))
+
+
+def test_a_class_method_namesake_does_not_launder_a_silent_renderer(tmp_path):
+    """The same re-merge with a method rather than a nested def — the shape that went from
+    unreported on main to *paired and scored compliant* on the first cut."""
+    pkg = _synthetic(tmp_path, {"r.py": '''
+def paired_rows(rows, *f): return rows
+def attrition_block(a, n, e=None, *, style="markdown"): return []
+
+def emit(rows):                      # reaches the pairing
+    return paired_rows(rows, "a_ok")
+
+class Sidebar:
+    def emit(self, a, n):            # discloses; never called by build_r4
+        return attrition_block(a, n)
+
+def build_r4(rows):
+    return emit(rows)
+'''})
+    graph, attr_only, amb, _bo = _call_graph(pkg)
+    _, silent = _paired_and_silent(graph, attr_only, amb, bind_only=_bo)
+    assert "r.py:build_r4" in silent, sorted(silent)
+
+
+def test_a_binding_is_not_a_disclosure(tmp_path):
+    """Closing the decorator/default evasions opened their mirror image: every bound Name
+    became a traversable edge, so `_unused=attrition_block` scored a silent renderer
+    compliant. A binding counts for "drawn over the pairing" and not for "discloses"."""
+    pkg = _synthetic(tmp_path, {"r.py": '''
+def paired_rows(rows, *f): return rows
+def attrition_block(a, n, e=None, *, style="markdown"): return []
+
+def build_default(rows, _unused=attrition_block):   # never calls it
+    return paired_rows(rows, "a_ok")
+
+@attrition_block
+def build_deco(rows):                                # nor this
+    return paired_rows(rows, "a_ok")
+'''})
+    graph, attr_only, amb, _bo = _call_graph(pkg)
+    _, silent = _paired_and_silent(graph, attr_only, amb, bind_only=_bo)
+    assert {"r.py:build_default", "r.py:build_deco"} <= silent, sorted(silent)
+
+
+def test_the_attribute_spelling_of_a_decorator_or_default_draws_an_edge(tmp_path):
+    """`@report.paired_rows` and `_pair=report.paired_rows` are the idiom this package
+    documents for calls. Closing only the `ast.Name` half left the same asymmetry one
+    level up: neither was reported at all (#363 review)."""
+    pkg = _synthetic(tmp_path, {"report.py": '''
+def paired_rows(rows, *f): return rows
+def attrition_block(a, n, e=None, *, style="markdown"): return []
+''', "r.py": '''
+from . import report
+
+@report.paired_rows
+def build_attr_deco(rows): return rows
+
+def build_attr_default(rows, _pair=report.paired_rows):
+    return _pair(rows, "a_ok")
+'''})
+    graph, attr_only, amb, _bo = _call_graph(pkg)
+    paired, silent = _paired_and_silent(graph, attr_only, amb, bind_only=_bo)
+    assert {"r.py:build_attr_deco", "r.py:build_attr_default"} <= paired, sorted(paired)
+    assert {"r.py:build_attr_deco", "r.py:build_attr_default"} <= silent, sorted(silent)
+
+
+def test_three_same_scope_defs_get_three_nodes(tmp_path):
+    """The `#N` counter. A hard-coded `#2` silently drops the third — node-dropping on
+    collision being the very defect #363 exists to close. No fixture had a triple, and
+    `src/terse` has none, so nothing could see it (#363 review)."""
+    pkg = _synthetic(tmp_path, {"r.py": '''
+def helper(): return 1
+def helper(): return 2
+def helper(): return 3
+'''})
+    graph, _, amb, _bo = _call_graph(pkg)
+    assert sorted(k for k in graph if "helper" in k) == \
+        ["r.py:helper", "r.py:helper#2", "r.py:helper#3"], sorted(graph)
+    assert "helper" in amb
+
+
+def test_function_scope_qualification_is_not_flattened(tmp_path):
+    """`_defs` recurses into FUNCTION bodies with the enclosing name, not just class
+    bodies. Dropping that made two nested namesakes collide into a `#2` node — a live
+    behaviour change that no test could see, because every namesake fixture used a class
+    method (#363 review)."""
+    pkg = _synthetic(tmp_path, {"r.py": '''
+def outer_a():
+    def inner(): return 1
+    return inner
+def outer_b():
+    def inner(): return 2
+    return inner
+'''})
+    graph, _, _, _bo = _call_graph(pkg)
+    assert "r.py:outer_a.inner" in graph and "r.py:outer_b.inner" in graph, sorted(graph)
+    assert not any("#" in k for k in graph), "nested namesakes collided into a dup node"
+
+
+def test_a_binding_is_not_traversed_onward_either(tmp_path):
+    """One level of indirection past `test_a_binding_is_not_a_disclosure`.
+
+    Binding `attrition_block` directly is caught by the target subtraction in `_reaches`.
+    Binding a function that DISCLOSES has to be caught by the traversal skip instead — and
+    with only the target subtraction in place, the mutation that drops bindings from
+    `attr_only` survives the whole file (#363 review sweep)."""
+    pkg = _synthetic(tmp_path, {"r.py": '''
+def paired_rows(rows, *f): return rows
+def attrition_block(a, n, e=None, *, style="markdown"): return []
+
+def discloser(a, n):
+    return attrition_block(a, n)
+
+def build_bound(rows, _d=discloser):     # binds a discloser, never calls it
+    return paired_rows(rows, "a_ok")
+'''})
+    graph, attr_only, amb, _bo = _call_graph(pkg)
+    _, silent = _paired_and_silent(graph, attr_only, amb, _bo)
+    assert "r.py:build_bound" in silent, sorted(silent)
