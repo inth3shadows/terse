@@ -1012,19 +1012,8 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
               "_MODELS (or --base-url/--models).", file=sys.stderr)
         return 1
     active = activate_suggestions(doc)
-    # Disclose the lift rather than let it be invisible. `activate_suggestions` restores
-    # default tiers on a `tiers: []` entry it promotes a suggestion onto (#375) — without
-    # that the eval measures nothing at all, but WITH it the eval is answering a slightly
-    # different question than the generated policy asks, and the operator has to be told
-    # which rules that applied to before reading the verdict as an endorsement.
     lifted = sorted((e.get("match") or {}).get("tool", "?") for e in active.get("policies", [])
                     if e.get(TIERS_RESTORED_KEY))
-    if lifted:
-        print(f"\nnote: {len(lifted)} rule(s) are 'tiers': [] (passthrough) in the generated "
-              f"policy, which suppresses the drop step entirely — the eval below restores "
-              f"default tiers for them so the suggestion can actually fire: "
-              f"{', '.join(lifted)}.\n      Enabling the suggestion on disk means setting "
-              f"tiers too; check `terse stats` for these tools first.")
     # Write inside the `with` (so the handle is CLOSED after it), then load by name: Windows
     # forbids reopening a temp file whose handle is still open, so a `delete=True` block that
     # loaded inside it would crash there. delete=False keeps the closed file for the reload.
@@ -1038,13 +1027,37 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
     if not pol.has_drop():
         print("--drop-eval: no drop suggestions to verify.")
         return 0
+
+    # ONE pure pass, before the models run and before the note is printed. It is what lets
+    # the note say something true: the first cut announced every lifted rule "so the
+    # suggestion can actually fire", and on the real corpus one of the three
+    # (`codegraph.codegraph_explore`) then scored zero, because 61 of its 62 envelopes carry
+    # no server and never select the qualified rule (#149's class, review finding). A note
+    # that knows which rules the corpus actually reaches does not have to promise.
+    measured, coverage_rows = dropeval.drop_eval_scope(envelopes, pol.select)
+    if lifted:
+        will, wont = ([r for r in lifted if r in measured],
+                      [r for r in lifted if r not in measured])
+        print(f"\nnote: {len(lifted)} rule(s) are 'tiers': [] (passthrough) in the generated "
+              f"policy, which suppresses the drop step entirely — the eval below restores "
+              f"default tiers for them. Enabling the suggestion on disk means setting tiers "
+              f"too; check `terse stats` for these tools first.")
+        if will:
+            print(f"      measured below: {', '.join(will)}")
+        if wont:
+            # Named separately and NOT as a promise: the lift happened, the corpus just has
+            # no payload that reaches these rules. Silence here is what made the first cut
+            # read as an endorsement of a tool the run never touched.
+            print(f"      lifted but STILL unmeasured (no corpus payload selects the rule): "
+                  f"{', '.join(wont)} — see 'Not evaluated' below.")
+
     print("\nverifying the suggested drops with a live model (does it call terse.retrieve "
           "when the dropped field is needed, and skip it when not?)...")
     results = dropeval.run_drop_fluency(envelopes, pol.select, answerers,
                                         trials=args.trials,
                                         control=not args.no_control)
     print("\n" + build_dropeval_report(results, accept_degraded=args.accept_degraded))
-    coverage = render_drop_coverage(dropeval.drop_eval_coverage(envelopes, pol.select))
+    coverage = render_drop_coverage(coverage_rows)
     if coverage:
         print("\n" + coverage)
     # Read the DIRECTIVE, never re-derive it from the PASS lines above — see

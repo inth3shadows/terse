@@ -110,6 +110,7 @@ DROP_SKIP_REASONS: dict[str, str] = {
     "passthrough_tiers": "rule is 'tiers': [] (explicit passthrough) — the drop step never runs",
     "not_record_shaped": "payload has no record list terse would drop into",
     "size_floor": "every candidate value fell under the drop size floor, or the loss gate failed",
+    "not_compressible": "terse passes this payload through untouched, so no drop step runs",
     "no_id_column": "no unique scalar id column to address a record by",
     "no_marker_landed": "no drop-marked field produced a committed handle",
     "value_visible": "the dropped value also appears in the retained text (question would leak)",
@@ -120,14 +121,21 @@ DROP_SKIP_REASONS: dict[str, str] = {
     "no_anchor_line": "no line in the dropped span is unique enough to anchor a question",
 }
 
-# The two reasons that mean the tool was never UNDER test — its rule marks nothing
-# drop-to-retrieve at all — as opposed to "it was under test and yielded nothing", which is
-# what #375 is about. A real corpus is overwhelmingly the former (1,515 of 1,524 envelopes
-# on the session corpus), so a report that itemizes both buries the handful of rows an
-# operator can act on. `report.render_drop_coverage` itemizes the rest and collapses these
-# into one line; `drop_eval_coverage` still returns every row, so the partition is a
-# presentation choice a caller can override rather than data thrown away.
-NOT_UNDER_TEST = ("no_drop_spec", "no_text_drop_spec")
+
+def rule_is_under_test(rule: Any) -> bool:
+    """Does `rule` mark ANYTHING drop-to-retrieve — a JSON field or a text span?
+
+    The predicate that decides whether a skipped payload is news. Read off the RULE, not
+    off the skip reason (review finding): `no_text_drop_spec` means "no TEXT selector", and
+    a non-JSON payload of a tool whose rule carries `result[].body: drop-to-retrieve` earns
+    exactly that reason while its rule very much does mark something drop-to-retrieve.
+    Classifying by reason therefore printed "their rule marks nothing drop-to-retrieve"
+    over rows where that is false — measured on the session corpus at 3 rows
+    (`kb.read.list_decisions`, `kb.read.list_principles`, `kb.read.similar_sessions`), which
+    the fix moves from the collapsed count into the itemized table: 1,089 of 1,515 skipped
+    payloads are genuinely not under test, not 1,092. A disclosure feature that states a
+    false reason is worse than one that stays quiet."""
+    return bool(lossy_mod._drop_specs(rule) or lossy_mod._text_drop_specs(rule))
 
 
 class DropProbe(NamedTuple):
@@ -135,18 +143,24 @@ class DropProbe(NamedTuple):
 
     `applied`/`staging` are meaningful ONLY when `questions` is non-empty; `reason` is the
     mirror image — a `DROP_SKIP_REASONS` key exactly when `questions` is empty. Replaces a
-    bare 3-tuple whose empty case carried no explanation at all (#375)."""
+    bare 3-tuple whose empty case carried no explanation at all (#375).
+
+    `detail` carries `policy.apply`'s own warning for a reason that has more than one
+    possible cause, so the closed vocabulary stays closed while the operator still gets the
+    specific sentence. Empty for every reason that names its cause exactly."""
 
     questions: list[DropQuestion]
     applied: policy_mod.Applied | None
     staging: dict[str, Any] | None
     reason: str | None
+    detail: str = ""
 
 
-def _no_probe(reason: str) -> DropProbe:
+def _no_probe(reason: str, detail: str = "") -> DropProbe:
     """A `DropProbe` for a payload with nothing testable, tagged with WHY."""
-    assert reason in DROP_SKIP_REASONS, f"unknown drop-skip reason {reason!r}"
-    return DropProbe([], None, None, reason)
+    if reason not in DROP_SKIP_REASONS:      # not an `assert`: `python -O` would strip it,
+        raise KeyError(f"unknown drop-skip reason {reason!r}")   # and the table renders "?"
+    return DropProbe([], None, None, reason, detail)
 
 
 def _staged_apply(obj: Any, rule: Any, tool: str) -> tuple[policy_mod.Applied, dict[str, Any]]:
@@ -394,7 +408,16 @@ def _questions_and_staging(obj: Any, rule: Any, tool: str) -> DropProbe:
         return _no_probe("not_record_shaped")
 
     applied, staging = _staged_apply(obj, rule, tool)
-    if applied.skipped or not staging:
+    # `applied.skipped` is NOT the size floor. Past the `tiers` pre-check above, `apply`
+    # still returns skipped for its structural passthrough guards — the depth cap and the
+    # reserved-marker collision (`policy.py`) — and reporting those as "fell under the drop
+    # size floor" tells an operator to lower `min`, which changes nothing on a payload
+    # terse refuses to compress at all (review finding). Same bucket-merging this issue
+    # carves `passthrough_tiers` out of, so it gets the same treatment: its own reason,
+    # carrying `apply`'s own warning as the specific cause.
+    if applied.skipped:
+        return _no_probe("not_compressible", "; ".join(applied.warnings))
+    if not staging:
         return _no_probe("size_floor")
 
     # Intersection, not `records[0].keys()`: #204 widened `find_record_list_with_path` to
@@ -765,27 +788,43 @@ def run_drop_fluency(envelopes: list[dict], rule_for: Callable[..., Any],
     return results
 
 
-def drop_eval_coverage(envelopes: list[dict], rule_for: Callable[..., Any]) -> list[dict]:
-    """One row per envelope the drop-eval could NOT pose a question about, as
-    `{"tool", "server", "sha", "reason"}` — `reason` a `DROP_SKIP_REASONS` key (#375).
+def drop_eval_scope(envelopes: list[dict],
+                    rule_for: Callable[..., Any]) -> tuple[set[str], list[dict]]:
+    """One pure pass over the corpus: `(measured_globs, coverage_rows)`.
 
-    Runs no model and makes no network call: it is the same pure `_probe_envelope` pass
-    `run_drop_fluency` uses, so the two cannot disagree about which payloads were skipped
-    or why. That is the point of the shared probe — a second hand-written loop here would
-    be free to drift from the one that actually decides, which is the class of defect this
-    whole issue is about.
+    `measured_globs` is the `tool_glob` of every RULE that produced at least one question —
+    which rules the eval is actually about to measure. `coverage_rows` is one row per
+    envelope that produced none, as `{"tool", "server", "sha", "reason", "detail",
+    "under_test"}`; `reason` is a `DROP_SKIP_REASONS` key and `under_test` is
+    `rule_is_under_test(rule)`, read off the rule rather than inferred from the reason.
 
-    The extra `policy.apply` sweep this costs is one pass over the corpus, against an eval
-    whose runtime is dominated by per-question model round-trips. Paid deliberately, to buy
-    a disclosure that is testable without a live backend."""
-    out: list[dict] = []
+    Runs no model and makes no network call: the same `_probe_envelope` `run_drop_fluency`
+    uses, so the two cannot disagree about which payloads were skipped or why. That is the
+    point of the shared probe — a second hand-written loop here would be free to drift from
+    the one that actually decides, which is the class of defect this whole issue is about.
+
+    `measured_globs` exists because the pre-eval note promised more than the run delivered
+    (review finding): it announced three lifted rules "so the suggestion can actually fire",
+    and one of them (`codegraph.codegraph_explore`) scored ZERO — 61 of its 62 envelopes
+    carry no server, so the qualified rule is never selected for them (#149's class). A note
+    that can name the rules it will actually measure does not have to promise."""
+    measured: set[str] = set()
+    rows: list[dict] = []
     for env in envelopes:
-        probe, _rule, _payload, _is_json = _probe_envelope(env, rule_for)
+        probe, rule, _payload, _is_json = _probe_envelope(env, rule_for)
         if probe.reason is None:
+            measured.add(getattr(rule, "tool_glob", env["tool"]))
             continue
-        out.append({"tool": env["tool"], "server": env.get("server"),
-                    "sha": env.get("sha", "?"), "reason": probe.reason})
-    return out
+        rows.append({"tool": env["tool"], "server": env.get("server"),
+                     "sha": env.get("sha", "?"), "reason": probe.reason,
+                     "detail": probe.detail, "under_test": rule_is_under_test(rule)})
+    return measured, rows
+
+
+def drop_eval_coverage(envelopes: list[dict], rule_for: Callable[..., Any]) -> list[dict]:
+    """Just the coverage rows of `drop_eval_scope` — the disclosure half, for a caller that
+    does not need to know which rules were measured."""
+    return drop_eval_scope(envelopes, rule_for)[1]
 
 
 # --------------------------------------------------------------------------- #

@@ -30,6 +30,12 @@ PAYLOAD = {"result": [{"id": i, "name": f"n{i}", "body": f"{i} " + "lorem ipsum 
 DROP_FIELDS = {"result[].body": {"lossy": "drop-to-retrieve", "min": 200}}
 
 
+def _row(tool, reason, *, under_test=True, detail="", sha="a", server=None):
+    """A coverage row in the shape `drop_eval_scope` emits."""
+    return {"tool": tool, "server": server, "sha": sha, "reason": reason,
+            "detail": detail, "under_test": under_test}
+
+
 def _doc(tiers):
     return {"version": 1,
             "defaults": {"tiers": ["minify", "tabularize", "dictionary"]},
@@ -135,9 +141,20 @@ def test_the_activated_policy_actually_produces_questions_end_to_end():
 
     from terse.policy import load_policy
 
-    for doc, expected in ((_doc([]), True), (_doc([]), True)):
+    # Both sides of the lift, through the real path. Without activation the rule is still
+    # `tiers: []` and poses nothing; with it, questions. The loop ran the SAME case twice
+    # before — `expected` never took `False`, so it asserted nothing the first pass didn't.
+    for doc, activate, expected in ((_doc([]), True, True), (_doc([]), False, False)):
+        loaded = activate_suggestions(doc) if activate else doc
+        if not activate:
+            # The un-activated doc keeps its suggestion INACTIVE, so promote by hand to
+            # isolate the ONE variable under test: the tiers, not the field set.
+            loaded = json.loads(json.dumps(doc))
+            entry = loaded["policies"][0]
+            entry["fields"] = entry.pop("_suggested_fields")
+            entry.pop("_suggested_fields_note")
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
-            tf.write(json.dumps(activate_suggestions(doc)))
+            tf.write(json.dumps(loaded))
             name = tf.name
         try:
             pol = load_policy(name)
@@ -158,7 +175,7 @@ def test_coverage_reports_the_passthrough_tool_with_its_reason():
     rows = dropeval.drop_eval_coverage(
         envelopes, lambda t, s=None: Rule(tool_glob="*", tiers=(), fields=dict(DROP_FIELDS)))
     assert rows == [{"tool": "kb.read.list_principles", "server": "kb", "sha": "abc",
-                     "reason": "passthrough_tiers"}]
+                     "reason": "passthrough_tiers", "detail": "", "under_test": True}]
 
 
 def test_coverage_is_silent_when_every_payload_was_evaluated():
@@ -173,11 +190,9 @@ def test_coverage_is_silent_when_every_payload_was_evaluated():
 
 def test_the_rendered_section_names_the_tool_the_count_and_the_remedy():
     text = render_drop_coverage([
-        {"tool": "kb.read.list_principles", "server": "kb", "sha": "a",
-         "reason": "passthrough_tiers"},
-        {"tool": "kb.read.list_principles", "server": "kb", "sha": "b",
-         "reason": "passthrough_tiers"},
-        {"tool": "gh.search", "server": "gh", "sha": "c", "reason": "size_floor"},
+        _row("kb.read.list_principles", "passthrough_tiers"),
+        _row("kb.read.list_principles", "passthrough_tiers"),
+        _row("gh.search", "size_floor"),
     ])
     assert "kb.read.list_principles" in text
     assert "2 payload(s)" in text
@@ -195,10 +210,8 @@ def test_a_tool_that_was_never_under_test_is_counted_not_itemized():
     They are still COUNTED, so the section accounts for every payload and the collapse
     cannot be used to hide something."""
     text = render_drop_coverage(
-        [{"tool": "kb.read.list_principles", "server": "kb", "sha": "a",
-          "reason": "passthrough_tiers"}]
-        + [{"tool": f"boring{i}", "server": None, "sha": str(i), "reason": "no_drop_spec"}
-           for i in range(9)])
+        [_row("kb.read.list_principles", "passthrough_tiers")]
+        + [_row(f"boring{i}", "no_drop_spec", under_test=False) for i in range(9)])
     assert "kb.read.list_principles" in text
     assert "boring3" not in text                    # collapsed, not itemized
     assert "9 further payload(s)" in text           # but accounted for
@@ -209,8 +222,7 @@ def test_a_run_whose_every_skip_is_out_of_scope_still_renders_the_count():
     """The all-collapsed case must not produce a section that claims something was under
     test when nothing was — the "NOT a pass" sentence is a real claim and belongs only
     where it is true."""
-    text = render_drop_coverage(
-        [{"tool": "t", "server": None, "sha": "a", "reason": "no_drop_spec"}])
+    text = render_drop_coverage([_row("t", "no_drop_spec", under_test=False)])
     assert "1 further payload(s)" in text
     assert "NOT a pass" not in text
     assert "carry a drop selector" not in text
@@ -366,3 +378,151 @@ def test_tune_drop_eval_hands_the_lifted_rules_to_the_directive(monkeypatch, cap
     assert seen["tiers_restored"] == ["kb.read.list_principles"]
     # ...and the same set reached the pre-eval note, so the two disclosures cannot diverge.
     assert "kb.read.list_principles" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# 6. Review round 2 — the four findings both reviewers' mutations exposed
+# --------------------------------------------------------------------------- #
+def test_the_not_evaluated_section_reaches_stdout_from_tune_drop_eval(monkeypatch, capsys):
+    """HIGH finding: both `render_drop_coverage` call sites could be replaced with no-ops
+    and the whole suite stayed green — the feature's ONLY user-facing path was unpinned
+    while its two halves were unit-tested. The `#303` shape: a fix that is inert on the
+    prod path because nothing watched the emitter."""
+    import argparse
+
+    from terse import cli, dropeval
+
+    monkeypatch.setattr(cli, "_build_answerers",
+                        lambda args, make: {"m": lambda messages: dropeval.Turn(text="no")})
+    doc = _doc(["minify", "tabularize", "dictionary"])   # compressing, so nothing is lifted
+    envelopes = [
+        {"tool": "kb.read.list_principles", "server": None, "sha": "a",
+         "raw": json.dumps(PAYLOAD)},
+        # ...and one the eval cannot pose a question about, so a section must be printed.
+        {"tool": "kb.read.list_principles", "server": None, "sha": "b", "raw": "{}"},
+    ]
+    args = argparse.Namespace(trials=1, no_control=True, accept_degraded=False)
+    assert cli._tune_drop_eval(args, doc, envelopes) == 0
+
+    out = capsys.readouterr().out
+    assert "## Not evaluated" in out
+    assert "not_record_shaped" in out
+
+
+def test_the_not_evaluated_section_reaches_the_written_report_file(tmp_path, monkeypatch):
+    """The other call site. `fluency --drop-eval --out <file>` APPENDS the section to the
+    report it writes; a reader opening that file later must be able to tell "this tool
+    passed" from "this tool was never posed a question", which is the whole point."""
+    import argparse
+
+    from terse import cli, dropeval
+
+    pol_path = tmp_path / "policy.json"
+    pol_path.write_text(json.dumps({
+        "version": 1,
+        "defaults": {"tiers": ["minify", "tabularize", "dictionary"]},
+        "policies": [{"match": {"tool": "kb.read.list_principles"},
+                      "tiers": ["minify", "tabularize", "dictionary"],
+                      "fields": dict(DROP_FIELDS)}]}))
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for sha, raw in (("a", json.dumps(PAYLOAD)), ("b", "{}")):
+        (corpus / f"{sha}.json").write_text(json.dumps(
+            {"tool": "kb.read.list_principles", "sha": sha, "raw": raw}))
+
+    monkeypatch.setattr(cli, "_build_answerers",
+                        lambda args, make: {"m": lambda messages: dropeval.Turn(text="no")})
+    out_path = tmp_path / "report.md"
+    args = argparse.Namespace(
+        corpus=str(corpus), policy=str(pol_path), drop_eval=True, out=str(out_path),
+        trials=1, no_control=True, accept_degraded=False, bars=False, html=False,
+        diff=False, diff_soak=False, text_diff_eval=False, codec_verdict=False,
+        pack=None, models=None, base_url=None, api_key=None)
+    cli._cmd_fluency(args)
+
+    written = out_path.read_text()
+    assert "## Not evaluated" in written
+    assert "not_record_shaped" in written
+
+
+def test_a_structural_passthrough_is_not_reported_as_the_size_floor():
+    """MEDIUM: `applied.skipped` also covers `policy.apply`'s depth cap and reserved-marker
+    guards. Reporting those as "fell under the drop size floor" tells the operator to lower
+    `min`, which changes nothing on a payload terse refuses to compress at all."""
+    marker = {"result": [{"id": i, "name": f"n{i}",
+                          "body": f"{i} " + "lorem ipsum dolor " * 40}
+                         for i in range(6)]}
+    marker["result"][0]["__terse_dict__"] = 1        # reserved key -> apply passes through
+    rule = Rule(tool_glob="*", tiers=("minify", "tabularize", "dictionary"),
+                fields=dict(DROP_FIELDS))
+    probe = dropeval._questions_and_staging(marker, rule, "t.x")
+    assert probe.reason == "not_compressible"
+    assert "reserved terse marker" in probe.detail    # apply's own words, not a guess
+
+    # ...and a real floor miss still says floor, so the split did not just rename everything.
+    tiny = {"result": [{"id": i, "body": "x"} for i in range(6)]}
+    assert dropeval._questions_and_staging(tiny, rule, "t.x").reason == "size_floor"
+
+
+def test_the_specific_cause_reaches_the_rendered_table():
+    """A reason with more than one cause is useless in the table without its detail — the
+    operator reads the table, not the probe."""
+    text = render_drop_coverage([
+        _row("t.x", "not_compressible", detail="payload contains a reserved terse marker key"),
+        _row("t.x", "not_compressible", detail="payload nests deeper than 200 levels"),
+    ])
+    assert "reserved terse marker key" in text
+    assert "nests deeper than 200" in text            # NOT collapsed into one count
+
+
+def test_a_text_payload_of_a_json_drop_rule_is_not_called_never_under_test():
+    """MEDIUM: `no_text_drop_spec` means "no TEXT selector", not "marks nothing
+    drop-to-retrieve". Collapsing it printed a sentence that is FALSE for a non-JSON payload
+    of a tool whose rule carries a JSON drop spec — 3 such rows on the real session corpus.
+    The partition now reads the rule, not the reason."""
+    rule = Rule(tool_glob="*", tiers=("minify", "tabularize", "dictionary"),
+                fields=dict(DROP_FIELDS))          # a JSON selector, no text selector
+    rows = dropeval.drop_eval_coverage(
+        [{"tool": "kb.read.list_decisions", "server": "kb", "sha": "a",
+          "raw": "not json at all"}], lambda t, s=None: rule)
+    assert rows[0]["reason"] == "no_text_drop_spec"
+    assert rows[0]["under_test"] is True, "its rule DOES mark a field drop-to-retrieve"
+    assert "never under test" not in render_drop_coverage(rows)
+
+    # A rule that really marks nothing still collapses — the partition still partitions.
+    bare = Rule(tool_glob="*", tiers=("minify",), fields={})
+    bare_rows = dropeval.drop_eval_coverage(
+        [{"tool": "t.x", "server": None, "sha": "a", "raw": "not json at all"}],
+        lambda t, s=None: bare)
+    assert bare_rows[0]["under_test"] is False
+    assert "never under test" in render_drop_coverage(bare_rows)
+
+
+def test_the_note_separates_rules_it_will_measure_from_rules_it_will_not(monkeypatch, capsys):
+    """MEDIUM: the note announced three lifted rules "so the suggestion can actually fire",
+    and one of them scored ZERO on the real corpus — its envelopes carry no server, so the
+    qualified rule is never selected for them. Lifting a rule the corpus cannot reach is not
+    a promise that it will be measured."""
+    import argparse
+
+    from terse import cli, dropeval
+
+    doc = _doc([])
+    doc["policies"].append({"match": {"tool": "codegraph.codegraph_explore"}, "tiers": [],
+                            "_suggested_fields": dict(DROP_FIELDS),
+                            "_suggested_fields_note": "…"})
+    # Only the first rule's tool appears in the corpus; the second is lifted but unreachable.
+    envelopes = [{"tool": "kb.read.list_principles", "server": None, "sha": "a",
+                  "raw": json.dumps(PAYLOAD)}]
+    monkeypatch.setattr(cli, "_build_answerers",
+                        lambda args, make: {"m": lambda messages: dropeval.Turn(text="no")})
+    args = argparse.Namespace(trials=1, no_control=True, accept_degraded=False)
+    assert cli._tune_drop_eval(args, doc, envelopes) == 0
+
+    out = capsys.readouterr().out
+    measured = out[out.index("measured below:"):]
+    assert "kb.read.list_principles" in measured.split("\n")[0]
+    assert "STILL unmeasured" in out
+    assert "codegraph.codegraph_explore" in out[out.index("STILL unmeasured"):]
+    # The old sentence promised the lift made the suggestion fire. It must be gone.
+    assert "so the suggestion can actually fire" not in out
