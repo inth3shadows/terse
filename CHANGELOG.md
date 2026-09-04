@@ -15,6 +15,37 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **`_unmeasured` saw dropeval's control arm but not its treatment arm, so the same
+  transport loss withheld a run on one side and published a gap on the other** (`#352`).
+  The gate discovers arms by scanning rows for `<arm>_trials` keys, and dropeval emits
+  exactly one of them. Its treatment arm deliberately has none — errored trials must stay
+  in the accuracy denominator, because scoring them as misses makes the drop rule look
+  *worse*, which is the conservative direction — so the gate was structurally blind to it
+  at every loss level. The only remaining cover was `inconclusive_models`' arm-blind
+  50%-of-pooled-calls threshold, which means the treatment arm could lose 49% of its own
+  calls and still have a final-accuracy gap published, while a control losing 21% was
+  withheld. That arm runs two turns to the control's one, so it is the arm that fails
+  first under a token-budget stop, and the questions it loses are not a random sample.
+
+  `_unmeasured` gains a fourth trigger reading an explicit `<arm>_errors` counter, at the
+  same `UNMEASURED_FAIL_SHARE` against that arm's own calls. Two smaller changes were
+  rejected and the reasons are recorded in the code: emitting `fails` reaches only the
+  pooled trigger, where a treatment-only loss would need 40% to fire against the control's
+  20% — the pooled-denominator defect `#339` removed, one harness over; and emitting
+  `answer_trials` would pull errored trials out of the recall denominator, the measured
+  33%-FAIL-to-100%-PASS regression `dropeval.py` exists to prevent. On the control arm the
+  new trigger is arithmetically identical to the existing one, so symmetry follows from the
+  shape rather than from a second threshold.
+
+  **Not closed, and now asserted rather than assumed:** recall and no-overfetch gate
+  against a fixed 100% ideal and never reach `_unmeasured` at all, so a treatment error is
+  still scored as a behavioural miss there. The run-level directive therefore remains
+  asymmetric — BLOCK for a treatment loss, NOT_CONCLUDED for the same loss on the control.
+  That is strictly conservative and never a gained ship authorization, and
+  `test_the_run_level_verdict_is_still_asymmetric_and_that_is_recorded_not_fixed` pins the
+  direction so it cannot drift.
+
+
 - **Four evasion classes left open in the `paired_rows` disclosure guard, and two false
   claims it made about itself** (`#363`, following `#361`). No renderer emitted anything
   wrong — what was wrong is the test meant to keep it that way. Its load-bearing claim is
