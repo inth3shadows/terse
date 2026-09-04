@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.30.7] - 2026-09-04
+
 ### Fixed
 
 - `tune --drop-eval` evaluated a drop suggestion attached to a `tiers: []` rule to
