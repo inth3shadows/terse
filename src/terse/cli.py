@@ -1049,8 +1049,11 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
         print("\n" + coverage)
     # Read the DIRECTIVE, never re-derive it from the PASS lines above — see
     # `dropeval_next_step_line`, which owns the sentence and the reason.
-    print(dropeval_next_step_line(dropeval_verdict(
-        results, accept_degraded=args.accept_degraded)))
+    print(dropeval_next_step_line(
+        dropeval_verdict(results, accept_degraded=args.accept_degraded),
+        # The SAME list the note above was built from, so the directive cannot authorize a
+        # rename the run already knows is insufficient for these rules (#375 review).
+        tiers_restored=lifted))
     return 0
 
 

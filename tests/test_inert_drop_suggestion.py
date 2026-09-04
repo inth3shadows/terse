@@ -277,3 +277,55 @@ def test_the_suggestion_note_warns_only_when_the_rule_is_passthrough(threshold, 
     assert ("renaming ALONE enables nothing" in note) is passthrough
     if passthrough:
         assert "terse stats" in note      # #274's cross-check, reachable from the note
+
+
+# --------------------------------------------------------------------------- #
+# 5. The final directive cannot prescribe the rename the run knows is inert
+# --------------------------------------------------------------------------- #
+# Review finding on the first cut of this fix: `dropeval_next_step_line` on a SHIP verdict
+# said "enable the verified fields by renaming '_suggested_fields' -> 'fields'". For a rule
+# whose `tiers: []` the eval had just lifted, that rename alone leaves the passthrough in
+# place and the drop never fires — #375 restated as an instruction the operator was told to
+# follow. The warning printed before the eval is hundreds of report lines away by then, and
+# the coverage section cannot re-flag those rules precisely BECAUSE they were lifted.
+def _fleet(*, recall, precision, n=24):
+    """Rows in the shape `run_drop_fluency` emits — one control-paired trial each. `recall`
+    and `precision` are `(answer_ok, retrieve_ok)`; the control arm is always correct, so
+    the treatment is the only thing under test."""
+    out = []
+    for kind, (answer, retrieve) in (("recall", recall), ("precision", precision)):
+        out += [{"kind": kind, "trials": 1, "retrieve_ok": retrieve, "answer_ok": answer,
+                 "handle_ok": 1, "errors": 0, "treatment_errors": 0, "control_errors": 0,
+                 "attempts": 2, "qid": f"{kind}-q{i}", "control_ok": 1, "control_trials": 1}
+                for i in range(n)]
+    return {"m": out}
+
+
+def test_the_ship_directive_names_the_lifted_rules_as_needing_tiers_too():
+    from terse.report import Directive, dropeval_next_step_line, dropeval_verdict
+
+    v = dropeval_verdict(_fleet(recall=(1, 1), precision=(1, 1)))
+    assert v.directive is Directive.SHIP, "precondition: this fixture ships"
+
+    plain = dropeval_next_step_line(v)
+    lifted = dropeval_next_step_line(v, tiers_restored=["kb.read.list_nodes",
+                                                       "kb.read.list_principles"])
+    assert "renaming" in plain and "NOT sufficient" not in plain
+    assert "NOT sufficient" in lifted
+    assert "kb.read.list_principles" in lifted and "kb.read.list_nodes" in lifted
+    assert "tiers" in lifted
+    # Sorted, so two runs over the same policy print the same sentence.
+    assert lifted.index("kb.read.list_nodes") < lifted.index("kb.read.list_principles")
+
+
+def test_a_declined_verdict_says_nothing_about_tiers_either_way():
+    """The caveat rides on the SHIP branch only. A verdict that already tells the operator
+    to change nothing must not grow an "...and also set tiers" clause, which would read as a
+    partial authorization the measurement does not support."""
+    from terse.report import Directive, dropeval_next_step_line, dropeval_verdict
+
+    v = dropeval_verdict(_fleet(recall=(0, 0), precision=(1, 1)))
+    assert v.directive is not Directive.SHIP, "precondition: this fixture does not ship"
+    line = dropeval_next_step_line(v, tiers_restored=["kb.read.list_principles"])
+    assert "does NOT authorize" in line
+    assert "NOT sufficient" not in line and "kb.read.list_principles" not in line

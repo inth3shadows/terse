@@ -12,7 +12,7 @@ Honesty requirements (plan Section 7, principle #24):
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from enum import IntEnum
 from types import MappingProxyType
 from typing import Any, Literal, NamedTuple, TypeGuard, assert_never
@@ -1913,7 +1913,8 @@ def dropeval_exclusion_bullets(v: DropevalVerdict) -> list[str]:
     return out
 
 
-def dropeval_next_step_line(v: DropevalVerdict) -> str:
+def dropeval_next_step_line(v: DropevalVerdict,
+                            tiers_restored: Sequence[str] = ()) -> str:
     """What `terse tune --drop-eval` should tell the operator to do with the policy.
 
     A separate sentence from `dropeval_directive_line` because it is about the POLICY FILE,
@@ -1924,12 +1925,27 @@ def dropeval_next_step_line(v: DropevalVerdict) -> str:
     `**PASS**` headlines under a verdict that authorizes nothing — and the reader following
     the instruction enables the drops the report just refused. That is #344's critical
     finding wearing a renderer's clothes, and no property could catch it here, because the
-    sentence was not derived from the verdict at all."""
-    if v.directive is Directive.SHIP:
-        return ("The verdict authorizes it: enable the verified fields by renaming that "
-                "tool's '_suggested_fields' -> 'fields' in the policy.")
-    return ("The verdict does NOT authorize enabling these drops — see the last bullet "
-            "above for what is missing. Leave '_suggested_fields' as it is until it does.")
+    sentence was not derived from the verdict at all.
+
+    `tiers_restored` is `policy_gen.activate_suggestions`'s lifted rules — the ones whose
+    `tiers: []` the eval had to fill in to measure anything (#375). For those, the rename
+    this sentence prescribes is NOT sufficient: `tiers: []` is an explicit passthrough that
+    suppresses the drop step, so renaming alone reproduces the exact defect #375 fixed,
+    restated as an instruction the operator was told to follow. Passed in for the same
+    reason the directive is: a caveat printed once, hundreds of report lines earlier, is
+    not a caveat the reader has when they act on this line."""
+    if v.directive is not Directive.SHIP:
+        return ("The verdict does NOT authorize enabling these drops — see the last bullet "
+                "above for what is missing. Leave '_suggested_fields' as it is until it does.")
+    line = ("The verdict authorizes it: enable the verified fields by renaming that "
+            "tool's '_suggested_fields' -> 'fields' in the policy.")
+    if tiers_restored:
+        line += (" NOT sufficient on its own for " + ", ".join(sorted(tiers_restored))
+                 + ": the eval had to fill in their 'tiers': [] to measure anything, so the "
+                 "rename must be accompanied by setting tiers — otherwise the passthrough "
+                 "suppresses the drop and nothing changes. Check `terse stats` for those "
+                 "tools first; a tool with real live traffic may already be compressing.")
+    return line
 
 
 def dropeval_directive_line(v: DropevalVerdict) -> str:
