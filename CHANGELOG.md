@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.30.8] - 2026-09-04
+
 ### Fixed
 
 - **A transport failure was published as a behavioural failure of the drop rule** (`#371`,
