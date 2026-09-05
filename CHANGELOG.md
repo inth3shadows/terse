@@ -13,6 +13,39 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A transport failure was published as a behavioural failure of the drop rule** (`#371`,
+  the unfinished half of `#352`). `_unmeasured` runs only on final-accuracy, via
+  `_accuracy_gate` -> `arm_gap`. Recall and no-overfetch score against a fixed 100% ideal,
+  so they never pair, never build an `ArmGap`, and had never been gated on transport loss
+  at all. Because `retrieve_ok` can only shrink as calls are lost — dropeval emits no
+  `retrieve_trials` to shrink the denominator alongside it — any loss past
+  `UNMEASURED_FAIL_SHARE` forced the column under tolerance and printed
+  `retrieve-recall 60% ... **FAIL** — keep drop-to-retrieve off`, two lines under the
+  report's own `these rows measure the harness, not the model: 192/960`. An operator was
+  told something about the model that the harness never measured.
+
+  `dropeval_verdict` now withholds the two mechanism metrics when the TREATMENT arm's own
+  loss share exceeds `UNMEASURED_FAIL_SHARE` — the same lattice move the `"empty"` case
+  beside it already made, and deliberately not a new `ExclusionReason`: the backend did not
+  answer, so the metric was not measured, and `"unmeasured"` already says that and already
+  carries `NOT_CONCLUDED` plus its remedy. The treatment arm specifically, because
+  `retrieve_ok` and `treatment_errors` come from the same loop in `dropeval.py`; a
+  control-arm loss cannot corrupt those columns and gating on it would withhold a
+  measurement that succeeded.
+
+  `_arm_loss_share` is extracted from `_unmeasured`'s trigger 4 so both callers read one
+  derivation — a second copy is what `test_only_one_place_derives_the_arm_to_trials_key`
+  exists to refuse. No production behavior changes for a clean run, and the direction was
+  never at risk: withholding can only make a directive stricter.
+
+  `test_the_run_level_verdict_is_still_asymmetric_and_that_is_recorded_not_fixed` asserted
+  this asymmetry as a recorded defect and ended "if someone makes it, this test goes red
+  and tells them to delete it." It is **replaced**, not deleted: by the inverse invariant,
+  and by a renderer test, because the defect an operator met was a rendered line rather
+  than a verdict object.
+
 ### Added
 
 - **A regression test for multiproxy capture attribution, which had none** (`#374`). The

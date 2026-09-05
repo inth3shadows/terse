@@ -311,34 +311,73 @@ def test_the_accuracy_gate_reaches_the_same_verdict_whichever_arm_lost_the_calls
         assert "not gated" in report
 
 
-def test_the_run_level_verdict_is_still_asymmetric_and_that_is_recorded_not_fixed():
-    """#352 asks for run-level symmetry "or the report states why it does not". This is the
-    "does not", asserted rather than left to a comment.
+def test_the_run_level_verdict_is_symmetric_across_the_arms_and_says_which():
+    """The inverse of the pin this replaces (#371), and the reason that one was written.
 
-    `_unmeasured` gates only `_accuracy_gate` -> `arm_gap`. Recall and no-overfetch call
-    `_form_stats` directly against a FIXED 100% ideal (`report.py`, `dropeval_verdict`), so
-    they never pair and `_unmeasured` has never applied to them. A treatment error is
-    therefore still scored as a behavioural recall MISS — deliberately, per `dropeval.py`'s
-    row build — while the same call lost on the control arm touches no mechanism metric at
-    all, because the control has none.
+    Its predecessor asserted the residual ASYMMETRY as a recorded defect: `_unmeasured`
+    gates only `_accuracy_gate` -> `arm_gap`, while recall and no-overfetch score against a
+    FIXED 100% ideal, never pair, and so were never gated on transport loss at all. Identical
+    loss produced BLOCK on the treatment arm and NOT_CONCLUDED on the control. That test
+    ended "if someone makes it, this test goes red and tells them to delete it." #371 made
+    it; this is the replacement, not the deletion.
 
-    So the two directions still differ, and the difference is BLOCK versus NOT_CONCLUDED:
-    strictly conservative, never a gained ship authorization. That direction is what makes
-    this acceptable to leave, and it is the half of the invariant this assertion exists to
-    keep honest. Closing it means gating the fixed-ideal metrics on transport loss, which
-    is a different change with a different argument; if someone makes it, this test goes
-    red and tells them to delete it."""
+    What must now hold is the symmetry #352 asked for at the RUN level: the same loss on
+    either arm produces the same directive, for a stated reason, on every metric.
+
+    The direction still matters and is asserted separately below: withholding may never
+    manufacture authority. NOT_CONCLUDED is not SHIP.
+    """
     treatment = dropeval_verdict({"m": _both_kinds(trials=10, t_err=4)})
     control = dropeval_verdict({"m": _both_kinds(trials=10, c_err=4)})
-    # Both arms are withheld from the metric `_unmeasured` governs...
-    assert treatment.metrics["accuracy"].excluded == {"m": "unmeasured"}
+
+    assert treatment.directive is control.directive is Directive.NOT_CONCLUDED
+    # Not merely equal directives — equal for a STATED reason. Two runs could agree on
+    # NOT_CONCLUDED while disagreeing about which metrics were measured, which is the
+    # contradiction #371 is about: a number in the table the prose above it disowns.
+    for metric in ("accuracy", "recall", "precision"):
+        assert treatment.metrics[metric].excluded == {"m": "unmeasured"}, metric
+    # The control arm's loss withholds accuracy (it pairs) but NOT the mechanism metrics,
+    # which are computed from the treatment loop's `retrieve_ok` and are unharmed by a
+    # control-arm failure. Symmetry is a property of the run-level directive, not a claim
+    # that the two losses damage the same columns — gating the mechanism metrics on control
+    # loss would withhold a measurement that actually succeeded.
     assert control.metrics["accuracy"].excluded == {"m": "unmeasured"}
-    # ...and the mechanism metrics, which it does not, still see only the treatment.
-    assert treatment.directive is Directive.BLOCK
-    assert control.directive is Directive.NOT_CONCLUDED
-    assert treatment.directive > control.directive, (
-        "the residual asymmetry must stay in the conservative direction — a treatment "
-        "loss may never produce a WEAKER directive than the same loss on the control")
+    assert control.metrics["recall"].excluded == {}
+
+    # The load-bearing direction: neither arm's loss may produce a SHIP authorization.
+    for v in (treatment, control):
+        assert v.directive is not Directive.SHIP
+    # And no metric survives as a behavioural FAIL built from lost calls. `worst is None`
+    # is what distinguishes "withheld" from "scored and failed" — the old BLOCK carried a
+    # `worst` gap of -40% computed from rows the report itself called unmeasurable.
+    assert treatment.metrics["recall"].worst is None
+
+
+def test_a_withheld_mechanism_metric_says_transport_in_the_rendered_report():
+    """#371 at the renderer, not just the verdict object. The defect an operator actually
+    met was a rendered line — `retrieve-recall 60% vs ideal (100%) ... **FAIL**` printed
+    under a paragraph declaring those same rows unmeasurable — so a verdict-only assertion
+    would leave the thing that was wrong on screen unpinned."""
+    report = build_dropeval_report({"m": _both_kinds(trials=10, t_err=4)})
+    # The line the issue quoted is gone: no behavioural FAIL anywhere, and no verdict
+    # authorizing or refusing policy on the strength of one.
+    assert "**FAIL**" not in report
+    assert "**PASS**" not in report
+    # The two mechanism metrics now say they were not gated, in the verdict prose that
+    # used to carry `retrieve-recall 60% vs ideal (100%) ... keep drop-to-retrieve off`.
+    for metric in ("retrieve-recall", "no-overfetch"):
+        assert f"**{metric}: not gated for `m`**" in report, metric
+    assert "INCONCLUSIVE for enabling" in report
+    # And the table cell is the withheld marker, not a number. Asserting on the ROW is what
+    # separates this from the verdict-object test: the defect an operator met was a
+    # percentage printed in a column, under a paragraph disowning the rows behind it.
+    row = next(ln for ln in report.splitlines() if ln.startswith("| `m` |"))
+    recall_cell, precision_cell = row.split("|")[3].strip(), row.split("|")[4].strip()
+    assert recall_cell == "not gated" and precision_cell == "not gated", row
+    # handle-accuracy is deliberately NOT covered here. It is the display-only column no
+    # gate reads (see `test_gap_gate_boundary.py`'s allowlist note), so it still renders a
+    # percentage on this run — an inconsistency worth its own decision, not a silent
+    # widening of this fix's scope.
 
 
 def test_a_row_stating_no_trial_count_is_read_as_one_call_not_zero():

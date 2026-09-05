@@ -671,29 +671,44 @@ def _unmeasured(rows: list[dict]) -> bool:
     # The bare pooled `errors` key does not match the `_errors` suffix, so it cannot
     # double-count the two arms it is the sum of.
     for err_key in sorted({k for r in rows for k in r if k.endswith("_errors")}):
-        arm = err_key[:-len("_errors")]
-        # Rows lacking the key are SKIPPED, not read as zero-loss: a merged set of one
-        # current and one legacy pack would otherwise dilute a real loss share with rows
-        # that never carried a count either way — the same reasoning as the `key in r`
-        # restriction above, one counter over.
-        carrying = [r for r in rows if err_key in r]
-        # The BARE arm name, not a re-spelled `<arm>_trials` — `_arm_attempts` normalizes
-        # either form on its first line, and writing the suffix swap a second time is what
-        # `test_only_one_place_derives_the_arm_to_trials_key` exists to refuse.
-        per_row = [(_arm_attempts(r, arm, int(r.get("trials", 1))), int(r[err_key]))
-                   for r in carrying]
-        arm_attempts = sum(a for a, _ in per_row)
-        if not arm_attempts:
-            continue
-        # No clamp against `a`, unlike trigger 2's `max(0, a - t)`. There the subtraction
-        # can go negative for a legitimate reason (a `score_pack` form whose per-form count
-        # exceeds the shared `trials`); here an arm reporting MORE errors than attempts is
-        # an emitter bug with no benign form, and a share over 1.0 fires this trigger
-        # rather than being quietly rounded down to something that might not.
-        lost = sum(e for _, e in per_row)
-        if lost / arm_attempts > UNMEASURED_FAIL_SHARE:
+        share = _arm_loss_share(rows, err_key[:-len("_errors")])
+        if share is not None and share > UNMEASURED_FAIL_SHARE:
             return True
     return False
+
+
+def _arm_loss_share(rows: list[dict], arm: str) -> float | None:
+    """What fraction of `arm`'s OWN calls it reported lost, via its explicit
+    `<arm>_errors` counter. None when this arm carried no attempts in `rows` — an
+    absence, which is not the same as a loss of 0.0 and must not be compared to a
+    threshold as though it were.
+
+    Extracted from `_unmeasured`'s trigger 4 so the fixed-ideal metrics can ask the same
+    question (#371) without a second copy of the derivation. `dropeval_verdict` gates
+    recall/no-overfetch on the TREATMENT arm's share: those columns are computed from the
+    treatment loop's `retrieve_ok`, and `treatment_errors` is that same loop's counter
+    (`dropeval.py`), so they are the one arm whose transport loss can corrupt them.
+
+    Rows lacking the key are SKIPPED, not read as zero-loss: a merged set of one current
+    and one legacy pack would otherwise dilute a real loss share with rows that never
+    carried a count either way — the same reasoning as `_unmeasured`'s `key in r`
+    restriction, one counter over."""
+    err_key = f"{arm}_errors"
+    carrying = [r for r in rows if err_key in r]
+    # The BARE arm name, not a re-spelled `<arm>_trials` — `_arm_attempts` normalizes
+    # either form on its first line, and writing the suffix swap a second time is what
+    # `test_only_one_place_derives_the_arm_to_trials_key` exists to refuse.
+    per_row = [(_arm_attempts(r, arm, int(r.get("trials", 1))), int(r[err_key]))
+               for r in carrying]
+    arm_attempts = sum(a for a, _ in per_row)
+    if not arm_attempts:
+        return None
+    # No clamp against `a`, unlike `_unmeasured`'s trigger 2 `max(0, a - t)`. There the
+    # subtraction can go negative for a legitimate reason (a `score_pack` form whose
+    # per-form count exceeds the shared `trials`); here an arm reporting MORE errors than
+    # attempts is an emitter bug with no benign form, and a share over 1.0 must fire
+    # rather than be quietly rounded down to something that might not.
+    return sum(e for _, e in per_row) / arm_attempts
 
 
 # Why a gap is never computed from two bare `_form_stats` calls again (#280).
@@ -1816,6 +1831,33 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
             kind_rows = by_kind[mech]
             if not kind_rows:
                 excluded_by_metric[mech][model] = "empty"
+                continue
+            # #371. These two columns are computed from the treatment loop's `retrieve_ok`
+            # against a FIXED 100% ideal, so they never pair, never build an `ArmGap`, and
+            # so `_unmeasured` — which runs only on final-accuracy, via `_accuracy_gate` ->
+            # `arm_gap` — has never seen them. A treatment transport loss was therefore
+            # published as a BEHAVIOURAL failure of the drop rule: `retrieve_ok` can only
+            # shrink as calls are lost (`retrieve_ok <= trials - errors`, and dropeval
+            # emits no `retrieve_trials` to shrink the denominator with it), so past
+            # `UNMEASURED_FAIL_SHARE` the column reads `**FAIL** — keep drop-to-retrieve
+            # off` on evidence the harness never collected. The report said so about
+            # itself, two lines apart: "these rows measure the harness, not the model:
+            # 192/960" above `retrieve-recall 60% **FAIL**`.
+            #
+            # Withheld, not scored — the same lattice move as the `"empty"` case above, and
+            # deliberately NOT a new `ExclusionReason`: the backend did not answer, so the
+            # metric was not measured, and `"unmeasured"` already says exactly that (and
+            # already carries `NOT_CONCLUDED` plus its remedy). `max()` over the lattice
+            # keeps the direction safe — a withheld model can only make the directive
+            # stricter, and a model that genuinely FAILS still outranks it.
+            #
+            # The TREATMENT arm specifically: `retrieve_ok` and `treatment_errors` are
+            # accumulated by the same loop in `dropeval.py`. A control-arm loss cannot
+            # corrupt these columns, and gating on it would withhold a metric that was
+            # measured fine.
+            loss = _arm_loss_share(kind_rows, "treatment")
+            if loss is not None and loss > UNMEASURED_FAIL_SHARE:
+                excluded_by_metric[mech][model] = "unmeasured"
                 continue
             acc, se = _form_stats(kind_rows, "retrieve_ok")
             gates[model][mech] = (acc, se, 1.0, 0.0)
