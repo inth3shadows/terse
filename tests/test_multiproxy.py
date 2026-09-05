@@ -199,6 +199,44 @@ def test_stats_ledger_records_peer_name_and_qualified_tool(tmp_path):
     assert "active" not in log.read_text(encoding="utf-8")   # payload-free
 
 
+def test_capture_dir_writes_one_envelope_per_peer_attributed_to_that_peer(tmp_path):
+    """#374: the router's corpus is the input to every drop/tune measurement, so a peer
+    whose payloads never land — or land under another peer's name — silently biases the
+    sample.
+
+    What pins the behavior is the direct assertion on each envelope's `tool` and `server`.
+    The byte-identical setup is a SECOND, independent witness on top of that, not the
+    mechanism: both peers front the same fake server and answer the same call, and capture
+    is idempotent by sha, so a bare (un-qualified) capture name would fold the two into ONE
+    envelope carrying whichever peer wrote last. That makes the cardinality assertion fail
+    too — but it would still be pinned by the name assertion if a later change gave the
+    fake per-process output and broke the fold.
+    """
+    from terse.capture import load_corpus
+
+    cfg = _write_config(tmp_path, [{"name": "gh", "command": [sys.executable, str(FAKE)]},
+                                   {"name": "gh2", "command": [sys.executable, str(FAKE)]}])
+    corpus = tmp_path / "corpus"
+    cin = io.StringIO("\n".join(
+        json.dumps({"jsonrpc": "2.0", "id": i, "method": "tools/call",
+                    "params": {"name": f"{peer}__gh.api.items"}})
+        for i, peer in enumerate(["gh", "gh2"], start=2)) + "\n")
+    cout = io.StringIO()
+    rc = run_multi_proxy(str(cfg), PLAIN_POLICY, stdin=cin, stdout=cout,
+                         capture_dir=str(corpus))
+    assert rc == 0
+    envs = load_corpus(corpus)
+    # Cardinality first, and as its own assertion: `sorted()` over a list holding None
+    # raises TypeError before it ever compares to the expected list, so a lost attribution
+    # would otherwise fail with a message that never mentions attribution.
+    assert len(envs) == 2
+    assert sorted(e.get("server") or "<none>" for e in envs) == ["gh", "gh2"]
+    # the peer-qualified name is what keeps two peers' identical payloads apart on disk
+    assert sorted(e["tool"] for e in envs) == ["gh2__gh.api.items", "gh__gh.api.items"]
+    # and it is the RAW downstream payload that was teed, not the compressed wire form
+    assert all(json.loads(e["raw"])["result"][0]["status"] == "active" for e in envs)
+
+
 def test_broken_stats_sink_warns_once_per_peer_under_the_multiproxy_prefix(tmp_path,
                                                                           capsys):
     # #131: sink-failure reporting moved into the Interceptor, so the line must still say
