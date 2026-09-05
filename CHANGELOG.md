@@ -19,13 +19,14 @@ fails that pull request until the section has moved.
   router tees every peer's raw payloads into one shared corpus dir, and that corpus is the
   input to `measure`, `tune --drop-eval` and every report built on them — so a peer whose
   payloads never land, or land under another peer's name, biases the sample without ever
-  erroring. Nothing covered it. The new test fronts the same fake server twice under two
-  peer names and answers the same call on both, so the raw bytes are byte-identical:
-  capture is idempotent by sha, and an un-qualified capture name folds the two into ONE
-  envelope carrying whichever peer wrote last. Two envelopes, one per peer, is the proof
-  the peer-qualified name (`proxy.py`'s `capture_tool`) keeps them apart. Both mutations
-  die: capturing under the bare name collapses the pair, and dropping `server=` loses the
-  attribution.
+  erroring. Nothing covered it. The new test asserts each envelope's `tool` and `server`
+  directly, which is what pins `proxy.py`'s peer-qualified `capture_tool`; on top of that
+  it fronts the same fake server twice under two peer names and answers the same call on
+  both, so the raw bytes are byte-identical and capture's idempotence-by-sha makes an
+  un-qualified name fold the pair into ONE envelope — a second, independent witness that
+  survives even if the naming assertion is later loosened. Three mutations die: capturing
+  under the bare name, dropping `server=`, and teeing the compressed text instead of the
+  raw payload.
 
   No production behavior changes — the wiring was already correct. What was missing is
   anything that would notice if it stopped being.
