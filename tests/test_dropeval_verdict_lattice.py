@@ -157,8 +157,15 @@ def test_the_lattice_order_is_strictness_not_declaration_order():
 
 def test_a_mechanism_metric_is_withheld_only_when_it_has_no_rows():
     """Recall and precision gate against a FIXED 100% ideal — no second arm, so no pairing,
-    so none of `_gap`'s exclusions can fire on them. The ONE way they leave a gate is
-    having no rows of that kind at all, which is `"empty"`.
+    so none of `_gap`'s exclusions can fire on them.
+
+    THE TITLE IS TRUE ONLY OF THESE FIXTURES, and that is now worth saying out loud: every
+    shape in `_fleets` carries `errors=0`, so the only exclusion reachable here is
+    `"empty"`. #371 added a second way out — `"unmeasured"`, when the treatment arm lost
+    enough calls to account for the miss on its own — which no fixture in this file can
+    reach. Its own boundary and direction are pinned in
+    `tests/test_unmeasured_arm_symmetry.py`; what this test still owns is that a CLEAN run
+    leaves these metrics by no route but `"empty"`.
 
     This test used to assert they were never withheld, full stop, and
     `dropeval_directive_line` leaned on that to license "so the mechanism works". Both were

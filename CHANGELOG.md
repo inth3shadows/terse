@@ -13,6 +13,54 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A transport failure was published as a behavioural failure of the drop rule** (`#371`,
+  the unfinished half of `#352`). `_unmeasured` runs only on final-accuracy, via
+  `_accuracy_gate` -> `arm_gap`. Recall and no-overfetch score against a fixed 100% ideal,
+  so they never pair, never build an `ArmGap`, and had never been gated on transport loss
+  at all. A lost call scores a MISS — dropeval emits no `retrieve_trials` to take it out of
+  the denominator — so the column read `retrieve-recall 60% ... **FAIL** — keep
+  drop-to-retrieve off` two lines under the report's own `these rows measure the harness,
+  not the model: 192/960`. An operator was told something about the model that the harness
+  never measured.
+
+  `dropeval_verdict` now scores the metric first and withholds it as `"unmeasured"` only
+  when the treatment arm's loss is **sufficient to explain the miss** — when crediting
+  every lost call would clear tolerance (`acc + loss`, over a shared denominator). This is
+  `thin_by_metric`'s shape mirrored: that withholds a PASS too thin to mean anything, this
+  withholds a FAIL too degraded to mean anything, and neither can withhold a demonstrated
+  regression.
+
+  **The predicate is not a loss-share threshold, and the difference is not cosmetic.** The
+  first cut of this fix used one and was wrong in both directions. It withheld demonstrated
+  failures — 21% loss with `retrieve_ok` 0 of the 79 calls that *landed* is a mechanism that
+  does not work, and a sweep of 1,440 fleets turned 240 BLOCKs into NOT_CONCLUDED that way;
+  since `NOT_CONCLUDED (2) < BLOCK (3)`, that is an exclusion IMPROVING a verdict, which
+  `UNMEASURED_FAIL_SHARE`'s own comment forbids. And it left the entire
+  `(tolerance, UNMEASURED_FAIL_SHARE]` band publishing the original defect: at 10% loss with
+  a model perfect on every landed call, the report still printed `retrieve-recall 90%
+  ... **FAIL**`. The loss share and the tolerance are different numbers. The new predicate
+  has no threshold, so it has no boundary to sit on the wrong side of.
+
+  `_arm_loss_share` is extracted from `_unmeasured`'s trigger 4 so both callers read one
+  derivation — a second copy is what `test_only_one_place_derives_the_arm_to_trials_key`
+  exists to refuse. It returns `None`, never `0.0`, for an arm that attempted nothing: an
+  absence and a measured zero are different facts.
+
+  Two things fixed alongside, both operator-visible or load-bearing:
+  `_exclusion_remedy`'s `"unmeasured"` prose ("Too few calls completed on **BOTH arms** ...
+  a zero means an arm completed no trials at all") was written for a paired metric and is
+  false for these two — they have one arm, and this gate cannot fire at zero loss — so the
+  fixed-ideal metrics now get their own sentence; and the comment above it cited
+  `test_only_accuracy_is_ever_withheld` as proof a recall exclusion could not happen, a test
+  that does not exist anywhere in the repo.
+
+  `test_the_run_level_verdict_is_still_asymmetric_and_that_is_recorded_not_fixed` asserted
+  the old asymmetry as a recorded defect and ended "if someone makes it, this test goes red
+  and tells them to delete it." It is **replaced**, not deleted — by the inverse invariant,
+  the predicate's boundary, the demonstrated-failure case, and a renderer test.
+
 ### Added
 
 - **A regression test for multiproxy capture attribution, which had none** (`#374`). The
