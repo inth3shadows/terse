@@ -27,6 +27,7 @@ import pytest
 from terse.report import (
     UNMEASURED_FAIL_SHARE,
     Directive,
+    _arm_loss_share,
     _unmeasured,
     build_dropeval_report,
     dropeval_verdict,
@@ -362,22 +363,176 @@ def test_a_withheld_mechanism_metric_says_transport_in_the_rendered_report():
     # The line the issue quoted is gone: no behavioural FAIL anywhere, and no verdict
     # authorizing or refusing policy on the strength of one.
     assert "**FAIL**" not in report
-    assert "**PASS**" not in report
     # The two mechanism metrics now say they were not gated, in the verdict prose that
     # used to carry `retrieve-recall 60% vs ideal (100%) ... keep drop-to-retrieve off`.
     for metric in ("retrieve-recall", "no-overfetch"):
         assert f"**{metric}: not gated for `m`**" in report, metric
     assert "INCONCLUSIVE for enabling" in report
+    # The REMEDY under a one-arm metric must not be the two-arm sentence. `_exclusion_remedy`
+    # is keyed on the reason, and its "unmeasured" prose was written for a paired metric:
+    # "Too few calls completed on BOTH arms to compare ... a zero means an arm completed no
+    # trials at all." Recall and no-overfetch have one arm, and this gate cannot fire at zero
+    # loss, so both halves of that sentence are false here — it was rendered to operators on
+    # every degraded run (review finding on #379).
+    bullet = next(ln for ln in report.splitlines()
+                  if ln.startswith("- **retrieve-recall: not gated"))
+    assert "BOTH arms" not in bullet, bullet
+    assert "withheld, not failed" in bullet, bullet
     # And the table cell is the withheld marker, not a number. Asserting on the ROW is what
     # separates this from the verdict-object test: the defect an operator met was a
     # percentage printed in a column, under a paragraph disowning the rows behind it.
+    # Read the cells by the HEADER's own column order rather than by a literal index.
+    # Indexing 3/4 was correct but could not detect a reorder: both expected values are the
+    # identical string, so swapping the two emitted cells survived the whole dropeval suite
+    # (review finding on #379). Locating them by name makes the assertion about the named
+    # columns, which is what it always claimed to be.
+    header = next(ln for ln in report.splitlines() if ln.startswith("| Model |"))
+    cols = [c.strip() for c in header.split("|")[1:-1]]
     row = next(ln for ln in report.splitlines() if ln.startswith("| `m` |"))
-    recall_cell, precision_cell = row.split("|")[3].strip(), row.split("|")[4].strip()
-    assert recall_cell == "not gated" and precision_cell == "not gated", row
+    cells = dict(zip(cols, [c.strip() for c in row.split("|")[1:-1]], strict=True))
+    assert cells["retrieve-recall"] == "not gated", row
+    assert cells["precision (no-overfetch)"] == "not gated", row
+
+    # Both cells above hold the SAME string, so they cannot detect the two being emitted in
+    # the wrong order — swapping them at the format string survived this file (review
+    # finding on #379). One asymmetric run fixes that: recall loses enough calls to be
+    # withheld, precision loses none and is scored, so the two cells are distinguishable and
+    # a swap moves each into the other's column.
+    mixed = build_dropeval_report({"m": _perfect_on_landed("recall", 24, 10, 4)
+                                   + _perfect_on_landed("precision", 24, 10, 0)})
+    header = next(ln for ln in mixed.splitlines() if ln.startswith("| Model |"))
+    cols = [c.strip() for c in header.split("|")[1:-1]]
+    row = next(ln for ln in mixed.splitlines() if ln.startswith("| `m` |"))
+    cells = dict(zip(cols, [c.strip() for c in row.split("|")[1:-1]], strict=True))
+    assert cells["retrieve-recall"] == "not gated", row
+    assert cells["precision (no-overfetch)"].startswith("100%"), row
     # handle-accuracy is deliberately NOT covered here. It is the display-only column no
     # gate reads (see `test_gap_gate_boundary.py`'s allowlist note), so it still renders a
     # percentage on this run — an inconsistency worth its own decision, not a silent
     # widening of this fix's scope.
+
+
+def _perfect_on_landed(kind, n, trials, t_err):
+    """`n` questions where every call that LANDED was answered correctly. `retrieve_ok`
+    counts the survivors only, which is what a transport loss looks like from the scorer's
+    side: dropeval emits no `retrieve_trials`, so each lost call is scored a MISS."""
+    return [{"qid": f"{kind}{i}", "kind": kind, "trials": trials,
+             "retrieve_ok": trials - t_err, "handle_ok": trials - t_err,
+             "answer_ok": trials - t_err, "errors": t_err, "treatment_errors": t_err,
+             "control_errors": 0, "attempts": trials * 2,
+             "control_ok": trials, "control_trials": trials} for i in range(n)]
+
+
+def _flat(kind, n, trials, t_err, r_ok):
+    """`n` questions scoring exactly `r_ok` of `trials`, whatever the loss."""
+    return [{"qid": f"{kind}{i}", "kind": kind, "trials": trials,
+             "retrieve_ok": r_ok, "handle_ok": r_ok, "answer_ok": r_ok,
+             "errors": t_err, "treatment_errors": t_err, "control_errors": 0,
+             "attempts": trials * 2, "control_ok": trials, "control_trials": trials}
+            for i in range(n)]
+
+
+def test_a_demonstrated_mechanism_failure_is_scored_even_at_a_large_transport_loss():
+    """The defect the FIRST cut of #371 shipped, and the reason the gate asks whether the
+    loss could EXPLAIN the miss rather than whether the loss is large.
+
+    A loss-share threshold withheld this run: 21% of the treatment arm lost, which is past
+    `UNMEASURED_FAIL_SHARE`. But the model operated the retrieve protocol correctly on ZERO
+    of the 79 calls that landed. The loss bounds recall at 79%; the observed 0% is 79 points
+    below anything transport can account for. Withholding it turned a BLOCK into
+    NOT_CONCLUDED — and `NOT_CONCLUDED (2) < BLOCK (3)`, so for that model the exclusion
+    IMPROVED the verdict. `UNMEASURED_FAIL_SHARE`'s own comment refuses exactly this: "do
+    not add a survival threshold here without first making an exclusion unable to improve a
+    verdict; those are one change, not two."
+
+    Measured on the first cut: a sweep of 1,440 two-model fleets turned 240 BLOCKs into
+    NOT_CONCLUDED this way."""
+    rows = _flat("recall", 24, 100, 21, 0) + _flat("precision", 24, 100, 21, 0)
+    assert _arm_loss_share(rows, "treatment") > UNMEASURED_FAIL_SHARE, (
+        "fixture must sit past the old threshold, or it proves nothing")
+    v = dropeval_verdict({"m": rows})
+    assert v.metrics["recall"].excluded == {}, "a demonstrated failure is never withheld"
+    assert v.metrics["recall"].worst is not None
+    assert v.metrics["recall"].worst.gap == pytest.approx(-1.0)
+    assert v.directive is Directive.BLOCK
+
+
+@pytest.mark.parametrize("t_err", [1, 2, 3, 4])
+def test_a_loss_that_fully_explains_the_miss_withholds_at_every_size(t_err):
+    """The other half of the same first cut: the band BELOW the old threshold kept
+    publishing the very line #371 is about.
+
+    At 10% loss with the model perfect on every landed call, the report printed
+    `retrieve-recall 90% ... **FAIL** at 5% tolerance` under its own "these rows measure the
+    harness, not the model". Tolerance is 5% and every lost call scores a miss, so the
+    defect was live across the whole `(5%, 20%]` band — while #371's body asserted that
+    band was harmless because "any loss past `UNMEASURED_FAIL_SHARE` forced the column
+    under tolerance". It does not; the loss share and the tolerance are different numbers.
+
+    The predicate has no threshold to sit under: what matters is that crediting the lost
+    calls clears tolerance."""
+    v = dropeval_verdict({"m": _perfect_on_landed("recall", 24, 10, t_err)
+                          + _perfect_on_landed("precision", 24, 10, t_err)})
+    for mech in ("recall", "precision"):
+        assert v.metrics[mech].excluded == {"m": "unmeasured"}, (
+            f"{t_err}/10 lost fully explains the miss and must be withheld, not failed")
+
+
+def test_a_metric_that_still_PASSES_under_loss_is_scored_not_withheld():
+    """The gate withholds a FAIL the loss explains — never a PASS.
+
+    Dropping the `not passes_tolerance(acc - 1.0)` clause left the suite green: every other
+    fixture here either fails or has no loss, so nothing observed the case where both are
+    true. The direction is conservative (a withheld PASS cannot authorize anything), which
+    is exactly why it would have gone unnoticed — and a SHIP silently downgraded to
+    NOT_CONCLUDED on a run that measured fine is still the harness lying about what it
+    knows, in the cheaper direction.
+
+    97 of 100 with 2 lost: inside tolerance as scored, so there is nothing for the loss to
+    explain."""
+    v = dropeval_verdict({"m": _flat("recall", 24, 100, 2, 97)
+                          + _flat("precision", 24, 100, 2, 97)})
+    for mech in ("recall", "precision"):
+        assert v.metrics[mech].excluded == {}, f"{mech}: a passing metric is never withheld"
+        assert v.metrics[mech].worst is not None and v.metrics[mech].worst.passed
+
+
+def test_the_predicate_boundary_is_whether_the_credited_loss_clears_TOLERANCE():
+    """The boundary itself, which under the old threshold was unpinned — mutating
+    `> UNMEASURED_FAIL_SHARE` to `>=` SURVIVED the whole suite (review finding on #379).
+
+    100 trials, 10 lost. Crediting all 10 lifts a 91% score to 101% (clears) and an 85%
+    score to 95% — exactly 5% down, which `passes_tolerance` accepts at its epsilon. One
+    point lower cannot be explained by the loss and must be scored."""
+    withheld = dropeval_verdict({"m": _flat("recall", 24, 100, 10, 90)
+                                 + _flat("precision", 24, 100, 10, 90)})
+    assert withheld.metrics["recall"].excluded == {"m": "unmeasured"}
+    # 85 + 10 = 95: on the tolerance line, still explained by the loss.
+    on_line = dropeval_verdict({"m": _flat("recall", 24, 100, 10, 85)
+                                + _flat("precision", 24, 100, 10, 85)})
+    assert on_line.metrics["recall"].excluded == {"m": "unmeasured"}
+    # 84 + 10 = 94: one point past what the loss can account for, so it is behaviour.
+    scored = dropeval_verdict({"m": _flat("recall", 24, 100, 10, 84)
+                               + _flat("precision", 24, 100, 10, 84)})
+    assert scored.metrics["recall"].excluded == {}
+    assert scored.metrics["recall"].worst is not None
+
+
+def test_an_arm_that_attempted_nothing_is_unknown_loss_not_zero_loss():
+    """`_arm_loss_share` returns None, never 0.0, when the arm carried no attempts.
+
+    The docstring calls this load-bearing and nothing pinned it: both call sites spell
+    `share is not None and share > ...` / `if loss and ...`, and `0.0` is falsey and fails
+    every comparison, so `return 0.0` is a provable no-op at both. The commit that added
+    the helper claimed a mutation killed it; that mutation had rewritten `_worst_case_gap`
+    by accident (review finding on #379). An absence and a measured zero are different
+    facts, and the type is the only thing that says so."""
+    assert _arm_loss_share([{"qid": "a", "kind": "recall", "trials": 0,
+                             "treatment_errors": 0}], "treatment") is None
+    assert _arm_loss_share([{"qid": "a", "kind": "recall", "trials": 10}],
+                           "treatment") is None, "no counter at all is not a zero loss"
+    assert _arm_loss_share([{"qid": "a", "kind": "recall", "trials": 10,
+                             "treatment_errors": 0}], "treatment") == 0.0
 
 
 def test_a_row_stating_no_trial_count_is_read_as_one_call_not_zero():

@@ -1655,6 +1655,13 @@ DROPEVAL_METRICS: tuple[tuple[Metric, str, str], ...] = (
     ("accuracy", "final-accuracy", "no-drop control"),
 )
 
+# The metrics scored against a fixed 100% ideal rather than a measured control arm — the
+# `"ideal (100%)"` rows above, derived once so the places that care cannot drift apart. A
+# tool call either happened or it did not, so 100% IS the target and there is no second arm
+# by construction; that is why they never pair, and why `_unmeasured` never saw them (#371).
+_FIXED_IDEAL_METRICS: frozenset[Metric] = frozenset(
+    m for m, _, control in DROPEVAL_METRICS if control == "ideal (100%)")
+
 
 def _reason_directive(reason: ExclusionReason) -> Directive:
     """Where a withheld model lands on the lattice. TOTAL over `ExclusionReason`.
@@ -1677,17 +1684,25 @@ def _reason_directive(reason: ExclusionReason) -> Directive:
     assert_never(reason)
 
 
-def _exclusion_remedy(reason: ExclusionReason) -> str:
+def _exclusion_remedy(reason: ExclusionReason, *, fixed_ideal: bool = False) -> str:
     """What the operator has to do to turn a withheld metric into a gated one.
 
-    Keyed on the REASON, not the metric — but every reason here is about a paired
-    form-vs-control comparison, and final-accuracy is dropeval's only metric that has one.
-    `dropeval_exclusion_bullets` nevertheless loops all three, so a recall exclusion (which
-    `test_only_accuracy_is_ever_withheld` says cannot happen) would render a control-arm
-    remedy under a metric with no control arm. That is the lesser of two evils on purpose:
-    the alternative — looping only "accuracy" — would make a future recall exclusion vanish
-    from the report entirely, and a wrong-but-visible sentence is recoverable where a
-    silent omission is the #300-finding-5 defect this whole path exists to prevent.
+    Keyed on the REASON, plus `fixed_ideal` for the one sentence that cannot be written
+    without knowing whether the metric has a second arm.
+
+    This comment used to say a recall exclusion "cannot happen" (citing
+    `test_only_accuracy_is_ever_withheld`, a test that does not exist anywhere in this
+    repo — the citation was wrong when it was written), and accepted rendering a
+    control-arm remedy under a metric with no control arm as the lesser evil. #371 made
+    that hypothetical the mainline path for every degraded run: `dropeval_verdict` now
+    withholds recall/no-overfetch as `"unmeasured"` whenever the treatment loss alone
+    accounts for the miss. So the sentence is chosen rather than tolerated — see the
+    `fixed_ideal` branch below.
+
+    `dropeval_exclusion_bullets` still loops all three metrics. That part of the old
+    reasoning stands: looping only "accuracy" would make an exclusion vanish from the
+    report entirely, and a silent omission is the #300-finding-5 defect this whole path
+    exists to prevent.
 
     TOTAL over `ExclusionReason` via `assert_never`, and that totality is load-bearing
     rather than tidy: the verdict used to pick its remedy sentence with a set-equality test
@@ -1729,6 +1744,16 @@ def _exclusion_remedy(reason: ExclusionReason) -> str:
             # trials (#338). Threading the counts in here is the better end state and is
             # deliberately NOT done in this change: it means widening `DropevalVerdict`,
             # which is a wider blast radius than the false sentence justifies.
+            if fixed_ideal:
+                # #371 made this branch reachable for a one-arm metric, and the two-arm
+                # sentence below is then a falsehood: recall and no-overfetch score the
+                # treatment against a fixed ideal, so "both arms" names nothing, and the
+                # zero-loss disjunct cannot occur — this gate fires only on a loss large
+                # enough to explain the miss.
+                return ("Enough treatment calls were lost to account for the miss on "
+                        "their own, so this column would be measuring the backend rather "
+                        "than the drop rule. Read the per-arm failure split above and "
+                        "re-run: the number is withheld, not failed.")
             return ("Too few calls completed on BOTH arms to compare. Read the per-arm "
                     "failure split above: a non-zero loss there is a transport problem "
                     "and the run needs repeating; a zero means an arm completed no trials "
@@ -1827,7 +1852,7 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
             "recall": [r for r in rows if r["kind"] == "recall"],
             "precision": [r for r in rows if r["kind"] == "precision"],
         }
-        for mech in ("recall", "precision"):
+        for mech in (m for m, _, _ in DROPEVAL_METRICS if m in _FIXED_IDEAL_METRICS):
             kind_rows = by_kind[mech]
             if not kind_rows:
                 excluded_by_metric[mech][model] = "empty"
@@ -1836,30 +1861,57 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
             # against a FIXED 100% ideal, so they never pair, never build an `ArmGap`, and
             # so `_unmeasured` — which runs only on final-accuracy, via `_accuracy_gate` ->
             # `arm_gap` — has never seen them. A treatment transport loss was therefore
-            # published as a BEHAVIOURAL failure of the drop rule: `retrieve_ok` can only
-            # shrink as calls are lost (`retrieve_ok <= trials - errors`, and dropeval
-            # emits no `retrieve_trials` to shrink the denominator with it), so past
-            # `UNMEASURED_FAIL_SHARE` the column reads `**FAIL** — keep drop-to-retrieve
-            # off` on evidence the harness never collected. The report said so about
-            # itself, two lines apart: "these rows measure the harness, not the model:
-            # 192/960" above `retrieve-recall 60% **FAIL**`.
+            # published as a BEHAVIOURAL failure of the drop rule: a lost call scores a
+            # MISS (dropeval emits no `retrieve_trials` to take it out of the denominator),
+            # so the column read `**FAIL** — keep drop-to-retrieve off` two lines under the
+            # report's own "these rows measure the harness, not the model: 192/960".
             #
-            # Withheld, not scored — the same lattice move as the `"empty"` case above, and
-            # deliberately NOT a new `ExclusionReason`: the backend did not answer, so the
-            # metric was not measured, and `"unmeasured"` already says exactly that (and
-            # already carries `NOT_CONCLUDED` plus its remedy). `max()` over the lattice
-            # keeps the direction safe — a withheld model can only make the directive
-            # stricter, and a model that genuinely FAILS still outranks it.
+            # THE PREDICATE IS "COULD THE LOSS EXPLAIN THIS", NOT "IS THE LOSS LARGE".
+            # A loss-share threshold was the first cut and it was wrong in BOTH directions
+            # (review on #379, both executed):
+            #
+            #   - It withheld DEMONSTRATED failures. 21% loss with `retrieve_ok` 0 of the
+            #     79 calls that LANDED is a mechanism that does not work; the loss bounds
+            #     recall at 79% and the observed 0% is 79 points below anything it can
+            #     account for. A sweep of 1,440 fleets turned 240 BLOCKs into
+            #     NOT_CONCLUDED that way. `NOT_CONCLUDED (2) < BLOCK (3)`, so for the
+            #     withheld model that is a LOOSENING — the shape `UNMEASURED_FAIL_SHARE`'s
+            #     own comment refuses ("do not add a survival threshold here without first
+            #     making an exclusion unable to improve a verdict") and the same one
+            #     `_MIN_PAIRED_QUESTIONS` is asymmetric to avoid.
+            #   - It left the whole `(tolerance, UNMEASURED_FAIL_SHARE]` band publishing
+            #     the exact defect it was written to fix: at 10% loss and a model perfect
+            #     on every landed call, the report still printed `retrieve-recall 90%
+            #     ... **FAIL**` under the same "these rows measure the harness" paragraph.
+            #
+            # So: score first, and withhold only a FAIL the loss is sufficient to explain —
+            # one that would pass tolerance if every lost call had succeeded. `acc + loss`
+            # is that ceiling, and the two share a denominator (`_form_stats` divides by
+            # the shared `trials`; `_arm_attempts` falls back to the same when the arm
+            # states none, which dropeval's treatment never does). A failure that survives
+            # crediting every lost call is behavioural and is scored, so an exclusion here
+            # can no longer improve any model's verdict — which is the invariant, not a
+            # side effect of where the threshold sits.
+            #
+            # This is `thin_by_metric`'s shape below, mirrored: that one withholds a PASS
+            # too thin to mean anything, this one withholds a FAIL too degraded to mean
+            # anything. Neither can withhold a demonstrated regression.
+            #
+            # Withheld as `"unmeasured"`, deliberately NOT a new `ExclusionReason`: the
+            # backend did not answer, so the metric was not measured, and that reason
+            # already says so, already maps to NOT_CONCLUDED, and already carries its
+            # remedy.
             #
             # The TREATMENT arm specifically: `retrieve_ok` and `treatment_errors` are
             # accumulated by the same loop in `dropeval.py`. A control-arm loss cannot
             # corrupt these columns, and gating on it would withhold a metric that was
             # measured fine.
+            acc, se = _form_stats(kind_rows, "retrieve_ok")
             loss = _arm_loss_share(kind_rows, "treatment")
-            if loss is not None and loss > UNMEASURED_FAIL_SHARE:
+            if (loss and not passes_tolerance(acc - 1.0)
+                    and passes_tolerance(acc + loss - 1.0)):
                 excluded_by_metric[mech][model] = "unmeasured"
                 continue
-            acc, se = _form_stats(kind_rows, "retrieve_ok")
             gates[model][mech] = (acc, se, 1.0, 0.0)
             # #335. Recall and no-overfetch gate against a FIXED 100% ideal, so they never
             # pair, so `_MIN_PAIRED_QUESTIONS` — which counts PAIRED questions — never
@@ -1940,7 +1992,8 @@ def dropeval_exclusion_bullets(v: DropevalVerdict) -> list[str]:
         for reason, models in _by_reason(v.metrics[metric].excluded):
             names = ", ".join(f"`{m}`" for m in models)
             out.append(f"- **{label}: not gated for {names}** — {REASON_LABEL[reason]}. "
-                       + _exclusion_remedy(reason))
+                       + _exclusion_remedy(
+                           reason, fixed_ideal=metric in _FIXED_IDEAL_METRICS))
         thin = v.metrics[metric].thin
         if thin:
             names = ", ".join(f"`{m}` ({n} question{'' if n == 1 else 's'})"
