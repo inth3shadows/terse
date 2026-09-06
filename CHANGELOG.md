@@ -15,6 +15,102 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **`final-accuracy` kept the loss-SHARE threshold `#371` replaced, so a treatment loss
+  under 20% was still published as a behavioural gap** (`#381`). `#371` gave recall and
+  no-overfetch a predicate that asks whether the treatment loss could *explain* the miss;
+  `final-accuracy` did not get it, because it pairs against a measured no-drop control
+  (`#269`) and so routes through `_gap`, whose only transport gate is `_unmeasured`'s
+  `> UNMEASURED_FAIL_SHARE` (0.20). Tolerance is 5%, and every lost treatment call scores a
+  MISS, so the defect was live across the whole `(5%, 20%]` band. Executed on `22eea92`
+  with the model correct on every call that landed: 10% loss printed
+  `final-accuracy 90% vs no-drop control 100% (gap -10% ±0 pts). **FAIL**`. Every point of
+  that gap was transport.
+
+  `_accuracy_gate` now scores first and withholds as `"unmeasured"` only a FAIL the
+  treatment arm's own loss is sufficient to explain — crediting every lost call clears
+  tolerance. A gap that survives that crediting is behaviour and still publishes, so an
+  exclusion here cannot improve any model's verdict.
+
+  **One arm, and not the asymmetry it looks like.** A two-arm metric suggests crediting
+  each arm's loss, but dropeval's arms lose calls into different denominators: control
+  emits `control_trials = trials - control_errors`, so its losses leave its own denominator
+  *and* `paired_rows` drops the whole row; treatment deliberately emits no `answer_trials`,
+  so its losses stay in scoring a MISS. Crediting the control could only push the gap
+  further negative, so it can never rescue a FAIL. Every step of that reads dropeval's emit
+  convention, which is why the predicate lives in `_accuracy_gate` and **not** in the shared
+  `_gap` — moving it there would apply a dropeval-schema argument to the codec verdict, the
+  diff soak, the per-depth table and fluency, whose arms state their losses differently.
+
+  The credited loss is read over the **paired subset**, not every row, so it shares a
+  denominator with the accuracy it is credited against; a fixture where pairing drops 30
+  control-degraded questions pins that (diluting to all rows publishes the manufactured
+  FAIL).
+
+- **The credited loss was a fraction of a SUBSET applied to the whole, which withheld a
+  demonstrated regression** (`#381`, found by adversarial review before merge; the same
+  shape shipped at `#371`'s site and is fixed with it). `_arm_loss_share` deliberately
+  SKIPS rows carrying no `<arm>_errors` counter — correct for its own question, "how
+  degraded is this arm" — but `_form_stats` scores every row. On a pack merged from one
+  producer predating `treatment_errors` and one emitting it, the credit was computed over
+  the carrying rows and subtracted from an accuracy computed over all of them:
+
+  ```
+  gap                       -0.25
+  credited (subset, 400)     0.20  ->  -0.05  ->  WITHHELD
+  honest   (all rows, 800)   0.10  ->  -0.15  ->  three times tolerance
+  ```
+
+  Sharpened, `acc + loss` reached **1.095** — crediting the arm with more successes than it
+  had trials, under a comment asserting the ceiling was real. `NOT_CONCLUDED (2) <
+  BLOCK (3)`, so withholding there is an exclusion that **improves** a model's verdict:
+  what `UNMEASURED_FAIL_SHARE`'s comment forbids and what `#379`'s review found 240 of.
+
+  New `_credited_loss_share` answers the credit's question instead — an absent counter
+  contributes no errors and its full trials to the denominator, so the failure direction is
+  under-crediting (publishes a FAIL that may be transport) rather than over-crediting
+  (withholds a regression). It also **refuses** a share above 1.0 where its sibling lets one
+  fire: there an over-1.0 share withholds and asks a human to look, here it would buy a
+  withholding off an emitter bug. Latent rather than live — `dropeval.py` writes the counter
+  unconditionally and no CLI path loads rows from disk — but it is exactly the merged-pack
+  shape `_arm_loss_share`, `_unmeasured`'s `key in r` restriction and `_accuracy_gate`'s own
+  `"partial control coverage"` gate all exist to handle.
+
+- **A withheld `final-accuracy` told the operator the arms had failed to pair when they
+  had not, and — through two rounds of review — first a false count, then a false cause**
+  (`#381`, both rounds found by adversarial review before merge). `_exclusion_remedy`'s
+  two-arm sentence, "Too few calls completed on BOTH arms to compare", is false on the new
+  route: every question completed every trial on both arms. The first correction stated the
+  consequence instead, which is what shipped.
+
+  `REASON_LABEL["unmeasured"]`, the constant six renderers share for this same reason, took
+  two attempts to reach the same place. It read `"too few calls to compare"` — false since
+  `#371`, which gave this reason a fourth route where nothing is "too few" of — and the
+  mechanism bullets have printed it on 48/48-paired runs ever since. The first fix,
+  `"transport loss"`, replaced a false count with a false CAUSE: route 1 is an arm that
+  completed zero trials, so it fires at **zero calls lost**, and adversarial review executed
+  the self-contradiction directly — `**Not measured** — transport loss, so no accuracy is
+  published for: \`m\` (0/240 calls lost). No calls were lost, so transport is not the
+  cause: ...` — the claim and its own refutation six words apart. The same review found the
+  dropeval table printing it under the **`control (no drop)`** column heading on a
+  `#381`-route exclusion, where the loss was entirely on the *treatment* arm.
+
+  The label is now `"no usable comparison"` — the CONSEQUENCE, which is the only thing all
+  four routes share and the only kind of label with no arm to misattribute. The renderer
+  test written for exactly this class of defect, `test_every_renderer_names_the_right_
+  exclusion_reason` (`#338`), passed on the false-cause label because its ban list is an
+  enumeration of wordings someone had already thought of; `"transport loss"` and
+  `"transport problem"` are now in it, so a third attempt at this phrase cannot repeat it
+  silently.
+
+  This PR's own change had also dropped the `> **Questions surviving the pairing**` line
+  under the new exclusion: that block lists only scored and `underpowered` models, so the
+  report claimed the comparison had not survived while suppressing the `48/48` that
+  disproved it — the exact number the remedy sentence tells the reader to consult.
+
+## [0.30.8] - 2026-09-04
+
+### Fixed
+
 - **A transport failure was published as a behavioural failure of the drop rule** (`#371`,
   the unfinished half of `#352`). `_unmeasured` runs only on final-accuracy, via
   `_accuracy_gate` -> `arm_gap`. Recall and no-overfetch score against a fixed 100% ideal,

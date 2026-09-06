@@ -14,7 +14,7 @@ is to make that edit visible in a diff, next to the argument for the current val
 
 This mirrors what the suite already does for the shared PROSE:
 `test_a_withheld_model_is_not_told_its_backend_was_unreachable` asserts
-`REASON_LABEL["unmeasured"] == "too few calls to compare"` literally, because a
+`REASON_LABEL["unmeasured"] == "no usable comparison"` literally, because a
 source-read assertion "pins that the renderers AGREE and is silent on whether they are
 right". The numeric policy never got the literal counterpart. It has one now.
 

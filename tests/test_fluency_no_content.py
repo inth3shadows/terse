@@ -251,5 +251,5 @@ def test_every_renderer_describes_an_unanswered_call_the_same_way():
         # about content: blanking the label to "" passed all 1693 tests while every
         # renderer printed "(excluded — : dead-model)". A literal is the only form that
         # asserts the shared vocabulary says anything at all.
-        assert "too few calls to compare" in text, name
+        assert "no usable comparison" in text, name
         assert "dead-model" in text, name

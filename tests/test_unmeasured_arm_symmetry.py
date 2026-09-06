@@ -25,13 +25,17 @@ from __future__ import annotations
 import pytest
 
 from terse.report import (
+    REASON_LABEL,
     UNMEASURED_FAIL_SHARE,
     Directive,
+    _accuracy_gate,
     _arm_loss_share,
+    _credited_loss_share,
     _unmeasured,
     build_dropeval_report,
     dropeval_verdict,
     inconclusive_models,
+    passes_tolerance,
 )
 
 # --------------------------------------------------------------------------- #
@@ -290,7 +294,7 @@ def test_a_degraded_treatment_arm_publishes_no_final_accuracy():
     rows = _both_kinds(trials=10, t_err=4)
     assert inconclusive_models({"m": rows}) == {}, "no other gate may be doing the work"
     report = build_dropeval_report({"m": rows})
-    assert "too few calls to compare" in report
+    assert "no usable comparison" in report
     assert "**Where they failed** (per arm" in report
 
 
@@ -300,7 +304,7 @@ def test_the_accuracy_gate_reaches_the_same_verdict_whichever_arm_lost_the_calls
     NAMED FOR THE GATE, NOT THE RUN, and that is a correction rather than a nicety. An
     earlier revision called itself
     `test_the_report_reaches_the_same_verdict_whichever_arm_lost_the_calls` and asserted
-    only that both renderings contain "too few calls to compare" and "not gated" — both of
+    only that both renderings contain "no usable comparison" and "not gated" — both of
     which are true of both reports while their run-level `Directive`s differ. A test named
     for an invariant it cannot observe failing is worse than no test: it is the #352
     blind spot re-created inside #352's own fix. The residual asymmetry it could not see is
@@ -308,7 +312,7 @@ def test_the_accuracy_gate_reaches_the_same_verdict_whichever_arm_lost_the_calls
     treatment = build_dropeval_report({"m": _both_kinds(trials=10, t_err=4)})
     control = build_dropeval_report({"m": _both_kinds(trials=10, c_err=4)})
     for report in (treatment, control):
-        assert "too few calls to compare" in report
+        assert "no usable comparison" in report
         assert "not gated" in report
 
 
@@ -548,3 +552,402 @@ def test_a_row_stating_no_trial_count_is_read_as_one_call_not_zero():
              "treatment_errors": 1}]
     assert "trials" not in rows[1]
     assert _unmeasured(rows), "a stated loss on a row with no trial count is still a loss"
+
+
+# --------------------------------------------------------------------------- #
+# #381 — the same predicate, on the one metric that PAIRS.
+#
+# `final-accuracy` never got #371's fix. It pairs against a measured no-drop control (#269),
+# so it routes `_accuracy_gate` -> `arm_gap` -> `_gap`, whose only transport gate is
+# `_unmeasured`'s loss SHARE. Below `UNMEASURED_FAIL_SHARE` that gate is silent and every
+# lost treatment call scores a MISS, so the gap IS the loss — the identical arithmetic and
+# the identical rendered contradiction #371 was filed on, one metric over.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("t_err", [1, 2])
+def test_a_treatment_loss_that_fully_EXPLAINS_the_accuracy_gap_withholds_it(t_err):
+    """The issue reproduction, executed on `main` @ 22eea92 before the fix as:
+
+        t_err=1   loss=10%   accuracy BLOCK   excluded={}   gap=-0.100
+        t_err=2   loss=20%   accuracy BLOCK   excluded={}   gap=-0.200
+
+    The model is correct on every call that LANDED and the control lost nothing, so every
+    point of that gap is transport. Both sizes sit in the live band: tolerance is 5% and
+    `_unmeasured` is a strict `>` against 0.20, so 10% and 20% clear neither.
+    """
+    rows = (_perfect_on_landed("recall", 24, 10, t_err)
+            + _perfect_on_landed("precision", 24, 10, t_err))
+    assert _arm_loss_share(rows, "treatment") <= UNMEASURED_FAIL_SHARE, (
+        "fixture must sit inside the band the old gate never reached")
+    assert not _unmeasured(rows), "no other gate may be doing the work"
+    v = dropeval_verdict({"m": rows})
+    assert v.metrics["accuracy"].excluded == {"m": "unmeasured"}, (
+        f"{t_err}/10 lost fully explains the gap and must be withheld, not failed")
+
+
+def test_a_demonstrated_accuracy_regression_inside_the_band_is_still_scored():
+    """The invariant the whole design rests on: an exclusion must never IMPROVE a verdict.
+
+    10% of the treatment arm lost and 50% scored on a control that scored 100%. Crediting
+    every lost call still leaves the arm 40 points behind — far past anything transport can
+    account for — so this is behaviour and is published. Without this, the predicate is
+    indistinguishable from `UNMEASURED_FAIL_SHARE`'s refused survival threshold.
+    """
+    rows = _flat("recall", 24, 100, 10, 50) + _flat("precision", 24, 100, 10, 50)
+    v = dropeval_verdict({"m": rows})
+    assert v.metrics["accuracy"].excluded == {}, "a demonstrated regression is never withheld"
+    assert v.metrics["accuracy"].worst is not None
+    assert v.metrics["accuracy"].worst.gap == pytest.approx(-0.5)
+    assert v.directive is Directive.BLOCK
+
+
+def test_an_accuracy_gap_that_still_PASSES_under_loss_is_scored_not_withheld():
+    """The `not passes_tolerance(gap)` clause, which is otherwise a pure no-op to delete.
+
+    97 of 100 against a 100% control is inside the 5% tolerance as scored, so there is
+    nothing for the 2% loss to explain. Withholding it would downgrade a measured SHIP to
+    NOT_CONCLUDED — the cheap direction, and still the harness lying about what it knows.
+    """
+    rows = _flat("recall", 24, 100, 2, 97) + _flat("precision", 24, 100, 2, 97)
+    v = dropeval_verdict({"m": rows})
+    assert v.metrics["accuracy"].excluded == {}, "a passing metric is never withheld"
+    assert v.metrics["accuracy"].worst is not None and v.metrics["accuracy"].worst.passed
+
+
+def test_the_accuracy_predicate_boundary_is_the_TOLERANCE_line_not_a_loss_SHARE():
+    """The boundary itself. 100 trials, 10 lost, control perfect throughout.
+
+    85 + 10 - 100 = -5%, exactly the tolerance line, which `passes_tolerance` accepts at
+    its epsilon — still explained. 84 is one point past what the loss can account for, so
+    it is behaviour. Nothing about either number is near `UNMEASURED_FAIL_SHARE`, which is
+    the point: the loss share and the tolerance are different numbers.
+    """
+    on_line = dropeval_verdict({"m": _flat("recall", 24, 100, 10, 85)
+                                + _flat("precision", 24, 100, 10, 85)})
+    assert on_line.metrics["accuracy"].excluded == {"m": "unmeasured"}
+    scored = dropeval_verdict({"m": _flat("recall", 24, 100, 10, 84)
+                               + _flat("precision", 24, 100, 10, 84)})
+    assert scored.metrics["accuracy"].excluded == {}
+    assert scored.metrics["accuracy"].worst is not None
+
+
+def test_the_credited_loss_is_read_over_the_PAIRED_subset_not_every_row():
+    """`_arm_loss_share(g.rows, ...)` — mutating `g.rows` to `rows` survives every fixture
+    above, because in all of them pairing drops nothing.
+
+    It cannot survive here. `paired_rows` discards the 30 questions whose CONTROL lost a
+    call, and those questions lost no treatment calls at all — so they dilute the treatment
+    share from the 10% actually behind the published accuracy down to 4%, which no longer
+    explains the gap and publishes a FAIL the harness manufactured.
+
+    The rule is that the credited loss and the accuracy must share a denominator: 90% was
+    computed over the paired 20, so the loss must be too.
+    """
+    paired = [{"qid": f"a{i}", "kind": "recall", "trials": 10, "attempts": 20,
+               "answer_ok": 9, "retrieve_ok": 9, "handle_ok": 9,
+               "errors": 1, "treatment_errors": 1, "control_errors": 0,
+               "control_ok": 10, "control_trials": 10} for i in range(20)]
+    dropped_by_pairing = [{"qid": f"b{i}", "kind": "recall", "trials": 10, "attempts": 20,
+                           "answer_ok": 10, "retrieve_ok": 10, "handle_ok": 10,
+                           "errors": 1, "treatment_errors": 0, "control_errors": 1,
+                           "control_ok": 9, "control_trials": 9} for i in range(30)]
+    rows = paired + dropped_by_pairing
+    assert not _unmeasured(rows), "no other gate may be doing the work"
+    assert _arm_loss_share(rows, "treatment") == pytest.approx(0.04)
+    assert _arm_loss_share(paired, "treatment") == pytest.approx(0.10)
+    g = _accuracy_gate(rows)
+    assert g.excluded == "unmeasured", (
+        "the 10% behind the paired 90% explains the gap; the diluted 4% does not")
+
+
+def test_only_the_TREATMENT_arms_loss_is_credited_to_the_accuracy_gap():
+    """Why this is one-armed even though the metric has two arms.
+
+    `dropeval.py` emits `control_trials = trials - control_errors` but deliberately emits no
+    `answer_trials`, so a control loss leaves its own denominator AND takes the whole row
+    out via `paired_rows`, while a treatment loss stays in scoring a MISS. Crediting the
+    control could only push the gap further negative, so it can never rescue a FAIL.
+
+    Here the treatment arm lost nothing and the control lost 10% of its calls on rows that
+    still pair (`control_trials` intact, `control_errors` set — the shape a merged pack
+    reaches). The gap is real behaviour and must be published; reading the CONTROL's share
+    instead would credit 10% and withhold it.
+    """
+    ANSWER_OK = 9  # NOT 8, and the difference is the whole test — see below.
+    rows = [{"qid": f"{k}{i}", "kind": k, "trials": 10, "attempts": 20,
+             "answer_ok": ANSWER_OK, "retrieve_ok": 10, "handle_ok": 10,
+             "errors": 1, "treatment_errors": 0, "control_errors": 1,
+             "control_ok": 10, "control_trials": 10}
+            for k in ("recall", "precision") for i in range(24)]
+    assert _credited_loss_share(rows, "treatment") == 0.0
+    assert _credited_loss_share(rows, "control") == pytest.approx(0.10)
+    assert not _unmeasured(rows), "no other gate may be doing the work"
+    # THE FIXTURE HAS TO PUT THE MUTANT INSIDE TOLERANCE OR IT PINS NOTHING. This scored
+    # `answer_ok: 8` when written, giving a -20% gap: crediting the control's 10% reaches
+    # -10%, still outside the 5% tolerance, so the swapped-arm mutant did not withhold
+    # either and the assertion below held with the arm swapped AND with the whole #381
+    # block deleted. Adversarial review of #382 caught it. At 9 the gap is -10%, the
+    # mutant's credit lands on 0.0 and withholds, and only the real code publishes.
+    assert passes_tolerance(ANSWER_OK / 10 + 0.10 - 1.0), (
+        "crediting the CONTROL's loss must bring this gap inside tolerance, or the "
+        "swapped-arm mutant behaves identically and this test cannot fail")
+    g = _accuracy_gate(rows)
+    assert g.excluded is None, "the treatment arm lost nothing, so nothing is explained"
+    assert g.form_acc - g.control_acc == pytest.approx(-0.1)
+
+
+def test_a_withheld_final_accuracy_does_not_claim_the_arms_failed_to_PAIR():
+    """#381 at the renderer. The verdict object is not what an operator meets.
+
+    Every question here completed all 10 trials on BOTH arms — `control_trials == trials`
+    on every row, so `paired_rows` drops nothing and all 24 pair. The old first sentence,
+    "Too few calls completed on BOTH arms to compare", was written for `_unmeasured` and
+    the empty-pairing gate and is simply false on this new path; printing it would send the
+    operator looking for a pairing failure that did not happen.
+
+    Asserted on the RENDERED bullet rather than the reason string, because the reason is
+    `"unmeasured"` on all three paths by design — the sentence is the only place the
+    difference is visible to a reader, so it is the only place it can be pinned.
+    """
+    rows = (_perfect_on_landed("recall", 24, 10, 1)
+            + _perfect_on_landed("precision", 24, 10, 1))
+    assert all(r["control_trials"] == r["trials"] for r in rows), "every row must pair"
+    report = build_dropeval_report({"m": rows})
+    assert "**FAIL**" not in report, "no behavioural verdict may survive a transport loss"
+    assert "**final-accuracy: not gated for `m`**" in report
+    bullet = next(ln for ln in report.splitlines()
+                  if ln.startswith("- **final-accuracy: not gated"))
+    assert "Too few calls completed on BOTH arms" not in bullet, bullet
+    assert "lost to account for the gap on their own" in bullet, bullet
+    # The SECOND false opening clause, caught by review of the first fix: "Not enough of
+    # this comparison survived to read" is equally false here -- all 48 questions survived
+    # pairing, at a clean -10% gap. Banning the old clause and requiring the shared
+    # disjunction (both asserted above) left this mutable: reverting ONLY the opening
+    # sentence, with the disjunction left untouched, passed both of those asserts. Pinned
+    # directly.
+    assert "survived to read" not in bullet, bullet
+    assert "not trusted as evidence" in bullet, bullet
+    # The table cell is the withheld marker, not a percentage — the defect an operator met
+    # on the mechanism half was a number printed under a paragraph disowning its rows.
+    header = next(ln for ln in report.splitlines() if ln.startswith("| Model |"))
+    cols = [c.strip() for c in header.split("|")[1:-1]]
+    row = next(ln for ln in report.splitlines() if ln.startswith("| `m` |"))
+    cells = dict(zip(cols, [c.strip() for c in row.split("|")[1:-1]], strict=True))
+    assert cells["final-accuracy"] == "not gated", row
+
+
+# --------------------------------------------------------------------------- #
+# Review of #382. The credit and the accuracy must share a ROW SET, not merely a
+# per-row denominator — `_arm_loss_share` skips rows carrying no counter, and a
+# credit is subtracted from a FAIL.
+# --------------------------------------------------------------------------- #
+
+
+def _merged_pack(kind, n_legacy, n_current, *, ok_legacy, ok_current, t_err, trials=10):
+    """A pack merged from one producer predating `treatment_errors` (#299) and one
+    emitting it. `_accuracy_gate` admits this: it requires `control_ok` on every row, which
+    a post-#269 legacy pack carries, and nothing requires the error counters."""
+    legacy = [{"qid": f"{kind}L{i}", "kind": kind, "trials": trials, "attempts": trials * 2,
+               "answer_ok": ok_legacy, "retrieve_ok": ok_legacy, "handle_ok": ok_legacy,
+               "control_ok": trials, "control_trials": trials} for i in range(n_legacy)]
+    current = [{"qid": f"{kind}C{i}", "kind": kind, "trials": trials,
+                "attempts": trials * 2, "answer_ok": ok_current,
+                "retrieve_ok": ok_current, "handle_ok": ok_current,
+                "errors": t_err, "treatment_errors": t_err, "control_errors": 0,
+                "control_ok": trials, "control_trials": trials} for i in range(n_current)]
+    return legacy + current
+
+
+def test_a_merged_pack_cannot_credit_a_loss_the_scored_rows_never_paid():
+    """The finding both reviewers of #382 reached independently, and the invariant it
+    breaks is the one this whole gate is built around.
+
+    `_form_stats` scores EVERY paired row; `_arm_loss_share` skips rows carrying no
+    counter. On a merged set that makes the credit a fraction of a SUBSET applied to the
+    WHOLE. Executed on the branch before the fix: 40 legacy rows at 7/10 with no loss at
+    all, plus 40 current rows at 8/10 losing 2 each, against a 100% control —
+
+        gap                       -0.25
+        credited (subset, 400)     0.20  ->  -0.05  ->  WITHHELD
+        honest   (all rows, 800)   0.10  ->  -0.15  ->  three times tolerance
+
+    A 15-point regression that survives crediting every genuinely lost call was withheld.
+    `NOT_CONCLUDED (2) < BLOCK (3)`, so the exclusion IMPROVED the model's verdict — what
+    `UNMEASURED_FAIL_SHARE`'s comment refuses and what #379's review found 240 of.
+    """
+    rows = (_merged_pack("recall", 40, 40, ok_legacy=7, ok_current=8, t_err=2)
+            + _merged_pack("precision", 40, 40, ok_legacy=7, ok_current=8, t_err=2))
+    assert not _unmeasured(rows), "no other gate may be doing the work"
+    assert _arm_loss_share(rows, "treatment") == pytest.approx(0.20), (
+        "the SIBLING helper still reports the subset share — that is its job")
+    assert _credited_loss_share(rows, "treatment") == pytest.approx(0.10), (
+        "the credited share is read over the same rows the accuracy was")
+    v = dropeval_verdict({"m": rows})
+    assert v.metrics["accuracy"].excluded == {}, (
+        "a 15-point gap that survives crediting every lost call is behaviour")
+    assert v.metrics["accuracy"].worst is not None
+    assert v.directive is Directive.BLOCK
+
+
+def test_a_merged_pack_cannot_credit_the_MECHANISM_metrics_either():
+    """The same defect at #371's site (`dropeval_verdict`'s fixed-ideal loop), which
+    shipped with it and which #382's fix inherits rather than introduces.
+
+    Kept as its own test because the two sites reach `_credited_loss_share` by different
+    routes — one through `_accuracy_gate` -> `arm_gap` -> `_gap`, one directly off
+    `by_kind` — so a fix applied to only one leaves the other live.
+    """
+    rows = (_merged_pack("recall", 40, 40, ok_legacy=7, ok_current=8, t_err=2)
+            + _merged_pack("precision", 40, 40, ok_legacy=7, ok_current=8, t_err=2))
+    v = dropeval_verdict({"m": rows})
+    for mech in ("recall", "precision"):
+        assert v.metrics[mech].excluded == {}, (
+            f"{mech}: a 25-point miss with a 10% honest loss is behaviour, not transport")
+
+
+def test_the_credit_never_exceeds_what_the_arm_could_have_scored():
+    """The sharpened form: an inflated credit does not merely withhold too much, it claims
+    an accuracy above 100%.
+
+    5 carrying rows losing 2 of 10, 95 legacy rows at 9/10, control perfect. The subset
+    share is 0.20, so `acc + loss` reaches 1.095 — crediting the arm with more successes
+    than it had trials, under a comment asserting the ceiling is real.
+    """
+    rows = (_merged_pack("recall", 95, 5, ok_legacy=9, ok_current=8, t_err=2)
+            + _merged_pack("precision", 95, 5, ok_legacy=9, ok_current=8, t_err=2))
+    acc = 0.895
+    assert _arm_loss_share(rows, "treatment") + acc > 1.0, (
+        "fixture must reach an impossible ceiling under the subset share, or it is not "
+        "reproducing the finding")
+    assert _credited_loss_share(rows, "treatment") + acc <= 1.0
+    v = dropeval_verdict({"m": rows})
+    assert v.metrics["accuracy"].excluded == {}, "a -9.5pt gap is not explained by 1% loss"
+
+
+def test_a_credited_share_over_one_is_REFUSED_where_its_sibling_fires():
+    """The one place `_credited_loss_share` deliberately inverts `_arm_loss_share`.
+
+    An arm reporting more errors than calls is an emitter bug with no benign form. Its
+    sibling lets the share go over 1.0 so `_unmeasured` FIRES — withholding asks a human to
+    look, which is the safe direction there. Here the same share would BUY a withheld FAIL
+    off that bug, so it is refused and the metric is scored instead.
+    """
+    rows = [{"qid": "a", "kind": "recall", "trials": 1, "attempts": 2,
+             "answer_ok": 0, "treatment_errors": 10}]
+    assert _arm_loss_share(rows, "treatment") == 10.0, "the sibling still goes over 1.0"
+    assert _credited_loss_share(rows, "treatment") is None
+    # ...and a share of exactly 1.0 is a real measurement, not the bug: it is refused only
+    # ABOVE the line, so the boundary is observed rather than assumed.
+    assert _credited_loss_share([dict(rows[0], treatment_errors=1)], "treatment") == 1.0
+
+
+def test_a_row_set_where_NOBODY_counted_credits_nothing():
+    """`None`, never 0.0 — the distinction `_arm_loss_share` documents, one helper over.
+
+    Absent counters mean the loss is unknown. Returning 0.0 would be indistinguishable at
+    the call sites (`if loss and ...` treats both as falsey today), but the two are
+    different facts and a future site spelling `is not None` would silently credit a
+    measured zero to a pack that measured nothing.
+    """
+    legacy = _merged_pack("recall", 20, 0, ok_legacy=8, ok_current=0, t_err=0)
+    assert not any("treatment_errors" in r for r in legacy)
+    assert _credited_loss_share(legacy, "treatment") is None
+    assert _credited_loss_share([{"qid": "z", "trials": 0, "treatment_errors": 0}],
+                                "treatment") is None, "no calls is not a zero loss"
+
+
+def test_the_survivor_COUNT_still_renders_under_the_new_exclusion():
+    """Review finding 2 of #382: the fix deleted the evidence its own remedy cites.
+
+    `> **Questions surviving the pairing**` is listed only for models that are scored or
+    `underpowered`, and the block is guarded by `if broken:` — a condition the #381 cause
+    always satisfies. So the report claimed the comparison had not survived while
+    suppressing the `48/48` proving pairing lost nothing. `origin/main` printed it for this
+    exact fixture.
+    """
+    rows = (_perfect_on_landed("recall", 24, 10, 1)
+            + _perfect_on_landed("precision", 24, 10, 1))
+    report = build_dropeval_report({"m": rows})
+    assert "**Questions surviving the pairing**" in report
+    line = next(ln for ln in report.splitlines() if "surviving the pairing" in ln)
+    assert "`m` 48/48" in line, line
+
+
+def test_no_renderer_claims_a_CALL_COUNT_about_a_fully_paired_withheld_run():
+    """The other half of finding 2, and it pre-dates #382: `REASON_LABEL["unmeasured"]` read
+    "too few calls to compare", which the mechanism bullets have printed on 48/48-paired
+    runs since #371 shipped. #382 extended it to the accuracy column, so it is fixed here.
+
+    The label now names the CONSEQUENCE the four routes to `"unmeasured"` share -- no
+    verdict about the model follows from this run -- rather than a count or a cause, both
+    of which are false of at least one route. A second round of review on #382 found the
+    first replacement, "transport loss", was a false CAUSE (see
+    `test_a_zero_loss_exclusion_does_not_claim_transport_lost_the_calls` below); this test
+    only ever pinned the false-COUNT defect and would not have caught that one.
+    """
+    rows = (_perfect_on_landed("recall", 24, 10, 1)
+            + _perfect_on_landed("precision", 24, 10, 1))
+    report = build_dropeval_report({"m": rows})
+    assert "too few calls to compare" not in report, (
+        "480 of 480 control calls landed and 48 of 48 questions paired")
+    for metric in ("retrieve-recall", "final-accuracy"):
+        bullet = next(ln for ln in report.splitlines()
+                      if ln.startswith(f"- **{metric}: not gated"))
+        assert "no usable comparison" in bullet, bullet
+
+
+def test_a_zero_loss_exclusion_does_not_claim_transport_lost_the_calls():
+    """Review finding 1 of the #382 remediation itself: "transport loss" fixed the
+    call-count falsehood and introduced a cause falsehood in its place, one route over.
+
+    `_unmeasured` trigger 1 fires at ZERO calls lost -- an arm that was simply never run.
+    Executed against "transport loss": `build_diff_report` rendered "**Not measured** --
+    transport loss, so no accuracy is published for: `m` (0/240 calls lost). No calls were
+    lost, so transport is not the cause: ..." -- the claim and its own refutation six words
+    apart, in the same sentence. This is `#338`'s defect re-entering through the shared
+    vocabulary: `REASON_LABEL["unmeasured"]` must be true at EVERY route, including the one
+    where nothing was lost at all.
+    """
+    from terse.report import build_diff_report
+
+    diff_rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "trials": 20, "attempts": 20, "fails": 0,
+        "diff_ok": 0, "diff_trials": 0, "terse_ok": 20, "terse_trials": 20,
+    } for i in range(12)]
+    assert _unmeasured(diff_rows), "fixture must trip trigger 1 (a zero-trial arm)"
+    assert sum(r["fails"] for r in diff_rows) == 0, "fixture must lose zero calls"
+    report = build_diff_report({"m": diff_rows})
+    line = next(ln for ln in report.splitlines() if "Not measured" in ln)
+    assert "0/240 calls lost" in line, line
+    # Scoped to the LABEL itself, not the sentence that follows it -- that sentence's whole
+    # job is to say "transport is not the cause" at this route, and banning the word from
+    # the line would forbid the correct rebuttal along with the defect.
+    label = line.split("\u2014", 1)[1].split(", so no accuracy", 1)[0]
+    for word in ("transport", "unanswered", "unreachable"):
+        assert word not in label.casefold(), (
+            f"the label {label!r} claims a cause ({word!r}) this route's own count "
+            f"(0/240 calls lost) refutes")
+
+
+def test_a_treatment_only_loss_is_not_attributed_to_the_control_column():
+    """Review finding 2: the dropeval table's `control (no drop)` cell rendered
+    `REASON_LABEL[reason]` unconditionally, so a #381-route exclusion -- loss entirely on
+    the TREATMENT arm -- printed "transport loss" under a column headed by the arm that
+    lost nothing.
+
+    A cause-bearing label has an arm to get wrong; a consequence-only one does not, so this
+    is pinned by asserting the CURRENT label carries no arm-specific word rather than by
+    asserting a specific arm name is absent -- the same argument `REASON_LABEL`'s own note
+    makes for why route 4 forced a consequence label in the first place.
+    """
+    rows = (_perfect_on_landed("recall", 24, 10, 1)
+            + _perfect_on_landed("precision", 24, 10, 1))
+    report = build_dropeval_report({"m": rows})
+    row = next(ln for ln in report.splitlines() if ln.startswith("| `m` |"))
+    assert "0 lost" not in row or "control" not in row.casefold(), row  # sanity: no stray count
+    for word in ("transport", "treatment", "control"):
+        assert word not in REASON_LABEL["unmeasured"].casefold(), (
+            f"REASON_LABEL['unmeasured'] is {REASON_LABEL['unmeasured']!r}, which names an "
+            f"arm -- and the table prints it under 'control (no drop)' regardless of "
+            f"which arm actually lost the calls")

@@ -648,8 +648,9 @@ def test_a_small_and_passing_arm_is_withheld_as_underpowered():
     assert "**PASS**" not in md and "safe to enable" not in md
     # Withheld is not the same as unmentioned, and the reason must not blame the backend.
     assert "`m`" in md
-    assert "too few calls to compare" not in md, (
-        "no calls were lost here; the transport wording would be a fabricated cause")
+    assert "no usable comparison" not in md, (
+        "this run is 'underpowered', not 'unmeasured' -- REASON_LABEL['unmeasured'] must "
+        "not leak onto an exclusion it does not own")
 
 
 def test_the_canonical_correlated_loss_fixture_is_still_scored():
@@ -685,12 +686,25 @@ def test_a_withheld_model_is_not_told_its_backend_was_unreachable():
     # distinguish this, because the markdown's (legitimate) hedge "either too many calls
     # went unanswered, or..." contains the bad phrase as a substring.
     from terse.report import REASON_LABEL
-    assert REASON_LABEL["unmeasured"] == "too few calls to compare", (
+    assert REASON_LABEL["unmeasured"] == "no usable comparison", (
         f"the shared label is {REASON_LABEL['unmeasured']!r}; the renderers spell this "
         f"phrase literally in their own tests, so changing it here alone splits them")
     assert "unanswered" not in REASON_LABEL["unmeasured"], (
         f"REASON_LABEL['unmeasured'] is {REASON_LABEL['unmeasured']!r}, which asserts a "
         f"cause that is false whenever the arms merely failed to pair")
+    # It must not assert a CAUSE either, and this constant has had two false ones. "too few
+    # calls to compare" was false of #371/#381's fourth route (48/48 questions paired,
+    # nothing to be "too few" of). Its replacement, "transport loss", was worse: false of
+    # route 1 by construction, since route 1 IS zero calls lost -- #382's own review
+    # rendered it next to the sentence that refutes it, six words apart, on the fixture
+    # this file builds just above. The label states the CONSEQUENCE, which is the only
+    # thing all four routes share.
+    assert "transport" not in REASON_LABEL["unmeasured"], (
+        f"REASON_LABEL['unmeasured'] is {REASON_LABEL['unmeasured']!r}, which is false at "
+        f"trigger 1 (zero calls lost) -- the exact defect #382's second review found")
+    assert not any(w in REASON_LABEL["unmeasured"] for w in ("few", "many", "enough")), (
+        f"REASON_LABEL['unmeasured'] is {REASON_LABEL['unmeasured']!r}, which asserts a "
+        f"COUNT that is false when the loss merely explains a gap on a fully-paired run")
 
     md = build_diff_report({"m": rows})
     html = build_html_diff_report({"m": rows}, "diff-form", "full-terse")
@@ -775,7 +789,15 @@ def test_every_renderer_names_the_right_exclusion_reason():
     # `"many calls were lost"`, not `"calls were lost"`: the zero-loss sentence has to be
     # able to say "No calls were lost", which is the disclosure, not the claim.
     banned = ("unanswered", "unreachable", "fix the backend", "backend is reachable",
-              "returned no content", "many calls were lost", "calls did not")
+              "returned no content", "many calls were lost", "calls did not",
+              # "transport loss" was #382's own first attempt at this label, and it is
+              # exactly the bug this test exists to catch: false at trigger-1 zero loss,
+              # reproduced verbatim in the #382 review as "transport loss ... (0/240 calls
+              # lost). No calls were lost, so transport is not the cause" -- the claim and
+              # its refutation six words apart. It slipped past a vocabulary ban that only
+              # covered wordings someone had already thought of; banned explicitly here so
+              # a THIRD attempt at this same phrase cannot repeat it silently.
+              "transport loss", "transport problem")
 
     def assert_no_transport_claim(name: str, text: str) -> None:
         low = text.casefold()
@@ -895,7 +917,7 @@ def test_an_underpowered_model_is_named_in_every_renderer():
         assert named[name] in text, f"{name} does not name the withheld model"
         assert passes[name] not in text, f"{name} published a PASS off 10 questions"
         # Nothing was lost. No renderer may say otherwise.
-        assert "too few calls to compare" not in text, name
+        assert "no usable comparison" not in text, name
         assert "went unanswered" not in text, name
 
 
