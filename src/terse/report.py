@@ -711,6 +711,44 @@ def _arm_loss_share(rows: list[dict], arm: str) -> float | None:
     return sum(e for _, e in per_row) / arm_attempts
 
 
+def _credited_loss_share(rows: list[dict], arm: str) -> float | None:
+    """What fraction of the calls BEHIND AN ACCURACY this arm reported lost.
+
+    The sibling of `_arm_loss_share`, and the difference is the denominator — which is the
+    whole reason both exist. `_arm_loss_share` answers "how degraded is this arm", so it
+    SKIPS rows carrying no counter: reading an absent count as zero would dilute a known
+    loss with unknown rows and push `_unmeasured` toward publishing. This one answers a
+    different question — "how much of the score in front of me is explained by loss" — and
+    its result is subtracted from a FAIL. `_form_stats` divides by every row's `trials`, so
+    a credit computed over a SUBSET is a fraction of the part applied to the whole.
+
+    Measured on a merged pack (5 rows carrying `treatment_errors: 2`, 95 legacy rows
+    carrying none, all scoring against a 100% control): `_arm_loss_share` reports 0.20 and
+    `acc + loss` reaches 1.095 — crediting the arm with more successes than it had trials —
+    which withheld a 9.5-point regression that no loss could explain. The honest share over
+    the same rows the accuracy used is 0.01. Both #371's site and #381's had this shape.
+
+    So an absent counter contributes NO errors and its FULL trials to the denominator. That
+    is the conservative direction here and the mirror of `_arm_loss_share`'s: under-crediting
+    publishes a FAIL that might be transport, which is recoverable; over-crediting withholds
+    a demonstrated regression, and `NOT_CONCLUDED (2) < BLOCK (3)` makes that an exclusion
+    that IMPROVES a verdict — the one thing `UNMEASURED_FAIL_SHARE`'s comment forbids.
+
+    None when NO row carries the counter (nothing is known, so nothing is credited) or when
+    the arm was given no calls. None also when the share exceeds 1.0, which is the OTHER
+    place this inverts its sibling: there an over-1.0 share must fire rather than be rounded
+    down, because firing withholds and asks a human to look; here it would BUY a withholding
+    off an emitter bug, so it is refused instead."""
+    err_key = f"{arm}_errors"
+    if not any(err_key in r for r in rows):
+        return None
+    attempts = sum(_arm_attempts(r, arm, int(r.get("trials", 1))) for r in rows)
+    if not attempts:
+        return None
+    share = sum(int(r[err_key]) for r in rows if err_key in r) / attempts
+    return None if share > 1.0 else share
+
+
 # Why a gap is never computed from two bare `_form_stats` calls again (#280).
 #
 # `_form_stats(rows, form)` computes ONE arm. Every gap site therefore called it twice and
@@ -931,8 +969,14 @@ def best_arm_gap(rows: list[dict[str, Any]], forms: list[str], control: str,
 REASON_LABEL = {
     # NOT "calls went unanswered": since #332 this reason also covers a backend that
     # answered almost everything, where the losses landed so as to leave no question
-    # complete on both arms. Reproduced at 5% loss. The label has to be true of both.
-    "unmeasured": "too few calls to compare",
+    # complete on both arms. Reproduced at 5% loss. The label has to be true of ALL of
+    # them, and since #371/#381 there are three — the third being a run where every
+    # question paired and the treatment arm's own loss is simply enough to account for the
+    # gap. "too few calls to compare" was false of that one, and rendered anyway: the
+    # mechanism bullets have led with it on 48/48-paired runs since #371 shipped, and #381
+    # extended it to the accuracy column. A COUNT was the wrong thing to assert; the cause
+    # is what all three share.
+    "unmeasured": "transport loss",
     "broken control": "control arm failed",
     "not a diff run": "no diff arm in these rows",
     "empty": "no rows",
@@ -940,7 +984,7 @@ REASON_LABEL = {
     "partial control coverage": "control ran on only some rows",
     # Distinct from "unmeasured" ON PURPOSE. Nothing failed here: the backend answered, the
     # arms paired, there were simply too few questions to conclude anything from an absence
-    # of regressions. Folding it into "unmeasured" would print "too few calls to compare"
+    # of regressions. Folding it into "unmeasured" would print "transport loss"
     # about a run that lost no calls at all — the #332 mistake, one reason over.
     "underpowered": f"fewer than {_MIN_PAIRED_QUESTIONS} paired questions",
     # Set only by the diff-soak per-depth table, whose own `lead` dict already carries a
@@ -1625,17 +1669,27 @@ def _accuracy_gate(rows: list[dict[str, Any]]) -> ArmGap:
     # predicate there would apply a dropeval-schema argument to four harnesses that never
     # made it. Same placement as #371's, for the same reason.
     #
-    # `acc + loss` is a real ceiling only because both sides share a denominator:
-    # `_form_stats` reads `answer_trials` and `_arm_loss_share` reads `treatment_attempts`,
-    # neither of which dropeval emits, so both fall back to the row's `trials`. Computed
-    # over `g.rows` — the PAIRED subset the accuracies were computed over — not `rows`,
-    # which still carries the questions pairing dropped.
+    # `acc + loss` is a real ceiling only while both sides share a denominator, and that
+    # takes BOTH of the things below. An earlier revision of this comment claimed it took
+    # only the first, and adversarial review of #382 executed the counter-example.
+    #
+    #   - the same ROW SET. `_credited_loss_share`, not `_arm_loss_share`: the sibling
+    #     SKIPS rows carrying no counter (correctly — it answers "how degraded is this
+    #     arm"), so on a merged pack it returns a fraction of a subset that is then applied
+    #     to the whole. Measured: a credit of 0.20 against an honest 0.10, withholding a
+    #     15-point regression; and, sharpened, `acc + loss` reaching 1.095.
+    #   - the same PAIRED subset. `g.rows`, not `rows`, which still carries the questions
+    #     pairing dropped.
+    #
+    # Per-row the two agree by construction: `_form_stats` reads `answer_trials` and
+    # `_arm_attempts` reads `treatment_attempts`, neither of which dropeval emits, so both
+    # fall back to the row's `trials`.
     #
     # Withheld as `"unmeasured"` rather than a new `ExclusionReason`, and the loosening this
     # admits is #371's, bounded the same way: a FAIL that survives crediting every lost
     # treatment call is behavioural and is still scored, so no demonstrated regression can
     # be withheld here.
-    loss = _arm_loss_share(g.rows, "treatment")
+    loss = _credited_loss_share(g.rows, "treatment")
     if (loss and not passes_tolerance(g.form_acc - g.control_acc)
             and passes_tolerance(g.form_acc + loss - g.control_acc)):
         return ArmGap(0.0, 0.0, 0.0, 0.0, [], "unmeasured")
@@ -1967,7 +2021,7 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
             # corrupt these columns, and gating on it would withhold a metric that was
             # measured fine.
             acc, se = _form_stats(kind_rows, "retrieve_ok")
-            loss = _arm_loss_share(kind_rows, "treatment")
+            loss = _credited_loss_share(kind_rows, "treatment")
             if (loss and not passes_tolerance(acc - 1.0)
                     and passes_tolerance(acc + loss - 1.0)):
                 excluded_by_metric[mech][model] = "unmeasured"
@@ -3387,9 +3441,15 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
             g = _accuracy_gate(rows)
             if not g.excluded:
                 surviving.append(f"`{model}` {len(g.rows)}/{len(rows)}")
-            elif g.excluded == "underpowered":
-                # `g.rows` is empty for every exclusion, so recompute: this is the one
-                # reason whose entire remedy is a NUMBER, and the reader was given none.
+            elif g.excluded in ("underpowered", "unmeasured"):
+                # `g.rows` is empty for every exclusion, so recompute. TWO reasons need it,
+                # for opposite readings of the same number. `underpowered`'s entire remedy
+                # IS the count. `unmeasured` needs it because #381 gave that reason a third
+                # cause in which pairing lost NOTHING — the treatment's own loss explains
+                # the gap — and this block is guarded by `if broken:`, which that cause
+                # always satisfies. Omitting it printed "too few calls to compare" while
+                # suppressing the `48/48` that disproves it, and the remedy sentence sends
+                # the reader here to settle exactly that disjunction.
                 pr = paired_rows(rows, "answer_ok", "control_ok")
                 surviving.append(f"`{model}` {len(pr)}/{len(rows)}")
         if surviving:

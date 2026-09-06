@@ -123,7 +123,7 @@ def test_a_partially_failing_model_cannot_force_a_regression_verdict():
                   terse_trials=0, primer_trials=0, inline_trials=0) for _ in range(20)]
     text = _report({"good": healthy, "flaky": flaky})
     verdict = text.split("## Verdict")[1]
-    assert "Excluded (too few calls to compare — not measured)" in verdict
+    assert "Excluded (transport loss — not measured)" in verdict
     assert "`flaky`" in verdict
     # The healthy model is measured and holds, so the run must PASS. With `flaky` gated,
     # its 0% terse against 100% raw is a -100pt worst-case gap and this reads FAIL.
@@ -379,7 +379,7 @@ def test_the_diff_forest_plot_excludes_the_same_models_the_diff_markdown_does():
     assert "good" in gap_rows
     chart = build_terminal_diff_report({"good": good, "dead": dead}, color=False)
     assert "FAIL" not in chart, "a dead backend must not render a FAIL bar"
-    assert "too few calls to compare: dead" in chart
+    assert "transport loss: dead" in chart
 
 
 def test_the_soak_report_cannot_pass_off_a_dead_backend():

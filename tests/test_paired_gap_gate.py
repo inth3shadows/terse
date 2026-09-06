@@ -648,7 +648,7 @@ def test_a_small_and_passing_arm_is_withheld_as_underpowered():
     assert "**PASS**" not in md and "safe to enable" not in md
     # Withheld is not the same as unmentioned, and the reason must not blame the backend.
     assert "`m`" in md
-    assert "too few calls to compare" not in md, (
+    assert "transport loss" not in md, (
         "no calls were lost here; the transport wording would be a fabricated cause")
 
 
@@ -685,12 +685,20 @@ def test_a_withheld_model_is_not_told_its_backend_was_unreachable():
     # distinguish this, because the markdown's (legitimate) hedge "either too many calls
     # went unanswered, or..." contains the bad phrase as a substring.
     from terse.report import REASON_LABEL
-    assert REASON_LABEL["unmeasured"] == "too few calls to compare", (
+    assert REASON_LABEL["unmeasured"] == "transport loss", (
         f"the shared label is {REASON_LABEL['unmeasured']!r}; the renderers spell this "
         f"phrase literally in their own tests, so changing it here alone splits them")
     assert "unanswered" not in REASON_LABEL["unmeasured"], (
         f"REASON_LABEL['unmeasured'] is {REASON_LABEL['unmeasured']!r}, which asserts a "
         f"cause that is false whenever the arms merely failed to pair")
+    # And it must not assert a COUNT either. #371/#381 gave this reason a third cause — a
+    # run where every question paired and the treatment arm's own loss simply accounts for
+    # the gap — of which "transport loss", the wording this pin carried for two
+    # releases, is plainly false. It rendered on 48/48-paired runs anyway. The label names
+    # the cause the three share; anything counting calls is false of the third.
+    assert not any(w in REASON_LABEL["unmeasured"] for w in ("few", "many", "enough")), (
+        f"REASON_LABEL['unmeasured'] is {REASON_LABEL['unmeasured']!r}, which asserts a "
+        f"COUNT that is false when the loss merely explains a gap on a fully-paired run")
 
     md = build_diff_report({"m": rows})
     html = build_html_diff_report({"m": rows}, "diff-form", "full-terse")
@@ -895,7 +903,7 @@ def test_an_underpowered_model_is_named_in_every_renderer():
         assert named[name] in text, f"{name} does not name the withheld model"
         assert passes[name] not in text, f"{name} published a PASS off 10 questions"
         # Nothing was lost. No renderer may say otherwise.
-        assert "too few calls to compare" not in text, name
+        assert "transport loss" not in text, name
         assert "went unanswered" not in text, name
 
 

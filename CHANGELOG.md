@@ -46,6 +46,47 @@ fails that pull request until the section has moved.
   control-degraded questions pins that (diluting to all rows publishes the manufactured
   FAIL).
 
+- **The credited loss was a fraction of a SUBSET applied to the whole, which withheld a
+  demonstrated regression** (`#381`, found by adversarial review before merge; the same
+  shape shipped at `#371`'s site and is fixed with it). `_arm_loss_share` deliberately
+  SKIPS rows carrying no `<arm>_errors` counter — correct for its own question, "how
+  degraded is this arm" — but `_form_stats` scores every row. On a pack merged from one
+  producer predating `treatment_errors` and one emitting it, the credit was computed over
+  the carrying rows and subtracted from an accuracy computed over all of them:
+
+  ```
+  gap                       -0.25
+  credited (subset, 400)     0.20  ->  -0.05  ->  WITHHELD
+  honest   (all rows, 800)   0.10  ->  -0.15  ->  three times tolerance
+  ```
+
+  Sharpened, `acc + loss` reached **1.095** — crediting the arm with more successes than it
+  had trials, under a comment asserting the ceiling was real. `NOT_CONCLUDED (2) <
+  BLOCK (3)`, so withholding there is an exclusion that **improves** a model's verdict:
+  what `UNMEASURED_FAIL_SHARE`'s comment forbids and what `#379`'s review found 240 of.
+
+  New `_credited_loss_share` answers the credit's question instead — an absent counter
+  contributes no errors and its full trials to the denominator, so the failure direction is
+  under-crediting (publishes a FAIL that may be transport) rather than over-crediting
+  (withholds a regression). It also **refuses** a share above 1.0 where its sibling lets one
+  fire: there an over-1.0 share withholds and asks a human to look, here it would buy a
+  withholding off an emitter bug. Latent rather than live — `dropeval.py` writes the counter
+  unconditionally and no CLI path loads rows from disk — but it is exactly the merged-pack
+  shape `_arm_loss_share`, `_unmeasured`'s `key in r` restriction and `_accuracy_gate`'s own
+  `"partial control coverage"` gate all exist to handle.
+
+### Changed
+
+- **`REASON_LABEL["unmeasured"]` no longer asserts a call count** (`#381`). It read "too few
+  calls to compare", which `#371` made false for a third cause — a run where every question
+  paired and the treatment arm's own loss simply accounts for the gap — and the mechanism
+  bullets have printed it on 48/48-paired runs since that shipped. It is now
+  `"transport loss"`, which names the cause all three routes share. `#382`'s own fix also
+  restored the `> **Questions surviving the pairing**` line under the new exclusion: that
+  block lists only scored and `underpowered` models, so the report was claiming the
+  comparison had not survived while suppressing the `48/48` that disproved it — the exact
+  number the remedy sentence tells the reader to consult.
+
 - **A withheld `final-accuracy` told the operator the arms had failed to pair when they
   had not** (`#381`). `_exclusion_remedy`'s two-arm sentence — "Too few calls completed on
   BOTH arms to compare" — is false on the new path, where every question completed every
