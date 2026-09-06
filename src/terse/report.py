@@ -969,14 +969,33 @@ def best_arm_gap(rows: list[dict[str, Any]], forms: list[str], control: str,
 REASON_LABEL = {
     # NOT "calls went unanswered": since #332 this reason also covers a backend that
     # answered almost everything, where the losses landed so as to leave no question
-    # complete on both arms. Reproduced at 5% loss. The label has to be true of ALL of
-    # them, and since #371/#381 there are three — the third being a run where every
-    # question paired and the treatment arm's own loss is simply enough to account for the
-    # gap. "too few calls to compare" was false of that one, and rendered anyway: the
-    # mechanism bullets have led with it on 48/48-paired runs since #371 shipped, and #381
-    # extended it to the accuracy column. A COUNT was the wrong thing to assert; the cause
-    # is what all three share.
-    "unmeasured": "transport loss",
+    # complete on both arms. Reproduced at 5% loss. Since #371/#381 there are FOUR routes
+    # here, not two, and the label has to be true of all of them:
+    #
+    #   1. an arm completed ZERO trials (it was never run) — ZERO calls lost.
+    #   2. calls were lost such that no question paired.
+    #   3. one arm's own loss share crossed a threshold.
+    #   4. (#371/#381) every question paired and both arms completed everything, but the
+    #      loss on its own is numerically sufficient to explain the gap.
+    #
+    # "too few calls to compare" was false of route 4 (48/48 questions paired) and rendered
+    # on it anyway for two releases. The first fix, "transport loss", was worse: false of
+    # route 1 by construction (route 1 IS the zero-loss route), so `#338`'s own
+    # `test_every_renderer_names_the_right_exclusion_reason` — the test written specifically
+    # to make a transport claim at zero loss impossible — rendered `**Not measured** —
+    # transport loss ... (0/240 calls lost). No calls were lost, so transport is not the
+    # cause: ...` six words later, in the same sentence. It slipped past that test because
+    # the test bans a fixed vocabulary of wordings someone already thought of, and "transport
+    # loss" was a new one. Do not add a synonym for "lost"/"unanswered" here without adding
+    # it to that ban list too (see the comment at its call site).
+    #
+    # So the label names neither a COUNT nor a CAUSE — both are false of one route or
+    # another. It names the CONSEQUENCE, which is true of all four: whatever happened, this
+    # run does not support a verdict about the model. It is also why this string must never
+    # be the sole content of a table cell keyed to one arm (`control (no drop)`, say):
+    # route 4's loss is on the TREATMENT arm, and a cause-bearing label there would put it
+    # under the wrong heading. A consequence-only label has no arm to get wrong.
+    "unmeasured": "no usable comparison",
     "broken control": "control arm failed",
     "not a diff run": "no diff arm in these rows",
     "empty": "no rows",
@@ -984,7 +1003,7 @@ REASON_LABEL = {
     "partial control coverage": "control ran on only some rows",
     # Distinct from "unmeasured" ON PURPOSE. Nothing failed here: the backend answered, the
     # arms paired, there were simply too few questions to conclude anything from an absence
-    # of regressions. Folding it into "unmeasured" would print "transport loss"
+    # of regressions. Folding it into "unmeasured" would print "no usable comparison"
     # about a run that lost no calls at all — the #332 mistake, one reason over.
     "underpowered": f"fewer than {_MIN_PAIRED_QUESTIONS} paired questions",
     # Set only by the diff-soak per-depth table, whose own `lead` dict already carries a
@@ -1861,17 +1880,24 @@ def _exclusion_remedy(reason: ExclusionReason, *, fixed_ideal: bool = False) -> 
             # on it: `_accuracy_gate` now also withholds when both arms completed
             # everything and the treatment's own lost calls are enough to account for the
             # gap. Naming the cause is not available here — the reason is deliberately
-            # `"unmeasured"` for all three paths, and `DropevalVerdict` carries no counts
-            # (see the note above) — so the sentence states the CONSEQUENCE, which is true
-            # of all three, and enumerates the causes as a disjunction the split above
-            # settles. Widening it rather than adding a fourth reason keeps the "assert
-            # nothing about the present run" property this branch is built on.
-            return ("Not enough of this comparison survived to read. Read the per-arm "
-                    "failure split above: a non-zero loss there is a transport problem "
-                    "and the run needs repeating — either too little completed on both "
-                    "arms to pair them, or enough treatment calls were lost to account "
-                    "for the gap on their own; a zero means an arm completed no trials "
-                    "at all, so check that every arm named actually ran.")
+            # `"unmeasured"` for all four routes (see `REASON_LABEL`'s note), and
+            # `DropevalVerdict` carries no counts — so the sentence states the CONSEQUENCE,
+            # which is true of all four, and enumerates the causes as a disjunction the
+            # split above settles. Widening it rather than adding a fourth reason keeps the
+            # "assert nothing about the present run" property this branch is built on.
+            #
+            # The opening clause used to read "Not enough of this comparison survived to
+            # read" — false of the #381 route, where 48 of 48 questions paired and the
+            # comparison read a clean -10%. Adversarial review of #382 caught it rendered
+            # verbatim on that fixture. "Not trusted as evidence" is true of all four: a
+            # comparison that fully survived can still be untrustworthy, which is the
+            # entire point of the #381 route.
+            return ("This comparison is not trusted as evidence about the model. Read the "
+                    "per-arm failure split above: a non-zero loss there means the loss "
+                    "alone could explain what is shown — either too little completed on "
+                    "both arms to pair them, or enough treatment calls were lost to "
+                    "account for the gap on their own; a zero means an arm completed no "
+                    "trials at all, so check that every arm named actually ran.")
         case "empty":
             return ("No rows of this kind were scored for this model — the pack carries "
                     "none, or a merged run lost them. Re-generate the question set for "

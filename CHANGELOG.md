@@ -75,24 +75,37 @@ fails that pull request until the section has moved.
   shape `_arm_loss_share`, `_unmeasured`'s `key in r` restriction and `_accuracy_gate`'s own
   `"partial control coverage"` gate all exist to handle.
 
-### Changed
-
-- **`REASON_LABEL["unmeasured"]` no longer asserts a call count** (`#381`). It read "too few
-  calls to compare", which `#371` made false for a third cause — a run where every question
-  paired and the treatment arm's own loss simply accounts for the gap — and the mechanism
-  bullets have printed it on 48/48-paired runs since that shipped. It is now
-  `"transport loss"`, which names the cause all three routes share. `#382`'s own fix also
-  restored the `> **Questions surviving the pairing**` line under the new exclusion: that
-  block lists only scored and `underpowered` models, so the report was claiming the
-  comparison had not survived while suppressing the `48/48` that disproved it — the exact
-  number the remedy sentence tells the reader to consult.
-
 - **A withheld `final-accuracy` told the operator the arms had failed to pair when they
-  had not** (`#381`). `_exclusion_remedy`'s two-arm sentence — "Too few calls completed on
-  BOTH arms to compare" — is false on the new path, where every question completed every
-  trial on both arms. It now states the consequence, which is true of all three routes to
-  `"unmeasured"`, and enumerates the causes as a disjunction the per-arm split above
-  settles — rather than minting a fourth `ExclusionReason` or widening `DropevalVerdict`.
+  had not, and — through two rounds of review — first a false count, then a false cause**
+  (`#381`, both rounds found by adversarial review before merge). `_exclusion_remedy`'s
+  two-arm sentence, "Too few calls completed on BOTH arms to compare", is false on the new
+  route: every question completed every trial on both arms. The first correction stated the
+  consequence instead, which is what shipped.
+
+  `REASON_LABEL["unmeasured"]`, the constant six renderers share for this same reason, took
+  two attempts to reach the same place. It read `"too few calls to compare"` — false since
+  `#371`, which gave this reason a fourth route where nothing is "too few" of — and the
+  mechanism bullets have printed it on 48/48-paired runs ever since. The first fix,
+  `"transport loss"`, replaced a false count with a false CAUSE: route 1 is an arm that
+  completed zero trials, so it fires at **zero calls lost**, and adversarial review executed
+  the self-contradiction directly — `**Not measured** — transport loss, so no accuracy is
+  published for: \`m\` (0/240 calls lost). No calls were lost, so transport is not the
+  cause: ...` — the claim and its own refutation six words apart. The same review found the
+  dropeval table printing it under the **`control (no drop)`** column heading on a
+  `#381`-route exclusion, where the loss was entirely on the *treatment* arm.
+
+  The label is now `"no usable comparison"` — the CONSEQUENCE, which is the only thing all
+  four routes share and the only kind of label with no arm to misattribute. The renderer
+  test written for exactly this class of defect, `test_every_renderer_names_the_right_
+  exclusion_reason` (`#338`), passed on the false-cause label because its ban list is an
+  enumeration of wordings someone had already thought of; `"transport loss"` and
+  `"transport problem"` are now in it, so a third attempt at this phrase cannot repeat it
+  silently.
+
+  This PR's own change had also dropped the `> **Questions surviving the pairing**` line
+  under the new exclusion: that block lists only scored and `underpowered` models, so the
+  report claimed the comparison had not survived while suppressing the `48/48` that
+  disproved it — the exact number the remedy sentence tells the reader to consult.
 
 ## [0.30.8] - 2026-09-04
 

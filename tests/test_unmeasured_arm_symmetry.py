@@ -25,6 +25,7 @@ from __future__ import annotations
 import pytest
 
 from terse.report import (
+    REASON_LABEL,
     UNMEASURED_FAIL_SHARE,
     Directive,
     _accuracy_gate,
@@ -293,7 +294,7 @@ def test_a_degraded_treatment_arm_publishes_no_final_accuracy():
     rows = _both_kinds(trials=10, t_err=4)
     assert inconclusive_models({"m": rows}) == {}, "no other gate may be doing the work"
     report = build_dropeval_report({"m": rows})
-    assert "transport loss" in report
+    assert "no usable comparison" in report
     assert "**Where they failed** (per arm" in report
 
 
@@ -303,7 +304,7 @@ def test_the_accuracy_gate_reaches_the_same_verdict_whichever_arm_lost_the_calls
     NAMED FOR THE GATE, NOT THE RUN, and that is a correction rather than a nicety. An
     earlier revision called itself
     `test_the_report_reaches_the_same_verdict_whichever_arm_lost_the_calls` and asserted
-    only that both renderings contain "transport loss" and "not gated" — both of
+    only that both renderings contain "no usable comparison" and "not gated" — both of
     which are true of both reports while their run-level `Directive`s differ. A test named
     for an invariant it cannot observe failing is worse than no test: it is the #352
     blind spot re-created inside #352's own fix. The residual asymmetry it could not see is
@@ -311,7 +312,7 @@ def test_the_accuracy_gate_reaches_the_same_verdict_whichever_arm_lost_the_calls
     treatment = build_dropeval_report({"m": _both_kinds(trials=10, t_err=4)})
     control = build_dropeval_report({"m": _both_kinds(trials=10, c_err=4)})
     for report in (treatment, control):
-        assert "transport loss" in report
+        assert "no usable comparison" in report
         assert "not gated" in report
 
 
@@ -719,6 +720,14 @@ def test_a_withheld_final_accuracy_does_not_claim_the_arms_failed_to_PAIR():
                   if ln.startswith("- **final-accuracy: not gated"))
     assert "Too few calls completed on BOTH arms" not in bullet, bullet
     assert "lost to account for the gap on their own" in bullet, bullet
+    # The SECOND false opening clause, caught by review of the first fix: "Not enough of
+    # this comparison survived to read" is equally false here -- all 48 questions survived
+    # pairing, at a clean -10% gap. Banning the old clause and requiring the shared
+    # disjunction (both asserted above) left this mutable: reverting ONLY the opening
+    # sentence, with the disjunction left untouched, passed both of those asserts. Pinned
+    # directly.
+    assert "survived to read" not in bullet, bullet
+    assert "not trusted as evidence" in bullet, bullet
     # The table cell is the withheld marker, not a percentage — the defect an operator met
     # on the mechanism half was a number printed under a paragraph disowning its rows.
     header = next(ln for ln in report.splitlines() if ln.startswith("| Model |"))
@@ -870,8 +879,12 @@ def test_no_renderer_claims_a_CALL_COUNT_about_a_fully_paired_withheld_run():
     "too few calls to compare", which the mechanism bullets have printed on 48/48-paired
     runs since #371 shipped. #382 extended it to the accuracy column, so it is fixed here.
 
-    The label now names the CAUSE the three routes to `"unmeasured"` share rather than
-    asserting a count that is false of one of them.
+    The label now names the CONSEQUENCE the four routes to `"unmeasured"` share -- no
+    verdict about the model follows from this run -- rather than a count or a cause, both
+    of which are false of at least one route. A second round of review on #382 found the
+    first replacement, "transport loss", was a false CAUSE (see
+    `test_a_zero_loss_exclusion_does_not_claim_transport_lost_the_calls` below); this test
+    only ever pinned the false-COUNT defect and would not have caught that one.
     """
     rows = (_perfect_on_landed("recall", 24, 10, 1)
             + _perfect_on_landed("precision", 24, 10, 1))
@@ -881,4 +894,60 @@ def test_no_renderer_claims_a_CALL_COUNT_about_a_fully_paired_withheld_run():
     for metric in ("retrieve-recall", "final-accuracy"):
         bullet = next(ln for ln in report.splitlines()
                       if ln.startswith(f"- **{metric}: not gated"))
-        assert "transport loss" in bullet, bullet
+        assert "no usable comparison" in bullet, bullet
+
+
+def test_a_zero_loss_exclusion_does_not_claim_transport_lost_the_calls():
+    """Review finding 1 of the #382 remediation itself: "transport loss" fixed the
+    call-count falsehood and introduced a cause falsehood in its place, one route over.
+
+    `_unmeasured` trigger 1 fires at ZERO calls lost -- an arm that was simply never run.
+    Executed against "transport loss": `build_diff_report` rendered "**Not measured** --
+    transport loss, so no accuracy is published for: `m` (0/240 calls lost). No calls were
+    lost, so transport is not the cause: ..." -- the claim and its own refutation six words
+    apart, in the same sentence. This is `#338`'s defect re-entering through the shared
+    vocabulary: `REASON_LABEL["unmeasured"]` must be true at EVERY route, including the one
+    where nothing was lost at all.
+    """
+    from terse.report import build_diff_report
+
+    diff_rows = [{
+        "qid": f"q{i}", "qtype": "lookup", "trials": 20, "attempts": 20, "fails": 0,
+        "diff_ok": 0, "diff_trials": 0, "terse_ok": 20, "terse_trials": 20,
+    } for i in range(12)]
+    assert _unmeasured(diff_rows), "fixture must trip trigger 1 (a zero-trial arm)"
+    assert sum(r["fails"] for r in diff_rows) == 0, "fixture must lose zero calls"
+    report = build_diff_report({"m": diff_rows})
+    line = next(ln for ln in report.splitlines() if "Not measured" in ln)
+    assert "0/240 calls lost" in line, line
+    # Scoped to the LABEL itself, not the sentence that follows it -- that sentence's whole
+    # job is to say "transport is not the cause" at this route, and banning the word from
+    # the line would forbid the correct rebuttal along with the defect.
+    label = line.split("\u2014", 1)[1].split(", so no accuracy", 1)[0]
+    for word in ("transport", "unanswered", "unreachable"):
+        assert word not in label.casefold(), (
+            f"the label {label!r} claims a cause ({word!r}) this route's own count "
+            f"(0/240 calls lost) refutes")
+
+
+def test_a_treatment_only_loss_is_not_attributed_to_the_control_column():
+    """Review finding 2: the dropeval table's `control (no drop)` cell rendered
+    `REASON_LABEL[reason]` unconditionally, so a #381-route exclusion -- loss entirely on
+    the TREATMENT arm -- printed "transport loss" under a column headed by the arm that
+    lost nothing.
+
+    A cause-bearing label has an arm to get wrong; a consequence-only one does not, so this
+    is pinned by asserting the CURRENT label carries no arm-specific word rather than by
+    asserting a specific arm name is absent -- the same argument `REASON_LABEL`'s own note
+    makes for why route 4 forced a consequence label in the first place.
+    """
+    rows = (_perfect_on_landed("recall", 24, 10, 1)
+            + _perfect_on_landed("precision", 24, 10, 1))
+    report = build_dropeval_report({"m": rows})
+    row = next(ln for ln in report.splitlines() if ln.startswith("| `m` |"))
+    assert "0 lost" not in row or "control" not in row.casefold(), row  # sanity: no stray count
+    for word in ("transport", "treatment", "control"):
+        assert word not in REASON_LABEL["unmeasured"].casefold(), (
+            f"REASON_LABEL['unmeasured'] is {REASON_LABEL['unmeasured']!r}, which names an "
+            f"arm -- and the table prints it under 'control (no drop)' regardless of "
+            f"which arm actually lost the calls")
