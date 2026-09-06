@@ -13,7 +13,45 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **`final-accuracy` kept the loss-SHARE threshold `#371` replaced, so a treatment loss
+  under 20% was still published as a behavioural gap** (`#381`). `#371` gave recall and
+  no-overfetch a predicate that asks whether the treatment loss could *explain* the miss;
+  `final-accuracy` did not get it, because it pairs against a measured no-drop control
+  (`#269`) and so routes through `_gap`, whose only transport gate is `_unmeasured`'s
+  `> UNMEASURED_FAIL_SHARE` (0.20). Tolerance is 5%, and every lost treatment call scores a
+  MISS, so the defect was live across the whole `(5%, 20%]` band. Executed on `22eea92`
+  with the model correct on every call that landed: 10% loss printed
+  `final-accuracy 90% vs no-drop control 100% (gap -10% ±0 pts). **FAIL**`. Every point of
+  that gap was transport.
+
+  `_accuracy_gate` now scores first and withholds as `"unmeasured"` only a FAIL the
+  treatment arm's own loss is sufficient to explain — crediting every lost call clears
+  tolerance. A gap that survives that crediting is behaviour and still publishes, so an
+  exclusion here cannot improve any model's verdict.
+
+  **One arm, and not the asymmetry it looks like.** A two-arm metric suggests crediting
+  each arm's loss, but dropeval's arms lose calls into different denominators: control
+  emits `control_trials = trials - control_errors`, so its losses leave its own denominator
+  *and* `paired_rows` drops the whole row; treatment deliberately emits no `answer_trials`,
+  so its losses stay in scoring a MISS. Crediting the control could only push the gap
+  further negative, so it can never rescue a FAIL. Every step of that reads dropeval's emit
+  convention, which is why the predicate lives in `_accuracy_gate` and **not** in the shared
+  `_gap` — moving it there would apply a dropeval-schema argument to the codec verdict, the
+  diff soak, the per-depth table and fluency, whose arms state their losses differently.
+
+  The credited loss is read over the **paired subset**, not every row, so it shares a
+  denominator with the accuracy it is credited against; a fixture where pairing drops 30
+  control-degraded questions pins that (diluting to all rows publishes the manufactured
+  FAIL).
+
+- **A withheld `final-accuracy` told the operator the arms had failed to pair when they
+  had not** (`#381`). `_exclusion_remedy`'s two-arm sentence — "Too few calls completed on
+  BOTH arms to compare" — is false on the new path, where every question completed every
+  trial on both arms. It now states the consequence, which is true of all three routes to
+  `"unmeasured"`, and enumerates the causes as a disjunction the per-arm split above
+  settles — rather than minting a fourth `ExclusionReason` or widening `DropevalVerdict`.
 
 ## [0.30.8] - 2026-09-04
 

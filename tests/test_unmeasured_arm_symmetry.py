@@ -27,6 +27,7 @@ import pytest
 from terse.report import (
     UNMEASURED_FAIL_SHARE,
     Directive,
+    _accuracy_gate,
     _arm_loss_share,
     _unmeasured,
     build_dropeval_report,
@@ -548,3 +549,168 @@ def test_a_row_stating_no_trial_count_is_read_as_one_call_not_zero():
              "treatment_errors": 1}]
     assert "trials" not in rows[1]
     assert _unmeasured(rows), "a stated loss on a row with no trial count is still a loss"
+
+
+# --------------------------------------------------------------------------- #
+# #381 — the same predicate, on the one metric that PAIRS.
+#
+# `final-accuracy` never got #371's fix. It pairs against a measured no-drop control (#269),
+# so it routes `_accuracy_gate` -> `arm_gap` -> `_gap`, whose only transport gate is
+# `_unmeasured`'s loss SHARE. Below `UNMEASURED_FAIL_SHARE` that gate is silent and every
+# lost treatment call scores a MISS, so the gap IS the loss — the identical arithmetic and
+# the identical rendered contradiction #371 was filed on, one metric over.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("t_err", [1, 2])
+def test_a_treatment_loss_that_fully_EXPLAINS_the_accuracy_gap_withholds_it(t_err):
+    """The issue reproduction, executed on `main` @ 22eea92 before the fix as:
+
+        t_err=1   loss=10%   accuracy BLOCK   excluded={}   gap=-0.100
+        t_err=2   loss=20%   accuracy BLOCK   excluded={}   gap=-0.200
+
+    The model is correct on every call that LANDED and the control lost nothing, so every
+    point of that gap is transport. Both sizes sit in the live band: tolerance is 5% and
+    `_unmeasured` is a strict `>` against 0.20, so 10% and 20% clear neither.
+    """
+    rows = (_perfect_on_landed("recall", 24, 10, t_err)
+            + _perfect_on_landed("precision", 24, 10, t_err))
+    assert _arm_loss_share(rows, "treatment") <= UNMEASURED_FAIL_SHARE, (
+        "fixture must sit inside the band the old gate never reached")
+    assert not _unmeasured(rows), "no other gate may be doing the work"
+    v = dropeval_verdict({"m": rows})
+    assert v.metrics["accuracy"].excluded == {"m": "unmeasured"}, (
+        f"{t_err}/10 lost fully explains the gap and must be withheld, not failed")
+
+
+def test_a_demonstrated_accuracy_regression_inside_the_band_is_still_scored():
+    """The invariant the whole design rests on: an exclusion must never IMPROVE a verdict.
+
+    10% of the treatment arm lost and 50% scored on a control that scored 100%. Crediting
+    every lost call still leaves the arm 40 points behind — far past anything transport can
+    account for — so this is behaviour and is published. Without this, the predicate is
+    indistinguishable from `UNMEASURED_FAIL_SHARE`'s refused survival threshold.
+    """
+    rows = _flat("recall", 24, 100, 10, 50) + _flat("precision", 24, 100, 10, 50)
+    v = dropeval_verdict({"m": rows})
+    assert v.metrics["accuracy"].excluded == {}, "a demonstrated regression is never withheld"
+    assert v.metrics["accuracy"].worst is not None
+    assert v.metrics["accuracy"].worst.gap == pytest.approx(-0.5)
+    assert v.directive is Directive.BLOCK
+
+
+def test_an_accuracy_gap_that_still_PASSES_under_loss_is_scored_not_withheld():
+    """The `not passes_tolerance(gap)` clause, which is otherwise a pure no-op to delete.
+
+    97 of 100 against a 100% control is inside the 5% tolerance as scored, so there is
+    nothing for the 2% loss to explain. Withholding it would downgrade a measured SHIP to
+    NOT_CONCLUDED — the cheap direction, and still the harness lying about what it knows.
+    """
+    rows = _flat("recall", 24, 100, 2, 97) + _flat("precision", 24, 100, 2, 97)
+    v = dropeval_verdict({"m": rows})
+    assert v.metrics["accuracy"].excluded == {}, "a passing metric is never withheld"
+    assert v.metrics["accuracy"].worst is not None and v.metrics["accuracy"].worst.passed
+
+
+def test_the_accuracy_predicate_boundary_is_the_TOLERANCE_line_not_a_loss_SHARE():
+    """The boundary itself. 100 trials, 10 lost, control perfect throughout.
+
+    85 + 10 - 100 = -5%, exactly the tolerance line, which `passes_tolerance` accepts at
+    its epsilon — still explained. 84 is one point past what the loss can account for, so
+    it is behaviour. Nothing about either number is near `UNMEASURED_FAIL_SHARE`, which is
+    the point: the loss share and the tolerance are different numbers.
+    """
+    on_line = dropeval_verdict({"m": _flat("recall", 24, 100, 10, 85)
+                                + _flat("precision", 24, 100, 10, 85)})
+    assert on_line.metrics["accuracy"].excluded == {"m": "unmeasured"}
+    scored = dropeval_verdict({"m": _flat("recall", 24, 100, 10, 84)
+                               + _flat("precision", 24, 100, 10, 84)})
+    assert scored.metrics["accuracy"].excluded == {}
+    assert scored.metrics["accuracy"].worst is not None
+
+
+def test_the_credited_loss_is_read_over_the_PAIRED_subset_not_every_row():
+    """`_arm_loss_share(g.rows, ...)` — mutating `g.rows` to `rows` survives every fixture
+    above, because in all of them pairing drops nothing.
+
+    It cannot survive here. `paired_rows` discards the 30 questions whose CONTROL lost a
+    call, and those questions lost no treatment calls at all — so they dilute the treatment
+    share from the 10% actually behind the published accuracy down to 4%, which no longer
+    explains the gap and publishes a FAIL the harness manufactured.
+
+    The rule is that the credited loss and the accuracy must share a denominator: 90% was
+    computed over the paired 20, so the loss must be too.
+    """
+    paired = [{"qid": f"a{i}", "kind": "recall", "trials": 10, "attempts": 20,
+               "answer_ok": 9, "retrieve_ok": 9, "handle_ok": 9,
+               "errors": 1, "treatment_errors": 1, "control_errors": 0,
+               "control_ok": 10, "control_trials": 10} for i in range(20)]
+    dropped_by_pairing = [{"qid": f"b{i}", "kind": "recall", "trials": 10, "attempts": 20,
+                           "answer_ok": 10, "retrieve_ok": 10, "handle_ok": 10,
+                           "errors": 1, "treatment_errors": 0, "control_errors": 1,
+                           "control_ok": 9, "control_trials": 9} for i in range(30)]
+    rows = paired + dropped_by_pairing
+    assert not _unmeasured(rows), "no other gate may be doing the work"
+    assert _arm_loss_share(rows, "treatment") == pytest.approx(0.04)
+    assert _arm_loss_share(paired, "treatment") == pytest.approx(0.10)
+    g = _accuracy_gate(rows)
+    assert g.excluded == "unmeasured", (
+        "the 10% behind the paired 90% explains the gap; the diluted 4% does not")
+
+
+def test_only_the_TREATMENT_arms_loss_is_credited_to_the_accuracy_gap():
+    """Why this is one-armed even though the metric has two arms.
+
+    `dropeval.py` emits `control_trials = trials - control_errors` but deliberately emits no
+    `answer_trials`, so a control loss leaves its own denominator AND takes the whole row
+    out via `paired_rows`, while a treatment loss stays in scoring a MISS. Crediting the
+    control could only push the gap further negative, so it can never rescue a FAIL.
+
+    Here the treatment arm lost nothing and the control lost 10% of its calls on rows that
+    still pair (`control_trials` intact, `control_errors` set — the shape a merged pack
+    reaches). The gap is real behaviour and must be published; reading the CONTROL's share
+    instead would credit 10% and withhold it.
+    """
+    rows = [{"qid": f"{k}{i}", "kind": k, "trials": 10, "attempts": 20,
+             "answer_ok": 8, "retrieve_ok": 10, "handle_ok": 10,
+             "errors": 1, "treatment_errors": 0, "control_errors": 1,
+             "control_ok": 10, "control_trials": 10}
+            for k in ("recall", "precision") for i in range(24)]
+    assert _arm_loss_share(rows, "treatment") == 0.0
+    assert _arm_loss_share(rows, "control") == pytest.approx(0.10)
+    assert not _unmeasured(rows), "no other gate may be doing the work"
+    g = _accuracy_gate(rows)
+    assert g.excluded is None, "the treatment arm lost nothing, so nothing is explained"
+    assert g.form_acc - g.control_acc == pytest.approx(-0.2)
+
+
+def test_a_withheld_final_accuracy_does_not_claim_the_arms_failed_to_PAIR():
+    """#381 at the renderer. The verdict object is not what an operator meets.
+
+    Every question here completed all 10 trials on BOTH arms — `control_trials == trials`
+    on every row, so `paired_rows` drops nothing and all 24 pair. The old first sentence,
+    "Too few calls completed on BOTH arms to compare", was written for `_unmeasured` and
+    the empty-pairing gate and is simply false on this new path; printing it would send the
+    operator looking for a pairing failure that did not happen.
+
+    Asserted on the RENDERED bullet rather than the reason string, because the reason is
+    `"unmeasured"` on all three paths by design — the sentence is the only place the
+    difference is visible to a reader, so it is the only place it can be pinned.
+    """
+    rows = (_perfect_on_landed("recall", 24, 10, 1)
+            + _perfect_on_landed("precision", 24, 10, 1))
+    assert all(r["control_trials"] == r["trials"] for r in rows), "every row must pair"
+    report = build_dropeval_report({"m": rows})
+    assert "**FAIL**" not in report, "no behavioural verdict may survive a transport loss"
+    assert "**final-accuracy: not gated for `m`**" in report
+    bullet = next(ln for ln in report.splitlines()
+                  if ln.startswith("- **final-accuracy: not gated"))
+    assert "Too few calls completed on BOTH arms" not in bullet, bullet
+    assert "lost to account for the gap on their own" in bullet, bullet
+    # The table cell is the withheld marker, not a percentage — the defect an operator met
+    # on the mechanism half was a number printed under a paragraph disowning its rows.
+    header = next(ln for ln in report.splitlines() if ln.startswith("| Model |"))
+    cols = [c.strip() for c in header.split("|")[1:-1]]
+    row = next(ln for ln in report.splitlines() if ln.startswith("| `m` |"))
+    cells = dict(zip(cols, [c.strip() for c in row.split("|")[1:-1]], strict=True))
+    assert cells["final-accuracy"] == "not gated", row

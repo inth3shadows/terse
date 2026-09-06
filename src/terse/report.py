@@ -1591,7 +1591,55 @@ def _accuracy_gate(rows: list[dict[str, Any]]) -> ArmGap:
         # subset the reader was never told about. A merged/legacy/partially-failed run is
         # exactly when that is most likely and least visible.
         return ArmGap(0.0, 0.0, 0.0, 0.0, [], "partial control coverage")
-    return arm_gap(rows, "answer_ok", "control_ok")
+    g = arm_gap(rows, "answer_ok", "control_ok")
+    if g.excluded:
+        return g
+    # #381. #371 gave recall and no-overfetch a predicate that asks whether the treatment
+    # loss could EXPLAIN the miss rather than whether the loss is LARGE; final-accuracy did
+    # not get it, because it pairs and so routes through `_gap`, whose only transport gate
+    # is `_unmeasured`'s loss SHARE (`> UNMEASURED_FAIL_SHARE`, 0.20). That left the whole
+    # `(_GAP_TOLERANCE, UNMEASURED_FAIL_SHARE]` band publishing the defect #371 was filed
+    # on, one metric over: at 10% treatment loss and a model correct on every call that
+    # LANDED, the gap is exactly -10% and renders `**FAIL**` under the report's own "these
+    # rows measure the harness, not the model" paragraph. The model did nothing wrong;
+    # every point of that gap is transport.
+    #
+    # ONE ARM, and the asymmetry is not the one it looks like. A two-arm gap suggests
+    # crediting each arm's own loss, but dropeval's two arms lose calls into DIFFERENT
+    # denominators (`dropeval.py`'s row dict):
+    #
+    #   - control emits `control_trials = trials - control_errors`, so its lost calls leave
+    #     its own denominator AND `paired_rows` drops the whole row from both arms. Control
+    #     loss is already removed twice before this line runs.
+    #   - treatment deliberately emits no `answer_trials` (that asymmetry is commented at
+    #     its source). Its lost calls stay in the denominator scoring a MISS, which is the
+    #     entire mechanism above.
+    #
+    # And crediting the control could only push the gap MORE negative, so it can never
+    # rescue a FAIL — it belongs to the mirror question (a PASS bought by a degraded
+    # control), which tightens rather than loosens and is not this issue.
+    #
+    # WHY HERE AND NOT IN `_gap`: every step of that derivation reads dropeval's emit
+    # convention. `_gap` is the shared chokepoint for the codec verdict, the diff soak, the
+    # per-depth table and fluency, whose arms state their losses differently; moving the
+    # predicate there would apply a dropeval-schema argument to four harnesses that never
+    # made it. Same placement as #371's, for the same reason.
+    #
+    # `acc + loss` is a real ceiling only because both sides share a denominator:
+    # `_form_stats` reads `answer_trials` and `_arm_loss_share` reads `treatment_attempts`,
+    # neither of which dropeval emits, so both fall back to the row's `trials`. Computed
+    # over `g.rows` — the PAIRED subset the accuracies were computed over — not `rows`,
+    # which still carries the questions pairing dropped.
+    #
+    # Withheld as `"unmeasured"` rather than a new `ExclusionReason`, and the loosening this
+    # admits is #371's, bounded the same way: a FAIL that survives crediting every lost
+    # treatment call is behavioural and is still scored, so no demonstrated regression can
+    # be withheld here.
+    loss = _arm_loss_share(g.rows, "treatment")
+    if (loss and not passes_tolerance(g.form_acc - g.control_acc)
+            and passes_tolerance(g.form_acc + loss - g.control_acc)):
+        return ArmGap(0.0, 0.0, 0.0, 0.0, [], "unmeasured")
+    return g
 
 
 def dropeval_gap_rows(results: dict) -> tuple[dict[str, dict[Metric, tuple[float, float, float, float]]],
@@ -1754,9 +1802,21 @@ def _exclusion_remedy(reason: ExclusionReason, *, fixed_ideal: bool = False) -> 
                         "their own, so this column would be measuring the backend rather "
                         "than the drop rule. Read the per-arm failure split above and "
                         "re-run: the number is withheld, not failed.")
-            return ("Too few calls completed on BOTH arms to compare. Read the per-arm "
+            # #381 gave final-accuracy a THIRD way to reach this branch, and the old
+            # first sentence ("Too few calls completed on BOTH arms to compare") is false
+            # on it: `_accuracy_gate` now also withholds when both arms completed
+            # everything and the treatment's own lost calls are enough to account for the
+            # gap. Naming the cause is not available here — the reason is deliberately
+            # `"unmeasured"` for all three paths, and `DropevalVerdict` carries no counts
+            # (see the note above) — so the sentence states the CONSEQUENCE, which is true
+            # of all three, and enumerates the causes as a disjunction the split above
+            # settles. Widening it rather than adding a fourth reason keeps the "assert
+            # nothing about the present run" property this branch is built on.
+            return ("Not enough of this comparison survived to read. Read the per-arm "
                     "failure split above: a non-zero loss there is a transport problem "
-                    "and the run needs repeating; a zero means an arm completed no trials "
+                    "and the run needs repeating — either too little completed on both "
+                    "arms to pair them, or enough treatment calls were lost to account "
+                    "for the gap on their own; a zero means an arm completed no trials "
                     "at all, so check that every arm named actually ran.")
         case "empty":
             return ("No rows of this kind were scored for this model — the pack carries "
