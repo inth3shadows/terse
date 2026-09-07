@@ -174,11 +174,16 @@ def test_a_row_that_carries_no_counter_is_unknown_loss_not_zero_loss():
     because the only two fixtures that distinguished the rules were the two this change
     already had to repair. So the choice gets its own witness.
 
-    An absent counter is not evidence of a clean call. Reading it as zero would put rows
-    whose loss is unknown into the denominator of a share computed from rows whose loss is
-    known — the same class of error as #339's pooled denominator, and it dilutes toward
-    publishing. One current row reporting a lost call, merged with rows from a producer
-    that counted nothing, is 1 of 3 known calls; it is NOT 1 of 144."""
+    An absent counter is not evidence of a clean call, and `_subset_loss_share` still
+    skips such rows for exactly that reason.
+
+    REWRITTEN by #383. This docstring used to end "One current row reporting a lost call,
+    merged with rows from a producer that counted nothing, is 1 of 3 known calls; it is NOT
+    1 of 144" — and the body four lines down now asserts precisely 1/144, because that is
+    the share `_unmeasured` reads. The old sentence was the position #383 overturned: it
+    does not preserve the unknown rows' uncertainty, it assigns them the carrying subset's
+    own rate. What survives is narrower and still true — the ROW-SET rule, which is about
+    which rows may contribute a NUMERATOR."""
     legacy = [{"qid": f"old{i}", "kind": "recall", "trials": 3, "attempts": 6,
                "answer_ok": 3, "control_ok": 3, "control_trials": 3} for i in range(47)]
     current = [{"qid": "new", "kind": "recall", "trials": 3, "attempts": 6,
@@ -204,10 +209,21 @@ def test_a_row_that_carries_no_counter_is_unknown_loss_not_zero_loss():
     assert _distrust_loss_share(legacy + current, "control") == pytest.approx(1 / 144)
     assert not _unmeasured(legacy + current), (
         "one lost call in 144 is not grounds to withhold the run (#383)")
-    # The same 47 legacy rows with nothing lost anywhere still publish, so the assertion
-    # above is about the missing counter and not about merging packs at all.
-    assert not _unmeasured(legacy + [dict(current[0], answer_ok=3, control_ok=3,
-                                          control_trials=3, errors=0, control_errors=0)])
+    # This trailing pair used to be a True/False contrast — a lossy pack withheld, a clean
+    # one published — and #383 made both sides False, leaving an assertion that cannot fail
+    # unless the one above it fails first. Restored as a contrast by moving the discriminator
+    # to the SIZE of the loss rather than its presence: the same single row losing ALL three
+    # of its control calls is 3 of 144, still under the threshold, while forty rows doing so
+    # is 120 of 144 and withholds. That is the whole-run rule doing the discriminating,
+    # which is what this file now exists to pin.
+    one_row_total_loss = legacy + [dict(current[0], control_ok=0, control_trials=0,
+                                        errors=3, control_errors=3)]
+    assert not _unmeasured(one_row_total_loss), "3 lost of 144 is still not a withhold"
+    many_rows_total_loss = ([dict(r, control_ok=0, control_trials=0, errors=3,
+                                  control_errors=3) for r in legacy[:40]]
+                            + legacy[40:] + current)
+    assert _unmeasured(many_rows_total_loss), (
+        "120 lost of 144 is, and it is the run share that decides which")
 
 
 def test_an_arm_reporting_more_errors_than_calls_is_withheld_not_rounded_down():
@@ -1073,6 +1089,31 @@ def test_an_emitter_reporting_more_errors_than_attempts_still_withholds():
     assert _credited_loss_share(rows, "treatment") is None, (
         "the credit helper refuses it -- unchanged by #383")
     assert _unmeasured(rows), "trigger 4 must still fire on an impossible share"
+
+
+def test_the_over_one_guard_is_pinned_on_the_shape_that_can_actually_defeat_it():
+    """Review finding: the test above uses `n_legacy=0`, where the subset and whole-run
+    denominators COINCIDE -- so it pins the over-1.0 guard only in the case where the
+    change could never have affected it.
+
+    On a merged pack the whole-run denominator is strictly larger, and an impossible
+    counter is divided down into a plausible-looking share. Executed: 95 legacy rows
+    carrying nothing plus 5 rows reporting 11 errors against 10 attempts reads 0.055 and
+    PUBLISHES, where the subset rule read 1.1 and withheld.
+
+    So this documents a real cost of #383, not a preserved guard: an emitter bug that is
+    arithmetically impossible on its own rows can now hide behind enough rows that carry no
+    counter. It is bounded -- the share is still the honest whole-run number, and every
+    other trigger still applies -- but the guard is weaker on merged packs than the commit
+    message for the first half of #383 claimed, and pretending otherwise is what an
+    n_legacy=0 fixture does.
+    """
+    merged = _merged_pack("recall", 95, 5, ok_legacy=9, ok_current=5, t_err=11, trials=10)
+    assert _subset_loss_share(merged, "treatment") == pytest.approx(1.1), (
+        "the counter is impossible on its own rows: 11 errors against 10 attempts")
+    assert _distrust_loss_share(merged, "treatment") == pytest.approx(55 / 1000)
+    assert not _unmeasured(merged), (
+        "and so it publishes -- the honest whole-run share, and a real weakening")
 
 
 def test_the_two_whole_run_helpers_agree_wherever_the_share_is_sane():

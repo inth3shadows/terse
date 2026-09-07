@@ -485,12 +485,16 @@ def attrition_line(label: str, a: Attrition, *, always: bool = False) -> str:
 # threshold still has to catch is the backend that was substantially down, where the
 # surviving sample is small and self-selected rather than merely smaller.
 #
-# THE DENOMINATOR IS PER ARM (#339), NOT POOLED ACROSS EVERY ARM. `_unmeasured` finds each
-# arm's own `<arm>_trials` counter and sums, over the rows that carry that key, its loss as
-# `<arm>_attempts - <arm>_trials` and its attempts as `<arm>_attempts` — where
+# THE DENOMINATOR IS PER ARM (#339), NOT POOLED ACROSS EVERY ARM — and it is that arm's
+# WHOLE-RUN calls, not only the calls on rows that happen to report a count (#383).
+# `_unmeasured` finds each arm's own counter and sums its loss over the rows that report
+# one, its attempts as `<arm>_attempts` over every row that ran the arm at all — where
 # `<arm>_attempts` is the row's shared `trials` for every live harness and an explicit
 # per-arm count for `score_pack` (#283, see `_arm_attempts`) — then fires if ANY single arm
-# exceeds `UNMEASURED_FAIL_SHARE` of its own calls. Before
+# exceeds `UNMEASURED_FAIL_SHARE` of its own calls. The two row sets are deliberately
+# different: a row that reports no count must not contribute phantom LOSS, and a row that
+# ran the arm must not be dropped from its DENOMINATOR. Collapsing them, in either
+# direction, is the defect #383 fixed at two triggers. Before
 # #339 the denominator was pooled `attempts` (= trials * arm_count), which let a single
 # arm lose over 40% of ITS calls in a two-arm run, or over 80% in a four-arm one, before
 # this fired — the threshold read as "20% of calls" and behaved as "20% of all arms'
@@ -555,7 +559,10 @@ def _unmeasured(rows: list[dict]) -> bool:
       2. more than `UNMEASURED_FAIL_SHARE` of ONE arm's own calls lost (#339) — the sample
          that survived is both small and selected by which calls happened to get through,
          and the share has to be read against that arm's own denominator or a loss
-         concentrated on one arm hides behind the others' clean numbers;
+         concentrated on one arm hides behind the others' clean numbers. That denominator
+         is every row carrying the arm's key, not only the rows that also carry `attempts`
+         (#383): the loss numerator still needs both, but excluding a row that ran the arm
+         made this a carrying-subset share against a whole-run threshold;
       3. the pooled fallback: more than `UNMEASURED_FAIL_SHARE` of TOTAL `attempts` lost.
          Needed because not every harness's `<arm>_trials` shrinks on a failed call —
          `codeceval.py` deliberately keeps it FIXED at `trials` and tracks loss only
@@ -563,7 +570,9 @@ def _unmeasured(rows: list[dict]) -> bool:
          permanently blind to that harness and a substantially-down codec backend would
          publish a confident SAFE. Review finding on #339 (verified by execution:
          `codec_verdict` returned SAFE at 68% call-loss without this trigger).
-      4. more than `UNMEASURED_FAIL_SHARE` of ONE arm's own calls lost, where the emitter
+      4. more than `UNMEASURED_FAIL_SHARE` of the WHOLE RUN's calls to one arm lost (#383
+         — a share over the carrying rows only compared against this whole-run threshold
+         withheld a demonstrated 12-point regression on 1.5% loss), where the emitter
          states that loss EXPLICITLY as `<arm>_errors` instead of by shrinking
          `<arm>_trials` (#352). Trigger 2 reads loss as `attempts - <arm>_trials`, so an
          arm with no `_trials` key of its own is invisible to it — and `dropeval`'s
