@@ -485,12 +485,16 @@ def attrition_line(label: str, a: Attrition, *, always: bool = False) -> str:
 # threshold still has to catch is the backend that was substantially down, where the
 # surviving sample is small and self-selected rather than merely smaller.
 #
-# THE DENOMINATOR IS PER ARM (#339), NOT POOLED ACROSS EVERY ARM. `_unmeasured` finds each
-# arm's own `<arm>_trials` counter and sums, over the rows that carry that key, its loss as
-# `<arm>_attempts - <arm>_trials` and its attempts as `<arm>_attempts` — where
+# THE DENOMINATOR IS PER ARM (#339), NOT POOLED ACROSS EVERY ARM — and it is that arm's
+# WHOLE-RUN calls, not only the calls on rows that happen to report a count (#383).
+# `_unmeasured` finds each arm's own counter and sums its loss over the rows that report
+# one, its attempts as `<arm>_attempts` over every row that ran the arm at all — where
 # `<arm>_attempts` is the row's shared `trials` for every live harness and an explicit
 # per-arm count for `score_pack` (#283, see `_arm_attempts`) — then fires if ANY single arm
-# exceeds `UNMEASURED_FAIL_SHARE` of its own calls. Before
+# exceeds `UNMEASURED_FAIL_SHARE` of its own calls. The two row sets are deliberately
+# different: a row that reports no count must not contribute phantom LOSS, and a row that
+# ran the arm must not be dropped from its DENOMINATOR. Collapsing them, in either
+# direction, is the defect #383 fixed at two triggers. Before
 # #339 the denominator was pooled `attempts` (= trials * arm_count), which let a single
 # arm lose over 40% of ITS calls in a two-arm run, or over 80% in a four-arm one, before
 # this fired — the threshold read as "20% of calls" and behaved as "20% of all arms'
@@ -555,7 +559,10 @@ def _unmeasured(rows: list[dict]) -> bool:
       2. more than `UNMEASURED_FAIL_SHARE` of ONE arm's own calls lost (#339) — the sample
          that survived is both small and selected by which calls happened to get through,
          and the share has to be read against that arm's own denominator or a loss
-         concentrated on one arm hides behind the others' clean numbers;
+         concentrated on one arm hides behind the others' clean numbers. That denominator
+         is every row carrying the arm's key, not only the rows that also carry `attempts`
+         (#383): the loss numerator still needs both, but excluding a row that ran the arm
+         made this a carrying-subset share against a whole-run threshold;
       3. the pooled fallback: more than `UNMEASURED_FAIL_SHARE` of TOTAL `attempts` lost.
          Needed because not every harness's `<arm>_trials` shrinks on a failed call —
          `codeceval.py` deliberately keeps it FIXED at `trials` and tracks loss only
@@ -563,7 +570,9 @@ def _unmeasured(rows: list[dict]) -> bool:
          permanently blind to that harness and a substantially-down codec backend would
          publish a confident SAFE. Review finding on #339 (verified by execution:
          `codec_verdict` returned SAFE at 68% call-loss without this trigger).
-      4. more than `UNMEASURED_FAIL_SHARE` of ONE arm's own calls lost, where the emitter
+      4. more than `UNMEASURED_FAIL_SHARE` of the WHOLE RUN's calls to one arm lost (#383
+         — a share over the carrying rows only compared against this whole-run threshold
+         withheld a demonstrated 12-point regression on 1.5% loss), where the emitter
          states that loss EXPLICITLY as `<arm>_errors` instead of by shrinking
          `<arm>_trials` (#352). Trigger 2 reads loss as `attempts - <arm>_trials`, so an
          arm with no `_trials` key of its own is invisible to it — and `dropeval`'s
@@ -620,12 +629,28 @@ def _unmeasured(rows: list[dict]) -> bool:
         # `score_pack` row's `trials` (a `max(...)` across forms) would make an
         # uneven-BY-DESIGN form look like a lost call, which is the same class of error as
         # the pooled denominator #339 removed — just one level down.
+        # #383, second half. The NUMERATOR stays on `carrying` — a row without `attempts`
+        # must not contribute phantom loss, which is the #339 finding above — but the
+        # DENOMINATOR is every row that carries this arm's key, `attempts` or not. Those
+        # rows ran the arm and completed it; excluding them made this the same
+        # carrying-subset share against a whole-run threshold that trigger 4 had.
+        #
+        # Executed before this change: 190 loss-free legacy rows carrying `control_trials`
+        # but no `attempts`, plus 10 rows losing 3 control calls of 10, is 30 lost calls in
+        # 2,000 -- 0.015. Trigger 2 read 30/100 = 0.30 and withheld, and the identical
+        # fleet WITH an `attempts` key on those legacy rows scored a -0.10 accuracy gap.
+        # Same arm, same loss, the verdict decided by the presence of one unrelated key.
+        #
+        # `key in r` and not `rows` wholesale is what keeps a NOT-ATTEMPTED arm out of its
+        # own denominator: a `--no-control` pack emits no `control_trials` at all, and
+        # dividing a control loss by calls that pack never made would understate it.
         per_row = [(_arm_attempts(r, key, int(r.get("trials", 1))), int(r[key]))
                    for r in carrying]
-        arm_attempts = sum(a for a, _ in per_row)
+        lost = sum(max(0, a - t) for a, t in per_row)
+        arm_attempts = sum(_arm_attempts(r, key, int(r.get("trials", 1)))
+                           for r in rows if key in r)
         if not arm_attempts:
             continue
-        lost = sum(max(0, a - t) for a, t in per_row)
         if lost / arm_attempts > UNMEASURED_FAIL_SHARE:
             return True
     # #352: the same share, for an arm that reports its loss EXPLICITLY rather than by
@@ -671,65 +696,44 @@ def _unmeasured(rows: list[dict]) -> bool:
     # The bare pooled `errors` key does not match the `_errors` suffix, so it cannot
     # double-count the two arms it is the sum of.
     for err_key in sorted({k for r in rows for k in r if k.endswith("_errors")}):
-        share = _arm_loss_share(rows, err_key[:-len("_errors")])
+        # `_distrust_loss_share` (#383). This read a subset share -- errors over the
+        # CARRYING rows' attempts only -- and compared it to a WHOLE-RUN threshold. Measured: 95 legacy rows carrying no counter plus 5
+        # current rows losing 3 of 10 each reads 0.30 and withholds, where the run actually
+        # lost 15 calls in 1,000 -- 0.015. Firing there withheld a demonstrated 12-point
+        # regression (`worst` went from a real GapVerdict to None) on 1.5% transport loss,
+        # which is the `NOT_CONCLUDED (2) < BLOCK (3)` direction UNMEASURED_FAIL_SHARE's
+        # own comment forbids: an exclusion must never improve a verdict.
+        #
+        # The subset rule was not merely imprecise, it was the STRONGER assumption. Skipping
+        # rows that carry no counter does not hold their loss unknown; it assigns them the
+        # carrying subset's own rate. Under it legacy run size is irrelevant, so one
+        # sufficiently degraded row withholds a merged run of any size.
+        share = _distrust_loss_share(rows, err_key[:-len("_errors")])
         if share is not None and share > UNMEASURED_FAIL_SHARE:
             return True
     return False
 
 
-def _arm_loss_share(rows: list[dict], arm: str) -> float | None:
-    """What fraction of `arm`'s OWN calls it reported lost, via its explicit
-    `<arm>_errors` counter. None when this arm carried no attempts in `rows` — an
-    absence, which is not the same as a loss of 0.0 and must not be compared to a
-    threshold as though it were.
-
-    Extracted from `_unmeasured`'s trigger 4 so the fixed-ideal metrics can ask the same
-    question (#371) without a second copy of the derivation. `dropeval_verdict` gates
-    recall/no-overfetch on the TREATMENT arm's share: those columns are computed from the
-    treatment loop's `retrieve_ok`, and `treatment_errors` is that same loop's counter
-    (`dropeval.py`), so they are the one arm whose transport loss can corrupt them.
-
-    Rows lacking the key are SKIPPED, not read as zero-loss: a merged set of one current
-    and one legacy pack would otherwise dilute a real loss share with rows that never
-    carried a count either way — the same reasoning as `_unmeasured`'s `key in r`
-    restriction, one counter over."""
-    err_key = f"{arm}_errors"
-    carrying = [r for r in rows if err_key in r]
-    # The BARE arm name, not a re-spelled `<arm>_trials` — `_arm_attempts` normalizes
-    # either form on its first line, and writing the suffix swap a second time is what
-    # `test_only_one_place_derives_the_arm_to_trials_key` exists to refuse.
-    per_row = [(_arm_attempts(r, arm, int(r.get("trials", 1))), int(r[err_key]))
-               for r in carrying]
-    arm_attempts = sum(a for a, _ in per_row)
-    if not arm_attempts:
-        return None
-    # No clamp against `a`, unlike `_unmeasured`'s trigger 2 `max(0, a - t)`. There the
-    # subtraction can go negative for a legitimate reason (a `score_pack` form whose
-    # per-form count exceeds the shared `trials`); here an arm reporting MORE errors than
-    # attempts is an emitter bug with no benign form, and a share over 1.0 must fire
-    # rather than be quietly rounded down to something that might not.
-    return sum(e for _, e in per_row) / arm_attempts
-
-
 def _credited_loss_share(rows: list[dict], arm: str) -> float | None:
     """What fraction of the calls BEHIND AN ACCURACY this arm reported lost.
 
-    The sibling of `_arm_loss_share`, and the difference is the denominator — which is the
-    whole reason both exist. `_arm_loss_share` answers "how degraded is this arm", so it
-    SKIPS rows carrying no counter: reading an absent count as zero would dilute a known
-    loss with unknown rows and push `_unmeasured` toward publishing. This one answers a
-    different question — "how much of the score in front of me is explained by loss" — and
-    its result is subtracted from a FAIL. `_form_stats` divides by every row's `trials`, so
+    The sibling of `_distrust_loss_share`, and the only difference is what each does with a
+    share over 1.0. Both divide by every row's attempts. A third rule — dividing by the
+    CARRYING rows only — was removed in #383 along with the helper that implemented it
+    (`_arm_loss_share`): it computed a subset share and handed it to callers comparing
+    against whole-run thresholds, which is the defect #383 fixed at two triggers. This one
+    answers "how much of the score in front of me is explained by loss" and its result is
+    subtracted from a FAIL. `_form_stats` divides by every row's `trials`, so
     a credit computed over a SUBSET is a fraction of the part applied to the whole.
 
     Measured on a merged pack (5 rows carrying `treatment_errors: 2`, 95 legacy rows
-    carrying none, all scoring against a 100% control): `_arm_loss_share` reports 0.20 and
-    `acc + loss` reaches 1.095 — crediting the arm with more successes than it had trials —
+    carrying none, all scoring against a 100% control): the removed subset rule reported
+    0.20 and `acc + loss` reached 1.095 — crediting the arm with more successes than it had trials —
     which withheld a 9.5-point regression that no loss could explain. The honest share over
     the same rows the accuracy used is 0.01. Both #371's site and #381's had this shape.
 
     So an absent counter contributes NO errors and its FULL trials to the denominator. That
-    is the conservative direction here and the mirror of `_arm_loss_share`'s: under-crediting
+    is the conservative direction here: under-crediting
     publishes a FAIL that might be transport, which is recoverable; over-crediting withholds
     a demonstrated regression, and `NOT_CONCLUDED (2) < BLOCK (3)` makes that an exclusion
     that IMPROVES a verdict — the one thing `UNMEASURED_FAIL_SHARE`'s comment forbids.
@@ -739,14 +743,47 @@ def _credited_loss_share(rows: list[dict], arm: str) -> float | None:
     place this inverts its sibling: there an over-1.0 share must fire rather than be rounded
     down, because firing withholds and asks a human to look; here it would BUY a withholding
     off an emitter bug, so it is refused instead."""
+    share = _distrust_loss_share(rows, arm)
+    # The ONLY divergence from `_distrust_loss_share`, and the reason this is a wrapper
+    # rather than a copy: there an over-1.0 share must fire, here it must not.
+    return None if share is not None and share > 1.0 else share
+
+
+def _distrust_loss_share(rows: list[dict], arm: str) -> float | None:
+    """What fraction of the WHOLE RUN's calls to `arm` were reported lost, via the explicit
+    `<arm>_errors` counter. The share `_unmeasured`'s trigger 4 compares to
+    `UNMEASURED_FAIL_SHARE`, and the shared derivation behind `_credited_loss_share`.
+
+    Three helpers now read this counter and the differences are load-bearing, so state them
+    once here:
+
+      - this one and `_credited_loss_share` divide by EVERY row's attempts, because both
+        of their thresholds are whole-run quantities: `UNMEASURED_FAIL_SHARE` asks what
+        fraction of the run was lost, and a credit is subtracted from an accuracy
+        `_form_stats` computed over every row.
+      - a third rule, dividing by the CARRYING rows only, was removed in #383 with the
+        helper that implemented it. It answered "how degraded is this arm" and was correct
+        for that question, but both of its callers were comparing the result against
+        whole-run thresholds, and after they moved it had none left.
+      - this one FIRES on a share over 1.0; `_credited_loss_share` refuses it. An arm
+        reporting more errors than attempts is an emitter bug with no benign form. Here
+        firing withholds and asks a human to look, which is what you want from a bug;
+        there it would BUY a withholding off that same bug. Swapping trigger 4 to
+        `_credited_loss_share` instead of adding this would have silently dropped that
+        guard, since a refused share is a share that cannot fire.
+
+    None when NO row carries the counter, and None when the arm was given no calls --
+    absence, which is not a loss of 0.0 and must not be compared to a threshold as one."""
     err_key = f"{arm}_errors"
     if not any(err_key in r for r in rows):
         return None
+    # The BARE arm name, not a re-spelled `<arm>_trials` — `_arm_attempts` normalizes
+    # either form, and `test_only_one_place_derives_the_arm_to_trials_key` refuses a
+    # second copy of that swap.
     attempts = sum(_arm_attempts(r, arm, int(r.get("trials", 1))) for r in rows)
     if not attempts:
         return None
-    share = sum(int(r[err_key]) for r in rows if err_key in r) / attempts
-    return None if share > 1.0 else share
+    return sum(int(r[err_key]) for r in rows if err_key in r) / attempts
 
 
 # Why a gap is never computed from two bare `_form_stats` calls again (#280).
@@ -1692,7 +1729,7 @@ def _accuracy_gate(rows: list[dict[str, Any]]) -> ArmGap:
     # takes BOTH of the things below. An earlier revision of this comment claimed it took
     # only the first, and adversarial review of #382 executed the counter-example.
     #
-    #   - the same ROW SET. `_credited_loss_share`, not `_arm_loss_share`: the sibling
+    #   - the same ROW SET. `_credited_loss_share`, not a carrying-rows share: that rule
     #     SKIPS rows carrying no counter (correctly — it answers "how degraded is this
     #     arm"), so on a merged pack it returns a fraction of a subset that is then applied
     #     to the whole. Measured: a credit of 0.20 against an honest 0.10, withholding a

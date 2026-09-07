@@ -29,14 +29,39 @@ from terse.report import (
     UNMEASURED_FAIL_SHARE,
     Directive,
     _accuracy_gate,
-    _arm_loss_share,
+    _arm_attempts,
     _credited_loss_share,
+    _distrust_loss_share,
     _unmeasured,
     build_dropeval_report,
     dropeval_verdict,
     inconclusive_models,
     passes_tolerance,
 )
+
+
+def _subset_loss_share(rows, arm):
+    """The rule `report._arm_loss_share` implemented until #383 deleted it: errors over the
+    attempts of the CARRYING rows only.
+
+    Kept here, in the tests, and deliberately NOT in `report.py`. Several assertions below
+    are built as a contrast — "the subset share is X, the share production actually uses is
+    Y" — and that contrast is the clearest statement of what #383 changed. But production
+    has no caller for it: both of its callers (trigger 4, and the fixed-ideal loop via
+    `_credited_loss_share`) were comparing a subset share against whole-run thresholds,
+    which was the defect. Leaving it in `report.py` would have meant a public-looking helper
+    kept alive only by its own tests, where mutating the body cannot change any report
+    output and the tests watching it therefore guard nothing shipped.
+    """
+    err_key = f"{arm}_errors"
+    carrying = [r for r in rows if err_key in r]
+    per_row = [(_arm_attempts(r, arm, int(r.get("trials", 1))), int(r[err_key]))
+               for r in carrying]
+    arm_attempts = sum(a for a, _ in per_row)
+    if not arm_attempts:
+        return None
+    return sum(e for _, e in per_row) / arm_attempts
+
 
 # --------------------------------------------------------------------------- #
 # Fixtures in dropeval's real row shape.
@@ -149,22 +174,56 @@ def test_a_row_that_carries_no_counter_is_unknown_loss_not_zero_loss():
     because the only two fixtures that distinguished the rules were the two this change
     already had to repair. So the choice gets its own witness.
 
-    An absent counter is not evidence of a clean call. Reading it as zero would put rows
-    whose loss is unknown into the denominator of a share computed from rows whose loss is
-    known — the same class of error as #339's pooled denominator, and it dilutes toward
-    publishing. One current row reporting a lost call, merged with rows from a producer
-    that counted nothing, is 1 of 3 known calls; it is NOT 1 of 144."""
+    An absent counter is not evidence of a clean call, and `_subset_loss_share` still
+    skips such rows for exactly that reason.
+
+    REWRITTEN by #383. This docstring used to end "One current row reporting a lost call,
+    merged with rows from a producer that counted nothing, is 1 of 3 known calls; it is NOT
+    1 of 144" — and the body four lines down now asserts precisely 1/144, because that is
+    the share `_unmeasured` reads. The old sentence was the position #383 overturned: it
+    does not preserve the unknown rows' uncertainty, it assigns them the carrying subset's
+    own rate. What survives is narrower and still true — the ROW-SET rule, which is about
+    which rows may contribute a NUMERATOR."""
     legacy = [{"qid": f"old{i}", "kind": "recall", "trials": 3, "attempts": 6,
                "answer_ok": 3, "control_ok": 3, "control_trials": 3} for i in range(47)]
     current = [{"qid": "new", "kind": "recall", "trials": 3, "attempts": 6,
                 "answer_ok": 2, "control_ok": 2, "control_trials": 2,
                 "errors": 1, "treatment_errors": 0, "control_errors": 1}]
-    assert _unmeasured(legacy + current), (
-        "1 lost of the 3 calls anyone counted is 33%, not 0.7% of 144 calls nobody did")
-    # The same 47 legacy rows with nothing lost anywhere still publish, so the assertion
-    # above is about the missing counter and not about merging packs at all.
-    assert not _unmeasured(legacy + [dict(current[0], answer_ok=3, control_ok=3,
-                                          control_trials=3, errors=0, control_errors=0)])
+    # AMENDED by #383, and the amendment is the point of the issue. This asserted
+    # `_unmeasured(legacy + current)` on the reasoning "1 lost of the 3 calls anyone
+    # counted is 33%, not 0.7% of 144 calls nobody did". That reasoning proves too much:
+    # under it legacy run size is mathematically irrelevant, so ONE sufficiently degraded
+    # row carrying a counter withholds a merged run of ANY size. Nor does it preserve the
+    # uncertainty it claims to — skipping the unknown rows does not hold them unknown, it
+    # implicitly assigns them the carrying subset's own loss rate, which is a STRONGER
+    # assumption than reading them as zero.
+    #
+    # What survives, and is what this test was really witnessing, is the ROW-SET rule
+    # inside `_subset_loss_share`. That helper still skips rows carrying no counter, because
+    # its question is "how degraded is this arm" and a caller wanting the degraded slice's
+    # own undiluted rate needs exactly that. `_unmeasured` is simply no longer such a
+    # caller.
+    assert _subset_loss_share(legacy + current, "control") == pytest.approx(1 / 3), (
+        "the row-set rule itself is unchanged: rows carrying no counter are skipped, "
+        "not read as a measured zero")
+    assert _distrust_loss_share(legacy + current, "control") == pytest.approx(1 / 144)
+    assert not _unmeasured(legacy + current), (
+        "one lost call in 144 is not grounds to withhold the run (#383)")
+    # This trailing pair used to be a True/False contrast — a lossy pack withheld, a clean
+    # one published — and #383 made both sides False, leaving an assertion that cannot fail
+    # unless the one above it fails first. Restored as a contrast by moving the discriminator
+    # to the SIZE of the loss rather than its presence: the same single row losing ALL three
+    # of its control calls is 3 of 144, still under the threshold, while forty rows doing so
+    # is 120 of 144 and withholds. That is the whole-run rule doing the discriminating,
+    # which is what this file now exists to pin.
+    one_row_total_loss = legacy + [dict(current[0], control_ok=0, control_trials=0,
+                                        errors=3, control_errors=3)]
+    assert not _unmeasured(one_row_total_loss), "3 lost of 144 is still not a withhold"
+    many_rows_total_loss = ([dict(r, control_ok=0, control_trials=0, errors=3,
+                                  control_errors=3) for r in legacy[:40]]
+                            + legacy[40:] + current)
+    assert _unmeasured(many_rows_total_loss), (
+        "120 lost of 144 is, and it is the run share that decides which")
 
 
 def test_an_arm_reporting_more_errors_than_calls_is_withheld_not_rounded_down():
@@ -452,7 +511,7 @@ def test_a_demonstrated_mechanism_failure_is_scored_even_at_a_large_transport_lo
     Measured on the first cut: a sweep of 1,440 two-model fleets turned 240 BLOCKs into
     NOT_CONCLUDED this way."""
     rows = _flat("recall", 24, 100, 21, 0) + _flat("precision", 24, 100, 21, 0)
-    assert _arm_loss_share(rows, "treatment") > UNMEASURED_FAIL_SHARE, (
+    assert _subset_loss_share(rows, "treatment") > UNMEASURED_FAIL_SHARE, (
         "fixture must sit past the old threshold, or it proves nothing")
     v = dropeval_verdict({"m": rows})
     assert v.metrics["recall"].excluded == {}, "a demonstrated failure is never withheld"
@@ -523,7 +582,7 @@ def test_the_predicate_boundary_is_whether_the_credited_loss_clears_TOLERANCE():
 
 
 def test_an_arm_that_attempted_nothing_is_unknown_loss_not_zero_loss():
-    """`_arm_loss_share` returns None, never 0.0, when the arm carried no attempts.
+    """`_subset_loss_share` returns None, never 0.0, when the arm carried no attempts.
 
     The docstring calls this load-bearing and nothing pinned it: both call sites spell
     `share is not None and share > ...` / `if loss and ...`, and `0.0` is falsey and fails
@@ -531,11 +590,11 @@ def test_an_arm_that_attempted_nothing_is_unknown_loss_not_zero_loss():
     the helper claimed a mutation killed it; that mutation had rewritten `_worst_case_gap`
     by accident (review finding on #379). An absence and a measured zero are different
     facts, and the type is the only thing that says so."""
-    assert _arm_loss_share([{"qid": "a", "kind": "recall", "trials": 0,
+    assert _subset_loss_share([{"qid": "a", "kind": "recall", "trials": 0,
                              "treatment_errors": 0}], "treatment") is None
-    assert _arm_loss_share([{"qid": "a", "kind": "recall", "trials": 10}],
+    assert _subset_loss_share([{"qid": "a", "kind": "recall", "trials": 10}],
                            "treatment") is None, "no counter at all is not a zero loss"
-    assert _arm_loss_share([{"qid": "a", "kind": "recall", "trials": 10,
+    assert _subset_loss_share([{"qid": "a", "kind": "recall", "trials": 10,
                              "treatment_errors": 0}], "treatment") == 0.0
 
 
@@ -551,7 +610,17 @@ def test_a_row_stating_no_trial_count_is_read_as_one_call_not_zero():
             {"qid": "b", "kind": "recall", "attempts": 2, "answer_ok": 0,
              "treatment_errors": 1}]
     assert "trials" not in rows[1]
-    assert _unmeasured(rows), "a stated loss on a row with no trial count is still a loss"
+    # Asserted through `_subset_loss_share` rather than through `_unmeasured` since #383.
+    # The observable had to move because trigger 4 now divides by every row's attempts,
+    # under which BOTH defaults (1 -> 1/11, 0 -> 1/10) sit below the 0.20 threshold and
+    # the gate can no longer see which one is in force. The helper still can, and it is
+    # where the fallback actually lives:
+    #   default 1 -> the row contributes 1 attempt, share 1/1 = 1.0
+    #   default 0 -> the row contributes nothing, no attempts at all, share None
+    # None is the reading this function exists to refuse: a reported failure turned into
+    # no evidence of failure.
+    assert _subset_loss_share(rows, "treatment") == pytest.approx(1.0), (
+        "a stated loss on a row with no trial count is still a loss")
 
 
 # --------------------------------------------------------------------------- #
@@ -578,7 +647,7 @@ def test_a_treatment_loss_that_fully_EXPLAINS_the_accuracy_gap_withholds_it(t_er
     """
     rows = (_perfect_on_landed("recall", 24, 10, t_err)
             + _perfect_on_landed("precision", 24, 10, t_err))
-    assert _arm_loss_share(rows, "treatment") <= UNMEASURED_FAIL_SHARE, (
+    assert _subset_loss_share(rows, "treatment") <= UNMEASURED_FAIL_SHARE, (
         "fixture must sit inside the band the old gate never reached")
     assert not _unmeasured(rows), "no other gate may be doing the work"
     v = dropeval_verdict({"m": rows})
@@ -633,7 +702,7 @@ def test_the_accuracy_predicate_boundary_is_the_TOLERANCE_line_not_a_loss_SHARE(
 
 
 def test_the_credited_loss_is_read_over_the_PAIRED_subset_not_every_row():
-    """`_arm_loss_share(g.rows, ...)` — mutating `g.rows` to `rows` survives every fixture
+    """`_subset_loss_share(g.rows, ...)` — mutating `g.rows` to `rows` survives every fixture
     above, because in all of them pairing drops nothing.
 
     It cannot survive here. `paired_rows` discards the 30 questions whose CONTROL lost a
@@ -654,8 +723,8 @@ def test_the_credited_loss_is_read_over_the_PAIRED_subset_not_every_row():
                            "control_ok": 9, "control_trials": 9} for i in range(30)]
     rows = paired + dropped_by_pairing
     assert not _unmeasured(rows), "no other gate may be doing the work"
-    assert _arm_loss_share(rows, "treatment") == pytest.approx(0.04)
-    assert _arm_loss_share(paired, "treatment") == pytest.approx(0.10)
+    assert _subset_loss_share(rows, "treatment") == pytest.approx(0.04)
+    assert _subset_loss_share(paired, "treatment") == pytest.approx(0.10)
     g = _accuracy_gate(rows)
     assert g.excluded == "unmeasured", (
         "the 10% behind the paired 90% explains the gap; the diluted 4% does not")
@@ -739,7 +808,7 @@ def test_a_withheld_final_accuracy_does_not_claim_the_arms_failed_to_PAIR():
 
 # --------------------------------------------------------------------------- #
 # Review of #382. The credit and the accuracy must share a ROW SET, not merely a
-# per-row denominator — `_arm_loss_share` skips rows carrying no counter, and a
+# per-row denominator — `_subset_loss_share` skips rows carrying no counter, and a
 # credit is subtracted from a FAIL.
 # --------------------------------------------------------------------------- #
 
@@ -763,7 +832,7 @@ def test_a_merged_pack_cannot_credit_a_loss_the_scored_rows_never_paid():
     """The finding both reviewers of #382 reached independently, and the invariant it
     breaks is the one this whole gate is built around.
 
-    `_form_stats` scores EVERY paired row; `_arm_loss_share` skips rows carrying no
+    `_form_stats` scores EVERY paired row; `_subset_loss_share` skips rows carrying no
     counter. On a merged set that makes the credit a fraction of a SUBSET applied to the
     WHOLE. Executed on the branch before the fix: 40 legacy rows at 7/10 with no loss at
     all, plus 40 current rows at 8/10 losing 2 each, against a 100% control —
@@ -779,7 +848,7 @@ def test_a_merged_pack_cannot_credit_a_loss_the_scored_rows_never_paid():
     rows = (_merged_pack("recall", 40, 40, ok_legacy=7, ok_current=8, t_err=2)
             + _merged_pack("precision", 40, 40, ok_legacy=7, ok_current=8, t_err=2))
     assert not _unmeasured(rows), "no other gate may be doing the work"
-    assert _arm_loss_share(rows, "treatment") == pytest.approx(0.20), (
+    assert _subset_loss_share(rows, "treatment") == pytest.approx(0.20), (
         "the SIBLING helper still reports the subset share — that is its job")
     assert _credited_loss_share(rows, "treatment") == pytest.approx(0.10), (
         "the credited share is read over the same rows the accuracy was")
@@ -817,7 +886,7 @@ def test_the_credit_never_exceeds_what_the_arm_could_have_scored():
     rows = (_merged_pack("recall", 95, 5, ok_legacy=9, ok_current=8, t_err=2)
             + _merged_pack("precision", 95, 5, ok_legacy=9, ok_current=8, t_err=2))
     acc = 0.895
-    assert _arm_loss_share(rows, "treatment") + acc > 1.0, (
+    assert _subset_loss_share(rows, "treatment") + acc > 1.0, (
         "fixture must reach an impossible ceiling under the subset share, or it is not "
         "reproducing the finding")
     assert _credited_loss_share(rows, "treatment") + acc <= 1.0
@@ -826,7 +895,7 @@ def test_the_credit_never_exceeds_what_the_arm_could_have_scored():
 
 
 def test_a_credited_share_over_one_is_REFUSED_where_its_sibling_fires():
-    """The one place `_credited_loss_share` deliberately inverts `_arm_loss_share`.
+    """The one place `_credited_loss_share` deliberately inverts `_subset_loss_share`.
 
     An arm reporting more errors than calls is an emitter bug with no benign form. Its
     sibling lets the share go over 1.0 so `_unmeasured` FIRES — withholding asks a human to
@@ -835,7 +904,7 @@ def test_a_credited_share_over_one_is_REFUSED_where_its_sibling_fires():
     """
     rows = [{"qid": "a", "kind": "recall", "trials": 1, "attempts": 2,
              "answer_ok": 0, "treatment_errors": 10}]
-    assert _arm_loss_share(rows, "treatment") == 10.0, "the sibling still goes over 1.0"
+    assert _subset_loss_share(rows, "treatment") == 10.0, "the sibling still goes over 1.0"
     assert _credited_loss_share(rows, "treatment") is None
     # ...and a share of exactly 1.0 is a real measurement, not the bug: it is refused only
     # ABOVE the line, so the boundary is observed rather than assumed.
@@ -843,7 +912,7 @@ def test_a_credited_share_over_one_is_REFUSED_where_its_sibling_fires():
 
 
 def test_a_row_set_where_NOBODY_counted_credits_nothing():
-    """`None`, never 0.0 — the distinction `_arm_loss_share` documents, one helper over.
+    """`None`, never 0.0 — the distinction `_subset_loss_share` documents, one helper over.
 
     Absent counters mean the loss is unknown. Returning 0.0 would be indistinguishable at
     the call sites (`if loss and ...` treats both as falsey today), but the two are
@@ -951,3 +1020,252 @@ def test_a_treatment_only_loss_is_not_attributed_to_the_control_column():
             f"REASON_LABEL['unmeasured'] is {REASON_LABEL['unmeasured']!r}, which names an "
             f"arm -- and the table prints it under 'control (no drop)' regardless of "
             f"which arm actually lost the calls")
+
+
+# --------------------------------------------------------------------------- #
+# #383. The same subset-denominator defect #382 fixed at its two CREDIT sites,
+# one gate upstream of them: `_unmeasured`'s trigger 4. `_gap` calls
+# `_unmeasured` first, so firing there withholds the run before `_accuracy_gate`
+# or `dropeval_verdict` score anything at all.
+# --------------------------------------------------------------------------- #
+
+
+def _pack_383():
+    """#383's fixture: a merged pack whose SUBSET share crosses UNMEASURED_FAIL_SHARE
+    while its whole-run share is nowhere near it, and whose honest gap is a demonstrated
+    regression far past `_GAP_TOLERANCE`."""
+    return (_merged_pack("recall", 95, 5, ok_legacy=9, ok_current=5, t_err=3)
+            + _merged_pack("precision", 95, 5, ok_legacy=9, ok_current=5, t_err=3))
+
+
+def test_trigger_4_reads_the_run_denominator_not_the_carrying_subset():
+    """Executed on `origin/main` @ 1138572 before the fix: `_unmeasured` returned True, the
+    model was excluded as `unmeasured`, and `worst` came back None -- so a 12-point
+    regression against a 100% control was withheld on the strength of 15 lost calls in
+    1,000.
+
+    `NOT_CONCLUDED (2) < BLOCK (3)`, so that exclusion IMPROVES the model's verdict, which
+    is exactly what `UNMEASURED_FAIL_SHARE`'s own comment forbids.
+    """
+    rows = _pack_383()
+    assert _subset_loss_share(rows, "treatment") == pytest.approx(0.30), (
+        "the subset share is unchanged -- reporting the degraded slice's own rate is "
+        "still that helper's job, and #383 is about which caller may use it")
+    assert _distrust_loss_share(rows, "treatment") == pytest.approx(0.015)
+    assert 0.015 < UNMEASURED_FAIL_SHARE < 0.30, (
+        "the fixture is only meaningful while the threshold sits between the two shares")
+
+    assert not _unmeasured(rows), "1.5% whole-run loss must not withhold the run"
+    v = dropeval_verdict({"m": rows})
+    assert v.metrics["accuracy"].excluded == {}
+    worst = v.metrics["accuracy"].worst
+    assert worst is not None, "the regression must reach the verdict, not be withheld"
+    assert worst.gap == pytest.approx(-0.12)
+    assert worst.passed is False
+    assert v.directive is Directive.BLOCK
+
+
+def test_trigger_4_still_fires_on_a_loss_that_is_real_across_the_whole_run():
+    """The other direction, so the fix cannot be mistaken for disabling the trigger: when
+    every row carries the counter, the two denominators coincide and a 30% loss withholds
+    exactly as it did before."""
+    rows = _merged_pack("recall", 0, 100, ok_legacy=9, ok_current=5, t_err=3)
+    assert _distrust_loss_share(rows, "treatment") == pytest.approx(0.30)
+    assert _unmeasured(rows)
+
+
+def test_an_emitter_reporting_more_errors_than_attempts_still_withholds():
+    """The guard that a swap to `_credited_loss_share` would have silently dropped.
+
+    An arm reporting more errors than it had attempts is an emitter bug with no benign
+    form. `_credited_loss_share` REFUSES an over-1.0 share on purpose -- there it would buy
+    a withholding off a bug -- and a refused share is a share that cannot fire. Trigger 4
+    needs the opposite: firing withholds and asks a human to look, which is the right
+    response to a bug. This is why #383 added a third helper instead of reusing the
+    sibling.
+    """
+    rows = _merged_pack("recall", 0, 10, ok_legacy=9, ok_current=5, t_err=11, trials=10)
+    assert _distrust_loss_share(rows, "treatment") == pytest.approx(1.1)
+    assert _credited_loss_share(rows, "treatment") is None, (
+        "the credit helper refuses it -- unchanged by #383")
+    assert _unmeasured(rows), "trigger 4 must still fire on an impossible share"
+
+
+def test_the_over_one_guard_is_pinned_on_the_shape_that_can_actually_defeat_it():
+    """Review finding: the test above uses `n_legacy=0`, where the subset and whole-run
+    denominators COINCIDE -- so it pins the over-1.0 guard only in the case where the
+    change could never have affected it.
+
+    On a merged pack the whole-run denominator is strictly larger, and an impossible
+    counter is divided down into a plausible-looking share. Executed: 95 legacy rows
+    carrying nothing plus 5 rows reporting 11 errors against 10 attempts reads 0.055 and
+    PUBLISHES, where the subset rule read 1.1 and withheld.
+
+    So this documents a real cost of #383, not a preserved guard: an emitter bug that is
+    arithmetically impossible on its own rows can now hide behind enough rows that carry no
+    counter. It is bounded -- the share is still the honest whole-run number, and every
+    other trigger still applies -- but the guard is weaker on merged packs than the commit
+    message for the first half of #383 claimed, and pretending otherwise is what an
+    n_legacy=0 fixture does.
+    """
+    merged = _merged_pack("recall", 95, 5, ok_legacy=9, ok_current=5, t_err=11, trials=10)
+    assert _subset_loss_share(merged, "treatment") == pytest.approx(1.1), (
+        "the counter is impossible on its own rows: 11 errors against 10 attempts")
+    assert _distrust_loss_share(merged, "treatment") == pytest.approx(55 / 1000)
+    assert not _unmeasured(merged), (
+        "and so it publishes -- the honest whole-run share, and a real weakening")
+
+
+def test_the_two_whole_run_helpers_agree_wherever_the_share_is_sane():
+    """`_credited_loss_share` is a thin policy wrapper over `_distrust_loss_share`, so the
+    only input on which they may differ is one over 1.0. Pinned because a future edit that
+    re-copies the derivation into the wrapper would pass every other test here."""
+    for rows in (_pack_383(),
+                 _merged_pack("recall", 0, 100, ok_legacy=9, ok_current=5, t_err=3),
+                 _merged_pack("recall", 50, 50, ok_legacy=7, ok_current=8, t_err=2)):
+        assert _credited_loss_share(rows, "treatment") == _distrust_loss_share(
+            rows, "treatment")
+
+
+def test_absence_is_not_a_zero_share_for_the_distrust_helper():
+    """Same contract as its siblings: no row carrying the counter is nothing known, which
+    must not be compared to a threshold as though it were a clean run."""
+    rows = _merged_pack("recall", 40, 0, ok_legacy=9, ok_current=5, t_err=3)
+    assert _distrust_loss_share(rows, "treatment") is None
+    assert not _unmeasured(rows)
+
+
+# --------------------------------------------------------------------------- #
+# #383, second half. Trigger 2 kept the carrying-rows denominator trigger 4 shed,
+# so the withhold did not disappear -- it relocated one trigger up. Found by
+# review of the first half.
+# --------------------------------------------------------------------------- #
+
+
+def _attempts_key_fleet(*, attempts_on_legacy):
+    """Two fleets differing in ONE key: whether the loss-free legacy rows carry `attempts`.
+
+    Every row here RAN the control arm and carries `control_trials`; the legacy rows simply
+    come from a producer that emitted no pooled `attempts`. The control loss is identical
+    in both -- 30 calls of 2,000."""
+    rows = []
+    for kind in ("recall", "precision"):
+        for i in range(95):
+            r = {"qid": f"{kind}L{i}", "kind": kind, "trials": 10, "answer_ok": 9,
+                 "retrieve_ok": 9, "handle_ok": 9, "control_ok": 10, "control_trials": 10}
+            if attempts_on_legacy:
+                r["attempts"] = 20
+            rows.append(r)
+        for i in range(5):
+            rows.append({"qid": f"{kind}C{i}", "kind": kind, "trials": 10, "attempts": 20,
+                         "answer_ok": 5, "retrieve_ok": 5, "handle_ok": 5,
+                         "control_ok": 7, "control_trials": 7,
+                         "errors": 3, "control_errors": 3, "treatment_errors": 0})
+    return rows
+
+
+def test_trigger_2_does_not_decide_a_verdict_on_the_presence_of_an_attempts_key():
+    """Executed on the first half of #383 before this fix:
+
+        legacy rows WITHOUT `attempts`:  _unmeasured True,  excluded {'m': 'unmeasured'},
+                                         worst None
+        legacy rows WITH    `attempts`:  _unmeasured False, excluded {}, worst gap -0.10
+
+    Same arm, same 30 lost calls in 2,000 (1.5%), and the verdict turned on one unrelated
+    key. Trigger 2 read 30/100 = 0.30 because its denominator was the carrying rows only --
+    the identical subset-against-a-whole-run-threshold defect the first half removed from
+    trigger 4, one trigger up.
+    """
+    without = _attempts_key_fleet(attempts_on_legacy=False)
+    with_ = _attempts_key_fleet(attempts_on_legacy=True)
+    assert not _unmeasured(without), "1.5% control loss must not withhold the run"
+    assert not _unmeasured(with_)
+
+    a, b = dropeval_verdict({"m": without}), dropeval_verdict({"m": with_})
+    assert a.metrics["accuracy"].excluded == b.metrics["accuracy"].excluded == {}
+    assert a.metrics["accuracy"].worst is not None
+    assert a.metrics["accuracy"].worst.gap == pytest.approx(
+        b.metrics["accuracy"].worst.gap), (
+        "an unrelated key must not move the measured gap")
+    assert a.metrics["accuracy"].worst.gap == pytest.approx(-0.10)
+
+
+def test_trigger_2_keeps_a_not_attempted_arm_out_of_its_own_denominator():
+    """The reason the denominator widened to `key in r` and not to `rows` wholesale.
+
+    A `--no-control` pack emits no `control_trials` at all on the rows that ran without
+    one. Dividing a real control loss by calls those rows never made would understate it
+    and let a substantially dead control arm publish. Rows carrying the key ran the arm;
+    rows without it did not, and stay out.
+    """
+    ran = [{"qid": f"c{i}", "kind": "recall", "trials": 10, "attempts": 20, "answer_ok": 9,
+            "control_ok": 2, "control_trials": 2} for i in range(5)]
+    never_ran = [{"qid": f"n{i}", "kind": "recall", "trials": 10, "attempts": 10,
+                  "answer_ok": 9} for i in range(95)]
+    assert _unmeasured(ran + never_ran), (
+        "8 of 10 control calls lost on every row that ran it is a withhold, and 95 rows "
+        "that never ran the arm must not dilute it")
+
+
+def test_trigger_2_still_refuses_phantom_loss_from_a_row_with_no_attempts_key():
+    """The #339 guard the widened denominator had to preserve: a row carrying the arm key
+    but no `attempts` may enter the DENOMINATOR, never the numerator. Its `trials` may
+    disagree with the arm count for benign reasons, and reading that as loss is what let
+    one merged row swing a whole model to withheld with nothing actually lost."""
+    rows = [{"qid": f"a{i}", "kind": "recall", "trials": 10, "attempts": 20,
+             "answer_ok": 10, "control_ok": 10, "control_trials": 10} for i in range(10)]
+    rows.append({"qid": "legacy", "kind": "recall", "trials": 10, "answer_ok": 10,
+                 "control_ok": 0, "control_trials": 0})
+    assert not _unmeasured(rows), (
+        "the row with no `attempts` contributes its attempts, not a 10-call loss")
+
+
+# --------------------------------------------------------------------------- #
+# #383 review, C2. The `trials` fallback moved into `_distrust_loss_share` and
+# lost its witness: the amendment above re-aimed the old test at
+# `_subset_loss_share`, which no production code calls, so mutating the default
+# from 1 to 0 survived the whole 2,020-test suite. Pinned here through
+# `_unmeasured`, which is a live path.
+# --------------------------------------------------------------------------- #
+
+
+def _no_trials_key_pack():
+    """Legacy rows carrying NO `trials` key at all, merged with current rows that do.
+
+    Each legacy row falls back to the default. At 1 it contributes one attempt; at 0 it
+    contributes nothing and the denominator collapses back to the carrying subset --
+    silently re-creating #383 inside the helper that fixed it."""
+    rows = []
+    for kind in ("recall", "precision"):
+        rows += [{"qid": f"{kind}L{i}", "kind": kind, "attempts": 2, "answer_ok": 0,
+                  "retrieve_ok": 0, "handle_ok": 0, "control_ok": 1, "control_trials": 1}
+                 for i in range(95)]
+        rows += [{"qid": f"{kind}C{i}", "kind": kind, "trials": 10, "attempts": 20,
+                  "answer_ok": 10, "retrieve_ok": 10, "handle_ok": 10,
+                  "control_ok": 10, "control_trials": 10,
+                  "errors": 3, "treatment_errors": 3, "control_errors": 0}
+                 for i in range(5)]
+    return rows
+
+
+def test_the_trials_default_of_one_is_pinned_on_a_live_path():
+    """Mutating `int(r.get("trials", 1))` to `0` in `_distrust_loss_share` survived the
+    entire suite before this test existed. It is not an equivalent mutant -- it changes
+    published verdicts:
+
+        default 1   share 0.1034   _unmeasured False   accuracy reaches the verdict
+        default 0   share 0.3000   _unmeasured True    excluded, worst None
+
+    `NOT_CONCLUDED (2) < BLOCK (3)` again, so the mutant BUYS a better verdict off a
+    denominator that silently dropped every row lacking a `trials` key.
+    """
+    rows = _no_trials_key_pack()
+    assert all("trials" not in r for r in rows if r["qid"].endswith(("L0", "L1")))
+    # 190 legacy rows at 1 attempt each + 10 current rows at 10 = 290; 30 errors.
+    assert _distrust_loss_share(rows, "treatment") == pytest.approx(30 / 290)
+    assert _distrust_loss_share(rows, "treatment") < UNMEASURED_FAIL_SHARE, (
+        "and at a default of 0 it would be 30/100 = 0.30, over the threshold")
+    assert not _unmeasured(rows)
+    v = dropeval_verdict({"m": rows})
+    assert v.metrics["accuracy"].excluded == {}, (
+        "a row with no trial count is one call, not zero calls")

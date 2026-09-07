@@ -13,7 +13,29 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A whole-run transport threshold was read against a carrying-rows share, at two
+  triggers, so a demonstrated regression could be withheld on ~1.5% loss** (`#383`).
+  `_unmeasured` withholds a model when transport failures make its numbers untrustworthy,
+  and `NOT_CONCLUDED (2) < BLOCK (3)` — so a spurious withhold IMPROVES a verdict, the one
+  direction `UNMEASURED_FAIL_SHARE` forbids. Trigger 4 divided an arm's errors by the
+  attempts of only the rows carrying an `<arm>_errors` counter, then compared that to a
+  whole-run threshold. On a pack merged from a producer predating the counter and one
+  emitting it — 95 legacy rows at 9/10 carrying none, plus 5 current rows at 5/10 losing 3
+  calls each — that read `15/50 = 0.30` and withheld, where the run lost `15/1000 = 0.015`.
+  The withheld result was a **-0.12** final-accuracy gap against a 100% control. Review of
+  that fix found the identical defect one trigger up: trigger 2 excluded rows lacking an
+  `attempts` key from its denominator, so two fleets differing only in the presence of that
+  one key scored `-0.10` or withheld. Both now take the loss NUMERATOR from rows that
+  report a count and the DENOMINATOR from every row that ran the arm — a row carrying
+  `<arm>_trials` ran it, a row without it may never have, and a `--no-control` pack's rows
+  must not dilute a control loss. Same invariant as `#371`/`#379`/`#381`, one gate upstream
+  of all three. `_arm_loss_share` is deleted: both callers moved and it would otherwise be
+  a helper kept alive only by its own tests. Recorded honestly, the change does weaken one
+  guard — an arm reporting more errors than attempts is divided down on a merged pack and
+  can now publish where it previously withheld (`test_the_over_one_guard_is_pinned_on_the_shape_that_can_actually_defeat_it`).
+
 
 ## [0.30.9] - 2026-09-06
 
