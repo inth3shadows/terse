@@ -1153,3 +1153,54 @@ def test_trigger_2_still_refuses_phantom_loss_from_a_row_with_no_attempts_key():
                  "control_ok": 0, "control_trials": 0})
     assert not _unmeasured(rows), (
         "the row with no `attempts` contributes its attempts, not a 10-call loss")
+
+
+# --------------------------------------------------------------------------- #
+# #383 review, C2. The `trials` fallback moved into `_distrust_loss_share` and
+# lost its witness: the amendment above re-aimed the old test at
+# `_arm_loss_share`, which no production code calls, so mutating the default
+# from 1 to 0 survived the whole 2,020-test suite. Pinned here through
+# `_unmeasured`, which is a live path.
+# --------------------------------------------------------------------------- #
+
+
+def _no_trials_key_pack():
+    """Legacy rows carrying NO `trials` key at all, merged with current rows that do.
+
+    Each legacy row falls back to the default. At 1 it contributes one attempt; at 0 it
+    contributes nothing and the denominator collapses back to the carrying subset --
+    silently re-creating #383 inside the helper that fixed it."""
+    rows = []
+    for kind in ("recall", "precision"):
+        rows += [{"qid": f"{kind}L{i}", "kind": kind, "attempts": 2, "answer_ok": 0,
+                  "retrieve_ok": 0, "handle_ok": 0, "control_ok": 1, "control_trials": 1}
+                 for i in range(95)]
+        rows += [{"qid": f"{kind}C{i}", "kind": kind, "trials": 10, "attempts": 20,
+                  "answer_ok": 10, "retrieve_ok": 10, "handle_ok": 10,
+                  "control_ok": 10, "control_trials": 10,
+                  "errors": 3, "treatment_errors": 3, "control_errors": 0}
+                 for i in range(5)]
+    return rows
+
+
+def test_the_trials_default_of_one_is_pinned_on_a_live_path():
+    """Mutating `int(r.get("trials", 1))` to `0` in `_distrust_loss_share` survived the
+    entire suite before this test existed. It is not an equivalent mutant -- it changes
+    published verdicts:
+
+        default 1   share 0.1034   _unmeasured False   accuracy reaches the verdict
+        default 0   share 0.3000   _unmeasured True    excluded, worst None
+
+    `NOT_CONCLUDED (2) < BLOCK (3)` again, so the mutant BUYS a better verdict off a
+    denominator that silently dropped every row lacking a `trials` key.
+    """
+    rows = _no_trials_key_pack()
+    assert all("trials" not in r for r in rows if r["qid"].endswith(("L0", "L1")))
+    # 190 legacy rows at 1 attempt each + 10 current rows at 10 = 290; 30 errors.
+    assert _distrust_loss_share(rows, "treatment") == pytest.approx(30 / 290)
+    assert _distrust_loss_share(rows, "treatment") < UNMEASURED_FAIL_SHARE, (
+        "and at a default of 0 it would be 30/100 = 0.30, over the threshold")
+    assert not _unmeasured(rows)
+    v = dropeval_verdict({"m": rows})
+    assert v.metrics["accuracy"].excluded == {}, (
+        "a row with no trial count is one call, not zero calls")
