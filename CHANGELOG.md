@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.30.9] - 2026-09-06
+
 ### Fixed
 
 - **`final-accuracy` kept the loss-SHARE threshold `#371` replaced, so a treatment loss
