@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -50,3 +52,44 @@ def _isolate_xdg_state(monkeypatch, tmp_path_factory):
     ~/.local/state. Tests that care about the path set their own value on top."""
     monkeypatch.setenv("XDG_STATE_HOME",
                        str(tmp_path_factory.getbasetemp() / "xdg-state"))
+
+
+# --------------------------------------------------------------------------- #
+# Shared drop-eval CLI fixtures (#386 review): ONE copy of the payload, the drop-field
+# spec, the policy doc and the `_cmd_fluency` Namespace, so a new required `args.<field>`
+# is added in one place and every driver test sees it.
+# --------------------------------------------------------------------------- #
+
+DROP_EVAL_PAYLOAD = {"result": [{"id": i, "name": f"n{i}",
+                                 "body": f"{i} " + "lorem ipsum dolor " * 40}
+                                for i in range(6)]}
+DROP_EVAL_FIELDS = {"result[].body": {"lossy": "drop-to-retrieve", "min": 200}}
+
+
+def drop_eval_policy_doc(tiers, *, suggested=True):
+    """A policy doc with one rule for `kb.read.list_principles`. `suggested=True` carries
+    the drop as `_suggested_fields` (the `tune --drop-eval` input); `False` as live
+    `fields` (the `fluency --drop-eval` input)."""
+    rule = {"match": {"tool": "kb.read.list_principles"}, "tiers": tiers}
+    if suggested:
+        rule["_suggested_fields"] = dict(DROP_EVAL_FIELDS)
+        rule["_suggested_fields_note"] = "…"
+    else:
+        rule["fields"] = dict(DROP_EVAL_FIELDS)
+    return {"version": 1,
+            "defaults": {"tiers": ["minify", "tabularize", "dictionary"]},
+            "policies": [rule]}
+
+
+def drop_eval_envelope(sha="a", raw=None):
+    return {"tool": "kb.read.list_principles", "server": None, "sha": sha,
+            "raw": json.dumps(DROP_EVAL_PAYLOAD) if raw is None else raw}
+
+
+def fluency_drop_eval_args(*, corpus, policy, out, no_control=True, trials=1):
+    """The full `_cmd_fluency` Namespace for a `--drop-eval` run."""
+    return argparse.Namespace(
+        corpus=str(corpus), policy=str(policy), drop_eval=True, out=str(out),
+        trials=trials, no_control=no_control, accept_degraded=False, bars=False, html=False,
+        diff=False, diff_soak=False, text_diff_eval=False, codec_verdict=False,
+        pack=None, models=None, base_url=None, api_key=None)

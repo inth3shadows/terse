@@ -1059,6 +1059,10 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
                                         control=not args.no_control)
     try:
         report = build_dropeval_report(results, accept_degraded=args.accept_degraded)
+        # Computed INSIDE the guard, not after it: the verdict below sees the same rows
+        # the report did, and a raise here after the report was printed would be a
+        # traceback under a rendered table (#386 review).
+        verdict = dropeval_verdict(results, accept_degraded=args.accept_degraded)
     except MixedSchemaError as exc:
         # Input, not a verdict (#386): a pack whose rows disagree on the error counters
         # cannot be scored, and `NOT_CONCLUDED` would read as a better outcome than BLOCK.
@@ -1071,7 +1075,7 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
     # Read the DIRECTIVE, never re-derive it from the PASS lines above — see
     # `dropeval_next_step_line`, which owns the sentence and the reason.
     print(dropeval_next_step_line(
-        dropeval_verdict(results, accept_degraded=args.accept_degraded),
+        verdict,
         # The SAME list the note above was built from, so the directive cannot authorize a
         # rename the run already knows is insufficient for these rules (#375 review).
         tiers_restored=lifted))

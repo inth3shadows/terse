@@ -1254,24 +1254,16 @@ def _drive_tune_drop_eval(monkeypatch, rows):
     code and stderr the operator sees, not on a helper."""
     import argparse
 
+    from conftest import drop_eval_envelope, drop_eval_policy_doc
+
     from terse import cli, dropeval
 
-    payload = {"result": [{"id": i, "name": f"n{i}", "body": f"{i} " + "lorem ipsum dolor " * 40}
-                          for i in range(6)]}
-    doc = {"version": 1,
-           "defaults": {"tiers": ["minify", "tabularize", "dictionary"]},
-           "policies": [{"match": {"tool": "kb.read.list_principles"},
-                         "tiers": ["minify", "tabularize", "dictionary"],
-                         "_suggested_fields": {"result[].body": {"lossy": "drop-to-retrieve",
-                                                                 "min": 200}},
-                         "_suggested_fields_note": "…"}]}
-    env = {"tool": "kb.read.list_principles", "server": None, "sha": "a",
-           "raw": json.dumps(payload)}
     monkeypatch.setattr(cli, "_build_answerers",
                         lambda args, make: {"m": lambda messages: dropeval.Turn(text="no")})
     monkeypatch.setattr(dropeval, "run_drop_fluency", lambda *a, **k: {"m": rows})
     args = argparse.Namespace(trials=1, no_control=False, accept_degraded=False)
-    return cli._tune_drop_eval(args, doc, [env])
+    doc = drop_eval_policy_doc(["minify", "tabularize", "dictionary"])
+    return cli._tune_drop_eval(args, doc, [drop_eval_envelope()])
 
 
 def test_a_mixed_schema_pack_exits_2_as_an_input_error_not_a_verdict(monkeypatch, capsys):
@@ -1279,11 +1271,14 @@ def test_a_mixed_schema_pack_exits_2_as_an_input_error_not_a_verdict(monkeypatch
     exception into a traceback or, worse, a rendered `NOT_CONCLUDED`. No live producer
     emits this shape, so the seam is the only way to reach the handler."""
     rc = _drive_tune_drop_eval(monkeypatch, _pack_383())
-    err = capsys.readouterr().err
+    out, err = capsys.readouterr()
     assert rc == 2
     assert "dropeval: input error:" in err
-    assert "mixes two schemas for arm 'treatment'" in err
+    assert "mixes two schemas for arm 'control'" in err, (
+        "arms are reported in sorted order; both are mixed in this pack")
     assert "do not merge result files" in err
+    assert "## " not in out.split("verifying the suggested drops")[-1], (
+        "nothing of the report may be printed before the refusal")
 
 
 def test_a_uniform_pack_is_scored_by_the_same_path(monkeypatch, capsys):
@@ -1300,33 +1295,111 @@ def test_the_written_report_path_refuses_a_mixed_pack_the_same_way(tmp_path, mon
     """The OTHER call site, `fluency --drop-eval --out <file>`. Unit-pinned code and an
     unpinned call site is how #376's mutations survived; every path that can hand a pack to
     the gate gets its own witness."""
-    import argparse
+    from conftest import (
+        drop_eval_envelope,
+        drop_eval_policy_doc,
+        fluency_drop_eval_args,
+    )
 
     from terse import cli, dropeval
 
     pol_path = tmp_path / "policy.json"
-    pol_path.write_text(json.dumps({
-        "version": 1,
-        "defaults": {"tiers": ["minify", "tabularize", "dictionary"]},
-        "policies": [{"match": {"tool": "kb.read.list_principles"},
-                      "tiers": ["minify", "tabularize", "dictionary"],
-                      "fields": {"result[].body": {"lossy": "drop-to-retrieve", "min": 200}}}]}))
+    pol_path.write_text(json.dumps(
+        drop_eval_policy_doc(["minify", "tabularize", "dictionary"], suggested=False)))
     corpus = tmp_path / "corpus"
     corpus.mkdir()
-    payload = {"result": [{"id": i, "name": f"n{i}", "body": f"{i} " + "lorem ipsum dolor " * 40}
-                          for i in range(6)]}
-    (corpus / "a.json").write_text(json.dumps(
-        {"tool": "kb.read.list_principles", "sha": "a", "raw": json.dumps(payload)}))
+    env = drop_eval_envelope()
+    (corpus / "a.json").write_text(json.dumps({k: env[k] for k in ("tool", "sha", "raw")}))
     monkeypatch.setattr(cli, "_build_answerers",
                         lambda args, make: {"m": lambda messages: dropeval.Turn(text="no")})
     monkeypatch.setattr(dropeval, "run_drop_fluency", lambda *a, **k: {"m": _pack_383()})
     out_path = tmp_path / "report.md"
-    args = argparse.Namespace(
-        corpus=str(corpus), policy=str(pol_path), drop_eval=True, out=str(out_path),
-        trials=1, no_control=False, accept_degraded=False, bars=False, html=False,
-        diff=False, diff_soak=False, text_diff_eval=False, codec_verdict=False,
-        pack=None, models=None, base_url=None, api_key=None)
-    rc = cli._cmd_fluency(args)
+    rc = cli._cmd_fluency(fluency_drop_eval_args(corpus=corpus, policy=pol_path, out=out_path,
+                                                 no_control=False))
     assert rc == 2
     assert "dropeval: input error:" in capsys.readouterr().err
     assert not out_path.exists(), "a refused pack must not leave a report behind"
+
+
+# --------------------------------------------------------------------------- #
+# #386 review. The refusal lived only in trigger 4, so a mixed pack that tripped
+# trigger 1-3 first was scored `unmeasured` -- NOT_CONCLUDED, the exact outcome the
+# refusal exists to close. Both reviewers built the same escape.
+# --------------------------------------------------------------------------- #
+
+
+def _mixed_pack_that_trips_trigger_2():
+    """50 rows carrying both counters plus 50 legacy rows carrying `treatment_errors` only,
+    the legacy half losing 5 of 10 control calls -- 25% of the control arm's own calls,
+    over `UNMEASURED_FAIL_SHARE`, so trigger 2 fires before trigger 4 is reached."""
+    current = [{"qid": f"c{i}", "kind": "recall", "trials": 10, "attempts": 20,
+                "answer_ok": 9, "retrieve_ok": 9, "handle_ok": 9,
+                "control_ok": 10, "control_trials": 10,
+                "errors": 0, "treatment_errors": 0, "control_errors": 0} for i in range(50)]
+    legacy = [{"qid": f"l{i}", "kind": "recall", "trials": 10, "attempts": 20,
+               "answer_ok": 9, "retrieve_ok": 9, "handle_ok": 9,
+               "control_ok": 5, "control_trials": 5,
+               "errors": 0, "treatment_errors": 0} for i in range(50)]
+    return current + legacy
+
+
+def test_a_mixed_pack_is_refused_even_when_an_earlier_trigger_would_fire():
+    """Executed on the first cut of #386: `_unmeasured` returned True via trigger 2 and
+    `dropeval_verdict` excluded the model as `unmeasured` -- a mixed pack reached the
+    lattice as NOT_CONCLUDED with no raise. The refusal has to run before every trigger."""
+    rows = _mixed_pack_that_trips_trigger_2()
+    assert sum("control_errors" in r for r in rows) == 50, "precondition: mixed on control"
+    with pytest.raises(MixedSchemaError, match="'control'"):
+        _unmeasured(rows)
+    with pytest.raises(MixedSchemaError, match="'control'"):
+        dropeval_verdict({"m": rows})
+    # And the same pack with the counter on every row is NOT refused -- trigger 2 fires
+    # on the real 25% control loss, which is the withhold this fixture was built to trip.
+    uniform = [dict(r, control_errors=r.get("control_errors", 10 - r["control_trials"]))
+               for r in rows]
+    assert _unmeasured(uniform)
+
+
+def test_a_mixed_pack_is_refused_before_the_no_attempts_exit():
+    """`_unmeasured` returns False when no row carries `attempts` (pre-counter result
+    files). A mixed pack with no `attempts` anywhere used to take that exit and be scored;
+    the refusal now precedes it."""
+    rows = [{k: v for k, v in r.items() if k != "attempts"}
+            for r in _mixed_pack_that_trips_trigger_2()]
+    assert not any("attempts" in r for r in rows)
+    with pytest.raises(MixedSchemaError):
+        _unmeasured(rows)
+
+
+def test_the_accuracy_route_refuses_a_mixed_pack_on_its_own():
+    """`dropeval_verdict` reaches the credit by two routes -- the fixed-ideal loop off
+    `by_kind`, and `_accuracy_gate` -> `arm_gap` -> `_gap`. Every mixed fixture above has a
+    `recall` kind that raises in the FIRST route, so the second was never independently
+    pinned (review finding). Driven directly here."""
+    rows = _merged_pack("recall", 40, 40, ok_legacy=7, ok_current=8, t_err=2)
+    with pytest.raises(MixedSchemaError):
+        _accuracy_gate(rows)
+
+
+def test_a_mixed_pack_that_is_uniform_within_every_kind_is_still_refused():
+    """A slice of a mixed pack can look uniform: all `recall` rows carry the counter, no
+    `precision` row does. Per-kind readers (`by_kind`, `_credited_loss_share(kind_rows)`)
+    would each see one schema. The whole-pack check in `dropeval_verdict` sees both."""
+    rows = (_merged_pack("recall", 0, 40, ok_legacy=7, ok_current=8, t_err=2)
+            + _merged_pack("precision", 40, 0, ok_legacy=7, ok_current=8, t_err=2))
+    with pytest.raises(MixedSchemaError, match="40 row\\(s\\) carry `control_errors` and 40 do not"):
+        dropeval_verdict({"m": rows})
+
+
+def test_the_refusal_survives_pickle_and_deepcopy():
+    """A worker pool re-raising the exception across a process boundary must show the
+    operator the input-error message, not a `TypeError` from `__init__`."""
+    import copy
+    import pickle
+
+    exc = MixedSchemaError("treatment", 5, 95)
+    for clone in (pickle.loads(pickle.dumps(exc)), copy.deepcopy(exc)):
+        assert isinstance(clone, MixedSchemaError)
+        assert (clone.arm, clone.n_with, clone.n_without) == ("treatment", 5, 95)
+        assert str(clone) == str(exc)
+        assert "5 row(s) carry `treatment_errors` and 95 do not" in str(clone)

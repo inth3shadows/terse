@@ -585,6 +585,10 @@ def _unmeasured(rows: list[dict]) -> bool:
     """
     if not rows:
         return False
+    # BEFORE every trigger and before the no-`attempts` exit (#386 review finding): the
+    # refusal used to live only in trigger 4, so a mixed pack that tripped trigger 1-3 first
+    # was scored `unmeasured` — NOT_CONCLUDED, the direction the refusal exists to close.
+    _refuse_mixed_schema(rows)
     attempts = sum(int(r.get("attempts", 0)) for r in rows)
     if not attempts:
         # Rows predating the counters (older result files) carry neither key. Absent is
@@ -696,18 +700,14 @@ def _unmeasured(rows: list[dict]) -> bool:
     # The bare pooled `errors` key does not match the `_errors` suffix, so it cannot
     # double-count the two arms it is the sum of.
     for err_key in sorted({k for r in rows for k in r if k.endswith("_errors")}):
-        # `_distrust_loss_share` (#383). This read a subset share -- errors over the
-        # CARRYING rows' attempts only -- and compared it to a WHOLE-RUN threshold. Measured: 95 legacy rows carrying no counter plus 5
-        # current rows losing 3 of 10 each reads 0.30 and withholds, where the run actually
-        # lost 15 calls in 1,000 -- 0.015. Firing there withheld a demonstrated 12-point
-        # regression (`worst` went from a real GapVerdict to None) on 1.5% transport loss,
-        # which is the `NOT_CONCLUDED (2) < BLOCK (3)` direction UNMEASURED_FAIL_SHARE's
-        # own comment forbids: an exclusion must never improve a verdict.
-        #
-        # The subset rule was not merely imprecise, it was the STRONGER assumption. Skipping
-        # rows that carry no counter does not hold their loss unknown; it assigns them the
-        # carrying subset's own rate. Under it legacy run size is irrelevant, so one
-        # sufficiently degraded row withholds a merged run of any size.
+        # `_distrust_loss_share`. Until #383 this read a subset share -- errors over the
+        # CARRYING rows' attempts only -- against a WHOLE-RUN threshold, and on a pack
+        # merged from two producer generations (95 rows carrying no counter plus 5 losing
+        # 3 of 10 each) read 0.30 and withheld a demonstrated 12-point regression on 1.5%
+        # real loss: the `NOT_CONCLUDED (2) < BLOCK (3)` direction. #383 made it whole-run;
+        # #386 then refused the merged shape outright (`_refuse_mixed_schema`, above),
+        # because on it even the whole-run number is a lower bound, not a rate. Past that
+        # refusal every row carries the counter and the two denominators coincide.
         share = _distrust_loss_share(rows, err_key[:-len("_errors")])
         if share is not None and share > UNMEASURED_FAIL_SHARE:
             return True
@@ -717,16 +717,47 @@ def _unmeasured(rows: list[dict]) -> bool:
 class MixedSchemaError(ValueError):
     """A results pack mixes rows that carry `<arm>_errors` with rows that do not (#386).
 
-    Raised by `_distrust_loss_share` and everything above it (`_unmeasured`,
-    `_credited_loss_share`, `dropeval_verdict`). The CLI reports it as an input error and
-    exits 2 — it is not a verdict, and must never become one."""
+    Raised by `_refuse_mixed_schema`, which runs FIRST in `_unmeasured` and in
+    `dropeval_verdict` — before any trigger, so a mixed pack cannot be scored `unmeasured`
+    (NOT_CONCLUDED) by an earlier trigger and skip the refusal (review finding on #386) —
+    and again inside `_distrust_loss_share` for callers that reach it directly. The CLI
+    reports it as an input error and exits 2 — it is not a verdict, and must never become
+    one."""
 
     def __init__(self, arm: str, n_with: int, n_without: int) -> None:
+        # All three through `args`, so the exception survives pickle/deepcopy (a worker
+        # pool re-raising it must show the operator THIS message, not a TypeError).
+        super().__init__(arm, n_with, n_without)
         self.arm, self.n_with, self.n_without = arm, n_with, n_without
-        super().__init__(
-            f"results pack mixes two schemas for arm {arm!r}: {n_with} row(s) carry "
-            f"`{arm}_errors` and {n_without} do not, so the run's transport loss cannot be "
-            f"identified. Re-run the eval with one producer; do not merge result files.")
+
+    def __str__(self) -> str:
+        return (f"results pack mixes two schemas for arm {self.arm!r}: {self.n_with} row(s) "
+                f"carry `{self.arm}_errors` and {self.n_without} do not, so the run's "
+                f"transport loss cannot be identified. Re-run the eval with one producer; "
+                f"do not merge result files.")
+
+
+def _refuse_mixed_schema(rows: list[dict], *arms: str) -> None:
+    """Raise `MixedSchemaError` if, for any arm whose `<arm>_errors` counter appears on SOME
+    row, another row lacks it (#386). With no `arms` given, every counter present is checked.
+
+    Some rows stating the counter and some not is two producer generations in one pack.
+    The whole-run loss share is then UNIDENTIFIED — the rows without a counter cannot say
+    how many calls they lost, so any division is a lower bound presented as a rate, and on
+    this shape an arm reporting more errors than attempts (an emitter bug) divides down to
+    a share that publishes. No live producer emits the shape (`dropeval.py` writes both
+    counters on every row, and nothing concatenates result files), so it is refused as
+    INPUT, not scored as `NOT_CONCLUDED`: `NOT_CONCLUDED (2) < BLOCK (3)`, and a schema
+    problem must never be able to improve a verdict. The bare pooled `errors` key is not a
+    per-arm counter and is not checked."""
+    if not arms:
+        arms = tuple(sorted({k[:-len("_errors")] for r in rows for k in r
+                             if k.endswith("_errors")}))
+    for arm in arms:
+        err_key = f"{arm}_errors"
+        n_with = sum(1 for r in rows if err_key in r)
+        if n_with and n_with != len(rows):
+            raise MixedSchemaError(arm, n_with, len(rows) - n_with)
 
 
 def _credited_loss_share(rows: list[dict], arm: str) -> float | None:
@@ -743,15 +774,13 @@ def _credited_loss_share(rows: list[dict], arm: str) -> float | None:
 
     Measured on a merged pack (5 rows carrying `treatment_errors: 2`, 95 legacy rows
     carrying none, all scoring against a 100% control): the removed subset rule reported
-    0.20 and `acc + loss` reached 1.095 — crediting the arm with more successes than it had trials —
-    which withheld a 9.5-point regression that no loss could explain. The honest share over
-    the same rows the accuracy used is 0.01. Both #371's site and #381's had this shape.
-
-    So an absent counter contributes NO errors and its FULL trials to the denominator. That
-    is the conservative direction here: under-crediting
-    publishes a FAIL that might be transport, which is recoverable; over-crediting withholds
-    a demonstrated regression, and `NOT_CONCLUDED (2) < BLOCK (3)` makes that an exclusion
-    that IMPROVES a verdict — the one thing `UNMEASURED_FAIL_SHARE`'s comment forbids.
+    0.20 and `acc + loss` reached 1.095 — crediting the arm with more successes than it had
+    trials — which withheld a 9.5-point regression that no loss could explain. Both #371's
+    site and #381's had this shape. #383 read that pack whole-run (0.01); #386 refuses it
+    instead (`MixedSchemaError`), because a row carrying no counter beside rows that do is
+    neither zero loss nor the carrying rate — it is unidentified, and either reading makes
+    an exclusion off a schema problem, which `NOT_CONCLUDED (2) < BLOCK (3)` turns into a
+    verdict that IMPROVES. Past the refusal every row carries the counter.
 
     None when NO row carries the counter (nothing is known, so nothing is credited) or when
     the arm was given no calls. None also when the share exceeds 1.0, which is the OTHER
@@ -792,20 +821,9 @@ def _distrust_loss_share(rows: list[dict], arm: str) -> float | None:
     Raises `MixedSchemaError` when SOME rows carry it and others do not (#386) — see the
     comment at the check."""
     err_key = f"{arm}_errors"
-    n_with = sum(1 for r in rows if err_key in r)
-    if not n_with:
+    if not any(err_key in r for r in rows):
         return None
-    if n_with != len(rows):
-        # Some rows state the counter and some do not: two producer generations in one
-        # pack. The whole-run share is then UNIDENTIFIED — the rows without a counter
-        # cannot say how many calls they lost, so any division here is a lower bound
-        # presented as a rate, and on this shape an arm reporting more errors than
-        # attempts (an emitter bug) divides down to a share that publishes (#386). No
-        # live producer emits this shape (`dropeval.py` writes both counters on every
-        # row, and nothing concatenates result files), so it is refused as INPUT, not
-        # scored as `NOT_CONCLUDED`: `NOT_CONCLUDED (2) < BLOCK (3)`, and a schema
-        # problem must never be able to improve a verdict.
-        raise MixedSchemaError(arm, n_with, len(rows) - n_with)
+    _refuse_mixed_schema(rows, arm)   # #386 — see the predicate for why
     # The BARE arm name, not a re-spelled `<arm>_trials` — `_arm_attempts` normalizes
     # either form, and `test_only_one_place_derives_the_arm_to_trials_key` refuses a
     # second copy of that swap.
@@ -2029,6 +2047,12 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
     excluded_by_metric: dict[Metric, dict[str, ExclusionReason]] = {
         m: {} for m, _, _ in DROPEVAL_METRICS}
     thin_by_metric: dict[Metric, dict[str, int]] = {m: {} for m, _, _ in DROPEVAL_METRICS}
+    # Input validation runs BEFORE the lattice (#386): every model's pack is checked for
+    # a mixed error-counter schema up front, so no per-kind or per-route reading of the
+    # rows — `_unmeasured`'s triggers, `_credited_loss_share` on a `by_kind` slice,
+    # `_accuracy_gate` — can score it first. A slice of a mixed pack can look uniform.
+    for rows in results.values():
+        _refuse_mixed_schema(rows)
     for model, rows in results.items():
         if not rows:
             # WITHHELD, not skipped. `continue` here dropped the model out of `gates` AND
