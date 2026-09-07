@@ -671,7 +671,20 @@ def _unmeasured(rows: list[dict]) -> bool:
     # The bare pooled `errors` key does not match the `_errors` suffix, so it cannot
     # double-count the two arms it is the sum of.
     for err_key in sorted({k for r in rows for k in r if k.endswith("_errors")}):
-        share = _arm_loss_share(rows, err_key[:-len("_errors")])
+        # `_distrust_loss_share`, NOT `_arm_loss_share` (#383). The sibling divides by the
+        # carrying rows only, and on a merged pack that makes this a subset share compared
+        # to a WHOLE-RUN threshold. Measured: 95 legacy rows carrying no counter plus 5
+        # current rows losing 3 of 10 each reads 0.30 and withholds, where the run actually
+        # lost 15 calls in 1,000 -- 0.015. Firing there withheld a demonstrated 12-point
+        # regression (`worst` went from a real GapVerdict to None) on 1.5% transport loss,
+        # which is the `NOT_CONCLUDED (2) < BLOCK (3)` direction UNMEASURED_FAIL_SHARE's
+        # own comment forbids: an exclusion must never improve a verdict.
+        #
+        # The subset rule was not merely imprecise, it was the STRONGER assumption. Skipping
+        # rows that carry no counter does not hold their loss unknown; it assigns them the
+        # carrying subset's own rate. Under it legacy run size is irrelevant, so one
+        # sufficiently degraded row withholds a merged run of any size.
+        share = _distrust_loss_share(rows, err_key[:-len("_errors")])
         if share is not None and share > UNMEASURED_FAIL_SHARE:
             return True
     return False
@@ -739,14 +752,45 @@ def _credited_loss_share(rows: list[dict], arm: str) -> float | None:
     place this inverts its sibling: there an over-1.0 share must fire rather than be rounded
     down, because firing withholds and asks a human to look; here it would BUY a withholding
     off an emitter bug, so it is refused instead."""
+    share = _distrust_loss_share(rows, arm)
+    # The ONLY divergence from `_distrust_loss_share`, and the reason this is a wrapper
+    # rather than a copy: there an over-1.0 share must fire, here it must not.
+    return None if share is not None and share > 1.0 else share
+
+
+def _distrust_loss_share(rows: list[dict], arm: str) -> float | None:
+    """What fraction of the WHOLE RUN's calls to `arm` were reported lost, via the explicit
+    `<arm>_errors` counter. The share `_unmeasured`'s trigger 4 compares to
+    `UNMEASURED_FAIL_SHARE`, and the shared derivation behind `_credited_loss_share`.
+
+    Three helpers now read this counter and the differences are load-bearing, so state them
+    once here:
+
+      - `_arm_loss_share` divides by the CARRYING rows' attempts. It answers "how degraded
+        is this arm", for a caller that wants the degraded slice's own rate undiluted.
+      - this one and `_credited_loss_share` divide by EVERY row's attempts, because both
+        of their thresholds are whole-run quantities: `UNMEASURED_FAIL_SHARE` asks what
+        fraction of the run was lost, and a credit is subtracted from an accuracy
+        `_form_stats` computed over every row.
+      - this one FIRES on a share over 1.0; `_credited_loss_share` refuses it. An arm
+        reporting more errors than attempts is an emitter bug with no benign form. Here
+        firing withholds and asks a human to look, which is what you want from a bug;
+        there it would BUY a withholding off that same bug. Swapping trigger 4 to
+        `_credited_loss_share` instead of adding this would have silently dropped that
+        guard, since a refused share is a share that cannot fire.
+
+    None when NO row carries the counter, and None when the arm was given no calls --
+    absence, which is not a loss of 0.0 and must not be compared to a threshold as one."""
     err_key = f"{arm}_errors"
     if not any(err_key in r for r in rows):
         return None
+    # The BARE arm name, not a re-spelled `<arm>_trials` — `_arm_attempts` normalizes
+    # either form, and `test_only_one_place_derives_the_arm_to_trials_key` refuses a
+    # second copy of that swap.
     attempts = sum(_arm_attempts(r, arm, int(r.get("trials", 1))) for r in rows)
     if not attempts:
         return None
-    share = sum(int(r[err_key]) for r in rows if err_key in r) / attempts
-    return None if share > 1.0 else share
+    return sum(int(r[err_key]) for r in rows if err_key in r) / attempts
 
 
 # Why a gap is never computed from two bare `_form_stats` calls again (#280).
