@@ -29,7 +29,7 @@ from terse.report import (
     UNMEASURED_FAIL_SHARE,
     Directive,
     _accuracy_gate,
-    _arm_loss_share,
+    _arm_attempts,
     _credited_loss_share,
     _distrust_loss_share,
     _unmeasured,
@@ -38,6 +38,30 @@ from terse.report import (
     inconclusive_models,
     passes_tolerance,
 )
+
+
+def _subset_loss_share(rows, arm):
+    """The rule `report._arm_loss_share` implemented until #383 deleted it: errors over the
+    attempts of the CARRYING rows only.
+
+    Kept here, in the tests, and deliberately NOT in `report.py`. Several assertions below
+    are built as a contrast — "the subset share is X, the share production actually uses is
+    Y" — and that contrast is the clearest statement of what #383 changed. But production
+    has no caller for it: both of its callers (trigger 4, and the fixed-ideal loop via
+    `_credited_loss_share`) were comparing a subset share against whole-run thresholds,
+    which was the defect. Leaving it in `report.py` would have meant a public-looking helper
+    kept alive only by its own tests, where mutating the body cannot change any report
+    output and the tests watching it therefore guard nothing shipped.
+    """
+    err_key = f"{arm}_errors"
+    carrying = [r for r in rows if err_key in r]
+    per_row = [(_arm_attempts(r, arm, int(r.get("trials", 1))), int(r[err_key]))
+               for r in carrying]
+    arm_attempts = sum(a for a, _ in per_row)
+    if not arm_attempts:
+        return None
+    return sum(e for _, e in per_row) / arm_attempts
+
 
 # --------------------------------------------------------------------------- #
 # Fixtures in dropeval's real row shape.
@@ -170,11 +194,11 @@ def test_a_row_that_carries_no_counter_is_unknown_loss_not_zero_loss():
     # assumption than reading them as zero.
     #
     # What survives, and is what this test was really witnessing, is the ROW-SET rule
-    # inside `_arm_loss_share`. That helper still skips rows carrying no counter, because
+    # inside `_subset_loss_share`. That helper still skips rows carrying no counter, because
     # its question is "how degraded is this arm" and a caller wanting the degraded slice's
     # own undiluted rate needs exactly that. `_unmeasured` is simply no longer such a
     # caller.
-    assert _arm_loss_share(legacy + current, "control") == pytest.approx(1 / 3), (
+    assert _subset_loss_share(legacy + current, "control") == pytest.approx(1 / 3), (
         "the row-set rule itself is unchanged: rows carrying no counter are skipped, "
         "not read as a measured zero")
     assert _distrust_loss_share(legacy + current, "control") == pytest.approx(1 / 144)
@@ -471,7 +495,7 @@ def test_a_demonstrated_mechanism_failure_is_scored_even_at_a_large_transport_lo
     Measured on the first cut: a sweep of 1,440 two-model fleets turned 240 BLOCKs into
     NOT_CONCLUDED this way."""
     rows = _flat("recall", 24, 100, 21, 0) + _flat("precision", 24, 100, 21, 0)
-    assert _arm_loss_share(rows, "treatment") > UNMEASURED_FAIL_SHARE, (
+    assert _subset_loss_share(rows, "treatment") > UNMEASURED_FAIL_SHARE, (
         "fixture must sit past the old threshold, or it proves nothing")
     v = dropeval_verdict({"m": rows})
     assert v.metrics["recall"].excluded == {}, "a demonstrated failure is never withheld"
@@ -542,7 +566,7 @@ def test_the_predicate_boundary_is_whether_the_credited_loss_clears_TOLERANCE():
 
 
 def test_an_arm_that_attempted_nothing_is_unknown_loss_not_zero_loss():
-    """`_arm_loss_share` returns None, never 0.0, when the arm carried no attempts.
+    """`_subset_loss_share` returns None, never 0.0, when the arm carried no attempts.
 
     The docstring calls this load-bearing and nothing pinned it: both call sites spell
     `share is not None and share > ...` / `if loss and ...`, and `0.0` is falsey and fails
@@ -550,11 +574,11 @@ def test_an_arm_that_attempted_nothing_is_unknown_loss_not_zero_loss():
     the helper claimed a mutation killed it; that mutation had rewritten `_worst_case_gap`
     by accident (review finding on #379). An absence and a measured zero are different
     facts, and the type is the only thing that says so."""
-    assert _arm_loss_share([{"qid": "a", "kind": "recall", "trials": 0,
+    assert _subset_loss_share([{"qid": "a", "kind": "recall", "trials": 0,
                              "treatment_errors": 0}], "treatment") is None
-    assert _arm_loss_share([{"qid": "a", "kind": "recall", "trials": 10}],
+    assert _subset_loss_share([{"qid": "a", "kind": "recall", "trials": 10}],
                            "treatment") is None, "no counter at all is not a zero loss"
-    assert _arm_loss_share([{"qid": "a", "kind": "recall", "trials": 10,
+    assert _subset_loss_share([{"qid": "a", "kind": "recall", "trials": 10,
                              "treatment_errors": 0}], "treatment") == 0.0
 
 
@@ -570,7 +594,7 @@ def test_a_row_stating_no_trial_count_is_read_as_one_call_not_zero():
             {"qid": "b", "kind": "recall", "attempts": 2, "answer_ok": 0,
              "treatment_errors": 1}]
     assert "trials" not in rows[1]
-    # Asserted through `_arm_loss_share` rather than through `_unmeasured` since #383.
+    # Asserted through `_subset_loss_share` rather than through `_unmeasured` since #383.
     # The observable had to move because trigger 4 now divides by every row's attempts,
     # under which BOTH defaults (1 -> 1/11, 0 -> 1/10) sit below the 0.20 threshold and
     # the gate can no longer see which one is in force. The helper still can, and it is
@@ -579,7 +603,7 @@ def test_a_row_stating_no_trial_count_is_read_as_one_call_not_zero():
     #   default 0 -> the row contributes nothing, no attempts at all, share None
     # None is the reading this function exists to refuse: a reported failure turned into
     # no evidence of failure.
-    assert _arm_loss_share(rows, "treatment") == pytest.approx(1.0), (
+    assert _subset_loss_share(rows, "treatment") == pytest.approx(1.0), (
         "a stated loss on a row with no trial count is still a loss")
 
 
@@ -607,7 +631,7 @@ def test_a_treatment_loss_that_fully_EXPLAINS_the_accuracy_gap_withholds_it(t_er
     """
     rows = (_perfect_on_landed("recall", 24, 10, t_err)
             + _perfect_on_landed("precision", 24, 10, t_err))
-    assert _arm_loss_share(rows, "treatment") <= UNMEASURED_FAIL_SHARE, (
+    assert _subset_loss_share(rows, "treatment") <= UNMEASURED_FAIL_SHARE, (
         "fixture must sit inside the band the old gate never reached")
     assert not _unmeasured(rows), "no other gate may be doing the work"
     v = dropeval_verdict({"m": rows})
@@ -662,7 +686,7 @@ def test_the_accuracy_predicate_boundary_is_the_TOLERANCE_line_not_a_loss_SHARE(
 
 
 def test_the_credited_loss_is_read_over_the_PAIRED_subset_not_every_row():
-    """`_arm_loss_share(g.rows, ...)` — mutating `g.rows` to `rows` survives every fixture
+    """`_subset_loss_share(g.rows, ...)` — mutating `g.rows` to `rows` survives every fixture
     above, because in all of them pairing drops nothing.
 
     It cannot survive here. `paired_rows` discards the 30 questions whose CONTROL lost a
@@ -683,8 +707,8 @@ def test_the_credited_loss_is_read_over_the_PAIRED_subset_not_every_row():
                            "control_ok": 9, "control_trials": 9} for i in range(30)]
     rows = paired + dropped_by_pairing
     assert not _unmeasured(rows), "no other gate may be doing the work"
-    assert _arm_loss_share(rows, "treatment") == pytest.approx(0.04)
-    assert _arm_loss_share(paired, "treatment") == pytest.approx(0.10)
+    assert _subset_loss_share(rows, "treatment") == pytest.approx(0.04)
+    assert _subset_loss_share(paired, "treatment") == pytest.approx(0.10)
     g = _accuracy_gate(rows)
     assert g.excluded == "unmeasured", (
         "the 10% behind the paired 90% explains the gap; the diluted 4% does not")
@@ -768,7 +792,7 @@ def test_a_withheld_final_accuracy_does_not_claim_the_arms_failed_to_PAIR():
 
 # --------------------------------------------------------------------------- #
 # Review of #382. The credit and the accuracy must share a ROW SET, not merely a
-# per-row denominator — `_arm_loss_share` skips rows carrying no counter, and a
+# per-row denominator — `_subset_loss_share` skips rows carrying no counter, and a
 # credit is subtracted from a FAIL.
 # --------------------------------------------------------------------------- #
 
@@ -792,7 +816,7 @@ def test_a_merged_pack_cannot_credit_a_loss_the_scored_rows_never_paid():
     """The finding both reviewers of #382 reached independently, and the invariant it
     breaks is the one this whole gate is built around.
 
-    `_form_stats` scores EVERY paired row; `_arm_loss_share` skips rows carrying no
+    `_form_stats` scores EVERY paired row; `_subset_loss_share` skips rows carrying no
     counter. On a merged set that makes the credit a fraction of a SUBSET applied to the
     WHOLE. Executed on the branch before the fix: 40 legacy rows at 7/10 with no loss at
     all, plus 40 current rows at 8/10 losing 2 each, against a 100% control —
@@ -808,7 +832,7 @@ def test_a_merged_pack_cannot_credit_a_loss_the_scored_rows_never_paid():
     rows = (_merged_pack("recall", 40, 40, ok_legacy=7, ok_current=8, t_err=2)
             + _merged_pack("precision", 40, 40, ok_legacy=7, ok_current=8, t_err=2))
     assert not _unmeasured(rows), "no other gate may be doing the work"
-    assert _arm_loss_share(rows, "treatment") == pytest.approx(0.20), (
+    assert _subset_loss_share(rows, "treatment") == pytest.approx(0.20), (
         "the SIBLING helper still reports the subset share — that is its job")
     assert _credited_loss_share(rows, "treatment") == pytest.approx(0.10), (
         "the credited share is read over the same rows the accuracy was")
@@ -846,7 +870,7 @@ def test_the_credit_never_exceeds_what_the_arm_could_have_scored():
     rows = (_merged_pack("recall", 95, 5, ok_legacy=9, ok_current=8, t_err=2)
             + _merged_pack("precision", 95, 5, ok_legacy=9, ok_current=8, t_err=2))
     acc = 0.895
-    assert _arm_loss_share(rows, "treatment") + acc > 1.0, (
+    assert _subset_loss_share(rows, "treatment") + acc > 1.0, (
         "fixture must reach an impossible ceiling under the subset share, or it is not "
         "reproducing the finding")
     assert _credited_loss_share(rows, "treatment") + acc <= 1.0
@@ -855,7 +879,7 @@ def test_the_credit_never_exceeds_what_the_arm_could_have_scored():
 
 
 def test_a_credited_share_over_one_is_REFUSED_where_its_sibling_fires():
-    """The one place `_credited_loss_share` deliberately inverts `_arm_loss_share`.
+    """The one place `_credited_loss_share` deliberately inverts `_subset_loss_share`.
 
     An arm reporting more errors than calls is an emitter bug with no benign form. Its
     sibling lets the share go over 1.0 so `_unmeasured` FIRES — withholding asks a human to
@@ -864,7 +888,7 @@ def test_a_credited_share_over_one_is_REFUSED_where_its_sibling_fires():
     """
     rows = [{"qid": "a", "kind": "recall", "trials": 1, "attempts": 2,
              "answer_ok": 0, "treatment_errors": 10}]
-    assert _arm_loss_share(rows, "treatment") == 10.0, "the sibling still goes over 1.0"
+    assert _subset_loss_share(rows, "treatment") == 10.0, "the sibling still goes over 1.0"
     assert _credited_loss_share(rows, "treatment") is None
     # ...and a share of exactly 1.0 is a real measurement, not the bug: it is refused only
     # ABOVE the line, so the boundary is observed rather than assumed.
@@ -872,7 +896,7 @@ def test_a_credited_share_over_one_is_REFUSED_where_its_sibling_fires():
 
 
 def test_a_row_set_where_NOBODY_counted_credits_nothing():
-    """`None`, never 0.0 — the distinction `_arm_loss_share` documents, one helper over.
+    """`None`, never 0.0 — the distinction `_subset_loss_share` documents, one helper over.
 
     Absent counters mean the loss is unknown. Returning 0.0 would be indistinguishable at
     the call sites (`if loss and ...` treats both as falsey today), but the two are
@@ -1008,7 +1032,7 @@ def test_trigger_4_reads_the_run_denominator_not_the_carrying_subset():
     is exactly what `UNMEASURED_FAIL_SHARE`'s own comment forbids.
     """
     rows = _pack_383()
-    assert _arm_loss_share(rows, "treatment") == pytest.approx(0.30), (
+    assert _subset_loss_share(rows, "treatment") == pytest.approx(0.30), (
         "the subset share is unchanged -- reporting the degraded slice's own rate is "
         "still that helper's job, and #383 is about which caller may use it")
     assert _distrust_loss_share(rows, "treatment") == pytest.approx(0.015)
@@ -1158,7 +1182,7 @@ def test_trigger_2_still_refuses_phantom_loss_from_a_row_with_no_attempts_key():
 # --------------------------------------------------------------------------- #
 # #383 review, C2. The `trials` fallback moved into `_distrust_loss_share` and
 # lost its witness: the amendment above re-aimed the old test at
-# `_arm_loss_share`, which no production code calls, so mutating the default
+# `_subset_loss_share`, which no production code calls, so mutating the default
 # from 1 to 0 survived the whole 2,020-test suite. Pinned here through
 # `_unmeasured`, which is a live path.
 # --------------------------------------------------------------------------- #
