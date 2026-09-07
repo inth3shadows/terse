@@ -1068,3 +1068,88 @@ def test_absence_is_not_a_zero_share_for_the_distrust_helper():
     rows = _merged_pack("recall", 40, 0, ok_legacy=9, ok_current=5, t_err=3)
     assert _distrust_loss_share(rows, "treatment") is None
     assert not _unmeasured(rows)
+
+
+# --------------------------------------------------------------------------- #
+# #383, second half. Trigger 2 kept the carrying-rows denominator trigger 4 shed,
+# so the withhold did not disappear -- it relocated one trigger up. Found by
+# review of the first half.
+# --------------------------------------------------------------------------- #
+
+
+def _attempts_key_fleet(*, attempts_on_legacy):
+    """Two fleets differing in ONE key: whether the loss-free legacy rows carry `attempts`.
+
+    Every row here RAN the control arm and carries `control_trials`; the legacy rows simply
+    come from a producer that emitted no pooled `attempts`. The control loss is identical
+    in both -- 30 calls of 2,000."""
+    rows = []
+    for kind in ("recall", "precision"):
+        for i in range(95):
+            r = {"qid": f"{kind}L{i}", "kind": kind, "trials": 10, "answer_ok": 9,
+                 "retrieve_ok": 9, "handle_ok": 9, "control_ok": 10, "control_trials": 10}
+            if attempts_on_legacy:
+                r["attempts"] = 20
+            rows.append(r)
+        for i in range(5):
+            rows.append({"qid": f"{kind}C{i}", "kind": kind, "trials": 10, "attempts": 20,
+                         "answer_ok": 5, "retrieve_ok": 5, "handle_ok": 5,
+                         "control_ok": 7, "control_trials": 7,
+                         "errors": 3, "control_errors": 3, "treatment_errors": 0})
+    return rows
+
+
+def test_trigger_2_does_not_decide_a_verdict_on_the_presence_of_an_attempts_key():
+    """Executed on the first half of #383 before this fix:
+
+        legacy rows WITHOUT `attempts`:  _unmeasured True,  excluded {'m': 'unmeasured'},
+                                         worst None
+        legacy rows WITH    `attempts`:  _unmeasured False, excluded {}, worst gap -0.10
+
+    Same arm, same 30 lost calls in 2,000 (1.5%), and the verdict turned on one unrelated
+    key. Trigger 2 read 30/100 = 0.30 because its denominator was the carrying rows only --
+    the identical subset-against-a-whole-run-threshold defect the first half removed from
+    trigger 4, one trigger up.
+    """
+    without = _attempts_key_fleet(attempts_on_legacy=False)
+    with_ = _attempts_key_fleet(attempts_on_legacy=True)
+    assert not _unmeasured(without), "1.5% control loss must not withhold the run"
+    assert not _unmeasured(with_)
+
+    a, b = dropeval_verdict({"m": without}), dropeval_verdict({"m": with_})
+    assert a.metrics["accuracy"].excluded == b.metrics["accuracy"].excluded == {}
+    assert a.metrics["accuracy"].worst is not None
+    assert a.metrics["accuracy"].worst.gap == pytest.approx(
+        b.metrics["accuracy"].worst.gap), (
+        "an unrelated key must not move the measured gap")
+    assert a.metrics["accuracy"].worst.gap == pytest.approx(-0.10)
+
+
+def test_trigger_2_keeps_a_not_attempted_arm_out_of_its_own_denominator():
+    """The reason the denominator widened to `key in r` and not to `rows` wholesale.
+
+    A `--no-control` pack emits no `control_trials` at all on the rows that ran without
+    one. Dividing a real control loss by calls those rows never made would understate it
+    and let a substantially dead control arm publish. Rows carrying the key ran the arm;
+    rows without it did not, and stay out.
+    """
+    ran = [{"qid": f"c{i}", "kind": "recall", "trials": 10, "attempts": 20, "answer_ok": 9,
+            "control_ok": 2, "control_trials": 2} for i in range(5)]
+    never_ran = [{"qid": f"n{i}", "kind": "recall", "trials": 10, "attempts": 10,
+                  "answer_ok": 9} for i in range(95)]
+    assert _unmeasured(ran + never_ran), (
+        "8 of 10 control calls lost on every row that ran it is a withhold, and 95 rows "
+        "that never ran the arm must not dilute it")
+
+
+def test_trigger_2_still_refuses_phantom_loss_from_a_row_with_no_attempts_key():
+    """The #339 guard the widened denominator had to preserve: a row carrying the arm key
+    but no `attempts` may enter the DENOMINATOR, never the numerator. Its `trials` may
+    disagree with the arm count for benign reasons, and reading that as loss is what let
+    one merged row swing a whole model to withheld with nothing actually lost."""
+    rows = [{"qid": f"a{i}", "kind": "recall", "trials": 10, "attempts": 20,
+             "answer_ok": 10, "control_ok": 10, "control_trials": 10} for i in range(10)]
+    rows.append({"qid": "legacy", "kind": "recall", "trials": 10, "answer_ok": 10,
+                 "control_ok": 0, "control_trials": 0})
+    assert not _unmeasured(rows), (
+        "the row with no `attempts` contributes its attempts, not a 10-call loss")

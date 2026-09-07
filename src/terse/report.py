@@ -620,12 +620,28 @@ def _unmeasured(rows: list[dict]) -> bool:
         # `score_pack` row's `trials` (a `max(...)` across forms) would make an
         # uneven-BY-DESIGN form look like a lost call, which is the same class of error as
         # the pooled denominator #339 removed — just one level down.
+        # #383, second half. The NUMERATOR stays on `carrying` — a row without `attempts`
+        # must not contribute phantom loss, which is the #339 finding above — but the
+        # DENOMINATOR is every row that carries this arm's key, `attempts` or not. Those
+        # rows ran the arm and completed it; excluding them made this the same
+        # carrying-subset share against a whole-run threshold that trigger 4 had.
+        #
+        # Executed before this change: 190 loss-free legacy rows carrying `control_trials`
+        # but no `attempts`, plus 10 rows losing 3 control calls of 10, is 30 lost calls in
+        # 2,000 -- 0.015. Trigger 2 read 30/100 = 0.30 and withheld, and the identical
+        # fleet WITH an `attempts` key on those legacy rows scored a -0.10 accuracy gap.
+        # Same arm, same loss, the verdict decided by the presence of one unrelated key.
+        #
+        # `key in r` and not `rows` wholesale is what keeps a NOT-ATTEMPTED arm out of its
+        # own denominator: a `--no-control` pack emits no `control_trials` at all, and
+        # dividing a control loss by calls that pack never made would understate it.
         per_row = [(_arm_attempts(r, key, int(r.get("trials", 1))), int(r[key]))
                    for r in carrying]
-        arm_attempts = sum(a for a, _ in per_row)
+        lost = sum(max(0, a - t) for a, t in per_row)
+        arm_attempts = sum(_arm_attempts(r, key, int(r.get("trials", 1)))
+                           for r in rows if key in r)
         if not arm_attempts:
             continue
-        lost = sum(max(0, a - t) for a, t in per_row)
         if lost / arm_attempts > UNMEASURED_FAIL_SHARE:
             return True
     # #352: the same share, for an arm that reports its loss EXPLICITLY rather than by
