@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.30.10] - 2026-09-07
+
 ### Fixed
 
 - **A whole-run transport threshold was read against a carrying-rows share, at two
@@ -35,7 +39,6 @@ fails that pull request until the section has moved.
   a helper kept alive only by its own tests. Recorded honestly, the change does weaken one
   guard — an arm reporting more errors than attempts is divided down on a merged pack and
   can now publish where it previously withheld (`test_the_over_one_guard_is_pinned_on_the_shape_that_can_actually_defeat_it`).
-
 
 ## [0.30.9] - 2026-09-06
 
