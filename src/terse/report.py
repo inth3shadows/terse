@@ -714,6 +714,21 @@ def _unmeasured(rows: list[dict]) -> bool:
     return False
 
 
+class MixedSchemaError(ValueError):
+    """A results pack mixes rows that carry `<arm>_errors` with rows that do not (#386).
+
+    Raised by `_distrust_loss_share` and everything above it (`_unmeasured`,
+    `_credited_loss_share`, `dropeval_verdict`). The CLI reports it as an input error and
+    exits 2 — it is not a verdict, and must never become one."""
+
+    def __init__(self, arm: str, n_with: int, n_without: int) -> None:
+        self.arm, self.n_with, self.n_without = arm, n_with, n_without
+        super().__init__(
+            f"results pack mixes two schemas for arm {arm!r}: {n_with} row(s) carry "
+            f"`{arm}_errors` and {n_without} do not, so the run's transport loss cannot be "
+            f"identified. Re-run the eval with one producer; do not merge result files.")
+
+
 def _credited_loss_share(rows: list[dict], arm: str) -> float | None:
     """What fraction of the calls BEHIND AN ACCURACY this arm reported lost.
 
@@ -773,17 +788,31 @@ def _distrust_loss_share(rows: list[dict], arm: str) -> float | None:
         guard, since a refused share is a share that cannot fire.
 
     None when NO row carries the counter, and None when the arm was given no calls --
-    absence, which is not a loss of 0.0 and must not be compared to a threshold as one."""
+    absence, which is not a loss of 0.0 and must not be compared to a threshold as one.
+    Raises `MixedSchemaError` when SOME rows carry it and others do not (#386) — see the
+    comment at the check."""
     err_key = f"{arm}_errors"
-    if not any(err_key in r for r in rows):
+    n_with = sum(1 for r in rows if err_key in r)
+    if not n_with:
         return None
+    if n_with != len(rows):
+        # Some rows state the counter and some do not: two producer generations in one
+        # pack. The whole-run share is then UNIDENTIFIED — the rows without a counter
+        # cannot say how many calls they lost, so any division here is a lower bound
+        # presented as a rate, and on this shape an arm reporting more errors than
+        # attempts (an emitter bug) divides down to a share that publishes (#386). No
+        # live producer emits this shape (`dropeval.py` writes both counters on every
+        # row, and nothing concatenates result files), so it is refused as INPUT, not
+        # scored as `NOT_CONCLUDED`: `NOT_CONCLUDED (2) < BLOCK (3)`, and a schema
+        # problem must never be able to improve a verdict.
+        raise MixedSchemaError(arm, n_with, len(rows) - n_with)
     # The BARE arm name, not a re-spelled `<arm>_trials` — `_arm_attempts` normalizes
     # either form, and `test_only_one_place_derives_the_arm_to_trials_key` refuses a
     # second copy of that swap.
     attempts = sum(_arm_attempts(r, arm, int(r.get("trials", 1))) for r in rows)
     if not attempts:
         return None
-    return sum(int(r[err_key]) for r in rows if err_key in r) / attempts
+    return sum(int(r[err_key]) for r in rows) / attempts
 
 
 # Why a gap is never computed from two bare `_form_stats` calls again (#280).

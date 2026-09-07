@@ -13,7 +13,21 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+
+- **A results pack whose rows disagree on whether `<arm>_errors` exists is refused as
+  input, not scored** (`#386`). `#383` made `_unmeasured`'s transport share whole-run on a
+  pack merged from a producer predating the counter and one emitting it. On that pack the
+  whole-run number is a lower bound dressed as a rate — the legacy rows cannot say what
+  they lost, so the true share is unidentified — and `#383` had to record a real weakening
+  because of it: an arm reporting more errors than attempts was divided down by rows
+  carrying no counter and could publish. No live producer emits the shape (`dropeval`
+  writes both counters on every row and nothing concatenates result files), so it is now
+  a `MixedSchemaError` from `_distrust_loss_share`; `tune --drop-eval` and
+  `fluency --drop-eval` print `dropeval: input error:` and exit 2. A schema problem can no
+  longer reach the verdict lattice, where `NOT_CONCLUDED (2) < BLOCK (3)` would let it
+  improve a verdict, and the over-1.0 guard `#383` weakened is whole again: an impossible
+  counter either fires trigger 4 or is refused.
 
 ## [0.30.10] - 2026-09-07
 

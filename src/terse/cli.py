@@ -50,6 +50,7 @@ from .probes import (
     value_redundancy,
 )
 from .report import (
+    MixedSchemaError,
     build_cross_server_probe_report,
     build_probe_report,
     build_report,
@@ -1056,7 +1057,14 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
     results = dropeval.run_drop_fluency(envelopes, pol.select, answerers,
                                         trials=args.trials,
                                         control=not args.no_control)
-    print("\n" + build_dropeval_report(results, accept_degraded=args.accept_degraded))
+    try:
+        report = build_dropeval_report(results, accept_degraded=args.accept_degraded)
+    except MixedSchemaError as exc:
+        # Input, not a verdict (#386): a pack whose rows disagree on the error counters
+        # cannot be scored, and `NOT_CONCLUDED` would read as a better outcome than BLOCK.
+        print(f"dropeval: input error: {exc}", file=sys.stderr)
+        return 2
+    print("\n" + report)
     coverage = render_drop_coverage(coverage_rows)
     if coverage:
         print("\n" + coverage)
@@ -1240,9 +1248,12 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
 
         coverage = render_drop_coverage(
             dropeval.drop_eval_coverage(envelopes, pol.select))
-        _write_report(build_dropeval_report(results, accept_degraded=args.accept_degraded)
-                      + ("\n" + coverage if coverage else ""),
-                      args.out)
+        try:
+            report = build_dropeval_report(results, accept_degraded=args.accept_degraded)
+        except MixedSchemaError as exc:
+            print(f"dropeval: input error: {exc}", file=sys.stderr)   # #386, see above
+            return 2
+        _write_report(report + ("\n" + coverage if coverage else ""), args.out)
         if args.bars:
             print("\n" + build_terminal_dropeval_report(results,
                                                          accept_degraded=args.accept_degraded))
