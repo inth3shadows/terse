@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from test_codeceval import PAYLOAD as CODEC_PAYLOAD
 from test_fluency import DIFF_CURR, DIFF_PREV, PAYLOAD, TEXT_CURR, TEXT_PREV, _soak_envs
 
 from terse import dropeval, fluency
@@ -23,7 +24,7 @@ from terse.fluency.harnesses import progress_line
 
 
 def _lines_for(model, lines):
-    return [ln for ln in lines if f" {model} " in ln]
+    return [ln for ln in lines if f" {model} " in ln or f" {model}:" in ln]
 
 
 def _questions(line):
@@ -144,8 +145,94 @@ def test_run_drop_fluency_reports_per_model_per_payload_and_counts_skips_as_done
                               progress=lines.append)
     for model in ("m1", "m2"):
         mine = _lines_for(model, lines)
-        assert [_done_total(ln) for ln in mine] == [(1, 2), (2, 2)], mine
+        assert [_done_total(ln) for ln in mine] == [(1, 2)], mine
         assert all(ln.startswith("[drop-eval]") for ln in mine)
+    # The skipped envelope gets ONE line, not one per model (review finding: 1,000 lines
+    # in 0.19s for 5 models over 200 mostly-skipped envelopes), and it carries `done`
+    # to `total` so the run's last line reads finished.
+    skips = [ln for ln in lines if "(skipped" in ln]
+    assert len(skips) == 1 and _done_total(skips[0]) == (2, 2) and "nothing.here" in skips[0]
+    assert _done_total(lines[-1]) == (2, 2)
+    assert len(lines) == 3
+
+
+def test_codec_verdict_harness_reports_like_the_drop_eval(tmp_path):
+    """`--codec-verdict` was the one live mode #267's first cut left silent (review
+    finding). Same envelope-outer loop, same contract: one line per (model, payload)
+    that ran, one per skipped payload, `done` reaching `total`."""
+    from terse import codeceval
+
+    envs = [{"tool": "t", "sha": "a", "raw": json.dumps(CODEC_PAYLOAD)},
+            {"tool": "t", "sha": "b", "raw": "not json"}]
+    lines: list[str] = []
+    answerers = {"m1": lambda m: dropeval.Turn(text="no"),
+                 "m2": lambda m: dropeval.Turn(text="no")}
+    codeceval.run_codec_fluency(envs, answerers, trials=1, progress=lines.append)
+    assert lines and all(ln.startswith("[fluency --codec-verdict]") for ln in lines)
+    assert _done_total(lines[-1]) == (2, 2)
+    assert sum("(skipped" in ln for ln in lines) == 1
+    assert len(lines) == 3, lines   # 2 models x 1 scorable payload + 1 skip
+    codeceval.run_codec_fluency(envs, answerers, trials=1)   # silent when not asked
+
+
+def test_model_outer_harnesses_name_the_model_index_and_restart_the_clock():
+    """Model-outer harnesses reset `done/total` per model, so the last line of model 1
+    read `N/N` and looked finished, and an elapsed clock spanning models made model 5's
+    first line read `1/N ... (2160s)` (review finding). Every line now says which model
+    of how many, and the clock is per model."""
+    envs = [{"tool": "t", "sha": "a", "raw": json.dumps(PAYLOAD)}]
+    lines: list[str] = []
+    fluency.run_fluency(envs, {"m1": lambda s, u: "", "m2": lambda s, u: ""}, trials=1,
+                        progress=lines.append)
+    assert "m1 (model 1/2)" in lines[0] and "m2 (model 2/2)" in lines[1]
+    # Clock: a per-model `started` reads ~0s on model 2's first line even when model 1
+    # took time. Driven through the harness with a fake clock that advances 100s per
+    # model call: with a shared clock model 2's only line would read (200s).
+    from terse.fluency import harnesses
+
+    tick = {"t": 0.0}
+
+    def clock():
+        return tick["t"]
+
+    def slow(system, user):
+        tick["t"] += 100.0
+        return ""
+
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(harnesses.time, "monotonic", clock)
+    try:
+        lines = []
+        fluency.run_fluency(envs, {"m1": slow, "m2": slow}, trials=1, progress=lines.append)
+    finally:
+        monkey.undo()
+    m1_s = int(lines[0].rsplit("(", 1)[1].rstrip("s)"))
+    m2_s = int(lines[1].rsplit("(", 1)[1].rstrip("s)"))
+    assert m1_s == m2_s > 0, lines
+    lines = []
+    fluency.run_diff_soak(_soak_envs(n=8), {"m1": lambda s, u: ""}, trials=1, max_depth=3,
+                          per_depth_cap=2, progress=lines.append)
+    assert all("(model 1/1)" in ln for ln in lines)
+
+
+def test_a_raising_progress_callback_cannot_abort_the_run():
+    """A closed stderr raises `BrokenPipeError` from the callback; unguarded, that
+    discarded every scored row -- the loss #267 is about, caused by its own fix (review
+    finding). The callback is dropped after its first failure; the run completes."""
+    def broken(line):
+        raise BrokenPipeError("stderr closed")
+
+    envs = [{"tool": "t", "sha": "a", "raw": json.dumps(PAYLOAD)}] * 2
+    results = fluency.run_fluency(envs, {"m": lambda s, u: ""}, trials=1, progress=broken)
+    assert results["m"], "the run must complete and keep its rows"
+    calls = []
+
+    def once(line):
+        calls.append(line)
+        raise RuntimeError("first call fails")
+
+    fluency.run_fluency(envs, {"m": lambda s, u: ""}, trials=1, progress=once)
+    assert len(calls) == 1, "dropped after the first failure, not retried per line"
 
 
 # --------------------------------------------------------------------------- #
@@ -159,6 +246,7 @@ _CLI_MODES = {
     "diff": (["--diff"], "[fluency --diff]", "json"),
     "diff-soak": (["--diff-soak"], "[fluency --diff-soak]", "soak"),
     "text-diff": (["--text-diff-eval"], "[fluency --text-diff]", "text"),
+    "codec-verdict": (["--codec-verdict"], "[fluency --codec-verdict]", "codec"),
 }
 
 
@@ -169,6 +257,8 @@ def _write_corpus(corpus, kind):
                 for sha, obj in (("aaa", DIFF_PREV), ("bbb", DIFF_CURR))]
     elif kind == "soak":
         envs = _soak_envs(n=8)
+    elif kind == "codec":
+        envs = [{"tool": "demo", "sha": "aaa", "raw": json.dumps(CODEC_PAYLOAD)}]
     else:
         envs = [{"tool": "tt", "sha": "aaa", "raw": TEXT_PREV},
                 {"tool": "tt", "sha": "bbb", "raw": TEXT_CURR}]
@@ -187,8 +277,12 @@ def test_the_cli_streams_progress_to_stderr_and_keeps_stdout_clean(tmp_path, mon
     flags, label, kind = _CLI_MODES[mode]
     corpus = tmp_path / "corpus"
     _write_corpus(corpus, kind)
+    # `--codec-verdict` builds tool-capable answerers (one `messages` arg); the rest are
+    # single-shot `(system, user)` answerers. Both stubs answer every question wrong.
+    stub = ((lambda m: dropeval.Turn(text="no")) if mode == "codec-verdict"
+            else (lambda s, u: "9"))
     monkeypatch.setattr(cli, "_build_answerers",
-                        lambda args, make: {"stub-model": lambda s, u: "9"})
+                        lambda args, make, **kw: {"stub-model": stub})
     argv = ["fluency", "--corpus", str(corpus), "--out", str(tmp_path / "rep.md"), *flags]
     assert main(argv) == 0
     out, err = capsys.readouterr()

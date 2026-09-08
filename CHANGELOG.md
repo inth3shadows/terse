@@ -15,6 +15,30 @@ fails that pull request until the section has moved.
 
 ### Added
 
+- **`terse fluency` and the drop-eval stream progress to stderr as work completes**
+  (`#267`). Every mode buffered its whole report and printed on completion, so a
+  45-minute run and a wedged one were identical for the whole duration — `#263`'s own
+  report names a 66-minute run with zero output, and `#264` fixed only the false verdict
+  at the end of it. Each live harness (`run_fluency`, `run_diff_fluency`,
+  `run_diff_soak`, `run_text_diff_fluency`, `run_drop_fluency`) now takes
+  `progress=None` and, when given, emits one cumulative line per (model, payload):
+  `[fluency] gemini-3.6-flash   4/9 payload(s)  27 question(s)  2/108 call(s) failed  (21s)`
+  — the per-arm failure counters `#264` added, surfaced live, so a run accumulating
+  transport failures at payload 1 is one to kill at payload 1. Skipped payloads still
+  advance `done` (one line per skip, not one per model), so the last line of a run
+  always reads `N/N`; the model-outer harnesses say `(model k/M)` on every line and time
+  each model from its own start, so model 1's `N/N` does not read as the run finishing
+  (review finding). `--codec-verdict` gets the same lines. The callback is guarded — a
+  closed stderr drops it rather than aborting the run and losing every scored row. The
+  CLI wires it at all seven call sites; the harnesses themselves print nothing, so tests
+  that drive them stay quiet. stderr only — `--out` and stdout piping are untouched.
+  Partial-result persistence (rows written as each model finishes) is the strictly
+  larger fix the issue splits out, and is not here.
+
+## [0.31.0] - 2026-09-08
+
+### Added
+
 - **`terse tune` states its sample's provenance under the payload count** (`#380`).
   The header said `1524 payload(s)` and nothing about what those payloads were: how many
   carry a `result_id` (its absence dates a capture to before `#116` folded a
@@ -51,21 +75,6 @@ fails that pull request until the section has moved.
   directive and remedy. `_accuracy_gate` keeps its own refusal ahead of the
   `no control arm` exit, which a pack mixed on `control_trials` alone would otherwise
   take before `_gap`'s check ran (found by mutation).
-- **`terse fluency` and the drop-eval stream progress to stderr as work completes**
-  (`#267`). Every mode buffered its whole report and printed on completion, so a
-  45-minute run and a wedged one were identical for the whole duration — `#263`'s own
-  report names a 66-minute run with zero output, and `#264` fixed only the false verdict
-  at the end of it. Each live harness (`run_fluency`, `run_diff_fluency`,
-  `run_diff_soak`, `run_text_diff_fluency`, `run_drop_fluency`) now takes
-  `progress=None` and, when given, emits one cumulative line per (model, payload):
-  `[fluency] gemini-3.6-flash   4/9 payload(s)  27 question(s)  2/108 call(s) failed  (21s)`
-  — the per-arm failure counters `#264` added, surfaced live, so a run accumulating
-  transport failures at payload 1 is one to kill at payload 1. Skipped payloads still
-  advance `done`, so the last line of a run always reads `N/N`. The CLI wires it at all
-  six call sites; the harnesses themselves print nothing, so tests that drive them stay
-  quiet. stderr only — `--out` and stdout piping are untouched. Partial-result
-  persistence (rows written as each model finishes) is the strictly larger fix the issue
-  splits out, and is not here.
 
 ## [0.30.11] - 2026-09-07
 

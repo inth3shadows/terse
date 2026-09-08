@@ -1345,7 +1345,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             print("`fluency --codec-verdict` needs a configured model: set "
                   "TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS.")
             return 1
-        results = codeceval.run_codec_fluency(envelopes, answerers, trials=args.trials)
+        results = codeceval.run_codec_fluency(envelopes, answerers, trials=args.trials,
+                                              progress=_stderr_progress)
         _write_report(build_codec_verdict_report(results), args.out)
         return 0
 

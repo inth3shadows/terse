@@ -773,20 +773,21 @@ def run_drop_fluency(envelopes: list[dict], rule_for: Callable[..., Any],
     `_questions_and_staging` derivation for a payload are the SAME regardless of which
     model answers it, so doing that work per-envelope instead of per-(model, envelope)
     avoids M times the redundant parsing/policy.apply() work for M configured models."""
-    from .fluency.harnesses import progress_line
-
     results: dict[str, list[dict]] = {name: [] for name in answerers}
+    progress = fluency.guarded(progress)
     started = time.monotonic()
     for i, env in enumerate(envelopes, 1):
         probe, rule, payload, is_json = _probe_envelope(env, rule_for)
         if not probe.questions:
             # Skipped payloads still count as done (#267): `done` has to reach `total`
             # or the last line of a run that ends on a skip reads as unfinished. No model
-            # was asked, so one line is enough — the per-model counts did not move.
+            # was asked, so ONE line — not one per model: a sparse drop policy over a
+            # 1,500-envelope corpus skips nearly everything, and M lines per skip flushed
+            # in a burst scroll the lines that report real work out of the terminal
+            # (review finding: 1,000 lines in 0.19s for 5 models over 200 envelopes).
             if progress is not None:
-                for name in answerers:
-                    progress(progress_line("drop-eval", name, i, len(envelopes),
-                                           results[name], started))
+                progress(f"[drop-eval] (skipped: {probe.reason}) "
+                         f"{env.get('tool', '?'):<24} {i}/{len(envelopes)} payload(s)")
             continue
         assert probe.applied is not None and probe.staging is not None
         tool = env["tool"]
@@ -798,8 +799,8 @@ def run_drop_fluency(envelopes: list[dict], rule_for: Callable[..., Any],
                                               fn, trials=trials, control_text=ctl):
                 results[name].append({"tool": tool, "sha": env.get("sha", "?"), **row})
             if progress is not None:
-                progress(progress_line("drop-eval", name, i, len(envelopes), results[name],
-                                       started))
+                progress(fluency.progress_line("drop-eval", name, i, len(envelopes),
+                                               results[name], started))
     return results
 
 
