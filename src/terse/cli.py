@@ -325,6 +325,13 @@ def _warn_if_dropping_capture_rules(out: Path) -> None:
               "you still want before relying on this file", file=sys.stderr)
 
 
+def _stderr_progress(line: str) -> None:
+    """The `progress` every live fluency/drop-eval run gets (#267): one line per
+    (model, payload) to stderr, flushed, so a 45-minute run is distinguishable from a
+    hung one from the first payload on. stderr keeps `--out` and stdout piping intact."""
+    print(line, file=sys.stderr, flush=True)
+
+
 def _print_corpus_identity_note(envelopes: list, out=None) -> None:
     """Say which of this run's inputs were GUESSED rather than read (#148, #152).
 
@@ -1107,7 +1114,8 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
           "when the dropped field is needed, and skip it when not?)...")
     results = dropeval.run_drop_fluency(envelopes, pol.select, answerers,
                                         trials=args.trials,
-                                        control=not args.no_control)
+                                        control=not args.no_control,
+                                        progress=_stderr_progress)
     try:
         report = build_dropeval_report(results, accept_degraded=args.accept_degraded)
         # Computed INSIDE the guard, not after it: the verdict below sees the same rows
@@ -1297,7 +1305,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             return 1
         results = dropeval.run_drop_fluency(envelopes, pol.select, answerers,
                                             trials=args.trials,
-                                            control=not args.no_control)
+                                            control=not args.no_control,
+                                            progress=_stderr_progress)
         # Appended to the SAME report, not printed beside it: a report written to `--out`
         # and read later must carry its own coverage gaps, or a reader has no way to tell
         # "this tool passed" from "this tool was never posed a question" (#375).
@@ -1336,7 +1345,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             print("`fluency --codec-verdict` needs a configured model: set "
                   "TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS.")
             return 1
-        results = codeceval.run_codec_fluency(envelopes, answerers, trials=args.trials)
+        results = codeceval.run_codec_fluency(envelopes, answerers, trials=args.trials,
+                                              progress=_stderr_progress)
         _write_report(build_codec_verdict_report(results), args.out)
         return 0
 
@@ -1348,7 +1358,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             print("`fluency --diff` needs a configured model: set TERSE_FLUENCY_BASE_URL/"
                   "_API_KEY/_MODELS.")
             return 1
-        results = fluency.run_diff_fluency(envelopes, answerers, trials=args.trials)
+        results = fluency.run_diff_fluency(envelopes, answerers, trials=args.trials,
+                                           progress=_stderr_progress)
         _write_report(build_diff_report(results), args.out)
         _maybe_write_diff_html(args, results)
         if args.bars:
@@ -1366,7 +1377,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             return 1
         results = fluency.run_diff_soak(envelopes, answerers, trials=args.trials,
                                         max_depth=args.soak_depth,
-                                        per_depth_cap=args.soak_windows)
+                                        per_depth_cap=args.soak_windows,
+                                        progress=_stderr_progress)
         _write_report(build_diff_soak_report(results), args.out)
         _maybe_write_diff_html(args, results, form_label="chain-form")
         if args.bars:
@@ -1382,7 +1394,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             print("`fluency --text-diff-eval` needs a configured model: set "
                   "TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS.")
             return 1
-        results = fluency.run_text_diff_fluency(envelopes, answerers, trials=args.trials)
+        results = fluency.run_text_diff_fluency(envelopes, answerers, trials=args.trials,
+                                                progress=_stderr_progress)
         _write_report(build_text_diff_report(results), args.out)
         _maybe_write_diff_html(args, results, control_label="raw text")
         if args.bars:
@@ -1428,7 +1441,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
               f"--pack {out}`.")
         return 0
 
-    results = fluency.run_fluency(envelopes, answerers, trials=args.trials)
+    results = fluency.run_fluency(envelopes, answerers, trials=args.trials,
+                                  progress=_stderr_progress)
     report = build_fluency_report(results, fluency.token_summary(envelopes))
     _write_report(report, args.out)
     if args.bars:

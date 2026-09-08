@@ -10,6 +10,8 @@ reports cross-tokenizer divergence rather than averaging it away).
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
 from typing import Any
 
 from .. import text_diff
@@ -147,24 +149,89 @@ def run_payload(obj: Any, raw_text: str, answerer: Answerer,
     return out
 
 
+# One line per (model, payload) as work completes, or nothing (#267). Every `run_*`
+# harness takes `progress=None`: the harnesses are pure functions the tests drive
+# directly, and printing from them would put stderr noise in every unit test and couple
+# measurement code to a terminal. The CLI passes `stderr_progress`, so a 45-minute run
+# is distinguishable from a hung one at minute 5 rather than minute 45 — and the
+# per-arm failure counters #264 added are exactly what to surface live: a run visibly
+# accumulating transport failures early is one to kill early.
+Progress = Callable[[str], None]
+
+
+def guarded(progress: Progress | None) -> Progress | None:
+    """`progress`, made unable to abort the run it reports on.
+
+    A closed stderr (`2>&-`, a full pipe) raises `BrokenPipeError` from the callback, and
+    an unguarded raise at the emit site discards every scored row — the exact loss #267
+    describes, caused by the feature meant to prevent it. The same rule `_safe_ask`
+    applies to a model call: one failure never aborts a long multi-model run. After the
+    first failure the callback is dropped for the rest of the run rather than retried
+    per line (review finding)."""
+    if progress is None:
+        return None
+    state = {"alive": True}
+
+    def emit(line: str) -> None:
+        if not state["alive"]:
+            return
+        try:
+            progress(line)
+        except Exception:
+            state["alive"] = False
+
+    return emit
+
+
+def progress_line(label: str, model: str, done: int, total: int, rows: list[dict],
+                  started: float, *, now: float | None = None,
+                  model_index: tuple[int, int] | None = None) -> str:
+    """The one line `progress` receives after a payload completes for a model.
+
+    `rows` is everything scored for that model SO FAR, so the counts are cumulative: a
+    reader compares two lines and sees the rate. Failures read `fails` (the fluency
+    harnesses) or `errors` (dropeval) — the two names #264/#299 gave the same counter —
+    over `attempts`, which both emit. `model_index` is `(k, M)` for the model-outer
+    harnesses, where `done/total` resets per model: without it the last line of model 1
+    of 5 reads `N/N` and looks like the run finished (review finding). `started` is
+    per model there too, for the same reason — an elapsed clock spanning models makes
+    model 5's first line read `1/N ... (2160s)`."""
+    fails = sum(int(r.get("fails", r.get("errors", 0))) for r in rows)
+    attempts = sum(int(r.get("attempts", 0)) for r in rows)
+    elapsed = (time.monotonic() if now is None else now) - started
+    who = f"{model} (model {model_index[0]}/{model_index[1]})" if model_index else model
+    return (f"[{label}] {who:<24} {done}/{total} payload(s)  {len(rows)} question(s)  "
+            f"{fails}/{attempts} call(s) failed  ({elapsed:.0f}s)")
+
+
 def run_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
-                primer: str = PRIMER, trials: int = 1) -> dict:
+                primer: str = PRIMER, trials: int = 1,
+                progress: Progress | None = None) -> dict:
     """Run the eval for each named answerer over every record-shaped payload.
 
     Returns {model_name: [scored_row, ...]} where each row carries tool/sha plus the
     per-form success counts and trial count. Payloads that generate no questions
     (no record list, no nested dict-map, not a flat record) are skipped.
+
+    `progress`, when given, receives one `progress_line` per (model, payload) as each
+    completes — including payloads that were skipped, so `done` reaches `total`.
     """
     results: dict[str, list[dict]] = {}
-    for name, fn in answerers.items():
+    progress = guarded(progress)
+    for k, (name, fn) in enumerate(answerers.items(), 1):
         rows: list[dict] = []
-        for env in envelopes:
+        started = time.monotonic()
+        for i, env in enumerate(envelopes, 1):
             try:
                 obj = json.loads(env["raw"])
             except (json.JSONDecodeError, TypeError):
-                continue
-            for row in run_payload(obj, env["raw"], fn, primer, trials):
-                rows.append({"tool": env["tool"], "sha": env.get("sha", "?"), **row})
+                obj = None
+            if obj is not None:
+                for row in run_payload(obj, env["raw"], fn, primer, trials):
+                    rows.append({"tool": env["tool"], "sha": env.get("sha", "?"), **row})
+            if progress is not None:
+                progress(progress_line("fluency", name, i, len(envelopes), rows, started,
+                                       model_index=(k, len(answerers))))
         results[name] = rows
     return results
 
@@ -232,21 +299,27 @@ def _iter_consecutive_pairs(envelopes: list[dict]):
 
 
 def _aggregate_by_model(pairs: list[tuple], answerers: dict[str, Answerer], trials: int,
-                        payload_fn) -> dict:
+                        payload_fn, label: str = "fluency --diff",
+                        progress: Progress | None = None) -> dict:
     """Shared per-model aggregation loop for run_diff_fluency/run_text_diff_fluency:
     run `payload_fn` over every pair for every answerer and collect the rows."""
     results: dict[str, list[dict]] = {}
-    for name, fn in answerers.items():
+    progress = guarded(progress)
+    for k, (name, fn) in enumerate(answerers.items(), 1):
         rows: list[dict] = []
-        for tool, csha, a, b in pairs:
+        started = time.monotonic()
+        for i, (tool, csha, a, b) in enumerate(pairs, 1):
             for row in payload_fn(a, b, fn, tool, trials=trials):
                 rows.append({"tool": tool, "sha": csha, **row})
+            if progress is not None:
+                progress(progress_line(label, name, i, len(pairs), rows, started,
+                                       model_index=(k, len(answerers))))
         results[name] = rows
     return results
 
 
 def run_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
-                     trials: int = 1) -> dict:
+                     trials: int = 1, progress: Progress | None = None) -> dict:
     """Run the diff-fluency eval over consecutive same-tool payload PAIRS (sorted by sha
     for determinism — the order the proxy would see them). Returns {model: [rows]}."""
     pairs: list[tuple] = []
@@ -257,7 +330,8 @@ def run_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
         except (json.JSONDecodeError, TypeError):
             continue
         pairs.append((tool, csha, prev_obj, curr_obj))
-    return _aggregate_by_model(pairs, answerers, trials, run_diff_payload)
+    return _aggregate_by_model(pairs, answerers, trials, run_diff_payload,
+                               progress=progress)
 
 
 # --------------------------------------------------------------------------- #
@@ -380,18 +454,23 @@ def run_chain_payload(objs: list, answerer: Answerer, tool: str = "",
 
 def run_diff_soak(envelopes: list[dict], answerers: dict[str, Answerer],
                   trials: int = 1, max_depth: int = 5,
-                  per_depth_cap: int = 6) -> dict:
+                  per_depth_cap: int = 6, progress: Progress | None = None) -> dict:
     """Score every answerer over the same depth-1..max_depth chain windows.
     Returns {model: [row,...]} where each row also carries `depth` — the report
     aggregates by it to show comprehension as a function of chain depth."""
     windows = build_chain_windows(envelopes, max_depth=max_depth,
                                   per_depth_cap=per_depth_cap)
     results: dict[str, list[dict]] = {}
-    for name, fn in answerers.items():
+    progress = guarded(progress)
+    for k, (name, fn) in enumerate(answerers.items(), 1):
         rows: list[dict] = []
-        for tool, sha, _depth, objs in windows:
+        started = time.monotonic()
+        for i, (tool, sha, _depth, objs) in enumerate(windows, 1):
             for row in run_chain_payload(objs, fn, tool, trials=trials):
                 rows.append({"tool": tool, "sha": sha, **row})
+            if progress is not None:
+                progress(progress_line("fluency --diff-soak", name, i, len(windows), rows,
+                                       started, model_index=(k, len(answerers))))
         results[name] = rows
     return results
 
@@ -450,7 +529,7 @@ def run_text_diff_payload(prev: str, curr: str, answerer: Answerer,
 
 
 def run_text_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
-                          trials: int = 1) -> dict:
+                          trials: int = 1, progress: Progress | None = None) -> dict:
     """Same tool-pairing loop as run_diff_fluency, inverted: only pairs envelopes whose
     raw text is NOT valid JSON on EITHER side (text-diff's domain; JSON payloads are
     run_diff_fluency's domain instead) — classify_shape (already used by measure.py)
@@ -463,4 +542,5 @@ def run_text_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
         if classify_shape(prev_raw) not in (LONG_TEXT, OTHER):
             continue  # prev is JSON-shaped -> not a text-to-text transition
         pairs.append((tool, csha, prev_raw, curr_raw))
-    return _aggregate_by_model(pairs, answerers, trials, run_text_diff_payload)
+    return _aggregate_by_model(pairs, answerers, trials, run_text_diff_payload,
+                               label="fluency --text-diff", progress=progress)

@@ -75,6 +75,8 @@ safety verdict, and a silent non-answer must not be able to shrink itself out of
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
 from typing import Any
 
 from . import capture, fluency
@@ -238,7 +240,8 @@ def _payload_tokens(raw_text: str, obj: Any) -> dict[str, int]:
 
 
 def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
-                      trials: int = 1) -> dict[str, list[dict]]:
+                      trials: int = 1,
+                      progress: Callable[[str], None] | None = None) -> dict[str, list[dict]]:
     """Run the codec-tier eval for each named tool-capable answerer over every payload in
     the corpus that has at least one `deref` question. Mirrors `dropeval.run_drop_fluency`'s
     envelope-outer/model-inner nesting (question generation is model-independent, so it is
@@ -258,12 +261,19 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
     for `report._codec_savings_section` to de-duplicate by `sha` and report beside the
     verdict."""
     results: dict[str, list[dict]] = {name: [] for name in answerers}
-    for env in envelopes:
+    progress = fluency.guarded(progress)
+    started = time.monotonic()
+    for i, env in enumerate(envelopes, 1):
         try:
             obj = json.loads(env["raw"])
         except (json.JSONDecodeError, TypeError):
-            continue  # deref needs parsed JSON structure; a non-JSON/text payload has none
-        if not gen_codec_questions(obj):
+            obj = None  # deref needs parsed JSON structure; a non-JSON/text payload has none
+        if obj is None or not gen_codec_questions(obj):
+            # One line per skip, like `run_drop_fluency` (#267): `done` reaches `total`
+            # without M near-identical lines per skipped envelope.
+            if progress is not None:
+                progress(f"[fluency --codec-verdict] (skipped) {env.get('tool', '?'):<24} "
+                         f"{i}/{len(envelopes)} payload(s)")
             continue
         toks = _payload_tokens(env["raw"], obj)
         # `sha` is OMITTED, never defaulted, when the envelope has no usable one. `tool`
@@ -288,4 +298,7 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
         for name, answerer in answerers.items():
             for row in run_codec_payload(obj, env["raw"], answerer, trials=trials):
                 results[name].append({**tags, **toks, **row})
+            if progress is not None:
+                progress(fluency.progress_line("fluency --codec-verdict", name, i,
+                                               len(envelopes), results[name], started))
     return results

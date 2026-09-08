@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 import urllib.request
 from collections import Counter
 from collections.abc import Callable
@@ -761,7 +762,8 @@ def _probe_envelope(env: dict, rule_for: Callable[..., Any]) -> tuple[DropProbe,
 
 def run_drop_fluency(envelopes: list[dict], rule_for: Callable[..., Any],
                      answerers: dict[str, ToolAnswerer], trials: int = 1,
-                     control: bool = False) -> dict:
+                     control: bool = False,
+                     progress: Callable[[str], None] | None = None) -> dict:
     """Run the drop-eval for each named tool-capable answerer over every record-shaped,
     drop-marked payload in the corpus. Mirrors `fluency.run_diff_fluency`'s shape.
     Returns {model_name: [scored_row, ...]}; a payload/tool with no drop-marked field
@@ -772,9 +774,20 @@ def run_drop_fluency(envelopes: list[dict], rule_for: Callable[..., Any],
     model answers it, so doing that work per-envelope instead of per-(model, envelope)
     avoids M times the redundant parsing/policy.apply() work for M configured models."""
     results: dict[str, list[dict]] = {name: [] for name in answerers}
-    for env in envelopes:
+    progress = fluency.guarded(progress)
+    started = time.monotonic()
+    for i, env in enumerate(envelopes, 1):
         probe, rule, payload, is_json = _probe_envelope(env, rule_for)
         if not probe.questions:
+            # Skipped payloads still count as done (#267): `done` has to reach `total`
+            # or the last line of a run that ends on a skip reads as unfinished. No model
+            # was asked, so ONE line — not one per model: a sparse drop policy over a
+            # 1,500-envelope corpus skips nearly everything, and M lines per skip flushed
+            # in a burst scroll the lines that report real work out of the terminal
+            # (review finding: 1,000 lines in 0.19s for 5 models over 200 envelopes).
+            if progress is not None:
+                progress(f"[drop-eval] (skipped: {probe.reason}) "
+                         f"{env.get('tool', '?'):<24} {i}/{len(envelopes)} payload(s)")
             continue
         assert probe.applied is not None and probe.staging is not None
         tool = env["tool"]
@@ -785,6 +798,9 @@ def run_drop_fluency(envelopes: list[dict], rule_for: Callable[..., Any],
             for row in _run_questions_against(probe.questions, probe.applied, probe.staging,
                                               fn, trials=trials, control_text=ctl):
                 results[name].append({"tool": tool, "sha": env.get("sha", "?"), **row})
+            if progress is not None:
+                progress(fluency.progress_line("drop-eval", name, i, len(envelopes),
+                                               results[name], started))
     return results
 
 
