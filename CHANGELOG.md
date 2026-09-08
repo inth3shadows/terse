@@ -13,7 +13,24 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A results pack whose rows disagree on `control_ok` / `control_trials` is refused as
+  input, the same policy `#386` set for `<arm>_errors`** (`#387`). `_accuracy_gate`
+  handled the sibling shape the opposite way, four lines from the site that refuses a
+  pack mixed on `control_errors`: a soft `partial control coverage` exclusion,
+  `NOT_CONCLUDED`, which is exactly what `#386` exists to prevent — a schema problem
+  reaching the lattice where `NOT_CONCLUDED (2) < BLOCK (3)` lets it improve a verdict.
+  The shape is not a live measurement fact: `--control` is decided once per run
+  (`_control_text` always returns a string; both callers gate on the run-level flag), so
+  every row of a live pack carries both keys or neither, and a pack carrying them on
+  SOME rows is two runs' files merged. `_refuse_mixed_schema` now checks the two control
+  keys alongside every `<arm>_errors` counter — whether or not a caller narrowed it to
+  one arm — `MixedSchemaError` names the key that split the pack, and the
+  `partial control coverage` reason is gone from `ExclusionReason`, its label, heading,
+  directive and remedy. `_accuracy_gate` keeps its own refusal ahead of the
+  `no control arm` exit, which a pack mixed on `control_trials` alone would otherwise
+  take before `_gap`'s check ran (found by mutation).
 
 ## [0.30.11] - 2026-09-07
 

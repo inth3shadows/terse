@@ -23,6 +23,7 @@ here, because a fixture that gives it one tests a harness that does not exist.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -35,6 +36,7 @@ from terse.report import (
     _arm_attempts,
     _credited_loss_share,
     _distrust_loss_share,
+    _refuse_mixed_schema,
     _unmeasured,
     build_dropeval_report,
     dropeval_verdict,
@@ -1158,21 +1160,39 @@ def test_trigger_2_does_not_decide_a_verdict_on_the_presence_of_an_attempts_key(
     assert a.metrics["accuracy"].worst.gap == pytest.approx(-0.10)
 
 
-def test_trigger_2_keeps_a_not_attempted_arm_out_of_its_own_denominator():
-    """The reason the denominator widened to `key in r` and not to `rows` wholesale.
-
-    A `--no-control` pack emits no `control_trials` at all on the rows that ran without
-    one. Dividing a real control loss by calls those rows never made would understate it
-    and let a substantially dead control arm publish. Rows carrying the key ran the arm;
-    rows without it did not, and stay out.
-    """
+def test_trigger_2_never_sees_rows_that_did_not_run_the_control_beside_rows_that_did():
+    """This test used to assert that 95 rows with no `control_trials` did not dilute the
+    control loss of 5 rows that carried it. That pack is not a `--no-control` run: the
+    flag is decided once per run (`dropeval.py:728`, `:783`), so a live pack carries the
+    key on every row or on none, and the mixed shape is two runs' files merged — refused
+    as input since #387, before trigger 2 can read it. The denominator rule the old test
+    guarded is now unreachable on this key; what remains to pin is that the refusal fires
+    ahead of the trigger, on `control_trials` specifically."""
     ran = [{"qid": f"c{i}", "kind": "recall", "trials": 10, "attempts": 20, "answer_ok": 9,
             "control_ok": 2, "control_trials": 2} for i in range(5)]
     never_ran = [{"qid": f"n{i}", "kind": "recall", "trials": 10, "attempts": 10,
                   "answer_ok": 9} for i in range(95)]
+    with pytest.raises(MixedSchemaError, match="5 row\\(s\\) carry `control_ok` and 95 do not"):
+        _unmeasured(ran + never_ran)
+    # The same loss on a uniform pack is still the withhold the old test wanted.
+    assert _unmeasured(ran)
+
+
+def test_trigger_2_keeps_a_not_attempted_arm_out_of_its_own_denominator():
+    """The denominator rule the test above used to pin, re-pinned on a key the refusal
+    does not cover: a hand-built #91 pack carrying `raw_trials` on a subset of its rows.
+    Review of #387 executed the mutation `for r in rows if key in r` -> `for r in rows`
+    against the PR and it SURVIVED the whole suite once the control-key witness became a
+    refusal. 40 lost of the 50 calls the arm made is 0.80 -- a withhold; over every row's
+    calls it is 0.04, and a substantially dead arm publishes."""
+    ran = [{"qid": f"r{i}", "kind": "recall", "trials": 10, "attempts": 10, "answer_ok": 9,
+            "raw_ok": 2, "raw_trials": 2} for i in range(5)]
+    never_ran = [{"qid": f"n{i}", "kind": "recall", "trials": 10, "attempts": 10,
+                  "answer_ok": 9} for i in range(95)]
+    _refuse_mixed_schema(ran + never_ran)   # precondition: this shape is NOT refused
     assert _unmeasured(ran + never_ran), (
-        "8 of 10 control calls lost on every row that ran it is a withhold, and 95 rows "
-        "that never ran the arm must not dilute it")
+        "8 of 10 raw calls lost on every row that ran the arm is a withhold, and 95 rows "
+        "that never ran it must not dilute it")
 
 
 def test_trigger_2_still_refuses_phantom_loss_from_a_row_with_no_attempts_key():
@@ -1403,3 +1423,148 @@ def test_the_refusal_survives_pickle_and_deepcopy():
         assert (clone.arm, clone.n_with, clone.n_without) == ("treatment", 5, 95)
         assert str(clone) == str(exc)
         assert "5 row(s) carry `treatment_errors` and 95 do not" in str(clone)
+
+
+# --------------------------------------------------------------------------- #
+# #387. `_accuracy_gate` used to handle rows disagreeing on `control_ok` as a soft
+# `partial control coverage` exclusion -- NOT_CONCLUDED -- four lines from the site
+# that refuses rows disagreeing on `control_errors`. One defect class, two opposite
+# policies in one function. The shape is unreachable in a live run (`control` is a
+# run-level flag; `_control_text` is `-> str`), so it gets #386's treatment: refused.
+# --------------------------------------------------------------------------- #
+
+_SCHEMA_KEYS = ("treatment_errors", "control_errors", "control_ok", "control_trials")
+
+
+def _uniform_pack(kind="recall", n=40, *, trials=10):
+    """The shape every live producer emits: every schema key on every row."""
+    return [{"qid": f"{kind}{i}", "kind": kind, "trials": trials, "attempts": trials * 2,
+             "answer_ok": 8, "retrieve_ok": 8, "handle_ok": 8,
+             "errors": 0, "treatment_errors": 0, "control_errors": 0,
+             "control_ok": trials, "control_trials": trials} for i in range(n)]
+
+
+def _strip_from_half(rows, key):
+    """The same pack with `key` deleted from the first half -- one key, one split."""
+    half = len(rows) // 2
+    return ([{k: v for k, v in r.items() if k != key} for r in rows[:half]]
+            + [dict(r) for r in rows[half:]])
+
+
+@pytest.mark.parametrize("key", _SCHEMA_KEYS)
+def test_every_producer_schema_key_is_refused_the_same_way(key):
+    """The acceptance line of #387: one policy for "rows disagree on a producer-schema
+    key", applied to every such key, through every entry the pack can reach the gate by.
+    Parametrized rather than written four times so that removing ANY key from the check
+    fails exactly one visible case (mutation check on the PR)."""
+    rows = _strip_from_half(_uniform_pack(), key)
+    assert sum(key in r for r in rows) == 20, "precondition: mixed on exactly this key"
+    expected = re.escape(f"20 row(s) carry `{key}` and 20 do not")
+    with pytest.raises(MixedSchemaError, match=expected):
+        _refuse_mixed_schema(rows)
+    with pytest.raises(MixedSchemaError, match=expected):
+        _unmeasured(rows)
+    with pytest.raises(MixedSchemaError, match=expected):
+        _accuracy_gate(rows)
+    with pytest.raises(MixedSchemaError, match=expected):
+        dropeval_verdict({"m": rows})
+    # And the uniform pack it was cut from is not refused anywhere.
+    _refuse_mixed_schema(_uniform_pack())
+    assert not _unmeasured(_uniform_pack())
+    assert _accuracy_gate(_uniform_pack()).excluded is None
+
+
+def test_the_accuracy_gate_refuses_before_its_no_control_arm_exit():
+    """`_gap` refuses a mixed pack through `_unmeasured`, but `_accuracy_gate` returns
+    `no control arm` BEFORE reaching `_gap` when no row carries `control_ok`. A pack with
+    `control_ok` on no row and `control_trials` on half would take that exit and be
+    scored -- so the gate needs its own refusal ahead of it. Mutation that found this:
+    deleting `_accuracy_gate`'s `_refuse_mixed_schema` call survived every other test."""
+    rows = [{k: v for k, v in r.items() if k != "control_ok"}
+            for r in _strip_from_half(_uniform_pack(), "control_trials")]
+    assert not any("control_ok" in r for r in rows)
+    with pytest.raises(MixedSchemaError, match="20 row\\(s\\) carry `control_trials` and 20 do not"):
+        _accuracy_gate(rows)
+
+
+def test_the_control_keys_are_refused_even_when_the_check_is_narrowed_to_another_arm():
+    """`_distrust_loss_share(rows, "treatment")` narrows the error-counter check to one arm.
+    A pack mixed on `control_ok` is a merged pack whichever key exposes it, so the
+    narrowing must not let it through."""
+    rows = _strip_from_half(_uniform_pack(), "control_ok")
+    with pytest.raises(MixedSchemaError, match="`control_ok`"):
+        _refuse_mixed_schema(rows, "treatment")
+
+
+def test_a_no_control_pack_is_uniform_and_still_not_refused():
+    """`--no-control` writes NEITHER control key on ANY row (and `control_errors: 0` on
+    every row). That is the other live shape, and it must keep its `no control arm`
+    exclusion rather than trip the new check."""
+    rows = [{k: v for k, v in r.items() if k not in ("control_ok", "control_trials")}
+            for r in _uniform_pack()]
+    _refuse_mixed_schema(rows)
+    assert _accuracy_gate(rows).excluded == "no control arm"
+
+
+def test_a_control_mixed_pack_exits_2_at_the_cli(monkeypatch, capsys):
+    """The CLI seam for the new key, so a `partial control coverage` rendering cannot
+    quietly come back through the handler: `_tune_drop_eval` must report the input error
+    and return 2, and the stderr must name the key that split the pack."""
+    rc = _drive_tune_drop_eval(monkeypatch, _strip_from_half(_uniform_pack(), "control_ok"))
+    out, err = capsys.readouterr()
+    assert rc == 2
+    assert "dropeval: input error:" in err
+    assert "carry `control_ok`" in err
+    assert "partial control coverage" not in out + err
+
+
+@pytest.mark.parametrize("control", [True, False])
+def test_dropeval_writes_the_control_keys_on_every_row_or_on_none(control):
+    """The producer contract #387's refusal rests on, asserted against the harness the way
+    #386 asserted its counters (`test_dropeval_emits_both_per_arm_counters_on_every_row`):
+    under `control=True` every row carries BOTH control keys -- including a question whose
+    control errored on every trial, the case a producer would be tempted to skip -- and
+    under `control=False` no row carries either. A producer that broke this would turn a
+    live run into `dropeval: input error` + exit 2 with no unit test in between."""
+    from terse import dropeval
+    from terse import policy as policy_mod
+
+    class _Answerer:
+        """Errors the first two calls -- with trials=1 and the control asked right after
+        the treatment, the first question's control fails on its only trial."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, messages):
+            self.calls += 1
+            return dropeval.Turn(text="x", tool_calls=[], error=self.calls <= 2)
+
+    obj = {"rows": [{"id": i, "evidence": f"{i}" + "E" * 300} for i in range(4)]}
+    rule = policy_mod.Rule(tool_glob="t", tiers=("minify", "table"),
+                           fields={"rows[].evidence": {"lossy": "drop-to-retrieve",
+                                                       "min": 10}})
+    rows = dropeval.run_drop_payload(obj, "", rule, "t", _Answerer(), trials=1,
+                                     control=control)
+    assert rows
+    for r in rows:
+        assert ("control_ok" in r) is control, r
+        assert ("control_trials" in r) is control, r
+    if control:
+        assert any(r["control_trials"] == 0 for r in rows), (
+            "fixture: no question lost its only control trial, so the tempting-to-skip "
+            "case was not exercised")
+    _refuse_mixed_schema(rows)   # and the live shape is never refused
+
+
+def test_partial_control_coverage_is_no_longer_an_exclusion_reason():
+    """An `ExclusionReason` nothing can produce is the Literal lying in the direction the
+    `unpaired` note warns about, pointing the other way: a renderer branch, a label, a
+    heading and a remedy for a shape the input check refuses before any of them run."""
+    from typing import get_args
+
+    from terse.report import REASON_HEADING, ExclusionReason
+
+    assert "partial control coverage" not in get_args(ExclusionReason)
+    assert "partial control coverage" not in REASON_LABEL
+    assert "partial control coverage" not in REASON_HEADING
