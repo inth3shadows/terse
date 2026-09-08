@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.30.11] - 2026-09-07
+
 ### Changed
 
 - **A results pack whose rows disagree on whether `<arm>_errors` exists is refused as
