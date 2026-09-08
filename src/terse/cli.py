@@ -362,14 +362,19 @@ def tune_sample_provenance(envelopes: list) -> tuple[int, int, int]:
     `tune` prints its payload COUNT, and the count is not the sample. A `result_id` dates
     an envelope: its absence marks a capture from before `#116` folded a multi-block
     result into one envelope, and modern captures fold to a record list 14x more often
-    than the fossils do (#374: 25.0% vs 1.8% `array-of-records`). And only a record list
-    can carry a drop candidate at all — `_questions_and_staging` needs one — so a
+    than the fossils do (#374: 25.0% vs 1.8% `array-of-records`). And a record list is
+    the shape `--drop-eval` can ask a question over (`_questions_and_staging`), so a
     `~34% tok` figure over a sample that is 4% record lists came from fragments of the
     field, not from the responses the field appears in. Neither share is a verdict; both
-    are what the figure beneath them was measured over.
+    are what the figure beneath them was measured over. NOT "the only shape a candidate
+    can come from": `_text_drop_candidate` proposes from `long-text` payloads, and a
+    3-payload text corpus prints `1 drop candidate(s)` over `0 record-list` (review).
 
-    Record-list-ness is read through `envelope_shape`, the one mechanism every consumer of
-    a bucket uses (#355), so this line cannot disagree with `terse measure`'s tables."""
+    Record-list-ness is read through `envelope_shape`, the one mechanism `terse measure`
+    and `capture.coverage` use (#355), so this line agrees with those tables. It is an
+    UPPER bound on what `--drop-eval` can measure: `classify_shape` finds a record list
+    nested inside a list, `find_record_list_with_path` (the eval's own predicate) does not
+    — that shape has no expressible drop path."""
     total = len(envelopes)
     # The same predicate `policy_gen` groups by (`isinstance(..., str)`), so "with
     # result_id" here is exactly the set whose results were READ rather than guessed.
@@ -378,10 +383,25 @@ def tune_sample_provenance(envelopes: list) -> tuple[int, int, int]:
     return total, with_id, lists
 
 
+def _share(n: int, total: int) -> str:
+    """`:.0%`, except that the two ends never round to the words they are not: 1/1524 is
+    not `0%` and 1523/1524 is not `100%` — the second is the false all-clear this line
+    exists to prevent (review finding)."""
+    if total == 0:
+        return "n/a"
+    if 0 < n < total:
+        pct = 100 * n / total
+        if pct < 0.5:
+            return "<1%"
+        if pct > 99.5:
+            return ">99%"
+    return f"{n / total:.0%}"
+
+
 def _tune_sample_line(envelopes: list) -> str:
     total, with_id, lists = tune_sample_provenance(envelopes)
-    return (f"#   sample: {with_id} with result_id ({with_id / total:.0%}), "
-            f"{lists} record-list ({lists / total:.0%})")
+    return (f"#   sample: {with_id} with result_id ({_share(with_id, total)}), "
+            f"{lists} record-list ({_share(lists, total)})")
 
 
 def _installed_autotune_defaults() -> tuple[str | None, str | None, str | None, set[str]]:
@@ -1150,8 +1170,7 @@ def _cmd_tune(args: argparse.Namespace) -> int:
 
     print(f"# terse tune — {len(envelopes)} payload(s), {len(rows)} tool(s), "
           f"{len(cands)} drop candidate(s)")
-    # The sample's provenance, on the line under its count (#380): `envelopes` is non-empty
-    # here (the early return above), so the shares divide.
+    # The sample's provenance, on the line under its count (#380).
     print(_tune_sample_line(envelopes))
 
     # Rationale in `_tune_ledger_warnings`'s own docstring (#274) — this call site just

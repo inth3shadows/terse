@@ -1524,10 +1524,27 @@ def test_tune_header_states_the_samples_result_id_and_record_list_shares(tmp_pat
     capture_payload("kb.b", records.replace('"id"', '"n"'), corpus)      # legacy, list
     capture_payload("kb.c", json.dumps({"ok": True}), corpus)            # legacy, single
     capture_payload("kb.d", "plain text " * 300, corpus)                 # legacy, text
+    # A non-string `result_id` is NOT "with result_id": `policy_gen` groups only `str`
+    # ids exactly, and this line claims to count the same set (review finding).
+    path = capture_payload("kb.e", json.dumps({"ok": True}), corpus)
+    path.write_text(json.dumps(json.loads(path.read_text()) | {"result_id": 7}))
     assert main(["tune", "--corpus", str(corpus)]) == 0
     lines = capsys.readouterr().out.splitlines()
-    head = next(i for i, ln in enumerate(lines) if ln.startswith("# terse tune — 4 payload(s)"))
-    assert lines[head + 1] == "#   sample: 1 with result_id (25%), 2 record-list (50%)"
+    head = next(i for i, ln in enumerate(lines) if ln.startswith("# terse tune — 5 payload(s)"))
+    assert lines[head + 1] == "#   sample: 1 with result_id (20%), 2 record-list (40%)"
+
+
+def test_tune_sample_shares_never_round_to_the_ends():
+    """`1/1524` rendering as `0%` hides the one identified envelope; `1523/1524` rendering
+    as `100%` is the false all-clear the line exists to prevent. The counts beside the
+    share keep it true either way; the clamp keeps it from being READ wrong."""
+    from terse.cli import _share
+
+    assert _share(1, 1524) == "<1%"
+    assert _share(1523, 1524) == ">99%"
+    assert _share(0, 1524) == "0%" and _share(1524, 1524) == "100%"
+    assert _share(1, 4) == "25%"
+    assert _share(0, 0) == "n/a"
 
 
 def test_tune_sample_provenance_reads_shape_live_not_from_the_stored_bucket(tmp_path):
