@@ -1501,3 +1501,45 @@ def test_downgrade_tail_does_not_claim_counts_it_did_not_print(tmp_path, capsys,
     assert "would LOSE a tier" in out
     assert "shown above" not in out
     assert "cross-check those tools in `terse stats`" in out
+
+
+# --------------------------------------------------------------------------- #
+# #380: `tune` discloses its payload COUNT; the two facts that decide whether the
+# per-field percentages beneath it mean anything -- how much of the sample carries a
+# `result_id`, and how much of it is a record list at all -- did not reach the operator.
+# --------------------------------------------------------------------------- #
+
+
+def test_tune_header_states_the_samples_result_id_and_record_list_shares(tmp_path, capsys):
+    """Driven through the real command and read off stdout: a corpus of four envelopes,
+    one with a `result_id` and two record lists, prints exactly those shares under the
+    count line. Pinned on the rendered line, not on the helper -- the header is what the
+    operator reads."""
+    from terse.capture import capture_payload
+
+    corpus = tmp_path / "corpus"
+    records = json.dumps({"result": [{"id": i, "description": "d" * 250 + str(i)}
+                                     for i in range(20)]})
+    capture_payload("kb.a", records, corpus, result_id="r-1")            # modern, list
+    capture_payload("kb.b", records.replace('"id"', '"n"'), corpus)      # legacy, list
+    capture_payload("kb.c", json.dumps({"ok": True}), corpus)            # legacy, single
+    capture_payload("kb.d", "plain text " * 300, corpus)                 # legacy, text
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    head = next(i for i, ln in enumerate(lines) if ln.startswith("# terse tune — 4 payload(s)"))
+    assert lines[head + 1] == "#   sample: 1 with result_id (25%), 2 record-list (50%)"
+
+
+def test_tune_sample_provenance_reads_shape_live_not_from_the_stored_bucket(tmp_path):
+    """`shape` on an envelope is a cache of `classify_shape` at capture time (#355). A
+    stale bucket must not move the record-list share -- the count reads `raw`."""
+    from terse.capture import capture_payload, load_corpus
+    from terse.cli import tune_sample_provenance
+
+    corpus = tmp_path / "corpus"
+    path = capture_payload("kb.a", json.dumps([{"id": 1, "v": "x"}, {"id": 2, "v": "y"}]),
+                           corpus)
+    env = json.loads(path.read_text())
+    env["shape"] = "compact-json"           # what an older classifier would have stored
+    path.write_text(json.dumps(env))
+    assert tune_sample_provenance(load_corpus(corpus)) == (1, 0, 1)

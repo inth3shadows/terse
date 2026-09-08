@@ -32,9 +32,11 @@ from pathlib import Path
 from . import transforms
 from ._secure_io import write_restricted
 from .capture import (
+    ARRAY_OF_RECORDS,
     capture_payload,
     classify_shape,
     coverage,
+    envelope_shape,
     extract_records,
     is_sidecar_filename,
     load_corpus,
@@ -351,6 +353,35 @@ def _print_corpus_identity_note(envelopes: list, out=None) -> None:
               f"authored under the bare tool name — which a deployed server-scoped rule "
               f"(`runecho.*`) shadows at runtime whatever its position. Re-capture, or wrap "
               f"with `proxy --server-name`, to author reachable rules.", file=out)
+
+
+def tune_sample_provenance(envelopes: list) -> tuple[int, int, int]:
+    """`(total, with_result_id, record_list)` — the two facts that decide whether `tune`'s
+    per-field percentages describe the responses they claim to (#380).
+
+    `tune` prints its payload COUNT, and the count is not the sample. A `result_id` dates
+    an envelope: its absence marks a capture from before `#116` folded a multi-block
+    result into one envelope, and modern captures fold to a record list 14x more often
+    than the fossils do (#374: 25.0% vs 1.8% `array-of-records`). And only a record list
+    can carry a drop candidate at all — `_questions_and_staging` needs one — so a
+    `~34% tok` figure over a sample that is 4% record lists came from fragments of the
+    field, not from the responses the field appears in. Neither share is a verdict; both
+    are what the figure beneath them was measured over.
+
+    Record-list-ness is read through `envelope_shape`, the one mechanism every consumer of
+    a bucket uses (#355), so this line cannot disagree with `terse measure`'s tables."""
+    total = len(envelopes)
+    # The same predicate `policy_gen` groups by (`isinstance(..., str)`), so "with
+    # result_id" here is exactly the set whose results were READ rather than guessed.
+    with_id = sum(1 for e in envelopes if isinstance(e.get("result_id"), str))
+    lists = sum(1 for e in envelopes if envelope_shape(e) == ARRAY_OF_RECORDS)
+    return total, with_id, lists
+
+
+def _tune_sample_line(envelopes: list) -> str:
+    total, with_id, lists = tune_sample_provenance(envelopes)
+    return (f"#   sample: {with_id} with result_id ({with_id / total:.0%}), "
+            f"{lists} record-list ({lists / total:.0%})")
 
 
 def _installed_autotune_defaults() -> tuple[str | None, str | None, str | None, set[str]]:
@@ -1119,6 +1150,9 @@ def _cmd_tune(args: argparse.Namespace) -> int:
 
     print(f"# terse tune — {len(envelopes)} payload(s), {len(rows)} tool(s), "
           f"{len(cands)} drop candidate(s)")
+    # The sample's provenance, on the line under its count (#380): `envelopes` is non-empty
+    # here (the early return above), so the shares divide.
+    print(_tune_sample_line(envelopes))
 
     # Rationale in `_tune_ledger_warnings`'s own docstring (#274) — this call site just
     # prints whatever it finds. Printed BEFORE `--out` writes the policy below: writing
