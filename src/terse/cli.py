@@ -50,6 +50,7 @@ from .probes import (
     value_redundancy,
 )
 from .report import (
+    MixedSchemaError,
     build_cross_server_probe_report,
     build_probe_report,
     build_report,
@@ -1056,14 +1057,25 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
     results = dropeval.run_drop_fluency(envelopes, pol.select, answerers,
                                         trials=args.trials,
                                         control=not args.no_control)
-    print("\n" + build_dropeval_report(results, accept_degraded=args.accept_degraded))
+    try:
+        report = build_dropeval_report(results, accept_degraded=args.accept_degraded)
+        # Computed INSIDE the guard, not after it: the verdict below sees the same rows
+        # the report did, and a raise here after the report was printed would be a
+        # traceback under a rendered table (#386 review).
+        verdict = dropeval_verdict(results, accept_degraded=args.accept_degraded)
+    except MixedSchemaError as exc:
+        # Input, not a verdict (#386): a pack whose rows disagree on the error counters
+        # cannot be scored, and `NOT_CONCLUDED` would read as a better outcome than BLOCK.
+        print(f"dropeval: input error: {exc}", file=sys.stderr)
+        return 2
+    print("\n" + report)
     coverage = render_drop_coverage(coverage_rows)
     if coverage:
         print("\n" + coverage)
     # Read the DIRECTIVE, never re-derive it from the PASS lines above — see
     # `dropeval_next_step_line`, which owns the sentence and the reason.
     print(dropeval_next_step_line(
-        dropeval_verdict(results, accept_degraded=args.accept_degraded),
+        verdict,
         # The SAME list the note above was built from, so the directive cannot authorize a
         # rename the run already knows is insufficient for these rules (#375 review).
         tiers_restored=lifted))
@@ -1240,9 +1252,12 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
 
         coverage = render_drop_coverage(
             dropeval.drop_eval_coverage(envelopes, pol.select))
-        _write_report(build_dropeval_report(results, accept_degraded=args.accept_degraded)
-                      + ("\n" + coverage if coverage else ""),
-                      args.out)
+        try:
+            report = build_dropeval_report(results, accept_degraded=args.accept_degraded)
+        except MixedSchemaError as exc:
+            print(f"dropeval: input error: {exc}", file=sys.stderr)   # #386, see above
+            return 2
+        _write_report(report + ("\n" + coverage if coverage else ""), args.out)
         if args.bars:
             print("\n" + build_terminal_dropeval_report(results,
                                                          accept_degraded=args.accept_degraded))
