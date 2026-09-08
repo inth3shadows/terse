@@ -13,6 +13,26 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Added
+
+- **`terse tune` states its sample's provenance under the payload count** (`#380`).
+  The header said `1524 payload(s)` and nothing about what those payloads were: how many
+  carry a `result_id` (its absence dates a capture to before `#116` folded a
+  multi-block result into one envelope — and modern captures fold to a record list 14x
+  more often, `#374`), and how many are a record list at all — the shape `--drop-eval`
+  can ask a question over. A `~34% tok` figure over a sample that is 4% record lists
+  was measured on fragments of the field, not on the responses the field appears in;
+  the number was not wrong, it was unaccompanied. One line now follows the count:
+  `#   sample: 124 with result_id (8%), 56 record-list (4%)`. Record-list-ness is read
+  through `envelope_shape` (live from `raw`, `#355`) so it agrees with `terse measure`;
+  it is an upper bound on drop-eval eligibility, not a count of candidates (a
+  `long-text` payload can carry one at `0 record-list`). "With result_id" is
+  `policy_gen`'s own grouping predicate. Shares clamp to `<1%` / `>99%` rather than
+  round to the ends. The low-sample WARNING `#380` also proposes is not here — its
+  threshold and direction are the open design question the issue leaves open.
+
+## [0.30.12] - 2026-09-08
+
 ### Fixed
 
 - **A results pack whose rows disagree on `control_ok` / `control_trials` is refused as
