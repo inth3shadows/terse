@@ -602,6 +602,7 @@ then presents drop-to-retrieve candidates **safe-first**, classified by field ro
 ```bash
 terse tune --corpus corpus/ --out policy.json
 # # terse tune — 40 payload(s), 6 tool(s), 3 drop candidate(s)
+# #   sample: 31 with result_id (78%), 12 record-list (30%)
 # SAFE candidates — supporting prose, enable after a dropeval pass:
 #   kb.read.nodes    result[].description   ~41% tok, 100% uniq  [prose]
 #   → enabling all 1 here: ≈12,400 tok, ~18% of corpus (gross, before the per-record retrieve-handle cost)
