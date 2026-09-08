@@ -14,6 +14,8 @@ falling back to the unrun ideal, and neither arm can score a failed call as a wr
 
 from __future__ import annotations
 
+import pytest
+
 from terse import dropeval
 from terse import policy as policy_mod
 from terse.report import _accuracy_gate, build_dropeval_report, dropeval_gap_rows
@@ -205,12 +207,21 @@ def test_the_report_says_final_accuracy_is_not_gated_when_no_control_ran():
     assert "vs no-drop control" not in report
 
 
-def test_partial_control_coverage_excludes_the_metric_rather_than_scoring_a_subset():
-    """A mixed result set (merged runs, a legacy pack, a partially-failed arm) would
-    otherwise activate the metric and let `paired_rows` silently discard the control-less
-    rows — a verdict computed over a subset nobody was told about."""
-    mixed = _rows(n=3, answer=1, control=1) + _rows(n=3, answer=1)
-    assert _accuracy_gate(mixed).excluded == "partial control coverage"
+def test_partial_control_coverage_is_refused_rather_than_scoring_a_subset():
+    """A mixed result set (merged runs, a legacy pack) would otherwise activate the metric
+    and let `paired_rows` silently discard the control-less rows — a verdict computed over
+    a subset nobody was told about. Until #387 this was a soft `partial control coverage`
+    exclusion, NOT_CONCLUDED; that is a schema problem improving a verdict, so it is now
+    refused as input exactly like a pack mixed on `<arm>_errors` (#386)."""
+    from terse.report import MixedSchemaError
+
+    # Mixed on the control keys ONLY -- `control_errors` stays on every row, so the raise
+    # below can only come from the #387 check, not from #386's.
+    stripped = [{k: v for k, v in r.items() if k not in ("control_ok", "control_trials")}
+                for r in _rows(n=3, answer=1, control=1)]
+    mixed = _rows(n=3, answer=1, control=1) + stripped
+    with pytest.raises(MixedSchemaError, match="3 row\\(s\\) carry `control_ok` and 3 do not"):
+        _accuracy_gate(mixed)
 
 
 def test_mechanism_metrics_alone_do_not_license_enabling_the_drop():

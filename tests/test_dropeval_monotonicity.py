@@ -103,14 +103,11 @@ def _break_control(rows):
     return [dict(r, control_ok=0) if "control_ok" in r else dict(r) for r in rows]
 
 
-def _partial_control(rows):
-    """One row loses its control — `_accuracy_gate` -> "partial control coverage"."""
-    out = [dict(r) for r in rows]
-    for r in out:
-        if "control_ok" in r:
-            del r["control_ok"], r["control_trials"]
-            break
-    return out
+# There is no `partial_control` perturbation. Stripping the control off ONE row used to be
+# a withholding (`_accuracy_gate` -> "partial control coverage" -> NOT_CONCLUDED); since
+# #387 it is a refused INPUT (`MixedSchemaError`), the same policy #386 set for a pack
+# mixed on `<arm>_errors` — no producer emits the shape, so it is never a fleet this
+# property has to hold over. `tests/test_unmeasured_arm_symmetry.py` pins the refusal.
 
 
 def _shrink(rows):
@@ -169,7 +166,6 @@ _WITHHOLDING = {
     "empty_rows": _empty_rows,
     "drop_control": _drop_control,
     "break_control": _break_control,
-    "partial_control": _partial_control,
     "shrink": _shrink,
 }
 

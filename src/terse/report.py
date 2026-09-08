@@ -715,7 +715,8 @@ def _unmeasured(rows: list[dict]) -> bool:
 
 
 class MixedSchemaError(ValueError):
-    """A results pack mixes rows that carry `<arm>_errors` with rows that do not (#386).
+    """A results pack mixes rows that carry a producer-schema key with rows that do not:
+    `<arm>_errors` (#386), or the control arm's `control_ok` / `control_trials` (#387).
 
     Raised by `_refuse_mixed_schema`, which runs FIRST in `_unmeasured` and in
     `dropeval_verdict` — before any trigger, so a mixed pack cannot be scored `unmeasured`
@@ -724,22 +725,40 @@ class MixedSchemaError(ValueError):
     reports it as an input error and exits 2 — it is not a verdict, and must never become
     one."""
 
-    def __init__(self, arm: str, n_with: int, n_without: int) -> None:
-        # All three through `args`, so the exception survives pickle/deepcopy (a worker
+    def __init__(self, arm: str, n_with: int, n_without: int,
+                 key: str | None = None) -> None:
+        # Everything through `args`, so the exception survives pickle/deepcopy (a worker
         # pool re-raising it must show the operator THIS message, not a TypeError).
-        super().__init__(arm, n_with, n_without)
-        self.arm, self.n_with, self.n_without = arm, n_with, n_without
+        # `key` names the row key that split the pack; it defaults to the arm's error
+        # counter so #386's three-argument callers and tests read unchanged.
+        key = key or f"{arm}_errors"
+        super().__init__(arm, n_with, n_without, key)
+        self.arm, self.n_with, self.n_without, self.key = arm, n_with, n_without, key
 
     def __str__(self) -> str:
         return (f"results pack mixes two schemas for arm {self.arm!r}: {self.n_with} row(s) "
-                f"carry `{self.arm}_errors` and {self.n_without} do not, so the run's "
+                f"carry `{self.key}` and {self.n_without} do not, so the run's "
                 f"transport loss cannot be identified. Re-run the eval with one producer; "
                 f"do not merge result files.")
 
 
+# The control arm's own producer-schema keys. `run_drop_payload` writes both on every row
+# under `--control` and neither under `--no-control` — decided once per run, never per
+# payload (`_control_text` is `-> str`; both callers gate on the run-level flag) — so a pack
+# on which SOME rows carry them is two runs' files merged, exactly the shape #386 refuses
+# for `<arm>_errors`. Before #387 `_accuracy_gate` scored that shape as a soft `partial
+# control coverage` exclusion instead: NOT_CONCLUDED, the outcome the refusal exists to
+# close, four lines from the site that refused the sibling key.
+_CONTROL_SCHEMA_KEYS: tuple[tuple[str, str], ...] = (("control", "control_ok"),
+                                                     ("control", "control_trials"))
+
+
 def _refuse_mixed_schema(rows: list[dict], *arms: str) -> None:
     """Raise `MixedSchemaError` if, for any arm whose `<arm>_errors` counter appears on SOME
-    row, another row lacks it (#386). With no `arms` given, every counter present is checked.
+    row, another row lacks it (#386) — or if `control_ok` / `control_trials` appears on some
+    rows and not others (#387; checked whether or not `arms` narrows the counters, because
+    a merged pack is a merged pack whichever key exposes it). With no `arms` given, every
+    counter present is checked.
 
     Some rows stating the counter and some not is two producer generations in one pack.
     The whole-run loss share is then UNIDENTIFIED — the rows without a counter cannot say
@@ -753,11 +772,11 @@ def _refuse_mixed_schema(rows: list[dict], *arms: str) -> None:
     if not arms:
         arms = tuple(sorted({k[:-len("_errors")] for r in rows for k in r
                              if k.endswith("_errors")}))
-    for arm in arms:
-        err_key = f"{arm}_errors"
-        n_with = sum(1 for r in rows if err_key in r)
+    keys = [(arm, f"{arm}_errors") for arm in arms] + list(_CONTROL_SCHEMA_KEYS)
+    for arm, key in keys:
+        n_with = sum(1 for r in rows if key in r)
         if n_with and n_with != len(rows):
-            raise MixedSchemaError(arm, n_with, len(rows) - n_with)
+            raise MixedSchemaError(arm, n_with, len(rows) - n_with, key=key)
 
 
 def _credited_loss_share(rows: list[dict], arm: str) -> float | None:
@@ -876,7 +895,6 @@ ExclusionReason = Literal[
     "not a diff run",
     "empty",
     "no control arm",
-    "partial control coverage",
     "underpowered",
     # Set by `build_diff_soak_report`'s per-depth table via `ArmGap._replace`, splitting
     # the transport half of "unmeasured" from the pairing half for that table only. It is a
@@ -1084,7 +1102,6 @@ REASON_LABEL = {
     "not a diff run": "no diff arm in these rows",
     "empty": "no rows",
     "no control arm": "no control arm was run",
-    "partial control coverage": "control ran on only some rows",
     # Distinct from "unmeasured" ON PURPOSE. Nothing failed here: the backend answered, the
     # arms paired, there were simply too few questions to conclude anything from an absence
     # of regressions. Folding it into "unmeasured" would print "no usable comparison"
@@ -1112,7 +1129,6 @@ REASON_HEADING = {
     "not a diff run": "Not applicable",
     "empty": "Not measured",
     "no control arm": "Not run",
-    "partial control coverage": "Excluded",
     # Not "Not measured": it WAS measured, and the measurement simply does not reach.
     "underpowered": "Not concluded",
     # Unrendered today for the same reason as `REASON_LABEL["unpaired"]` — see the note
@@ -1729,15 +1745,18 @@ def _accuracy_gate(rows: list[dict[str, Any]]) -> ArmGap:
     Routing through `arm_gap` (rather than two `_form_stats` calls) is what
     `tests/test_gap_gate_boundary.py` requires of every form-vs-control gap, and its
     allowlist comment names this issue as the reason dropeval was temporarily exempt."""
-    with_control = sum("control_ok" in r for r in rows)
-    if with_control == 0:
+    # A pack on which only SOME rows carry `control_ok` is refused here as well as at the
+    # verdict's entry (#387): `any()` would activate the metric and let `paired_rows`
+    # silently discard every control-less row — a verdict computed over a subset the
+    # reader was never told about — and the soft `partial control coverage` exclusion
+    # that used to catch it instead routed the merged pack through the lattice as
+    # NOT_CONCLUDED, which `NOT_CONCLUDED (2) < BLOCK (3)` lets improve a verdict.
+    # `_gap` runs the same check through `_unmeasured`, but only past the `no control arm`
+    # exit below, which a pack mixed on `control_trials` alone would take first (executed:
+    # removing this line survives every test but the one that pins that shape).
+    _refuse_mixed_schema(rows)
+    if not any("control_ok" in r for r in rows):
         return ArmGap(0.0, 0.0, 0.0, 0.0, [], "no control arm")
-    if with_control != len(rows):
-        # `any()` would activate the metric on a mixed result set and let `paired_rows`
-        # silently discard every control-less row — a verdict quietly computed over a
-        # subset the reader was never told about. A merged/legacy/partially-failed run is
-        # exactly when that is most likely and least visible.
-        return ArmGap(0.0, 0.0, 0.0, 0.0, [], "partial control coverage")
     g = arm_gap(rows, "answer_ok", "control_ok")
     if g.excluded:
         return g
@@ -1884,7 +1903,7 @@ def _reason_directive(reason: ExclusionReason) -> Directive:
         case "underpowered":
             return Directive.INSUFFICIENT
         case ("unmeasured" | "unpaired" | "broken control" | "empty"
-              | "no control arm" | "partial control coverage" | "not a diff run"):
+              | "no control arm" | "not a diff run"):
             return Directive.NOT_CONCLUDED
     assert_never(reason)
 
@@ -1932,10 +1951,6 @@ def _exclusion_remedy(reason: ExclusionReason, *, fixed_ideal: bool = False) -> 
             return ("The control answers a question with the value sitting verbatim in "
                     "its payload, so a 0% control is a grader or backend fault, not a "
                     "blameless drop (#300). Fix the control arm and re-run.")
-        case "partial control coverage":
-            return ("Only some rows carry a control arm, so scoring the metric would "
-                    "compute it over a subset the reader was never told about. Re-run the "
-                    "whole question set with the control on rather than merging packs.")
         case "unmeasured" | "unpaired":
             # This sentence asserts NOTHING about the present run, and that is the whole
             # design. The other five exclusion sites pick their cause from the loss count
