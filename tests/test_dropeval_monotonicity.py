@@ -224,9 +224,10 @@ def test_withholding_evidence_never_authorizes_a_ship():
     """The rule violated by the worst finding of all four review rounds on #335.
 
     A fleet that does not ship must not start shipping because one of its models lost a
-    control arm, lost the control's score, lost control coverage on one question, or lost
-    every question but one. All four are ways a model leaves the accuracy gate, and a model
-    that leaves the gate stops being able to fail it."""
+    control arm, lost the control's score, or lost every question but one. All three are
+    ways a model leaves the accuracy gate, and a model that leaves the gate stops being
+    able to fail it. (Losing control coverage on ONE question used to be a fourth; since
+    #387 that pack is refused as input, so it is not a fleet this property ranges over.)"""
     bad = _violations()
     assert not bad, (
         f"{len(bad)} input pairs where removing evidence authorized a ship; first 5:\n"

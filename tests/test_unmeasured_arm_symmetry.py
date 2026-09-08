@@ -1178,6 +1178,23 @@ def test_trigger_2_never_sees_rows_that_did_not_run_the_control_beside_rows_that
     assert _unmeasured(ran)
 
 
+def test_trigger_2_keeps_a_not_attempted_arm_out_of_its_own_denominator():
+    """The denominator rule the test above used to pin, re-pinned on a key the refusal
+    does not cover: a hand-built #91 pack carrying `raw_trials` on a subset of its rows.
+    Review of #387 executed the mutation `for r in rows if key in r` -> `for r in rows`
+    against the PR and it SURVIVED the whole suite once the control-key witness became a
+    refusal. 40 lost of the 50 calls the arm made is 0.80 -- a withhold; over every row's
+    calls it is 0.04, and a substantially dead arm publishes."""
+    ran = [{"qid": f"r{i}", "kind": "recall", "trials": 10, "attempts": 10, "answer_ok": 9,
+            "raw_ok": 2, "raw_trials": 2} for i in range(5)]
+    never_ran = [{"qid": f"n{i}", "kind": "recall", "trials": 10, "attempts": 10,
+                  "answer_ok": 9} for i in range(95)]
+    _refuse_mixed_schema(ran + never_ran)   # precondition: this shape is NOT refused
+    assert _unmeasured(ran + never_ran), (
+        "8 of 10 raw calls lost on every row that ran the arm is a withhold, and 95 rows "
+        "that never ran it must not dilute it")
+
+
 def test_trigger_2_still_refuses_phantom_loss_from_a_row_with_no_attempts_key():
     """The #339 guard the widened denominator had to preserve: a row carrying the arm key
     but no `attempts` may enter the DENOMINATOR, never the numerator. Its `trials` may
@@ -1499,6 +1516,45 @@ def test_a_control_mixed_pack_exits_2_at_the_cli(monkeypatch, capsys):
     assert "dropeval: input error:" in err
     assert "carry `control_ok`" in err
     assert "partial control coverage" not in out + err
+
+
+@pytest.mark.parametrize("control", [True, False])
+def test_dropeval_writes_the_control_keys_on_every_row_or_on_none(control):
+    """The producer contract #387's refusal rests on, asserted against the harness the way
+    #386 asserted its counters (`test_dropeval_emits_both_per_arm_counters_on_every_row`):
+    under `control=True` every row carries BOTH control keys -- including a question whose
+    control errored on every trial, the case a producer would be tempted to skip -- and
+    under `control=False` no row carries either. A producer that broke this would turn a
+    live run into `dropeval: input error` + exit 2 with no unit test in between."""
+    from terse import dropeval
+    from terse import policy as policy_mod
+
+    class _Answerer:
+        """Errors the first two calls -- with trials=1 and the control asked right after
+        the treatment, the first question's control fails on its only trial."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, messages):
+            self.calls += 1
+            return dropeval.Turn(text="x", tool_calls=[], error=self.calls <= 2)
+
+    obj = {"rows": [{"id": i, "evidence": f"{i}" + "E" * 300} for i in range(4)]}
+    rule = policy_mod.Rule(tool_glob="t", tiers=("minify", "table"),
+                           fields={"rows[].evidence": {"lossy": "drop-to-retrieve",
+                                                       "min": 10}})
+    rows = dropeval.run_drop_payload(obj, "", rule, "t", _Answerer(), trials=1,
+                                     control=control)
+    assert rows
+    for r in rows:
+        assert ("control_ok" in r) is control, r
+        assert ("control_trials" in r) is control, r
+    if control:
+        assert any(r["control_trials"] == 0 for r in rows), (
+            "fixture: no question lost its only control trial, so the tempting-to-skip "
+            "case was not exercised")
+    _refuse_mixed_schema(rows)   # and the live shape is never refused
 
 
 def test_partial_control_coverage_is_no_longer_an_exclusion_reason():

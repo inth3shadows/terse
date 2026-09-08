@@ -646,8 +646,12 @@ def _unmeasured(rows: list[dict]) -> bool:
         # Same arm, same loss, the verdict decided by the presence of one unrelated key.
         #
         # `key in r` and not `rows` wholesale is what keeps a NOT-ATTEMPTED arm out of its
-        # own denominator: a `--no-control` pack emits no `control_trials` at all, and
-        # dividing a control loss by calls that pack never made would understate it.
+        # own denominator. Not for the control arm any more — a pack carrying
+        # `control_trials` on some rows only is refused above (#387), and a `--no-control`
+        # pack carries it on none, so `arm_keys` never holds it — but a hand-built #91
+        # pack can carry another arm's `_trials` on a subset, and dividing that arm's loss
+        # by calls the other rows never made understates it (executed: 40 lost of 50
+        # reads 0.80 and withholds; over every row it reads 0.04 and publishes).
         per_row = [(_arm_attempts(r, key, int(r.get("trials", 1))), int(r[key]))
                    for r in carrying]
         lost = sum(max(0, a - t) for a, t in per_row)
@@ -736,10 +740,15 @@ class MixedSchemaError(ValueError):
         self.arm, self.n_with, self.n_without, self.key = arm, n_with, n_without, key
 
     def __str__(self) -> str:
+        # What the split HIDES differs by key: a missing error counter leaves the run's
+        # transport loss unidentified; a missing control key means a control arm that ran
+        # on only part of the pack, which no single run produces.
+        why = ("the run's transport loss cannot be identified"
+               if self.key.endswith("_errors")
+               else "the control arm covers only part of the pack")
         return (f"results pack mixes two schemas for arm {self.arm!r}: {self.n_with} row(s) "
-                f"carry `{self.key}` and {self.n_without} do not, so the run's "
-                f"transport loss cannot be identified. Re-run the eval with one producer; "
-                f"do not merge result files.")
+                f"carry `{self.key}` and {self.n_without} do not, so {why}. Re-run the "
+                f"eval with one producer; do not merge result files.")
 
 
 # The control arm's own producer-schema keys. `run_drop_payload` writes both on every row
