@@ -60,6 +60,7 @@ from .harnesses import (  # noqa: F401
     _safe_ask,
     _user_prompt,
     build_chain_windows,
+    progress_line,
     run_chain_payload,
     run_diff_fluency,
     run_diff_payload,
