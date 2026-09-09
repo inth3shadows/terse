@@ -1555,7 +1555,22 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
         wraps = None
         diff = None
         stats_on = None
-        if state in ("wrapped", "wrapped-unstashed", "router", "router-ambiguous"):
+        # A `folded-and-live` entry is live under its own name AND named in the peers
+        # file, so when that live entry launches via terse it runs its own proxy and
+        # writes its own ledger rows under its own guessed identity — which is exactly
+        # what makes it a candidate for #285's label collision (#309). Without the launch
+        # fields below it reaches `terse stats` with `wraps`/`ledger_identity` None,
+        # `_guessed_label` returns "", and `_ambiguous_labels` drops it before counting.
+        #
+        # `launches_via_terse` is load-bearing, not belt-and-braces: the state is reached
+        # on `name in folded and present` ABOVE, before any terse check, so a raw
+        # `claude mcp add <name>` re-add of the original command lands here too. That
+        # entry runs no proxy and writes no ledger rows, and must keep every launch field
+        # None — counting it toward a collision would MANUFACTURE an ambiguity, the
+        # direction #285's review warned about.
+        live_terse_peer = state == "folded-and-live" and launches_via_terse
+        if live_terse_peer or state in ("wrapped", "wrapped-unstashed", "router",
+                                        "router-ambiguous"):
             # The launcher (`command`) is the entry's most silent failure mode: if it
             # no longer resolves, the client can't spawn the proxy at all and the server
             # just shows up with no tools. That is exactly what an upgrade moving a
@@ -1609,7 +1624,7 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
             stats_on = "--no-stats" not in args
         ledger_identity = None
         ledger_identity_explicit = None
-        if state in ("wrapped", "wrapped-unstashed") and downstream:
+        if (live_terse_peer or state in ("wrapped", "wrapped-unstashed")) and downstream:
             # `resolve_ledger_identity` is the SAME rule `proxy.py`'s live write path
             # uses, imported rather than re-derived — a review round caught this and
             # `proxy.py`'s copy diverging in principle before this existed. A standalone
@@ -1657,7 +1672,8 @@ def scan_scopes(*, cfg: Path | None = None, file: str | None = None,
     """Enumerate every terse-relevant mcpServers entry across all three scopes,
     read-only — no writes, no directory creation, never raises. One row per
     (scope, server): {scope, server, state, policy, policy_missing, launcher,
-    launcher_missing, wraps, diff, stats, config, router, peers_error}, state one of
+    launcher_missing, wraps, diff, stats, config, router, peers_error, ledger_identity,
+    ledger_identity_explicit}, state one of
     "wrapped"
     (stashed and present), "wrapped-unstashed" (the entry launches via terse but has no
     stash, so its original command cannot be restored — #172), "router" (a --multiproxy
@@ -1670,7 +1686,10 @@ def scan_scopes(*, cfg: Path | None = None, file: str | None = None,
     "orphaned-stash" (stashed
     but the entry vanished — see `_scan_target`), or "unwrapped" (present, not terse's). The wrapped-only
     fields (policy_missing, launcher, launcher_missing, wraps, diff, stats) are
-    None/False for non-wrapped rows. Local scope is
+    None/False for non-wrapped rows — with one exception: a "folded-and-live" row whose
+    LIVE entry launches via terse carries them too, because that entry runs its own proxy
+    and writes its own ledger records (#309). A "folded-and-live" row that is live as a
+    raw re-add keeps them None. Local scope is
     silently omitted, not an error, when it doesn't resolve (not in a git repo and
     no --repo-path given) — "no local scope here" is the common case, not a failure."""
     rows: list[dict] = []

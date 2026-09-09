@@ -778,6 +778,20 @@ def build_version_section(agg: dict[str, Any]) -> list[str]:
 # fleet and the peers pay nothing, so counting them would double-charge.
 _PAYS_PRIMER = ("wrapped", "wrapped-unstashed", "router", "router-ambiguous")
 
+# States whose entry WRITES ITS OWN LEDGER ROWS. A different question from the one above,
+# and it was a real defect that they shared a filter (#309): a `folded-and-live` peer pays
+# no primer of its own — correctly absent from `_PAYS_PRIMER` — but its live entry does run
+# its own proxy and does write records under its own guessed label, so it is every bit as
+# able to collide with another entry over a launcher basename as a `wrapped` one is.
+#
+# The `launches_via_terse` half of that condition is NOT repeated here, because it cannot
+# be: this tuple sees only a state name. `scan_scopes` carries it instead — a
+# `folded-and-live` row that is live as a raw re-add leaves `wraps`/`ledger_identity`
+# None, so `_guessed_label` returns "" and the count below skips it anyway. Coupled on
+# purpose, and pinned from both ends (see `test_install_mcp.py`'s scan-contract test as
+# well as the collision tests here).
+_WRITES_LEDGER_ROWS = _PAYS_PRIMER + ("folded-and-live",)
+
 # Of those, the states that still prime EAGERLY at `initialize.instructions`, which the
 # client re-reads every turn as `cache_read` — a recurring per-turn charge. Everything else
 # in `_PAYS_PRIMER` is a standalone `run_proxy` entry, lazy since #211: one attach, to the
@@ -837,14 +851,27 @@ def _ambiguous_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
     the same binary, which is one logical server and one honest label.
 
     De-duplicated by server NAME first: the same entry present in both project and user
-    scope is one server to the client (the caller's own `seen` set says so), and counting
-    it twice would manufacture a collision with itself."""
+    scope is one server to the client, and counting it twice would manufacture a collision
+    with itself. A row that guesses NOTHING never takes that slot, though — it would
+    SHADOW a same-named row in a lower-priority scope that does guess, silently deleting a
+    real collision (found in review of #309, and reproduced: a raw `folded-and-live`
+    re-add in user scope hid a genuine `python` collision between two project-scope
+    entries, which the pre-#309 code caught). Rows are emitted user scope first, so the
+    shadowing row is always the one that wins the slot."""
     by_name: dict[str, str] = {}
     for row in scan_rows:
         name = row.get("server")
-        if row.get("state") not in _PAYS_PRIMER or not name or name in by_name:
+        if row.get("state") not in _WRITES_LEDGER_ROWS or not name or name in by_name:
             continue
-        by_name[str(name)] = _guessed_label(row)
+        # `stats is False` means `--no-stats` was baked in: that entry writes no ledger
+        # records at all, so counting it toward a collision deletes a correct measurement
+        # from the entry that DOES own every row under the label. `is not False` on
+        # purpose — the field is None on rows that never reach the launch-field block, and
+        # those are skipped by the empty guess below anyway.
+        lbl = _guessed_label(row) if row.get("stats") is not False else ""
+        if not lbl:
+            continue
+        by_name[str(name)] = lbl
     counts: dict[str, int] = {}
     for lbl in by_name.values():
         if lbl and _is_launcher_basename(lbl):
