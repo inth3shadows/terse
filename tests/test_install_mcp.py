@@ -2364,3 +2364,65 @@ def test_install_warns_when_the_chosen_launcher_is_a_different_terse(tmp_path, m
     assert _install_and_capture(tmp_path, monkeypatch, launcher, multiproxy=multiproxy) == 0
     out = capsys.readouterr().out
     assert "WARNING" in out and "0.0.1" in out, out
+
+
+def test_a_terse_launched_folded_and_live_peer_carries_its_launch_fields(tmp_path):
+    """#309. `terse stats` decides whether two entries collide over one ledger label from
+    `wraps` / `ledger_identity`. A `folded-and-live` entry was excluded from the block that
+    fills those in, so its row reached `_ambiguous_labels` with both None, `_guessed_label`
+    returned "", and the count skipped it — the collision could not be detected no matter
+    what the stats-side filter said.
+
+    Both directions are pinned here, because the difference between them is the whole
+    condition: the state is reached on `name in folded and present`, BEFORE any terse check,
+    so it covers a live entry that runs its own proxy AND a raw re-add that runs none. Only
+    the first writes ledger rows; filling the fields in for the second would manufacture an
+    ambiguity against an entry that owns every row under that label."""
+    from terse.install_mcp import do_install, scan_scopes
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    live = json.loads(cfg.read_text())
+    # Live again under its own name, launching via terse with no baked --server-name.
+    live["mcpServers"]["kb"] = {"command": "terse", "args": [
+        "proxy", "--policy", str(pol), "--", "/usr/bin/python", "-m", "server_a"]}
+    # Live again as the ORIGINAL command: not terse, writes nothing. `uv run x -- <args>`
+    # rather than a bare command on purpose — a raw entry is allowed its own `--`, and that
+    # is the shape in which widening the gate does the WORST damage: `wraps` and the
+    # ledger identity get read off an argument list terse never wrote, which is what
+    # reaches `terse stats`. (`launcher`/`stats` below catch a bare command too.)
+    live["mcpServers"]["gh"] = {"command": "uv",
+                                "args": ["run", "server_b", "--", "--verbose"]}
+    cfg.write_text(json.dumps(live), encoding="utf-8")
+    rows = {r["server"]: r for r in scan_scopes(cfg=cfg) if r["scope"] == "user"}
+
+    assert rows["kb"]["state"] == rows["gh"]["state"] == "folded-and-live"
+    assert rows["kb"]["wraps"] == "/usr/bin/python -m server_a"
+    assert rows["kb"]["ledger_identity"] == "python"
+    assert rows["kb"]["ledger_identity_explicit"] is False
+    # The raw re-add stays exactly as it was before #309.
+    assert rows["gh"]["wraps"] is None
+    assert rows["gh"]["ledger_identity"] is None
+    assert rows["gh"]["ledger_identity_explicit"] is None
+    assert rows["gh"]["launcher"] is None and rows["gh"]["stats"] is None
+
+
+def test_merely_MENTIONING_terse_does_not_make_a_folded_and_live_peer_a_proxy(tmp_path):
+    """`_looks_like_terse_launcher` errs toward detection by design — its own docstring says
+    a false positive is "caught anyway by `parse_proxy_opts` requiring a `proxy`
+    subcommand" — and it matches a bare `"terse" in args`. Gating #309's widened block on
+    it therefore filled in `wraps` and a ledger identity for `uv run --with terse -- python
+    -m server_a`: an entry that installs terse as a DEPENDENCY and runs no proxy at all.
+
+    That manufactured the exact ambiguity the gate exists to avoid, deleting the correct
+    measurement of the entry that really does own every `python` row. Found in review of
+    #309; the discriminator is `parse_proxy_opts`, which the block already computes."""
+    from terse.install_mcp import do_install, scan_scopes
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    live = json.loads(cfg.read_text())
+    live["mcpServers"]["kb"] = {"command": "uv", "args": [
+        "run", "--with", "terse", "--", "/usr/bin/python", "-m", "server_a"]}
+    cfg.write_text(json.dumps(live), encoding="utf-8")
+    row = {r["server"]: r for r in scan_scopes(cfg=cfg) if r["scope"] == "user"}["kb"]
+    assert row["state"] == "folded-and-live"
+    assert row["wraps"] is None and row["ledger_identity"] is None

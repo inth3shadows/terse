@@ -13,7 +13,22 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A `folded-and-live` peer can now trigger the ambiguous-ledger-label guard (#309).**
+  Such an entry is named in the peers file *and* live under its own name; when that live
+  entry launches via terse it runs its own proxy and writes its own ledger rows. It pays no
+  primer (the router pays one union primer for the fleet), and ambiguity detection had
+  borrowed the primer filter — so it was skipped, the collision count stayed at 1, and a
+  `wrapped` entry sharing its launcher basename read the other server's traffic as its own
+  measurement. The scan now records that entry's `wraps` and ledger identity — visible in
+  `terse mcp-status --json`, and without which the stats-side fix could not fire at all. A
+  `folded-and-live` entry that is live as a raw re-add runs no proxy, writes nothing, and
+  is still skipped.
+- **The ambiguity guard no longer loses a collision to an entry that guesses nothing.** A
+  row with no guessable label (a raw re-add, or one with `--server-name` baked in) took the
+  de-duplication slot for its server name and shadowed a same-named row in a lower-priority
+  scope that did guess — hiding a real collision.
 
 ## [0.32.0] - 2026-09-08
 

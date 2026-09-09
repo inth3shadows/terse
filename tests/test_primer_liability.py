@@ -1384,3 +1384,118 @@ def test_the_verdicts_sort_by_what_needs_action_not_by_rate(tmp_path):
     rows = build_recommend_section(liab)[1:1 + len(liab["servers"])]
     assert [ln.split()[0] for ln in rows] == ["loser", "shortfall", "nolabel", "keeper"]
     assert [ln.split()[1] for ln in rows] == ["UNWRAP", "TUNE", "INSUFFICIENT", "KEEP"]
+
+
+def test_a_folded_and_live_peer_collides_with_a_wrapped_entry_over_a_launcher_label(tmp_path):
+    """#309. `folded-and-live` is "named in the peers file AND live under its own name", so
+    when that live entry launches via terse it runs its OWN proxy and writes its OWN ledger
+    rows — under the downstream basename when nothing baked `--server-name`. It pays no
+    primer of its own (the router pays one union primer for the fleet), which is why it is
+    correctly absent from `_PAYS_PRIMER` and gets no row here.
+
+    Ambiguity is a different question, and the two shared one filter. The fleet below is
+    #309's: both entries launch `python -m ...`, both write rows labelled `python`. Skipping
+    the folded-and-live one left the count at 1, `n > 1` false, and the `wrapped` entry then
+    read `python` rows carrying the OTHER server's traffic as its own measurement — #285's
+    manufactured-KEEP direction, undetected by the guard built to catch it."""
+    pol = _policy(tmp_path)
+    rows = [_scan("server-b", "wrapped", "/usr/bin/python -m server_b", pol,
+                  identity="python", explicit=False),
+            _scan("server-a", "folded-and-live", "/usr/bin/python -m server_a", pol,
+                  identity="python", explicit=False)]
+    liab = primer_liability(rows, _agg(("python", 9, 6000, 3000)))
+    served = {r["server"]: r for r in liab["servers"]}
+    # The folded peer pays nothing, so it is not billed a primer — that part was right.
+    assert list(served) == ["server-b"]
+    assert served["server-b"]["break_even_verdict"] == "ambiguous ledger label"
+    assert served["server-b"]["blocks"] is None
+
+
+def test_a_folded_and_live_peer_that_is_NOT_terse_launched_manufactures_no_collision(tmp_path):
+    """The other direction, and the reason the fix is two-file. `folded-and-live` is reached
+    on `name in folded and present` BEFORE any terse check, so a raw `claude mcp add <name>`
+    re-add of the original command lands in that state too — and runs no proxy and writes no
+    ledger rows at all.
+
+    `scan_scopes` is what encodes the difference: it leaves such a row's `wraps` and
+    `ledger_identity` None, so `_guessed_label` returns "" and the count skips it. Counting
+    it would MANUFACTURE an ambiguity and delete a correct measurement from an entry that
+    owns every `python` row in the ledger — the failure the first draft of #285's fix made,
+    in the opposite direction."""
+    pol = _policy(tmp_path)
+    rows = [_scan("server-b", "wrapped", "/usr/bin/python -m server_b", pol,
+                  identity="python", explicit=False),
+            # No `wraps`, no identity: exactly what `scan_scopes` emits for a raw re-add.
+            {"scope": "user", "server": "server-a", "state": "folded-and-live",
+             "wraps": None, "policy": None}]
+    liab = primer_liability(rows, _agg(("python", 9, 6000, 3000)))
+    served = {r["server"]: r for r in liab["servers"]}
+    assert served["server-b"]["break_even_verdict"] != "ambiguous ledger label"
+    assert served["server-b"]["blocks"] == 9
+
+
+def test_an_entry_that_guesses_nothing_does_not_shadow_a_real_collision(tmp_path):
+    """Found reviewing #309, and it is the widened filter that made it reachable. The
+    de-duplication in `_ambiguous_labels` keyed `by_name[server]` BEFORE checking that the
+    row guessed anything, so a row with no guessable label took the slot for that name and
+    a same-named row in a lower-priority scope — one that DID guess — never got counted.
+
+    Widening the filter to `folded-and-live` made the typical such row (a raw re-add, which
+    guesses nothing precisely because it writes nothing) a shadowing row. Rows are emitted
+    user scope first, so the shadowing row always wins. The result was a fix for one missed
+    collision that opened another: below, the `python` collision between the two project
+    entries is real and pre-#309 code caught it."""
+    pol = _policy(tmp_path)
+    colliding = [_scan("kb", "wrapped", "/usr/bin/python -m a", pol, scope="project",
+                       identity="python", explicit=False),
+                 _scan("zz", "wrapped", "/usr/bin/python -m b", pol, scope="project",
+                       identity="python", explicit=False)]
+    shadow = {"scope": "user", "server": "kb", "state": "folded-and-live",
+              "wraps": None, "policy": None}
+    liab = primer_liability([shadow, *colliding], _agg(("python", 9, 6000, 3000)))
+    verdicts = {r["server"]: r["break_even_verdict"] for r in liab["servers"]}
+    assert verdicts == {"kb": "ambiguous ledger label", "zz": "ambiguous ledger label"}
+    # Without the guard both rows instead claim the SAME 9 blocks — #285's double count.
+    assert all(r["blocks"] is None for r in liab["servers"])
+
+
+def test_a_real_scan_of_a_real_config_drives_the_collision_end_to_end(tmp_path):
+    """The two halves of #309's fix are coupled on purpose — `stats.py` filters on a bare
+    STATE, and its correctness depends on `install_mcp.py` leaving `wraps`/`ledger_identity`
+    empty for a `folded-and-live` entry that is not terse-launched. Every other test on
+    either side hand-builds its scan rows (`_scan` sets `identity=` outright), so the two
+    ends agree only by fixture convention and a change to `resolve_ledger_identity`'s
+    semantics would leave all of them green.
+
+    This one writes a real client config, runs the real `do_install` + `scan_scopes`, and
+    feeds that output straight into `primer_liability` — nothing hand-shaped in between."""
+    import json as _json
+
+    from terse.install_mcp import do_install, scan_scopes
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(_json.dumps({"mcpServers": {
+        "kb": {"command": "kb-mcp", "args": ["--x"]},
+        "gh": {"command": "gh-mcp"},
+        "zz": {"command": "/usr/bin/python", "args": ["-m", "server_b"]},
+    }}), encoding="utf-8")
+    pol = _policy(tmp_path)
+    do_install(["kb", "gh"], pol, cfg=cfg, multiproxy=True)   # kb, gh fold behind a router
+    do_install(["zz"], pol, cfg=cfg)                          # zz wraps standalone
+    live = _json.loads(cfg.read_text())
+    # kb comes back live under its own name, launching via terse over a LAUNCHER command
+    # with no baked --server-name: it writes `python` rows, and so does zz.
+    live["mcpServers"]["kb"] = {"command": "terse", "args": [
+        "proxy", "--policy", pol, "--", "/usr/bin/python", "-m", "server_a"]}
+    live["mcpServers"]["zz"]["args"] = [
+        a for a in live["mcpServers"]["zz"]["args"] if not a.startswith("--server-name")]
+    zz_args = live["mcpServers"]["zz"]["args"]
+    assert not any(a == "--server-name" or a.startswith("--server-name=") for a in zz_args)
+    cfg.write_text(_json.dumps(live), encoding="utf-8")
+
+    rows = scan_scopes(cfg=cfg)
+    assert {r["server"]: r["state"] for r in rows}["kb"] == "folded-and-live"
+    liab = primer_liability(rows, _agg(("python", 9, 6000, 3000)))
+    served = {r["server"]: r for r in liab["servers"]}
+    # zz must NOT read the `python` rows as its own — kb writes them too.
+    assert served["zz"]["break_even_verdict"] == "ambiguous ledger label"
+    assert served["zz"]["blocks"] is None
