@@ -28,8 +28,7 @@ fails that pull request until the section has moved.
 - **The ambiguity guard no longer loses a collision to an entry that guesses nothing.** A
   row with no guessable label (a raw re-add, or one with `--server-name` baked in) took the
   de-duplication slot for its server name and shadowed a same-named row in a lower-priority
-  scope that did guess — hiding a real collision. Entries baked with `--no-stats` write no
-  ledger records and no longer count toward one either.
+  scope that did guess — hiding a real collision.
 
 ## [0.32.0] - 2026-09-08
 

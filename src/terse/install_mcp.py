@@ -1562,13 +1562,23 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
         # fields below it reaches `terse stats` with `wraps`/`ledger_identity` None,
         # `_guessed_label` returns "", and `_ambiguous_labels` drops it before counting.
         #
-        # `launches_via_terse` is load-bearing, not belt-and-braces: the state is reached
-        # on `name in folded and present` ABOVE, before any terse check, so a raw
+        # The terse check is load-bearing, not belt-and-braces: the state is reached on
+        # `name in folded and present` ABOVE, before any terse check, so a raw
         # `claude mcp add <name>` re-add of the original command lands here too. That
         # entry runs no proxy and writes no ledger rows, and must keep every launch field
         # None — counting it toward a collision would MANUFACTURE an ambiguity, the
         # direction #285's review warned about.
-        live_terse_peer = state == "folded-and-live" and launches_via_terse
+        #
+        # `parse_proxy_opts`, NOT `launches_via_terse`: `_looks_like_terse_launcher` errs
+        # toward detection BY DESIGN (its docstring says so — a false positive there is
+        # meant to be caught by this exact check), and it matches a bare `"terse" in
+        # args`. So `uv run --with terse -- python -m server_a` passed it while running no
+        # proxy at all, and manufactured the collision this branch exists to avoid.
+        # `parse_proxy_opts` returns None unless there is a real `proxy` subcommand, and
+        # calls `_looks_like_terse_launcher` itself — the state guarantees `present`, so
+        # the subscript is safe.
+        live_terse_peer = (state == "folded-and-live"
+                           and parse_proxy_opts(servers[name]) is not None)
         if live_terse_peer or state in ("wrapped", "wrapped-unstashed", "router",
                                         "router-ambiguous"):
             # The launcher (`command`) is the entry's most silent failure mode: if it

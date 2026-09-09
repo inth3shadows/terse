@@ -1459,27 +1459,6 @@ def test_an_entry_that_guesses_nothing_does_not_shadow_a_real_collision(tmp_path
     assert all(r["blocks"] is None for r in liab["servers"])
 
 
-def test_a_no_stats_entry_writes_no_ledger_rows_and_cannot_collide(tmp_path):
-    """`--no-stats` sets `stats_log = None`: that entry writes no ledger records at all, so
-    it cannot be one of the two entries fighting over a label. Counting it deleted a correct
-    measurement from the entry that owns every row under that label — the first-draft
-    failure `_ambiguous_labels`' own docstring warns about, arriving by a different route.
-
-    `folded-and-live` is where #309 made this newly reachable, but the guard is on the row's
-    `stats` field, so the identical `wrapped` hole closes with it."""
-    pol = _policy(tmp_path)
-    owner = _scan("zz", "wrapped", "/usr/bin/python -m b", pol,
-                  identity="python", explicit=False)
-    owner["stats"] = True
-    quiet = _scan("kb", "wrapped", "/usr/bin/python -m a", pol,
-                  identity="python", explicit=False)
-    quiet["stats"] = False
-    liab = primer_liability([quiet, owner], _agg(("python", 9, 6000, 3000)))
-    served = {r["server"]: r for r in liab["servers"]}
-    assert served["zz"]["break_even_verdict"] != "ambiguous ledger label"
-    assert served["zz"]["blocks"] == 9
-
-
 def test_a_real_scan_of_a_real_config_drives_the_collision_end_to_end(tmp_path):
     """The two halves of #309's fix are coupled on purpose — `stats.py` filters on a bare
     STATE, and its correctness depends on `install_mcp.py` leaving `wraps`/`ledger_identity`

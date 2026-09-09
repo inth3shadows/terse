@@ -856,19 +856,30 @@ def _ambiguous_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
     SHADOW a same-named row in a lower-priority scope that does guess, silently deleting a
     real collision (found in review of #309, and reproduced: a raw `folded-and-live`
     re-add in user scope hid a genuine `python` collision between two project-scope
-    entries, which the pre-#309 code caught). Rows are emitted user scope first, so the
-    shadowing row is always the one that wins the slot."""
+    entries, which the pre-#309 code caught).
+
+    Which row wins the slot when several DO guess is a separate, pre-existing defect, named
+    here so the next reader does not mistake the order for a decision: rows arrive user →
+    project → local and first wins, while the client resolves the opposite way (local >
+    project > user). The kept row can therefore be the one definition that is never
+    launched. Skipping empty guesses moves the slot toward higher-precedence rows, which is
+    the right direction, but it does not fix the tiebreak — `primer_liability`'s own `seen`
+    dedup has the same inversion, and correcting both moves published numbers."""
     by_name: dict[str, str] = {}
     for row in scan_rows:
         name = row.get("server")
         if row.get("state") not in _WRITES_LEDGER_ROWS or not name or name in by_name:
             continue
-        # `stats is False` means `--no-stats` was baked in: that entry writes no ledger
-        # records at all, so counting it toward a collision deletes a correct measurement
-        # from the entry that DOES own every row under the label. `is not False` on
-        # purpose — the field is None on rows that never reach the launch-field block, and
-        # those are skipped by the empty guess below anyway.
-        lbl = _guessed_label(row) if row.get("stats") is not False else ""
+        # NOT also gated on `row["stats"]`: an entry baked with `--no-stats` writes no
+        # ledger records, so in principle it cannot be one of the two fighting over a
+        # label — but skipping it HERE only removes the collision. Nothing downstream stops
+        # that same entry from claiming the label anyway (`_wrapped_labels` still returns
+        # its guess, and `primer_liability` still renders it), so both entries then report
+        # the SAME blocks: #285's double count, relocated rather than fixed. Tried in
+        # review of #309 and reverted with the measurement in hand. The `--no-stats` hole
+        # is real in both directions and pre-dates this — it needs the label path and this
+        # one changed together, which moves published numbers. Tracked separately.
+        lbl = _guessed_label(row)
         if not lbl:
             continue
         by_name[str(name)] = lbl

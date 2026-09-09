@@ -2404,3 +2404,25 @@ def test_a_terse_launched_folded_and_live_peer_carries_its_launch_fields(tmp_pat
     assert rows["gh"]["ledger_identity"] is None
     assert rows["gh"]["ledger_identity_explicit"] is None
     assert rows["gh"]["launcher"] is None and rows["gh"]["stats"] is None
+
+
+def test_merely_MENTIONING_terse_does_not_make_a_folded_and_live_peer_a_proxy(tmp_path):
+    """`_looks_like_terse_launcher` errs toward detection by design — its own docstring says
+    a false positive is "caught anyway by `parse_proxy_opts` requiring a `proxy`
+    subcommand" — and it matches a bare `"terse" in args`. Gating #309's widened block on
+    it therefore filled in `wraps` and a ledger identity for `uv run --with terse -- python
+    -m server_a`: an entry that installs terse as a DEPENDENCY and runs no proxy at all.
+
+    That manufactured the exact ambiguity the gate exists to avoid, deleting the correct
+    measurement of the entry that really does own every `python` row. Found in review of
+    #309; the discriminator is `parse_proxy_opts`, which the block already computes."""
+    from terse.install_mcp import do_install, scan_scopes
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    live = json.loads(cfg.read_text())
+    live["mcpServers"]["kb"] = {"command": "uv", "args": [
+        "run", "--with", "terse", "--", "/usr/bin/python", "-m", "server_a"]}
+    cfg.write_text(json.dumps(live), encoding="utf-8")
+    row = {r["server"]: r for r in scan_scopes(cfg=cfg) if r["scope"] == "user"}["kb"]
+    assert row["state"] == "folded-and-live"
+    assert row["wraps"] is None and row["ledger_identity"] is None
