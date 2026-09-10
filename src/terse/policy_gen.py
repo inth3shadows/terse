@@ -398,8 +398,14 @@ def _text_drop_candidate(raws: list[str]) -> tuple[dict[str, dict], list[dict[st
     # addressed to one handle, so a tool that repeats the same source across payloads is
     # cheaper to drop than a unique-every-time one, and the report should say so rather
     # than print a fabricated "100% uniq" beside honestly-measured JSON rows.
+    # `payloads`/`payloads_total` are equal on this path by construction — `share` is
+    # pooled over the long-text payloads, so every one of them backs the figure and there
+    # is no minority case to flag. They are still emitted so the renderer states this
+    # candidate's SAMPLE SIZE in the same column as a JSON candidate's (#373), rather than
+    # leaving the one lossy rule live in production as the only row with no denominator.
     row = {"path": TEXT_SELECTOR_CODE_BLOCKS, "role": "unknown", "n": n_spans,
            "distinct": len(distinct), "uniq_ratio": round(len(distinct) / n_spans, 4),
+           "payloads": n, "payloads_total": n,
            "mean_tok": round(spans_tok / n_spans, 1), "max_tok": max_tok,
            "tok_share": round(share, 4)}
     return suggestion, [row]
@@ -420,7 +426,22 @@ def _drop_candidates(
 
     Each payload is profiled INDEPENDENTLY and the metrics are averaged: cardinality is a
     within-payload property (the drop runs per result at runtime), so pooling records across
-    payloads would wrongly halve `uniq_ratio` when the same result is captured twice."""
+    payloads would wrongly halve `uniq_ratio` when the same result is captured twice.
+
+    `_avg` averages over the payloads that CARRY the field, which is right for the metric
+    and wrong as a summary: a field present in 2 of a tool's 8 payloads is averaged over
+    those 2 and reads exactly like one present in all 8. `n` cannot stand in — it counts
+    RECORDS, so a field in two large payloads outranks one in six small ones. So every row
+    also carries `payloads` / `payloads_total`, the denominator the averages were actually
+    taken over (#373).
+
+    That this is worth stating is measured, not hypothetical: `kb.read.list_nodes
+    [].embedding` ranked as the corpus's second-largest candidate at `~80% tok` while
+    living in 2 of 8 payloads, both captured 2026-07-26..27 — the server stopped returning
+    the field on 2026-07-28 (kb `264011d`). Presence is a WITHIN-CORPUS signal and not
+    proof of retirement: a field retired recently against a stale corpus still reads as
+    fully present. Like #380's sample line, it is the denominator, never a verdict —
+    a legitimately nullable field is a minority for an innocent reason."""
     path: str | None = None
     per_payload: list[dict[str, dict[str, Any]]] = []
     for raw in raws:
@@ -445,6 +466,9 @@ def _drop_candidates(
     fields = {f for pp in per_payload for f in pp}
     agg = {f: {"n": sum(pp[f]["n"] for pp in per_payload if f in pp),
                "distinct": sum(pp[f]["distinct"] for pp in per_payload if f in pp),
+               # The denominator every other metric on this row was averaged over.
+               "payloads": sum(1 for pp in per_payload if f in pp),
+               "payloads_total": len(per_payload),
                "uniq_ratio": round(_avg(f, "uniq_ratio"), 4),
                "mean_tok": round(_avg(f, "mean_tok"), 1),
                "max_tok": max(pp[f]["max_tok"] for pp in per_payload if f in pp),

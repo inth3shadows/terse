@@ -13,7 +13,22 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A `terse tune` drop candidate now states the payload count its percentages were
+  averaged over (#373).** `_drop_candidates` averages `tok_share`/`uniq_ratio` over the
+  payloads that CARRY the field — right for the metric, wrong as a summary: a field in 2
+  of a tool's 8 payloads rendered identically to one in all 8, and `n` could not stand in
+  because it counts records, so two large payloads outrank six small ones. Measured
+  consequence: `kb.read.list_nodes [].embedding` ranked as the corpus's second-largest
+  candidate at `~80% tok` while living in 2 of 8 payloads, both captured 2026-07-26..27
+  — the server stopped returning the field on 2026-07-28 (kb `264011d`), five weeks
+  before the issue proposing a drop rule for it was filed. Every candidate line now
+  carries `n/N payloads`, marked `⚠` when the field is absent from most of them or fewer
+  than three were profiled at all. Disclosure only: `tune` proposes exactly what it
+  proposed before, because suppressing a candidate on a thin corpus is the silent-zero
+  failure of #375. Presence is a within-corpus signal, not proof of retirement — a field
+  retired recently against a stale corpus still reads as fully present.
 
 ## [0.32.2] - 2026-09-09
 

@@ -405,6 +405,27 @@ def _share(n: int, total: int) -> str:
     return f"{n / total:.0%}"
 
 
+# Below this many profiled payloads, a drop candidate's averaged share is not an average.
+# 3 is the smallest n where a single outlier payload is not the whole figure; it is a
+# DISCLOSURE threshold, never a filter — `tune` proposes exactly what it proposed before
+# (suppressing a candidate on a thin corpus is the silent-zero failure of #375).
+_TUNE_MIN_CANDIDATE_PAYLOADS = 3
+
+
+def _candidate_presence(c: dict) -> tuple[int, int]:
+    """`(payloads carrying the field, payloads profiled)` for one drop candidate, or
+    `(0, 0)` when the row predates the keys (#373).
+
+    Kept tolerant rather than indexed directly: a candidate row also reaches this renderer
+    from a stored report, and a `KeyError` there would take down the whole listing over a
+    disclosure line. `(0, 0)` renders as no note — the pre-#373 behaviour — which is the
+    right failure: silence about the denominator, not a wrong denominator."""
+    seen, total = c.get("payloads"), c.get("payloads_total")
+    if not isinstance(seen, int) or not isinstance(total, int) or total <= 0:
+        return 0, 0
+    return seen, total
+
+
 def _tune_sample_line(envelopes: list) -> str:
     total, with_id, lists = tune_sample_provenance(envelopes)
     return (f"#   sample: {with_id} with result_id ({_share(with_id, total)}), "
@@ -1227,14 +1248,37 @@ def _cmd_tune(args: argparse.Namespace) -> int:
         if not items:
             return
         print(f"\n{label}:")
+        thin = False
         for c in items:
+            # `tok_share`/`uniq_ratio` are averaged over the payloads that CARRY the field,
+            # so the denominator is part of the figure, not a footnote (#373). A field in a
+            # MINORITY of payloads reads identically to one in all of them without it.
+            seen, total = _candidate_presence(c)
+            note = ""
+            if total:
+                note = f", {seen}/{total} payloads"
+                # Two ways the figure is thin, one marker. MINORITY: the field is absent
+                # from most payloads, so the share is an average over the ones that still
+                # carry it — how a RETIRED field keeps its rank. UNDERPOWERED: fewer than
+                # three payloads were profiled at all, so there is no average to speak of.
+                if seen * 2 < total or total < _TUNE_MIN_CANDIDATE_PAYLOADS:
+                    note += " ⚠"
+                    thin = True
             print(f"  {c['tool']:<28} {c['path']:<26} "
-                  f"~{c['tok_share'] * 100:.0f}% tok, {c['uniq_ratio'] * 100:.0f}% uniq  "
-                  f"[{c.get('role', 'unknown')}]")
+                  f"~{c['tok_share'] * 100:.0f}% tok, {c['uniq_ratio'] * 100:.0f}% uniq"
+                  f"{note}  [{c.get('role', 'unknown')}]")
         est = _est_tokens(items)
         share = f", ~{est / corpus_raw * 100:.0f}% of corpus" if corpus_raw else ""
         print(f"  → enabling all {len(items)} here: ≈{est:,.0f} tok{share} "
               "(gross, before the per-record retrieve-handle cost)")
+        if thin:
+            print(f"  ⚠ = averaged over a MINORITY of this tool's payloads, or over fewer "
+                  f"than {_TUNE_MIN_CANDIDATE_PAYLOADS}. Both read like a confident share "
+                  f"and are not one: a field the server has STOPPED returning keeps the "
+                  f"share it had in the payloads that still carry it, and a one-payload "
+                  f"average is that payload. Check the field is still live, and compare "
+                  f"the payload count against `terse stats` live blocks, before enabling "
+                  f"a drop for it (#373).")
 
     _show("SAFE candidates — supporting prose, enable after a dropeval pass",
           [c for c in cands if c.get("role") == "prose"])

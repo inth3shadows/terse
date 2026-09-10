@@ -1560,3 +1560,63 @@ def test_tune_sample_provenance_reads_shape_live_not_from_the_stored_bucket(tmp_
     env["shape"] = "compact-json"           # what an older classifier would have stored
     path.write_text(json.dumps(env))
     assert tune_sample_provenance(load_corpus(corpus)) == (1, 0, 1)
+
+
+def _tune_corpus_with_a_retired_field(tmp_path, n_payloads=4, n_with_embedding=1):
+    """A corpus shaped like the #373 failure: every payload carries `description`, only the
+    first `n_with_embedding` also carry a huge unique `embedding` — i.e. a field the server
+    stopped returning partway through the capture window."""
+    corpus = tmp_path / "corpus"
+    for p in range(n_payloads):
+        recs = []
+        for i in range(20):
+            rec = {"id": f"{p}-{i}", "description": "d" * 250 + f"{p}-{i}"}
+            if p < n_with_embedding:
+                rec["embedding"] = "[" + ",".join(f"0.{p}{i}{j:03d}" for j in range(120)) + "]"
+            recs.append(rec)
+        f = _write(tmp_path, f"p{p}.json", json.dumps({"result": recs}))
+        assert main(["capture", str(f), "--tool", "kb.x", "--corpus", str(corpus)]) == 0
+    return corpus
+
+
+def test_tune_states_the_payload_count_each_drop_candidate_was_averaged_over(tmp_path,
+                                                                            capsys):
+    # `tok_share`/`uniq_ratio` are averaged over the payloads that CARRY the field, so the
+    # denominator is part of the figure (#373). A field in every payload says so plainly
+    # and draws no warning — the marker has to mean something.
+    corpus = _tune_corpus_with_a_retired_field(tmp_path, n_payloads=4, n_with_embedding=0)
+    capsys.readouterr()
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    line = next(ln for ln in capsys.readouterr().out.splitlines()
+                if "result[].description" in ln)
+    assert "4/4 payloads" in line
+    assert "⚠" not in line
+
+
+def test_tune_flags_a_drop_candidate_present_in_a_minority_of_payloads(tmp_path, capsys):
+    # The #373 regression, pinned end-to-end through the real command: a field the server
+    # has stopped returning keeps the token share it had in the payloads that still carry
+    # it, so it can outrank a field present in every payload. Before this, both rendered
+    # identically and the retired one read as the corpus's largest candidate.
+    corpus = _tune_corpus_with_a_retired_field(tmp_path, n_payloads=4, n_with_embedding=1)
+    capsys.readouterr()
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    out = capsys.readouterr().out
+    emb = next(ln for ln in out.splitlines() if "result[].embedding" in ln)
+    desc = next(ln for ln in out.splitlines() if "result[].description" in ln)
+    assert "1/4 payloads ⚠" in emb, emb
+    assert "4/4 payloads" in desc and "⚠" not in desc, desc
+    # and the marker is explained where the operator reads it, naming the mechanism
+    assert "STOPPED returning" in out and "MINORITY" in out
+
+
+def test_tune_flags_a_drop_candidate_averaged_over_a_single_payload(tmp_path, capsys):
+    # The other way the share is thin, and the more dangerous one because it looks clean:
+    # a one-payload "average" is that payload. Same marker, stated in the footnote.
+    corpus = _tune_corpus_with_a_retired_field(tmp_path, n_payloads=1, n_with_embedding=0)
+    capsys.readouterr()
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if "result[].description" in ln)
+    assert "1/1 payloads ⚠" in line, line
+    assert "fewer than 3" in out
