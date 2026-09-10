@@ -30,6 +30,20 @@ fails that pull request until the section has moved.
   failure of #375. Presence is a within-corpus signal, not proof of retirement — a field
   retired recently against a stale corpus still reads as fully present.
 
+  The denominator counts **every payload captured for the tool**, not the payloads the
+  analyzer admitted. Counting the latter reproduced the original failure through the new
+  code: payloads that fail to parse, carry no record list, or whose record path differs
+  from the first one are excluded from `per_payload`, and those exclusions correlate with
+  exactly the case being caught — a field going away usually comes with a shape change or
+  an error payload. An `embedding` in the 3 oldest of 8 captures, where the 5 newer
+  renamed the envelope key, reported `3/3` and drew no warning. `$text.code_blocks` was
+  worse still: its share is pooled over the long-text payloads alone, so `n/n` asserted
+  "100% of the payloads I counted" over what was really 3 of 12 — on the one lossy rule
+  live in production. The disclosure also reaches `_suggested_fields_note` inside the
+  written `policy.json` and the `terse policy generate` candidate line; a number that
+  reaches only `tune`'s stdout is inert on the path that decides the lossy change, since
+  the note is what the operator reads when renaming `_suggested_fields` to `fields`.
+
 ## [0.32.2] - 2026-09-09
 
 ### Fixed

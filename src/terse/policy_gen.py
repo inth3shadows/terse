@@ -398,17 +398,60 @@ def _text_drop_candidate(raws: list[str]) -> tuple[dict[str, dict], list[dict[st
     # addressed to one handle, so a tool that repeats the same source across payloads is
     # cheaper to drop than a unique-every-time one, and the report should say so rather
     # than print a fabricated "100% uniq" beside honestly-measured JSON rows.
-    # `payloads`/`payloads_total` are equal on this path by construction — `share` is
-    # pooled over the long-text payloads, so every one of them backs the figure and there
-    # is no minority case to flag. They are still emitted so the renderer states this
-    # candidate's SAMPLE SIZE in the same column as a JSON candidate's (#373), rather than
-    # leaving the one lossy rule live in production as the only row with no denominator.
+    # `share` is pooled over the `n` LONG_TEXT payloads only, while `raws` holds every
+    # payload captured for the tool — so the denominator is `len(raws)`, not `n`. Emitting
+    # `n/n` would be circular ("100% of the payloads I counted"), which is how a `~99%`
+    # share measured inside 3 of a tool's 12 payloads printed as `3/3` (review finding).
+    # This governs `codegraph_explore $text.code_blocks`, the only lossy rule live in
+    # production, so it is the last row that should carry a self-confirming denominator.
     row = {"path": TEXT_SELECTOR_CODE_BLOCKS, "role": "unknown", "n": n_spans,
            "distinct": len(distinct), "uniq_ratio": round(len(distinct) / n_spans, 4),
-           "payloads": n, "payloads_total": n,
+           "payloads": n, "payloads_total": len(raws),
            "mean_tok": round(spans_tok / n_spans, 1), "max_tok": max_tok,
            "tok_share": round(share, 4)}
     return suggestion, [row]
+
+
+# Below this many payloads, a drop candidate's averaged share is not an average. 3 is the
+# smallest n where one outlier payload is not the whole figure. A DISCLOSURE threshold,
+# never a filter: suppressing a candidate on a thin corpus is the silent-zero failure of
+# #375.
+MIN_CANDIDATE_PAYLOADS = 3
+
+
+def candidate_presence(row: dict) -> tuple[int, int]:
+    """`(payloads carrying the field, payloads captured for the tool)`, or `(0, 0)` when
+    the row does not carry the pair (#373).
+
+    Every in-tree producer -- `_drop_candidates` and `_text_drop_candidate` -- sets both,
+    and `test_every_drop_candidate_producer_states_a_denominator` pins that, so `(0, 0)`
+    is unreachable today. It is kept only so a future producer that forgets the keys
+    degrades to the pre-#373 rendering instead of raising mid-listing; that is a worse
+    outcome than raising, which is why the test exists to make it unreachable rather than
+    the tolerance existing to make it survivable."""
+    seen, total = row.get("payloads"), row.get("payloads_total")
+    if not isinstance(seen, int) or not isinstance(total, int) or total <= 0:
+        return 0, 0
+    return seen, total
+
+
+def presence_is_thin(seen: int, total: int) -> bool:
+    """Whether a candidate's percentages rest on too little to read as a confident share.
+
+    Two shapes, one marker. MINORITY (`seen * 2 < total`): the field is absent from most
+    payloads, so the share is an average over the ones that still carry it -- how a
+    RETIRED field keeps its rank. Exactly half is deliberately NOT thin: "absent from most
+    of them" is the claim, and 4/8 is not most. UNDERPOWERED (`total <
+    MIN_CANDIDATE_PAYLOADS`): too few payloads to average at all."""
+    return bool(total) and (seen * 2 < total or total < MIN_CANDIDATE_PAYLOADS)
+
+
+def _presence_suffix(row: dict) -> str:
+    """`", 2/8 payloads ⚠"` for the policy note, or `""` when the row carries no pair."""
+    seen, total = candidate_presence(row)
+    if not total:
+        return ""
+    return f", {seen}/{total} payloads{' ⚠' if presence_is_thin(seen, total) else ''}"
 
 
 def _drop_candidates(
@@ -466,9 +509,18 @@ def _drop_candidates(
     fields = {f for pp in per_payload for f in pp}
     agg = {f: {"n": sum(pp[f]["n"] for pp in per_payload if f in pp),
                "distinct": sum(pp[f]["distinct"] for pp in per_payload if f in pp),
-               # The denominator every other metric on this row was averaged over.
+               # The denominator every other metric on this row was averaged over. Counted
+               # against `raws` -- every payload captured for this tool -- NOT against
+               # `per_payload`. `per_payload` silently excludes payloads that fail to
+               # parse, carry no record list, or whose record path differs from the first
+               # payload's (`if p == path`), and those exclusions correlate with exactly
+               # the case this disclosure exists to catch: a field going away usually
+               # comes WITH a shape change or an error payload. Against `per_payload` an
+               # `embedding` present in the 3 oldest of 8 captures, where the 5 newer
+               # renamed the envelope key, reports `3/3` and draws no warning -- the #373
+               # failure reproduced through the code added to prevent it (review finding).
                "payloads": sum(1 for pp in per_payload if f in pp),
-               "payloads_total": len(per_payload),
+               "payloads_total": len(raws),
                "uniq_ratio": round(_avg(f, "uniq_ratio"), 4),
                "mean_tok": round(_avg(f, "mean_tok"), 1),
                "max_tok": max(pp[f]["max_tok"] for pp in per_payload if f in pp),
@@ -831,8 +883,15 @@ def generate_policy(
         # `_suggested_fields`, so this is a no-op until the operator renames it. Drop is
         # lossy — the human confirms; the generator never enables it.
         if r.get("drop_suggestion"):
+            # Carries the denominator too. This note is what the operator reads at the
+            # moment they rename `_suggested_fields` -> `fields` and make the lossy change
+            # live, and it outlives the stdout line that `tune` printed beside it, so a
+            # disclosure that reaches only stdout is inert on the path that decides the
+            # change (review finding). `terse policy generate` and `policy autotune` share
+            # this note and never print that stdout line at all.
             shares = ", ".join(
-                f"{dr['path']} ~{dr['tok_share']*100:.0f}% [{dr.get('role', 'unknown')}]"
+                f"{dr['path']} ~{dr['tok_share']*100:.0f}%{_presence_suffix(dr)} "
+                f"[{dr.get('role', 'unknown')}]"
                 for dr in r["drop_rows"])
             has_unknown = any(dr.get("role") == "unknown" for dr in r["drop_rows"])
             caution = (" A field tagged [unknown] may be LOAD-BEARING — the name doesn't "
