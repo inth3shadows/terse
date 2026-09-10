@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.32.3] - 2026-09-09
+
 ### Fixed
 
 - **A `terse tune` drop candidate now states the payload count its percentages were
