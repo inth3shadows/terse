@@ -19,7 +19,7 @@ import pytest
 from test_codeceval import PAYLOAD as CODEC_PAYLOAD
 from test_fluency import DIFF_CURR, DIFF_PREV, PAYLOAD, TEXT_CURR, TEXT_PREV, _soak_envs
 
-from terse import dropeval, fluency
+from terse import codeceval, dropeval, fluency
 from terse.fluency.harnesses import progress_line
 
 
@@ -167,12 +167,13 @@ def test_codec_verdict_harness_reports_like_the_drop_eval(tmp_path):
     lines: list[str] = []
     answerers = {"m1": lambda m: dropeval.Turn(text="no"),
                  "m2": lambda m: dropeval.Turn(text="no")}
-    codeceval.run_codec_fluency(envs, answerers, trials=1, progress=lines.append)
+    codeceval.run_codec_fluency(envs, answerers, trials=1, progress=lines.append,
+                                preflight=False)
     assert lines and all(ln.startswith("[fluency --codec-verdict]") for ln in lines)
     assert _done_total(lines[-1]) == (2, 2)
     assert sum("(skipped" in ln for ln in lines) == 1
     assert len(lines) == 3, lines   # 2 models x 1 scorable payload + 1 skip
-    codeceval.run_codec_fluency(envs, answerers, trials=1)   # silent when not asked
+    codeceval.run_codec_fluency(envs, answerers, trials=1, preflight=False)   # silent when not asked
 
 
 def test_model_outer_harnesses_name_the_model_index_and_restart_the_clock():
@@ -278,9 +279,19 @@ def test_the_cli_streams_progress_to_stderr_and_keeps_stdout_clean(tmp_path, mon
     corpus = tmp_path / "corpus"
     _write_corpus(corpus, kind)
     # `--codec-verdict` builds tool-capable answerers (one `messages` arg); the rest are
-    # single-shot `(system, user)` answerers. Both stubs answer every question wrong.
-    stub = ((lambda m: dropeval.Turn(text="no")) if mode == "codec-verdict"
-            else (lambda s, u: "9"))
+    # single-shot `(system, user)` answerers. Both stubs answer every corpus question
+    # wrong — but the codec stub must still CLEAR THE PRE-FLIGHT (#403), which asks a
+    # fixed 2-record question before any corpus work and drops a model that cannot express
+    # a container tool argument. A stub that fails it is excluded and emits no per-payload
+    # progress at all, which is what this test measures. So: answer the pre-flight
+    # correctly, everything else wrong.
+    def _codec_stub(messages):
+        asks_preflight = codeceval.PREFLIGHT_PROMPT in messages[-1]["content"]
+        value = codeceval.PREFLIGHT_EXPECTED if asks_preflight else {"wrong": True}
+        return dropeval.Turn(text="", tool_calls=[dropeval.ToolCall(
+            call_id="c1", name=codeceval.RECORD_VALUE_TOOL, arguments={"value": value})])
+
+    stub = _codec_stub if mode == "codec-verdict" else (lambda s, u: "9")
     monkeypatch.setattr(cli, "_build_answerers",
                         lambda args, make, **kw: {"stub-model": stub})
     argv = ["fluency", "--corpus", str(corpus), "--out", str(tmp_path / "rep.md"), *flags]

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from terse import codeceval, fluency
 from terse.dropeval import ToolCall, Turn
 
@@ -214,7 +216,7 @@ def test_run_codec_fluency_stamps_tool_and_shape_on_every_row():
 
     envelopes = [{"tool": "demo.get", "shape": "array-of-records", "sha": "abc123",
                  "raw": RAW_TEXT}]
-    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1)
+    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1, preflight=False)
     assert results["m1"]
     for row in results["m1"]:
         assert row["tool"] == "demo.get"
@@ -229,7 +231,7 @@ def test_run_codec_fluency_skips_a_payload_with_no_deref_question():
     flat = {"result": [{"id": 1, "n": 10}, {"id": 2, "n": 20}]}
     envelopes = [{"tool": "demo.get", "shape": "array-of-records", "sha": "x",
                  "raw": json.dumps(flat)}]
-    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1)
+    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1, preflight=False)
     assert results["m1"] == []
 
 
@@ -238,5 +240,98 @@ def test_run_codec_fluency_skips_non_json_payloads():
         return Turn(text="", tool_calls=[])
 
     envelopes = [{"tool": "demo.get", "shape": "long-text", "sha": "x", "raw": "not json"}]
-    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1)
+    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1, preflight=False)
     assert results["m1"] == []
+
+
+# --- #403: container-argument encoding pre-flight -----------------------------------
+
+def _stub_answerer(values):
+    """Answerer returning `values` in order as the `value` argument; a value of the
+    sentinel `NO_CALL` returns a prose turn with no tool call."""
+    seq = list(values)
+
+    def answerer(messages):
+        v = seq.pop(0) if seq else seq
+        if v == "NO_CALL":
+            return Turn(text='["x", "y"]', tool_calls=[], error=False)
+        return Turn(text="", error=False, tool_calls=[
+            ToolCall(call_id="c1", name=codeceval.RECORD_VALUE_TOOL,
+                     arguments={"value": v})])
+    return answerer
+
+
+@pytest.mark.parametrize("got,expected,is_mismatch", [
+    ('["x"]', ["x"], True),                 # the deepseek-v4-pro case
+    ('{"a": 1}', {"a": 1}, True),
+    ('[]', [], True),
+    (["x"], ["x"], False),                  # correctly typed -> not a mismatch
+    ("nope", ["x"], False),                 # not even parseable
+    ('["z"]', ["x"], False),                # parses, but wrong content: a real miss
+    ('"a"', "a", False),                    # string expected: excluded by design
+    (None, ["x"], False),
+])
+def test_encodes_as_json_string_identifies_only_right_content_wrong_type(got, expected,
+                                                                        is_mismatch):
+    assert codeceval.encodes_as_json_string(got, expected) is is_mismatch
+
+
+def test_encoding_detection_never_turns_a_miss_into_a_hit():
+    # The whole point: this is diagnosis, not scoring. A stringified answer stays WRONG.
+    assert codeceval._value_matches('["x"]', ["x"]) is False
+    assert codeceval.encodes_as_json_string('["x"]', ["x"]) is True
+
+
+def test_preflight_passes_a_model_that_sends_a_native_container():
+    a = _stub_answerer([codeceval.PREFLIGHT_EXPECTED] * codeceval.PREFLIGHT_ATTEMPTS)
+    assert codeceval.preflight_encoding(a) is None
+
+
+def test_preflight_names_the_json_string_encoding_and_counts_attempts():
+    a = _stub_answerer([json.dumps(codeceval.PREFLIGHT_EXPECTED)] * 3)
+    why = codeceval.preflight_encoding(a, attempts=3)
+    assert why and "JSON STRING" in why and "3/3 pre-flight attempts failed" in why
+
+
+def test_preflight_rejects_a_model_that_is_only_sometimes_right():
+    # Measured on deepseek-v4-pro at temperature=0: one call stringified, another sent no
+    # `value` at all. A model that expresses a container argument only sometimes still
+    # poisons the arm it is on, so ALL attempts must match.
+    a = _stub_answerer([codeceval.PREFLIGHT_EXPECTED,
+                        json.dumps(codeceval.PREFLIGHT_EXPECTED),
+                        codeceval.PREFLIGHT_EXPECTED])
+    why = codeceval.preflight_encoding(a, attempts=3)
+    assert why and "1/3 pre-flight attempts failed" in why
+
+
+def test_preflight_names_a_model_that_answers_in_prose():
+    a = _stub_answerer(["NO_CALL"] * 3)
+    why = codeceval.preflight_encoding(a, attempts=3)
+    assert why and codeceval.RECORD_VALUE_TOOL in why and "prose" not in why.lower()[:20]
+
+
+def test_run_codec_fluency_excludes_a_bad_model_and_keeps_the_good_one():
+    good = _stub_answerer([codeceval.PREFLIGHT_EXPECTED] * 20)
+    bad = _stub_answerer([json.dumps(codeceval.PREFLIGHT_EXPECTED)] * 20)
+    seen: list[str] = []
+    out = codeceval.run_codec_fluency([], {"good": good, "bad": bad}, trials=1,
+                                      progress=seen.append)
+    assert set(out) == {"good"}, out
+    assert any("EXCLUDED bad" in s and "JSON STRING" in s for s in seen), seen
+
+
+def test_cli_codec_verdict_never_disables_the_preflight():
+    # The opt-out is for degenerate test stubs only. If the CLI ever passes it, a live run
+    # silently regains the failure mode #403 was filed about: 57 minutes producing
+    # `broken control` with no named cause.
+    import pathlib
+    src = pathlib.Path("src/terse/cli.py").read_text()
+    assert "preflight=False" not in src and "preflight = False" not in src
+
+
+def test_run_codec_fluency_refuses_when_every_model_is_excluded():
+    # Returning empty rows would render as UNRESOLVED "no data" — indistinguishable from a
+    # thin corpus, which is the exact ambiguity #403 was filed about.
+    bad = _stub_answerer([json.dumps(codeceval.PREFLIGHT_EXPECTED)] * 10)
+    with pytest.raises(RuntimeError, match="no model can express a container tool argument"):
+        codeceval.run_codec_fluency([], {"bad": bad}, trials=1)

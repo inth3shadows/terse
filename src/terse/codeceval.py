@@ -125,6 +125,110 @@ def _value_matches(got: Any, expected: Any) -> bool:
     return got == expected
 
 
+def encodes_as_json_string(got: Any, expected: Any) -> bool:
+    """Did the model send the RIGHT VALUE as a JSON *string* instead of as its native type?
+
+    `{"value": "[\\"Navidrome\\"]"}` where `["Navidrome"]` was asked for: content exact,
+    type wrong. `_value_matches` rejects it, correctly — a downstream tool declaring
+    `"type": "array"` would reject it too, so it is a genuinely malformed tool call, not a
+    spelling of a right answer. But it is malformed for a reason that has NOTHING to do
+    with the codec: the model encodes the same way on the raw arm and the terse arm, so it
+    zeroes BOTH and the eval learns nothing about compression.
+
+    Measured 2026-09-09, live, against `~/.config/terse/session-corpus`: `deepseek-v4-pro`
+    stringifies **5 of 5** deref answers, `qwen3-coder-30b-fl` **0 of 5**. That produced a
+    0%-accuracy control on 5 of 6 (tool, shape) cells and `report.arm_gap`'s `broken
+    control` -> UNRESOLVED, with nothing anywhere naming the cause; it took a live probe to
+    find. This predicate exists so the harness can say it instead.
+
+    Not a scoring path. NOTHING calls this to turn a miss into a hit — that would accept an
+    argument a strict tool rejects, which is exactly the loosening #295 forbids. It is
+    diagnosis only: `preflight_encoding` refuses such a model up front, and the per-row
+    counts let a report say which arm was lost to encoding rather than to comprehension.
+
+    `expected` that is itself a string is excluded: `json.loads('"a"') == "a"` would make
+    every correctly-answered string question look like a mismatch. `deref`'s `expected` is
+    always a dict or list, so this is defence in depth rather than a live case."""
+    if not isinstance(got, str) or isinstance(expected, (str, int, float, bool)):
+        return False
+    try:
+        return bool(json.loads(got) == expected)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return False
+
+
+# A deref question whose answer is unambiguous from a 2-record payload, used only to ask a
+# model "how do you encode a container argument?" before spending an hour finding out. Kept
+# here rather than generated from the corpus so the pre-flight cannot itself fail for
+# corpus reasons (a thin corpus is a SEPARATE defect; conflating them is what made the
+# 2026-09-09 run unreadable).
+PREFLIGHT_PAYLOAD = {"result": [{"id": "a", "tags": ["x", "y"]}, {"id": "b", "tags": ["z"]}]}
+PREFLIGHT_PROMPT = "For the record whose 'id' is 'a', what is the full value of 'tags'?"
+PREFLIGHT_EXPECTED = ["x", "y"]
+
+
+PREFLIGHT_ATTEMPTS = 3
+
+
+def preflight_encoding(answerer: ToolAnswerer, attempts: int = PREFLIGHT_ATTEMPTS) -> str | None:
+    """`None` if this model can participate in the codec eval, else a one-line reason.
+
+    The 2026-09-09 run burned 57 minutes and 324 calls to discover that one of its two
+    models could not express a container argument. That is a property of the model and the
+    tool protocol, knowable in ONE call, and independent of the corpus, the codec and the
+    question set — so it is checked once per model before the sweep, and the model is
+    dropped with its reason named rather than silently scoring 0%.
+
+    Uses the same `_ask` path and the same `RECORD_VALUE_TOOL_DEF` as a real trial, so a
+    model that passes here is exercising the identical protocol it will be scored on. A
+    pre-flight that constructed its own request could pass while the real path fails.
+
+    Sampled `attempts` times, and **every** attempt must match. Measured while building
+    this: `deepseek-v4-pro` at `temperature=0.0` answered one call with
+    `{"value": "[\\"x\\", \\"y\\"]"}` and another with no `value` at all, so a
+    single call diagnoses the same model differently run to run. Requiring all attempts is
+    the right bar rather than a strict one — a model that expresses a container argument
+    only sometimes still poisons the arm it is on, and the reported reason is the FIRST
+    failure seen, with a count, so a flaky model reads as flaky instead of as whichever
+    mode happened to land first."""
+    q = fluency.Question(qid="preflight", qtype="deref", transform="none",
+                         prompt=PREFLIGHT_PROMPT, instruction="", expected=PREFLIGHT_EXPECTED)
+    messages = [{"role": "user", "content": fluency._user_prompt(
+        q.prompt, _codec_instruction(), json.dumps(PREFLIGHT_PAYLOAD))}]
+    first_reason: str | None = None
+    bad = 0
+    for _ in range(max(1, attempts)):
+        turn: Turn = _safe_call(answerer, messages)
+        reason: str | None
+        if turn.error:
+            reason = f"pre-flight call failed ({turn.error})"
+        else:
+            calls = [c for c in turn.tool_calls if c.name == RECORD_VALUE_TOOL]
+            if not calls:
+                reason = (f"answered without calling {RECORD_VALUE_TOOL} "
+                          f"(text: {(turn.text or '')[:60]!r}) — this eval scores a "
+                          f"tool-call argument")
+            else:
+                got = calls[-1].arguments.get("value")
+                if _value_matches(got, PREFLIGHT_EXPECTED):
+                    reason = None
+                elif encodes_as_json_string(got, PREFLIGHT_EXPECTED):
+                    reason = ("sends container arguments as a JSON STRING "
+                              f"({got!r} for {PREFLIGHT_EXPECTED!r}) — right content, wrong "
+                              "type. It would encode both arms the same way and score 0% on "
+                              "each, so the run would learn nothing about the codec")
+                else:
+                    reason = (f"failed a 2-record pre-flight question: got {got!r}, "
+                              f"expected {PREFLIGHT_EXPECTED!r}")
+        if reason is not None:
+            bad += 1
+            if first_reason is None:
+                first_reason = reason
+    if first_reason is None:
+        return None
+    return f"{first_reason} [{bad}/{max(1, attempts)} pre-flight attempts failed]"
+
+
 def _codec_instruction() -> str:
     """The instruction half of the user prompt for a codec-eval trial.
 
@@ -241,7 +345,8 @@ def _payload_tokens(raw_text: str, obj: Any) -> dict[str, int]:
 
 def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                       trials: int = 1,
-                      progress: Callable[[str], None] | None = None) -> dict[str, list[dict]]:
+                      progress: Callable[[str], None] | None = None,
+                      preflight: bool = True) -> dict[str, list[dict]]:
     """Run the codec-tier eval for each named tool-capable answerer over every payload in
     the corpus that has at least one `deref` question. Mirrors `dropeval.run_drop_fluency`'s
     envelope-outer/model-inner nesting (question generation is model-independent, so it is
@@ -260,8 +365,35 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
     `terse_tokens` (`_payload_tokens`) — PER PAYLOAD, repeated on each of its question rows,
     for `report._codec_savings_section` to de-duplicate by `sha` and report beside the
     verdict."""
+    emit = fluency.guarded(progress)
+    # Pre-flight EVERY model before touching the corpus (#403). A model that cannot express
+    # a container tool argument scores 0% on both arms and takes the whole run's verdict
+    # down with it as `broken control`; one call per model buys the difference between a
+    # named refusal in seconds and an hour of UNRESOLVED. Dropped, never scored: a row from
+    # such a model is not evidence about the codec in either direction.
+    # `preflight=False` exists for tests whose subject is envelope handling (row stamping,
+    # skip accounting) and whose stub answerer is deliberately degenerate — a stub that
+    # "never calls the tool" is precisely what the pre-flight is built to reject, so those
+    # fixtures would otherwise have to fake a capability they are not testing. NEVER pass
+    # it from the CLI: `test_cli_codec_verdict_never_disables_the_preflight` pins that.
+    usable: dict[str, ToolAnswerer] = dict(answerers) if not preflight else {}
+    for name, a in (answerers.items() if preflight else ()):
+        why = preflight_encoding(a)
+        if why is None:
+            usable[name] = a
+        else:
+            if emit:
+                emit(f"[codec-verdict] EXCLUDED {name}: {why}")
+    if preflight and answerers and not usable:
+        # Every model failed. Returning empty rows would render as UNRESOLVED "no data",
+        # which is indistinguishable from a thin corpus and is exactly the ambiguity #403
+        # was filed about — so say which failure this was.
+        raise RuntimeError(
+            "terse fluency --codec-verdict: no model can express a container tool argument, "
+            "so no run is possible. See the EXCLUDED line(s) above for each model's reason.")
+    answerers = usable
     results: dict[str, list[dict]] = {name: [] for name in answerers}
-    progress = fluency.guarded(progress)
+    progress = emit
     started = time.monotonic()
     for i, env in enumerate(envelopes, 1):
         try:
