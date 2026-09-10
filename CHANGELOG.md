@@ -15,6 +15,39 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **A `terse tune` drop candidate now states the payload count its percentages were
+  averaged over (#373).** `_drop_candidates` averages `tok_share`/`uniq_ratio` over the
+  payloads that CARRY the field — right for the metric, wrong as a summary: a field in 2
+  of a tool's 8 payloads rendered identically to one in all 8, and `n` could not stand in
+  because it counts records, so two large payloads outrank six small ones. Measured
+  consequence: `kb.read.list_nodes [].embedding` ranked as the corpus's second-largest
+  candidate at `~80% tok` while living in 2 of 8 payloads, both captured 2026-07-26..27
+  — the server stopped returning the field on 2026-07-28 (kb `264011d`), five weeks
+  before the issue proposing a drop rule for it was filed. Every candidate line now
+  carries `n/N payloads`, marked `⚠` when the field is absent from most of them or fewer
+  than three were profiled at all. Disclosure only: `tune` proposes exactly what it
+  proposed before, because suppressing a candidate on a thin corpus is the silent-zero
+  failure of #375. Presence is a within-corpus signal, not proof of retirement — a field
+  retired recently against a stale corpus still reads as fully present.
+
+  The denominator counts **every payload captured for the tool**, not the payloads the
+  analyzer admitted. Counting the latter reproduced the original failure through the new
+  code: payloads that fail to parse, carry no record list, or whose record path differs
+  from the first one are excluded from `per_payload`, and those exclusions correlate with
+  exactly the case being caught — a field going away usually comes with a shape change or
+  an error payload. An `embedding` in the 3 oldest of 8 captures, where the 5 newer
+  renamed the envelope key, reported `3/3` and drew no warning. `$text.code_blocks` was
+  worse still: its share is pooled over the long-text payloads alone, so `n/n` asserted
+  "100% of the payloads I counted" over what was really 3 of 12 — on the one lossy rule
+  live in production. The disclosure also reaches `_suggested_fields_note` inside the
+  written `policy.json` and the `terse policy generate` candidate line; a number that
+  reaches only `tune`'s stdout is inert on the path that decides the lossy change, since
+  the note is what the operator reads when renaming `_suggested_fields` to `fields`.
+
+## [0.32.2] - 2026-09-09
+
+### Fixed
+
 - **`terse fluency`'s `terse+inline` column now states the exam it was scored over
   (#292).** The inline arm is display-only: it does not gate the pairing, deliberately,
   because its prompt is the longest of the four and pairing on it would void

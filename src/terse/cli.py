@@ -833,7 +833,7 @@ def _cmd_policy_autotune(args: argparse.Namespace) -> int:
 
 def _cmd_policy_generate(args: argparse.Namespace) -> int:
     from .policy import load_policy
-    from .policy_gen import generate_policy
+    from .policy_gen import _presence_suffix, generate_policy
 
     envelopes = load_corpus(args.corpus)
     if not envelopes:
@@ -853,7 +853,8 @@ def _cmd_policy_generate(args: argparse.Namespace) -> int:
         print(f"  {r['tool']:<28} {tiers:<28} {r['reason']}", file=sys.stderr)
         for dr in r.get("drop_rows", []):
             print(f"      ↳ drop-candidate {dr['path']} "
-                  f"(~{dr['tok_share']*100:.0f}% of tokens, {dr['uniq_ratio']*100:.0f}% unique, "
+                  f"(~{dr['tok_share']*100:.0f}% of tokens, {dr['uniq_ratio']*100:.0f}% unique"
+                  f"{_presence_suffix(dr)}, "
                   f"~{dr['mean_tok']:.0f} tok/value) — suggested, off by default",
                   file=sys.stderr)
 
@@ -1147,7 +1148,7 @@ def _cmd_tune(args: argparse.Namespace) -> int:
     the generated policy (suggestions INACTIVE), and optionally verify them with a live model.
     Chains `policy generate` + the drop-eval into the single flow an operator would otherwise
     assemble by hand."""
-    from .policy_gen import generate_policy
+    from .policy_gen import MIN_CANDIDATE_PAYLOADS, _presence_suffix, generate_policy
 
     envelopes = load_corpus(args.corpus)
     if not envelopes:
@@ -1227,14 +1228,29 @@ def _cmd_tune(args: argparse.Namespace) -> int:
         if not items:
             return
         print(f"\n{label}:")
+        thin = False
         for c in items:
+            # `tok_share`/`uniq_ratio` are averaged over the payloads that CARRY the field,
+            # so the denominator is part of the figure, not a footnote (#373). A field in a
+            # MINORITY of payloads reads identically to one in all of them without it.
+            note = _presence_suffix(c)
+            if "⚠" in note:
+                thin = True
             print(f"  {c['tool']:<28} {c['path']:<26} "
-                  f"~{c['tok_share'] * 100:.0f}% tok, {c['uniq_ratio'] * 100:.0f}% uniq  "
-                  f"[{c.get('role', 'unknown')}]")
+                  f"~{c['tok_share'] * 100:.0f}% tok, {c['uniq_ratio'] * 100:.0f}% uniq"
+                  f"{note}  [{c.get('role', 'unknown')}]")
         est = _est_tokens(items)
         share = f", ~{est / corpus_raw * 100:.0f}% of corpus" if corpus_raw else ""
         print(f"  → enabling all {len(items)} here: ≈{est:,.0f} tok{share} "
               "(gross, before the per-record retrieve-handle cost)")
+        if thin:
+            print(f"  ⚠ = averaged over a MINORITY of this tool's payloads, or over fewer "
+                  f"than {MIN_CANDIDATE_PAYLOADS}. Both read like a confident share "
+                  f"and are not one: a field the server has STOPPED returning keeps the "
+                  f"share it had in the payloads that still carry it, and a one-payload "
+                  f"average is that payload. Check the field is still live, and compare "
+                  f"the payload count against `terse stats` live blocks, before enabling "
+                  f"a drop for it (#373).")
 
     _show("SAFE candidates — supporting prose, enable after a dropeval pass",
           [c for c in cands if c.get("role") == "prose"])

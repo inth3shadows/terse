@@ -1560,3 +1560,185 @@ def test_tune_sample_provenance_reads_shape_live_not_from_the_stored_bucket(tmp_
     env["shape"] = "compact-json"           # what an older classifier would have stored
     path.write_text(json.dumps(env))
     assert tune_sample_provenance(load_corpus(corpus)) == (1, 0, 1)
+
+
+def _tune_corpus_with_a_retired_field(tmp_path, n_payloads=4, n_with_embedding=1):
+    """A corpus shaped like the #373 failure: every payload carries `description`, only the
+    first `n_with_embedding` also carry a huge unique `embedding` — i.e. a field the server
+    stopped returning partway through the capture window."""
+    corpus = tmp_path / "corpus"
+    for p in range(n_payloads):
+        recs = []
+        for i in range(20):
+            rec = {"id": f"{p}-{i}", "description": "d" * 250 + f"{p}-{i}"}
+            if p < n_with_embedding:
+                rec["embedding"] = "[" + ",".join(f"0.{p}{i}{j:03d}" for j in range(120)) + "]"
+            recs.append(rec)
+        f = _write(tmp_path, f"p{p}.json", json.dumps({"result": recs}))
+        assert main(["capture", str(f), "--tool", "kb.x", "--corpus", str(corpus)]) == 0
+    return corpus
+
+
+def test_tune_states_the_payload_count_each_drop_candidate_was_averaged_over(tmp_path,
+                                                                            capsys):
+    # `tok_share`/`uniq_ratio` are averaged over the payloads that CARRY the field, so the
+    # denominator is part of the figure (#373). A field in every payload says so plainly
+    # and draws no warning — the marker has to mean something.
+    corpus = _tune_corpus_with_a_retired_field(tmp_path, n_payloads=4, n_with_embedding=0)
+    capsys.readouterr()
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    line = next(ln for ln in capsys.readouterr().out.splitlines()
+                if "result[].description" in ln)
+    assert "4/4 payloads" in line
+    assert "⚠" not in line
+
+
+def test_tune_flags_a_drop_candidate_present_in_a_minority_of_payloads(tmp_path, capsys):
+    # The #373 regression, pinned end-to-end through the real command: a field the server
+    # has stopped returning keeps the token share it had in the payloads that still carry
+    # it, so it can outrank a field present in every payload. Before this, both rendered
+    # identically and the retired one read as the corpus's largest candidate.
+    corpus = _tune_corpus_with_a_retired_field(tmp_path, n_payloads=4, n_with_embedding=1)
+    capsys.readouterr()
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    out = capsys.readouterr().out
+    emb = next(ln for ln in out.splitlines() if "result[].embedding" in ln)
+    desc = next(ln for ln in out.splitlines() if "result[].description" in ln)
+    assert "1/4 payloads ⚠" in emb, emb
+    assert "4/4 payloads" in desc and "⚠" not in desc, desc
+    # and the marker is explained where the operator reads it, naming the mechanism
+    assert "STOPPED returning" in out and "MINORITY" in out
+
+
+def test_tune_flags_a_drop_candidate_averaged_over_a_single_payload(tmp_path, capsys):
+    # The other way the share is thin, and the more dangerous one because it looks clean:
+    # a one-payload "average" is that payload. Same marker, stated in the footnote.
+    corpus = _tune_corpus_with_a_retired_field(tmp_path, n_payloads=1, n_with_embedding=0)
+    capsys.readouterr()
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    out = capsys.readouterr().out
+    line = next(ln for ln in out.splitlines() if "result[].description" in ln)
+    assert "1/1 payloads ⚠" in line, line
+    assert "fewer than 3" in out
+
+
+def _capture(tmp_path, name, tool, payload, corpus):
+    f = _write(tmp_path, name, payload)
+    assert main(["capture", str(f), "--tool", tool, "--corpus", str(corpus)]) == 0
+
+
+def test_tune_denominator_counts_payloads_the_analyzer_skipped(tmp_path, capsys):
+    # The #373 failure reproduced THROUGH the disclosure meant to prevent it (review
+    # finding). `per_payload` excludes payloads that don't parse, carry no record list, or
+    # whose record path differs from the first — and those exclusions correlate with the
+    # very case being caught: a field going away usually comes WITH a shape change. Three
+    # old payloads carry `embedding` under `result`; five newer ones renamed the envelope
+    # key and dropped the field. Against `per_payload` this reads `3/3`, unwarned.
+    corpus = tmp_path / "corpus"
+    for p in range(3):
+        _capture(tmp_path, f"old{p}.json", "kb.z", json.dumps({"result": [
+            {"id": f"o{p}-{i}", "embedding": "[" + ",".join(f"0.{p}{i}{j:03d}"
+                                                            for j in range(120)) + "]"}
+            for i in range(20)]}), corpus)
+    for p in range(5):
+        _capture(tmp_path, f"new{p}.json", "kb.z", json.dumps({"nodes": [
+            {"id": f"n{p}-{i}", "description": "d" * 250 + f"{p}-{i}"} for i in range(20)]}),
+            corpus)
+    capsys.readouterr()
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if "[].embedding" in ln)
+    assert "3/8 payloads ⚠" in line, line
+
+
+def test_tune_denominator_counts_non_json_payloads(tmp_path, capsys):
+    # Same value, second route in: an error string is a real captured shape for a tool
+    # (`policy_gen` documents kb.read.search at 4 of 436). It cannot carry the field, so
+    # it belongs in the denominator.
+    corpus = tmp_path / "corpus"
+    for p in range(3):
+        _capture(tmp_path, f"ok{p}.json", "kb.e", json.dumps({"result": [
+            {"id": f"{p}-{i}", "description": "d" * 250 + f"{p}-{i}"} for i in range(20)]}),
+            corpus)
+    for p in range(3):
+        _capture(tmp_path, f"err{p}.json", "kb.e", f"Error executing tool kb.e: boom {p}",
+                 corpus)
+    capsys.readouterr()
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    line = next(ln for ln in capsys.readouterr().out.splitlines()
+                if "result[].description" in ln)
+    assert "3/6 payloads" in line, line
+
+
+def test_tune_text_drop_candidate_states_a_real_denominator(tmp_path, capsys):
+    # `$text.code_blocks` governs the ONLY lossy rule live in production. Its share is
+    # pooled over the LONG_TEXT payloads alone, so `n/n` would be circular — "100% of the
+    # payloads I counted" (review finding). Three long-text payloads out of twelve.
+    corpus = tmp_path / "corpus"
+    block = "```python\n" + "\n".join(f"x{i} = compute_value({i})" for i in range(140)) + "\n```"
+    for p in range(3):
+        _capture(tmp_path, f"long{p}.txt", "cg.explore",
+                 f"analysis {p}\n\n{block}\n\ntrailing prose {p}", corpus)
+    for p in range(9):
+        _capture(tmp_path, f"short{p}.txt", "cg.explore", f"tiny answer {p}", corpus)
+    capsys.readouterr()
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    line = next(ln for ln in capsys.readouterr().out.splitlines()
+                if "$text.code_blocks" in ln)
+    assert "3/12 payloads ⚠" in line, line
+
+
+def test_every_drop_candidate_producer_states_a_denominator(tmp_path):
+    # `candidate_presence` degrades to (0, 0) — no denominator — when a row lacks the keys.
+    # That tolerance is only safe while no producer can forget them, so pin the producers
+    # rather than trusting the fallback (review finding: deleting both keys from
+    # `_text_drop_candidate` survived the whole suite).
+    from terse.policy_gen import _drop_candidates, _text_drop_candidate
+    recs = [{"id": i, "description": "d" * 250 + str(i)} for i in range(20)]
+    _, rows = _drop_candidates([json.dumps({"result": recs})] * 4)
+    assert rows, "fixture produced no JSON candidate"
+    block = "```python\n" + "\n".join(f"x{i} = compute_value({i})" for i in range(140)) + "\n```"
+    _, trows = _text_drop_candidate([f"analysis\n\n{block}\n\ntrailing"] * 3)
+    assert trows, "fixture produced no text candidate"
+    for row in rows + trows:
+        assert isinstance(row.get("payloads"), int), row
+        assert isinstance(row.get("payloads_total"), int) and row["payloads_total"] > 0, row
+
+
+def test_presence_thresholds_at_their_boundaries():
+    # Both comparisons were behaviourally untested: `<=` and `total < 2` each survived the
+    # full suite. Exactly half is deliberately NOT thin — the claim is "absent from MOST
+    # payloads", and 4/8 is not most.
+    from terse.policy_gen import MIN_CANDIDATE_PAYLOADS, presence_is_thin
+    assert MIN_CANDIDATE_PAYLOADS == 3
+    assert presence_is_thin(4, 9)          # minority
+    assert not presence_is_thin(4, 8)      # exactly half is not "most"
+    assert not presence_is_thin(5, 9)
+    assert presence_is_thin(2, 2)          # underpowered: total < 3, reachable
+    assert not presence_is_thin(3, 3)
+    assert not presence_is_thin(0, 0)      # no pair on the row -> no claim
+
+
+def test_tune_writes_the_denominator_into_the_policy_note(tmp_path, capsys):
+    # THE path that decides the lossy change: `_suggested_fields_note` is what the operator
+    # reads when renaming `_suggested_fields` -> `fields`, and it outlives the stdout line.
+    # A disclosure reaching only stdout is inert here (review finding).
+    corpus = _tune_corpus_with_a_retired_field(tmp_path, n_payloads=4, n_with_embedding=1)
+    out_pol = tmp_path / "policy.json"
+    capsys.readouterr()
+    assert main(["tune", "--corpus", str(corpus), "--out", str(out_pol)]) == 0
+    note = json.loads(out_pol.read_text())["policies"][0]["_suggested_fields_note"]
+    assert "result[].embedding ~" in note and "1/4 payloads ⚠" in note, note
+    assert "4/4 payloads" in note, note
+
+
+def test_policy_generate_states_the_denominator_too(tmp_path, capsys):
+    # `terse policy generate` and `policy autotune` never print tune's stdout line at all,
+    # so its own drop-candidate line has to carry the denominator (review finding).
+    corpus = _tune_corpus_with_a_retired_field(tmp_path, n_payloads=4, n_with_embedding=1)
+    capsys.readouterr()
+    assert main(["policy", "generate", "--corpus", str(corpus),
+                 "--out", str(tmp_path / "p.json")]) == 0
+    cap = capsys.readouterr()
+    blob = cap.out + cap.err
+    assert "drop-candidate result[].embedding" in blob, blob[:800]
+    assert "1/4 payloads ⚠" in blob, blob[:800]
