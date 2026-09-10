@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.32.2] - 2026-09-09
+
 ### Fixed
 
 - **`terse fluency`'s `terse+inline` column now states the exam it was scored over
