@@ -15,6 +15,23 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **`terse fluency`'s `terse+inline` column now states the exam it was scored over
+  (#292).** The inline arm is display-only: it does not gate the pairing, deliberately,
+  because its prompt is the longest of the four and pairing on it would void
+  otherwise-complete runs over a column no verdict consumes. The cost of that, unaccounted
+  for until now, is that the paired subset keeps questions inline never answered while
+  `_form_stats` divides each arm by its own trial count — so a question inline lost
+  entirely left inline's exam and stayed in every other arm's. Reproduced: 19 questions
+  every arm aces plus one hard question every arm fails, with inline's call lost on that
+  one, published `raw/terse/primer 95%` beside `terse+inline 100%`. The cell now carries
+  its own `q` whenever that is smaller. The accuracy is deliberately unchanged — a 0/0 row
+  never contributed to either sum, so the number was always over the questions inline
+  answered; what was missing was saying so.
+
+## [0.32.1] - 2026-09-09
+
+### Fixed
+
 - **A `folded-and-live` peer can now trigger the ambiguous-ledger-label guard (#309).**
   Such an entry is named in the peers file *and* live under its own name; when that live
   entry launches via terse it runs its own proxy and writes its own ledger rows. It pays no

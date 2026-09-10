@@ -936,6 +936,13 @@ class ArmGap(NamedTuple):
     # ArmGap process-wide. Read-only today; the proxy makes that structural rather than a
     # convention nobody checks.
     arms: Mapping[str, tuple[float, float]] = MappingProxyType({})
+    # How many of `rows` each DISPLAY arm was actually scored over (#292). A display arm
+    # does not gate, so `rows` can contain questions it never answered — and those are
+    # exactly the questions it is scored WITHOUT. The renderer needs the number to say so;
+    # without it the cell prints an accuracy over a silently smaller exam. Gating arms are
+    # absent here: they are complete on every row by construction, so `len(rows)` is their
+    # count and a second copy could only disagree. Same read-only proxy, same reason.
+    display_n: Mapping[str, int] = MappingProxyType({})
 
 
 # How many PAIRED questions a PASS needs before "no regression observed" means anything
@@ -1013,7 +1020,30 @@ def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
         # as a confident PASS. See the note on this gate above for why it is `not pr` and
         # not a survival share.
         return ArmGap(0.0, 0.0, 0.0, 0.0, [], "unmeasured")
-    arms = {f: _form_stats(pr, f) for f in (*gating, control, *display)}
+    arms = {f: _form_stats(pr, f) for f in (*gating, control)}
+    # How many of `pr` each DISPLAY arm actually answered (#292). A display arm does not
+    # gate — see the note above — so `pr` keeps questions it never answered, and
+    # `_form_stats` divides its successes by its OWN `<arm>_trials`. A question the arm
+    # lost entirely therefore leaves its exam while staying in everyone else's. Measured on
+    # the arm it matters for: 19 questions every arm aces plus one hard question every arm
+    # fails, with the inline call lost on that hard one, published `raw/terse/primer 95%`
+    # beside `inline 100%` — the arm carrying the inline-delivery argument flattered by
+    # exactly the question it could not answer.
+    #
+    # BE PRECISE ABOUT WHAT THIS FIXES. Dropping a fully-lost row changes the arm's
+    # accuracy by nothing at all: `_form_stats` sums k and t, and a 0/0 row already
+    # contributes zero to both. The number was always over the questions the arm answered.
+    # What was missing is SAYING so — the cell printed that accuracy beside columns over a
+    # larger exam with no sign the exams differed. So this computes the arm's real question
+    # count for the renderer, and the accuracy is deliberately unchanged.
+    #
+    # `> 0`, not `_arm_full`: an arm that answered 3 trials of 5 still answered the
+    # QUESTION, and counting that as attrition would understate the exam it really sat.
+    # Only a total loss removes a question from an arm's set, and only a total loss is
+    # worth reporting as a smaller `q`.
+    display_rows = {f: [r for r in pr if _arm_trials(r, f) > 0] for f in display}
+    arms.update({f: _form_stats(rs, f) for f, rs in display_rows.items()})
+    dn = MappingProxyType({f: len(rs) for f, rs in display_rows.items()})
     cacc, cse = arms[control]
     if control in ("raw_ok", "control_ok") and cacc == 0:
         # A control at exactly 0% is a backend/config error, not a comprehension result —
@@ -1024,7 +1054,7 @@ def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
         # grader or backend produced no signal, not that the drop is blameless (review
         # finding 3 on #300). Kept here rather than at the call sites so the markdown
         # verdict and the forest plot cannot disagree about it.
-        return ArmGap(0.0, 0.0, cacc, cse, pr, "broken control", arms)
+        return ArmGap(0.0, 0.0, cacc, cse, pr, "broken control", arms, dn)
     best = max((arms[f] for f in gating), key=lambda s: s[0])
     floor = _MIN_PAIRED_QUESTIONS if min_paired is None else min_paired
     # The cut is the TOLERANCE line, not exact equality. Withholding only `best >= cacc`
@@ -1042,7 +1072,7 @@ def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
     # than tolerance publishes at any question count.
     if len(pr) < floor and passes_tolerance(best[0] - cacc):
         return ArmGap(0.0, 0.0, 0.0, 0.0, [], "underpowered")
-    return ArmGap(best[0], best[1], cacc, cse, pr, None, arms)
+    return ArmGap(best[0], best[1], cacc, cse, pr, None, arms, dn)
 
 
 def arm_gap(rows: list[dict[str, Any]], form: str, control: str, *,
@@ -3872,7 +3902,17 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
                           "gap_form": g.form_acc, "gap_form_se": g.form_se}
         if has_inline:
             summary[model].update({"inline": iacc, "inline_se": ise})
-        inline_cell = (f"{iacc:.0%} ±{_ci(ise) * 100:.0f}" if has_inline else "n/a")
+        # The inline arm's own q, stated in the cell WHENEVER it is smaller than the row's
+        # (#292). Inline does not gate, so `g.rows` can hold questions it never answered;
+        # it is scored without them, and a reader comparing `terse+inline` to the columns
+        # beside it is otherwise comparing two different exams with no sign that they
+        # differ. Printed only on attrition — a healthy run's cell is unchanged, so the
+        # marker means "this number is over fewer questions" rather than being decoration
+        # every row carries.
+        inline_n = g.display_n.get("inline_ok", len(g.rows))
+        inline_q = f" (q={inline_n})" if has_inline and inline_n < len(g.rows) else ""
+        inline_cell = (f"{iacc:.0%} ±{_ci(ise) * 100:.0f}{inline_q}"
+                       if has_inline else "n/a")
         # Same rule for the primer arm, which `score_pack` can now report as never collected
         # (#283): `_form_stats` would render its empty sample as a confident `0% ±0`, and
         # "primer recovers" would silently mean "recovered none of them" for an arm that was
@@ -3908,8 +3948,9 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         out += [
             "Partially degraded (a question is dropped from every GATED arm unless all of "
             "them completed all of its trials, so the `q` column is the paired exam, not "
-            "the questions generated; `terse+inline` is display-only and is not part of "
-            "that pairing. The losses below are calls, "
+            "the questions generated; `terse+inline` is display-only and does not gate "
+            "that pairing, but is scored over the questions IT answered — its cell states "
+            "its own `q` when that is fewer. The losses below are calls, "
             "not scored as wrong): "
             + ", ".join(f"`{m}` ({s['fails']}/{s['attempts']})"
                         for m, s in sorted(degraded.items()))
