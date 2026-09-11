@@ -17,9 +17,10 @@ import json
 
 import pytest
 from test_codeceval import PAYLOAD as CODEC_PAYLOAD
+from test_codeceval import preflight_stub
 from test_fluency import DIFF_CURR, DIFF_PREV, PAYLOAD, TEXT_CURR, TEXT_PREV, _soak_envs
 
-from terse import codeceval, dropeval, fluency
+from terse import dropeval, fluency
 from terse.fluency.harnesses import progress_line
 
 
@@ -280,18 +281,10 @@ def test_the_cli_streams_progress_to_stderr_and_keeps_stdout_clean(tmp_path, mon
     _write_corpus(corpus, kind)
     # `--codec-verdict` builds tool-capable answerers (one `messages` arg); the rest are
     # single-shot `(system, user)` answerers. Both stubs answer every corpus question
-    # wrong — but the codec stub must still CLEAR THE PRE-FLIGHT (#403), which asks a
-    # fixed 2-record question before any corpus work and drops a model that cannot express
-    # a container tool argument. A stub that fails it is excluded and emits no per-payload
-    # progress at all, which is what this test measures. So: answer the pre-flight
-    # correctly, everything else wrong.
-    def _codec_stub(messages):
-        asks_preflight = codeceval.PREFLIGHT_PROMPT in messages[-1]["content"]
-        value = codeceval.PREFLIGHT_EXPECTED if asks_preflight else {"wrong": True}
-        return dropeval.Turn(text="", tool_calls=[dropeval.ToolCall(
-            call_id="c1", name=codeceval.RECORD_VALUE_TOOL, arguments={"value": value})])
-
-    stub = _codec_stub if mode == "codec-verdict" else (lambda s, u: "9")
+    # wrong — but the codec stub must still CLEAR THE PRE-FLIGHT (#403), which refuses the
+    # whole run, before any per-payload progress, if a model cannot express a container
+    # tool argument. So: answer the pre-flight correctly, everything else wrong.
+    stub = preflight_stub(lambda e, n: e) if mode == "codec-verdict" else (lambda s, u: "9")
     monkeypatch.setattr(cli, "_build_answerers",
                         lambda args, make, **kw: {"stub-model": stub})
     argv = ["fluency", "--corpus", str(corpus), "--out", str(tmp_path / "rep.md"), *flags]
@@ -301,6 +294,28 @@ def test_the_cli_streams_progress_to_stderr_and_keeps_stdout_clean(tmp_path, mon
     assert progress, err
     assert all("stub-model" in ln for ln in progress)
     assert "payload(s)" not in out
+
+
+def test_the_cli_refuses_a_codec_verdict_run_a_model_cannot_answer(tmp_path, monkeypatch,
+                                                                    capsys):
+    """#403's pre-flight, driven through `main` rather than grepped out of `cli.py`: the
+    first version's test checked the source for the string `preflight=False`, and
+    `preflight=bool(0)` passed it. Exit 2, the reason on stderr, and no report — a report
+    would read as a measured run."""
+    from terse import cli
+    from terse.cli import main
+
+    corpus = tmp_path / "corpus"
+    _write_corpus(corpus, "codec")
+    stringifies = preflight_stub(lambda e, n: json.dumps(e))
+    monkeypatch.setattr(cli, "_build_answerers",
+                        lambda args, make, **kw: {"stub-model": stringifies})
+    report = tmp_path / "rep.md"
+    argv = ["fluency", "--corpus", str(corpus), "--out", str(report), "--codec-verdict"]
+    assert main(argv) == 2
+    _, err = capsys.readouterr()
+    assert "stub-model: sends container arguments as a JSON STRING" in err, err
+    assert not report.exists()
 
 
 @pytest.mark.parametrize("seam", ["tune", "fluency"])

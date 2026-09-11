@@ -1361,8 +1361,12 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             print("`fluency --codec-verdict` needs a configured model: set "
                   "TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS.")
             return 1
-        results = codeceval.run_codec_fluency(envelopes, answerers, trials=args.trials,
-                                              progress=_stderr_progress)
+        try:
+            results = codeceval.run_codec_fluency(envelopes, answerers, trials=args.trials,
+                                                  progress=_stderr_progress)
+        except codeceval.PreflightError as exc:
+            print(str(exc), file=sys.stderr)   # no report: nothing was measured (#403)
+            return 2
         _write_report(build_codec_verdict_report(results), args.out)
         return 0
 
