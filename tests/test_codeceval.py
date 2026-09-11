@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from terse import codeceval, fluency
 from terse.dropeval import ToolCall, Turn
 
@@ -214,7 +216,7 @@ def test_run_codec_fluency_stamps_tool_and_shape_on_every_row():
 
     envelopes = [{"tool": "demo.get", "shape": "array-of-records", "sha": "abc123",
                  "raw": RAW_TEXT}]
-    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1)
+    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1, preflight=False)
     assert results["m1"]
     for row in results["m1"]:
         assert row["tool"] == "demo.get"
@@ -229,7 +231,7 @@ def test_run_codec_fluency_skips_a_payload_with_no_deref_question():
     flat = {"result": [{"id": 1, "n": 10}, {"id": 2, "n": 20}]}
     envelopes = [{"tool": "demo.get", "shape": "array-of-records", "sha": "x",
                  "raw": json.dumps(flat)}]
-    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1)
+    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1, preflight=False)
     assert results["m1"] == []
 
 
@@ -238,5 +240,201 @@ def test_run_codec_fluency_skips_non_json_payloads():
         return Turn(text="", tool_calls=[])
 
     envelopes = [{"tool": "demo.get", "shape": "long-text", "sha": "x", "raw": "not json"}]
-    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1)
+    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1, preflight=False)
     assert results["m1"] == []
+
+
+# --- #403: container-argument encoding pre-flight -----------------------------------
+
+NO_CALL = object()
+ERROR = object()
+
+
+def preflight_stub(answer):
+    """Answerer that recognises which pre-flight question a request carries (by its payload
+    text) and returns `answer(expected, n)` as the `value` argument, `n` being the 0-based
+    call index across the whole pre-flight. `NO_CALL` returns a prose turn, `ERROR` an
+    errored one. A request that is not a pre-flight question is answered `{"wrong": True}`,
+    so a stub that clears the pre-flight still scores nothing on the corpus."""
+    n = {"i": 0}
+
+    def answerer(messages):
+        content = messages[-1]["content"]
+        expected = next((q.expected for q, text in codeceval.preflight_questions()
+                         if text in content), None)
+        if expected is None:
+            v = {"wrong": True}
+        else:
+            v = answer(expected, n["i"])
+            n["i"] += 1
+        if v is NO_CALL:
+            return Turn(text='["x", "y"]', tool_calls=[])
+        if v is ERROR:
+            return Turn(text="", error=True)
+        return Turn(text="", tool_calls=[
+            ToolCall(call_id="c1", name=codeceval.RECORD_VALUE_TOOL, arguments={"value": v})])
+    return answerer
+
+
+@pytest.mark.parametrize("got,expected,is_mismatch", [
+    ('["x"]', ["x"], True),                 # the deepseek-v4-pro case
+    ('{"a": 1}', {"a": 1}, True),
+    ('[]', [], True),
+    (["x"], ["x"], False),                  # correctly typed -> not a mismatch
+    ("nope", ["x"], False),                 # not even parseable
+    ('["z"]', ["x"], False),                # parses, but wrong content: a real miss
+    ('{"a": 1}', [{"a": 1}], False),        # parses to the wrong container type
+    ('"a"', "a", False),                    # string expected: excluded by design
+    ("null", None, False),                  # null expected: excluded by design
+    ("1", 1, False),
+    (None, ["x"], False),
+    pytest.param("[" * 100_000, ["x"], False, id="deeply-nested"),  # pathological: no crash
+])
+def test_encodes_as_json_string_identifies_only_right_content_wrong_type(got, expected,
+                                                                        is_mismatch):
+    assert codeceval.encodes_as_json_string(got, expected) is is_mismatch
+
+
+def test_encoding_detection_never_turns_a_miss_into_a_hit():
+    # The whole point: this is diagnosis, not scoring. A stringified answer stays WRONG.
+    assert codeceval._value_matches('["x"]', ["x"]) is False
+    assert codeceval.encodes_as_json_string('["x"]', ["x"]) is True
+
+
+def test_preflight_asks_one_deref_question_per_container_type():
+    # A model can stringify objects and not arrays; the first version only asked an array.
+    # And each asked-for value NESTS a container: a model that stringifies only inner values
+    # would otherwise pass here and zero both arms of the sweep (round-2 review of #403).
+    qs = codeceval.preflight_questions()
+    assert all(q.qtype == "deref" for q, _ in qs)
+    assert sorted(type(q.expected).__name__ for q, _ in qs) == ["dict", "list"]
+    for q, _ in qs:
+        inner = q.expected if isinstance(q.expected, list) else list(q.expected.values())
+        assert any(isinstance(v, (dict, list)) for v in inner), q.expected
+
+
+def test_preflight_refuses_to_check_nothing_if_question_generation_changes(monkeypatch):
+    # An empty question list would pass every model through a pre-flight that asked nothing.
+    monkeypatch.setattr(codeceval, "gen_codec_questions", lambda obj: [])
+    with pytest.raises(RuntimeError, match="yields 0 deref questions"):
+        codeceval.preflight_encoding(preflight_stub(lambda e, n: e))
+
+
+def test_preflight_sends_the_request_a_real_trial_sends():
+    # Review of #403: the pre-flight's request was a copy, and a mutation that changed only
+    # the copy passed every test. Same question and payload text -> identical messages.
+    def recorder(sink):
+        def answerer(messages):
+            sink.append(messages)
+            return Turn(text="", error=True)
+        return answerer
+
+    q, text = codeceval.preflight_questions()[0]
+    via_preflight: list = []
+    via_trial: list = []
+    codeceval.preflight_encoding(recorder(via_preflight), attempts=1)
+    codeceval._ask_codec_question(q, text, recorder(via_trial))
+    assert via_trial and via_preflight[0] == via_trial[0]
+
+
+def test_preflight_passes_a_model_that_sends_native_containers():
+    assert codeceval.preflight_encoding(preflight_stub(lambda e, n: e)) is None
+
+
+def test_preflight_names_the_json_string_encoding_and_counts_answers():
+    why = codeceval.preflight_encoding(preflight_stub(lambda e, n: json.dumps(e)), attempts=3)
+    assert why and "JSON STRING" in why and "[6/6 pre-flight answers failed]" in why, why
+
+
+def test_preflight_catches_a_model_that_stringifies_only_objects():
+    stub = preflight_stub(lambda e, n: json.dumps(e) if isinstance(e, dict) else e)
+    why = codeceval.preflight_encoding(stub, attempts=3)
+    assert why and "JSON STRING" in why and "[3/6 pre-flight answers failed]" in why, why
+
+
+def test_preflight_rejects_a_model_that_is_only_sometimes_right():
+    # Measured on deepseek-v4-pro at temperature=0: one call stringified, another sent no
+    # `value` at all. A model that expresses a container argument only sometimes still
+    # poisons the arm it is on, so ALL answers must match.
+    stub = preflight_stub(lambda e, n: json.dumps(e) if n == 1 else e)
+    why = codeceval.preflight_encoding(stub, attempts=3)
+    assert why and "[1/6 pre-flight answers failed]" in why, why
+
+
+def test_preflight_names_a_model_that_answers_in_prose():
+    why = codeceval.preflight_encoding(preflight_stub(lambda e, n: NO_CALL), attempts=3)
+    assert why and why.startswith(f"answered without calling {codeceval.RECORD_VALUE_TOOL}")
+
+
+def test_preflight_retries_an_errored_turn_instead_of_failing_the_model():
+    # One timeout says nothing about encoding; before this, it excluded a perfect model.
+    stub = preflight_stub(lambda e, n: ERROR if n == 0 else e)
+    assert codeceval.preflight_encoding(stub, attempts=3) is None
+
+
+def test_preflight_reports_a_backend_that_never_answers_as_that():
+    why = codeceval.preflight_encoding(preflight_stub(lambda e, n: ERROR), attempts=3)
+    assert why and why.startswith(
+        "backend returned no usable turn on 6 of 6 calls for pre-flight question 1 of 2 — ")
+
+
+def test_preflight_needs_every_scorable_answer_not_just_one():
+    # One good answer then five errors: 1 of the 3 answers the question needs.
+    why = codeceval.preflight_encoding(preflight_stub(lambda e, n: ERROR if n else e), attempts=3)
+    assert why and why.startswith(
+        "backend returned no usable turn on 5 of 6 calls for pre-flight question 1 of 2")
+
+
+def test_preflight_names_the_question_a_backend_loss_happened_on():
+    # Question 1 answered cleanly 3 times; the loss is question 2's alone (round-3 review).
+    why = codeceval.preflight_encoding(preflight_stub(lambda e, n: ERROR if n >= 3 else e),
+                                       attempts=3)
+    assert why and why.startswith(
+        "backend returned no usable turn on 6 of 6 calls for pre-flight question 2 of 2")
+
+
+def test_preflight_reports_the_first_failure_not_the_latest():
+    stub = preflight_stub(lambda e, n: json.dumps(e) if n == 0 else NO_CALL if n == 1 else e)
+    why = codeceval.preflight_encoding(stub, attempts=3)
+    assert why and why.startswith("sends container arguments as a JSON STRING"), why
+    assert "[2/6 pre-flight answers failed]" in why
+
+
+def test_preflight_keeps_an_answer_failure_ahead_of_a_later_backend_failure():
+    # A JSON-string model behind a flaky gateway must not read as "retry and see".
+    stub = preflight_stub(lambda e, n: json.dumps(e) if n < 2 else ERROR)
+    why = codeceval.preflight_encoding(stub, attempts=3)
+    assert why and why.startswith("sends container arguments as a JSON STRING"), why
+    assert ("[2/2 pre-flight answers failed before the backend returned no usable turn on "
+            "4 of 6 calls for pre-flight question 1 of 2]") in why, why
+
+
+def test_run_codec_fluency_refuses_the_run_when_any_model_fails_the_preflight():
+    # Dropping the failed model and continuing let a cell read SAFE over fewer models than
+    # were asked for (review of #403). The refusal lands BEFORE any corpus question: `good`
+    # passes the pre-flight, so only running the sweep first could reach `corpus_calls`.
+    corpus_calls: list = []
+    passes = preflight_stub(lambda e, n: e)
+
+    def good(messages):
+        if not any(text in messages[-1]["content"] for _, text in codeceval.preflight_questions()):
+            corpus_calls.append(messages)
+        return passes(messages)
+
+    bad = preflight_stub(lambda e, n: json.dumps(e))
+    envelopes = [{"tool": "demo.get", "sha": "abc", "raw": RAW_TEXT}]
+    with pytest.raises(codeceval.PreflightError) as exc:
+        codeceval.run_codec_fluency(envelopes, {"good": good, "bad": bad}, trials=1)
+    msg = str(exc.value)
+    assert "1 of 2 model(s)" in msg and "  bad: sends container arguments as a JSON STRING" in msg
+    assert "  good:" not in msg
+    assert corpus_calls == []
+
+
+def test_run_codec_fluency_preflights_with_the_default_attempt_count():
+    # Pins PREFLIGHT_ATTEMPTS through the production call: a model wrong only on its third
+    # answer (n == 2) passes a 1-attempt pre-flight, and a 2-attempt one reports "1/4".
+    late_miss = preflight_stub(lambda e, n: json.dumps(e) if n == 2 else e)
+    with pytest.raises(codeceval.PreflightError, match="1/6 pre-flight answers failed"):
+        codeceval.run_codec_fluency([], {"m": late_miss}, trials=1)
+

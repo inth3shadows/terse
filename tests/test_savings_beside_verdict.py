@@ -424,14 +424,15 @@ def test_run_codec_fluency_omits_sha_rather_than_defaulting_it_to_a_placeholder(
         obj = [{"id": 1, "blob": blob}, {"id": 2, "blob": {"k": [9]}}]
         return {"tool": "t", "shape": "array-of-records", "raw": json.dumps(obj), **extra}
 
-    rows = codeceval.run_codec_fluency([env_for({"k": [1, 2, 3]})], {"m": answerer})["m"]
+    rows = codeceval.run_codec_fluency([env_for({"k": [1, 2, 3]})], {"m": answerer},
+                                       preflight=False)["m"]
     assert rows, "fixture produced no deref questions — it cannot fail"
     assert all("sha" not in r for r in rows), "a placeholder sha was emitted"
 
     # And the end-to-end consequence: two distinct sha-less payloads stay two, disclosed as
     # rows, rather than collapsing into one payload's token counts.
     envs = [env_for({"k": [1, 2, 3]}), env_for({"k": [7, 7, 7]})]
-    allrows = codeceval.run_codec_fluency(envs, {"m": answerer})["m"]
+    allrows = codeceval.run_codec_fluency(envs, {"m": answerer}, preflight=False)["m"]
     _, savings = _sections(build_codec_verdict_report({"m": allrows}))
     assert "| `t` | array-of-records | 0 | n/a | n/a | n/a | n/a |" in savings
     assert f"{len(allrows)} row(s) carry no `sha`" in savings
@@ -452,7 +453,7 @@ def test_run_codec_fluency_stamps_the_counts_on_every_row_of_a_payload():
                     tool_calls=[ToolCall(name=codeceval.RECORD_VALUE_TOOL,
                                          arguments={"value": {"k": [1, 2, 3]}})])
 
-    rows = codeceval.run_codec_fluency([env], {"m": answerer})["m"]
+    rows = codeceval.run_codec_fluency([env], {"m": answerer}, preflight=False)["m"]
     assert rows, "fixture produced no deref questions — it cannot fail"
     expected = _payload_tokens(raw, obj)
     assert expected, "tokenizer unavailable; this test cannot assert anything"

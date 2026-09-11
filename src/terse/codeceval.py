@@ -125,6 +125,161 @@ def _value_matches(got: Any, expected: Any) -> bool:
     return got == expected
 
 
+def encodes_as_json_string(got: Any, expected: Any) -> bool:
+    """Did the model send the RIGHT VALUE as a JSON *string* instead of as its native type?
+
+    `{"value": "[\\"Navidrome\\"]"}` where `["Navidrome"]` was asked for: content exact,
+    type wrong. `_value_matches` rejects it, correctly — a downstream tool declaring
+    `"type": "array"` would reject it too, so it is a genuinely malformed tool call, not a
+    spelling of a right answer. But it is malformed for a reason that has NOTHING to do
+    with the codec: the model encodes the same way on the raw arm and the terse arm, so it
+    zeroes BOTH and the eval learns nothing about compression.
+
+    Measured 2026-09-09, live, against `~/.config/terse/session-corpus`: `deepseek-v4-pro`
+    stringifies **5 of 5** deref answers, `qwen3-coder-30b-fl` **0 of 5**. That produced a
+    0%-accuracy control on 5 of 6 (tool, shape) cells and `report.arm_gap`'s `broken
+    control` -> UNRESOLVED, with nothing anywhere naming the cause; it took a live probe to
+    find. This predicate exists so the harness can say it instead.
+
+    Not a scoring path. NOTHING calls this to turn a miss into a hit — that would accept an
+    argument a strict tool rejects, which is exactly the loosening #295 forbids. It is
+    diagnosis only: `preflight_encoding` uses it to name the reason it refuses a model.
+
+    Only a container `expected` qualifies. A string one would make every correctly-answered
+    string question look like a mismatch (`json.loads('"a"') == "a"`), and `None` would
+    label a real `null` answer (`json.loads("null") is None`) the same way. `deref`'s
+    `expected` is always a dict or list, so both are defence in depth rather than live
+    cases. `RecursionError` is caught because the string is a model's reply: a pathological
+    `"[[[[…"` must read as "not this failure mode", not abort the pre-flight."""
+    if not isinstance(got, str) or not isinstance(expected, (dict, list)):
+        return False
+    try:
+        return bool(json.loads(got) == expected)
+    except (json.JSONDecodeError, ValueError, TypeError, RecursionError):
+        return False
+
+
+# Two fixed payloads, one per container type a real `deref` answer can take (`questions.py`'s
+# `blobcol` requires every cell to be a dict or a list), because a model can stringify one
+# type and not the other. The PAYLOADS are fixed rather than drawn from the corpus so the
+# pre-flight cannot fail for corpus reasons (a thin corpus is a SEPARATE defect, #403
+# Blocker 2; conflating them is what made the 2026-09-09 run unreadable). The QUESTIONS are
+# not hand-written: `preflight_questions` derives them with the same `gen_codec_questions`
+# the sweep uses, so prompt wording and `expected` cannot drift from what is scored.
+# The asked-for values (record index 1, `questions.py`'s `n // 2` pick) are NESTED — a list
+# of objects, an object holding a list and an empty object — because real `deref` values
+# are, and a model that stringifies only inner containers would otherwise pass here and
+# still zero both arms of the sweep.
+PREFLIGHT_PAYLOADS: tuple[dict, ...] = (
+    {"result": [{"id": "a", "rows": [{"k": "x"}]},
+                {"id": "b", "rows": [{"k": "y", "v": [1, 2]}, {"k": "z"}]}]},
+    {"result": [{"id": 1, "meta": {"owner": "ann"}},
+                {"id": 2, "meta": {"owner": "bo", "tags": ["q", "r"], "extra": {}}}]},
+)
+PREFLIGHT_ATTEMPTS = 3
+
+
+class PreflightError(RuntimeError):
+    """At least one model failed `preflight_encoding`; the run is refused before the sweep."""
+
+
+def preflight_questions() -> list[tuple[fluency.Question, str]]:
+    """`(question, payload text)` for each of `PREFLIGHT_PAYLOADS` — the raw-arm form, the
+    same `json.dumps` text a captured envelope's `raw` is.
+
+    Raw arm only, deliberately. The pre-flight asks whether a model can express a container
+    argument AT ALL, which is a property of the model and the tool protocol. A miss on the
+    terse form is the thing the sweep exists to measure; refusing a model for it here would
+    decide the verdict before the run instead of reporting it.
+
+    Raises rather than returning fewer questions: if `questions.py` ever stops emitting a
+    `deref` for one of these payloads, an empty list would let every model pass a
+    pre-flight that checked nothing."""
+    out: list[tuple[fluency.Question, str]] = []
+    for payload in PREFLIGHT_PAYLOADS:
+        qs = gen_codec_questions(payload)
+        if len(qs) != 1:
+            raise RuntimeError(f"pre-flight payload {payload!r} yields {len(qs)} deref "
+                               "questions, expected exactly 1 — questions.py changed")
+        out.append((qs[0], json.dumps(payload)))
+    return out
+
+
+def _preflight_miss(turn: Turn, expected: Any) -> str | None:
+    """`None` if a scorable pre-flight turn matched, else why not — named by failure mode,
+    since the three need different remedies (a prompt, a different model, a harder look)."""
+    called, got = _recorded_value(turn)
+    if not called:
+        return (f"answered without calling {RECORD_VALUE_TOOL} "
+                f"(text: {(turn.text or '')[:60]!r}) — this eval scores a tool-call argument")
+    if _value_matches(got, expected):
+        return None
+    if encodes_as_json_string(got, expected):
+        return ("sends container arguments as a JSON STRING "
+                f"({got!r} for {expected!r}) — right content, wrong type. It would encode "
+                "both arms the same way and score 0% on each, so the run would learn nothing "
+                "about the codec")
+    return f"failed a 2-record pre-flight question: got {got!r}, expected {expected!r}"
+
+
+def preflight_encoding(answerer: ToolAnswerer, attempts: int = PREFLIGHT_ATTEMPTS) -> str | None:
+    """`None` if this model can participate in the codec eval, else a one-line reason.
+
+    The 2026-09-09 run burned 57 minutes and 324 calls to discover that one of its two
+    models could not express a container argument. That is a property of the model and the
+    tool protocol, knowable in a handful of calls, and independent of the corpus and the
+    codec — so it is checked once per model before the sweep.
+
+    Every request goes through `_codec_turn`, the function a real trial sends through, and
+    every reply through `_recorded_value`. The first version copied that request inline and
+    documented it as shared; review of #403 showed a mutation to the copy alone passed
+    every test. `test_preflight_sends_the_request_a_real_trial_sends` pins the equality.
+
+    Each question needs `attempts` SCORABLE answers, and **every** one must match. Measured
+    while building this: `deepseek-v4-pro` at `temperature=0.0` answered one call with
+    `{"value": "[\\"x\\", \\"y\\"]"}` and another with no `value` at all, so a single call
+    diagnoses the same model differently run to run. A model that expresses a container
+    argument only sometimes still poisons the arm it is on. The reason reported is the FIRST
+    failure seen, with a count, so a flaky model reads as flaky.
+
+    An errored turn (transport failure, or 200 with no content) is NOT an answer: it says
+    nothing about encoding, and one timeout must not cost a good model its place in the
+    run. It is retried, up to `attempts` extra calls per question; a backend that cannot
+    produce `attempts` scorable turns in `2 * attempts` calls fails the pre-flight. When a
+    model's ANSWERS had already failed before the backend gave out, that failure leads the
+    reason: a JSON-string model behind a flaky gateway must not read as "retry and see"."""
+    attempts = max(1, attempts)
+    first_reason: str | None = None
+    bad = scored = 0
+    questions = preflight_questions()
+    for qi, (question, payload_text) in enumerate(questions, 1):
+        answered = calls = 0
+        while answered < attempts and calls < 2 * attempts:
+            calls += 1
+            turn = _codec_turn(question, payload_text, answerer)
+            if turn.error:
+                continue
+            answered += 1
+            reason = _preflight_miss(turn, question.expected)
+            if reason is not None:
+                bad += 1
+                if first_reason is None:
+                    first_reason = reason
+        scored += answered
+        if answered < attempts:
+            # `calls` is per question and `bad/scored` runs across questions, so the loss
+            # names its question: "6 of 6" after question 1 answered cleanly must not read
+            # as a backend that never answered at all (round-3 review).
+            lost = (f"backend returned no usable turn on {calls - answered} of {calls} calls "
+                    f"for pre-flight question {qi} of {len(questions)}")
+            if first_reason is None:
+                return f"{lost} — cannot tell whether this model can express a container argument"
+            return f"{first_reason} [{bad}/{scored} pre-flight answers failed before the {lost}]"
+    if first_reason is None:
+        return None
+    return f"{first_reason} [{bad}/{scored} pre-flight answers failed]"
+
+
 def _codec_instruction() -> str:
     """The instruction half of the user prompt for a codec-eval trial.
 
@@ -156,18 +311,34 @@ def _ask_codec_question(question: fluency.Question, payload_text: str,
     help a run reach SAFE (review finding 3 on PR #302). A model that reaches the tool
     definition and declines to call anything is scored the same way, for the same reason
     (not a transport error, but still the failure mode this eval exists to catch)."""
+    turn = _codec_turn(question, payload_text, answerer)
+    if turn.error:
+        return False, True  # counted as a miss by the caller, kept in the fixed denominator
+    called, got = _recorded_value(turn)
+    if not called:
+        return False, False
+    return _value_matches(got, question.expected), False
+
+
+def _codec_turn(question: fluency.Question, payload_text: str, answerer: ToolAnswerer) -> Turn:
+    """The one request a codec-eval question is sent as — a single user message, no system
+    message — shared by the sweep (`_ask_codec_question`) and `preflight_encoding`, so a
+    model that passes the pre-flight passed on the request it is scored on."""
     messages: list[dict] = [
         {"role": "user", "content": fluency._user_prompt(question.prompt, _codec_instruction(),
                                                           payload_text)},
     ]
-    turn: Turn = _safe_call(answerer, messages)
-    if turn.error:
-        return False, True  # counted as a miss by the caller, kept in the fixed denominator
+    return _safe_call(answerer, messages)
+
+
+def _recorded_value(turn: Turn) -> tuple[bool, Any]:
+    """`(called, value)`: whether the turn called `RECORD_VALUE_TOOL`, and the `value`
+    argument of its LAST such call (`None` when the key is absent — which `_value_matches`
+    scores as a miss against any `deref` `expected`)."""
     record_calls = [c for c in turn.tool_calls if c.name == RECORD_VALUE_TOOL]
     if not record_calls:
-        return False, False
-    got = record_calls[-1].arguments.get("value")
-    return _value_matches(got, question.expected), False
+        return False, None
+    return True, record_calls[-1].arguments.get("value")
 
 
 def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
@@ -241,7 +412,8 @@ def _payload_tokens(raw_text: str, obj: Any) -> dict[str, int]:
 
 def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                       trials: int = 1,
-                      progress: Callable[[str], None] | None = None) -> dict[str, list[dict]]:
+                      progress: Callable[[str], None] | None = None,
+                      preflight: bool = True) -> dict[str, list[dict]]:
     """Run the codec-tier eval for each named tool-capable answerer over every payload in
     the corpus that has at least one `deref` question. Mirrors `dropeval.run_drop_fluency`'s
     envelope-outer/model-inner nesting (question generation is model-independent, so it is
@@ -260,6 +432,31 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
     `terse_tokens` (`_payload_tokens`) — PER PAYLOAD, repeated on each of its question rows,
     for `report._codec_savings_section` to de-duplicate by `sha` and report beside the
     verdict."""
+    # Pre-flight EVERY model before touching the corpus (#403). A model that cannot express
+    # a container tool argument scores 0% on both arms and takes the run's verdict down as
+    # `broken control` with no named cause; a few calls per model buy a named refusal in
+    # seconds instead of an hour of UNRESOLVED.
+    # REFUSE the run, never drop the model and continue. The verdict is the WORST model's,
+    # so running without a failed model can only move a cell toward SAFE, and neither the
+    # rows nor the report would carry a trace of the model that was asked for. Review of
+    # #403 reproduced it: the same corpus rendered UNRESOLVED with the model and a clean
+    # SAFE without it. Re-running with a corrected `--models` costs seconds.
+    # `preflight=False` exists for tests whose subject is envelope handling and whose stub
+    # answerer is deliberately degenerate. The CLI never passes it:
+    # `test_the_cli_refuses_a_codec_verdict_run_a_model_cannot_answer` drives `main`.
+    if preflight:
+        failed = {name: why for name, a in answerers.items()
+                  if (why := preflight_encoding(a)) is not None}
+        if failed:
+            raise PreflightError(
+                f"terse fluency --codec-verdict: refused before the sweep — {len(failed)} of "
+                f"{len(answerers)} model(s) failed the container-argument pre-flight:\n"
+                + "".join(f"  {name}: {why}\n" for name, why in failed.items())
+                + "A backend that returned no usable turn may pass on a retry. A model whose "
+                "ANSWERS failed cannot take part: remove it from --models, knowing the "
+                "verdict then covers only the models you name. That choice is yours to make "
+                "and to disclose — the run will not make it silently, because the verdict is "
+                "set by the worst model and dropping one can only move it toward SAFE.")
     results: dict[str, list[dict]] = {name: [] for name in answerers}
     progress = fluency.guarded(progress)
     started = time.monotonic()
