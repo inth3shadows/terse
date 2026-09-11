@@ -251,7 +251,8 @@ def preflight_encoding(answerer: ToolAnswerer, attempts: int = PREFLIGHT_ATTEMPT
     attempts = max(1, attempts)
     first_reason: str | None = None
     bad = scored = 0
-    for question, payload_text in preflight_questions():
+    questions = preflight_questions()
+    for qi, (question, payload_text) in enumerate(questions, 1):
         answered = calls = 0
         while answered < attempts and calls < 2 * attempts:
             calls += 1
@@ -266,11 +267,14 @@ def preflight_encoding(answerer: ToolAnswerer, attempts: int = PREFLIGHT_ATTEMPT
                     first_reason = reason
         scored += answered
         if answered < attempts:
-            lost = (f"backend returned no usable turn on {calls - answered} of {calls} "
-                    "pre-flight calls")
+            # `calls` is per question and `bad/scored` runs across questions, so the loss
+            # names its question: "6 of 6" after question 1 answered cleanly must not read
+            # as a backend that never answered at all (round-3 review).
+            lost = (f"backend returned no usable turn on {calls - answered} of {calls} calls "
+                    f"for pre-flight question {qi} of {len(questions)}")
             if first_reason is None:
                 return f"{lost} — cannot tell whether this model can express a container argument"
-            return f"{first_reason} [{bad}/{scored} pre-flight answers failed; {lost}]"
+            return f"{first_reason} [{bad}/{scored} pre-flight answers failed before the {lost}]"
     if first_reason is None:
         return None
     return f"{first_reason} [{bad}/{scored} pre-flight answers failed]"

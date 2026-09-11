@@ -374,13 +374,23 @@ def test_preflight_retries_an_errored_turn_instead_of_failing_the_model():
 
 def test_preflight_reports_a_backend_that_never_answers_as_that():
     why = codeceval.preflight_encoding(preflight_stub(lambda e, n: ERROR), attempts=3)
-    assert why and why.startswith("backend returned no usable turn on 6 of 6 pre-flight calls")
+    assert why and why.startswith(
+        "backend returned no usable turn on 6 of 6 calls for pre-flight question 1 of 2 — ")
 
 
 def test_preflight_needs_every_scorable_answer_not_just_one():
     # One good answer then five errors: 1 of the 3 answers the question needs.
     why = codeceval.preflight_encoding(preflight_stub(lambda e, n: ERROR if n else e), attempts=3)
-    assert why and why.startswith("backend returned no usable turn on 5 of 6 pre-flight calls")
+    assert why and why.startswith(
+        "backend returned no usable turn on 5 of 6 calls for pre-flight question 1 of 2")
+
+
+def test_preflight_names_the_question_a_backend_loss_happened_on():
+    # Question 1 answered cleanly 3 times; the loss is question 2's alone (round-3 review).
+    why = codeceval.preflight_encoding(preflight_stub(lambda e, n: ERROR if n >= 3 else e),
+                                       attempts=3)
+    assert why and why.startswith(
+        "backend returned no usable turn on 6 of 6 calls for pre-flight question 2 of 2")
 
 
 def test_preflight_reports_the_first_failure_not_the_latest():
@@ -395,7 +405,8 @@ def test_preflight_keeps_an_answer_failure_ahead_of_a_later_backend_failure():
     stub = preflight_stub(lambda e, n: json.dumps(e) if n < 2 else ERROR)
     why = codeceval.preflight_encoding(stub, attempts=3)
     assert why and why.startswith("sends container arguments as a JSON STRING"), why
-    assert "[2/2 pre-flight answers failed; backend returned no usable turn on 4 of 6" in why
+    assert ("[2/2 pre-flight answers failed before the backend returned no usable turn on "
+            "4 of 6 calls for pre-flight question 1 of 2]") in why, why
 
 
 def test_run_codec_fluency_refuses_the_run_when_any_model_fails_the_preflight():

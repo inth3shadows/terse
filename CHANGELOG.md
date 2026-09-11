@@ -26,8 +26,9 @@ fails that pull request until the section has moved.
   answer must match. An errored call is retried, not counted. A failure exits 2 with each
   model's reason on stderr (`sends container arguments as a JSON STRING`, `answered without
   calling terse.record_answer`, `failed a 2-record pre-flight question`, or `backend
-  returned no usable turn` when fewer than three answers arrive in six calls) and writes no
-  report. The run is refused rather than continued without
+  returned no usable turn` when fewer than three answers arrive in six calls — unless an
+  answer had already failed, which then leads and the backend loss is appended) and writes
+  no report. The run is refused rather than continued without
   the model: the verdict is the worst model's, so dropping one can only move a cell toward
   SAFE, and a review of the first cut reproduced exactly that — UNRESOLVED with the model,
   a clean SAFE without it, and no trace of it in the report. Scoring is unchanged: a
