@@ -143,8 +143,7 @@ def encodes_as_json_string(got: Any, expected: Any) -> bool:
 
     Not a scoring path. NOTHING calls this to turn a miss into a hit — that would accept an
     argument a strict tool rejects, which is exactly the loosening #295 forbids. It is
-    diagnosis only: `preflight_encoding` refuses such a model up front, and the per-row
-    counts let a report say which arm was lost to encoding rather than to comprehension.
+    diagnosis only: `preflight_encoding` uses it to name the reason it refuses a model.
 
     Only a container `expected` qualifies. A string one would make every correctly-answered
     string question look like a mismatch (`json.loads('"a"') == "a"`), and `None` would
@@ -167,10 +166,15 @@ def encodes_as_json_string(got: Any, expected: Any) -> bool:
 # Blocker 2; conflating them is what made the 2026-09-09 run unreadable). The QUESTIONS are
 # not hand-written: `preflight_questions` derives them with the same `gen_codec_questions`
 # the sweep uses, so prompt wording and `expected` cannot drift from what is scored.
+# The asked-for values (record index 1, `questions.py`'s `n // 2` pick) are NESTED — a list
+# of objects, an object holding a list and an empty object — because real `deref` values
+# are, and a model that stringifies only inner containers would otherwise pass here and
+# still zero both arms of the sweep.
 PREFLIGHT_PAYLOADS: tuple[dict, ...] = (
-    {"result": [{"id": "a", "tags": ["x", "y"]}, {"id": "b", "tags": ["z"]}]},
-    {"result": [{"id": 1, "meta": {"owner": "ann", "n": 2}},
-                {"id": 2, "meta": {"owner": "bo", "n": 3}}]},
+    {"result": [{"id": "a", "rows": [{"k": "x"}]},
+                {"id": "b", "rows": [{"k": "y", "v": [1, 2]}, {"k": "z"}]}]},
+    {"result": [{"id": 1, "meta": {"owner": "ann"}},
+                {"id": 2, "meta": {"owner": "bo", "tags": ["q", "r"], "extra": {}}}]},
 )
 PREFLIGHT_ATTEMPTS = 3
 
@@ -241,15 +245,16 @@ def preflight_encoding(answerer: ToolAnswerer, attempts: int = PREFLIGHT_ATTEMPT
     An errored turn (transport failure, or 200 with no content) is NOT an answer: it says
     nothing about encoding, and one timeout must not cost a good model its place in the
     run. It is retried, up to `attempts` extra calls per question; a backend that cannot
-    produce `attempts` scorable turns in `2 * attempts` calls is reported as that."""
+    produce `attempts` scorable turns in `2 * attempts` calls fails the pre-flight. When a
+    model's ANSWERS had already failed before the backend gave out, that failure leads the
+    reason: a JSON-string model behind a flaky gateway must not read as "retry and see"."""
     attempts = max(1, attempts)
     first_reason: str | None = None
     bad = scored = 0
     for question, payload_text in preflight_questions():
-        answered = 0
-        for _ in range(2 * attempts):
-            if answered == attempts:
-                break
+        answered = calls = 0
+        while answered < attempts and calls < 2 * attempts:
+            calls += 1
             turn = _codec_turn(question, payload_text, answerer)
             if turn.error:
                 continue
@@ -257,12 +262,15 @@ def preflight_encoding(answerer: ToolAnswerer, attempts: int = PREFLIGHT_ATTEMPT
             reason = _preflight_miss(turn, question.expected)
             if reason is not None:
                 bad += 1
-                first_reason = first_reason or reason
+                if first_reason is None:
+                    first_reason = reason
         scored += answered
         if answered < attempts:
-            return (f"backend returned no usable turn on {2 * attempts - answered} of "
-                    f"{2 * attempts} pre-flight calls — cannot tell whether this model can "
-                    "express a container argument")
+            lost = (f"backend returned no usable turn on {calls - answered} of {calls} "
+                    "pre-flight calls")
+            if first_reason is None:
+                return f"{lost} — cannot tell whether this model can express a container argument"
+            return f"{first_reason} [{bad}/{scored} pre-flight answers failed; {lost}]"
     if first_reason is None:
         return None
     return f"{first_reason} [{bad}/{scored} pre-flight answers failed]"
@@ -440,9 +448,11 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                 f"terse fluency --codec-verdict: refused before the sweep — {len(failed)} of "
                 f"{len(answerers)} model(s) failed the container-argument pre-flight:\n"
                 + "".join(f"  {name}: {why}\n" for name, why in failed.items())
-                + "Re-run with --models naming only models that pass. The run is refused "
-                "rather than continued without them: the verdict is set by the worst model, "
-                "so dropping one can only move it toward SAFE, and the report would not say so.")
+                + "A backend that returned no usable turn may pass on a retry. A model whose "
+                "ANSWERS failed cannot take part: remove it from --models, knowing the "
+                "verdict then covers only the models you name. That choice is yours to make "
+                "and to disclose — the run will not make it silently, because the verdict is "
+                "set by the worst model and dropping one can only move it toward SAFE.")
     results: dict[str, list[dict]] = {name: [] for name in answerers}
     progress = fluency.guarded(progress)
     started = time.monotonic()

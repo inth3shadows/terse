@@ -303,9 +303,14 @@ def test_encoding_detection_never_turns_a_miss_into_a_hit():
 
 def test_preflight_asks_one_deref_question_per_container_type():
     # A model can stringify objects and not arrays; the first version only asked an array.
+    # And each asked-for value NESTS a container: a model that stringifies only inner values
+    # would otherwise pass here and zero both arms of the sweep (round-2 review of #403).
     qs = codeceval.preflight_questions()
     assert all(q.qtype == "deref" for q, _ in qs)
     assert sorted(type(q.expected).__name__ for q, _ in qs) == ["dict", "list"]
+    for q, _ in qs:
+        inner = q.expected if isinstance(q.expected, list) else list(q.expected.values())
+        assert any(isinstance(v, (dict, list)) for v in inner), q.expected
 
 
 def test_preflight_refuses_to_check_nothing_if_question_generation_changes(monkeypatch):
@@ -369,19 +374,42 @@ def test_preflight_retries_an_errored_turn_instead_of_failing_the_model():
 
 def test_preflight_reports_a_backend_that_never_answers_as_that():
     why = codeceval.preflight_encoding(preflight_stub(lambda e, n: ERROR), attempts=3)
-    assert why and "no usable turn on 6 of 6 pre-flight calls" in why, why
+    assert why and why.startswith("backend returned no usable turn on 6 of 6 pre-flight calls")
+
+
+def test_preflight_needs_every_scorable_answer_not_just_one():
+    # One good answer then five errors: 1 of the 3 answers the question needs.
+    why = codeceval.preflight_encoding(preflight_stub(lambda e, n: ERROR if n else e), attempts=3)
+    assert why and why.startswith("backend returned no usable turn on 5 of 6 pre-flight calls")
+
+
+def test_preflight_reports_the_first_failure_not_the_latest():
+    stub = preflight_stub(lambda e, n: json.dumps(e) if n == 0 else NO_CALL if n == 1 else e)
+    why = codeceval.preflight_encoding(stub, attempts=3)
+    assert why and why.startswith("sends container arguments as a JSON STRING"), why
+    assert "[2/6 pre-flight answers failed]" in why
+
+
+def test_preflight_keeps_an_answer_failure_ahead_of_a_later_backend_failure():
+    # A JSON-string model behind a flaky gateway must not read as "retry and see".
+    stub = preflight_stub(lambda e, n: json.dumps(e) if n < 2 else ERROR)
+    why = codeceval.preflight_encoding(stub, attempts=3)
+    assert why and why.startswith("sends container arguments as a JSON STRING"), why
+    assert "[2/2 pre-flight answers failed; backend returned no usable turn on 4 of 6" in why
 
 
 def test_run_codec_fluency_refuses_the_run_when_any_model_fails_the_preflight():
     # Dropping the failed model and continuing let a cell read SAFE over fewer models than
-    # were asked for (review of #403). The refusal lands BEFORE any corpus question.
+    # were asked for (review of #403). The refusal lands BEFORE any corpus question: `good`
+    # passes the pre-flight, so only running the sweep first could reach `corpus_calls`.
     corpus_calls: list = []
+    passes = preflight_stub(lambda e, n: e)
 
-    def good_on_corpus(messages):
-        corpus_calls.append(messages)
-        return Turn(text="", tool_calls=[])
+    def good(messages):
+        if not any(text in messages[-1]["content"] for _, text in codeceval.preflight_questions()):
+            corpus_calls.append(messages)
+        return passes(messages)
 
-    good = preflight_stub(lambda e, n: e)
     bad = preflight_stub(lambda e, n: json.dumps(e))
     envelopes = [{"tool": "demo.get", "sha": "abc", "raw": RAW_TEXT}]
     with pytest.raises(codeceval.PreflightError) as exc:
@@ -394,7 +422,7 @@ def test_run_codec_fluency_refuses_the_run_when_any_model_fails_the_preflight():
 
 def test_run_codec_fluency_preflights_with_the_default_attempt_count():
     # Pins PREFLIGHT_ATTEMPTS through the production call: a model wrong only on its third
-    # answer to the first question passes a 1- or 2-attempt pre-flight.
+    # answer (n == 2) passes a 1-attempt pre-flight, and a 2-attempt one reports "1/4".
     late_miss = preflight_stub(lambda e, n: json.dumps(e) if n == 2 else e)
     with pytest.raises(codeceval.PreflightError, match="1/6 pre-flight answers failed"):
         codeceval.run_codec_fluency([], {"m": late_miss}, trials=1)
