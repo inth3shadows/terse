@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.32.4] - 2026-09-11
+
 ### Fixed
 
 - **`terse fluency --codec-verdict` pre-flights every model and refuses the run if one
