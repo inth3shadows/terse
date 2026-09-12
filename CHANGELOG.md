@@ -23,8 +23,14 @@ fails that pull request until the section has moved.
   reach a corpus that feeds a published benchmark. The generator reproduces the STRUCTURE
   of the broker's `list_credentials` — declared rows carry `name, kind, source, env_var,
   has_value` plus three usage fields, undeclared rows drop two of those and add a long
-  repeated `note`, so the table has both absent columns and a dictionary legend — and
-  invents every value. It compresses 42.8%, against 45.5% measured on the real tool.
+  repeated `note`, so the table has both absent columns and a dictionary legend, and
+  `env_var` is both explicitly null and absent, which is the one column that exercises the
+  `__terse_absent__` sentinel — and invents every value. The three pool to **+39.2%** in the
+  codec savings table terse itself renders (the largest alone is 42.5% on the same cl100k
+  basis), against the **45.5%** the shipped policy records for the real tool.
+  They are **opt-in** (`python scripts/gen_stress_corpus.py <dir> --fleet-shapes`): they
+  would otherwise be 78% of the tokens in `terse verify`'s zero-setup sample and move its
+  headline from +37.2% to +38.7%, one tool's shape deciding an adopter-facing number.
   Three sizes share one tool name so they pool into a single verdict cell: the shape yields
   one `enumerate` question per payload, so one payload could never clear the 20-trial
   floor, and three at `--trials 7` reach 21. The `synthetic.` prefix survives into the

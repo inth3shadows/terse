@@ -27,7 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from terse.capture import capture_payload  # noqa: E402
+from terse.capture import capture_payload, extract_records  # noqa: E402
 from terse.transforms import minify  # noqa: E402
 
 # A small pool of long, repeated strings — guarantees dictionary coding fires
@@ -120,7 +120,13 @@ def secret_list_credentials(n_declared: int = 60, n_undeclared: int = 10) -> dic
     - `note` is one long string repeated across every undeclared row — the dictionary tier's
       alias case.
     - `kind`/`source` repeat from small pools; `last_used`/`last_ok` are null on never-used
-      credentials, which is the explicit-null-vs-absent distinction a deref failure destroys.
+      credentials.
+    - `env_var` is BOTH explicitly null (declared rows can have none — `config.py:182` types
+      it `str | None`) and absent (undeclared rows omit the key). That one column is the only
+      place the real payload forces `transforms`' `sentinel_cols` branch, which encodes an
+      absent cell as `__terse_absent__` precisely so a reader can tell it from a real null.
+      Review of the first cut found the fixture claiming that distinction while emitting an
+      `env_var` on every declared row, so the hardest cell in the shape went untested.
     """
     kinds = ["api_key", "oauth_token", "password", "ssh_key"]
     sources = ["config_toml", "connect_vault", "env"]
@@ -137,7 +143,7 @@ def secret_list_credentials(n_declared: int = 60, n_undeclared: int = 10) -> dic
             "name": f"service-{i:02d}-credential",
             "kind": kinds[i % len(kinds)],
             "source": sources[i % len(sources)],
-            "env_var": f"SERVICE_{i:02d}_CREDENTIAL",
+            "env_var": f"SERVICE_{i:02d}_CREDENTIAL" if i % 3 else None,
             "has_value": i % 7 != 0,
             "call_count": (i * 13) % 90 if used else 0,
             "last_used": f"2026-09-{(i % 28) + 1:02d}T0{i % 10}:15:00Z" if used else None,
@@ -172,7 +178,9 @@ SYNTHETIC_TOOL = "synthetic.secret.list_credentials"
 # under ONE tool name: they pool into a single (tool, shape) cell, and this payload yields
 # exactly one codec question each (`credentials` has no container column, so `enumerate`
 # only), so one payload could never clear `report._CODEC_MIN_TRIALS` — three at
-# `--trials 7` reach 21. The sizes also straddle the tabularizer's fold threshold.
+# `--trials 7` reach 21. The sizes vary the table's height (a 70-row enumerate answer is a
+# different reading task from a 10-row one); they do NOT straddle a fold threshold — all
+# three take both tiers, and the only size gate in the fold path is `len >= 2`.
 SYNTHETIC = [
     (SYNTHETIC_TOOL, secret_list_credentials()),
     (SYNTHETIC_TOOL, secret_list_credentials(n_declared=24, n_undeclared=4)),
@@ -189,16 +197,24 @@ PAYLOADS = {
 }
 
 
-def main(corpus_dir: str = "corpus-stress") -> int:
-    for tool, obj in list(PAYLOADS.items()) + SYNTHETIC:
-        # `len(obj)` counts records for the list payloads and top-level keys for the dict
-        # ones; the record count that matters for a dict payload is printed beside it.
-        size = (f"{len(obj)} records" if isinstance(obj, list)
-                else f"{len(obj['credentials'])} records")
+def main(corpus_dir: str = "corpus-stress", with_fleet_shapes: bool = False) -> int:
+    """Write the stress payloads; add the `synthetic.*` fleet shapes only when asked.
+
+    OPT-IN, because `terse verify` runs this script for its zero-setup sample
+    (`cli.py`'s `_cmd_verify`) and that sample is an adopter-facing claim about terse on
+    ordinary traffic. The three fleet-shape payloads are 78% of the sample's tokens and
+    moved its headline from +37.2% to +38.7% — one tool's shape quietly deciding the
+    number (review of #403 Blocker 2). The codec-verdict run asks for them explicitly."""
+    payloads = list(PAYLOADS.items()) + (SYNTHETIC if with_fleet_shapes else [])
+    for tool, obj in payloads:
+        records = extract_records(obj)
+        size = f"{len(records)} records" if records else f"{len(obj)} keys"
         path = capture_payload(tool, minify(obj), corpus_dir)
         print(f"wrote {tool} ({size}) -> {path}")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1] if len(sys.argv) > 1 else "corpus-stress"))
+    args = [a for a in sys.argv[1:] if a != "--fleet-shapes"]
+    raise SystemExit(main(args[0] if args else "corpus-stress",
+                          with_fleet_shapes="--fleet-shapes" in sys.argv[1:]))

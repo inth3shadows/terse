@@ -968,6 +968,12 @@ against known-correct values — no second model judging.
 # 1. (optional) build a synthetic corpus that stresses the hardest cases
 python scripts/gen_stress_corpus.py corpus-stress
 
+# 1b. (optional) add the `synthetic.*` fleet shapes — structure-faithful, value-invented
+#     payloads for tools a capture corpus cannot hold (secret.list_credentials is
+#     `capture: false` by policy). Opt-in: they would otherwise dominate `terse verify`'s
+#     bundled sample, and the `synthetic.` prefix keeps them apart in every report.
+python scripts/gen_stress_corpus.py corpus-stress --fleet-shapes
+
 # 2a. keyless: writes an eval pack you can drive by hand, then score
 uv run terse fluency --corpus corpus-stress
 

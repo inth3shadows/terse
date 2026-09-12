@@ -62,6 +62,10 @@ def test_each_variant_keeps_the_shape_the_broker_returns(obj):
     keysets = {frozenset(r) for r in obj["credentials"]}
     assert keysets <= {frozenset(DECLARED), frozenset(UNDECLARED)}, keysets
     assert frozenset(DECLARED) in keysets, "no declared rows"
+    # Required per VARIANT, not just somewhere in the set: a variant with no undeclared rows
+    # has no union schema and no repeated note, yet still contributes its trials to the
+    # cell's verdict (review of #403 Blocker 2 caught exactly that mutation surviving).
+    assert frozenset(UNDECLARED) in keysets, "no undeclared rows"
     # A never-used credential carries explicit nulls, not absent keys — the distinction a
     # deref/enumerate failure destroys, and one the real tool emits (`meta.py:46`). Asserted
     # on DECLARED rows: undeclared ones are null by construction, so they would carry this
@@ -95,6 +99,18 @@ def test_the_largest_variant_exercises_absent_columns_and_the_legend():
     assert text.count(note) == 1, "the repeated note was not aliased into the legend"
 
 
+@pytest.mark.parametrize("obj", [obj for _, obj in gsc.SYNTHETIC])
+def test_env_var_is_both_explicitly_null_and_absent(obj):
+    # The one column where the real payload forces the encoder to tell an ABSENT cell from
+    # an explicit null: declared rows may have no env_var (`config.py:182` types it
+    # `str | None`), undeclared rows omit the key entirely.
+    declared = [r for r in obj["credentials"] if "env_var" in r]
+    assert any(r["env_var"] is None for r in declared), "no declared row with a null env_var"
+    assert any(r["env_var"] for r in declared), "every declared env_var is null"
+    assert any("env_var" not in r for r in obj["credentials"]), "no row omits env_var"
+    assert "__terse_absent__" in fluency.compress(obj), "the absent-vs-null branch is unused"
+
+
 def test_the_largest_variant_is_the_size_the_real_tool_returns():
     # The shipped policy's own note calls `list_credentials` "~70 uniform records". A
     # handful of rows would not exercise the table the real payload produces.
@@ -117,8 +133,20 @@ def test_there_are_enough_variants_for_a_cell_to_resolve():
     assert _CODEC_MIN_TRIALS > 7, "one payload at --trials 7 must not be able to resolve"
 
 
-def test_the_generator_writes_every_payload_including_the_synthetic_ones(tmp_path, capsys):
+def test_the_fleet_shapes_are_opt_in(tmp_path, capsys):
+    # `terse verify`'s zero-setup sample shells out to this script with no flag, and that
+    # sample is an adopter-facing claim about ordinary traffic. These three payloads are 78%
+    # of its tokens and moved its headline from +37.2% to +38.7%, so they stay out by
+    # default (review of #403 Blocker 2).
     assert gsc.main(str(tmp_path)) == 0
+    capsys.readouterr()
+    envelopes = capture.load_corpus(tmp_path)
+    assert len(envelopes) == len(gsc.PAYLOADS)
+    assert not [e for e in envelopes if e["tool"].startswith("synthetic.")]
+
+
+def test_the_generator_writes_the_fleet_shapes_when_asked(tmp_path, capsys):
+    assert gsc.main(str(tmp_path), with_fleet_shapes=True) == 0
     capsys.readouterr()
     envelopes = capture.load_corpus(tmp_path)
     assert len(envelopes) == len(gsc.PAYLOADS) + len(gsc.SYNTHETIC)
