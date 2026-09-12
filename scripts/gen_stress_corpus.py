@@ -231,5 +231,12 @@ if __name__ == "__main__":
               f"usage: gen_stress_corpus.py [corpus_dir] [{FLEET_FLAG}]", file=sys.stderr)
         raise SystemExit(2)
     positional = [a for a in argv if a != FLEET_FLAG]
+    if len(positional) > 1:
+        # The same silent no-op one dash further out: `gen_stress_corpus.py dir fleet-shapes`
+        # took `dir`, dropped the rest, and wrote no fleet shapes (review round 3).
+        print(f"expected at most one corpus dir, got {len(positional)}: "
+              f"{' '.join(positional)}\n"
+              f"usage: gen_stress_corpus.py [corpus_dir] [{FLEET_FLAG}]", file=sys.stderr)
+        raise SystemExit(2)
     raise SystemExit(main(positional[0] if positional else "corpus-stress",
                           with_fleet_shapes=FLEET_FLAG in argv))

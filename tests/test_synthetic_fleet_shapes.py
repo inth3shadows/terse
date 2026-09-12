@@ -172,14 +172,28 @@ def test_the_command_line_writes_the_fleet_shapes_when_asked(tmp_path):
     assert "synthetic.secret.list_credentials" in r.stdout
 
 
-def test_a_mistyped_flag_is_refused_rather_than_named_as_the_corpus_dir(tmp_path):
-    # It used to positional-ize: exit 0, a corpus in a directory called `--fleetshapes`,
-    # no fleet shapes in it, and nothing saying so — then a codec-verdict run measuring
-    # nothing about the shape the flag exists to measure.
+def test_a_mistyped_flag_is_refused_rather_than_silently_ignored(tmp_path):
+    # Both spellings of the same silent no-op: exit 0, a corpus with no fleet shapes in it,
+    # and nothing saying so — then a codec-verdict run measuring nothing about the shape the
+    # flag exists to measure. With no dir argument the dashed typo also became the dir name.
     r = _run_script(tmp_path, "--fleetshapes")
     assert r.returncode == 2, r.stdout
     assert "unknown option" in r.stderr and gsc.FLEET_FLAG in r.stderr
     assert not list(tmp_path.iterdir()), "a refused run must write nothing"
+
+    r = _run_script(tmp_path, "fleet-shapes")     # a dash-less typo is an extra positional
+    assert r.returncode == 2, r.stdout
+    assert "at most one corpus dir" in r.stderr and gsc.FLEET_FLAG in r.stderr
+    assert not list(tmp_path.iterdir()), "a refused run must write nothing"
+
+
+def test_the_flag_spelling_is_the_one_the_docs_tell_people_to_type():
+    # The literal lives in exactly one place in code; every test reaches it through the
+    # constant, so renaming it broke the documented command with the suite green.
+    assert gsc.FLEET_FLAG == "--fleet-shapes"
+    root = SCRIPT.resolve().parents[1]
+    for doc in ("USAGE.md", "README.md"):
+        assert gsc.FLEET_FLAG in (root / doc).read_text(encoding="utf-8"), doc
 
 
 def test_the_written_line_survives_a_payload_with_no_record_list(tmp_path, capsys, monkeypatch):
