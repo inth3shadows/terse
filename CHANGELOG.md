@@ -15,6 +15,35 @@ fails that pull request until the section has moved.
 
 ### Added
 
+- **`scripts/gen_stress_corpus.py` also emits `synthetic.secret.list_credentials`, a fleet
+  shape no capture corpus can hold (#403 Blocker 2).** That tool is the largest codec saver
+  in the live ledger — 73.4% of 30-day codec savings when measured on 2026-09-11 — and has
+  **zero** captured payloads by design: the shipped policy sets `capture: false` on every
+  secret-broker tool ("compress it, never persist it"), so a credential inventory cannot
+  reach a corpus that feeds a published benchmark. The generator reproduces the STRUCTURE
+  of the broker's `list_credentials` — declared rows carry `name, kind, source, env_var,
+  has_value` plus three usage fields, undeclared rows drop two of those and add a long
+  repeated `note`, so the table has both absent columns and a dictionary legend, and
+  `env_var` is both explicitly null and absent, which is the one column that exercises the
+  `__terse_absent__` sentinel — and invents every value. The 70-record variant compresses
+  **42.5%** (`cl100k(minify)` vs `cl100k(compress)`, the arithmetic the codec savings table
+  renders), against the **45.5%** the shipped policy records for the real tool — not
+  like-for-like, since that measurement is a smaller 3,521-token payload described as
+  uniform. Pooled over all three sizes the table shows +39.2%.
+  They are **opt-in** (`python scripts/gen_stress_corpus.py <dir> --fleet-shapes`): they
+  would otherwise be 78% of the tokens in `terse verify`'s zero-setup sample and move its
+  headline from +37.2% to +38.7%, one tool's shape deciding an adopter-facing number.
+  Three sizes share one tool name so they pool into a single verdict cell: the shape yields
+  one `enumerate` question per payload, so one payload could never clear the 20-trial
+  floor, and three at `--trials 7` reach 21. The `synthetic.` prefix survives into the
+  verdict table's tool column, so a cell measured on invented values cannot be read as
+  production coverage. **What this establishes is that the codec reads the SHAPE back
+  correctly — not that it is safe on the real tool's values, which stays unmeasured.**
+
+## [0.33.0] - 2026-09-11
+
+### Added
+
 - **`terse fluency --codec-verdict` also scores `enumerate` questions, and question
   generation no longer goes silent on a list that ends in a metadata record (#403
   Blocker 2).** Measured against the live corpus and 30 days of ledger, over codec savings

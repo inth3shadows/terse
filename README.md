@@ -225,7 +225,8 @@ src/terse/
   cli.py         entrypoint: gate / policy / compress / capture / measure / probe / validate /
                  proxy / stats / fluency / tune / install-mcp / uninstall-mcp / mcp-status / verify
 scripts/
-  gen_stress_corpus.py  synthetic stress corpus for the fluency eval
+  gen_stress_corpus.py  synthetic stress corpus for the fluency eval; `--fleet-shapes`
+                        adds `synthetic.*` shapes a capture corpus cannot hold (#403)
   bench/                terse-vs-TOON token benchmark on a real GitHub-API corpus
                         (fetch_corpus.sh, benchmark.py, diff_demo.py, toon_encode.mjs)
   bench/mcp_servers/    what terse does, zero-config, to popular third-party MCP servers
