@@ -38,6 +38,7 @@ import re
 import pytest
 
 from terse.report import (
+    _CODEC_MIN_CALL_RATE,
     _CODEC_MIN_TRIALS,
     _GAP_TOLERANCE,
     UNMEASURED_FAIL_SHARE,
@@ -120,6 +121,20 @@ def _codec_row(n: int) -> list[dict]:
     return [{"qid": "q0", "qtype": "lookup", "transform": "table", "trials": n,
              "raw_ok": n, "raw_trials": n, "terse_ok": n, "terse_trials": n,
              "attempts": n * 2, "fails": 0}]
+
+
+def test_the_codec_call_rate_floor_is_eighty_percent():
+    """`_CODEC_MIN_CALL_RATE` is how much of an arm's answered trials must have gone through
+    the tool call before that arm can license SAFE (#403).
+
+    Pinned as a VALUE, not only as a derivation: every test that uses it computes its
+    fixtures from the constant, so without this the number floats freely and the
+    "reuses `UNMEASURED_FAIL_SHARE` rather than a second tunable number" argument in its
+    definition is held by nothing — the same gap `test_the_codec_trial_floor_is_twenty`
+    exists to close one constant up."""
+    assert _CODEC_MIN_CALL_RATE == 0.80
+    # ...and the derivation, so raising one threshold cannot silently desynchronise them.
+    assert _CODEC_MIN_CALL_RATE == 1.0 - UNMEASURED_FAIL_SHARE
 
 
 def test_the_codec_trial_floor_is_twenty():

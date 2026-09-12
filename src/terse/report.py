@@ -1320,6 +1320,51 @@ def _not_measured_lines(
 # `tests/test_codec_verdict.py`; #337 added the VALUE, which nothing held.)
 _CODEC_MIN_TRIALS = 20
 
+# The share of an arm's trials that must have delivered their value through the tool call
+# for that arm to license SAFE (#403). Reuses `UNMEASURED_FAIL_SHARE` rather than
+# introducing a second, independently-tunable number: both answer "how much of this arm's
+# sample failed to arrive the way the harness asked for it", and a run is already withheld
+# at that share of lost CALLS, so withholding at the same share of lost CHANNELS keeps one
+# threshold to argue about instead of two.
+#
+# NOT a Clopper-Pearson bound and not a corruption gate — a premise check. `codeceval`
+# scores the value on whichever channel it arrives by, so accuracy is channel-independent
+# and an observed excess of terse misses stays trustworthy at any compliance level. What
+# compliance bears on is the OTHER half of #295's claim: that the value survives into a
+# real downstream tool argument. A run where the model answered in prose most of the time
+# has not shown that, so it cannot print SAFE — but it has still shown whatever corruption
+# it observed, so it can still print UNSAFE. Gates SAFE only, exactly like
+# `_CODEC_MIN_TRIALS` above.
+_CODEC_MIN_CALL_RATE = 1.0 - UNMEASURED_FAIL_SHARE
+
+
+def codec_call_rate(rows: list[dict[str, Any]], form: str) -> float | None:
+    """Share of `form`'s trials in `rows` that delivered their value through the tool call.
+
+    `None` when no row carries the counter — every result file written before #403, and any
+    hand-built row set in the tests that predates it. A missing counter is NOT compliance
+    and NOT its absence: it is a run that never measured the question, so `codec_verdict`
+    must not read it as either. Defaulting it to 1.0 would silently re-certify every
+    pre-#403 report as fully compliant; defaulting it to 0.0 would retract every one of
+    them on evidence that was never collected.
+
+    The denominator is `<arm>_answered` — trials that produced a scorable turn — not the
+    arm's trial count. A call the backend never answered is not a model that declined to
+    use the tool, and counting it as one makes the renderer's "Why" attribute transport loss
+    to model behaviour (backend loss is `fails`/`attempts` -> `_unmeasured`'s job). Falls
+    back to `_arm_trials` for a row that carries `<arm>_calls` without it, so a hand-built
+    or older row set still reads as it did."""
+    key = form.replace("_ok", "_calls")
+    answered_key = form.replace("_ok", "_answered")
+    carrying = [r for r in rows if key in r]
+    if not carrying:
+        return None
+    answered = sum(int(r[answered_key]) if answered_key in r else _arm_trials(r, form)
+                   for r in carrying)
+    if answered <= 0:
+        return None
+    return sum(int(r[key]) for r in carrying) / answered
+
 # Below this many questions, a fixed-ideal metric prints INSUFFICIENT instead of PASS
 # (#335). A DISCLOSURE THRESHOLD, NOT A STATISTICAL FLOOR — deliberately, and the
 # distinction is the whole design:
@@ -1360,6 +1405,21 @@ def fixed_ideal_sufficient(n: int | None) -> bool:
 _VERDICT_RANK = {"SAFE": 0, "UNRESOLVED": 1, "UNSAFE": 2}  # worst wins when grouping models
 
 
+def _codec_low_call_arm(rows: list[dict[str, Any]]) -> tuple[str, float] | None:
+    """`(arm, rate)` for the worst arm whose tool-call compliance is below
+    `_CODEC_MIN_CALL_RATE`, or `None` when every measured arm clears it.
+
+    The renderer's half of the gate `codec_verdict` applies, kept beside it so the table's
+    "Why" names the arm and the number rather than falling through to the trial-count
+    reason, which would be true but would point at the wrong cause. Returns the WORST arm,
+    not the first, so a cell where both arms are non-compliant reports the one that
+    explains most of it."""
+    low = [(form[:-len("_ok")], rate) for form in ("raw_ok", "terse_ok")
+           if (rate := codec_call_rate(rows, form)) is not None
+           and rate < _CODEC_MIN_CALL_RATE]
+    return min(low, key=lambda t: t[1]) if low else None
+
+
 def codec_verdict(rows: list[dict[str, Any]]) -> tuple[str, ArmGap]:
     """SAFE / UNSAFE / UNRESOLVED for one model's codec-eval rows, already scoped to one
     `(tool, shape)` group (`codeceval.run_codec_fluency`'s row tags).
@@ -1398,6 +1458,13 @@ def codec_verdict(rows: list[dict[str, Any]]) -> tuple[str, ArmGap]:
     excess_terse_misses = sum(max(0, int(r["raw_ok"]) - int(r["terse_ok"])) for r in g.rows)
     if excess_terse_misses > 0:
         return "UNSAFE", g
+    # Compliance gates SAFE only, and is checked AFTER the corruption gate on purpose: an
+    # observed excess is scored channel-independently (`codeceval._ask_codec_question`), so
+    # it is real whether or not the model kept to the tool protocol, and withholding it here
+    # would suppress the finding this tier exists to make. See `_CODEC_MIN_CALL_RATE`.
+    if any((rate := codec_call_rate(g.rows, form)) is not None
+           and rate < _CODEC_MIN_CALL_RATE for form in ("raw_ok", "terse_ok")):
+        return "UNRESOLVED", g
     if n >= _CODEC_MIN_TRIALS:
         return "SAFE", g
     return "UNRESOLVED", g
@@ -1615,6 +1682,11 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
                   f"(raw {worst_gap.control_acc:.0%}, terse {worst_gap.form_acc:.0%})")
         elif worst_gap.excluded:
             why = REASON_LABEL.get(worst_gap.excluded, worst_gap.excluded)
+        elif worst_verdict == "UNRESOLVED" and (low := _codec_low_call_arm(worst_gap.rows)):
+            arm, rate = low
+            why = (f"{arm} arm delivered {rate:.0%} of its answers through the tool call, "
+                   f"need {_CODEC_MIN_CALL_RATE:.0%} — the run cannot show a value "
+                   f"surviving into a downstream tool argument")
         elif worst_verdict == "UNRESOLVED":
             why = f"only {n} zero-failure trial(s), need {_CODEC_MIN_TRIALS}"
         else:
