@@ -13,6 +13,7 @@ import json
 from terse import capture, codeceval, fluency
 from terse.dropeval import ToolCall, Turn
 from terse.report import build_codec_verdict_report
+from terse.transforms import minify
 
 # The live `kb.read.list_principles` shape: uniform records, then a trailer that shares no
 # key with them. Wide enough records that the codec still folds the list (it refuses a
@@ -93,17 +94,51 @@ def test_a_payload_the_codec_leaves_alone_is_skipped_not_scored():
 
 
 def test_the_verdict_table_names_the_question_types_each_cell_was_scored_on():
-    payload = {"result": [{"id": i, "meta": {"a": i}} for i in range(1, 9)]}
+    # TWO payloads and TWO models, so the column cannot pass by counting per-payload,
+    # per-question, or across every model's rows: it counts the rows `n` sums over, which
+    # are the WORST model's.
+    payloads = [{"result": [{"id": i, "meta": {"a": i}} for i in range(base, base + 8)]}
+                for base in (1, 9)]
 
     def correct(messages):
         content = messages[-1]["content"]
-        q = next(q for q in codeceval.gen_codec_questions(payload) if q.prompt in content)
+        q = next(q for p in payloads for q in codeceval.gen_codec_questions(p)
+                 if q.prompt in content)
         return Turn(text="", tool_calls=[
             ToolCall(call_id="c1", name=codeceval.RECORD_VALUE_TOOL,
                      arguments={"value": q.expected})])
 
-    env = {"tool": "demo.get", "sha": "abc", "raw": json.dumps(payload)}
-    results = codeceval.run_codec_fluency([env], {"m": correct}, trials=2, preflight=False)
+    envs = [{"tool": "demo.get", "sha": f"sha{i}", "raw": json.dumps(p)}
+            for i, p in enumerate(payloads)]
+    results = codeceval.run_codec_fluency(envs, {"m1": correct, "m2": correct}, trials=2,
+                                          preflight=False)
     report = build_codec_verdict_report(results)
     assert "| Tool | Shape | Questions | n | Verdict |" in report
-    assert "| `demo.get` | array-of-records | deref 1, enumerate 1 | 4 | **UNRESOLVED** |" in report
+    assert "| `demo.get` | array-of-records | deref 2, enumerate 2 | 8 | **UNRESOLVED** |" in report
+
+
+def test_an_empty_final_entry_is_not_metadata():
+    # `{}` shares no key with anything, so the disjointness test alone would call it a
+    # trailer and describe it as "holding only " — nothing.
+    payload = [{**r, "id": i} for i, r in enumerate(RECORDS * 3)] + [{}]
+    assert capture.extract_records(payload) is not None
+    assert fluency.gen_questions(payload) == []
+
+
+def test_a_trailer_is_judged_against_every_record_not_just_the_first():
+    # The head is drifted: record 0 carries 'a', the rest carry 'b'. The final entry shares
+    # 'b' with records 1..9, so it is a record, and the list has no column in common.
+    payload = ([{"id": 0, "a": "x"}] + [{"id": i, "b": "y"} for i in range(1, 10)]
+               + [{"b": "z"}])
+    assert capture.extract_records(payload) is not None
+    assert fluency.gen_questions(payload) == []
+
+
+def test_codec_changes_reads_a_passthrough_as_unchanged_even_with_a_reserved_marker():
+    # The codec hands a payload carrying a reserved marker straight through, so a
+    # marker-in-the-output test would call it encoded and score free matches.
+    passthrough = {"result": [{"id": 1, "note": "__terse_absent__"}, {"id": 2, "note": "x"}]}
+    assert codeceval.gen_codec_questions(passthrough)          # askable...
+    assert fluency.compress(passthrough) == minify(passthrough)  # ...but untouched
+    assert codeceval.codec_changes(passthrough) is False
+    assert codeceval.codec_changes([{"id": i, "meta": {"o": f"n{i}"}} for i in range(8)])

@@ -342,6 +342,11 @@ def test_preflight_refuses_to_check_nothing_if_question_generation_changes(monke
                         lambda obj: [q for q in real(obj) if q.qtype == "deref"])
     with pytest.raises(RuntimeError, match=r"yields \['deref'\], expected one each"):
         codeceval.preflight_encoding(preflight_stub(lambda e, n: e))
+    # Nor is the COUNT the test: two of one type still never checks the other.
+    monkeypatch.setattr(codeceval, "gen_codec_questions",
+                        lambda obj: [q for q in real(obj) if q.qtype == "deref"] * 2)
+    with pytest.raises(RuntimeError, match=r"yields \['deref', 'deref'\], expected one each"):
+        codeceval.preflight_encoding(preflight_stub(lambda e, n: e))
 
 
 def test_preflight_sends_the_request_a_real_trial_sends():

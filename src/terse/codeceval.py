@@ -31,8 +31,13 @@ what the codec does:
   resolution.
 - `enumerate` — read one column back out of EVERY row, in order: the positional table read
   the tabularizer introduces. Added for #403 Blocker 2: deref-only covered tools carrying
-  11.9% of the codec's 30-day savings, because `kb.read.search`, `kb.read.list_principles`
-  and `secret.list_credentials` have no container column; with `enumerate` it is 21.9%.
+  11.9% of the codec's 30-day savings (`codegraph_explore` excluded from that denominator —
+  its savings are drop-tier, not codec), because `kb.read.search` and
+  `kb.read.list_principles` have no container column; with `enumerate` it is 21.9%. Both
+  figures are one measurement (2026-09-11, 338 envelopes, 30-day ledger window), not
+  invariants — the corpus grows and the mix drifts. Most of the rest is
+  `secret.list_credentials`, which the corpus has never captured, so its shape is
+  unmeasured here.
 
 `lookup` is NOT admitted: its answer is a bare scalar, which the spike note below measured
 being coerced to a string.
@@ -94,7 +99,7 @@ from typing import Any
 from . import capture, fluency
 from .dropeval import ToolAnswerer, Turn, _safe_call
 from .tokenize import count_cl100k
-from .transforms import has_terse_marker
+from .transforms import minify
 
 # OpenAI function-calling schemas can't cleanly express "any JSON type" — see the module
 # docstring's spike note. `{"description": ...}` with no `"type"` is the untyped form that
@@ -129,12 +134,14 @@ def codec_changes(obj: Any) -> bool:
     corpus were encoded), but `enumerate` does: 10 of its first 147 corpus questions were on
     payloads the codec declined (#403 Blocker 2). Skipped, never scored.
 
-    Output that does not parse as JSON counts as a change: it is not a passthrough, so it
-    is exactly what the eval should look at."""
-    try:
-        return has_terse_marker(json.loads(fluency.compress(obj)))
-    except ValueError:
-        return True
+    Compared against `minify`, which is exactly what the codec emits when it encodes
+    nothing — not against a marker in the output. Review of this change found the marker
+    test calling a passthrough "encoded" whenever the RAW payload already carried a
+    reserved marker (`{"note": "__terse_absent__"}`): the codec hands such a payload
+    through untouched, the marker is still there, and its trials would be free matches
+    again. No live corpus payload carries one, so this is the predicate stating its intent
+    rather than a fixed defect."""
+    return fluency.compress(obj) != minify(obj)
 
 
 def gen_codec_questions(obj: Any) -> list[fluency.Question]:
@@ -382,8 +389,8 @@ def _recorded_value(turn: Turn) -> tuple[bool, Any]:
 
 def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
                       trials: int = 1) -> list[dict]:
-    """Ask each `deref` question in `obj` over raw vs terse, `trials` times each, via the
-    tool-calling protocol. One row per question.
+    """Ask each `CODEC_QTYPES` question in `obj` over raw vs terse, `trials` times each, via
+    the tool-calling protocol. One row per question.
 
     `raw_trials`/`terse_trials` are the FIXED `trials` count, not reduced by errors (see
     `_ask_codec_question`'s docstring) — this differs from `fluency.harnesses.run_payload`'s
@@ -428,8 +435,10 @@ def _payload_tokens(raw_text: str, obj: Any) -> dict[str, int]:
     MEASURED ONCE, on 2026-09-01, against the 1,524-envelope corpus at
     `~/.config/terse/session-corpus`, and neither one an invariant:
 
-    - `run_codec_fluency` only emits rows for payloads that yield a `deref` question. 8 of
-      1,524 did, so the corpus-wide table would cover 190x the payloads the verdict does.
+    - `run_codec_fluency` only emits rows for payloads that yield a `CODEC_QTYPES` question
+      AND that the codec encodes (`codec_changes`). 8 of 1,524 yielded the `deref` this was
+      measured against, so the corpus-wide table would cover 190x the payloads the verdict
+      does; `enumerate` (#403) widens that set without changing the argument.
     - 36 of those 1,524 envelopes carried a stored `shape` that `classify_shape(raw)` no
       longer agreed with, so the two tables would not bucket the same payload the same way.
       That was `#355`, FIXED — `capture.envelope_shape` re-classifies at the read, so this
@@ -454,7 +463,8 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                       progress: Callable[[str], None] | None = None,
                       preflight: bool = True) -> dict[str, list[dict]]:
     """Run the codec-tier eval for each named tool-capable answerer over every payload in
-    the corpus that has at least one `deref` question. Mirrors `dropeval.run_drop_fluency`'s
+    the corpus that has at least one `CODEC_QTYPES` question AND that the codec actually
+    encodes (`codec_changes`). Mirrors `dropeval.run_drop_fluency`'s
     envelope-outer/model-inner nesting (question generation is model-independent, so it is
     derived once per envelope, not once per (model, envelope)) and `fluency.run_fluency`'s
     row-tagging convention.
@@ -503,7 +513,7 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
         try:
             obj = json.loads(env["raw"])
         except (json.JSONDecodeError, TypeError):
-            obj = None  # deref needs parsed JSON structure; a non-JSON/text payload has none
+            obj = None  # these questions need parsed JSON; a non-JSON/text payload has none
         if obj is None or not gen_codec_questions(obj) or not codec_changes(obj):
             # One line per skip, like `run_drop_fluency` (#267): `done` reaches `total`
             # without M near-identical lines per skipped envelope.

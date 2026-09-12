@@ -17,9 +17,11 @@ fails that pull request until the section has moved.
 
 - **`terse fluency --codec-verdict` also scores `enumerate` questions, and question
   generation no longer goes silent on a list that ends in a metadata record (#403
-  Blocker 2).** Measured against the live corpus and 30 days of ledger: `deref`-only
-  questions existed for tools carrying **11.9%** of the codec's savings. `kb.read.search`
-  (85 codec-transformed payloads) and `kb.read.list_principles` have no whole-object
+  Blocker 2).** Measured against the live corpus and 30 days of ledger, over codec savings
+  only (`codegraph_explore`'s are drop-tier and excluded from the denominator): `deref`-only
+  questions existed for tools carrying **11.9%** of them. `kb.read.search`
+  (85 codec-transformed payloads when measured) and
+  `kb.read.list_principles` have no whole-object
   column, and the KB server's `{_categories, _note, _truncated}` trailer shares no key
   with the records, so `list_principles` got no question of any type. `enumerate` —
   one column read back out of every row, in order — is the positional table read the
@@ -33,8 +35,11 @@ fails that pull request until the section has moved.
   trials, not distinct questions. A payload the codec passes through unencoded is now
   skipped: both arms would read the same JSON, so its trials could only ever match and
   would count toward the SAFE floor for free — `deref` never landed on one, but 10 of the
-  first 147 `enumerate` questions did. The remaining ~73% is `secret.list_credentials`, which
-  the corpus has never captured; that is a separate change.
+  first 147 `enumerate` questions did. Every percentage here was measured on 2026-09-11
+  against a 338-envelope corpus and a 30-day ledger window; both grow, so the figures
+  drift. **78.1% stayed uncovered**, 73.4 points of it
+  `secret.list_credentials`, which the corpus has never captured; that is a separate
+  change.
 
 ## [0.32.4] - 2026-09-11
 
