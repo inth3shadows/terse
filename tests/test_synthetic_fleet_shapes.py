@@ -18,6 +18,7 @@ reach the codec verdict (a question, an encoded payload, and enough of them for 
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -143,6 +144,53 @@ def test_the_fleet_shapes_are_opt_in(tmp_path, capsys):
     envelopes = capture.load_corpus(tmp_path)
     assert len(envelopes) == len(gsc.PAYLOADS)
     assert not [e for e in envelopes if e["tool"].startswith("synthetic.")]
+
+
+def _run_script(tmp_path, *args):
+    """The script as `terse verify` runs it: a subprocess with positional args, NOT `main`.
+
+    The opt-in lives in the `__main__` argv block, and `cli.py`'s `_cmd_verify` shells out
+    (`subprocess.run([sys.executable, script, sample_dir])`). Pinning only `main`'s keyword
+    left that layer unwatched — a mutation defaulting it to on passed the whole suite while
+    `terse verify`'s headline moved from +37.2% to +38.7% (review of #403 Blocker 2).
+    """
+    return subprocess.run([sys.executable, str(SCRIPT), str(tmp_path), *args],
+                          capture_output=True, text=True)
+
+
+def test_the_command_line_keeps_the_fleet_shapes_off_by_default(tmp_path):
+    r = _run_script(tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert len(capture.load_corpus(tmp_path)) == len(gsc.PAYLOADS)
+    assert "synthetic." not in r.stdout
+
+
+def test_the_command_line_writes_the_fleet_shapes_when_asked(tmp_path):
+    r = _run_script(tmp_path, gsc.FLEET_FLAG)
+    assert r.returncode == 0, r.stderr
+    assert len(capture.load_corpus(tmp_path)) == len(gsc.PAYLOADS) + len(gsc.SYNTHETIC)
+    assert "synthetic.secret.list_credentials" in r.stdout
+
+
+def test_a_mistyped_flag_is_refused_rather_than_named_as_the_corpus_dir(tmp_path):
+    # It used to positional-ize: exit 0, a corpus in a directory called `--fleetshapes`,
+    # no fleet shapes in it, and nothing saying so — then a codec-verdict run measuring
+    # nothing about the shape the flag exists to measure.
+    r = _run_script(tmp_path, "--fleetshapes")
+    assert r.returncode == 2, r.stdout
+    assert "unknown option" in r.stderr and gsc.FLEET_FLAG in r.stderr
+    assert not list(tmp_path.iterdir()), "a refused run must write nothing"
+
+
+def test_the_written_line_survives_a_payload_with_no_record_list(tmp_path, capsys, monkeypatch):
+    # `verify` turns a traceback here into "the bundled sample generator failed", so the
+    # size line must not assume a `credentials` key.
+    monkeypatch.setattr(gsc, "PAYLOADS", {})
+    assert gsc.main(str(tmp_path), with_fleet_shapes=True) == 0
+    assert "(70 records)" in capsys.readouterr().out
+    monkeypatch.setattr(gsc, "SYNTHETIC", [("synthetic.other", {"a": 1, "b": 2})])
+    assert gsc.main(str(tmp_path), with_fleet_shapes=True) == 0
+    assert "(2 keys)" in capsys.readouterr().out
 
 
 def test_the_generator_writes_the_fleet_shapes_when_asked(tmp_path, capsys):

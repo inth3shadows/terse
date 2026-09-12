@@ -25,9 +25,11 @@ fails that pull request until the section has moved.
   has_value` plus three usage fields, undeclared rows drop two of those and add a long
   repeated `note`, so the table has both absent columns and a dictionary legend, and
   `env_var` is both explicitly null and absent, which is the one column that exercises the
-  `__terse_absent__` sentinel — and invents every value. The three pool to **+39.2%** in the
-  codec savings table terse itself renders (the largest alone is 42.5% on the same cl100k
-  basis), against the **45.5%** the shipped policy records for the real tool.
+  `__terse_absent__` sentinel — and invents every value. The 70-record variant compresses
+  **42.5%** (`cl100k(minify)` vs `cl100k(compress)`, the arithmetic the codec savings table
+  renders), against the **45.5%** the shipped policy records for the real tool — not
+  like-for-like, since that measurement is a smaller 3,521-token payload described as
+  uniform. Pooled over all three sizes the table shows +39.2%.
   They are **opt-in** (`python scripts/gen_stress_corpus.py <dir> --fleet-shapes`): they
   would otherwise be 78% of the tokens in `terse verify`'s zero-setup sample and move its
   headline from +37.2% to +38.7%, one tool's shape deciding an adopter-facing number.

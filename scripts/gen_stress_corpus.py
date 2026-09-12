@@ -9,15 +9,18 @@ that *maximally* stress the two transforms most likely to cost a model comprehen
   - column->value mapping over WIDE tables and enumeration over LONG ones,
   - nested uniform-dict columns (the subcols form).
 
-It also carries `synthetic.*` payloads for a different reason: a fleet SHAPE that no
+It can also write `synthetic.*` payloads, for a different reason: a fleet SHAPE that no
 capture corpus can hold, because the shipped policy forbids persisting that tool's output
 (#403 Blocker 2). Those are structure-faithful and value-invented, and the prefix keeps
-them distinguishable from real traffic wherever a report prints the tool name.
+them distinguishable from real traffic wherever a report prints the tool name. They are
+OFF unless `--fleet-shapes` is passed — `terse verify` runs this script for its zero-setup
+sample, and one tool's shape must not decide that sample's headline.
 
 Deterministic (no randomness) so the eval is reproducible. Writes shape-tagged
 envelopes via the same capture path the real corpus uses.
 
-    python scripts/gen_stress_corpus.py [corpus_dir]   # default: corpus-stress
+    python scripts/gen_stress_corpus.py [corpus_dir] [--fleet-shapes]
+                                       # default dir: corpus-stress; fleet shapes off
 """
 
 from __future__ import annotations
@@ -171,6 +174,7 @@ def secret_list_credentials(n_declared: int = 60, n_undeclared: int = 10) -> dic
     return {"credentials": creds, "services": services}
 
 
+FLEET_FLAG = "--fleet-shapes"
 SYNTHETIC_TOOL = "synthetic.secret.list_credentials"
 
 # Fleet SHAPES no capture corpus contains, kept apart from real traffic by a `synthetic.`
@@ -215,6 +219,17 @@ def main(corpus_dir: str = "corpus-stress", with_fleet_shapes: bool = False) -> 
 
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if a != "--fleet-shapes"]
-    raise SystemExit(main(args[0] if args else "corpus-stress",
-                          with_fleet_shapes="--fleet-shapes" in sys.argv[1:]))
+    # This layer, not `main`, is what `terse verify` executes (`cli.py`'s `_cmd_verify`
+    # shells out with one positional arg), so it is where the opt-in actually has to hold.
+    # A mistyped flag must NOT fall through to the directory name: `--fleetshapes` used to
+    # exit 0 having written a corpus into a directory of that name, with no fleet shapes in
+    # it and nothing saying so (review of #403 Blocker 2).
+    argv = sys.argv[1:]
+    unknown = [a for a in argv if a.startswith("-") and a != FLEET_FLAG]
+    if unknown:
+        print(f"unknown option(s): {' '.join(unknown)}\n"
+              f"usage: gen_stress_corpus.py [corpus_dir] [{FLEET_FLAG}]", file=sys.stderr)
+        raise SystemExit(2)
+    positional = [a for a in argv if a != FLEET_FLAG]
+    raise SystemExit(main(positional[0] if positional else "corpus-stress",
+                          with_fleet_shapes=FLEET_FLAG in argv))
