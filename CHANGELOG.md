@@ -13,7 +13,65 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The codec verdict no longer scores a correct answer as a codec failure because it
+  arrived in prose instead of through the tool call (#403).** `codeceval` asks a model to
+  reconstruct a value and call `terse.record_answer` with it; a turn that made no tool call
+  scored a miss whether its text reply carried the right value or the wrong one.
+  `codec_verdict`'s own docstring argued that `max(0, raw_ok - terse_ok)` neutralises "a
+  prose-reply habit" because such a habit is about the MODEL rather than the FORM.
+  **Measured, it is not arm-independent.** On `kb__kb.read.list_nodes` at `--trials 7`,
+  temperature 0, `qwen3-coder-30b-fl` answered `enumerate` correctly in prose on the raw
+  arm (7/7 right, 7/7 scored a miss) and through the tool on the terse arm, then flipped
+  channels for `deref` — and the paired subtraction turned the flip straight into
+  `excess_terse_misses`, i.e. into UNSAFE, on trials where terse was read correctly every
+  time. The value is now scored on whichever channel it arrives by: tool argument first,
+  text reply (`fluency._extract_json`) as a fallback. The denominator is untouched — a
+  wrong value misses on either channel, a reply carrying no value misses, an errored call
+  misses; only the conflation of "wrong value" with "right value, wrong channel" is gone.
+
+  **The text channel accepts a WHOLE-REPLY JSON value only** (after stripping surrounding
+  whitespace and at most one markdown code fence) — deliberately not the comprehension
+  tier's `fluency._extract_json`, which pulls a value out of surrounding prose. Adversarial
+  review of the first cut found that extractor reintroduces the same arm-asymmetry through
+  a different door: a `deref` answer is a verbatim substring of the RAW payload and is not
+  a substring of the terse form, so a model that merely QUOTES what it was shown extracts
+  to a hit on raw and a miss on terse. Executed on a 6-record fixture, one scripted model
+  declining identically on BOTH arms scored `raw_ok=7, terse_ok=0` and published UNSAFE.
+  Whole-reply parsing cannot manufacture that. The cost is accepted: a tool call emitted as
+  text (`{"value": [1, 2]}`), a `<tool_call>` wrapper and a bare comma-separated list are
+  misses even when their content is right — narrow is the conservative direction, because a
+  missed shape costs a hit on both arms equally and can never turn a correct read into a
+  demonstrated-corruption finding.
+
+- **The codec pre-flight admits a model that answers correctly in prose (#403, amending
+  #404).** `preflight_encoding` scored the tool channel only, so a prose-answering model was
+  refused before the sweep — `terse fluency --codec-verdict` exited 2 and wrote **no report
+  at all**. That suppresses UNSAFE, which is precisely what the new compliance gate's design
+  forbids: a low-compliance run publishes whatever corruption it observed and is withheld
+  only from SAFE. The pre-flight now scores the same two channels the sweep does, keeping
+  its stated premise that a model is admitted on the request it is scored on. What it still
+  refuses is unchanged and is what #404 was built for — a model that gets the VALUE wrong,
+  and specifically one that stringifies a container argument.
+
 ### Added
+
+- **Tool-call compliance is measured per arm and gates SAFE (#403).** `run_codec_payload`
+  emits `raw_calls`/`terse_calls`, and `report.codec_verdict` withholds SAFE when either
+  arm delivered less than `_CODEC_MIN_CALL_RATE` (0.80, reused from
+  `UNMEASURED_FAIL_SHARE`) of its answers through the tool. Scoring a value on either
+  channel makes accuracy channel-independent, so an observed excess of terse misses stays
+  trustworthy at any compliance level and **UNSAFE is never withheld** — but SAFE is a
+  claim that the value survives into a real downstream tool argument, and a run where the
+  model mostly declined to make one has not shown that. Gates SAFE only, exactly like
+  `_CODEC_MIN_TRIALS`. A result file written before this carries no counter;
+  `codec_call_rate` answers `None` there rather than re-certifying or retracting a run on
+  evidence never collected. The rate is read against `raw_answered`/`terse_answered` — the
+  trials that produced a scorable turn — not against the arm's trial count: a call the
+  backend never answered is not a model declining to use the tool, and counting it as one
+  would make the verdict table's "Why" blame the model for transport loss. Backend loss
+  keeps its own path (`fails`/`attempts` -> `report._unmeasured`).
 
 - **`scripts/gen_stress_corpus.py` also emits `synthetic.secret.list_credentials`, a fleet
   shape no capture corpus can hold (#403 Blocker 2).** That tool is the largest codec saver

@@ -118,7 +118,7 @@ def test_run_codec_payload_scores_zero_when_the_call_argument_is_wrong():
     assert row["fails"] == 0
 
 
-def test_run_codec_payload_scores_zero_but_not_errored_when_the_model_answers_in_prose():
+def test_run_codec_payload_scores_zero_when_a_prose_reply_carries_no_value():
     def answers_in_prose(messages):
         return Turn(text="the value is whatever", tool_calls=[])
 
@@ -126,9 +126,200 @@ def test_run_codec_payload_scores_zero_but_not_errored_when_the_model_answers_in
     row = rows[0]
     assert row["raw_ok"] == 0
     assert row["terse_ok"] == 0
-    assert row["raw_trials"] == 1  # the call landed — declining to call the tool is a MISS,
+    assert row["raw_trials"] == 1  # the call landed — a reply with no value is a MISS,
     assert row["terse_trials"] == 1  # not a transport failure, so it stays in the denominator
     assert row["fails"] == 0
+    assert row["raw_calls"] == 0  # and it is not a tool call either
+    assert row["terse_calls"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# The prose channel (#403) — a value is scored wherever the model put it, and the
+# tool-call rate is kept as its own per-arm counter.
+# --------------------------------------------------------------------------- #
+def test_a_correct_value_answered_in_prose_scores_as_a_hit():
+    # The defect this fixes: `kb__kb.read.list_nodes` scored UNSAFE on trials where the
+    # model read terse correctly and merely skipped the tool call. Conflating "wrong value"
+    # with "right value, wrong channel" is what manufactured the excess.
+    q = _deref_question()
+
+    def answers_correctly_in_prose(messages):
+        return Turn(text=json.dumps(q.expected), tool_calls=[])
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, answers_correctly_in_prose,
+                                       trials=3)
+    row = next(r for r in rows if r["qid"] == q.qid)
+    assert row["raw_ok"] == 3
+    assert row["terse_ok"] == 3
+    assert row["fails"] == 0
+    # ...and the compliance counter still records that no tool call was made.
+    assert row["raw_calls"] == 0
+    assert row["terse_calls"] == 0
+
+
+def test_a_value_merely_MENTIONED_in_a_sentence_is_not_a_hit():
+    """The blocker the first cut of this fallback had.
+
+    A `deref` answer is a verbatim substring of the RAW payload and is not a substring of
+    the terse form. So an extractor that pulls a JSON value out of surrounding prose scores
+    a model that merely QUOTES what it was shown as correct on raw and wrong on terse —
+    manufacturing `excess_terse_misses` out of a refusal. Whole-reply parsing is what stops
+    it, and the assertion pair below is the point: a miss, on BOTH arms."""
+    q = _deref_question()
+
+    def answers_with_preamble(messages):
+        return Turn(text=f"Sure — the full value is {json.dumps(q.expected)}.",
+                    tool_calls=[])
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, answers_with_preamble, trials=1)
+    row = next(r for r in rows if r["qid"] == q.qid)
+    assert (row["raw_ok"], row["terse_ok"]) == (0, 0)
+
+
+def test_a_model_declining_identically_on_both_arms_shows_no_excess():
+    """The same defect, driven end to end and stated as the property that matters.
+
+    The scripted model declines on both arms and quotes its own payload while doing it —
+    the raw quote happens to contain the expected value, the terse quote cannot. Under
+    prose-extraction this scored `raw_ok=7, terse_ok=0` and `codec_verdict` published
+    UNSAFE for a model that answered nothing."""
+    from terse import report
+
+    q = _deref_question()
+    terse_text = fluency.compress(PAYLOAD)
+
+    def declines_while_quoting(messages):
+        content = messages[-1]["content"]
+        shown = RAW_TEXT if RAW_TEXT in content else terse_text
+        return Turn(text=f"I cannot determine that reliably; what I was shown is {shown}",
+                    tool_calls=[])
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, declines_while_quoting, trials=7)
+    row = next(r for r in rows if r["qid"] == q.qid)
+    assert (row["raw_ok"], row["terse_ok"]) == (0, 0)
+    assert report.codec_verdict([dict(row, tool="t", shape="array-of-records")])[0] != "UNSAFE"
+
+
+def test_a_value_in_a_code_fence_still_scores_as_a_hit():
+    # One fence is stripped: it wraps the whole reply, so it cannot be the asymmetry above.
+    q = _deref_question()
+
+    def answers_in_a_fence(messages):
+        return Turn(text=f"```json\n{json.dumps(q.expected)}\n```", tool_calls=[])
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, answers_in_a_fence, trials=1)
+    row = next(r for r in rows if r["qid"] == q.qid)
+    assert (row["raw_ok"], row["terse_ok"]) == (1, 1)
+
+
+def test_a_deeply_nested_reply_is_a_miss_not_a_RecursionError():
+    # `json.loads` recurses; a model reply is arbitrary text. The guard catches
+    # RecursionError specifically — narrow it to ValueError and this aborts the sweep.
+    def answers_with_deep_nesting(messages):
+        return Turn(text="[" * 100_000 + "]" * 100_000, tool_calls=[])
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, answers_with_deep_nesting, trials=1)
+    assert (rows[0]["raw_ok"], rows[0]["terse_ok"]) == (0, 0)
+
+
+def test_an_errored_trial_is_not_counted_in_the_compliance_denominator():
+    """`<arm>_answered`, not `trials`. A call the backend never answered is not a model
+    declining to use the tool, and counting it as one makes the report's "Why" blame the
+    model for transport loss."""
+    from terse import report
+
+    q = _deref_question()
+    state = {"n": 0}
+
+    def errors_every_other_call(messages):
+        state["n"] += 1
+        if state["n"] % 2:
+            raise RuntimeError("connection refused")
+        return Turn(text="", tool_calls=[
+            ToolCall(call_id="c1", name=codeceval.RECORD_VALUE_TOOL,
+                     arguments={"value": q.expected}),
+        ])
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, errors_every_other_call, trials=4)
+    row = next(r for r in rows if r["qid"] == q.qid)
+    assert row["raw_answered"] == 2 and row["terse_answered"] == 2
+    assert row["raw_calls"] == 2 and row["terse_calls"] == 2
+    # Every answered trial used the tool — full compliance, not 50%.
+    assert report.codec_call_rate([row], "terse_ok") == 1.0
+
+
+def test_a_wrong_value_answered_in_prose_is_still_a_miss():
+    # The fallback is a CHANNEL, not a tolerance: it must not turn a wrong answer into a
+    # hit. Invert this and the whole fix reads as "accept more answers".
+    def answers_wrongly_in_prose(messages):
+        return Turn(text=json.dumps({"totally": "different"}), tool_calls=[])
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, answers_wrongly_in_prose,
+                                       trials=2)
+    assert rows[0]["raw_ok"] == 0
+    assert rows[0]["terse_ok"] == 0
+    assert rows[0]["fails"] == 0
+
+
+def test_a_prose_reply_that_is_not_json_at_all_is_a_miss_not_a_crash():
+    # A model reply is arbitrary text; an unbalanced bracket must read as "no value here".
+    def answers_with_garbage(messages):
+        return Turn(text="[[[[[{{{ not json", tool_calls=[])
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, answers_with_garbage, trials=1)
+    assert rows[0]["raw_ok"] == 0
+    assert rows[0]["terse_ok"] == 0
+
+
+def test_a_tool_call_beats_a_contradicting_prose_reply():
+    # The tool argument is the channel this eval is written around: when both are present
+    # the tool call is what is scored, so a model that "thinks aloud" correctly and then
+    # emits a malformed argument still misses.
+    q = _deref_question()
+
+    def right_in_prose_wrong_in_the_call(messages):
+        return Turn(text=json.dumps(q.expected), tool_calls=[
+            ToolCall(call_id="c1", name=codeceval.RECORD_VALUE_TOOL,
+                     arguments={"value": {"totally": "different"}}),
+        ])
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, right_in_prose_wrong_in_the_call,
+                                       trials=2)
+    row = next(r for r in rows if r["qid"] == q.qid)
+    assert (row["raw_ok"], row["terse_ok"]) == (0, 0)
+    assert (row["raw_calls"], row["terse_calls"]) == (2, 2)
+
+
+def test_the_call_counters_are_per_arm_not_pooled():
+    # The entire reason the counter exists is that the channel choice differed BY ARM on
+    # one live model. A pooled counter would have averaged that away.
+    q = _deref_question()
+
+    def tool_on_terse_prose_on_raw(messages):
+        raw_arm = RAW_TEXT in messages[-1]["content"]
+        if raw_arm:
+            return Turn(text=json.dumps(q.expected), tool_calls=[])
+        return Turn(text="", tool_calls=[
+            ToolCall(call_id="c1", name=codeceval.RECORD_VALUE_TOOL,
+                     arguments={"value": q.expected}),
+        ])
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, tool_on_terse_prose_on_raw,
+                                       trials=4)
+    row = next(r for r in rows if r["qid"] == q.qid)
+    assert row["raw_calls"] == 0
+    assert row["terse_calls"] == 4
+    # Both arms read the payload correctly, so neither arm may show an excess of misses.
+    assert (row["raw_ok"], row["terse_ok"]) == (4, 4)
+
+
+def test_an_errored_trial_is_not_counted_as_a_tool_call():
+    def always_errors(messages):
+        raise RuntimeError("connection refused")
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, always_errors, trials=2)
+    assert rows[0]["raw_calls"] == 0
+    assert rows[0]["terse_calls"] == 0
 
 
 def test_run_codec_payload_counts_a_transport_failure_as_a_miss_in_a_fixed_denominator():
@@ -390,9 +581,39 @@ def test_preflight_rejects_a_model_that_is_only_sometimes_right():
     assert why and "[1/12 pre-flight answers failed]" in why, why
 
 
-def test_preflight_names_a_model_that_answers_in_prose():
+def test_preflight_names_a_model_whose_prose_is_not_the_value_either():
+    # `NO_CALL` replies `["x", "y"]`, which is not any pre-flight answer.
     why = codeceval.preflight_encoding(preflight_stub(lambda e, n: NO_CALL), attempts=3)
     assert why and why.startswith(f"answered without calling {codeceval.RECORD_VALUE_TOOL}")
+
+
+def test_preflight_admits_a_model_that_answers_CORRECTLY_in_prose():
+    """The pre-flight must admit on the same two channels the sweep scores (#403).
+
+    Refusing here withholds the WHOLE run — `cli.py` exits 2 and writes no report — for the
+    one behaviour `_CODEC_MIN_CALL_RATE` was built to handle by withholding SAFE alone. A
+    refusal upstream of the sweep suppresses UNSAFE, which that gate's own argument forbids.
+    """
+    def prose_answerer(messages):
+        content = messages[-1]["content"]
+        expected = next((q.expected for q, text in codeceval.preflight_questions()
+                         if q.prompt in content and text in content), None)
+        return Turn(text=json.dumps(expected), tool_calls=[])
+
+    assert codeceval.preflight_encoding(prose_answerer, attempts=3) is None
+
+
+def test_preflight_still_refuses_a_stringifier_that_answers_in_prose():
+    # The admission widened to a second CHANNEL, not to a looser value test: a model whose
+    # prose is the right content at the wrong type is still the #404 refusal.
+    def stringifying_prose(messages):
+        content = messages[-1]["content"]
+        expected = next((q.expected for q, text in codeceval.preflight_questions()
+                         if q.prompt in content and text in content), None)
+        return Turn(text=json.dumps(json.dumps(expected)), tool_calls=[])
+
+    why = codeceval.preflight_encoding(stringifying_prose, attempts=3)
+    assert why and "not the value either" in why
 
 
 def test_preflight_retries_an_errored_turn_instead_of_failing_the_model():

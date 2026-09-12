@@ -45,10 +45,18 @@ being coerced to a string.
 The comparison itself: the same question is put to a tool-calling model twice, once
 fed the raw payload and once fed terse's compressed form, both times via a single stub tool
 (`RECORD_VALUE_TOOL_DEF`) the model must call with the reconstructed value as its argument.
-Scoring compares the tool-call ARGUMENT the model emits against `Question.expected` by plain
-structural equality (`_value_matches`) — not a text-extraction heuristic, and not a
-free-text comprehension score. This is what #295 calls "material equivalence": would the
-model's downstream tool call carry the same value regardless of which form it read.
+Scoring compares the VALUE the model emits against `Question.expected` by plain structural
+equality (`_value_matches`) — not a free-text comprehension score. This is what #295 calls
+"material equivalence": would the model's downstream tool call carry the same value
+regardless of which form it read.
+
+The tool call is the channel this eval is written around, but it is not itself the thing
+scored. A turn that emits no tool call is scored on its text reply instead
+(`_prose_value`), because #403 measured the channel choice flipping BY ARM on one model —
+which turned correctly-read terse trials into `excess_terse_misses`. Compliance is kept as
+its own per-arm counter (`raw_calls`/`terse_calls`) and gates SAFE in
+`report.codec_verdict`, so the downstream-tool-argument premise is enforced where it
+belongs instead of inside the accuracy comparison. See `_ask_codec_question`.
 
 **No system primer** on either arm — the system message is OMITTED entirely (matching
 `fluency.answerers`' `if system:` guard, not `harnesses.run_payload`'s bare `terse_ok` arm,
@@ -92,6 +100,7 @@ safety verdict, and a silent non-answer must not be able to shrink itself out of
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable
 from typing import Any
@@ -253,11 +262,30 @@ def preflight_questions() -> list[tuple[fluency.Question, str]]:
 
 def _preflight_miss(turn: Turn, expected: Any) -> str | None:
     """`None` if a scorable pre-flight turn matched, else why not — named by failure mode,
-    since the three need different remedies (a prompt, a different model, a harder look)."""
+    since each needs a different remedy (a prompt, a different model, a harder look).
+
+    Scored on the SAME two channels `_ask_codec_question` scores (#403): the tool argument
+    first, the whole-reply JSON of the text second. The pre-flight's premise is that a model
+    is admitted on the request it will be scored on
+    (`test_preflight_sends_the_request_a_real_trial_sends`), and that premise broke when the
+    sweep gained the prose channel and this did not — a model that answered the pre-flight
+    CORRECTLY in prose was refused, `cli.py` exited 2, and NO report was written. That is
+    UNSAFE-suppression: `report._CODEC_MIN_CALL_RATE`'s whole argument is that a
+    low-compliance run still publishes whatever corruption it observed and is withheld only
+    from SAFE. A refusal upstream of the sweep withholds everything, on the one behaviour the
+    gate exists to handle.
+
+    What it still refuses is unchanged and is what #404 was built for: a model that gets the
+    VALUE wrong, and specifically one that stringifies a container. That is an encoding
+    incapacity — it corrupts both arms identically and teaches the run nothing about the
+    codec — where a prose reply is a channel preference the compliance counter measures."""
     called, got = _recorded_value(turn)
     if not called:
-        return (f"answered without calling {RECORD_VALUE_TOOL} "
-                f"(text: {(turn.text or '')[:60]!r}) — this eval scores a tool-call argument")
+        parsed, prose = _prose_value(turn)
+        if parsed and _value_matches(prose, expected):
+            return None
+        return (f"answered without calling {RECORD_VALUE_TOOL}, and its reply was not the "
+                f"value either (text: {(turn.text or '')[:60]!r})")
     if _value_matches(got, expected):
         return None
     if encodes_as_json_string(got, expected):
@@ -340,10 +368,55 @@ def _codec_instruction() -> str:
            "not call any other tool.")
 
 
+_FENCE = re.compile(r"\A```(?:[A-Za-z0-9_+-]*)\n(.*?)\n?```\Z", re.DOTALL)
+
+
+def _prose_value(turn: Turn) -> tuple[bool, Any]:
+    """`(parsed, value)` for a turn that made no tool call: is its TEXT reply *entirely* a
+    JSON value, and which one.
+
+    The fallback channel for `_ask_codec_question`. **The WHOLE reply must parse**, after
+    stripping surrounding whitespace and at most one markdown code fence. Deliberately NOT
+    `fluency._extract_json`, which the comprehension tier uses to pull a value out of
+    surrounding prose — that extractor takes the span from the first `{`/`[` to the LAST
+    `}`/`]`, and using it here reintroduces the very arm-asymmetry this fallback exists to
+    remove, through a different door:
+
+    a `deref` answer is a VERBATIM SUBSTRING of the raw payload and is not a substring of
+    the terse form (it lives as a positional row and has to be reconstructed). So a reply
+    that merely QUOTES what it was shown — "I cannot determine that reliably; the record's
+    meta is {...}." — extracts to a hit on the raw arm and to a miss on the terse arm.
+    Executed on the 6-record fixture in `tests/test_codeceval.py`: one scripted model
+    declining identically on BOTH arms scored `raw_ok=7, terse_ok=0` and published UNSAFE.
+    Whole-reply parsing cannot manufacture that: a reply that IS the value is an answer on
+    either arm, and a reply that merely mentions it is an answer on neither.
+
+    The cost is real and accepted: `{"value": [1, 2]}` (the tool call emitted as text), a
+    `<tool_call>...</tool_call>` wrapper, and a bare comma-separated list are all scored as
+    misses even when their content is right. Narrow is the conservative direction here — an
+    accepted shape that is easier to produce on one arm than on the other is exactly the
+    defect class #403 closes, and no missed shape can turn a correct read into a
+    demonstrated-corruption finding; it can only cost a hit on both arms equally.
+
+    A reply that is not wholly a JSON value answers `(False, None)`, which the caller scores
+    as a miss — NOT as an exclusion. Nothing about this path shrinks a denominator."""
+    text = (turn.text or "").strip()
+    if fence := _FENCE.match(text):
+        text = fence.group(1).strip()
+    if not text:
+        return False, None
+    try:
+        return True, json.loads(text)
+    except (ValueError, TypeError, RecursionError):
+        # A model reply is arbitrary text: a pathological "[[[[..." must read as "no value
+        # here", not abort the sweep. Same defensive set as `encodes_as_json_string`.
+        return False, None
+
+
 def _ask_codec_question(question: fluency.Question, payload_text: str,
-                        answerer: ToolAnswerer) -> tuple[bool, bool]:
+                        answerer: ToolAnswerer) -> tuple[bool, bool, bool]:
     """One trial: ask `question` over `payload_text`, expect a `RECORD_VALUE_TOOL` call.
-    Returns (matched, errored).
+    Returns (matched, errored, called).
 
     `errored` means the call never produced a scorable turn — either a transport failure
     (`_safe_call`'s except branch) or a live backend returning 200 with neither text nor a
@@ -354,16 +427,40 @@ def _ask_codec_question(question: fluency.Question, payload_text: str,
     direction"), not `fluency.harnesses`' per-form-trial-reduction convention: this eval
     renders a SAFE/UNSAFE verdict, and a silent non-answer — the worst possible outcome for
     a downstream tool call — must not be able to shrink itself out of the denominator and
-    help a run reach SAFE (review finding 3 on PR #302). A model that reaches the tool
-    definition and declines to call anything is scored the same way, for the same reason
-    (not a transport error, but still the failure mode this eval exists to catch)."""
+    help a run reach SAFE (review finding 3 on PR #302).
+
+    `called` reports whether the value arrived through the TOOL, and the value is scored
+    either way: tool argument first, text reply (`_prose_value`) as a fallback.
+
+    That fallback is #403's fix for the one UNSAFE cell this eval has ever produced, and it
+    corrects a stated assumption rather than relaxing a standard. The first cut scored a
+    turn that returned the CORRECT value in prose identically to one that returned a WRONG
+    value, and `codec_verdict`'s docstring argued `max(0, raw_ok - terse_ok)` neutralises
+    "a prose-reply habit" because such a habit is about the MODEL rather than the FORM.
+    Measured on `kb__kb.read.list_nodes` at `--trials 7`, temperature 0, it is NOT
+    arm-independent: the same model on the same payload answered `enumerate` in prose on the
+    raw arm (7/7 correct, 7/7 scored a miss) and through the tool on the terse arm, then
+    flipped channels for `deref`. The paired subtraction turned that straight into
+    `excess_terse_misses`, i.e. into UNSAFE, on trials where the codec was demonstrably read
+    correctly.
+
+    The denominator is untouched: a wrong value misses on either channel, a reply carrying
+    no value misses, and an errored call misses. What the fallback removes is only the
+    conflation of a WRONG value with a right value sent through the wrong channel. The
+    "downstream tool argument" half of the premise is preserved by `called`, which
+    `run_codec_payload` totals per arm and `report.codec_verdict` reads as a gate on SAFE —
+    never on UNSAFE, because a value comparison scored identically on both channels is
+    arm-independent again, while a SAFE verdict is a claim about values surviving into a
+    real tool call and cannot be made by a run that mostly declined to make one."""
     turn = _codec_turn(question, payload_text, answerer)
     if turn.error:
-        return False, True  # counted as a miss by the caller, kept in the fixed denominator
+        # counted as a miss by the caller, kept in the fixed denominator; not a tool call
+        return False, True, False
     called, got = _recorded_value(turn)
-    if not called:
-        return False, False
-    return _value_matches(got, question.expected), False
+    if called:
+        return _value_matches(got, question.expected), False, True
+    parsed, prose = _prose_value(turn)
+    return parsed and _value_matches(prose, question.expected), False, False
 
 
 def _codec_turn(question: fluency.Question, payload_text: str, answerer: ToolAnswerer) -> Turn:
@@ -402,20 +499,38 @@ def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
     terse_text = fluency.compress(obj)
     out: list[dict] = []
     for q in gen_codec_questions(obj):
-        raw_ok = terse_ok = raw_fail = terse_fail = 0
+        raw_ok = terse_ok = raw_fail = terse_fail = raw_calls = terse_calls = 0
         for _ in range(trials):
-            ok, err = _ask_codec_question(q, raw_text, answerer)
+            ok, err, called = _ask_codec_question(q, raw_text, answerer)
             raw_fail += int(err)
+            raw_calls += int(called)
             raw_ok += int(ok)  # an errored call scores as a miss, not an exclusion
         for _ in range(trials):
-            ok, err = _ask_codec_question(q, terse_text, answerer)
+            ok, err, called = _ask_codec_question(q, terse_text, answerer)
             terse_fail += int(err)
+            terse_calls += int(called)
             terse_ok += int(ok)
         out.append({
             "qid": q.qid, "qtype": q.qtype, "transform": q.transform, "trials": trials,
             "raw_ok": raw_ok, "terse_ok": terse_ok,
             "raw_trials": trials,
             "terse_trials": trials,
+            # Tool-call compliance per arm, NOT a second accuracy count: how many of this
+            # arm's trials delivered their value through `RECORD_VALUE_TOOL` rather than in
+            # prose. `report.codec_verdict` reads it as a floor on SAFE (#403). Counted per
+            # arm because the whole reason it exists is that the rate differs BY ARM.
+            "raw_calls": raw_calls,
+            "terse_calls": terse_calls,
+            # The denominator those rates are read against: trials that produced a scorable
+            # turn at all. An errored call is a BACKEND loss, and folding it into the
+            # compliance rate would make the report say "the model answered in prose" about
+            # calls the model never received — attributing transport loss to model
+            # behaviour, in the one sentence whose job is to name the cause. Backend loss
+            # has its own reporting path (`fails`/`attempts` -> `report._unmeasured`).
+            # NOT named `<arm>_errors`: that suffix is read by `_unmeasured`'s trigger 4 and
+            # by `_refuse_mixed_schema`, and this counter is not making a claim about either.
+            "raw_answered": trials - raw_fail,
+            "terse_answered": trials - terse_fail,
             "fails": raw_fail + terse_fail,
             "attempts": trials * 2,
         })

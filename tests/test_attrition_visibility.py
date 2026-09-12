@@ -1358,6 +1358,8 @@ def _crow(qid: str) -> dict:
     shared `_drow` builder, which is exactly what makes it work."""
     return {"qid": qid, "qtype": "deref", "transform": "table", "trials": 3,
             "raw_ok": 3, "terse_ok": 0, "raw_trials": 3, "terse_trials": 3,
+            "raw_calls": 3, "terse_calls": 3,
+            "raw_answered": 3, "terse_answered": 3,
             "fails": 3, "attempts": 6}
 
 
