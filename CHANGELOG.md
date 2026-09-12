@@ -13,7 +13,33 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **`terse fluency --codec-verdict` also scores `enumerate` questions, and question
+  generation no longer goes silent on a list that ends in a metadata record (#403
+  Blocker 2).** Measured against the live corpus and 30 days of ledger, over codec savings
+  only (`codegraph_explore`'s are drop-tier and excluded from the denominator): `deref`-only
+  questions existed for tools carrying **11.9%** of them. `kb.read.search`
+  (85 codec-transformed payloads when measured) and
+  `kb.read.list_principles` have no whole-object
+  column, and the KB server's `{_categories, _note, _truncated}` trailer shares no key
+  with the records, so `list_principles` got no question of any type. `enumerate` —
+  one column read back out of every row, in order — is the positional table read the
+  tabularizer introduces, and its answer is a list carried verbatim into a tool argument.
+  With both changes, covered tools carry **21.9%**. `lookup` stays out: its answer is a
+  bare scalar, measured coerced to a string by one model. A final entry sharing no key
+  with the entries before it is now treated as metadata, and questions ranging over every
+  record say so in the prompt; a payload without one keeps its exact prompts. The
+  pre-flight asks each model an `enumerate` over string and integer ids as well, and the
+  verdict table gains a **Questions** column (`deref 9, enumerate 9`) because `n` counts
+  trials, not distinct questions. A payload the codec passes through unencoded is now
+  skipped: both arms would read the same JSON, so its trials could only ever match and
+  would count toward the SAFE floor for free — `deref` never landed on one, but 10 of the
+  first 147 `enumerate` questions did. Every percentage here was measured on 2026-09-11
+  against a 338-envelope corpus and a 30-day ledger window; both grow, so the figures
+  drift. **78.1% stayed uncovered**, 73.4 points of it
+  `secret.list_credentials`, which the corpus has never captured; that is a separate
+  change.
 
 ## [0.32.4] - 2026-09-11
 

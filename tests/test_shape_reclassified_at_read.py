@@ -28,8 +28,10 @@ DRIFTED_RAW = json.dumps(DRIFTED)
 # The same drift, but ALSO carrying a whole-object column on every record — so it yields a
 # `deref` question and reaches `run_codec_fluency`'s per-`(tool, shape)` tagging. Non-uniform
 # keysets do not block question generation: the generator selects out of the key INTERSECTION.
-DRIFTED_DEREFABLE = [{"id": i, "meta": {"o": f"n{i}"}} for i in range(4)]
-DRIFTED_DEREFABLE[3]["extra"] = True
+# Ten records: `run_codec_fluency` skips a payload the codec does not encode (#403
+# Blocker 2), and with the drifted `extra` column this list is not folded below ten.
+DRIFTED_DEREFABLE = [{"id": i, "meta": {"o": f"n{i}"}} for i in range(10)]
+DRIFTED_DEREFABLE[9]["extra"] = True
 STALE = "compact-json"
 LIVE = "array-of-records"
 

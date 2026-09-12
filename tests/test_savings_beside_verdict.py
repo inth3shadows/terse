@@ -421,7 +421,8 @@ def test_run_codec_fluency_omits_sha_rather_than_defaulting_it_to_a_placeholder(
                                          arguments={"value": {"k": [1, 2, 3]}})])
 
     def env_for(blob, **extra):
-        obj = [{"id": 1, "blob": blob}, {"id": 2, "blob": {"k": [9]}}]
+        # Eight rows: `run_codec_fluency` skips a payload the codec leaves unencoded (#403).
+        obj = [{"id": 1, "blob": blob}] + [{"id": i, "blob": {"k": [9]}} for i in range(2, 9)]
         return {"tool": "t", "shape": "array-of-records", "raw": json.dumps(obj), **extra}
 
     rows = codeceval.run_codec_fluency([env_for({"k": [1, 2, 3]})], {"m": answerer},
@@ -444,7 +445,8 @@ def test_run_codec_fluency_stamps_the_counts_on_every_row_of_a_payload():
     from terse import codeceval
     from terse.dropeval import ToolCall, Turn
 
-    obj = [{"id": 1, "blob": {"k": [1, 2, 3]}}, {"id": 2, "blob": {"k": [4, 5, 6]}}]
+    # Eight rows: `run_codec_fluency` skips a payload the codec leaves unencoded (#403).
+    obj = [{"id": i, "blob": {"k": [i, i + 1, i + 2]}} for i in range(1, 9)]
     raw = json.dumps(obj)
     env = {"tool": "t", "shape": "array-of-records", "sha": "abc", "raw": raw}
 

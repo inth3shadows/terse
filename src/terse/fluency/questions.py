@@ -120,6 +120,31 @@ def _intersection_cols(records: list[dict]) -> list[str]:
     return [k for k in records[0] if k in common]
 
 
+def _split_metadata_trailer(records: list[dict]) -> tuple[list[dict], dict | None]:
+    """`(records, trailer)`: a final entry that shares NO key with the records before it is
+    metadata about the list, not a member of it.
+
+    Measured on the live corpus (#403 Blocker 2): the KB server appends
+    `{"_categories", "_note", "_truncated"}` to a truncated list. The codec folds it into the
+    table like any other row, but it shares no column with the records, so
+    `_intersection_cols` came back EMPTY and `gen_questions` returned nothing at all for
+    `kb.read.list_principles` — 6.1% of the codec's 30-day savings with no question to ask.
+
+    Structural, not name-based: the rule never looks at the leading underscore, so it is
+    not a KB special case, and a final row that shares even one key with the others stays a
+    record. Needs at least two records left over, or "the rest" is not a list worth scoping —
+    defence in depth only: one record plus a key-disjoint trailer is exactly half full, which
+    the codec never folds, so `extract_records` never hands this function such a pair."""
+    if len(records) < 3 or not records[-1]:
+        return records, None
+    head_keys: set[str] = set()
+    for r in records[:-1]:
+        head_keys.update(r)
+    if records[-1].keys() & head_keys:
+        return records, None
+    return records[:-1], records[-1]
+
+
 def _nested_record_group(obj: Any) -> tuple[str, list[dict], list[str]] | None:
     """Reach a GROUPED record list that the flat extractor cannot scope: a dict-map of
     parent records each holding a child list of dicts (runecho.structure's
@@ -291,6 +316,13 @@ def gen_questions(obj: Any) -> list[Question]:
     records = extract_records(obj)
     if not records:
         return _flat_record_questions(obj)
+    records, trailer = _split_metadata_trailer(records)
+    # A question whose answer ranges over EVERY record has to say the trailer is not one:
+    # both forms show it as a final entry, and "every record" would otherwise be ambiguous
+    # in a way a reader could resolve differently per form. `lookup`/`deref` address one
+    # record by id and need no scope.
+    scope = ("" if trailer is None else " The final entry, holding only "
+             + ", ".join(repr(k) for k in trailer) + ", is metadata, not a record.")
     cols = _intersection_cols(records)
     if not cols:
         # Non-uniform records with nothing in common: every column-scoped question below
@@ -305,7 +337,7 @@ def gen_questions(obj: Any) -> list[Question]:
     # count — enumeration fidelity; the motivation for the row-count hint.
     qs.append(Question(
         "count", "count", "table",
-        "How many records does the dataset contain?",
+        "How many records does the dataset contain?" + scope,
         "Reply with only the integer count.",
         n,
     ))
@@ -332,7 +364,7 @@ def gen_questions(obj: Any) -> list[Question]:
         # enumerate — under-enumeration of wide tables was terse's measured recall gap.
         qs.append(Question(
             "enumerate", "enumerate", "table",
-            f"List the {idcol!r} of every record, in order.",
+            f"List the {idcol!r} of every record, in order.{scope}",
             "Reply with a JSON array of the values and nothing else.",
             [r[idcol] for r in records],
         ))
@@ -341,7 +373,7 @@ def gen_questions(obj: Any) -> list[Question]:
     if numcol is not None:
         qs.append(Question(
             "aggregate", "aggregate", "table",
-            f"What is the maximum value of {numcol!r} across all records?",
+            f"What is the maximum value of {numcol!r} across all records?{scope}",
             "Reply with only the number.",
             max(r[numcol] for r in records),
         ))

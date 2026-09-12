@@ -17,17 +17,18 @@ from terse.dropeval import ToolCall, Turn
 
 # A uniform record list with an id column ("id") and a whole-object column ("meta") whose
 # cells are all dicts — exactly what questions.py's deref generator requires (a blobcol
-# where every record's value is a dict/list).
+# where every record's value is a dict/list). SIX records, not three: `run_codec_fluency`
+# skips a payload the codec passes through unencoded (#403 Blocker 2), and it declines to
+# fold a list this narrow until there are enough rows for a table to pay.
 PAYLOAD = {"result": [
-    {"id": 1, "meta": {"owner": "alice", "tags": ["x", "y"]}},
-    {"id": 2, "meta": {"owner": "bob", "tags": ["z"]}},
-    {"id": 3, "meta": {"owner": "carol", "tags": []}},
+    {"id": i, "meta": {"owner": owner, "tags": ["x", "y"]}}
+    for i, owner in enumerate(["alice", "bob", "carol", "dave", "erin", "frank"], 1)
 ]}
 RAW_TEXT = json.dumps(PAYLOAD)
 
 
 def _deref_question():
-    qs = codeceval.gen_codec_questions(PAYLOAD)
+    qs = [q for q in codeceval.gen_codec_questions(PAYLOAD) if q.qtype == "deref"]
     assert len(qs) == 1  # PAYLOAD has exactly one whole-object column
     return qs[0]
 
@@ -35,17 +36,24 @@ def _deref_question():
 # --------------------------------------------------------------------------- #
 # gen_codec_questions — qtype filter, not transform
 # --------------------------------------------------------------------------- #
-def test_gen_codec_questions_keeps_only_deref():
+def test_gen_codec_questions_keeps_only_the_codec_qtypes():
+    # count/aggregate answers are computed, not carried; lookup's is a bare scalar.
     all_qs = fluency.gen_questions(PAYLOAD)
-    assert {q.qtype for q in all_qs} >= {"count", "enumerate", "deref"}
+    assert {q.qtype for q in all_qs} >= {"count", "enumerate", "deref", "aggregate"}
     codec_qs = codeceval.gen_codec_questions(PAYLOAD)
-    assert codec_qs and all(q.qtype == "deref" for q in codec_qs)
-    assert len(codec_qs) < len(all_qs)  # the comprehension-only qtypes were dropped
+    assert sorted(q.qtype for q in codec_qs) == ["deref", "enumerate"]
 
 
-def test_gen_codec_questions_empty_when_no_deref_question():
-    # No whole-object/array column -> questions.py never emits a deref question.
+def test_gen_codec_questions_enumerates_a_payload_with_no_container_column():
+    # #403 Blocker 2: kb.read.search had 85 transformed payloads and zero deref questions.
     flat = {"result": [{"id": 1, "n": 10}, {"id": 2, "n": 20}]}
+    qs = codeceval.gen_codec_questions(flat)
+    assert [(q.qtype, q.expected) for q in qs] == [("enumerate", [1, 2])]
+
+
+def test_gen_codec_questions_empty_without_an_id_or_container_column():
+    # No unique scalar column to enumerate, no whole-object column to deref.
+    flat = {"result": [{"k": "x", "n": 10}, {"k": "x", "n": 10}]}
     assert fluency.gen_questions(flat)  # sanity: still a valid comprehension payload
     assert codeceval.gen_codec_questions(flat) == []
 
@@ -152,11 +160,15 @@ def test_run_codec_payload_asks_the_same_question_against_both_forms():
         return Turn(text="", tool_calls=[])
 
     codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, capture, trials=1)
-    q = _deref_question()
-    assert all(q.prompt in s and codeceval._codec_instruction() in s for s in seen)
-    # Different DATA blocks: the raw arm's prompt must literally contain raw JSON text,
-    # the terse arm's must contain terse's compressed form, not the same string twice.
-    assert seen[0] != seen[1]
+    qs = codeceval.gen_codec_questions(PAYLOAD)
+    assert len(seen) == 2 * len(qs) == 4
+    for q in qs:
+        arms = [s for s in seen if q.prompt in s]
+        assert len(arms) == 2, (q.prompt, seen)
+        assert all(codeceval._codec_instruction() in s for s in arms)
+        # Different DATA blocks: the raw arm's prompt must literally contain raw JSON text,
+        # the terse arm's must contain terse's compressed form, not the same string twice.
+        assert arms[0] != arms[1]
 
 
 def test_run_codec_payload_sends_no_system_message_at_all():
@@ -224,11 +236,11 @@ def test_run_codec_fluency_stamps_tool_and_shape_on_every_row():
         assert row["sha"] == "abc123"
 
 
-def test_run_codec_fluency_skips_a_payload_with_no_deref_question():
+def test_run_codec_fluency_skips_a_payload_with_no_codec_question():
     def never_calls(messages):
         return Turn(text="", tool_calls=[])
 
-    flat = {"result": [{"id": 1, "n": 10}, {"id": 2, "n": 20}]}
+    flat = {"result": [{"k": "x", "n": 10}, {"k": "x", "n": 10}]}
     envelopes = [{"tool": "demo.get", "shape": "array-of-records", "sha": "x",
                  "raw": json.dumps(flat)}]
     results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1, preflight=False)
@@ -251,17 +263,18 @@ ERROR = object()
 
 
 def preflight_stub(answer):
-    """Answerer that recognises which pre-flight question a request carries (by its payload
-    text) and returns `answer(expected, n)` as the `value` argument, `n` being the 0-based
-    call index across the whole pre-flight. `NO_CALL` returns a prose turn, `ERROR` an
-    errored one. A request that is not a pre-flight question is answered `{"wrong": True}`,
-    so a stub that clears the pre-flight still scores nothing on the corpus."""
+    """Answerer that recognises which pre-flight question a request carries (by its prompt
+    AND payload text — each payload carries one question per codec qtype) and returns
+    `answer(expected, n)` as the `value` argument, `n` being the 0-based call index across
+    the whole pre-flight. `NO_CALL` returns a prose turn, `ERROR` an errored one. A request
+    that is not a pre-flight question is answered `{"wrong": True}`, so a stub that clears
+    the pre-flight still scores nothing on the corpus."""
     n = {"i": 0}
 
     def answerer(messages):
         content = messages[-1]["content"]
         expected = next((q.expected for q, text in codeceval.preflight_questions()
-                         if text in content), None)
+                         if q.prompt in content and text in content), None)
         if expected is None:
             v = {"wrong": True}
         else:
@@ -305,18 +318,34 @@ def test_preflight_asks_one_deref_question_per_container_type():
     # A model can stringify objects and not arrays; the first version only asked an array.
     # And each asked-for value NESTS a container: a model that stringifies only inner values
     # would otherwise pass here and zero both arms of the sweep (round-2 review of #403).
+    # Each payload also asks one `enumerate`, over string ids and integer ids respectively.
     qs = codeceval.preflight_questions()
-    assert all(q.qtype == "deref" for q, _ in qs)
-    assert sorted(type(q.expected).__name__ for q, _ in qs) == ["dict", "list"]
-    for q, _ in qs:
+    derefs = [q for q, _ in qs if q.qtype == "deref"]
+    enums = [q for q, _ in qs if q.qtype == "enumerate"]
+    assert len(qs) == 4 and len(derefs) == 2 and len(enums) == 2
+    assert sorted(type(q.expected).__name__ for q in derefs) == ["dict", "list"]
+    for q in derefs:
         inner = q.expected if isinstance(q.expected, list) else list(q.expected.values())
         assert any(isinstance(v, (dict, list)) for v in inner), q.expected
+    assert sorted(type(q.expected[0]).__name__ for q in enums) == ["int", "str"]
 
 
 def test_preflight_refuses_to_check_nothing_if_question_generation_changes(monkeypatch):
     # An empty question list would pass every model through a pre-flight that asked nothing.
+    real = codeceval.gen_codec_questions
     monkeypatch.setattr(codeceval, "gen_codec_questions", lambda obj: [])
-    with pytest.raises(RuntimeError, match="yields 0 deref questions"):
+    with pytest.raises(RuntimeError, match=r"yields \[\], expected one each"):
+        codeceval.preflight_encoding(preflight_stub(lambda e, n: e))
+    # Losing ONE type is the same hole: the sweep would score `enumerate` answers the
+    # pre-flight never checked a model could encode.
+    monkeypatch.setattr(codeceval, "gen_codec_questions",
+                        lambda obj: [q for q in real(obj) if q.qtype == "deref"])
+    with pytest.raises(RuntimeError, match=r"yields \['deref'\], expected one each"):
+        codeceval.preflight_encoding(preflight_stub(lambda e, n: e))
+    # Nor is the COUNT the test: two of one type still never checks the other.
+    monkeypatch.setattr(codeceval, "gen_codec_questions",
+                        lambda obj: [q for q in real(obj) if q.qtype == "deref"] * 2)
+    with pytest.raises(RuntimeError, match=r"yields \['deref', 'deref'\], expected one each"):
         codeceval.preflight_encoding(preflight_stub(lambda e, n: e))
 
 
@@ -343,13 +372,13 @@ def test_preflight_passes_a_model_that_sends_native_containers():
 
 def test_preflight_names_the_json_string_encoding_and_counts_answers():
     why = codeceval.preflight_encoding(preflight_stub(lambda e, n: json.dumps(e)), attempts=3)
-    assert why and "JSON STRING" in why and "[6/6 pre-flight answers failed]" in why, why
+    assert why and "JSON STRING" in why and "[12/12 pre-flight answers failed]" in why, why
 
 
 def test_preflight_catches_a_model_that_stringifies_only_objects():
     stub = preflight_stub(lambda e, n: json.dumps(e) if isinstance(e, dict) else e)
     why = codeceval.preflight_encoding(stub, attempts=3)
-    assert why and "JSON STRING" in why and "[3/6 pre-flight answers failed]" in why, why
+    assert why and "JSON STRING" in why and "[3/12 pre-flight answers failed]" in why, why
 
 
 def test_preflight_rejects_a_model_that_is_only_sometimes_right():
@@ -358,7 +387,7 @@ def test_preflight_rejects_a_model_that_is_only_sometimes_right():
     # poisons the arm it is on, so ALL answers must match.
     stub = preflight_stub(lambda e, n: json.dumps(e) if n == 1 else e)
     why = codeceval.preflight_encoding(stub, attempts=3)
-    assert why and "[1/6 pre-flight answers failed]" in why, why
+    assert why and "[1/12 pre-flight answers failed]" in why, why
 
 
 def test_preflight_names_a_model_that_answers_in_prose():
@@ -375,14 +404,14 @@ def test_preflight_retries_an_errored_turn_instead_of_failing_the_model():
 def test_preflight_reports_a_backend_that_never_answers_as_that():
     why = codeceval.preflight_encoding(preflight_stub(lambda e, n: ERROR), attempts=3)
     assert why and why.startswith(
-        "backend returned no usable turn on 6 of 6 calls for pre-flight question 1 of 2 — ")
+        "backend returned no usable turn on 6 of 6 calls for pre-flight question 1 of 4 — ")
 
 
 def test_preflight_needs_every_scorable_answer_not_just_one():
     # One good answer then five errors: 1 of the 3 answers the question needs.
     why = codeceval.preflight_encoding(preflight_stub(lambda e, n: ERROR if n else e), attempts=3)
     assert why and why.startswith(
-        "backend returned no usable turn on 5 of 6 calls for pre-flight question 1 of 2")
+        "backend returned no usable turn on 5 of 6 calls for pre-flight question 1 of 4")
 
 
 def test_preflight_names_the_question_a_backend_loss_happened_on():
@@ -390,14 +419,14 @@ def test_preflight_names_the_question_a_backend_loss_happened_on():
     why = codeceval.preflight_encoding(preflight_stub(lambda e, n: ERROR if n >= 3 else e),
                                        attempts=3)
     assert why and why.startswith(
-        "backend returned no usable turn on 6 of 6 calls for pre-flight question 2 of 2")
+        "backend returned no usable turn on 6 of 6 calls for pre-flight question 2 of 4")
 
 
 def test_preflight_reports_the_first_failure_not_the_latest():
     stub = preflight_stub(lambda e, n: json.dumps(e) if n == 0 else NO_CALL if n == 1 else e)
     why = codeceval.preflight_encoding(stub, attempts=3)
     assert why and why.startswith("sends container arguments as a JSON STRING"), why
-    assert "[2/6 pre-flight answers failed]" in why
+    assert "[2/12 pre-flight answers failed]" in why
 
 
 def test_preflight_keeps_an_answer_failure_ahead_of_a_later_backend_failure():
@@ -406,7 +435,7 @@ def test_preflight_keeps_an_answer_failure_ahead_of_a_later_backend_failure():
     why = codeceval.preflight_encoding(stub, attempts=3)
     assert why and why.startswith("sends container arguments as a JSON STRING"), why
     assert ("[2/2 pre-flight answers failed before the backend returned no usable turn on "
-            "4 of 6 calls for pre-flight question 1 of 2]") in why, why
+            "4 of 6 calls for pre-flight question 1 of 4]") in why, why
 
 
 def test_run_codec_fluency_refuses_the_run_when_any_model_fails_the_preflight():
@@ -433,8 +462,8 @@ def test_run_codec_fluency_refuses_the_run_when_any_model_fails_the_preflight():
 
 def test_run_codec_fluency_preflights_with_the_default_attempt_count():
     # Pins PREFLIGHT_ATTEMPTS through the production call: a model wrong only on its third
-    # answer (n == 2) passes a 1-attempt pre-flight, and a 2-attempt one reports "1/4".
+    # answer (n == 2) passes a 1-attempt pre-flight, and a 2-attempt one reports "1/8".
     late_miss = preflight_stub(lambda e, n: json.dumps(e) if n == 2 else e)
-    with pytest.raises(codeceval.PreflightError, match="1/6 pre-flight answers failed"):
+    with pytest.raises(codeceval.PreflightError, match="1/12 pre-flight answers failed"):
         codeceval.run_codec_fluency([], {"m": late_miss}, trials=1)
 

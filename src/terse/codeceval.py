@@ -20,14 +20,29 @@ structural corruption and a hard arithmetic question identically.
 
 ## What this module tests, and what it does not
 
-This is deliberately narrower than `fluency.py`'s comprehension sweep: only `deref`
-questions (`Question.qtype == "deref"`, `fluency/questions.py`) enter this eval. Every other
-`qtype` (count/lookup/enumerate/aggregate) stays a comprehension question — this module
-does not re-litigate whether a model can count. `deref` is the one question whose ANSWER
-*is* a structural reconstruction, which makes it the one question a downstream-outcome
-comparison can meaningfully replace a comprehension comparison for.
+This is deliberately narrower than `fluency.py`'s comprehension sweep: only `deref` and
+`enumerate` questions (`CODEC_QTYPES`, `fluency/questions.py`) enter this eval. `count` and
+`aggregate` stay comprehension questions — their answers are computed, not carried, so this
+module does not re-litigate whether a model can count. Each admitted type is a value an
+agent would carry VERBATIM into its next tool call, and each stresses a different half of
+what the codec does:
 
-The comparison itself: the same `deref` question is put to a tool-calling model twice, once
+- `deref` — reconstruct one record's whole object/array column: alias (`~N`) and structure
+  resolution.
+- `enumerate` — read one column back out of EVERY row, in order: the positional table read
+  the tabularizer introduces. Added for #403 Blocker 2: deref-only covered tools carrying
+  11.9% of the codec's 30-day savings (`codegraph_explore` excluded from that denominator —
+  its savings are drop-tier, not codec), because `kb.read.search` and
+  `kb.read.list_principles` have no container column; with `enumerate` it is 21.9%. Both
+  figures are one measurement (2026-09-11, 338 envelopes, 30-day ledger window), not
+  invariants — the corpus grows and the mix drifts. Most of the rest is
+  `secret.list_credentials`, which the corpus has never captured, so its shape is
+  unmeasured here.
+
+`lookup` is NOT admitted: its answer is a bare scalar, which the spike note below measured
+being coerced to a string.
+
+The comparison itself: the same question is put to a tool-calling model twice, once
 fed the raw payload and once fed terse's compressed form, both times via a single stub tool
 (`RECORD_VALUE_TOOL_DEF`) the model must call with the reconstructed value as its argument.
 Scoring compares the tool-call ARGUMENT the model emits against `Question.expected` by plain
@@ -47,11 +62,13 @@ a pass here implies a pass with a primer, not the reverse.
 **Tool-schema note, spiked live before this module was written** (against the gateway
 `dropeval`'s own tests target, deepseek-v4-flash): a `dict`/`list` argument round-trips
 through an untyped OpenAI-style `{"value": {"description": "..."}}` property unmangled. A
-bare scalar (e.g. `42`) came back coerced to the string `"42"` — but `deref`'s `expected` is
-ALWAYS a `dict` or `list` (`questions.py`'s `blobcol` selection requires
-`isinstance(r[c], (dict, list))` for every record), so the scalar-coercion case never reaches
-this eval's data and needs no workaround here. If this module is ever extended to a `qtype`
-whose `expected` can be a bare scalar, re-spike before trusting the argument type.
+bare scalar (e.g. `42`) came back coerced to the string `"42"` — but every admitted `qtype`
+answers with a container: `deref`'s `expected` is ALWAYS a `dict` or `list` (`questions.py`'s
+`blobcol` selection requires `isinstance(r[c], (dict, list))` for every record) and
+`enumerate`'s is ALWAYS a list, so the bare-scalar case never reaches this eval's data. The
+scalars INSIDE an `enumerate` list are checked by the pre-flight, whose payloads carry both
+string and integer ids. If this module is ever extended to a `qtype` whose `expected` can
+be a bare scalar, re-spike before trusting the argument type.
 
 Ground truth, tool-loop plumbing (`Turn`, `ToolCall`, `ToolAnswerer`, `openai_tool_answerer`,
 `_safe_call`) are reused from `dropeval.py` rather than reinvented — same protocol, same
@@ -82,6 +99,7 @@ from typing import Any
 from . import capture, fluency
 from .dropeval import ToolAnswerer, Turn, _safe_call
 from .tokenize import count_cl100k
+from .transforms import minify
 
 # OpenAI function-calling schemas can't cleanly express "any JSON type" — see the module
 # docstring's spike note. `{"description": ...}` with no `"type"` is the untyped form that
@@ -103,12 +121,36 @@ RECORD_VALUE_TOOL_DEF = {
 }
 
 
+CODEC_QTYPES = ("deref", "enumerate")
+
+
+def codec_changes(obj: Any) -> bool:
+    """Does the codec actually encode this payload — a table, a legend — rather than pass it
+    through minified?
+
+    A payload it leaves alone gives both arms the same JSON, so every trial is a free match:
+    it cannot fail, and it would still count toward `_CODEC_MIN_TRIALS` and push a cell
+    toward SAFE. No `deref` question ever landed on such a payload (all 28 on the live
+    corpus were encoded), but `enumerate` does: 10 of its first 147 corpus questions were on
+    payloads the codec declined (#403 Blocker 2). Skipped, never scored.
+
+    Compared against `minify`, which is exactly what the codec emits when it encodes
+    nothing — not against a marker in the output. Review of this change found the marker
+    test calling a passthrough "encoded" whenever the RAW payload already carried a
+    reserved marker (`{"note": "__terse_absent__"}`): the codec hands such a payload
+    through untouched, the marker is still there, and its trials would be free matches
+    again. No live corpus payload carries one, so this is the predicate stating its intent
+    rather than a fixed defect."""
+    return fluency.compress(obj) != minify(obj)
+
+
 def gen_codec_questions(obj: Any) -> list[fluency.Question]:
-    """The `deref` subset of `fluency.gen_questions(obj)` — the only question type whose
-    answer is a structural reconstruction, and so the only one this eval's downstream-
-    argument comparison can stand in for. `[]` if the payload has no `deref` question
-    (no column of whole dict/list values) — fails closed, same as `dropeval.gen_drop_questions`."""
-    return [q for q in fluency.gen_questions(obj) if q.qtype == "deref"]
+    """The `CODEC_QTYPES` subset of `fluency.gen_questions(obj)` — the question types whose
+    answer is a value carried verbatim into a downstream tool argument, and container-typed
+    (see the module docstring). `[]` if the payload has neither (no id column to enumerate,
+    no column of whole dict/list values) — fails closed, same as
+    `dropeval.gen_drop_questions`."""
+    return [q for q in fluency.gen_questions(obj) if q.qtype in CODEC_QTYPES]
 
 
 def _value_matches(got: Any, expected: Any) -> bool:
@@ -147,8 +189,8 @@ def encodes_as_json_string(got: Any, expected: Any) -> bool:
 
     Only a container `expected` qualifies. A string one would make every correctly-answered
     string question look like a mismatch (`json.loads('"a"') == "a"`), and `None` would
-    label a real `null` answer (`json.loads("null") is None`) the same way. `deref`'s
-    `expected` is always a dict or list, so both are defence in depth rather than live
+    label a real `null` answer (`json.loads("null") is None`) the same way. Every
+    `CODEC_QTYPES` answer is a dict or list, so both are defence in depth rather than live
     cases. `RecursionError` is caught because the string is a model's reply: a pathological
     `"[[[[…"` must read as "not this failure mode", not abort the pre-flight."""
     if not isinstance(got, str) or not isinstance(expected, (dict, list)):
@@ -169,7 +211,9 @@ def encodes_as_json_string(got: Any, expected: Any) -> bool:
 # The asked-for values (record index 1, `questions.py`'s `n // 2` pick) are NESTED — a list
 # of objects, an object holding a list and an empty object — because real `deref` values
 # are, and a model that stringifies only inner containers would otherwise pass here and
-# still zero both arms of the sweep.
+# still zero both arms of the sweep. Each payload also yields an `enumerate` question, and
+# the two carry string and integer ids respectively, so a model that stringifies the
+# scalars inside a list is caught too.
 PREFLIGHT_PAYLOADS: tuple[dict, ...] = (
     {"result": [{"id": "a", "rows": [{"k": "x"}]},
                 {"id": "b", "rows": [{"k": "y", "v": [1, 2]}, {"k": "z"}]}]},
@@ -192,16 +236,18 @@ def preflight_questions() -> list[tuple[fluency.Question, str]]:
     terse form is the thing the sweep exists to measure; refusing a model for it here would
     decide the verdict before the run instead of reporting it.
 
-    Raises rather than returning fewer questions: if `questions.py` ever stops emitting a
-    `deref` for one of these payloads, an empty list would let every model pass a
-    pre-flight that checked nothing."""
+    One question per `CODEC_QTYPES` entry per payload, in generation order. Raises rather
+    than returning fewer: if `questions.py` ever stops emitting one of them for these
+    payloads, a shorter list would let every model pass a pre-flight that skipped the very
+    answer type the sweep then scores."""
     out: list[tuple[fluency.Question, str]] = []
     for payload in PREFLIGHT_PAYLOADS:
         qs = gen_codec_questions(payload)
-        if len(qs) != 1:
-            raise RuntimeError(f"pre-flight payload {payload!r} yields {len(qs)} deref "
-                               "questions, expected exactly 1 — questions.py changed")
-        out.append((qs[0], json.dumps(payload)))
+        got = sorted(q.qtype for q in qs)
+        if got != sorted(CODEC_QTYPES):
+            raise RuntimeError(f"pre-flight payload {payload!r} yields {got}, expected one "
+                               f"each of {sorted(CODEC_QTYPES)} — questions.py changed")
+        out.extend((q, json.dumps(payload)) for q in qs)
     return out
 
 
@@ -343,8 +389,8 @@ def _recorded_value(turn: Turn) -> tuple[bool, Any]:
 
 def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
                       trials: int = 1) -> list[dict]:
-    """Ask each `deref` question in `obj` over raw vs terse, `trials` times each, via the
-    tool-calling protocol. One row per question.
+    """Ask each `CODEC_QTYPES` question in `obj` over raw vs terse, `trials` times each, via
+    the tool-calling protocol. One row per question.
 
     `raw_trials`/`terse_trials` are the FIXED `trials` count, not reduced by errors (see
     `_ask_codec_question`'s docstring) — this differs from `fluency.harnesses.run_payload`'s
@@ -389,8 +435,10 @@ def _payload_tokens(raw_text: str, obj: Any) -> dict[str, int]:
     MEASURED ONCE, on 2026-09-01, against the 1,524-envelope corpus at
     `~/.config/terse/session-corpus`, and neither one an invariant:
 
-    - `run_codec_fluency` only emits rows for payloads that yield a `deref` question. 8 of
-      1,524 did, so the corpus-wide table would cover 190x the payloads the verdict does.
+    - `run_codec_fluency` only emits rows for payloads that yield a `CODEC_QTYPES` question
+      AND that the codec encodes (`codec_changes`). 8 of 1,524 yielded the `deref` this was
+      measured against, so the corpus-wide table would cover 190x the payloads the verdict
+      does; `enumerate` (#403) widens that set without changing the argument.
     - 36 of those 1,524 envelopes carried a stored `shape` that `classify_shape(raw)` no
       longer agreed with, so the two tables would not bucket the same payload the same way.
       That was `#355`, FIXED — `capture.envelope_shape` re-classifies at the read, so this
@@ -415,7 +463,8 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                       progress: Callable[[str], None] | None = None,
                       preflight: bool = True) -> dict[str, list[dict]]:
     """Run the codec-tier eval for each named tool-capable answerer over every payload in
-    the corpus that has at least one `deref` question. Mirrors `dropeval.run_drop_fluency`'s
+    the corpus that has at least one `CODEC_QTYPES` question AND that the codec actually
+    encodes (`codec_changes`). Mirrors `dropeval.run_drop_fluency`'s
     envelope-outer/model-inner nesting (question generation is model-independent, so it is
     derived once per envelope, not once per (model, envelope)) and `fluency.run_fluency`'s
     row-tagging convention.
@@ -464,8 +513,8 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
         try:
             obj = json.loads(env["raw"])
         except (json.JSONDecodeError, TypeError):
-            obj = None  # deref needs parsed JSON structure; a non-JSON/text payload has none
-        if obj is None or not gen_codec_questions(obj):
+            obj = None  # these questions need parsed JSON; a non-JSON/text payload has none
+        if obj is None or not gen_codec_questions(obj) or not codec_changes(obj):
             # One line per skip, like `run_drop_fluency` (#267): `done` reaches `total`
             # without M near-identical lines per skipped envelope.
             if progress is not None:

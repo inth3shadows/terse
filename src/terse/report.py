@@ -1565,17 +1565,20 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
     out += [
         "Does a real tool-calling model's downstream tool-call argument stay structurally",
         "identical whether it read raw JSON or terse's compressed form? Scored on `deref`",
-        "questions only — reconstructing an aliased or table-encoded value back into the",
-        "original structure, which is what an agent does when it feeds a result into the",
-        "next tool call, PAIRED against the same question answered from raw. No percentage",
+        "questions (reconstructing an aliased or table-encoded object back into its original",
+        "structure) and `enumerate` questions (reading one column back out of every row, in",
+        "order) — values an agent carries verbatim into its next tool call — each PAIRED",
+        "against the same question answered from raw. The Questions column says which types",
+        "a cell was scored on; a verdict covers those, not the tool as a whole. No percentage",
         "tolerance: any trial where raw succeeded and terse did not is UNSAFE; a clean run",
         "needs enough trials to trust the zero, or it is UNRESOLVED.",
         "",
     ]
     if not results or not any(results.values()):
         out += [
-            "No tool-capable model answered, or no `deref`-eligible payloads in the corpus",
-            "(needs a record-shaped payload with a whole object/array column). Configure a",
+            "No tool-capable model answered, or no payload in the corpus yields a `deref` or",
+            "`enumerate` question (needs a record-shaped payload with a unique id column or a",
+            "whole object/array column). Configure a",
             "model and re-run `terse fluency --codec-verdict`.",
             "",
         ]
@@ -1590,8 +1593,8 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
     out += [
         "## Verdict by tool and shape",
         "",
-        "| Tool | Shape | n | Verdict | Worst model | Why |",
-        "|---|---|---|---|---|---|",
+        "| Tool | Shape | Questions | n | Verdict | Worst model | Why |",
+        "|---|---|---|---|---|---|---|",
     ]
     for (tool, shape), by_model in sorted(groups.items()):
         # Gates on the worst model, not the mean — the same principle every other verdict
@@ -1616,8 +1619,16 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
             why = f"only {n} zero-failure trial(s), need {_CODEC_MIN_TRIALS}"
         else:
             why = f"{n} zero-failure trials"
-        out.append(f"| `{tool}` | {shape} | {n} | **{worst_verdict}** | `{worst_model}` | "
-                   f"{why} |")
+        # Distinct questions per type, from the rows the verdict was computed over. `n` counts
+        # TRIALS, and a cell of one question run 20 times reads like 20 questions without
+        # this beside it (#403 Blocker 2).
+        qtypes: dict[str, int] = {}
+        for r in worst_gap.rows:
+            qt = str(r.get("qtype", "?"))
+            qtypes[qt] = qtypes.get(qt, 0) + 1
+        questions = ", ".join(f"{qt} {c}" for qt, c in sorted(qtypes.items())) or "—"
+        out.append(f"| `{tool}` | {shape} | {questions} | {n} | **{worst_verdict}** | "
+                   f"`{worst_model}` | {why} |")
     out.append("")
     out += _codec_savings_section(groups)
     return "\n".join(out)

@@ -2119,7 +2119,8 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--codec-verdict", action="store_true",
                    help="behavioral eval (#295): does a real tool-calling model's downstream "
                         "tool-call argument stay structurally identical whether it read raw "
-                        "JSON or terse's compressed form? scored on deref questions only, "
+                        "JSON or terse's compressed form? scored on deref and enumerate "
+                        "questions, "
                         "rendered as SAFE/UNSAFE/UNRESOLVED per (tool, shape) rather than a "
                         "global accuracy tolerance; needs a configured tool-calling model")
     f.add_argument("--accept-degraded", action="store_true",
