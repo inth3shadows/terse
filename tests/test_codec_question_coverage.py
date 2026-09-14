@@ -88,7 +88,7 @@ def test_a_payload_the_codec_leaves_alone_is_skipped_not_scored():
             {"tool": "t", "sha": "encoded", "raw": json.dumps(encoded)}]
     lines: list[str] = []
     rows = codeceval.run_codec_fluency(envs, {"m": never_calls}, preflight=False,
-                                       progress=lines.append)["m"]
+                                       progress=lines.append).rows["m"]
     assert rows and {r["sha"] for r in rows} == {"encoded"}
     assert sum("(skipped)" in ln for ln in lines) == 1
 
@@ -111,7 +111,7 @@ def test_the_verdict_table_names_the_question_types_each_cell_was_scored_on():
     envs = [{"tool": "demo.get", "sha": f"sha{i}", "raw": json.dumps(p)}
             for i, p in enumerate(payloads)]
     results = codeceval.run_codec_fluency(envs, {"m1": correct, "m2": correct}, trials=2,
-                                          preflight=False)
+                                          preflight=False).rows
     report = build_codec_verdict_report(results)
     assert "| Tool | Shape | Questions | n | Verdict |" in report
     assert "| `demo.get` | array-of-records | deref 2, enumerate 2 | 8 | **UNRESOLVED** |" in report

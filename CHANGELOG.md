@@ -15,6 +15,87 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **The codec eval no longer scores a payload the model cannot fit (#403 Blocker 4).**
+  `run_codec_fluency` sent every corpus payload to every model with no check that the
+  request fits its `max_input_tokens`. Measured 2026-09-10: `qwen3-coder-30b-fl` (32,768)
+  lost 12 of 162 calls to two 123k payloads while `qwen3.8-flash-next-fl` (262,144) lost
+  none. **The gateway does not reject an oversized request** — `b0e5f862` (35,707 cl100k on
+  the raw arm) was answered off a truncated payload with `err=0`, so this cannot be caught
+  by watching for transport errors.
+
+  The serious half is an arm asymmetry that is **structural, not incidental**: terse's whole
+  purpose is that the compressed arm is smaller, so there is always a band where the RAW arm
+  exceeds the limit and the TERSE arm does not — `b0e5f862` sits in it at 35,707 vs 32,510
+  against 32,768. Scored rather than excluded, the control arm reads a truncated payload
+  while the treatment arm reads a whole one, which flatters terse and can manufacture a
+  false SAFE. That is #408's finding one layer out: an asymmetry in what the two arms are
+  actually asked.
+
+  A payload whose request would exceed a model's limit is now **excluded from that model's
+  rows before any call is made**, and named in a new `## Corpus coverage` section beside the
+  verdict. Excluding is normally the dangerous direction here (PR #302 F3: a silent
+  non-answer must not shrink itself out of the denominator) and the distinction is the
+  design — #302 F3 bans excluding by **outcome**, which is self-selection biased toward
+  SAFE, while this excludes by a **predeclared property of the input**, computed before the
+  question is put and independent of how any arm performs. Both arms of a payload go
+  together, so a model's corpus never splits by arm; per model rather than globally, so the
+  smallest-context model cannot shrink the corpus every other model is scored on.
+
+  Counted on the **whole request** — prompt, instruction, payload and tool schema — not the
+  payload alone: `b0e5f862`'s terse arm fits by payload (32,510 < 32,768) and does not fit
+  once the prompt is added, so a payload-only check would miss the case that motivated it.
+
+  **An exclusion withholds SAFE, and never withholds UNSAFE.** Adversarial review falsified
+  the first design's central claim. "Excluding by a predeclared property of the input is
+  categorically unlike excluding by outcome" is true of the SELECTION and false of the
+  CONSEQUENCE: payload SIZE is not independent of what the eval measures, because the
+  largest payloads are the widest tables, which is exactly where a positional row lookup
+  fails (#408's finding). Executed on a two-payload corpus at `--trials 20`, a cell reading
+  **UNSAFE** (raw 100%, terse 50%) read **SAFE** once the payload carrying the failure was
+  excluded. A cell that lost any payload to a limit is now UNRESOLVED with that named
+  reason, in the same direction as `_CODEC_MIN_CALL_RATE` — evidence that survived the trim
+  is still evidence, so UNSAFE still prints. A cell whose every payload was excluded still
+  renders a row rather than vanishing, and `OversizedPayload` carries `shape` so an
+  exclusion can be keyed the way the verdict is keyed.
+
+  Three further disclosure gaps review found, all closed: with **no tokenizer** the check
+  passes vacuously and the report used to state that every payload fitted — it now says the
+  check did not run; an empty run caused by **both** a limit and unaskable payloads named
+  only the limit, sending the reader after a bigger model when the remedy is mixed; and the
+  **savings table** silently shrank when payloads were excluded (+42.0% to +31.5% on
+  identical data, decided by a flag), against its own promise that whatever the sums cannot
+  cover is disclosed — the drop is systematically downward, since the excluded payloads are
+  the largest.
+
+### Added
+
+- **`terse fluency --codec-verdict --max-input-tokens MODEL=N[,MODEL=N...]`**, with
+  best-effort discovery from the gateway (LiteLLM `/model/info`, else an OpenRouter-style
+  `/models` `context_length`). The flag wins over discovery, because a gateway can publish a
+  limit that is wrong for the route actually served — an alias resolves through a fallback
+  chain at request time. **A model whose limit is unknown is scored over the whole corpus
+  exactly as before and the report says so**; no default limit is invented, since a guessed
+  one would silently drop payloads against a backend that publishes nothing. A malformed
+  `MODEL=N` is refused rather than skipped: a typo'd model name would leave that model
+  unchecked, which is the behaviour the flag exists to replace.
+
+  Discovery takes the **smallest** limit when a gateway lists a model group's deployments
+  separately, since a request routed to the smaller deployment is the defect being checked
+  for; a duplicate model in the flag is refused rather than silently last-wins.
+
+  `count_cl100k` is an approximation for these non-OpenAI models. It catches a clear overrun
+  (`b0e5f862`'s raw arm is 9% over) and may miss a marginal one; **no correction factor is
+  applied because none has been measured** — measuring the drift against the gateway's
+  reported `usage.prompt_tokens` and tightening the check is open work on #403. Also open
+  and stated rather than fixed: the bound is **input-only**. Where a backend shares one
+  window between prompt and completion, a payload that fits can still leave the raw arm less
+  room to answer than the terse arm — the same asymmetry one step further on, unmeasured
+  because it is backend-dependent.
+
+## [0.33.1] - 2026-09-12
+
+### Fixed
+
 - **The codec verdict no longer scores a correct answer as a codec failure because it
   arrived in prose instead of through the tool call (#403).** `codeceval` asks a model to
   reconstruct a value and call `terse.record_answer` with it; a turn that made no tool call

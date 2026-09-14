@@ -983,6 +983,86 @@ def _cmd_probe_cross_server(args: argparse.Namespace, envelopes: list[dict]) -> 
     return 0
 
 
+def _parse_model_limits(spec: str | None) -> dict[str, int]:
+    """`"m1=32768,m2=262144"` -> `{"m1": 32768, "m2": 262144}`. Empty for an empty spec.
+
+    Raises `ValueError` on a malformed entry rather than skipping it. A typo'd model name
+    would silently leave that model unlimited, and an unlimited model is exactly the
+    pre-#403-Blocker-4 behaviour the flag exists to replace — a flag that quietly does
+    nothing is worse than no flag."""
+    limits: dict[str, int] = {}
+    for part in (x.strip() for x in (spec or "").split(",") if x.strip()):
+        model, sep, raw = part.partition("=")
+        if not sep or not model.strip():
+            raise ValueError(f"--max-input-tokens: expected MODEL=N, got {part!r}")
+        try:
+            n = int(raw)
+        except ValueError:
+            raise ValueError(f"--max-input-tokens: {raw!r} is not an integer "
+                             f"(in {part!r})") from None
+        if n <= 0:
+            raise ValueError(f"--max-input-tokens: {model.strip()}={n} must be positive")
+        if model.strip() in limits:
+            raise ValueError(f"--max-input-tokens: {model.strip()} given twice — a silent "
+                             f"last-wins would pick a limit the operator did not choose")
+        limits[model.strip()] = n
+    return limits
+
+
+def _discover_model_limits(base_url: str | None, api_key: str | None,
+                           models: list[str]) -> dict[str, int]:
+    """Best-effort `max_input_tokens` per model, read from the gateway.
+
+    Two shapes, in order: LiteLLM's `/model/info` (`model_info.max_input_tokens`) and an
+    OpenRouter-style `/models` (`context_length`). Neither is part of the OpenAI API, so
+    this is a convenience over a heterogeneous fleet, never a contract.
+
+    **Failure is silent and returns nothing for that model, on purpose.** An undiscovered
+    limit means the model is scored over the whole corpus exactly as before and the report
+    says the limit was unknown; a discovery error that aborted the run would make a
+    non-LiteLLM backend unusable for an eval that does not need this to work."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    if not base_url or not models:
+        return {}
+    trimmed = base_url.rstrip("/")
+    root = trimmed.removesuffix("/v1")
+    out: dict[str, int] = {}
+    # `/model/info` hangs off the gateway ROOT; an OpenRouter-style `/models` hangs off the
+    # `/v1` base (`https://openrouter.ai/api/v1/models`). Stripping `/v1` for both made the
+    # second probe unreachable for the only backend the docstring names.
+    for url_root, path, key in ((root, "/model/info", "max_input_tokens"),
+                                (trimmed, "/models", "context_length"),
+                                (root, "/models", "context_length")):
+        try:
+            req = urllib.request.Request(url_root + path, headers={
+                "Authorization": f"Bearer {api_key or ''}", "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        for entry in data.get("data") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("model_name") or entry.get("id")
+            nested = entry.get("model_info")
+            info: dict = nested if isinstance(nested, dict) else entry
+            n = info.get(key)
+            if isinstance(name, str) and name in models and isinstance(n, int) and n > 0:
+                # MIN, not first-wins. LiteLLM returns one entry per DEPLOYMENT, so a model
+                # group with two deployments yields two entries under the same
+                # `model_name` with different limits; a request routed to the smaller one
+                # would be answered off a truncated payload — the exact defect this checks
+                # for. The conservative reduction is the only safe one.
+                prev = out.get(name)
+                out[name] = n if prev is None else min(prev, n)
+    return out
+
+
 def _build_answerers(args: argparse.Namespace, make_openai, mode_name: str = "--drop-eval") -> dict:
     """Assemble named answerers from env + flags. Empty means keyless (pack) mode.
 
@@ -1361,13 +1441,36 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             print("`fluency --codec-verdict` needs a configured model: set "
                   "TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS.")
             return 1
+        # #403 Blocker 4. Explicit flag wins over discovery: a gateway can publish a limit
+        # that is wrong for the route actually served (a fallback chain resolves at request
+        # time, KB principle #222), and the operator needs a way to say so.
         try:
-            results = codeceval.run_codec_fluency(envelopes, answerers, trials=args.trials,
-                                                  progress=_stderr_progress)
+            limits = _parse_model_limits(getattr(args, "max_input_tokens", None))
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        import os as _os
+        discovered = _discover_model_limits(
+            args.base_url or _os.environ.get("TERSE_FLUENCY_BASE_URL"),
+            _os.environ.get(args.api_key_env or "TERSE_FLUENCY_API_KEY"),
+            list(answerers))
+        limits = {**discovered, **limits}
+        unknown = sorted(set(answerers) - set(limits))
+        if unknown:
+            print(f"[fluency --codec-verdict] no max_input_tokens for "
+                  f"{', '.join(unknown)} — scored over the whole corpus; pass "
+                  f"--max-input-tokens MODEL=N to check them", file=sys.stderr)
+        try:
+            run = codeceval.run_codec_fluency(
+                envelopes, answerers, trials=args.trials, progress=_stderr_progress,
+                limits=limits, tool_defs=[codeceval.RECORD_VALUE_TOOL_DEF])
         except codeceval.PreflightError as exc:
             print(str(exc), file=sys.stderr)   # no report: nothing was measured (#403)
             return 2
-        _write_report(build_codec_verdict_report(results), args.out)
+        _write_report(build_codec_verdict_report(
+            run.rows, excluded=run.excluded, limits=limits, models=list(answerers),
+            skipped_unaskable=run.skipped_unaskable,
+            limit_check_ran=run.limit_check_ran), args.out)
         return 0
 
     # Diff mode: does a model read a cross-call DIFF as well as the full result? Needs a
@@ -2116,6 +2219,13 @@ def main(argv: list[str] | None = None) -> int:
                         "when a dropped field is needed (recall), and leave it alone when "
                         "it isn't (precision)? needs --policy with a drop-to-retrieve field "
                         "+ a configured model")
+    f.add_argument("--max-input-tokens", metavar="MODEL=N[,MODEL=N...]",
+                   help="each model's input-token limit, for --codec-verdict. A payload "
+                        "whose request would exceed it is not asked of that model and is "
+                        "reported as excluded, rather than scored against a payload the "
+                        "model never fully read (#403). Overrides what the gateway "
+                        "publishes; models with no known limit are scored over the whole "
+                        "corpus.")
     f.add_argument("--codec-verdict", action="store_true",
                    help="behavioral eval (#295): does a real tool-calling model's downstream "
                         "tool-call argument stay structurally identical whether it read raw "
