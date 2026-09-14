@@ -1420,7 +1420,8 @@ def _codec_low_call_arm(rows: list[dict[str, Any]]) -> tuple[str, float] | None:
     return min(low, key=lambda t: t[1]) if low else None
 
 
-def codec_verdict(rows: list[dict[str, Any]]) -> tuple[str, ArmGap]:
+def codec_verdict(rows: list[dict[str, Any]],
+                  excluded_from_group: int = 0) -> tuple[str, ArmGap]:
     """SAFE / UNSAFE / UNRESOLVED for one model's codec-eval rows, already scoped to one
     `(tool, shape)` group (`codeceval.run_codec_fluency`'s row tags).
 
@@ -1465,6 +1466,21 @@ def codec_verdict(rows: list[dict[str, Any]]) -> tuple[str, ArmGap]:
     if any((rate := codec_call_rate(g.rows, form)) is not None
            and rate < _CODEC_MIN_CALL_RATE for form in ("raw_ok", "terse_ok")):
         return "UNRESOLVED", g
+    # A payload this cell never asked, because it exceeded a model's input limit (#403
+    # Blocker 4), blocks SAFE for the same reason and in the same direction — never UNSAFE.
+    #
+    # `codeceval.run_codec_fluency` argues that excluding by a PREDECLARED PROPERTY OF THE
+    # INPUT is categorically unlike #302 F3's ban on excluding by OUTCOME. That is true of
+    # the SELECTION and false of the CONSEQUENCE, and the difference is this gate. Payload
+    # SIZE is not independent of what the eval measures: the largest payloads are the widest
+    # tables, which are exactly where a positional row lookup fails (#408's finding). So
+    # trimming by size trims the evidence most likely to demonstrate corruption.
+    #
+    # Executed, same corpus and same answerers, `trials=20`: a cell reading UNSAFE (raw
+    # 100%, terse 50%) read **SAFE** once the payload carrying the failure was excluded for
+    # one model. Not a hypothetical — that flip is what this gate exists to stop.
+    if excluded_from_group > 0:
+        return "UNRESOLVED", g
     if n >= _CODEC_MIN_TRIALS:
         return "SAFE", g
     return "UNRESOLVED", g
@@ -1472,6 +1488,7 @@ def codec_verdict(rows: list[dict[str, Any]]) -> tuple[str, ArmGap]:
 
 def _codec_savings_section(
     groups: dict[tuple[str, str], dict[str, list[dict]]],
+    excluded: Sequence[Any] = (),
 ) -> list[str]:
     """The economics, rendered BESIDE the verdict and never inside it (#303, #295 DoD 4).
 
@@ -1565,6 +1582,26 @@ def _codec_savings_section(
         out.append(f"| `{tool}` | {shape} | {len(counted)} | {raw} | {cmp_} | "
                    f"{raw - cmp_:+d} | {_pct(raw - cmp_, raw)} |")
     out.append("")
+    # #403 Blocker 4. The header above promises "whatever the sums could not cover is
+    # disclosed beneath the table, never quietly dropped", and a payload excluded for EVERY
+    # model contributes no row, so it vanishes from these sums with no trace. Measured on a
+    # two-payload corpus: +42.0% became +31.5% on identical data, decided by a flag. The
+    # drop is systematically DOWNWARD, because the excluded payloads are the largest.
+    unasked = {(e.tool, e.shape, e.sha) for e in excluded}
+    scored = {(str(r.get("tool", "?")), str(r.get("shape", "unknown")), r.get("sha"))
+              for by_model in groups.values() for rows in by_model.values() for r in rows}
+    never_scored = len(unasked - scored)
+    if never_scored:
+        out += [
+            f"{never_scored} payload(s) are absent from the sums above entirely: no model "
+            "was asked them,",
+            "because they exceed every model's input limit (see **Corpus coverage**). The "
+            "percentage above",
+            "is therefore computed over the SMALLER payloads only, and the excluded ones "
+            "are the largest —",
+            "so it understates what the codec saves on this corpus.",
+            "",
+        ]
     if uncounted_total:
         out += [
             f"{uncounted_total} payload(s) — counted once per `(tool, shape)` group, so a "
@@ -1612,7 +1649,68 @@ def _is_token_count(v: object) -> TypeGuard[int]:
     return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
-def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
+def _codec_corpus_section(excluded: Sequence[Any],
+                          limits: dict[str, int] | None,
+                          models: Sequence[str] | None,
+                          limit_check_ran: bool = True) -> list[str]:
+    """What the run did NOT ask, and of whom (#403 Blocker 4).
+
+    A verdict computed over a silently trimmed corpus is indistinguishable from one computed
+    over the whole corpus — that is the entire defect. So this section prints whenever a
+    limit was known OR a payload was excluded, and it names the models whose limit could not
+    be determined, because "no exclusions" means something different for a model that was
+    checked than for one that could not be.
+
+    Deliberately a peer `##` heading beside the verdict, like `_codec_savings_section`: it
+    qualifies WHICH payloads the verdict covers, which a reader needs before reading the
+    verdict, and burying it as a footnote under the table is how a trimmed corpus goes
+    unnoticed."""
+    limits = limits or {}
+    # `models` alone is enough to print: a fleet whose limits were ALL undiscoverable has
+    # empty `limits` and no exclusions, and returning early there leaves the artifact with
+    # no trace that no limit check ran — the only warning would be an ephemeral stderr line.
+    if not excluded and not limits and not models:
+        return []
+    out = ["## Corpus coverage", "",
+           "Payloads the run declined to ask, because the request would not fit the model's",
+           "input limit. Excluded BEFORE the question was put and independently of any",
+           "answer, so this is not a sample selected by outcome — both arms of a payload go",
+           "together, per model. A payload scored anyway would put a TRUNCATED payload on one",
+           "arm and a whole one on the other, which is an asymmetry in what the arms were",
+           "asked, not a fact about the codec.", ""]
+    if excluded:
+        out += ["| Model | Tool | sha | Arm | Request tokens | Limit |",
+                "|---|---|---|---|---|---|"]
+        for e in sorted(excluded, key=lambda x: (x.model, x.tool, x.sha or "", x.arm)):
+            sha = f"`{e.sha[:8]}`" if e.sha else "—"
+            out.append(f"| `{e.model}` | `{e.tool}` | {sha} | {e.arm} | "
+                       f"{e.tokens:,} | {e.limit:,} |")
+        out.append("")
+        out += ["Counted on the whole request (prompt, instruction, payload, tool schema),",
+                "in cl100k — an approximation, since these are not OpenAI models. It catches",
+                "a clear overrun and may miss a marginal one; no correction factor is applied",
+                "because none has been measured.", ""]
+    elif not limit_check_ran:
+        out += ["**The limit check did not run**: no tokenizer was available, so no request",
+                "size could be measured and every payload was asked unchecked. This is not",
+                "the same as every payload fitting.", ""]
+    elif limits:
+        out += ["Every payload fitted every model that declared a limit.", ""]
+    if models is not None:
+        unknown = sorted(set(models) - set(limits))
+        if unknown:
+            out += [f"**Limit unknown for {', '.join(f'`{m}`' for m in unknown)}** — scored "
+                    f"over the whole corpus, unchecked. Pass `--max-input-tokens MODEL=N`.",
+                    ""]
+    return out
+
+
+def build_codec_verdict_report(results: dict[str, list[dict]],
+                               excluded: Sequence[Any] = (),
+                               limits: dict[str, int] | None = None,
+                               models: Sequence[str] | None = None,
+                               skipped_unaskable: int = 0,
+                               limit_check_ran: bool = True) -> str:
     """Render the codec-tier material-preservation eval, grouped by `(tool, shape)` — never
     as one global number (#295's explicit non-goal). `results` is
     `{model: [row, ...]}` from `codeceval.run_codec_fluency`; each row carries `tool` and
@@ -1641,7 +1739,15 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
         "needs enough trials to trust the zero, or it is UNRESOLVED.",
         "",
     ]
-    if not results or not any(results.values()):
+    # `excluded` keeps the table alive: an all-excluded run has no rows, and returning here
+    # would drop the cells those payloads belong to entirely — a cell that silently
+    # disappears is indistinguishable from a corpus that never had it.
+    if (not results or not any(results.values())) and not excluded:
+        # An empty run has THREE causes and they need different remedies. The corpus section
+        # below distinguishes the third, so it must render here too: this is the one branch
+        # where every payload was excluded, which is exactly when a reader most needs to be
+        # told the corpus was trimmed rather than empty. The first cut returned before it and
+        # printed "no payload yields a question" about a corpus full of payloads that do.
         out += [
             "No tool-capable model answered, or no payload in the corpus yields a `deref` or",
             "`enumerate` question (needs a record-shaped payload with a unique id column or a",
@@ -1649,7 +1755,30 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
             "model and re-run `terse fluency --codec-verdict`.",
             "",
         ]
+        out += _codec_corpus_section(excluded, limits, models, limit_check_ran)
         return "\n".join(out)
+
+    if not any(results.values()):
+        # Rows are empty but payloads WERE excluded, so the table below still renders their
+        # cells. An empty run has two causes at once on any real corpus — most envelopes
+        # yield no `deref`/`enumerate` question, and the ones that do are wide record tables,
+        # exactly what blows a small limit — and naming only one sends the reader after the
+        # wrong remedy.
+        if skipped_unaskable:
+            out += [
+                f"No payload was scored, for TWO reasons: {len(excluded)} exclusion(s) by a "
+                f"model's input limit (see **Corpus coverage** below), and "
+                f"{skipped_unaskable} payload(s) that yield no `deref`/`enumerate` question "
+                f"or that the codec leaves unencoded. Neither alone explains the empty run.",
+                "",
+            ]
+        else:
+            out += [
+                "No payload was scored: every one was excluded by a model's input limit. See",
+                "**Corpus coverage** below — this is a corpus/model mismatch, not an absence",
+                "of questions.",
+                "",
+            ]
 
     groups: dict[tuple[str, str], dict[str, list[dict]]] = {}
     for model, rows in results.items():
@@ -1663,14 +1792,34 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
         "| Tool | Shape | Questions | n | Verdict | Worst model | Why |",
         "|---|---|---|---|---|---|---|",
     ]
+    # Exclusions keyed the way the verdict is keyed. A model that lost EVERY payload of a
+    # cell contributes no rows and so vanishes from `by_model` — the worst-model gate then
+    # silently drops the model it was meant to gate on. `groups` is built from rows, so that
+    # cell would not even appear; the union below puts it back.
+    by_cell: dict[tuple[str, str], dict[str, int]] = {}
+    for e in excluded:
+        by_cell.setdefault((e.tool, e.shape), {})
+        by_cell[(e.tool, e.shape)][e.model] = \
+            by_cell[(e.tool, e.shape)].get(e.model, 0) + 1
+    for cell in by_cell:
+        groups.setdefault(cell, {})
+
     for (tool, shape), by_model in sorted(groups.items()):
+        dropped = by_cell.get((tool, shape), {})
+        if not by_model:
+            # Every model lost every payload of this cell. It still gets a row: a cell that
+            # silently disappears is indistinguishable from a corpus that never had it.
+            who = ", ".join(f"`{m}`" for m in sorted(dropped))
+            out.append(f"| `{tool}` | {shape} | — | 0 | **UNRESOLVED** | {who} | "
+                       f"every payload exceeded the input limit — nothing was asked |")
+            continue
         # Gates on the worst model, not the mean — the same principle every other verdict
         # in this file follows (#24): a shape that's unsafe for one model in the fleet is
         # unsafe, full stop. `_VERDICT_RANK` orders UNSAFE worst, SAFE best; ties keep the
         # first model encountered in sorted order rather than an arbitrary last-wins.
         worst_verdict, worst_model, worst_gap = "SAFE", "", None
         for model, mrows in sorted(by_model.items()):
-            v, g = codec_verdict(mrows)
+            v, g = codec_verdict(mrows, excluded_from_group=dropped.get(model, 0))
             if worst_gap is None or _VERDICT_RANK[v] > _VERDICT_RANK[worst_verdict]:
                 worst_verdict, worst_model, worst_gap = v, model, g
         assert worst_gap is not None  # by_model is never empty — every group has >=1 model
@@ -1682,6 +1831,9 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
                   f"(raw {worst_gap.control_acc:.0%}, terse {worst_gap.form_acc:.0%})")
         elif worst_gap.excluded:
             why = REASON_LABEL.get(worst_gap.excluded, worst_gap.excluded)
+        elif worst_verdict == "UNRESOLVED" and dropped.get(worst_model):
+            why = (f"{dropped[worst_model]} payload(s) not asked of `{worst_model}` — over "
+                   f"its input limit, so this cell was scored on a trimmed corpus")
         elif worst_verdict == "UNRESOLVED" and (low := _codec_low_call_arm(worst_gap.rows)):
             arm, rate = low
             why = (f"{arm} arm delivered {rate:.0%} of its answers through the tool call, "
@@ -1702,7 +1854,8 @@ def build_codec_verdict_report(results: dict[str, list[dict]]) -> str:
         out.append(f"| `{tool}` | {shape} | {questions} | {n} | **{worst_verdict}** | "
                    f"`{worst_model}` | {why} |")
     out.append("")
-    out += _codec_savings_section(groups)
+    out += _codec_corpus_section(excluded, limits, models, limit_check_ran)
+    out += _codec_savings_section(groups, excluded)
     return "\n".join(out)
 
 

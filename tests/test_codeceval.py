@@ -419,7 +419,8 @@ def test_run_codec_fluency_stamps_tool_and_shape_on_every_row():
 
     envelopes = [{"tool": "demo.get", "shape": "array-of-records", "sha": "abc123",
                  "raw": RAW_TEXT}]
-    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1, preflight=False)
+    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1,
+                                          preflight=False).rows
     assert results["m1"]
     for row in results["m1"]:
         assert row["tool"] == "demo.get"
@@ -434,7 +435,8 @@ def test_run_codec_fluency_skips_a_payload_with_no_codec_question():
     flat = {"result": [{"k": "x", "n": 10}, {"k": "x", "n": 10}]}
     envelopes = [{"tool": "demo.get", "shape": "array-of-records", "sha": "x",
                  "raw": json.dumps(flat)}]
-    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1, preflight=False)
+    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1,
+                                          preflight=False).rows
     assert results["m1"] == []
 
 
@@ -443,7 +445,8 @@ def test_run_codec_fluency_skips_non_json_payloads():
         return Turn(text="", tool_calls=[])
 
     envelopes = [{"tool": "demo.get", "shape": "long-text", "sha": "x", "raw": "not json"}]
-    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1, preflight=False)
+    results = codeceval.run_codec_fluency(envelopes, {"m1": never_calls}, trials=1,
+                                          preflight=False).rows
     assert results["m1"] == []
 
 

@@ -103,7 +103,7 @@ import json
 import re
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import capture, fluency
 from .dropeval import ToolAnswerer, Turn, _safe_call
@@ -573,10 +573,112 @@ def _payload_tokens(raw_text: str, obj: Any) -> dict[str, int]:
     return {"raw_tokens": raw_tok, "terse_tokens": terse_tok}
 
 
+class OversizedPayload(NamedTuple):
+    """One (model, payload) pair the run declined to ask, and why. Rendered by
+    `report.build_codec_verdict_report` beneath the verdict table.
+
+    `shape` is carried, not just `tool`, because the VERDICT is keyed `(tool, shape)`. A
+    coverage note filed under a tool alone cannot say which cell lost payloads when a tool
+    spans two shapes — and the cell is what `report.codec_verdict` gates on."""
+    model: str
+    tool: str
+    shape: str
+    sha: str | None
+    arm: str
+    tokens: int
+    limit: int
+
+
+class CodecRun(NamedTuple):
+    """`run_codec_fluency`'s result: the per-model rows, plus what it refused to ask.
+
+    `excluded` is not decoration. A verdict computed over a silently trimmed corpus reads
+    identically to one computed over the whole corpus, and #403 Blocker 4 is precisely that
+    failure — so the two travel together and the renderer prints both."""
+    rows: dict[str, list[dict]]
+    excluded: list[OversizedPayload]
+    # Payloads no model was asked because the codec leaves them unencoded or they yield no
+    # `CODEC_QTYPES` question. Counted so the report can tell "the corpus was TRIMMED by an
+    # input limit" from "the corpus has no questions" — an empty run has both causes at once
+    # on any real corpus (8 of 1,524 envelopes yielded a question when last measured), and a
+    # message naming only one of them points the reader at the wrong remedy.
+    skipped_unaskable: int = 0
+    # False when no tokenizer was available, so `oversized_arms` could not measure anything
+    # and every payload passed the check vacuously. `limit_check_available`'s docstring has
+    # the argument; the report must say the check did not run, never that it passed.
+    limit_check_ran: bool = True
+
+
+def request_tokens(question: fluency.Question, payload_text: str,
+                   tool_defs: list[dict] | None = None) -> int | None:
+    """cl100k count of the REAL request one trial sends, or `None` without a tokenizer.
+
+    The whole request, not the payload: `_codec_turn`'s user message plus the serialized
+    tool definitions the answerer binds. `b0e5f862` is why — its terse arm is 32,510 tokens
+    against a 32,768 limit and fits by payload alone, then does not fit once the prompt and
+    the tool schema are added. A payload-only check would miss the exact case that motivated
+    the check.
+
+    `count_cl100k` is an approximation here: the models this eval runs against are not
+    OpenAI models and do not use cl100k. The count is close enough to catch a clear overrun
+    (`b0e5f862`'s raw arm is 9% over) and may miss a marginal one. No correction factor is
+    applied, because none has been measured — inventing one would be a guess wearing the
+    costume of a bound. Measuring the drift against `usage.prompt_tokens` and tightening
+    this is open work on #403."""
+    text = fluency._user_prompt(question.prompt, _codec_instruction(), payload_text)
+    tools = json.dumps(tool_defs if tool_defs is not None else [RECORD_VALUE_TOOL_DEF])
+    return count_cl100k(text + tools)
+
+
+def oversized_arms(obj: Any, raw_text: str, limit: int,
+                   tool_defs: list[dict] | None = None) -> list[tuple[str, int]]:
+    """`[(arm, tokens), ...]` for every arm whose LARGEST request exceeds `limit`. Empty
+    when the payload fits, or when no tokenizer is available to say.
+
+    Largest over the payload's questions, because one oversized question is enough to make
+    the payload unaskable — and both arms are reported so the caller can name which one.
+
+    The asymmetry this exists to catch is structural, not incidental: terse's entire purpose
+    is that the compressed arm is smaller, so there is always a band where the RAW arm is
+    over the limit and the TERSE arm is not. `b0e5f862` sits in it — 35,707 vs 32,510
+    against 32,768. Scored rather than excluded, the CONTROL arm reads a truncated payload
+    while the TREATMENT arm reads a whole one, which flatters terse and can manufacture a
+    false SAFE. That is #408's finding one layer out: an asymmetry in what the arms are
+    actually asked."""
+    questions = gen_codec_questions(obj)
+    if not questions:
+        return []
+    out: list[tuple[str, int]] = []
+    for arm, text in (("raw", raw_text), ("terse", fluency.compress(obj))):
+        sizes = [n for q in questions
+                 if (n := request_tokens(q, text, tool_defs)) is not None]
+        if sizes and max(sizes) > limit:
+            out.append((arm, max(sizes)))
+    return out
+
+
+def limit_check_available() -> bool:
+    """Can the limit check run at all? False without a tokenizer.
+
+    `oversized_arms` returns `[]` both for a payload that FITS and for one it could not
+    measure, and the two must not read alike: with `count_cl100k` unavailable
+    (`tokenize._enc` documents a corrupt cache or an offline first fetch as real causes)
+    every payload would pass the check and the report would state that every payload fitted
+    — a flag that quietly does nothing, which is worse than no flag. The caller pairs this
+    with `limits` so the report can say the check did not run instead of that it passed.
+
+    Mirrors `_payload_tokens`' stance one function up: the savings table discloses a missing
+    tokenizer rather than printing a 100% saving, and this is the same disclosure for the
+    same reason."""
+    return count_cl100k("probe") is not None
+
+
 def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                       trials: int = 1,
                       progress: Callable[[str], None] | None = None,
-                      preflight: bool = True) -> dict[str, list[dict]]:
+                      preflight: bool = True,
+                      limits: dict[str, int] | None = None,
+                      tool_defs: list[dict] | None = None) -> CodecRun:
     """Run the codec-tier eval for each named tool-capable answerer over every payload in
     the corpus that has at least one `CODEC_QTYPES` question AND that the codec actually
     encodes (`codec_changes`). Mirrors `dropeval.run_drop_fluency`'s
@@ -595,7 +697,28 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
     Rows also carry `sha` and, when a tokenizer is available, the payload's `raw_tokens` /
     `terse_tokens` (`_payload_tokens`) — PER PAYLOAD, repeated on each of its question rows,
     for `report._codec_savings_section` to de-duplicate by `sha` and report beside the
-    verdict."""
+    verdict.
+
+    `limits` maps a model name to its `max_input_tokens` (#403 Blocker 4). A payload whose
+    request would exceed one model's limit is **excluded from that model's rows before any
+    call is made**, and returned in `CodecRun.excluded` for the report to name. A model
+    absent from `limits` has no known limit and is scored over the whole corpus exactly as
+    before — no default is invented, because a guessed limit would silently drop payloads
+    against a backend that publishes nothing.
+
+    Excluding is normally the dangerous direction in this module (`_ask_codec_question`, PR
+    #302 F3: a silent non-answer must not shrink itself out of the denominator), and the
+    distinction is the design:
+
+    - #302 F3 bans excluding by **OUTCOME** — a trial that was asked and went badly. That is
+      self-selection, and the surviving sample is biased toward SAFE.
+    - This excludes by a **predeclared property of the INPUT**, computed before the question
+      is put and independent of how any arm performs. No result can influence whether a
+      payload is in the sample.
+
+    Both arms of a payload are excluded together, so a model's corpus never splits by arm.
+    PER MODEL, not globally: a global rule would let the smallest-context model shrink the
+    corpus every other model is scored on, which is a different distortion, not a fix."""
     # Pre-flight EVERY model before touching the corpus (#403). A model that cannot express
     # a container tool argument scores 0% on both arms and takes the run's verdict down as
     # `broken control` with no named cause; a few calls per model buy a named refusal in
@@ -622,6 +745,8 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                 "and to disclose — the run will not make it silently, because the verdict is "
                 "set by the worst model and dropping one can only move it toward SAFE.")
     results: dict[str, list[dict]] = {name: [] for name in answerers}
+    excluded: list[OversizedPayload] = []
+    skipped_unaskable = 0
     progress = fluency.guarded(progress)
     started = time.monotonic()
     for i, env in enumerate(envelopes, 1):
@@ -635,6 +760,7 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
             if progress is not None:
                 progress(f"[fluency --codec-verdict] (skipped) {env.get('tool', '?'):<24} "
                          f"{i}/{len(envelopes)} payload(s)")
+            skipped_unaskable += 1
             continue
         toks = _payload_tokens(env["raw"], obj)
         # `sha` is OMITTED, never defaulted, when the envelope has no usable one. `tool`
@@ -657,9 +783,29 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
         if isinstance(sha, str) and sha:
             tags["sha"] = sha
         for name, answerer in answerers.items():
+            limit = (limits or {}).get(name)
+            # `is not None`, not truthiness: a declared limit of 0 means NOTHING fits, and
+            # reading it as "no limit known" would silently disable the check for the one
+            # value that most obviously asks for it.
+            over = (oversized_arms(obj, env["raw"], limit, tool_defs)
+                    if limit is not None else [])
+            if over and limit is not None:
+                # One line per (model, payload), like the skip lines above: the run says
+                # what it declined to ask AS it declines, not only in the final report.
+                for arm, ntok in over:
+                    excluded.append(OversizedPayload(
+                        model=name, tool=str(tags["tool"]), shape=str(tags["shape"]),
+                        sha=sha, arm=arm, tokens=ntok, limit=limit))
+                if progress is not None:
+                    arms = ", ".join(f"{a} {n:,}" for a, n in over)
+                    progress(f"[fluency --codec-verdict] (over limit) "
+                             f"{env.get('tool', '?'):<24} {name}: {arms} > {limit:,} "
+                             f"max_input_tokens — not asked")
+                continue
             for row in run_codec_payload(obj, env["raw"], answerer, trials=trials):
                 results[name].append({**tags, **toks, **row})
             if progress is not None:
                 progress(fluency.progress_line("fluency --codec-verdict", name, i,
                                                len(envelopes), results[name], started))
-    return results
+    return CodecRun(results, excluded, skipped_unaskable,
+                    limit_check_ran=(not limits) or limit_check_available())

@@ -99,7 +99,7 @@ def test_run_codec_fluency_stamps_the_live_shape():
     assert codeceval.gen_codec_questions(DRIFTED_DEREFABLE)     # ...and still derefable
     envs = [{"tool": "demo.get", "shape": STALE, "sha": "abc", "raw": raw}]
     rows = codeceval.run_codec_fluency(envs, {"m1": lambda m: Turn(text="", tool_calls=[])},
-                                       preflight=False)
+                                       preflight=False).rows
     assert rows["m1"]
     assert {r["shape"] for r in rows["m1"]} == {LIVE}
 
