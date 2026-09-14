@@ -1470,7 +1470,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         _write_report(build_codec_verdict_report(
             run.rows, excluded=run.excluded, limits=limits, models=list(answerers),
             skipped_unaskable=run.skipped_unaskable,
-            limit_check_ran=run.limit_check_ran), args.out)
+            limit_check_ran=run.limit_check_ran,
+            merged_duplicates=run.merged_duplicates), args.out)
         return 0
 
     # Diff mode: does a model read a cross-call DIFF as well as the full result? Needs a

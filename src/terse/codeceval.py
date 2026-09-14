@@ -102,7 +102,8 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 from . import capture, fluency
@@ -607,6 +608,12 @@ class CodecRun(NamedTuple):
     # and every payload passed the check vacuously. `limit_check_available`'s docstring has
     # the argument; the report must say the check did not run, never that it passed.
     limit_check_ran: bool = True
+    # Askable payloads NOT asked a second time because the same payload (sha) was already
+    # asked under another spelling of the same tool, keyed by the cell's tool (#403 Blocker
+    # 3). Per cell, so a reader can tell WHICH cell's `n` a merge affected. Counts only
+    # payloads that would otherwise have been asked — an unaskable duplicate is not a merge
+    # anyone could observe.
+    merged_duplicates: Mapping[str, int] = MappingProxyType({})
 
 
 def request_tokens(question: fluency.Question, payload_text: str,
@@ -671,6 +678,45 @@ def limit_check_available() -> bool:
     tokenizer rather than printing a 100% saving, and this is the same disclosure for the
     same reason."""
     return count_cl100k("probe") is not None
+
+
+def cell_tool(env: dict) -> str:
+    """The tool name a codec verdict cell is keyed on (#403 Blocker 3).
+
+    multiproxy qualifies a peer's tool as `<peer>__<tool>`, so ONE tool was captured under
+    two spellings and graded as two cells — `kb.read.list_nodes` n=12 beside
+    `kb__kb.read.list_nodes` n=12, instead of one n=24 cell, on the axis where sample size
+    decides whether a verdict exists. 10 tools were split this way in the live corpus.
+
+    Composed from two existing helpers rather than a third canonicalizer:
+    `stats.canonical_tool` strips a `<peer>__` prefix ONLY when it equals the recorded
+    server, then `capture.qualify` produces the policy name (#158) — the name a rule is
+    authored under, `coverage` counts by and `measure` tags with. The verdict answers a POLICY
+    question (#295: compress THIS shape, for THIS tool?), so its cell carries that name.
+
+    **Why not `capture.qualified_tool` directly**, which is the same name on every envelope a
+    router can produce: it strips ANY `__` prefix unverified. Adversarial review traced two
+    ways that pools DIFFERENT tools into one verdict — a legacy envelope with no `server`
+    (`gh__search` and `kb__search` both became `search`), and a tool whose own name contains
+    `__` (`issues__list` under `server=gh` became `gh.list`, the cell of gh's real `list`). A
+    wrong merge is worse than the split it fixes: it pools two tools' evidence into one
+    verdict. `coverage` tolerates that guess because a count is not a safety claim; a verdict
+    cannot. Only a VERIFIED router prefix is stripped here, so on every envelope multiproxy
+    writes (`server_name=spec.name` per peer, `multiproxy.py`) this equals `qualified_tool`,
+    and it diverges only where that function would be guessing.
+
+    A non-string `tool` reads as `"?"`, as it did before this key existed:
+    `capture.load_corpus` only requires the key to be present, and a hand-built corpus is
+    otherwise handled defensively throughout this module."""
+    from .stats import canonical_tool
+
+    tool = env.get("tool")
+    if not isinstance(tool, str):
+        return "?"
+    server = env.get("server")
+    server = server if isinstance(server, str) and server else None
+    bare = canonical_tool(server, tool) if server is not None else tool
+    return capture.qualify(bare, server)
 
 
 def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
@@ -749,6 +795,10 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
     skipped_unaskable = 0
     progress = fluency.guarded(progress)
     started = time.monotonic()
+    # Deduplication happens INSIDE the loop, after the askability skip below — never before
+    # it. See the comment at the check.
+    asked_payloads: set[tuple[str, str]] = set()
+    merged_duplicates: dict[str, int] = {}
     for i, env in enumerate(envelopes, 1):
         try:
             obj = json.loads(env["raw"])
@@ -758,10 +808,29 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
             # One line per skip, like `run_drop_fluency` (#267): `done` reaches `total`
             # without M near-identical lines per skipped envelope.
             if progress is not None:
-                progress(f"[fluency --codec-verdict] (skipped) {env.get('tool', '?'):<24} "
+                progress(f"[fluency --codec-verdict] (skipped) "
+                         f"{cell_tool(env):<24} "
                          f"{i}/{len(envelopes)} payload(s)")
             skipped_unaskable += 1
             continue
+        # The same payload under two spellings of one tool (#403 Blocker 3). `load_corpus` keys
+        # files `<tool>__<sha>.json`, so a payload captured behind a router AND behind a plain
+        # proxy loads as two envelopes; merged into one cell and scored twice, it would pad `n`
+        # toward the SAFE floor with no new evidence — the shape #406 closed for unencoded
+        # payloads. Checked here, AFTER the askability skip, not in a pre-pass: both reviews
+        # of the first cut found it counting duplicates that were never asked anyway, and on
+        # the live corpus BOTH duplicates are error text (`Error executing tool
+        # kb.read.get: ...`) — unaskable, so the report's "asked once" was false on the only
+        # real instances. The guard is still load-bearing for an askable duplicate; the live
+        # corpus simply holds none. A sha-less envelope is never merged: nothing proves it is
+        # the same payload as another.
+        dup_sha = env.get("sha")
+        if isinstance(dup_sha, str) and dup_sha:
+            dup_key = (cell_tool(env), dup_sha)
+            if dup_key in asked_payloads:
+                merged_duplicates[dup_key[0]] = merged_duplicates.get(dup_key[0], 0) + 1
+                continue
+            asked_payloads.add(dup_key)
         toks = _payload_tokens(env["raw"], obj)
         # `sha` is OMITTED, never defaulted, when the envelope has no usable one. `tool`
         # defaults because it is a LABEL — a group headed `?` is legible. `shape` carries a
@@ -778,7 +847,7 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
         # `capture.record` always writes `sha`, but `capture.load_corpus` does not require
         # it, so a foreign or hand-built corpus reaches here without one.
         sha = env.get("sha")
-        tags: dict[str, Any] = {"tool": env.get("tool", "?"),
+        tags: dict[str, Any] = {"tool": cell_tool(env),   # #403 Blocker 3
                                 "shape": capture.envelope_shape(env, "unknown")}
         if isinstance(sha, str) and sha:
             tags["sha"] = sha
@@ -799,7 +868,7 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                 if progress is not None:
                     arms = ", ".join(f"{a} {n:,}" for a, n in over)
                     progress(f"[fluency --codec-verdict] (over limit) "
-                             f"{env.get('tool', '?'):<24} {name}: {arms} > {limit:,} "
+                             f"{str(tags['tool']):<24} {name}: {arms} > {limit:,} "
                              f"max_input_tokens — not asked")
                 continue
             for row in run_codec_payload(obj, env["raw"], answerer, trials=trials):
@@ -808,4 +877,5 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                 progress(fluency.progress_line("fluency --codec-verdict", name, i,
                                                len(envelopes), results[name], started))
     return CodecRun(results, excluded, skipped_unaskable,
-                    limit_check_ran=(not limits) or limit_check_available())
+                    limit_check_ran=(not limits) or limit_check_available(),
+                    merged_duplicates=merged_duplicates)
