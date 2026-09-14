@@ -15,6 +15,43 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **An UNRESOLVED codec cell names every reason it is unresolved, not only the first
+  (#403).** The renderer walked an `elif` chain and stopped at the first gate that applied.
+  On the 2026-09-14 re-run `kb.read.list_principles` printed "terse arm delivered 29% of its
+  answers through the tool call, need 80%" — true, and incomplete: the cell was also at n=7
+  against a 20-trial floor, so fixing compliance alone would still have left it UNRESOLVED,
+  after another hour-long run. The reasons now come from `report.codec_unresolved_reasons`,
+  built from the same predicates `codec_verdict` gates on, and a grid test holds the
+  invariant that a cell is UNRESOLVED exactly when at least one reason is named — so a gate
+  cannot be added without a reason, or a reason without a gate.
+
+- **Corrected a false claim published with #409, in five places.** The CHANGELOG entry, two
+  docstrings, #409's PR body and a #403 comment said `b0e5f862`'s terse arm "fits by payload
+  alone, then does not fit once the prompt and tool schema are added", as the motivating
+  case for counting the whole request. It was inferred, never executed, and false: that
+  arm's whole request is **32,650** cl100k, under the 32,768 limit, and the live re-run
+  listed only the RAW arm (35,847) as over. The payload was excluded anyway, because both
+  arms go together, and counting the whole request is still right — but that example was
+  not evidence for it.
+
+### Changed
+
+- **The input-limit check's cl100k count is now documented as measured to UNDER-count.**
+  Against the gateway's own `usage.prompt_tokens` on the exact request a trial sends, 78 of
+  78 requests on two Qwen models read higher in the model's tokens than in cl100k:
+  **1.08x-1.20x** on ordinary JSON and **1.67x-1.68x** on numeric-dense payloads (the 123k
+  `embedding` captures — Qwen tokenizes digits far more finely). So the #409 check is
+  permissive in the direction that matters: it passes requests that are really over the
+  limit. The report's Corpus coverage section now says so instead of claiming the drift was
+  never measured. **No correction factor is applied**, because the drift is
+  content-dependent: any single factor loose enough not to exclude ordinary payloads still
+  misses numeric-dense ones. Tightening it needs the model's own tokenizer or a per-content
+  bound, and stays open on #403.
+
+## [0.33.3] - 2026-09-14
+
+### Fixed
+
 - **The codec verdict grades one tool as one cell, not two (#403 Blocker 3).** Cells were
   keyed on the captured tool name verbatim, and multiproxy qualifies a peer's tool as
   `<peer>__<tool>` — so the same tool, reached through a router and through a plain proxy,
@@ -65,8 +102,8 @@ fails that pull request until the section has moved.
 
   The serious half is an arm asymmetry that is **structural, not incidental**: terse's whole
   purpose is that the compressed arm is smaller, so there is always a band where the RAW arm
-  exceeds the limit and the TERSE arm does not — `b0e5f862` sits in it at 35,707 vs 32,510
-  against 32,768. Scored rather than excluded, the control arm reads a truncated payload
+  exceeds the limit and the TERSE arm does not — `b0e5f862` sits in it by cl100k, at whole
+  requests of 35,847 vs 32,650 against 32,768. Scored rather than excluded, the control arm reads a truncated payload
   while the treatment arm reads a whole one, which flatters terse and can manufacture a
   false SAFE. That is #408's finding one layer out: an asymmetry in what the two arms are
   actually asked.
@@ -82,8 +119,9 @@ fails that pull request until the section has moved.
   smallest-context model cannot shrink the corpus every other model is scored on.
 
   Counted on the **whole request** — prompt, instruction, payload and tool schema — not the
-  payload alone: `b0e5f862`'s terse arm fits by payload (32,510 < 32,768) and does not fit
-  once the prompt is added, so a payload-only check would miss the case that motivated it.
+  payload alone, since that is what the model is sent. *(Corrected 2026-09-14: this entry
+  originally claimed `b0e5f862`'s terse arm fits by payload and not by request. It was never
+  true — the whole request is 32,650 cl100k, under 32,768.)*
 
   **An exclusion withholds SAFE, and never withholds UNSAFE.** Adversarial review falsified
   the first design's central claim. "Excluding by a predeclared property of the input is
@@ -124,9 +162,8 @@ fails that pull request until the section has moved.
   for; a duplicate model in the flag is refused rather than silently last-wins.
 
   `count_cl100k` is an approximation for these non-OpenAI models. It catches a clear overrun
-  (`b0e5f862`'s raw arm is 9% over) and may miss a marginal one; **no correction factor is
-  applied because none has been measured** — measuring the drift against the gateway's
-  reported `usage.prompt_tokens` and tightening the check is open work on #403. Also open
+  (`b0e5f862`'s raw arm is 9% over) and may miss a marginal one. *(Corrected 2026-09-14:
+  the drift has since been measured — see [Unreleased].)* Also open
   and stated rather than fixed: the bound is **input-only**. Where a backend shares one
   window between prompt and completion, a payload that fits can still leave the raw arm less
   room to answer than the terse arm — the same asymmetry one step further on, unmeasured

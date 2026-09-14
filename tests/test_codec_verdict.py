@@ -301,3 +301,84 @@ def test_an_arm_dependent_prose_habit_no_longer_manufactures_UNSAFE():
     # ...and the cell is UNRESOLVED on compliance rather than UNSAFE. NOT SAFE either: at
     # 50% compliance the run never showed a value reaching a real tool argument.
     assert codec_verdict(rows)[0] == "UNRESOLVED"
+
+
+# --------------------------------------------------------------------------- #
+# Every reason an UNRESOLVED cell is unresolved — not just the first (#403)
+# --------------------------------------------------------------------------- #
+def _cell(report: str) -> str:
+    return next(ln for ln in report.splitlines() if ln.startswith("| `t` |"))
+
+
+def test_an_unresolved_cell_names_BOTH_compliance_and_the_trial_floor():
+    """The 2026-09-14 re-run: `kb.read.list_principles` printed only "terse arm delivered 29%
+    of its answers through the tool call" — true, and incomplete. It was also n=7 against a
+    20-trial floor, so fixing compliance alone would still leave it UNRESOLVED. This row
+    reproduces that cell's shape: one question, 7 trials, 2 of 7 through the tool."""
+    rows = [dict(_row("q", 7, 7, trials=7, raw_calls=7, terse_calls=2),
+                 tool="t", shape="array-of-records")]
+    cell = _cell(build_codec_verdict_report({"m": rows}))
+    assert "**UNRESOLVED**" in cell
+    assert "delivered 29%" in cell
+    assert "only 7 zero-failure trial(s), need 20" in cell
+
+
+def test_an_unresolved_cell_names_the_trimmed_corpus_AND_the_trial_floor():
+    from terse.codeceval import OversizedPayload
+
+    rows = [dict(_row("q", 3, 3, trials=3, raw_calls=3, terse_calls=3),
+                 tool="t", shape="array-of-records")]
+    excluded = [OversizedPayload(model="m", tool="t", shape="array-of-records", sha="s",
+                                 arm="raw", tokens=99, limit=10)]
+    cell = _cell(build_codec_verdict_report({"m": rows}, excluded=excluded))
+    assert "trimmed corpus" in cell
+    assert "only 3 zero-failure trial(s)" in cell
+
+
+def test_all_three_reasons_at_once_are_all_named():
+    from terse.codeceval import OversizedPayload
+
+    rows = [dict(_row("q", 5, 5, trials=5, raw_calls=5, terse_calls=0),
+                 tool="t", shape="array-of-records")]
+    excluded = [OversizedPayload(model="m", tool="t", shape="array-of-records", sha="s",
+                                 arm="raw", tokens=99, limit=10)]
+    cell = _cell(build_codec_verdict_report({"m": rows}, excluded=excluded))
+    assert cell.count(";") == 2, cell
+    for part in ("trimmed corpus", "delivered 0%", "only 5 zero-failure"):
+        assert part in cell, part
+
+
+def test_a_single_reason_is_still_rendered_alone():
+    # Full compliance and nothing excluded — only the trial floor fails. The join must not
+    # invent a separator around a lone reason.
+    rows = [dict(_row("q", 5, 5, trials=5, raw_calls=5, terse_calls=5),
+                 tool="t", shape="array-of-records")]
+    cell = _cell(build_codec_verdict_report({"m": rows}))
+    assert "only 5 zero-failure trial(s), need 20" in cell
+    assert ";" not in cell.split("**UNRESOLVED**")[1]
+
+
+def test_every_unresolved_cell_names_at_least_one_reason():
+    """The invariant that keeps reasons and gates from drifting apart.
+
+    Over a grid of cells, whenever `codec_verdict` returns UNRESOLVED for a reason other than
+    `arm_gap` exclusion, `codec_unresolved_reasons` must name at least one reason — and
+    whenever it names none, the verdict must not be UNRESOLVED. A gate added to
+    `codec_verdict` without a matching reason fails here; so does a reason with no gate."""
+    from terse.report import codec_unresolved_reasons
+
+    checked = 0
+    for trials in (1, 5, 10, 20, 25):
+        for terse_calls_share in (0.0, 0.5, 0.79, 0.8, 1.0):
+            for dropped in (0, 1):
+                tc = round(trials * terse_calls_share)
+                rows = [_row("q", trials, trials, trials=trials,
+                             raw_calls=trials, terse_calls=tc)]
+                verdict, gap = codec_verdict(rows, excluded_from_group=dropped)
+                if gap.excluded:
+                    continue
+                reasons = codec_unresolved_reasons(rows, dropped, "m")
+                assert (verdict == "UNRESOLVED") == bool(reasons), (
+                    trials, terse_calls_share, dropped, verdict, reasons)
+                checked += 1
+    assert checked >= 40, "the grid collapsed — the invariant was checked on too few cells"

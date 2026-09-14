@@ -1687,9 +1687,10 @@ def _codec_corpus_section(excluded: Sequence[Any],
                        f"{e.tokens:,} | {e.limit:,} |")
         out.append("")
         out += ["Counted on the whole request (prompt, instruction, payload, tool schema),",
-                "in cl100k — an approximation, since these are not OpenAI models. It catches",
-                "a clear overrun and may miss a marginal one; no correction factor is applied",
-                "because none has been measured.", ""]
+                "in cl100k. **cl100k under-counts these models' own tokens** — measured at",
+                "1.08x-1.20x on ordinary JSON and ~1.67x on numeric-dense payloads — so this",
+                "check can pass a request that is really over the limit. No single correction",
+                "factor is applied because the drift depends on content.", ""]
     elif not limit_check_ran:
         out += ["**The limit check did not run**: no tokenizer was available, so no request",
                 "size could be measured and every payload was asked unchecked. This is not",
@@ -1703,6 +1704,43 @@ def _codec_corpus_section(excluded: Sequence[Any],
                     f"over the whole corpus, unchecked. Pass `--max-input-tokens MODEL=N`.",
                     ""]
     return out
+
+
+def codec_unresolved_reasons(rows: list[dict[str, Any]], excluded_from_group: int = 0,
+                             model: str = "") -> list[str]:
+    """EVERY reason a non-excluded codec cell is UNRESOLVED, in the order `codec_verdict`
+    applies its gates. Empty when the cell is not UNRESOLVED for one of these reasons.
+
+    The renderer used to print only the FIRST reason that applied. Measured on the
+    2026-09-14 re-run: `kb.read.list_principles` printed "terse arm delivered 29% of its
+    answers through the tool call, need 80%" — true, and incomplete. The cell was ALSO at
+    n=7 against a 20-trial floor (one payload, one question, `--trials 7`), so fixing the
+    compliance problem alone would still have left it UNRESOLVED. A reason list that stops at
+    the first hit sends the operator to fix one thing and re-run for an hour to learn the
+    next.
+
+    Kept beside `codec_verdict`, and deliberately built from the SAME predicates
+    (`excluded_from_group`, `codec_call_rate` against `_CODEC_MIN_CALL_RATE`, the trial count
+    against `_CODEC_MIN_TRIALS`) rather than re-derived in the renderer, so the reasons cannot
+    drift from the gates they explain. `test_every_unresolved_cell_names_at_least_one_reason`
+    holds that invariant over a grid of rows. A cell withheld by `arm_gap` (`g.excluded`:
+    lost calls, a broken control) is not covered here — there the comparison itself is
+    unusable, and naming compliance or trial counts computed over it would be noise."""
+    reasons: list[str] = []
+    if excluded_from_group > 0:
+        who = f"`{model}`" if model else "a model"
+        reasons.append(f"{excluded_from_group} payload(s) not asked of {who} — over its input "
+                       f"limit, so this cell was scored on a trimmed corpus")
+    low = _codec_low_call_arm(rows)
+    if low is not None:
+        arm, rate = low
+        reasons.append(f"{arm} arm delivered {rate:.0%} of its answers through the tool call, "
+                       f"need {_CODEC_MIN_CALL_RATE:.0%} — the run cannot show a value "
+                       f"surviving into a downstream tool argument")
+    n = sum(_arm_trials(r, "terse_ok") for r in rows)
+    if n < _CODEC_MIN_TRIALS:
+        reasons.append(f"only {n} zero-failure trial(s), need {_CODEC_MIN_TRIALS}")
+    return reasons
 
 
 def _codec_merge_section(merged_duplicates: Mapping[str, int]) -> list[str]:
@@ -1856,16 +1894,11 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
                   f"(raw {worst_gap.control_acc:.0%}, terse {worst_gap.form_acc:.0%})")
         elif worst_gap.excluded:
             why = REASON_LABEL.get(worst_gap.excluded, worst_gap.excluded)
-        elif worst_verdict == "UNRESOLVED" and dropped.get(worst_model):
-            why = (f"{dropped[worst_model]} payload(s) not asked of `{worst_model}` — over "
-                   f"its input limit, so this cell was scored on a trimmed corpus")
-        elif worst_verdict == "UNRESOLVED" and (low := _codec_low_call_arm(worst_gap.rows)):
-            arm, rate = low
-            why = (f"{arm} arm delivered {rate:.0%} of its answers through the tool call, "
-                   f"need {_CODEC_MIN_CALL_RATE:.0%} — the run cannot show a value "
-                   f"surviving into a downstream tool argument")
         elif worst_verdict == "UNRESOLVED":
-            why = f"only {n} zero-failure trial(s), need {_CODEC_MIN_TRIALS}"
+            # ALL of them, not the first — see `codec_unresolved_reasons`.
+            reasons = codec_unresolved_reasons(worst_gap.rows,
+                                               dropped.get(worst_model, 0), worst_model)
+            why = "; ".join(reasons) or "no zero-failure evidence"
         else:
             why = f"{n} zero-failure trials"
         # Distinct questions per type, from the rows the verdict was computed over. `n` counts
