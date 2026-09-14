@@ -1705,12 +1705,36 @@ def _codec_corpus_section(excluded: Sequence[Any],
     return out
 
 
+def _codec_merge_section(merged_duplicates: Mapping[str, int]) -> list[str]:
+    """Which cells had a payload captured under two spellings of their tool (#403 Blocker 3).
+
+    Its own section, NOT a line under **Corpus coverage**: that section's intro explains
+    payloads declined for not fitting a model's input limit, and a merge is not that — the
+    first cut rendered the note there, where its surrounding text gave the wrong reason.
+
+    Per cell rather than a run total, so a reader can tell WHICH cell's `n` a merge touched.
+    Silent when nothing merged: a section announcing zero merges would imply a class of event
+    the reader should have been worried about in a run where none occurred."""
+    if not merged_duplicates:
+        return []
+    out = ["## Tool name spellings merged", "",
+           "A tool reached through a router is captured as `<peer>__<tool>` and through a plain",
+           "proxy under its bare name. This report grades both as ONE cell, keyed on the name a",
+           "policy rule is authored under. Where the SAME payload was captured under both",
+           "spellings it was asked once, not twice — scoring it twice would count one payload's",
+           "evidence twice toward the SAFE trial floor.", "",
+           "| Tool | Payloads asked once instead of twice |", "|---|---|"]
+    out += [f"| `{tool}` | {n} |" for tool, n in sorted(merged_duplicates.items())]
+    return out + [""]
+
+
 def build_codec_verdict_report(results: dict[str, list[dict]],
                                excluded: Sequence[Any] = (),
                                limits: dict[str, int] | None = None,
                                models: Sequence[str] | None = None,
                                skipped_unaskable: int = 0,
-                               limit_check_ran: bool = True) -> str:
+                               limit_check_ran: bool = True,
+                               merged_duplicates: Mapping[str, int] | None = None) -> str:
     """Render the codec-tier material-preservation eval, grouped by `(tool, shape)` — never
     as one global number (#295's explicit non-goal). `results` is
     `{model: [row, ...]}` from `codeceval.run_codec_fluency`; each row carries `tool` and
@@ -1756,6 +1780,7 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
             "",
         ]
         out += _codec_corpus_section(excluded, limits, models, limit_check_ran)
+        out += _codec_merge_section(merged_duplicates or {})
         return "\n".join(out)
 
     if not any(results.values()):
@@ -1855,6 +1880,7 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
                    f"`{worst_model}` | {why} |")
     out.append("")
     out += _codec_corpus_section(excluded, limits, models, limit_check_ran)
+    out += _codec_merge_section(merged_duplicates or {})
     out += _codec_savings_section(groups, excluded)
     return "\n".join(out)
 

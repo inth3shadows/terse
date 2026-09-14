@@ -15,6 +15,46 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **The codec verdict grades one tool as one cell, not two (#403 Blocker 3).** Cells were
+  keyed on the captured tool name verbatim, and multiproxy qualifies a peer's tool as
+  `<peer>__<tool>` — so the same tool, reached through a router and through a plain proxy,
+  was graded as two cells: `kb.read.list_nodes` n=12 beside `kb__kb.read.list_nodes` n=12
+  instead of one n=24 cell, on the axis where sample size decides whether a verdict exists.
+  **10 tools** were split this way in the live corpus, not only the kb ones —
+  `runecho.structure`, `runecho.locate` and `codegraph.codegraph_explore` too.
+
+  Cells are now keyed on the **policy name** — the name a rule is authored under, `coverage`
+  counts by and `measure` already tags with (#158) — because the verdict answers a POLICY
+  question (#295: compress THIS shape, for THIS tool?), and a verdict filed under a name no
+  rule can carry is unactionable. **Cells are renamed even where nothing merges** —
+  `structure` becomes `runecho.structure` — which is the name the policy file already uses.
+
+  The key is reached by stripping a `<peer>__` prefix **only when it equals the recorded
+  server**, then qualifying — composed from the existing `stats.canonical_tool` and
+  `capture.qualify`, not a new canonicalizer. On every envelope multiproxy writes (it records
+  the peer as `server`) that equals `capture.qualified_tool`. It deliberately diverges where
+  that function guesses: adversarial review traced `qualified_tool` pooling DIFFERENT tools
+  into one verdict — `gh__search` and `kb__search` with no `server` both became `search`, and
+  `issues__list` under `server=gh` landed in the cell of gh's real `list`. A wrong merge is
+  worse than the split it fixes, because it pools two tools' evidence into one safety claim.
+  None occur in the live corpus; they are pinned anyway.
+
+  **Merging opened a trap, closed in the same change: the same payload scored twice.** A
+  payload captured under both spellings loads as two envelopes, so one payload could be asked
+  twice and counted twice in one cell, padding `n` toward the SAFE floor with no new
+  evidence — the shape #406 closed once. The sweep now asks the first envelope per
+  `(cell tool, sha)` and skips the rest, and a new `## Tool name spellings merged` section
+  lists, per cell, how many were merged. The check runs **after** the askability skip:
+  both reviews of the first cut found it counting duplicates that were never asked, and the
+  live corpus's only two duplicates are error text (`Error executing tool kb.read.get: ...`),
+  so the report's "asked once" was false on every real instance. The guard pins the mechanism
+  for an askable duplicate; the live corpus holds none. An envelope with no `sha` is never
+  merged, since nothing proves it is the same payload.
+
+## [0.33.2] - 2026-09-14
+
+### Fixed
+
 - **The codec eval no longer scores a payload the model cannot fit (#403 Blocker 4).**
   `run_codec_fluency` sent every corpus payload to every model with no check that the
   request fits its `max_input_tokens`. Measured 2026-09-10: `qwen3-coder-30b-fl` (32,768)
