@@ -76,9 +76,10 @@ def _needs_a_tokenizer():
 # request_tokens — the WHOLE request, not the payload
 # --------------------------------------------------------------------------- #
 def test_request_tokens_counts_more_than_the_payload():
-    """`b0e5f862`'s terse arm is 32,510 tokens against a 32,768 limit — it fits by payload
-    and does not fit once the prompt, instruction and tool schema are added. A payload-only
-    check would miss exactly the case that motivated this."""
+    """The limit is measured against what the model is SENT, so the prompt, instruction and
+    tool schema count too. (This docstring used to cite `b0e5f862`'s terse arm as fitting by
+    payload and not by request; that was never true — its whole request is 32,650 cl100k,
+    under 32,768. Corrected 2026-09-14.)"""
     from terse.tokenize import count_cl100k
 
     q = codeceval.gen_codec_questions(PAYLOAD)[0]

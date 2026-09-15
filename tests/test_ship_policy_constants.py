@@ -178,8 +178,9 @@ def test_nineteen_zero_failure_trials_are_UNRESOLVED():
     the fixture slides with the value it is supposed to hold still. Verified by mutation —
     the relative form left both of these green at a floor of 19 and at 21.
 
-    Together the pair also fixes the comparison as INCLUSIVE (`n >= _CODEC_MIN_TRIALS`):
-    a `>` would turn the 20-trial case below UNRESOLVED."""
+    Together the pair also fixes the comparison as INCLUSIVE (SAFE at exactly the floor, i.e.
+    the reason fires on `n < _CODEC_MIN_TRIALS` in `codec_unresolved_reasons`): a `<=`
+    would turn the 20-trial case below UNRESOLVED."""
     assert codec_verdict(_codec_row(19))[0] == "UNRESOLVED"
 
 
@@ -194,8 +195,9 @@ def test_twenty_zero_failure_trials_are_SAFE():
     it is the anti-pattern this module's docstring describes, living in the file this test
     is meant to reinforce.
 
-    The inclusive `>=` is NOT this test's contribution: mutating `n >= _CODEC_MIN_TRIALS`
-    to `n >` reddens both `test_codec_verdict.py` tests as well. What is new here is the
+    The inclusive comparison is NOT this test's contribution: mutating the trial-floor
+    reason's `n < _CODEC_MIN_TRIALS` to `n <=` reddens both `test_codec_verdict.py` tests
+    as well. What is new here is the
     floor's VALUE, held by a literal 20 that cannot slide."""
     assert codec_verdict(_codec_row(20))[0] == "SAFE"
 

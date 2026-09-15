@@ -621,17 +621,29 @@ def request_tokens(question: fluency.Question, payload_text: str,
     """cl100k count of the REAL request one trial sends, or `None` without a tokenizer.
 
     The whole request, not the payload: `_codec_turn`'s user message plus the serialized
-    tool definitions the answerer binds. `b0e5f862` is why — its terse arm is 32,510 tokens
-    against a 32,768 limit and fits by payload alone, then does not fit once the prompt and
-    the tool schema are added. A payload-only check would miss the exact case that motivated
-    the check.
+    tool definitions the answerer binds, because that is what the model is sent and what its
+    limit is measured against.
 
-    `count_cl100k` is an approximation here: the models this eval runs against are not
-    OpenAI models and do not use cl100k. The count is close enough to catch a clear overrun
-    (`b0e5f862`'s raw arm is 9% over) and may miss a marginal one. No correction factor is
-    applied, because none has been measured — inventing one would be a guess wearing the
-    costume of a bound. Measuring the drift against `usage.prompt_tokens` and tightening
-    this is open work on #403."""
+    CORRECTED 2026-09-14. This docstring previously cited `b0e5f862` as the motivating case —
+    "its terse arm is 32,510 tokens and fits by payload alone, then does not fit once the
+    prompt and the tool schema are added." That was an inference, never executed, and it is
+    false: the terse arm's whole request is **32,650** cl100k, under 32,768 — the live re-run
+    listed only the RAW arm (35,847) as over. The payload is excluded anyway, because both
+    arms go together. The whole-request count is still right in general; that example was
+    not evidence for it.
+
+    `count_cl100k` UNDER-counts, measured. Against the gateway's own `usage.prompt_tokens` on
+    the exact request a trial sends, 78 of 78 requests read higher in the model's tokens than
+    in cl100k: **1.08x-1.20x** on ordinary JSON and **1.67x-1.68x** on numeric-dense payloads
+    (the 123k `embedding` captures — Qwen tokenizes digits far more finely than cl100k). So
+    this check is permissive in the direction that matters: it passes requests that are
+    really over the limit. `b0e5f862`'s terse arm is the likely live example — 32,650 cl100k,
+    which the measured ratios PROJECT to ~35k-39k in the model's tokens if its content reads
+    like ordinary JSON, over 32,768 at both ends. Projected, not measured: that request's own
+    `usage.prompt_tokens` was never read. No correction factor is applied, and not for lack of a
+    measurement: the drift is CONTENT-dependent, so any single factor small enough not to
+    exclude ordinary payloads still misses numeric-dense ones. Tightening this needs the
+    model's own tokenizer or a per-content bound; open on #403."""
     text = fluency._user_prompt(question.prompt, _codec_instruction(), payload_text)
     tools = json.dumps(tool_defs if tool_defs is not None else [RECORD_VALUE_TOOL_DEF])
     return count_cl100k(text + tools)
@@ -647,8 +659,10 @@ def oversized_arms(obj: Any, raw_text: str, limit: int,
 
     The asymmetry this exists to catch is structural, not incidental: terse's entire purpose
     is that the compressed arm is smaller, so there is always a band where the RAW arm is
-    over the limit and the TERSE arm is not. `b0e5f862` sits in it — 35,707 vs 32,510
-    against 32,768. Scored rather than excluded, the CONTROL arm reads a truncated payload
+    over the limit and the TERSE arm is not. `b0e5f862` sits in it by cl100k — whole requests
+    of 35,847 vs 32,650 against 32,768 (in the model's OWN tokens both arms are PROJECTED
+    over, not measured; see `request_tokens` on the drift). Scored rather than excluded, the CONTROL arm
+    reads a truncated payload
     while the TREATMENT arm reads a whole one, which flatters terse and can manufacture a
     false SAFE. That is #408's finding one layer out: an asymmetry in what the arms are
     actually asked."""

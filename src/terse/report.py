@@ -1405,19 +1405,17 @@ def fixed_ideal_sufficient(n: int | None) -> bool:
 _VERDICT_RANK = {"SAFE": 0, "UNRESOLVED": 1, "UNSAFE": 2}  # worst wins when grouping models
 
 
-def _codec_low_call_arm(rows: list[dict[str, Any]]) -> tuple[str, float] | None:
-    """`(arm, rate)` for the worst arm whose tool-call compliance is below
-    `_CODEC_MIN_CALL_RATE`, or `None` when every measured arm clears it.
+def _codec_low_call_arms(rows: list[dict[str, Any]]) -> list[tuple[str, float]]:
+    """`(arm, rate)` for EVERY arm whose tool-call compliance is below
+    `_CODEC_MIN_CALL_RATE`, worst first; empty when every measured arm clears it.
 
-    The renderer's half of the gate `codec_verdict` applies, kept beside it so the table's
-    "Why" names the arm and the number rather than falling through to the trial-count
-    reason, which would be true but would point at the wrong cause. Returns the WORST arm,
-    not the first, so a cell where both arms are non-compliant reports the one that
-    explains most of it."""
+    Every arm, not the worst one: the first cut returned `min(...)`, so a cell with raw at
+    50% and terse at 30% named only terse — and fixing terse left it UNRESOLVED on raw, the
+    same first-reason-only defect `codec_unresolved_reasons` exists to remove."""
     low = [(form[:-len("_ok")], rate) for form in ("raw_ok", "terse_ok")
            if (rate := codec_call_rate(rows, form)) is not None
            and rate < _CODEC_MIN_CALL_RATE]
-    return min(low, key=lambda t: t[1]) if low else None
+    return sorted(low, key=lambda t: t[1])
 
 
 def codec_verdict(rows: list[dict[str, Any]],
@@ -1448,42 +1446,23 @@ def codec_verdict(rows: list[dict[str, Any]],
     # SAFE unreachable for this tier: a codec group is characteristically one question run
     # many times (`test_identical_partial_failure_on_both_arms_at_the_trial_floor_is_SAFE`
     # is a single row at 25 trials), so it would never reach 20 paired questions. This is
-    # not an exemption from sample-size gating — `_CODEC_MIN_TRIALS` below is the same
+    # not an exemption from sample-size gating — `_CODEC_MIN_TRIALS`, applied in
+    # `codec_unresolved_reasons`, is the same
     # Clopper-Pearson floor in the unit this verdict actually counts in. Layering a second
     # floor in a different unit would silently re-calibrate a tier that already decided
     # this question, without saying so anywhere near `_CODEC_MIN_TRIALS`.
     g = arm_gap(rows, "terse_ok", "raw_ok", min_paired=0)
     if g.excluded:
         return "UNRESOLVED", g
-    n = sum(_arm_trials(r, "terse_ok") for r in g.rows)
     excess_terse_misses = sum(max(0, int(r["raw_ok"]) - int(r["terse_ok"])) for r in g.rows)
     if excess_terse_misses > 0:
         return "UNSAFE", g
-    # Compliance gates SAFE only, and is checked AFTER the corruption gate on purpose: an
-    # observed excess is scored channel-independently (`codeceval._ask_codec_question`), so
-    # it is real whether or not the model kept to the tool protocol, and withholding it here
-    # would suppress the finding this tier exists to make. See `_CODEC_MIN_CALL_RATE`.
-    if any((rate := codec_call_rate(g.rows, form)) is not None
-           and rate < _CODEC_MIN_CALL_RATE for form in ("raw_ok", "terse_ok")):
+    # Every SAFE-blocking gate lives in `codec_unresolved_reasons` and nowhere else, so the
+    # verdict IS "any reason named" — a gate cannot exist without the sentence the table
+    # prints for it. Consulted AFTER the corruption gate on purpose: see that function.
+    if codec_unresolved_reasons(g.rows, excluded_from_group):
         return "UNRESOLVED", g
-    # A payload this cell never asked, because it exceeded a model's input limit (#403
-    # Blocker 4), blocks SAFE for the same reason and in the same direction — never UNSAFE.
-    #
-    # `codeceval.run_codec_fluency` argues that excluding by a PREDECLARED PROPERTY OF THE
-    # INPUT is categorically unlike #302 F3's ban on excluding by OUTCOME. That is true of
-    # the SELECTION and false of the CONSEQUENCE, and the difference is this gate. Payload
-    # SIZE is not independent of what the eval measures: the largest payloads are the widest
-    # tables, which are exactly where a positional row lookup fails (#408's finding). So
-    # trimming by size trims the evidence most likely to demonstrate corruption.
-    #
-    # Executed, same corpus and same answerers, `trials=20`: a cell reading UNSAFE (raw
-    # 100%, terse 50%) read **SAFE** once the payload carrying the failure was excluded for
-    # one model. Not a hypothetical — that flip is what this gate exists to stop.
-    if excluded_from_group > 0:
-        return "UNRESOLVED", g
-    if n >= _CODEC_MIN_TRIALS:
-        return "SAFE", g
-    return "UNRESOLVED", g
+    return "SAFE", g
 
 
 def _codec_savings_section(
@@ -1687,9 +1666,10 @@ def _codec_corpus_section(excluded: Sequence[Any],
                        f"{e.tokens:,} | {e.limit:,} |")
         out.append("")
         out += ["Counted on the whole request (prompt, instruction, payload, tool schema),",
-                "in cl100k — an approximation, since these are not OpenAI models. It catches",
-                "a clear overrun and may miss a marginal one; no correction factor is applied",
-                "because none has been measured.", ""]
+                "in cl100k. **cl100k under-counts these models' own tokens** — measured at",
+                "1.08x-1.20x on ordinary JSON and ~1.67x on numeric-dense payloads — so this",
+                "check can pass a request that is really over the limit. No single correction",
+                "factor is applied because the drift depends on content.", ""]
     elif not limit_check_ran:
         out += ["**The limit check did not run**: no tokenizer was available, so no request",
                 "size could be measured and every payload was asked unchecked. This is not",
@@ -1703,6 +1683,85 @@ def _codec_corpus_section(excluded: Sequence[Any],
                     f"over the whole corpus, unchecked. Pass `--max-input-tokens MODEL=N`.",
                     ""]
     return out
+
+
+def _codec_trimmed_reason(excluded: int, model: str) -> str:
+    who = f"`{model}`" if model else "a model"
+    return (f"{excluded} payload(s) not asked of {who} — over its input limit, so this cell "
+            f"was scored on a trimmed corpus")
+
+
+def codec_unresolved_reasons(rows: list[dict[str, Any]], excluded_from_group: int = 0,
+                             model: str = "") -> list[str]:
+    """EVERY reason a codec cell's evidence cannot license SAFE — and the ONLY definition of
+    those gates. `codec_verdict` returns UNRESOLVED exactly when this is non-empty, once
+    `arm_gap` has not withheld the cell and no corruption was observed.
+
+    NOT a verdict on its own: it does not look for corruption or `arm_gap` exclusion, so an
+    UNSAFE cell or a withheld one can still carry reasons here. Ask `codec_verdict` whether a
+    cell is UNRESOLVED; ask this function why.
+
+    The renderer used to print only the FIRST reason that applied. Measured on the
+    2026-09-14 re-run: `kb.read.list_principles` printed "terse arm delivered 29% of its
+    answers through the tool call, need 80%" — true, and incomplete. The cell was ALSO at
+    n=7 against a 20-trial floor (one payload, one question, `--trials 7`), so fixing the
+    compliance problem alone would still have left it UNRESOLVED. A reason list that stops at
+    the first hit sends the operator to fix one thing and re-run for an hour to learn the
+    next.
+
+    The first cut kept these as a SECOND copy of the predicates `codec_verdict` gated on, and
+    review showed the grid test meant to hold them together could not fail: a gate added to
+    the verdict alone survived it. Now there is one copy, so that drift is unrepresentable."""
+    reasons: list[str] = []
+    # A payload this cell never asked, because it exceeded a model's input limit (#403
+    # Blocker 4), blocks SAFE — never UNSAFE.
+    #
+    # `codeceval.run_codec_fluency` argues that excluding by a PREDECLARED PROPERTY OF THE
+    # INPUT is categorically unlike #302 F3's ban on excluding by OUTCOME. That is true of
+    # the SELECTION and false of the CONSEQUENCE, and the difference is this gate. Payload
+    # SIZE is not independent of what the eval measures: the largest payloads are the widest
+    # tables, which are exactly where a positional row lookup fails (#408's finding). So
+    # trimming by size trims the evidence most likely to demonstrate corruption.
+    #
+    # Executed, same corpus and same answerers, `trials=20`: a cell reading UNSAFE (raw
+    # 100%, terse 50%) read **SAFE** once the payload carrying the failure was excluded for
+    # one model. Not a hypothetical — that flip is what this gate exists to stop.
+    if excluded_from_group > 0:
+        reasons.append(_codec_trimmed_reason(excluded_from_group, model))
+    # Compliance gates SAFE only, and `codec_verdict` consults it AFTER the corruption gate on
+    # purpose: an observed excess is scored channel-independently
+    # (`codeceval._ask_codec_question`), so it is real whether or not the model kept to the
+    # tool protocol, and withholding it would suppress the finding this tier exists to make.
+    # See `_CODEC_MIN_CALL_RATE`.
+    for arm, rate in _codec_low_call_arms(rows):
+        # Truncated to one decimal when whole percents would round a below-floor rate up TO
+        # the floor: 199/250 is 79.6%, and "delivered 80%, need 80%" reads as a
+        # contradiction. Truncated, not rounded, so 79.96% cannot print as 80.0% either.
+        shown = (f"{math.floor(rate * 1000) / 10:.1f}%"
+                 if f"{rate:.0%}" == f"{_CODEC_MIN_CALL_RATE:.0%}" else f"{rate:.0%}")
+        reasons.append(f"{arm} arm delivered {shown} of its answers through the tool call, "
+                       f"need {_CODEC_MIN_CALL_RATE:.0%} — the run cannot show a value "
+                       f"surviving into a downstream tool argument")
+    n = sum(_arm_trials(r, "terse_ok") for r in rows)
+    if n < _CODEC_MIN_TRIALS:
+        reasons.append(f"only {n} zero-failure trial(s), need {_CODEC_MIN_TRIALS}")
+    return reasons
+
+
+def _codec_trials(g: ArmGap) -> int:
+    """Terse-arm trials in the rows a codec verdict was computed over — the table's `n`."""
+    return sum(_arm_trials(r, "terse_ok") for r in g.rows)
+
+
+def _codec_questions(g: ArmGap) -> str:
+    """Distinct questions per type, from the rows the verdict was computed over. `n` counts
+    TRIALS, and a cell of one question run 20 times reads like 20 questions without this
+    beside it (#403 Blocker 2)."""
+    qtypes: dict[str, int] = {}
+    for r in g.rows:
+        qt = str(r.get("qtype", "?"))
+        qtypes[qt] = qtypes.get(qt, 0) + 1
+    return ", ".join(f"{qt} {c}" for qt, c in sorted(qtypes.items())) or "—"
 
 
 def _codec_merge_section(merged_duplicates: Mapping[str, int]) -> list[str]:
@@ -1818,14 +1877,19 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
         "|---|---|---|---|---|---|---|",
     ]
     # Exclusions keyed the way the verdict is keyed. A model that lost EVERY payload of a
-    # cell contributes no rows and so vanishes from `by_model` — the worst-model gate then
-    # silently drops the model it was meant to gate on. `groups` is built from rows, so that
-    # cell would not even appear; the union below puts it back.
-    by_cell: dict[tuple[str, str], dict[str, int]] = {}
-    for e in excluded:
-        by_cell.setdefault((e.tool, e.shape), {})
-        by_cell[(e.tool, e.shape)][e.model] = \
-            by_cell[(e.tool, e.shape)].get(e.model, 0) + 1
+    # cell contributes no rows and so vanishes from `by_model`; `groups` is built from rows,
+    # so a cell where every model did would not even appear — the union below puts it back,
+    # and the per-model loop further down unions `dropped` in for the same reason.
+    #
+    # Counted in PAYLOADS: `run_codec_fluency` emits one `OversizedPayload` per oversized
+    # ARM, so a payload with both arms over its limit is two records and read "2 payload(s)
+    # not asked" until review of #411. Deduplicated by sha; a record without one cannot be
+    # matched to its sibling arm and still counts once per record.
+    seen: dict[tuple[str, str], dict[str, set[object]]] = {}
+    for i, e in enumerate(excluded):
+        seen.setdefault((e.tool, e.shape), {}).setdefault(e.model, set()).add(
+            e.sha if e.sha else ("no-sha", i))
+    by_cell = {cell: {m: len(shas) for m, shas in per.items()} for cell, per in seen.items()}
     for cell in by_cell:
         groups.setdefault(cell, {})
 
@@ -1843,41 +1907,66 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
         # unsafe, full stop. `_VERDICT_RANK` orders UNSAFE worst, SAFE best; ties keep the
         # first model encountered in sorted order rather than an arbitrary last-wins.
         worst_verdict, worst_model, worst_gap = "SAFE", "", None
-        for model, mrows in sorted(by_model.items()):
+        verdicts: dict[str, tuple[str, ArmGap]] = {}
+        # Every model that either answered OR lost a payload to its input limit. `by_model`
+        # alone misses a model that lost EVERY payload of this cell while another model
+        # answered: it has no rows, so it never got a verdict, and the cell printed SAFE on
+        # the other model's trials — the trimmed-corpus false SAFE #409 exists to stop
+        # (executed on 4333fb7, found in review of #411).
+        for model in sorted(set(by_model) | set(dropped)):
+            mrows = by_model.get(model, [])
             v, g = codec_verdict(mrows, excluded_from_group=dropped.get(model, 0))
+            verdicts[model] = (v, g)
             if worst_gap is None or _VERDICT_RANK[v] > _VERDICT_RANK[worst_verdict]:
                 worst_verdict, worst_model, worst_gap = v, model, g
         assert worst_gap is not None  # by_model is never empty — every group has >=1 model
-        n = sum(_arm_trials(r, "terse_ok") for r in worst_gap.rows)
+        n = _codec_trials(worst_gap)
+        questions, n_col, model_col = _codec_questions(worst_gap), str(n), f"`{worst_model}`"
         if worst_verdict == "UNSAFE":
             excess = sum(max(0, int(r["raw_ok"]) - int(r["terse_ok"]))
                         for r in worst_gap.rows)
             why = (f"{excess} trial(s) where raw succeeded and terse did not "
                   f"(raw {worst_gap.control_acc:.0%}, terse {worst_gap.form_acc:.0%})")
-        elif worst_gap.excluded:
-            why = REASON_LABEL.get(worst_gap.excluded, worst_gap.excluded)
-        elif worst_verdict == "UNRESOLVED" and dropped.get(worst_model):
-            why = (f"{dropped[worst_model]} payload(s) not asked of `{worst_model}` — over "
-                   f"its input limit, so this cell was scored on a trimmed corpus")
-        elif worst_verdict == "UNRESOLVED" and (low := _codec_low_call_arm(worst_gap.rows)):
-            arm, rate = low
-            why = (f"{arm} arm delivered {rate:.0%} of its answers through the tool call, "
-                   f"need {_CODEC_MIN_CALL_RATE:.0%} — the run cannot show a value "
-                   f"surviving into a downstream tool argument")
         elif worst_verdict == "UNRESOLVED":
-            why = f"only {n} zero-failure trial(s), need {_CODEC_MIN_TRIALS}"
+            # ALL of them, not the first — and for EVERY unresolved model, not the one the
+            # tie-break named. A cell held back by two models for different reasons stays
+            # UNRESOLVED after fixing only the named one's; the operator learns that now, not
+            # after the re-run.
+            per_model = []
+            for model, (v, g) in verdicts.items():
+                if v != "UNRESOLVED":
+                    continue
+                if not by_model.get(model) and dropped.get(model):
+                    text = (f"every payload exceeded `{model}`'s input limit — nothing was "
+                            f"asked of it")
+                elif g.excluded:
+                    # The withheld label, PLUS a trimmed corpus if there is one: fixing the
+                    # backend alone would still leave the cell UNRESOLVED on the exclusion
+                    # (review of #411). Compliance and trial counts stay unnamed — computed
+                    # over an unusable comparison they are noise.
+                    text = REASON_LABEL.get(g.excluded, g.excluded)
+                    if dropped.get(model):
+                        text += "; " + _codec_trimmed_reason(dropped[model], model)
+                else:
+                    text = "; ".join(codec_unresolved_reasons(g.rows, dropped.get(model, 0),
+                                                              model))
+                per_model.append((model, text))
+            if len(per_model) == 1:
+                why = per_model[0][1]
+            else:
+                # The other columns follow the Why column: once it speaks for several models,
+                # Questions and n printing only the tie-break winner's rows put "n=0" beside
+                # "`b`: only 7 zero-failure trial(s)" (review of #411).
+                why = " · ".join(f"`{m}`: {t}" for m, t in per_model)
+                questions = " · ".join(f"`{m}`: {_codec_questions(verdicts[m][1])}"
+                                       for m, _ in per_model)
+                n_col = " · ".join(f"`{m}`: {_codec_trials(verdicts[m][1])}"
+                                   for m, _ in per_model)
+                model_col = ", ".join(f"`{m}`" for m, _ in per_model)
         else:
             why = f"{n} zero-failure trials"
-        # Distinct questions per type, from the rows the verdict was computed over. `n` counts
-        # TRIALS, and a cell of one question run 20 times reads like 20 questions without
-        # this beside it (#403 Blocker 2).
-        qtypes: dict[str, int] = {}
-        for r in worst_gap.rows:
-            qt = str(r.get("qtype", "?"))
-            qtypes[qt] = qtypes.get(qt, 0) + 1
-        questions = ", ".join(f"{qt} {c}" for qt, c in sorted(qtypes.items())) or "—"
-        out.append(f"| `{tool}` | {shape} | {questions} | {n} | **{worst_verdict}** | "
-                   f"`{worst_model}` | {why} |")
+        out.append(f"| `{tool}` | {shape} | {questions} | {n_col} | **{worst_verdict}** | "
+                   f"{model_col} | {why} |")
     out.append("")
     out += _codec_corpus_section(excluded, limits, models, limit_check_ran)
     out += _codec_merge_section(merged_duplicates or {})
