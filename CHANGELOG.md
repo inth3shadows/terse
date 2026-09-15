@@ -20,10 +20,11 @@ fails that pull request until the section has moved.
   On the 2026-09-14 re-run `kb.read.list_principles` printed "terse arm delivered 29% of its
   answers through the tool call, need 80%" — true, and incomplete: the cell was also at n=7
   against a 20-trial floor, so fixing compliance alone would still have left it UNRESOLVED,
-  after another hour-long run. The reasons now come from `report.codec_unresolved_reasons`,
-  built from the same predicates `codec_verdict` gates on, and a grid test holds the
-  invariant that a cell is UNRESOLVED exactly when at least one reason is named — so a gate
-  cannot be added without a reason, or a reason without a gate.
+  after another hour-long run. `report.codec_unresolved_reasons` is now the ONLY definition
+  of the SAFE-blocking gates — `codec_verdict` returns UNRESOLVED exactly when it names a
+  reason — so a gate cannot exist without the sentence the table prints for it. Every
+  non-compliant arm is named, not only the worse one, and a cell held back by two models
+  names each model's reasons, not only the tie-break winner's.
 
 - **Corrected a false claim published with #409, in five places.** The CHANGELOG entry, two
   docstrings, #409's PR body and a #403 comment said `b0e5f862`'s terse arm "fits by payload
@@ -163,7 +164,8 @@ fails that pull request until the section has moved.
 
   `count_cl100k` is an approximation for these non-OpenAI models. It catches a clear overrun
   (`b0e5f862`'s raw arm is 9% over) and may miss a marginal one. *(Corrected 2026-09-14:
-  the drift has since been measured — see [Unreleased].)* Also open
+  the drift has since been measured — see the entry "The input-limit check's cl100k count
+  is now documented as measured to UNDER-count", #411.)* Also open
   and stated rather than fixed: the bound is **input-only**. Where a backend shares one
   window between prompt and completion, a payload that fits can still leave the raw arm less
   room to answer than the terse arm — the same asymmetry one step further on, unmeasured

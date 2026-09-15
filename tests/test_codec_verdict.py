@@ -245,12 +245,15 @@ def test_the_table_names_the_arm_and_the_rate_when_compliance_withholds_SAFE():
     assert "zero-failure trial(s), need" not in out
 
 
-def test_the_table_reports_the_worse_arm_when_both_are_non_compliant():
+def test_the_table_names_BOTH_arms_worst_first_when_both_are_non_compliant():
+    # Naming only the worse arm (the first cut) leaves the cell UNRESOLVED on the other one
+    # after its fix — review of #411 found this.
     rows = [dict(_row(f"q{i}", 4, 4, trials=4, raw_calls=2, terse_calls=1),
                  tool="kb.read.list_nodes", shape="array-of-records") for i in range(10)]
     out = build_codec_verdict_report({"m1": rows})
     assert "terse arm delivered 25%" in out
-    assert "raw arm delivered" not in out
+    assert "raw arm delivered 50%" in out
+    assert out.index("terse arm delivered") < out.index("raw arm delivered")
 
 
 def test_an_arm_dependent_prose_habit_no_longer_manufactures_UNSAFE():
@@ -358,27 +361,65 @@ def test_a_single_reason_is_still_rendered_alone():
     assert ";" not in cell.split("**UNRESOLVED**")[1]
 
 
-def test_every_unresolved_cell_names_at_least_one_reason():
-    """The invariant that keeps reasons and gates from drifting apart.
+def test_a_cell_unresolved_for_two_models_names_BOTH_models_reasons():
+    """Review of #411: the worst-model tie-break kept the first UNRESOLVED model and printed
+    only its reasons. Here `a` is short on trials and `b` is short on compliance — raising
+    the trial count alone leaves the cell UNRESOLVED on `b`."""
+    a = [dict(_row("q", 7, 7, trials=7, raw_calls=7, terse_calls=7),
+              tool="t", shape="array-of-records")]
+    b = [dict(_row("q", 20, 20, trials=20, raw_calls=20, terse_calls=6),
+              tool="t", shape="array-of-records")]
+    cell = _cell(build_codec_verdict_report({"a": a, "b": b}))
+    assert "**UNRESOLVED**" in cell
+    assert "`a`: only 7 zero-failure trial(s), need 20" in cell
+    assert "`b`: terse arm delivered 30%" in cell
 
-    Over a grid of cells, whenever `codec_verdict` returns UNRESOLVED for a reason other than
-    `arm_gap` exclusion, `codec_unresolved_reasons` must name at least one reason — and
-    whenever it names none, the verdict must not be UNRESOLVED. A gate added to
-    `codec_verdict` without a matching reason fails here; so does a reason with no gate."""
+
+def test_a_SAFE_model_beside_an_unresolved_one_adds_no_reason():
+    a = [dict(_row("q", 7, 7, trials=7, raw_calls=7, terse_calls=7),
+              tool="t", shape="array-of-records")]
+    b = [dict(_row("q", 20, 20, trials=20, raw_calls=20, terse_calls=20),
+              tool="t", shape="array-of-records")]
+    why = _cell(build_codec_verdict_report({"a": a, "b": b})).split("|")[-2]
+    assert why.strip() == "only 7 zero-failure trial(s), need 20"
+
+
+def test_the_verdict_is_UNRESOLVED_exactly_when_a_reason_is_named():
+    """The invariant that keeps reasons and gates from drifting apart, over every gate input.
+
+    `codec_verdict` now DERIVES its SAFE-blocking decision from `codec_unresolved_reasons`,
+    so a gate cannot be added there without its sentence. This grid is what fails if someone
+    re-adds one inline anyway: it varies both arms' compliance, the trial count and the
+    exclusion count, so a new gate on any of them produces a cell where the verdict and the
+    reason list disagree. (The first cut varied only terse compliance; a raw-arm gate with
+    no reason survived it.)
+
+    Scoped to cells neither withheld by `arm_gap` nor UNSAFE — the reasons function is not a
+    verdict and says so; `test_reasons_are_not_a_verdict_on_their_own` pins that side."""
     from terse.report import codec_unresolved_reasons
 
     checked = 0
-    for trials in (1, 5, 10, 20, 25):
-        for terse_calls_share in (0.0, 0.5, 0.79, 0.8, 1.0):
-            for dropped in (0, 1):
-                tc = round(trials * terse_calls_share)
-                rows = [_row("q", trials, trials, trials=trials,
-                             raw_calls=trials, terse_calls=tc)]
-                verdict, gap = codec_verdict(rows, excluded_from_group=dropped)
-                if gap.excluded:
-                    continue
-                reasons = codec_unresolved_reasons(rows, dropped, "m")
-                assert (verdict == "UNRESOLVED") == bool(reasons), (
-                    trials, terse_calls_share, dropped, verdict, reasons)
-                checked += 1
-    assert checked >= 40, "the grid collapsed — the invariant was checked on too few cells"
+    for trials in (1, 5, 20, 25):
+        for raw_share in (0.0, 0.79, 0.8, 1.0):
+            for terse_share in (0.0, 0.79, 0.8, 1.0):
+                for dropped in (0, 1):
+                    rows = [_row("q", trials, trials, trials=trials,
+                                 raw_calls=round(trials * raw_share),
+                                 terse_calls=round(trials * terse_share))]
+                    verdict, gap = codec_verdict(rows, excluded_from_group=dropped)
+                    assert not gap.excluded and verdict != "UNSAFE"
+                    reasons = codec_unresolved_reasons(rows, dropped, "m")
+                    assert (verdict == "UNRESOLVED") == bool(reasons), (
+                        trials, raw_share, terse_share, dropped, verdict, reasons)
+                    checked += 1
+    assert checked == 4 * 4 * 4 * 2
+
+
+def test_reasons_are_not_a_verdict_on_their_own():
+    # Review of #411: the docstring claimed "empty when not UNRESOLVED", which is false for an
+    # UNSAFE cell. A caller must ask `codec_verdict` whether, and this function why.
+    from terse.report import codec_unresolved_reasons
+
+    rows = [_row("q", 5, 4, trials=5, raw_calls=5, terse_calls=0)]
+    assert codec_verdict(rows)[0] == "UNSAFE"
+    assert codec_unresolved_reasons(rows)
