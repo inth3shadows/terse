@@ -391,6 +391,54 @@ def test_a_model_that_lost_EVERY_payload_still_blocks_SAFE_for_the_cell():
         assert "`b`" in cell and "every payload exceeded `b`'s input limit" in cell, cell
 
 
+def test_a_cell_withheld_by_arm_gap_names_that_not_a_thin_sample():
+    """Review of #411: this branch had no rendering test — replacing it with the trial-floor
+    reasons survived the full suite, reporting a dead backend as "only 0 zero-failure
+    trial(s)". Alone, and beside a model that is short on trials."""
+    from terse.report import REASON_LABEL
+
+    dead = [dict(_row("q", 0, 0, trials=20), raw_trials=0, terse_trials=0, fails=40,
+                 attempts=40, tool="t", shape="array-of-records")]
+    thin = [dict(_row("q", 7, 7, trials=7, raw_calls=7, terse_calls=7),
+                 tool="t", shape="array-of-records")]
+    gap = codec_verdict(dead)[1]
+    assert gap.excluded
+    label = REASON_LABEL.get(gap.excluded, gap.excluded)
+
+    why = _cell(build_codec_verdict_report({"a": dead})).split("|")[-2].strip()
+    assert why == label
+    why = _cell(build_codec_verdict_report({"a": dead, "b": thin})).split("|")[-2].strip()
+    assert why == f"`a`: {label} · `b`: only 7 zero-failure trial(s), need 20"
+
+
+def test_a_payload_over_the_limit_on_BOTH_arms_counts_as_one_payload():
+    # Review of #411: one `OversizedPayload` is emitted per ARM, and the reason counted
+    # records — a single payload with both arms over read "2 payload(s) not asked".
+    from terse.codeceval import OversizedPayload
+
+    rows = [dict(_row("q", 25, 25, trials=25, raw_calls=25, terse_calls=25),
+                 tool="t", shape="array-of-records")]
+    excluded = [OversizedPayload(model="m", tool="t", shape="array-of-records", sha="s1",
+                                 arm=arm, tokens=99, limit=10) for arm in ("raw", "terse")]
+    excluded.append(OversizedPayload(model="m", tool="t", shape="array-of-records",
+                                     sha="s2", arm="raw", tokens=99, limit=10))
+    cell = _cell(build_codec_verdict_report({"m": rows}, excluded=excluded))
+    assert "2 payload(s) not asked of `m`" in cell, cell
+
+
+def test_a_rate_just_below_the_floor_never_prints_as_the_floor():
+    # Review of #411: 199/250 is 79.6%, and `.0%` printed "delivered 80% ... need 80%".
+    rows = [dict(_row("q", 250, 250, trials=250, raw_calls=250, terse_calls=199),
+                 tool="t", shape="array-of-records")]
+    cell = _cell(build_codec_verdict_report({"m": rows}))
+    assert "terse arm delivered 79.6%" in cell, cell
+    rows[0]["terse_calls"] = 1999
+    rows[0].update(raw_ok=2500, terse_ok=2500, trials=2500, raw_trials=2500,
+                   terse_trials=2500, raw_calls=2500, attempts=5000)
+    cell = _cell(build_codec_verdict_report({"m": rows}))
+    assert "terse arm delivered 79.9%" in cell, cell  # 79.96%: truncated, not rounded up
+
+
 def test_a_SAFE_model_beside_an_unresolved_one_adds_no_reason():
     a = [dict(_row("q", 7, 7, trials=7, raw_calls=7, terse_calls=7),
               tool="t", shape="array-of-records")]
@@ -415,20 +463,25 @@ def test_the_verdict_is_UNRESOLVED_exactly_when_a_reason_is_named():
     from terse.report import codec_unresolved_reasons
 
     checked = 0
-    for trials in (1, 5, 20, 25):
-        for raw_share in (0.0, 0.79, 0.8, 1.0):
-            for terse_share in (0.0, 0.79, 0.8, 1.0):
+    for trials in (1, 5, 19, 20, 25):
+        # Call COUNTS, not shares: `round(t * 0.79)` lands ON the floor for every t tried
+        # (review of #411), so the grid never probed just-below. These are the largest count
+        # under the floor and the smallest at it, computed from the constant.
+        below = max(c for c in range(trials + 1) if c / trials < _CODEC_MIN_CALL_RATE)
+        at = min(c for c in range(trials + 1) if c / trials >= _CODEC_MIN_CALL_RATE)
+        counts = sorted({0, below, at, trials})
+        for raw_calls in counts:
+            for terse_calls in counts:
                 for dropped in (0, 1):
                     rows = [_row("q", trials, trials, trials=trials,
-                                 raw_calls=round(trials * raw_share),
-                                 terse_calls=round(trials * terse_share))]
+                                 raw_calls=raw_calls, terse_calls=terse_calls)]
                     verdict, gap = codec_verdict(rows, excluded_from_group=dropped)
                     assert not gap.excluded and verdict != "UNSAFE"
                     reasons = codec_unresolved_reasons(rows, dropped, "m")
                     assert (verdict == "UNRESOLVED") == bool(reasons), (
-                        trials, raw_share, terse_share, dropped, verdict, reasons)
+                        trials, raw_calls, terse_calls, dropped, verdict, reasons)
                     checked += 1
-    assert checked == 4 * 4 * 4 * 2
+    assert checked >= 100, "the grid collapsed — the invariant was checked on too few cells"
 
 
 def test_reasons_are_not_a_verdict_on_their_own():

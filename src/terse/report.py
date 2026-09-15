@@ -1446,7 +1446,8 @@ def codec_verdict(rows: list[dict[str, Any]],
     # SAFE unreachable for this tier: a codec group is characteristically one question run
     # many times (`test_identical_partial_failure_on_both_arms_at_the_trial_floor_is_SAFE`
     # is a single row at 25 trials), so it would never reach 20 paired questions. This is
-    # not an exemption from sample-size gating — `_CODEC_MIN_TRIALS` below is the same
+    # not an exemption from sample-size gating — `_CODEC_MIN_TRIALS`, applied in
+    # `codec_unresolved_reasons`, is the same
     # Clopper-Pearson floor in the unit this verdict actually counts in. Layering a second
     # floor in a different unit would silently re-calibrate a tier that already decided
     # this question, without saying so anywhere near `_CODEC_MIN_TRIALS`.
@@ -1729,7 +1730,13 @@ def codec_unresolved_reasons(rows: list[dict[str, Any]], excluded_from_group: in
     # tool protocol, and withholding it would suppress the finding this tier exists to make.
     # See `_CODEC_MIN_CALL_RATE`.
     for arm, rate in _codec_low_call_arms(rows):
-        reasons.append(f"{arm} arm delivered {rate:.0%} of its answers through the tool call, "
+        # Truncated to one decimal when whole percents would round a below-floor rate up TO
+        # the floor: 199/250 is 79.6%, and "delivered 80%, need 80%" reads as a
+        # contradiction. Truncated, not rounded, so 79.96% cannot print as 80.0% either.
+        # (+1e-9: 0.796 * 1000 can land a hair under 796 in floating point.)
+        shown = (f"{math.floor(rate * 1000 + 1e-9) / 10:.1f}%"
+                 if f"{rate:.0%}" == f"{_CODEC_MIN_CALL_RATE:.0%}" else f"{rate:.0%}")
+        reasons.append(f"{arm} arm delivered {shown} of its answers through the tool call, "
                        f"need {_CODEC_MIN_CALL_RATE:.0%} — the run cannot show a value "
                        f"surviving into a downstream tool argument")
     n = sum(_arm_trials(r, "terse_ok") for r in rows)
@@ -1851,14 +1858,19 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
         "|---|---|---|---|---|---|---|",
     ]
     # Exclusions keyed the way the verdict is keyed. A model that lost EVERY payload of a
-    # cell contributes no rows and so vanishes from `by_model` — the worst-model gate then
-    # silently drops the model it was meant to gate on. `groups` is built from rows, so that
-    # cell would not even appear; the union below puts it back.
-    by_cell: dict[tuple[str, str], dict[str, int]] = {}
-    for e in excluded:
-        by_cell.setdefault((e.tool, e.shape), {})
-        by_cell[(e.tool, e.shape)][e.model] = \
-            by_cell[(e.tool, e.shape)].get(e.model, 0) + 1
+    # cell contributes no rows and so vanishes from `by_model`; `groups` is built from rows,
+    # so a cell where every model did would not even appear — the union below puts it back,
+    # and the per-model loop further down unions `dropped` in for the same reason.
+    #
+    # Counted in PAYLOADS: `run_codec_fluency` emits one `OversizedPayload` per oversized
+    # ARM, so a payload with both arms over its limit is two records and read "2 payload(s)
+    # not asked" until review of #411. Deduplicated by sha; a record without one cannot be
+    # matched to its sibling arm and still counts once per record.
+    seen: dict[tuple[str, str], dict[str, set[object]]] = {}
+    for i, e in enumerate(excluded):
+        seen.setdefault((e.tool, e.shape), {}).setdefault(e.model, set()).add(
+            e.sha if e.sha else ("no-sha", i))
+    by_cell = {cell: {m: len(shas) for m, shas in per.items()} for cell, per in seen.items()}
     for cell in by_cell:
         groups.setdefault(cell, {})
 
