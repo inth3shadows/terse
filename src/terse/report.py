@@ -1877,7 +1877,13 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
         # first model encountered in sorted order rather than an arbitrary last-wins.
         worst_verdict, worst_model, worst_gap = "SAFE", "", None
         verdicts: dict[str, tuple[str, ArmGap]] = {}
-        for model, mrows in sorted(by_model.items()):
+        # Every model that either answered OR lost a payload to its input limit. `by_model`
+        # alone misses a model that lost EVERY payload of this cell while another model
+        # answered: it has no rows, so it never got a verdict, and the cell printed SAFE on
+        # the other model's trials — the trimmed-corpus false SAFE #409 exists to stop
+        # (executed on 4333fb7, found in review of #411).
+        for model in sorted(set(by_model) | set(dropped)):
+            mrows = by_model.get(model, [])
             v, g = codec_verdict(mrows, excluded_from_group=dropped.get(model, 0))
             verdicts[model] = (v, g)
             if worst_gap is None or _VERDICT_RANK[v] > _VERDICT_RANK[worst_verdict]:
@@ -1898,7 +1904,10 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
             for model, (v, g) in verdicts.items():
                 if v != "UNRESOLVED":
                     continue
-                if g.excluded:
+                if not by_model.get(model) and dropped.get(model):
+                    text = (f"every payload exceeded `{model}`'s input limit — nothing was "
+                            f"asked of it")
+                elif g.excluded:
                     text = REASON_LABEL.get(g.excluded, g.excluded)
                 else:
                     text = "; ".join(codec_unresolved_reasons(g.rows, dropped.get(model, 0),

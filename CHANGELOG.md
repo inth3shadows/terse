@@ -26,6 +26,15 @@ fails that pull request until the section has moved.
   non-compliant arm is named, not only the worse one, and a cell held back by two models
   names each model's reasons, not only the tie-break winner's.
 
+- **A model that lost EVERY payload of a cell to its input limit no longer lets that cell
+  read SAFE (#403).** The per-model verdict loop iterated only models with rows, so a model
+  whose every payload was over its limit — while another model answered — never got a
+  verdict, and the cell printed SAFE on the other model's trials: the trimmed-corpus false
+  SAFE #409's gate exists to stop. Executed on `4333fb7`: `a` 25/25 clean, `b` lost the only
+  payload → **SAFE**, "25 zero-failure trials". The loop now covers every model that
+  answered or lost a payload, and the cell reads UNRESOLVED naming `b`. Predates #411; found
+  in its review.
+
 - **Corrected a false claim published with #409, in five places.** The CHANGELOG entry, two
   docstrings, #409's PR body and a #403 comment said `b0e5f862`'s terse arm "fits by payload
   alone, then does not fit once the prompt and tool schema are added", as the motivating

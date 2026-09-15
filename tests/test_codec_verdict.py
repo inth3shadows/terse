@@ -375,6 +375,22 @@ def test_a_cell_unresolved_for_two_models_names_BOTH_models_reasons():
     assert "`b`: terse arm delivered 30%" in cell
 
 
+def test_a_model_that_lost_EVERY_payload_still_blocks_SAFE_for_the_cell():
+    """Review of #411, predating it: `b` lost the cell's only payload to its input limit, so
+    it had no rows and never got a verdict — the cell printed SAFE on `a`'s 25 clean trials.
+    A trimmed corpus must withhold SAFE whether the model lost some payloads or all of them."""
+    from terse.codeceval import OversizedPayload
+
+    a = [dict(_row("q", 25, 25, trials=25, raw_calls=25, terse_calls=25),
+              tool="t", shape="array-of-records")]
+    excluded = [OversizedPayload(model="b", tool="t", shape="array-of-records", sha="s",
+                                 arm="raw", tokens=99, limit=10)]
+    for results in ({"a": a}, {"a": a, "b": []}):
+        cell = _cell(build_codec_verdict_report(results, excluded=excluded))
+        assert "**UNRESOLVED**" in cell, cell
+        assert "`b`" in cell and "every payload exceeded `b`'s input limit" in cell, cell
+
+
 def test_a_SAFE_model_beside_an_unresolved_one_adds_no_reason():
     a = [dict(_row("q", 7, 7, trials=7, raw_calls=7, terse_calls=7),
               tool="t", shape="array-of-records")]
