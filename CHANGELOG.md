@@ -26,7 +26,10 @@ fails that pull request until the section has moved.
   non-compliant arm is named, not only the worse one, and a cell held back by two models
   names each model's reasons, not only the tie-break winner's. The payload count in that
   reason counts payloads, not oversized arms (one payload with both arms over read "2"),
-  and a rate just under the floor prints as 79.6%, not "80%, need 80%".
+  and a rate just under the floor prints as 79.6%, not "80%, need 80%". When the Why column
+  speaks for several models, Questions, n and Worst model list the same models instead of
+  printing only the tie-break winner's rows, and a model withheld for lost calls also names
+  a trimmed corpus if it has one.
 
 - **A model that lost EVERY payload of a cell to its input limit no longer lets that cell
   read SAFE (#403).** The per-model verdict loop iterated only models with rows, so a model

@@ -95,8 +95,9 @@ def test_a_payload_the_codec_leaves_alone_is_skipped_not_scored():
 
 def test_the_verdict_table_names_the_question_types_each_cell_was_scored_on():
     # TWO payloads and TWO models, so the column cannot pass by counting per-payload,
-    # per-question, or across every model's rows: it counts the rows `n` sums over, which
-    # are the WORST model's.
+    # per-question, or across every model's rows: it counts the rows `n` sums over, per
+    # model. Both models are UNRESOLVED here (8 trials < 20), so every column is labelled
+    # per model (review of #411) — a pooled count would read "deref 4, enumerate 4 | 16".
     payloads = [{"result": [{"id": i, "meta": {"a": i}} for i in range(base, base + 8)]}
                 for base in (1, 9)]
 
@@ -114,7 +115,8 @@ def test_the_verdict_table_names_the_question_types_each_cell_was_scored_on():
                                           preflight=False).rows
     report = build_codec_verdict_report(results)
     assert "| Tool | Shape | Questions | n | Verdict |" in report
-    assert "| `demo.get` | array-of-records | deref 2, enumerate 2 | 8 | **UNRESOLVED** |" in report
+    assert ("| `demo.get` | array-of-records | `m1`: deref 2, enumerate 2 · "
+            "`m2`: deref 2, enumerate 2 | `m1`: 8 · `m2`: 8 | **UNRESOLVED** |") in report
 
 
 def test_an_empty_final_entry_is_not_metadata():

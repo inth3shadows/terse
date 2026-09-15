@@ -1685,6 +1685,12 @@ def _codec_corpus_section(excluded: Sequence[Any],
     return out
 
 
+def _codec_trimmed_reason(excluded: int, model: str) -> str:
+    who = f"`{model}`" if model else "a model"
+    return (f"{excluded} payload(s) not asked of {who} — over its input limit, so this cell "
+            f"was scored on a trimmed corpus")
+
+
 def codec_unresolved_reasons(rows: list[dict[str, Any]], excluded_from_group: int = 0,
                              model: str = "") -> list[str]:
     """EVERY reason a codec cell's evidence cannot license SAFE — and the ONLY definition of
@@ -1721,9 +1727,7 @@ def codec_unresolved_reasons(rows: list[dict[str, Any]], excluded_from_group: in
     # 100%, terse 50%) read **SAFE** once the payload carrying the failure was excluded for
     # one model. Not a hypothetical — that flip is what this gate exists to stop.
     if excluded_from_group > 0:
-        who = f"`{model}`" if model else "a model"
-        reasons.append(f"{excluded_from_group} payload(s) not asked of {who} — over its input "
-                       f"limit, so this cell was scored on a trimmed corpus")
+        reasons.append(_codec_trimmed_reason(excluded_from_group, model))
     # Compliance gates SAFE only, and `codec_verdict` consults it AFTER the corruption gate on
     # purpose: an observed excess is scored channel-independently
     # (`codeceval._ask_codec_question`), so it is real whether or not the model kept to the
@@ -1733,8 +1737,7 @@ def codec_unresolved_reasons(rows: list[dict[str, Any]], excluded_from_group: in
         # Truncated to one decimal when whole percents would round a below-floor rate up TO
         # the floor: 199/250 is 79.6%, and "delivered 80%, need 80%" reads as a
         # contradiction. Truncated, not rounded, so 79.96% cannot print as 80.0% either.
-        # (+1e-9: 0.796 * 1000 can land a hair under 796 in floating point.)
-        shown = (f"{math.floor(rate * 1000 + 1e-9) / 10:.1f}%"
+        shown = (f"{math.floor(rate * 1000) / 10:.1f}%"
                  if f"{rate:.0%}" == f"{_CODEC_MIN_CALL_RATE:.0%}" else f"{rate:.0%}")
         reasons.append(f"{arm} arm delivered {shown} of its answers through the tool call, "
                        f"need {_CODEC_MIN_CALL_RATE:.0%} — the run cannot show a value "
@@ -1743,6 +1746,22 @@ def codec_unresolved_reasons(rows: list[dict[str, Any]], excluded_from_group: in
     if n < _CODEC_MIN_TRIALS:
         reasons.append(f"only {n} zero-failure trial(s), need {_CODEC_MIN_TRIALS}")
     return reasons
+
+
+def _codec_trials(g: ArmGap) -> int:
+    """Terse-arm trials in the rows a codec verdict was computed over — the table's `n`."""
+    return sum(_arm_trials(r, "terse_ok") for r in g.rows)
+
+
+def _codec_questions(g: ArmGap) -> str:
+    """Distinct questions per type, from the rows the verdict was computed over. `n` counts
+    TRIALS, and a cell of one question run 20 times reads like 20 questions without this
+    beside it (#403 Blocker 2)."""
+    qtypes: dict[str, int] = {}
+    for r in g.rows:
+        qt = str(r.get("qtype", "?"))
+        qtypes[qt] = qtypes.get(qt, 0) + 1
+    return ", ".join(f"{qt} {c}" for qt, c in sorted(qtypes.items())) or "—"
 
 
 def _codec_merge_section(merged_duplicates: Mapping[str, int]) -> list[str]:
@@ -1901,7 +1920,8 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
             if worst_gap is None or _VERDICT_RANK[v] > _VERDICT_RANK[worst_verdict]:
                 worst_verdict, worst_model, worst_gap = v, model, g
         assert worst_gap is not None  # by_model is never empty — every group has >=1 model
-        n = sum(_arm_trials(r, "terse_ok") for r in worst_gap.rows)
+        n = _codec_trials(worst_gap)
+        questions, n_col, model_col = _codec_questions(worst_gap), str(n), f"`{worst_model}`"
         if worst_verdict == "UNSAFE":
             excess = sum(max(0, int(r["raw_ok"]) - int(r["terse_ok"]))
                         for r in worst_gap.rows)
@@ -1920,25 +1940,33 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
                     text = (f"every payload exceeded `{model}`'s input limit — nothing was "
                             f"asked of it")
                 elif g.excluded:
+                    # The withheld label, PLUS a trimmed corpus if there is one: fixing the
+                    # backend alone would still leave the cell UNRESOLVED on the exclusion
+                    # (review of #411). Compliance and trial counts stay unnamed — computed
+                    # over an unusable comparison they are noise.
                     text = REASON_LABEL.get(g.excluded, g.excluded)
+                    if dropped.get(model):
+                        text += "; " + _codec_trimmed_reason(dropped[model], model)
                 else:
                     text = "; ".join(codec_unresolved_reasons(g.rows, dropped.get(model, 0),
                                                               model))
                 per_model.append((model, text))
-            why = (per_model[0][1] if len(per_model) == 1
-                   else " · ".join(f"`{m}`: {t}" for m, t in per_model))
+            if len(per_model) == 1:
+                why = per_model[0][1]
+            else:
+                # The other columns follow the Why column: once it speaks for several models,
+                # Questions and n printing only the tie-break winner's rows put "n=0" beside
+                # "`b`: only 7 zero-failure trial(s)" (review of #411).
+                why = " · ".join(f"`{m}`: {t}" for m, t in per_model)
+                questions = " · ".join(f"`{m}`: {_codec_questions(verdicts[m][1])}"
+                                       for m, _ in per_model)
+                n_col = " · ".join(f"`{m}`: {_codec_trials(verdicts[m][1])}"
+                                   for m, _ in per_model)
+                model_col = ", ".join(f"`{m}`" for m, _ in per_model)
         else:
             why = f"{n} zero-failure trials"
-        # Distinct questions per type, from the rows the verdict was computed over. `n` counts
-        # TRIALS, and a cell of one question run 20 times reads like 20 questions without
-        # this beside it (#403 Blocker 2).
-        qtypes: dict[str, int] = {}
-        for r in worst_gap.rows:
-            qt = str(r.get("qtype", "?"))
-            qtypes[qt] = qtypes.get(qt, 0) + 1
-        questions = ", ".join(f"{qt} {c}" for qt, c in sorted(qtypes.items())) or "—"
-        out.append(f"| `{tool}` | {shape} | {questions} | {n} | **{worst_verdict}** | "
-                   f"`{worst_model}` | {why} |")
+        out.append(f"| `{tool}` | {shape} | {questions} | {n_col} | **{worst_verdict}** | "
+                   f"{model_col} | {why} |")
     out.append("")
     out += _codec_corpus_section(excluded, limits, models, limit_check_ran)
     out += _codec_merge_section(merged_duplicates or {})

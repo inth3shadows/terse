@@ -375,6 +375,41 @@ def test_a_cell_unresolved_for_two_models_names_BOTH_models_reasons():
     assert "`b`: terse arm delivered 30%" in cell
 
 
+def test_every_column_speaks_for_every_unresolved_model_once_why_does():
+    """Review of #411: with the Why column naming several models, Questions and n still
+    printed only the tie-break winner's rows — "n=0" beside "`b`: only 7 zero-failure
+    trial(s)". Every column of the row now names the same models."""
+    from terse.report import REASON_LABEL
+
+    dead = [dict(_row("q", 0, 0, trials=20), raw_trials=0, terse_trials=0, fails=40,
+                 attempts=40, tool="t", shape="array-of-records")]
+    thin = [dict(_row("q1", 7, 7, trials=7, raw_calls=7, terse_calls=7), tool="t",
+                 shape="array-of-records"),
+            dict(_row("q2", 7, 7, trials=7, raw_calls=7, terse_calls=7), tool="t",
+                 shape="array-of-records", qtype="enumerate")]
+    safe = [dict(_row("q", 25, 25, trials=25, raw_calls=25, terse_calls=25),
+                 tool="t", shape="array-of-records")]
+    cols = [c.strip() for c in
+            _cell(build_codec_verdict_report({"a": dead, "b": thin, "c": safe})).split("|")]
+    _, _, _, questions, n, verdict, models, why, _ = cols
+    label = REASON_LABEL.get(codec_verdict(dead)[1].excluded)
+    assert verdict == "**UNRESOLVED**"
+    assert questions == "`a`: — · `b`: deref 1, enumerate 1"
+    assert n == "`a`: 0 · `b`: 14"
+    assert models == "`a`, `b`"  # the SAFE model is in no column
+    assert why == f"`a`: {label} · `b`: only 14 zero-failure trial(s), need 20"
+
+
+def test_a_single_unresolved_model_keeps_the_plain_columns():
+    thin = [dict(_row("q", 7, 7, trials=7, raw_calls=7, terse_calls=7),
+                 tool="t", shape="array-of-records")]
+    safe = [dict(_row("q", 25, 25, trials=25, raw_calls=25, terse_calls=25),
+                 tool="t", shape="array-of-records")]
+    cols = [c.strip() for c in
+            _cell(build_codec_verdict_report({"a": safe, "b": thin})).split("|")]
+    assert cols[3:7] == ["deref 1", "7", "**UNRESOLVED**", "`b`"]
+
+
 def test_a_model_that_lost_EVERY_payload_still_blocks_SAFE_for_the_cell():
     """Review of #411, predating it: `b` lost the cell's only payload to its input limit, so
     it had no rows and never got a verdict — the cell printed SAFE on `a`'s 25 clean trials.
@@ -409,6 +444,22 @@ def test_a_cell_withheld_by_arm_gap_names_that_not_a_thin_sample():
     assert why == label
     why = _cell(build_codec_verdict_report({"a": dead, "b": thin})).split("|")[-2].strip()
     assert why == f"`a`: {label} · `b`: only 7 zero-failure trial(s), need 20"
+
+
+def test_a_withheld_model_that_ALSO_lost_a_payload_names_both():
+    # Review of #411: the withheld branch printed only its label, so fixing the backend alone
+    # would still leave the cell UNRESOLVED on a trimmed corpus nobody was told about.
+    from terse.codeceval import OversizedPayload
+    from terse.report import REASON_LABEL
+
+    dead = [dict(_row("q", 0, 0, trials=20), raw_trials=0, terse_trials=0, fails=40,
+                 attempts=40, tool="t", shape="array-of-records")]
+    excluded = [OversizedPayload(model="a", tool="t", shape="array-of-records", sha="s2",
+                                 arm="raw", tokens=99, limit=10)]
+    label = REASON_LABEL.get(codec_verdict(dead)[1].excluded)
+    why = _cell(build_codec_verdict_report({"a": dead}, excluded=excluded)).split("|")[-2]
+    assert why.strip() == (f"{label}; 1 payload(s) not asked of `a` — over its input "
+                           f"limit, so this cell was scored on a trimmed corpus")
 
 
 def test_a_payload_over_the_limit_on_BOTH_arms_counts_as_one_payload():
