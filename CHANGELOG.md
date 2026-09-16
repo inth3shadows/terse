@@ -25,7 +25,12 @@ fails that pull request until the section has moved.
   legitimately owned every row under that label. Both now share `_precedence_winner`, which
   picks the row the client would launch; reporting order is unchanged, and a name whose
   winning row guesses nothing contributes no guess rather than borrowing another
-  definition's.
+  definition's. The contest is fleet-wide, over every row whatever its state: giving each
+  consumer its own admission set made them disagree about which definition speaks for a
+  name — a project-scope `folded-and-live` shadowing a user-scope `wrapped` had ambiguity
+  read the folded row while liability billed the shadowed one and read its blocks, which is
+  #285's double count restored. A name whose winning definition is raw, folded or otherwise
+  not a terse proxy now reports nothing at all.
 
 ## [0.33.5] - 2026-09-16
 

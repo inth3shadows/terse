@@ -1411,6 +1411,51 @@ def test_the_scope_the_client_LAUNCHES_wins_the_name_slot(tmp_path):
     assert served["kb"]["ledger_labels"] == ["kb"]
 
 
+def test_a_folded_and_live_winner_silences_the_shadowed_entry_below_it(tmp_path):
+    """Review of PR #415. The first cut gave each consumer its own admission set, so they
+    disagreed about which row speaks for a name: `_ambiguous_labels` admits
+    `_WRITES_LEDGER_ROWS` and picked the project-scope `folded-and-live` row (a raw re-add,
+    guessing nothing, so no collision), while `primer_liability` admits `_PAYS_PRIMER`,
+    skipped it, and rendered the SHADOWED user-scope row — reading `zz`'s 120 `python`
+    blocks for it. Two entries, the same blocks: #285's double count, restored.
+
+    The client launches the project definition, so the user one must report nothing at all —
+    not a measurement borrowed from an unrelated server."""
+    pol = _policy(tmp_path)
+    rows = [_scan("k", "wrapped", "/usr/bin/python -m k", pol, scope="user",
+                  identity="python", explicit=False),
+            _scan("k", "folded-and-live", None, pol, scope="project"),
+            _scan("zz", "wrapped", "/usr/bin/python -m zz", pol, scope="user",
+                  identity="python", explicit=False)]
+    liab = primer_liability(rows, _agg(("python", 120, 12_000, 6_000)))
+    served = {r["server"]: r for r in liab["servers"]}
+
+    assert "k" not in served, "the shadowed definition must not be billed or measured"
+    assert served["zz"]["blocks"] == 120
+
+
+def test_an_UNWRAPPED_definition_above_a_wrapped_one_silences_it(tmp_path):
+    """The general form, and what makes the contest fleet-wide rather than per-consumer
+    (review of PR #415, mutation MB): `k` is wrapped in user scope and defined RAW in
+    project scope. The client launches the project one, so no terse proxy runs for `k` at
+    all — it pays no primer, writes no rows, and cannot own the `python` label. Restricting
+    the contest to states that write ledger rows would skip the raw row, hand the slot back
+    to the shadowed user entry, and bill it."""
+    pol = _policy(tmp_path)
+    rows = [_scan("k", "wrapped", "/usr/bin/python -m k", pol, scope="user",
+                  identity="python", explicit=False),
+            _scan("k", "unwrapped", None, pol, scope="project"),
+            _scan("zz", "wrapped", "/usr/bin/python -m zz", pol, scope="user",
+                  identity="python", explicit=False)]
+    from terse.stats import _ambiguous_labels
+    assert _ambiguous_labels(rows) == set()
+
+    served = {r["server"]: r for r in
+              primer_liability(rows, _agg(("python", 120, 12_000, 6_000)))["servers"]}
+    assert "k" not in served
+    assert served["zz"]["blocks"] == 120
+
+
 def test_two_rows_in_ONE_scope_keep_the_first(tmp_path):
     # A hand-merged config can carry the same name twice in one scope. Precedence cannot
     # separate them, so the tiebreak stays first-wins — the pre-existing behaviour, pinned
@@ -1453,6 +1498,12 @@ def test_a_shadowed_entry_does_not_take_the_slot_from_the_one_that_runs(tmp_path
                   identity="python", explicit=False),
             _scan("b", "wrapped", "/usr/bin/python -m b", pol, scope="project",
                   identity="python", explicit=False)]
+    # Asserted on `_ambiguous_labels` directly as well as through the report: review of
+    # #415 found this fleet reaching the same verdict via the liability-side check alone,
+    # so the assertion below is what actually pins the ambiguity side.
+    from terse.stats import _ambiguous_labels
+    assert _ambiguous_labels(rows) == {"python"}
+
     liab = primer_liability(rows, _agg(("python", 30, 3000, 1500)))
     served = {r["server"]: r for r in liab["servers"]}
     for name in ("a", "b"):
