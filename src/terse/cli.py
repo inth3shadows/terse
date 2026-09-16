@@ -1873,6 +1873,7 @@ def _cmd_uninstall_mcp(args: argparse.Namespace) -> int:
 
 def _cmd_mcp_status(args: argparse.Namespace) -> int:
     from .install_mcp import scan_scopes
+    from .stats import _WRITES_LEDGER_ROWS
 
     rows = scan_scopes(file=args.file, repo_path=args.repo_path)
     if args.json:
@@ -1911,7 +1912,20 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
             elif r["state"] == "router-ambiguous":
                 print(f"  {'':<20} another entry fronts the same peers file — delete the "
                       f"duplicate (they are interchangeable) before terse can manage it")
-            if r["state"] in ("wrapped", "wrapped-unstashed", "router", "router-ambiguous"):
+            # `_WRITES_LEDGER_ROWS`, imported rather than re-spelled: this line describes
+            # what an entry FRONTS and how it will show up in the ledger, which is exactly
+            # that predicate's population. The renderer carried its own copy of the
+            # original four states and silently fell behind when #309 added
+            # `folded-and-live` to the scan — `terse stats` would report `ambiguous ledger
+            # label` while status withheld the `--server-name` hint that fixes it (#399).
+            #
+            # The extra `launcher` test is the half the predicate cannot express: a
+            # `folded-and-live` row is in it because its live half MAY run a terse proxy,
+            # and `scan_scopes` fills these fields only when it actually does. A live half
+            # that is a raw re-add keeps them None, and printing `wraps=?  diff=?` for it
+            # would answer a question nobody asked with a guess.
+            if (r["state"] in _WRITES_LEDGER_ROWS
+                    and (r["state"] != "folded-and-live" or r.get("launcher"))):
                 stats = "on" if r.get("stats") else "off"
                 detail = (f"wraps={r.get('wraps') or '?'}  "
                           f"diff={r.get('diff') or '?'}  stats={stats}")

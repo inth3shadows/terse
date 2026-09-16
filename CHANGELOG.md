@@ -13,7 +13,18 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **`mcp-status` no longer withholds a `folded-and-live` entry's detail line (#399).** #309
+  taught the scan to fill `wraps` / `diff` / `stats` / `launcher` / `ledger_identity` for
+  such an entry when its live half really runs a terse proxy, and `--json` showed them, but
+  the text renderer carried its own copy of the original four states. So `terse stats` could
+  report `ambiguous ledger label` for the entry while `mcp-status` withheld the
+  `no --server-name baked in` hint that says how to fix it — along with
+  `launcher=… (MISSING)`, which is fatal to the entry and invisible everywhere else. The
+  renderer now reuses `stats._WRITES_LEDGER_ROWS` rather than re-spelling the states, so it
+  cannot fall behind that predicate again. A live half that is a raw re-add still prints
+  nothing extra: it runs no proxy, and those fields are `None` by design.
 
 ## [0.33.4] - 2026-09-15
 
