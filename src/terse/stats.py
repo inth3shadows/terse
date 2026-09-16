@@ -1120,9 +1120,12 @@ def _writes_ledger_rows(row: dict[str, Any], ledger_path: str | None = None) -> 
     default path out is the same case. `parse_proxy_opts`' docstring calls hand-edited
     entries "the one population this has to read correctly".
 
-    Resolved before comparing, so `~/x.jsonl`, `./x.jsonl` and `/home/u/x.jsonl` are one
-    file. A path that cannot be resolved is compared as written rather than raising — a
-    report is never load-bearing (#197).
+    Resolved before comparing, so `~/x.jsonl` and `/home/u/x.jsonl` are one file — a tilde
+    stays LITERAL inside a JSON MCP config while `default_stats_log()` is already expanded,
+    which is the spelling that matters. A RELATIVE path resolves against the cwd of whoever
+    runs `terse stats`, not against the config's directory, so two relative spellings can
+    compare equal while naming different files; baked paths are absolute in practice
+    (`install-mcp` writes one), and a wrong answer here mislabels a report, nothing more.
 
     `stats` MISSING is True, not False: a row from a scan that predates the field cannot
     say, and reading absence as silence would retract the measurement of every entry
@@ -1883,7 +1886,14 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     if liab["unresolved"]:
         lines.append(f"  {liab['unresolved']} server(s) have an unreadable policy and are "
                      f"NOT counted — treat both figures as lower bounds.")
-    if liab.get("uncertain"):
+    # Silent entries are named whatever their CADENCE. `uncertain` is `_ONCE_UNKNOWN`, which
+    # a router never is (it primes eagerly, so `_cadence` returns `_PER_TURN` before it ever
+    # looks at `blocks`), so a silent ROUTER printed the verdict in a table cell that nothing
+    # in the report explained — the very gap this split was widened to close, one state over
+    # (review of PR #417).
+    silent_any = sorted(s["server"] for s in liab["servers"]
+                        if s.get("break_even_verdict") == _R_NO_LEDGER_ROWS)
+    if liab.get("uncertain") or silent_any:
         # Split by CAUSE, because only one of the two has a fix the operator can act on.
         # `mcp-status` already tells this entry to bake `--server-name`; saying "no ledger
         # label" here and nothing else made the two commands read as unrelated complaints.
@@ -1899,8 +1909,16 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         # bucket and was told "no ledger label", whose documented meaning is "rows were
         # looked for and not found" — sending the operator to hunt for rows that do not
         # exist, four lines under a table that already said `writes no ledger rows`.
-        silent = _named(_R_NO_LEDGER_ROWS)
-        rest = [n for n in sorted(unknown) if n not in set(amb) | set(silent)]
+        silent = silent_any
+        # Named by its OWN reason rather than "everything left over": a fourth reason added
+        # later would otherwise inherit the "no ledger label" caption, which is the same
+        # mislabelling this split exists to remove.
+        #
+        # Measured equivalent TODAY — `uncertain` is exactly the `blocks is None` population
+        # and those three reasons are its only causes, so no test can tell the two spellings
+        # apart (mutation P5 survives, and is listed as equivalent rather than as a kill).
+        # It is the cheap half of a defect that has now been fixed twice.
+        rest = [n for n in _named("no ledger label") if n not in set(amb) | set(silent)]
         if rest:
             lines.append(f"  no ledger label, so it is unknown whether the lazy primer ever "
                          f"attached: {', '.join(rest)}")
@@ -2043,6 +2061,12 @@ def _fmt_denominator(srv: dict[str, Any]) -> str:
     return f"{blocks:,}"
 
 
+# The widest a rendered break-even row may get, reason strings included. 79 is the numeric
+# guarantee; the slack is the longest reason the last cell can carry (`ambiguous ledger
+# label`). A new reason longer than that folds the table and must be abbreviated instead.
+_BREAK_EVEN_MAX_WIDTH = 84
+
+
 def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
     """Per-server `saved/block` and the block count that pays for that server's primer.
 
@@ -2077,6 +2101,12 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
     # 15 with bare digits in the pair form holds a million-block ledger; the sum below is
     # 2 + 14+1 + 6+1 + 15+1 + 11+1 + 9+1 + 17 = 79, and `test_the_break_even_row_stays_
     # inside_eighty_columns` fails if any of these change without the others.
+    #
+    # The 80 is a guarantee about the NUMERIC cells only, and always has been: the last cell
+    # also carries a reason string, and `ambiguous ledger label` (22) has pushed that row to
+    # 84 since #285 — `writes no ledger rows` (21) is one of the same family, not a new one.
+    # Named here because the test measured only the numeric row and so could never have
+    # caught either (review of PR #417). `_BREAK_EVEN_MAX_WIDTH` below is the real bound.
     lines = ["", f"  {'server':<14} {'primer':>6} {'blocks':>15} {'saved/block':>11} "
                  f"{'cadence':>9} {'to break even':>17}"]
     # Rateless rows sort last as a group rather than tying with a 0.0 rate: `or -1` treated
@@ -2169,8 +2199,8 @@ def build_recommend_section(liab: dict[str, Any]) -> list[str]:
         lines.append("  terse has tested no policy change here — `terse policy autotune` is "
                      "the command that does.")
     if INSUFFICIENT in verdicts:
-        lines.append("  INSUFFICIENT = the ledger cannot answer yet (no label, no token "
-                     "data, unreadable policy, or not called).")
+        lines.append("  INSUFFICIENT = the ledger cannot answer yet (no label, no rows "
+                     "written at all, no token data, unreadable policy, or not called).")
     shown = _cadences_of(servers)
     if _PER_TURN in shown:
         lines.append("  coverage on a /turn row is against ONE turn's charge — a router "

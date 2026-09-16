@@ -21,6 +21,7 @@ called", and now mistaking a one-time charge for a recurring one.
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 
@@ -915,6 +916,35 @@ def test_the_break_even_row_stays_inside_eighty_columns(tmp_path):
                if ln.startswith("  ") and "1000000/1234567" in ln) <= 80
 
 
+def test_a_verdict_string_row_stays_inside_the_documented_bound(tmp_path):
+    """Review of PR #417: the test above matches the NUMERIC row, so it structurally cannot
+    measure a row whose last cell carries a reason string — and those are the wide ones.
+    `ambiguous ledger label` has pushed such a row to 84 since #285, and #397's
+    `writes no ledger rows` joins the same family. This measures every rendered row against
+    the bound the table documents, so a longer reason added later folds the table loudly."""
+    from terse.stats import _BREAK_EVEN_MAX_WIDTH, _build_break_even_table
+
+    pol = _policy(tmp_path)
+    silent = _scan("secret-broker", "wrapped", "/usr/bin/python -m sb", pol,
+                   identity="python", explicit=False)
+    silent["stats"] = False
+    rows = [silent,
+            _scan("aa", "wrapped", "/usr/bin/python -m aa", pol,
+                  identity="python", explicit=False),
+            _scan("bb", "wrapped", "/usr/bin/python -m bb", pol,
+                  identity="python", explicit=False),
+            _scan("kb", "wrapped", "/opt/kb-mcp", pol, identity="kb", explicit=True)]
+    liab = primer_liability(rows, _agg(("python", 30, 3000, 1500), ("kb", 9, 900, 300)))
+    lines = _build_break_even_table(liab["servers"])
+    printed = "\n".join(lines)
+    assert "writes no ledger rows" in printed and "ambiguous ledger label" in printed
+    # DATA rows only — the legend below the table is prose and wraps on its own terms.
+    names = {r["server"] for r in liab["servers"]}
+    data = [ln for ln in lines if ln[2:].split(" ")[0] in names]
+    assert len(data) == len(names), data
+    assert max(len(ln) for ln in data) <= _BREAK_EVEN_MAX_WIDTH, printed
+
+
 def test_a_called_server_that_never_shipped_a_wire_form_is_not_billed_a_primer(tmp_path):
     """Review finding, and the same mis-bucketing this split exists to fix, in the other
     direction. The lazy primer attaches to a result carrying a terse wire form, so an entry
@@ -1589,6 +1619,52 @@ def test_the_DEFAULT_ledger_spelled_out_is_not_elsewhere(tmp_path):
     assert served["blocks"] == 40, "the default ledger, spelled out, IS the ledger read"
 
 
+def test_the_ambiguity_contest_uses_the_ledger_path_too(tmp_path):
+    """Review of PR #417: dropping `ledger_path` from the `_ambiguous_labels` call left the
+    suite green, and it is not a no-op. Both entries write to the file being READ, so both
+    own `python` rows and neither may claim them — with the thread dropped, the contest
+    thinks both are silent, finds no collision, and hands each the other's blocks: #285's
+    double count, reopened."""
+    pol = _policy(tmp_path)
+    rows = []
+    for name in ("aa", "bb"):
+        r = _scan(name, "wrapped", f"/usr/bin/python -m {name}", pol,
+                  identity="python", explicit=False)
+        r["stats_log"] = "/srv/kb.jsonl"
+        rows.append(r)
+    from terse.stats import _ambiguous_labels
+    assert _ambiguous_labels(rows, "/srv/kb.jsonl") == {"python"}
+
+    served = {r["server"]: r for r in
+              primer_liability(rows, _agg(("python", 30, 3000, 1500)),
+                               ledger_path="/srv/kb.jsonl")["servers"]}
+    for name in ("aa", "bb"):
+        assert served[name]["ledger_labels"] == [], name
+        assert served[name]["break_even_verdict"] == "ambiguous ledger label", name
+
+
+def test_a_tilde_or_dotted_ledger_path_is_the_same_file(tmp_path):
+    """Review of PR #417: replacing `_same_file`'s body with `a == b` left the suite green,
+    because both existing tests spelled the path identically on each side. A tilde stays
+    LITERAL inside a JSON MCP config, and `default_stats_log()` returns it expanded — so
+    without normalisation the hand-edited entry that spells `~/...` is misread as silent.
+    That is the population `parse_proxy_opts`' docstring calls the one to read correctly."""
+    from terse.stats import default_stats_log
+
+    pol = _policy(tmp_path)
+    default = default_stats_log()
+    home = str(pathlib.Path.home())
+    assert str(default).startswith(home), "fixture assumes the default ledger is under $HOME"
+    tilde = "~" + str(default)[len(home):]
+    dotted = str(default.parent / "." / default.name)
+
+    for spelling in (tilde, dotted):
+        row = _scan("kb", "wrapped", "/opt/kb-mcp", pol, identity="kb", explicit=True)
+        row["stats_log"] = spelling
+        served = primer_liability([row], _agg(("kb", 40, 4000, 2000)))["servers"][0]
+        assert served["blocks"] == 40, f"{spelling} names the default ledger"
+
+
 def test_a_SILENT_router_claims_no_peer_labels(tmp_path):
     """Review of PR #417: the router branch never consulted the predicate, so a router baked
     `--no-stats` still claimed every peer's rows — including rows a `folded-and-live` peer
@@ -1602,6 +1678,24 @@ def test_a_SILENT_router_claims_no_peer_labels(tmp_path):
     assert served["terse"]["ledger_labels"] == []
     assert served["terse"]["blocks"] is None
     assert served["terse"]["break_even_verdict"] == "writes no ledger rows"
+
+
+def test_a_silent_ROUTER_is_explained_in_the_prose_too(tmp_path):
+    """Review of PR #417: the prose bucket was reached only through `uncertain`, which is
+    `cadence == _ONCE_UNKNOWN` — and a router primes eagerly, so it is `_PER_TURN` and never
+    lands there. A silent router therefore printed `writes no ledger rows` in a table cell
+    with nothing in the report explaining it: the same gap the bucket was added to close."""
+    from terse.stats import build_primer_section
+
+    pol = _policy(tmp_path)
+    router = _scan("terse", "router", "kb, zz", pol)
+    router["stats"] = False
+    prose = "\n".join(build_primer_section(
+        primer_liability([router, _scan("kb2", "wrapped", "/opt/kb-mcp", pol,
+                                        identity="kb2", explicit=True)],
+                         _agg(("kb", 40, 4000, 2000), ("kb2", 9, 900, 300)))))
+    assert "writes no ledger rows" in prose
+    assert "terse" in prose.split("writes no ledger rows")[1]
 
 
 def test_a_silent_entry_whose_guess_is_ALSO_ambiguous_names_the_silence(tmp_path):

@@ -13,24 +13,7 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
-
-## [0.33.7] - 2026-09-16
-
 ### Fixed
-
-- **A downstream server's `--no-stats` / `--no-diff` is no longer read as terse's own
-  (#397).** Both fields were derived over the entry's ENTIRE arg vector, so a flag
-  belonging to the wrapped server — anything after the `--`, such as a containerized
-  server's own flags in `docker run --rm -i <image> --no-stats` — reported `stats=off` /
-  `diff=off` for a proxy that logs and diffs normally. Where the entry runs no proxy at all
-  (not a terse launcher, or no `proxy` subcommand), both fields are now `None` — "cannot
-  say" — rather than asserting the defaults. `parse_proxy_opts`'
-  docstring already forbids exactly this for value flags; the boolean ones never used the
-  boundary. Both now read `proxy_arg_segment`, the tokens between `proxy` and the first
-  `--`. Display-only today, but #397's remaining work reads `stats` to decide whether an
-  entry can own a ledger label, which would have turned a wrong status line into a wrong
-  published number.
 
 - **An entry that writes no ledger rows neither collides nor claims a label (#397).** An
   entry baked with `--no-stats`, or pointed at another file with `--stats-log`, was counted
@@ -50,12 +33,35 @@ _Nothing yet._
   exists to protect. A silent ROUTER likewise claims none of its peers' labels. The verdict
   reaches the prose and the `1x?` legend, which named two causes where there are now three.
 
+  A silent ROUTER claims none of its peers' labels either, and is named in the prose
+  whatever its cadence — the `uncertain` bucket the explanation hangs off is
+  `once/session (?)`, which a router never is, so its verdict used to appear in a table cell
+  nothing explained. Both the break-even legend and `--recommend`'s INSUFFICIENT legend name
+  the new cause.
+
   Scope, stated rather than fixed: ownership is decided from the config as it is NOW, while
   the ledger may hold rows an entry wrote before `--no-stats` was baked. Those rows keep
   their label and, if it is a shared launcher basename, go to whichever entry still claims
   it.
 
 ### Added
+
+## [0.33.7] - 2026-09-16
+
+### Fixed
+
+- **A downstream server's `--no-stats` / `--no-diff` is no longer read as terse's own
+  (#397).** Both fields were derived over the entry's ENTIRE arg vector, so a flag
+  belonging to the wrapped server — anything after the `--`, such as a containerized
+  server's own flags in `docker run --rm -i <image> --no-stats` — reported `stats=off` /
+  `diff=off` for a proxy that logs and diffs normally. Where the entry runs no proxy at all
+  (not a terse launcher, or no `proxy` subcommand), both fields are now `None` — "cannot
+  say" — rather than asserting the defaults. `parse_proxy_opts`'
+  docstring already forbids exactly this for value flags; the boolean ones never used the
+  boundary. Both now read `proxy_arg_segment`, the tokens between `proxy` and the first
+  `--`. Display-only today, but #397's remaining work reads `stats` to decide whether an
+  entry can own a ledger label, which would have turned a wrong status line into a wrong
+  published number.
 
 - **A scan row can say where its ledger rows land (#397).** `parse_proxy_opts` now reads
   `--stats-log`, and `scan_scopes` carries it as `stats_log`. `terse stats` reads one
