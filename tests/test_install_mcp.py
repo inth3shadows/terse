@@ -1309,6 +1309,18 @@ def test_parse_proxy_opts_ignores_a_downstream_policy_flag():
     assert im.parse_proxy_opts(entry) == {"policy": "/terse/pol.json"}
 
 
+def test_parse_proxy_opts_reads_stats_log_so_a_row_can_say_where_rows_land():
+    """#397. `terse stats` reads ONE ledger. An entry pointed at another file writes real
+    records the report never sees — indistinguishable from an entry that writes none, and
+    the row could not even express the difference before this."""
+    entry = {"command": "/home/u/.local/bin/terse",
+             "args": ["proxy", "--stats-log", "/elsewhere.jsonl", "--", "kb-mcp"]}
+    assert im.parse_proxy_opts(entry) == {"stats_log": "/elsewhere.jsonl"}
+    eq = {"command": "/home/u/.local/bin/terse",
+          "args": ["proxy", "--stats-log=/e.jsonl", "--", "kb-mcp", "--stats-log", "/d"]}
+    assert im.parse_proxy_opts(eq) == {"stats_log": "/e.jsonl"}
+
+
 def test_parse_proxy_opts_returns_none_for_non_terse_entries():
     assert im.parse_proxy_opts(
         {"command": "node", "args": ["s.js", "proxy", "--policy", "x"]}) is None  # not terse
@@ -1458,6 +1470,38 @@ def _cfg_with(tmp_path, servers, stash):
     cfg.write_text(json.dumps({"mcpServers": servers}))
     (tmp_path / im.STASH_NAME).write_text(json.dumps({"user": stash}))
     return cfg
+
+
+def test_a_DOWNSTREAM_no_stats_or_no_diff_flag_is_not_read_as_terses(tmp_path):
+    """#397 direction 3, and the same defect in `diff`, which the issue does not mention.
+    Both were derived over the ENTIRE arg vector (`"--no-stats" not in args`), so a wrapped
+    server carrying its own `--no-stats` / `--no-diff` — `docker run --no-stats …` is a real
+    shape — turned the fields off for a proxy that diffs and logs normally.
+
+    `parse_proxy_opts`' docstring already forbids exactly this for value flags; the boolean
+    ones simply never used the boundary. Display-only today (`mcp-status` prints
+    `stats=off`), but #397's own fix for the ambiguity path reads `row["stats"]`, which
+    would turn a wrong status line into a wrong published number."""
+    cfg = _cfg_with(
+        tmp_path,
+        {"kb": _wrapped_entry("/opt/kb-mcp", extra_args=("--no-stats", "--no-diff"))},
+        {"kb": {"type": "stdio", "command": "/opt/kb-mcp", "args": [], "env": {}}})
+    row = {r["server"]: r for r in im.scan_scopes(cfg=cfg)}["kb"]
+    assert row["stats"] is True, "the proxy logs; only the downstream said otherwise"
+    assert row["diff"] != "off"
+    assert row["stats_log"] is None
+
+    # …and terse's OWN flags, in the same position the proxy writes them, still read.
+    (tmp_path / "b").mkdir()
+    cfg2 = _cfg_with(
+        tmp_path / "b",
+        {"kb": {"type": "stdio", "command": "/home/u/.local/bin/terse",
+                "args": ["proxy", "--no-stats", "--no-diff",
+                         "--stats-log", "/elsewhere.jsonl", "--", "/opt/kb-mcp"]}},
+        {"kb": {"type": "stdio", "command": "/opt/kb-mcp", "args": [], "env": {}}})
+    row2 = {r["server"]: r for r in im.scan_scopes(cfg=cfg2)}["kb"]
+    assert row2["stats"] is False and row2["diff"] == "off"
+    assert row2["stats_log"] == "/elsewhere.jsonl"
 
 
 def test_wrapped_but_unstashed_entry_is_not_reported_as_unwrapped(tmp_path):

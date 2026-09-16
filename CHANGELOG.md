@@ -15,6 +15,27 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **A downstream server's `--no-stats` / `--no-diff` is no longer read as terse's own
+  (#397).** Both fields were derived over the entry's ENTIRE arg vector, so a wrapped
+  server carrying either flag — `docker run --no-stats …` is a real shape — reported
+  `stats=off` / `diff=off` for a proxy that logs and diffs normally. `parse_proxy_opts`'
+  docstring already forbids exactly this for value flags; the boolean ones never used the
+  boundary. Both now read `proxy_arg_segment`, the tokens between `proxy` and the first
+  `--`. Display-only today, but #397's remaining work reads `stats` to decide whether an
+  entry can own a ledger label, which would have turned a wrong status line into a wrong
+  published number.
+
+### Added
+
+- **A scan row can say where its ledger rows land (#397).** `parse_proxy_opts` now reads
+  `--stats-log`, and `scan_scopes` carries it as `stats_log`. `terse stats` reads one
+  ledger; an entry pointed at another file writes real records the report never sees, which
+  until now was indistinguishable from an entry that wrote none.
+
+## [0.33.6] - 2026-09-16
+
+### Fixed
+
 - **`terse stats` no longer reads the server definition the client ignores (#398).** A
   server defined in more than one scope is one server to the client, which connects to the
   **highest-precedence** definition (local > project > user). Both `_ambiguous_labels` and

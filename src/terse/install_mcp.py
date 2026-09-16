@@ -935,6 +935,31 @@ def _looks_like_terse_launcher(entry: dict) -> bool:
 NO_PEERS = "(no peers)"
 
 
+def proxy_arg_segment(entry: dict) -> list[str] | None:
+    """The tokens between the `proxy` subcommand and the first `--` — TERSE's own flags,
+    with the downstream's excluded — or None when `entry` is not a terse-wrapped entry.
+
+    The boundary every reader of these args needs and two of them did not have. `stats_on`
+    and the `diff` label were derived with `"--no-stats" not in args` / `"--no-diff" in
+    args` over the ENTIRE vector, so a DOWNSTREAM server's own `--no-stats` or `--no-diff`
+    flag was read as terse's (#397). That is precisely what `parse_proxy_opts`' docstring
+    says this boundary exists to prevent; the boolean flags simply never used it."""
+    if not _looks_like_terse_launcher(entry):
+        return None
+    args = entry.get("args")
+    if not isinstance(args, list):
+        return None
+    try:
+        start = args.index("proxy")
+    except ValueError:
+        return None
+    try:
+        end = args.index("--", start + 1)
+    except ValueError:
+        end = len(args)   # no downstream separator (unusual) — scan to the end
+    return [a for a in args[start + 1:end] if isinstance(a, str)]
+
+
 def parse_proxy_opts(entry: dict) -> dict[str, str] | None:
     """The terse proxy options baked into a wrapped MCP server `entry`'s args —
     `{'policy','capture_dir','server_name'}` for whichever keys are present — or None
@@ -950,22 +975,16 @@ def parse_proxy_opts(entry: dict) -> dict[str, str] | None:
     what a hand-edit did. Missing it made `--server-name=kb` invisible to `mcp-status` and
     to `terse stats`' break-even, reproducing #285's silent under-report on an entry that
     had baked the very flag that fixes it."""
-    if not _looks_like_terse_launcher(entry):
+    seg = proxy_arg_segment(entry)
+    if seg is None:
         return None
-    args = entry.get("args")
-    if not isinstance(args, list):
-        return None
-    try:
-        start = args.index("proxy")
-    except ValueError:
-        return None
-    try:
-        end = args.index("--", start + 1)
-    except ValueError:
-        end = len(args)   # no downstream separator (unusual) — scan to the end
-    seg = args[start + 1:end]
     flag_map = {"--policy": "policy", "--capture-dir": "capture_dir",
-                "--server-name": "server_name"}
+                "--server-name": "server_name",
+                # Captured so a scan row can EXPRESS "writes its ledger rows somewhere
+                # else" (#397). An entry with `--stats-log /elsewhere.jsonl` writes real
+                # records that `terse stats` never reads, which looks exactly like an entry
+                # that wrote nothing — except that nothing in the row could say so.
+                "--stats-log": "stats_log"}
     opts: dict[str, str] = {}
     i = 0
     while i < len(seg):
@@ -1555,6 +1574,7 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
         wraps = None
         diff = None
         stats_on = None
+        stats_log = None
         # A `folded-and-live` entry is live under its own name AND named in the peers
         # file, so when that live entry launches via terse it runs its own proxy and
         # writes its own ledger rows under its own guessed identity — which is exactly
@@ -1629,9 +1649,20 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
                 default_label = _default_diff_label(policy)
             # The router's own `--diff` / `--no-diff` still wins outright — `_build_peers`
             # applies the CLI flag over every peer's policy, so the label must too.
-            diff = ("off" if "--no-diff" in args
-                    else "on" if "--diff" in args else default_label)
-            stats_on = "--no-stats" not in args
+            # TERSE's own flags only. Over the whole vector, a downstream server's
+            # `--no-diff`/`--no-stats` was read as this proxy's (#397): `wraps` for a
+            # `docker run … --no-stats` downstream turned the status line off for a proxy
+            # logging normally, and any published number derived from the field inherits
+            # that. `or []` keeps a row whose entry is unreadable at the documented
+            # defaults rather than crashing the scan.
+            seg = proxy_arg_segment(servers[name]) or []
+            diff = ("off" if "--no-diff" in seg
+                    else "on" if "--diff" in seg else default_label)
+            stats_on = "--no-stats" not in seg
+            # Where those rows land, when it is not the default ledger. `terse stats` reads
+            # one file; an entry pointed elsewhere writes real records the report never
+            # sees, which is indistinguishable from writing none unless the row says so.
+            stats_log = (parse_proxy_opts(servers[name]) or {}).get("stats_log")
         ledger_identity = None
         ledger_identity_explicit = None
         if (live_terse_peer or state in ("wrapped", "wrapped-unstashed")) and downstream:
@@ -1664,7 +1695,7 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
         rows.append({"scope": scope, "server": name, "state": state, "policy": policy,
                     "policy_missing": policy_missing, "launcher": launcher,
                     "launcher_missing": launcher_gone, "wraps": wraps, "diff": diff,
-                    "stats": stats_on, "config": str(target.cfg),
+                    "stats": stats_on, "stats_log": stats_log, "config": str(target.cfg),
                     # Which router a peer sits behind — the one fact a folded row can't
                     # otherwise state, and the first thing you need to un-fold it.
                     "router": (router_name if state in ("folded", "folded-unstashed",
@@ -1682,8 +1713,8 @@ def scan_scopes(*, cfg: Path | None = None, file: str | None = None,
     """Enumerate every terse-relevant mcpServers entry across all three scopes,
     read-only — no writes, no directory creation, never raises. One row per
     (scope, server): {scope, server, state, policy, policy_missing, launcher,
-    launcher_missing, wraps, diff, stats, config, router, peers_error, ledger_identity,
-    ledger_identity_explicit}, state one of
+    launcher_missing, wraps, diff, stats, stats_log, config, router, peers_error,
+    ledger_identity, ledger_identity_explicit}, state one of
     "wrapped"
     (stashed and present), "wrapped-unstashed" (the entry launches via terse but has no
     stash, so its original command cannot be restored — #172), "router" (a --multiproxy
@@ -1695,7 +1726,7 @@ def scan_scopes(*, cfg: Path | None = None, file: str | None = None,
     front one peers file — a hand-edit terse refuses to guess through),
     "orphaned-stash" (stashed
     but the entry vanished — see `_scan_target`), or "unwrapped" (present, not terse's). The wrapped-only
-    fields (policy_missing, launcher, launcher_missing, wraps, diff, stats) are
+    fields (policy_missing, launcher, launcher_missing, wraps, diff, stats, stats_log) are
     None/False for non-wrapped rows — with one exception: a "folded-and-live" row whose
     LIVE entry launches via terse carries them too, because that entry runs its own proxy
     and writes its own ledger records (#309). A "folded-and-live" row that is live as a
