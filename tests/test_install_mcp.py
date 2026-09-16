@@ -1474,9 +1474,11 @@ def _cfg_with(tmp_path, servers, stash):
 
 def test_a_DOWNSTREAM_no_stats_or_no_diff_flag_is_not_read_as_terses(tmp_path):
     """#397 direction 3, and the same defect in `diff`, which the issue does not mention.
-    Both were derived over the ENTIRE arg vector (`"--no-stats" not in args`), so a wrapped
-    server carrying its own `--no-stats` / `--no-diff` — `docker run --no-stats …` is a real
-    shape — turned the fields off for a proxy that diffs and logs normally.
+    Both were derived over the ENTIRE arg vector (`"--no-stats" not in args`), so a flag
+    belonging to the wrapped server — anything after the `--`, e.g. the containerized
+    server's own flags in `docker run --rm -i <image> --no-stats` — turned the fields off
+    for a proxy that diffs and logs normally. (`docker run` itself has no `--no-stats`; an
+    earlier draft of this docstring said it did.)
 
     `parse_proxy_opts`' docstring already forbids exactly this for value flags; the boolean
     ones simply never used the boundary. Display-only today (`mcp-status` prints
@@ -1502,6 +1504,30 @@ def test_a_DOWNSTREAM_no_stats_or_no_diff_flag_is_not_read_as_terses(tmp_path):
     row2 = {r["server"]: r for r in im.scan_scopes(cfg=cfg2)}["kb"]
     assert row2["stats"] is False and row2["diff"] == "off"
     assert row2["stats_log"] == "/elsewhere.jsonl"
+
+
+def test_an_entry_that_runs_NO_proxy_says_cannot_say_rather_than_asserting(tmp_path):
+    """Review of PR #416: `or []` collapsed "not a terse launcher / no `proxy` subcommand"
+    into "no flags baked", so a stashed entry hand-edited back to a raw command reported
+    `stats=True` — an assertion about a proxy that does not run. Step 2 reads this field to
+    decide whether an entry may own a ledger label."""
+    cfg = _cfg_with(
+        tmp_path,
+        {"kb": {"type": "stdio", "command": "docker",
+                "args": ["run", "--rm", "-i", "kb-img", "--no-stats"]}},
+        {"kb": {"type": "stdio", "command": "/opt/kb-mcp", "args": [], "env": {}}})
+    row = {r["server"]: r for r in im.scan_scopes(cfg=cfg)}["kb"]
+    assert row["state"] == "wrapped"
+    assert row["stats"] is None and row["diff"] is None and row["stats_log"] is None
+
+
+def test_a_non_str_token_does_not_let_a_flag_reach_its_value(tmp_path):
+    # Review of PR #416: filtering the segment to `str` COMPACTED it, so `--policy`, 5,
+    # "/p.json" read as `--policy /p.json`. Every caller previously saw the junk token
+    # sitting between them and gave up.
+    entry = {"command": "/home/u/.local/bin/terse",
+             "args": ["proxy", "--policy", 5, "/p.json", "--", "kb-mcp"]}
+    assert im.parse_proxy_opts(entry) == {}
 
 
 def test_wrapped_but_unstashed_entry_is_not_reported_as_unwrapped(tmp_path):

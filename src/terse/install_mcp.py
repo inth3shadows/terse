@@ -941,8 +941,9 @@ def proxy_arg_segment(entry: dict) -> list[str] | None:
 
     The boundary every reader of these args needs and two of them did not have. `stats_on`
     and the `diff` label were derived with `"--no-stats" not in args` / `"--no-diff" in
-    args` over the ENTIRE vector, so a DOWNSTREAM server's own `--no-stats` or `--no-diff`
-    flag was read as terse's (#397). That is precisely what `parse_proxy_opts`' docstring
+    args` over the ENTIRE vector, so a flag belonging to the DOWNSTREAM server — anything
+    after the `--`, including a containerized server's own flags in `docker run --rm -i
+    <image> --no-stats` — was read as terse's (#397). That is precisely what `parse_proxy_opts`' docstring
     says this boundary exists to prevent; the boolean flags simply never used it."""
     if not _looks_like_terse_launcher(entry):
         return None
@@ -957,13 +958,17 @@ def proxy_arg_segment(entry: dict) -> list[str] | None:
         end = args.index("--", start + 1)
     except ValueError:
         end = len(args)   # no downstream separator (unusual) — scan to the end
-    return [a for a in args[start + 1:end] if isinstance(a, str)]
+    # NOT filtered to `str`: compacting the segment would let `["--policy", 5,
+    # "/p.json"]` read as `--policy /p.json`, where every caller previously saw the
+    # non-str token sitting between them and gave up (review of PR #416). Callers test
+    # `isinstance` at the point of use; membership tests for boolean flags do not care.
+    return list(args[start + 1:end])
 
 
 def parse_proxy_opts(entry: dict) -> dict[str, str] | None:
     """The terse proxy options baked into a wrapped MCP server `entry`'s args —
-    `{'policy','capture_dir','server_name'}` for whichever keys are present — or None
-    when `entry` is not a terse-wrapped entry.
+    `{'policy','capture_dir','server_name','stats_log'}` for whichever keys are present —
+    or None when `entry` is not a terse-wrapped entry.
 
     Only the segment BETWEEN the `proxy` subcommand and the first `--` (the downstream
     boundary `wrap` writes) is scanned, so a value on the DOWNSTREAM side that happens to
@@ -1650,19 +1655,27 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
             # The router's own `--diff` / `--no-diff` still wins outright — `_build_peers`
             # applies the CLI flag over every peer's policy, so the label must too.
             # TERSE's own flags only. Over the whole vector, a downstream server's
-            # `--no-diff`/`--no-stats` was read as this proxy's (#397): `wraps` for a
-            # `docker run … --no-stats` downstream turned the status line off for a proxy
-            # logging normally, and any published number derived from the field inherits
-            # that. `or []` keeps a row whose entry is unreadable at the documented
-            # defaults rather than crashing the scan.
-            seg = proxy_arg_segment(servers[name]) or []
-            diff = ("off" if "--no-diff" in seg
-                    else "on" if "--diff" in seg else default_label)
-            stats_on = "--no-stats" not in seg
+            # `--no-diff` / `--no-stats` was read as this proxy's (#397) — e.g. a
+            # containerized server run as `docker run --rm -i kb-img --no-stats`, where the
+            # flag after the image is the SERVER's — and any published number derived from
+            # the field inherits that.
+            #
+            # `None` is kept as None, not defaulted to "no flags baked" (review of PR #416).
+            # It means the entry is not a terse launcher, or carries no `proxy` subcommand:
+            # a row reached through the stash or through `_is_router_entry` can land here
+            # without one. Saying `stats=True` for an entry that provably runs no proxy is
+            # an assertion, not a default — and step 2 reads this field to decide whether
+            # an entry may own a ledger label. The wrapped-only fields are documented as
+            # None for exactly this "cannot say" case.
+            seg = proxy_arg_segment(servers[name])
+            if seg is not None:
+                diff = ("off" if "--no-diff" in seg
+                        else "on" if "--diff" in seg else default_label)
+                stats_on = "--no-stats" not in seg
             # Where those rows land, when it is not the default ledger. `terse stats` reads
             # one file; an entry pointed elsewhere writes real records the report never
             # sees, which is indistinguishable from writing none unless the row says so.
-            stats_log = (parse_proxy_opts(servers[name]) or {}).get("stats_log")
+                stats_log = (parse_proxy_opts(servers[name]) or {}).get("stats_log")
         ledger_identity = None
         ledger_identity_explicit = None
         if (live_terse_peer or state in ("wrapped", "wrapped-unstashed")) and downstream:
