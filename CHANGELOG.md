@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.33.7] - 2026-09-16
+
 ### Fixed
 
 - **A downstream server's `--no-stats` / `--no-diff` is no longer read as terse's own
@@ -39,6 +43,17 @@ fails that pull request until the section has moved.
   distinct from `no ledger label` (rows looked for, not found) and `ambiguous ledger label`
   (rows exist, shared). A row from a scan predating the `stats` field keeps its measurement:
   absence of the field is not evidence of silence.
+
+  `--stats-log` is compared against the ledger the report is actually reading (`terse stats
+  --log FILE`, else the default), not treated as silence on sight — an entry writing to the
+  file being read is its OWNER, and the first cut deleted exactly the measurement this fix
+  exists to protect. A silent ROUTER likewise claims none of its peers' labels. The verdict
+  reaches the prose and the `1x?` legend, which named two causes where there are now three.
+
+  Scope, stated rather than fixed: ownership is decided from the config as it is NOW, while
+  the ledger may hold rows an entry wrote before `--no-stats` was baked. Those rows keep
+  their label and, if it is a shared launcher basename, go to whichever entry still claims
+  it.
 
 ### Added
 

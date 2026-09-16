@@ -901,7 +901,8 @@ def _guessed_label(row: dict[str, Any]) -> str:
     return server_label(wraps.split()) if wraps else ""
 
 
-def _ambiguous_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
+def _ambiguous_labels(scan_rows: list[dict[str, Any]],
+                      ledger_path: str | None = None) -> set[str]:
     """Guessed launcher labels that MORE THAN ONE installed entry resolves to — the only
     state in which reading ledger rows under one is provably attributing another server's
     traffic (#285).
@@ -946,17 +947,8 @@ def _ambiguous_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
         # then reported the SAME blocks — #285's double count, relocated rather than fixed.
         # The two paths only make sense changed together, and they are: see
         # `_wrapped_labels`.
-        if not _writes_ledger_rows(row):
+        if not _writes_ledger_rows(row, ledger_path):
             continue
-        # NOT also gated on `row["stats"]`: an entry baked with `--no-stats` writes no
-        # ledger records, so in principle it cannot be one of the two fighting over a
-        # label — but skipping it HERE only removes the collision. Nothing downstream stops
-        # that same entry from claiming the label anyway (`_wrapped_labels` still returns
-        # its guess, and `primer_liability` still renders it), so both entries then report
-        # the SAME blocks: #285's double count, relocated rather than fixed. Tried in
-        # review of #309 and reverted with the measurement in hand. The `--no-stats` hole
-        # is real in both directions and pre-dates this — it needs the label path and this
-        # one changed together, which moves published numbers. Tracked separately.
         lbl = _guessed_label(row)
         if not lbl:
             continue
@@ -1029,7 +1021,8 @@ def _superseded_labels(row: dict[str, Any], labels: list[str],
     return [guess] if by_label.get(guess) else []
 
 
-def _wrapped_labels(row: dict[str, Any], wraps: str, ambiguous: set[str]) -> list[str]:
+def _wrapped_labels(row: dict[str, Any], wraps: str, ambiguous: set[str],
+                    ledger_path: str | None = None) -> list[str]:
     """The ledger label(s) a WRAPPED (standalone) entry's records are written under.
 
     `--server-name` (#83, baked by `install-mcp` since #152) overrides what the proxy
@@ -1056,7 +1049,7 @@ def _wrapped_labels(row: dict[str, Any], wraps: str, ambiguous: set[str]) -> lis
     # `--server-name`, which says what it WOULD write, not that it wrote anything. Without
     # this, excluding it from the ambiguity contest just lets it claim another server's
     # rows outright.
-    if not _writes_ledger_rows(row):
+    if not _writes_ledger_rows(row, ledger_path):
         return []
     ident = row.get("ledger_identity")
     if ident and row.get("ledger_identity_explicit"):
@@ -1111,13 +1104,25 @@ _R_AMBIGUOUS = "ambiguous ledger label"
 _R_NO_LEDGER_ROWS = "writes no ledger rows"
 
 
-def _writes_ledger_rows(row: dict[str, Any]) -> bool:
-    """Does this entry write records into the ledger `terse stats` reads?
+def _writes_ledger_rows(row: dict[str, Any], ledger_path: str | None = None) -> bool:
+    """Does this entry write records into the ledger THIS REPORT IS READING?
 
     False in exactly two configured cases: `--no-stats` (the proxy writes nothing at all)
-    and `--stats-log /elsewhere.jsonl` (it writes real records this report never sees).
-    Both make the entry unable to own a ledger label, and unable to be one of two servers
-    colliding over one.
+    and `--stats-log` pointing at a DIFFERENT file from the one being read (it writes real
+    records this report never sees). Both make the entry unable to own a ledger label, and
+    unable to be one of two servers colliding over one.
+
+    `ledger_path` is the file the report was built from (`terse stats --log FILE`, else
+    `default_stats_log()`). Comparing against it is not a refinement — without it the
+    predicate deletes exactly the measurement it exists to protect (review of PR #417):
+    `--stats-log /srv/kb.jsonl` read back with `terse stats --log /srv/kb.jsonl` is the
+    entry that owns every row in the file, and a hand-edited entry that simply spells the
+    default path out is the same case. `parse_proxy_opts`' docstring calls hand-edited
+    entries "the one population this has to read correctly".
+
+    Resolved before comparing, so `~/x.jsonl`, `./x.jsonl` and `/home/u/x.jsonl` are one
+    file. A path that cannot be resolved is compared as written rather than raising — a
+    report is never load-bearing (#197).
 
     `stats` MISSING is True, not False: a row from a scan that predates the field cannot
     say, and reading absence as silence would retract the measurement of every entry
@@ -1125,7 +1130,21 @@ def _writes_ledger_rows(row: dict[str, Any]) -> bool:
     keeps for a missing counter."""
     if row.get("stats") is False:
         return False
-    return not row.get("stats_log")
+    baked = row.get("stats_log")
+    if not baked:
+        return True
+    return _same_file(str(baked), ledger_path or str(default_stats_log()))
+
+
+def _same_file(a: str, b: str) -> bool:
+    """Do two ledger paths name one file? Expanded and normalised, never `os.path.samefile`
+    — that needs both to EXIST, and a ledger the proxy has not written yet is the common
+    case for a freshly installed entry."""
+    try:
+        return (os.path.realpath(os.path.expanduser(a))
+                == os.path.realpath(os.path.expanduser(b)))
+    except Exception:  # noqa: BLE001 - a malformed path is "not the same file", not a crash
+        return a == b
 
 # Verdict reason vocabulary beyond the `_break_even` strings it passes through. Closed set --
 # `--json` consumers switch on these.
@@ -1246,6 +1265,11 @@ def _break_even(primer_tokens: int | None, blocks: int | None,
                         basename is a launcher (`python`, `npx`, ...) that ANOTHER installed
                         entry also resolves to, so its rows cannot be told from that
                         server's. Rows exist; attribution does not (#285).
+      writes no ledger rows
+                        the entry is configured not to write into the ledger this report
+                        reads — `--no-stats`, or `--stats-log` naming a different file. It
+                        owns no label here and cannot collide over one; there is nothing to
+                        look for, as opposed to looking and not finding (#397).
       never called      installed, pays a primer, banked nothing this window.
       no token data     called, but every matching row was recorded without tiktoken. The
                         savings in TOKENS are unknown, not zero — and dividing a cl100k
@@ -1276,9 +1300,10 @@ def _break_even(primer_tokens: int | None, blocks: int | None,
     a server that is in fact paying for itself (found in review of #197).
     """
     if blocks is None:
-        # `no_label_reason` refines WHY there is no label when the caller knows — today only
-        # `ambiguous ledger label`. Defaulted, so every existing caller keeps the original
-        # string and this stays additive to the `--json` vocabulary.
+        # `no_label_reason` refines WHY there is no label when the caller knows:
+        # `ambiguous ledger label` (#285) or `writes no ledger rows` (#397). Defaulted, so
+        # every existing caller keeps the original string and this stays additive to the
+        # `--json` vocabulary.
         return {"saved_per_block": None, "blocks_to_break_even": None,
                 "break_even_verdict": no_label_reason or "no ledger label"}
     if blocks == 0:
@@ -1428,7 +1453,8 @@ def _contributors(labels: list[str], blocks_by: dict[str, int], saved_by: dict[s
     return sorted(rows, key=lambda r: r["saved_tokens"], reverse=True)
 
 
-def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> dict[str, Any]:
+def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
+                     ledger_path: str | None = None) -> dict[str, Any]:
     """Primer cost of the INSTALLED wrapped servers, against the window's savings.
 
     Installed, not ledger-derived, and that distinction is the whole point: an eagerly-primed
@@ -1581,7 +1607,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
     winners = _precedence_winner(scan_rows)
     # Computed over ALL rows before any is rendered: whether one entry's guessed label is
     # ambiguous is a fact about the fleet, not about that row (#285).
-    ambiguous = _ambiguous_labels(scan_rows)
+    ambiguous = _ambiguous_labels(scan_rows, ledger_path)
     live = _live_labels(scan_rows)
     for i, row in enumerate(scan_rows):
         name, state = row.get("server"), row.get("state")
@@ -1609,7 +1635,15 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         peers = ([] if peerless
                  else [p for p in (q.strip() for q in wraps.split(",")) if p]
                  ) if is_router else []
-        labels = peers if is_router else _wrapped_labels(row, wraps, ambiguous)
+        # A SILENT router owns no labels either (review of PR #417). The peer names are
+        # the labels a router's rows carry, but a router baked `--no-stats` (or writing to
+        # another ledger) wrote none of them — and leaving this branch ungated let it claim
+        # every peer's savings, including rows a `folded-and-live` peer wrote through its
+        # own proxy. That is the same "excluded from the contest, still owning the label"
+        # shape this fix exists to remove, one state over.
+        writes = _writes_ledger_rows(row, ledger_path)
+        labels = (peers if writes else []) if is_router \
+            else _wrapped_labels(row, wraps, ambiguous, ledger_path)
         pol_path = row.get("policy")
         tokens: int | None = None
         try:
@@ -1714,8 +1748,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
                               # Reporting that would send the operator to bake
                               # `--server-name` on an entry whose rows do not exist.
                               _R_NO_LEDGER_ROWS
-                              if not labels and not is_router
-                              and not _writes_ledger_rows(row)
+                              if not labels and not writes
                               else _R_AMBIGUOUS
                               if not labels and not is_router
                               and _guessed_label(row) in ambiguous
@@ -1855,13 +1888,27 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         # `mcp-status` already tells this entry to bake `--server-name`; saying "no ledger
         # label" here and nothing else made the two commands read as unrelated complaints.
         unknown = set(liab["uncertain"])
-        amb = sorted(s["server"] for s in liab["servers"]
-                     if s["server"] in unknown
-                     and s.get("break_even_verdict") == _R_AMBIGUOUS)
-        rest = [n for n in sorted(unknown) if n not in set(amb)]
+
+        def _named(reason: str) -> list[str]:
+            return sorted(s["server"] for s in liab["servers"]
+                          if s["server"] in unknown
+                          and s.get("break_even_verdict") == reason)
+
+        amb = _named(_R_AMBIGUOUS)
+        # THREE causes now, not two (review of PR #417). A silent entry reached the `rest`
+        # bucket and was told "no ledger label", whose documented meaning is "rows were
+        # looked for and not found" — sending the operator to hunt for rows that do not
+        # exist, four lines under a table that already said `writes no ledger rows`.
+        silent = _named(_R_NO_LEDGER_ROWS)
+        rest = [n for n in sorted(unknown) if n not in set(amb) | set(silent)]
         if rest:
             lines.append(f"  no ledger label, so it is unknown whether the lazy primer ever "
                          f"attached: {', '.join(rest)}")
+        if silent:
+            lines.append("  writes no ledger rows — baked `--no-stats`, or `--stats-log` "
+                         "pointing elsewhere, so this report")
+            lines.append(f"  cannot see what they banked and they claim no ledger label: "
+                         f"{', '.join(silent)}")
         if amb:
             lines.append(f"  ambiguous ledger label — these entries share a launcher "
                          f"basename, so their rows cannot be told apart: {', '.join(amb)}")
@@ -2058,8 +2105,8 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
         lines.append("  1x = a lazily-primed standalone entry (#211): the break-even is "
                      "blocks ONCE PER SESSION, a far lower bar.")
         if _ONCE_FREE in shown or _ONCE_UNKNOWN in shown:
-            lines.append("  1x? = called-ness unknown (no ledger label, or an ambiguous "
-                         "one); 1x- = unpaid, either")
+            lines.append("  1x? = called-ness unknown (no ledger label, an ambiguous one, "
+                         "or no rows written at all); 1x- = unpaid, either")
             lines.append("  because it was never triggered or because every primer was "
                          "declined (#286).")
     lines.append("  a BLOCK is one emitted tool-result text block — >=1 per call, so this "
