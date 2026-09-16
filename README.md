@@ -30,24 +30,27 @@ tabularization primitive is public (formats like [TOON](https://toonformat.dev/)
 it standalone, MIT-licensed, ~40% on flat arrays), so a motivated competitor could clone
 the codec in a weekend.
 
-**2. The stateful cross-call diff — the defensible axis.** When the same tool is called
-again — poll a list, re-read a file — terse emits a lossless *delta* against the prior
-result instead of the whole payload (**~73% smaller on the repeated call** in the model
-below). This is the one axis a stateless encoder **architecturally cannot reach**: TOON,
-headroom's stateless per-call compressor, and server-side history-pruning all pay the
-full column every call because none of them remember the last result — terse can only do
-it because it lives in the session as a transparent proxy. That makes it the harder half
-to copy. But it is a **bonus tier, not the headline**: it only pays off when a workload
-actually repeats a call with a similar-enough payload. That measured ~0.4% of results in
-terse's own 7-day traffic — but most of that was **structural, not workload**: results
-arriving as N content blocks were excluded from diffing outright, which was 71% of tokens.
-The cross-block join (below) removed that exclusion, and across every third-party server
-benchmarked in BENCHMARKS §6 a repeated call now produces a delta. How often *your* loop
-repeats a call is still yours to measure (`terse stats`).
-When your loop *does* re-fetch mostly-unchanged results it compounds hard; when it
-doesn't, it costs nothing (lossless, and emitted only when smaller). OPT-IN, not the
-default, since #170: its validation program completed, but its primer paragraph costs
-more than the tier banks at the measured hit rate (see Status).
+**2. The stateful cross-call diff — the axis nobody else can reach, and it still does not
+pay here.** When the same tool is called again — poll a list, re-read a file — terse emits
+a lossless *delta* against the prior result instead of the whole payload (**~73% smaller on
+the repeated call** in the model below). This is the one axis a stateless encoder
+**architecturally cannot reach**: TOON, headroom's stateless per-call compressor, and
+server-side history-pruning all pay the full column every call because none of them
+remember the last result — terse can only do it because it lives in the session as a
+transparent proxy.
+
+That is an architectural claim, and it survives. The economic one does not, at this
+workload. Measured over 14 days of terse's own post-join traffic (#250): the tier fired on
+**1.9% of blocks** (3.7% on the newest build — the highest hit rate ever measured here) and
+banked **1,344 tokens**, while its primer paragraph costs **190 tokens every turn** behind a
+router. The dominant exclusion is no longer structural — the cross-block join removed that
+one — it is the workload: `no_prior`, i.e. the call was the first for that tool in the
+session. No codec change reaches that.
+
+So it is **opt-in and not the headline** (#170, re-confirmed on post-join evidence). When a
+loop really does re-fetch mostly-unchanged results it compounds hard; short sessions with
+wide tool variety never exercise it. How often *your* loop repeats a call is yours to
+measure (`terse stats`).
 
 Around those two sits the **bundle** that turns a byte filter into a control plane you
 don't want to rip out: MCP-native proxy packaging (transparent to any downstream
@@ -341,6 +344,11 @@ attached once per session to each wrapped server that emits a terse form
 which roughly 27 primer attaches erase — about two a day across that window, which an
 active fleet passes immediately. That is the standalone cadence; behind a router the
 same paragraph rides `initialize` and is re-read every turn, which only widens the gap.
+**Re-measured post-join, 14 days to 2026-09-15 (#250):** the structural exclusion is gone
+and the verdict is unchanged — 17 of 908 blocks (1.9%; 3.7% on the newest build) banking
+**1,344 tokens**, against 190 tokens per turn of primer behind a router. Break-even would
+need about seven turns a fortnight. The remaining exclusions are workload, not structure
+(`no_prior` 162, `not_smaller_diff_args` 140).
 Its full
 validation program did pass: pair fluency
 (`fluency --diff`, 4-model panel 100% — per the 0.26.0 changelog entry (#249), this
@@ -355,7 +363,9 @@ keyframe bound). Opt IN per proxy (`--diff`) or per policy (`"diff": true`) — 
 workload that really does re-call the same tool with the same arguments.
 Cross-block joining (N content blocks
 folded into one record array before compressing) is built and on by default — it removed
-the structural exclusion that kept 71% of real traffic out of the diff tier entirely.
+the structural exclusion that kept 71% of real traffic out of the diff tier entirely, and
+the re-measurement above is what that removal was worth: a higher hit rate on payloads too
+small to pay for the primer.
 The Tier 1 lossy modes `truncate` and
 `drop-to-retrieve` are built (opt-in, off by default); `summarize` remains designed but
 not yet built — see TECHNICAL.md "Known Limitations".

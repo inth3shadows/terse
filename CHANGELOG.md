@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.33.4] - 2026-09-15
+
 ### Fixed
 
 - **An UNRESOLVED codec cell names every reason it is unresolved, not only the first
