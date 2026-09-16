@@ -1511,6 +1511,81 @@ def test_a_shadowed_entry_does_not_take_the_slot_from_the_one_that_runs(tmp_path
         assert served[name]["blocks"] is None
 
 
+def test_a_SILENT_entry_neither_collides_nor_claims_the_label(tmp_path):
+    """#397, both directions at once — and the pair of numbers the reverted PR #395 attempt
+    got wrong. `kb` is baked `--no-stats`, so it writes no ledger rows at all; `zz` wrote
+    every one of the 9 `python` blocks.
+
+        main before #397:  kb blocks=None  zz blocks=None   "ambiguous ledger label"
+        the reverted fix:  kb blocks=9     zz blocks=9      <- both claim the same rows
+        here:              kb "writes no ledger rows"       zz blocks=9
+
+    Skipping the silent entry in `_ambiguous_labels` alone removes the collision but lets
+    it claim the label anyway; giving up the claim alone leaves the false ambiguity. Only
+    both together give `zz` its own measurement back."""
+    pol = _policy(tmp_path)
+    rows = [_scan("kb", "wrapped", "/usr/bin/python -m kb", pol,
+                  identity="python", explicit=False),
+            _scan("zz", "wrapped", "/usr/bin/python -m zz", pol,
+                  identity="python", explicit=False)]
+    rows[0]["stats"] = False
+    from terse.stats import _ambiguous_labels
+    assert _ambiguous_labels(rows) == set()
+
+    served = {r["server"]: r for r in
+              primer_liability(rows, _agg(("python", 9, 6000, 3000)))["servers"]}
+    assert served["kb"]["ledger_labels"] == []
+    assert served["kb"]["blocks"] is None
+    assert served["kb"]["break_even_verdict"] == "writes no ledger rows"
+    assert served["zz"]["blocks"] == 9
+    assert served["zz"]["break_even_verdict"] != "ambiguous ledger label"
+
+
+def test_a_stats_log_elsewhere_entry_is_silent_to_THIS_ledger(tmp_path):
+    # The same case, worse hidden: the rows exist, just not in the file `terse stats` reads.
+    # An explicit `--server-name` does not rescue it — that says what it WOULD write.
+    pol = _policy(tmp_path)
+    rows = [_scan("kb", "wrapped", "/opt/kb-mcp", pol, identity="kb", explicit=True),
+            _scan("zz", "wrapped", "/usr/bin/python -m zz", pol,
+                  identity="python", explicit=False)]
+    rows[0]["stats"] = True
+    rows[0]["stats_log"] = "/elsewhere.jsonl"
+    served = {r["server"]: r for r in
+              primer_liability(rows, _agg(("kb", 40, 4000, 2000)))["servers"]}
+    assert served["kb"]["ledger_labels"] == []
+    assert served["kb"]["break_even_verdict"] == "writes no ledger rows"
+
+
+def test_a_silent_entry_is_INSUFFICIENT_not_UNWRAP(tmp_path):
+    """Unmeasured by configuration is not a measured zero: "it banks nothing, remove it" is
+    a verdict about evidence nobody collected.
+
+    Pins the OUTCOME, not the route. Measured while mutating: dropping the reason from
+    `_NO_DATA_REASONS` leaves this green, because a silent entry has no labels and so
+    reaches the same INSUFFICIENT through `_recommend`'s last branch. The tuple entry is
+    kept for meaning — see the comment there — and this test cannot distinguish the two
+    paths, which is worth saying rather than implying otherwise."""
+    from terse.stats import build_recommend_section
+
+    pol = _policy(tmp_path)
+    rows = [_scan("kb", "wrapped", "/usr/bin/python -m kb", pol,
+                  identity="python", explicit=False)]
+    rows[0]["stats"] = False
+    liab = primer_liability(rows, _agg(("python", 9, 6000, 3000)))
+    assert liab["servers"][0]["verdict"] == "INSUFFICIENT"
+    assert "INSUFFICIENT" in build_recommend_section(liab)[1]
+
+
+def test_a_scan_row_predating_the_stats_field_keeps_its_measurement(tmp_path):
+    # `stats` MISSING must not read as silence: every row recorded before #397 lacks it,
+    # and retracting their measurements would be a regression dressed as a fix.
+    pol = _policy(tmp_path)
+    rows = [_scan("kb", "wrapped", "/opt/kb-mcp", pol, identity="kb", explicit=True)]
+    assert "stats" not in rows[0]
+    served = primer_liability(rows, _agg(("kb", 40, 4000, 2000)))["servers"][0]
+    assert served["ledger_labels"] == ["kb"] and served["blocks"] == 40
+
+
 def test_a_folded_and_live_peer_collides_with_a_wrapped_entry_over_a_launcher_label(tmp_path):
     """#309. `folded-and-live` is "named in the peers file AND live under its own name", so
     when that live entry launches via terse it runs its OWN proxy and writes its OWN ledger

@@ -937,6 +937,17 @@ def _ambiguous_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
             continue
         if row.get("state") not in _WRITES_LEDGER_ROWS:
             continue
+        # An entry that writes no rows into this ledger cannot be one of the two servers
+        # fighting over a label (#397). Counting it flagged the label ambiguous and deleted
+        # the measurement of the entry that legitimately owned every row under it.
+        #
+        # Skipping it HERE ALONE was tried in PR #395 and reverted with the measurement in
+        # hand: `_wrapped_labels` still handed the same entry the label, so both entries
+        # then reported the SAME blocks — #285's double count, relocated rather than fixed.
+        # The two paths only make sense changed together, and they are: see
+        # `_wrapped_labels`.
+        if not _writes_ledger_rows(row):
+            continue
         # NOT also gated on `row["stats"]`: an entry baked with `--no-stats` writes no
         # ledger records, so in principle it cannot be one of the two fighting over a
         # label — but skipping it HERE only removes the collision. Nothing downstream stops
@@ -1040,6 +1051,13 @@ def _wrapped_labels(row: dict[str, Any], wraps: str, ambiguous: set[str]) -> lis
     Saying "cannot say" there is the same unknown-is-not-zero discipline `_break_even`'s
     vocabulary already keeps — and it gets its OWN reason string, because `no ledger label`
     is documented as "matched no ledger rows", which is not what happened here."""
+    # The other half of #397's fix, and the half PR #395's reverted attempt lacked. An
+    # entry that writes no rows into this ledger owns no label in it — not even an explicit
+    # `--server-name`, which says what it WOULD write, not that it wrote anything. Without
+    # this, excluding it from the ambiguity contest just lets it claim another server's
+    # rows outright.
+    if not _writes_ledger_rows(row):
+        return []
     ident = row.get("ledger_identity")
     if ident and row.get("ledger_identity_explicit"):
         return [ident]
@@ -1069,14 +1087,45 @@ KEEP, TUNE, UNWRAP, INSUFFICIENT = "KEEP", "TUNE", "UNWRAP", "INSUFFICIENT"
 # `_break_even` reasons that describe MISSING DATA rather than a measured outcome. `never
 # called` is NOT here: it is a real measurement whose meaning depends on cadence (see
 # `_recommend`), which is the whole idle-router/free-standalone split (#211).
+#
+# `writes no ledger rows` is listed for MEANING, not for behaviour: measured 2026-09-16, a
+# silent entry reaches the same INSUFFICIENT through branch 6 of `_recommend` (no labels ->
+# no token data), so removing it from this tuple changes no output and no test can tell the
+# difference. It belongs here anyway — it is missing data, not a measured outcome — and any
+# future branch that reads this tuple inherits the right answer instead of the accidental
+# one.
 _NO_DATA_REASONS = ("no ledger label", "ambiguous ledger label", "no token data",
-                    "primer unknown")
+                    "primer unknown", "writes no ledger rows")
 
 # A guessed label two installed entries share (#285). Distinct from `no ledger label`, whose
 # documented meaning is "matched no ledger rows": here rows exist, they just belong to more
 # than one server. Collapsing the two would tell an operator to go looking for traffic that
 # is sitting right there under a name they can fix with `--server-name`.
 _R_AMBIGUOUS = "ambiguous ledger label"
+
+# An entry configured not to write into the ledger `terse stats` reads (#397). Distinct
+# again from both neighbours: `no ledger label` means the rows were looked for and not
+# found, `ambiguous` means they exist and belong to more than one server, and this one
+# means the entry never wrote any to look for. The operator's fix is different in each
+# case — bake `--server-name`, or turn stats back on, or nothing at all.
+_R_NO_LEDGER_ROWS = "writes no ledger rows"
+
+
+def _writes_ledger_rows(row: dict[str, Any]) -> bool:
+    """Does this entry write records into the ledger `terse stats` reads?
+
+    False in exactly two configured cases: `--no-stats` (the proxy writes nothing at all)
+    and `--stats-log /elsewhere.jsonl` (it writes real records this report never sees).
+    Both make the entry unable to own a ledger label, and unable to be one of two servers
+    colliding over one.
+
+    `stats` MISSING is True, not False: a row from a scan that predates the field cannot
+    say, and reading absence as silence would retract the measurement of every entry
+    recorded before #397. Unknown is not zero — the same discipline `codec_call_rate`
+    keeps for a missing counter."""
+    if row.get("stats") is False:
+        return False
+    return not row.get("stats_log")
 
 # Verdict reason vocabulary beyond the `_break_even` strings it passes through. Closed set --
 # `--json` consumers switch on these.
@@ -1658,10 +1707,19 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
                           sum(saved_by_label.get(lbl, 0) for lbl in labels),
                           # Same shape as `no ledger label` — nothing measurable — but a
                           # different CAUSE, and the only one with an actionable fix.
-                          no_label_reason=(_R_AMBIGUOUS
-                                           if not labels and not is_router
-                                           and _guessed_label(row) in ambiguous
-                                           else None)),
+                          no_label_reason=(
+                              # Order matters: a silent entry has no labels for a reason
+                              # that is not ambiguity, and its guess may well ALSO be in
+                              # `ambiguous` because another entry shares the basename.
+                              # Reporting that would send the operator to bake
+                              # `--server-name` on an entry whose rows do not exist.
+                              _R_NO_LEDGER_ROWS
+                              if not labels and not is_router
+                              and not _writes_ledger_rows(row)
+                              else _R_AMBIGUOUS
+                              if not labels and not is_router
+                              and _guessed_label(row) in ambiguous
+                              else None)),
             "contributors": _contributors(labels, by_label, saved_by_label,
                                           tokenized_by_label),
             # Reported, never summed into anything above — see `_superseded_labels`.

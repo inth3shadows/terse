@@ -28,6 +28,18 @@ fails that pull request until the section has moved.
   entry can own a ledger label, which would have turned a wrong status line into a wrong
   published number.
 
+- **An entry that writes no ledger rows neither collides nor claims a label (#397).** An
+  entry baked with `--no-stats`, or pointed at another file with `--stats-log`, was counted
+  as one of two servers fighting over a launcher label — flagging the label ambiguous and
+  deleting the measurement of the entry that legitimately owned every row under it. Skipping
+  it in the ambiguity contest alone was tried in PR #395 and reverted with the measurement
+  in hand: `_wrapped_labels` still handed it the label, so both entries then reported the
+  SAME blocks (#285's double count, relocated). Both paths change together — it is excluded
+  from the contest AND owns no label — and it reports a new reason, `writes no ledger rows`,
+  distinct from `no ledger label` (rows looked for, not found) and `ambiguous ledger label`
+  (rows exist, shared). A row from a scan predating the `stats` field keeps its measurement:
+  absence of the field is not evidence of silence.
+
 ### Added
 
 - **A scan row can say where its ledger rows land (#397).** `parse_proxy_opts` now reads
