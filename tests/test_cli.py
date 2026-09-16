@@ -312,6 +312,83 @@ def test_mcp_status_cmd_shows_detail_line_and_json(tmp_path, monkeypatch, capsys
     assert row["policy_missing"] is False
 
 
+def _folded_and_live_cfg(tmp_path, live_entry: dict):
+    """A router fronting `kb` + `gh`, with `kb` re-added live under its own name."""
+    from terse.install_mcp import do_install
+
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {
+        "kb": {"type": "stdio", "command": "kb-mcp", "args": ["--x"]},
+        "gh": {"command": "gh-mcp"},
+    }}), encoding="utf-8")
+    pol = tmp_path / "p.json"
+    pol.write_text(json.dumps({"version": 1, "defaults": {"tiers": ["minify"]}}),
+                   encoding="utf-8")
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    live = json.loads(cfg.read_text())
+    live["mcpServers"]["kb"] = live_entry
+    cfg.write_text(json.dumps(live), encoding="utf-8")
+    return cfg, pol
+
+
+def test_mcp_status_gives_a_terse_launched_folded_and_live_entry_its_detail_line(
+        tmp_path, monkeypatch, capsys):
+    """#399. #309 taught `scan_scopes` to fill `wraps`/`ledger_identity`/`launcher` for a
+    `folded-and-live` entry whose live half runs its own proxy, and `--json` shows them —
+    but the text renderer carried its own copy of the original four states. So `terse
+    stats` could report `ambiguous ledger label` for this entry while `mcp-status`
+    withheld the `--server-name` hint that fixes it."""
+    cfg, pol = _folded_and_live_cfg(tmp_path, {"command": "terse", "args": [
+        "proxy", "--policy", "P", "--", "/usr/bin/python", "-m", "server_a"]})
+    cfg_text = cfg.read_text().replace('"P"', json.dumps(str(pol)))
+    cfg.write_text(cfg_text, encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["mcp-status"]) == 0
+    out = capsys.readouterr().out
+    assert "ALSO live as its own entry" in out          # the pre-existing warning stays
+    assert "wraps=/usr/bin/python -m server_a" in out   # …and now the detail line too
+    assert "no --server-name baked in" in out and "'python'" in out
+
+
+def test_mcp_status_detail_line_does_not_depend_on_the_entry_having_a_command(
+        tmp_path, monkeypatch, capsys):
+    """Review of PR #414: `launcher` reads the entry's `command`, but `parse_proxy_opts`
+    matches on `args` alone — so an entry with no `command` runs a proxy, gets `wraps` and
+    a guessed ledger identity filled in, and had its detail line withheld anyway. That is
+    #399's symptom on exactly the row `terse stats` would flag ambiguous."""
+    cfg, pol = _folded_and_live_cfg(tmp_path, {"args": [
+        "terse", "proxy", "--policy", "P", "--", "/usr/bin/python", "-m", "server_a"]})
+    cfg.write_text(cfg.read_text().replace('"P"', json.dumps(str(pol))), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["mcp-status"]) == 0
+    out = capsys.readouterr().out
+    assert "wraps=/usr/bin/python -m server_a" in out
+    assert "no --server-name baked in" in out
+
+
+def test_mcp_status_stays_quiet_for_a_folded_and_live_entry_that_runs_no_proxy(
+        tmp_path, monkeypatch, capsys):
+    # The other direction, and why the state alone is not the condition: a live half that
+    # is a RAW re-add runs no terse proxy, so `scan_scopes` leaves those fields None.
+    # Printing `wraps=?  diff=?` for it would answer with a guess.
+    cfg, _ = _folded_and_live_cfg(tmp_path, {"command": "uv",
+                                             "args": ["run", "server_a", "--", "-v"]})
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["mcp-status"]) == 0
+    out = capsys.readouterr().out
+    assert "ALSO live as its own entry" in out
+    # The ROUTER's own row still prints `wraps=gh, kb`, so this asserts on what the
+    # re-added entry would have claimed, not on the substring.
+    assert "wraps=uv run server_a" not in out and "wraps=?" not in out
+    assert "no --server-name baked in" not in out
+
+
 def test_mcp_status_cmd_flags_a_launcher_that_no_longer_resolves(tmp_path, monkeypatch, capsys):
     # The silent failure a wrapped entry can't report itself: if `command` stops
     # resolving (an upgrade moves a versioned uv-tool/pipx venv), the client cannot spawn
