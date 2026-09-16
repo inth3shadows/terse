@@ -1919,13 +1919,21 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
             # `folded-and-live` to the scan — `terse stats` would report `ambiguous ledger
             # label` while status withheld the `--server-name` hint that fixes it (#399).
             #
-            # The extra `launcher` test is the half the predicate cannot express: a
+            # The extra `stats` test is the half the predicate cannot express: a
             # `folded-and-live` row is in it because its live half MAY run a terse proxy,
             # and `scan_scopes` fills these fields only when it actually does. A live half
             # that is a raw re-add keeps them None, and printing `wraps=?  diff=?` for it
             # would answer a question nobody asked with a guess.
+            #
+            # `stats is not None`, NOT `launcher`: `launcher` reads the entry's `command`,
+            # and an entry can run a proxy without one — `parse_proxy_opts` matches on
+            # `args` alone, so `{"args": ["terse", "proxy", …]}` fills `wraps` and the
+            # ledger identity while `launcher` stays None. Gating on it withheld the
+            # `--server-name` hint from exactly the row `terse stats` would flag ambiguous
+            # — #399's own symptom, one shape further in (review of PR #414). `stats` is
+            # set if and only if that fill block ran.
             if (r["state"] in _WRITES_LEDGER_ROWS
-                    and (r["state"] != "folded-and-live" or r.get("launcher"))):
+                    and (r["state"] != "folded-and-live" or r.get("stats") is not None)):
                 stats = "on" if r.get("stats") else "off"
                 detail = (f"wraps={r.get('wraps') or '?'}  "
                           f"diff={r.get('diff') or '?'}  stats={stats}")

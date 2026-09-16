@@ -22,9 +22,13 @@ fails that pull request until the section has moved.
   report `ambiguous ledger label` for the entry while `mcp-status` withheld the
   `no --server-name baked in` hint that says how to fix it — along with
   `launcher=… (MISSING)`, which is fatal to the entry and invisible everywhere else. The
-  renderer now reuses `stats._WRITES_LEDGER_ROWS` rather than re-spelling the states, so it
-  cannot fall behind that predicate again. A live half that is a raw re-add still prints
-  nothing extra: it runs no proxy, and those fields are `None` by design.
+  renderer now reuses `stats._WRITES_LEDGER_ROWS` rather than re-spelling the states, so
+  this line cannot fall behind that predicate again (the SCAN's fill gate in `install_mcp`
+  still spells the four states by hand — a separate copy, untouched here). A live half that
+  is a raw re-add still prints nothing extra: it runs no proxy, and those fields are `None`
+  by design. The discriminator for that is `stats`, not `launcher` — an entry with `args`
+  but no `command` runs a proxy while `launcher` stays `None`, and gating on it withheld
+  the hint from exactly the row `terse stats` flags.
 
 ## [0.33.4] - 2026-09-15
 

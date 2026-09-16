@@ -352,6 +352,24 @@ def test_mcp_status_gives_a_terse_launched_folded_and_live_entry_its_detail_line
     assert "no --server-name baked in" in out and "'python'" in out
 
 
+def test_mcp_status_detail_line_does_not_depend_on_the_entry_having_a_command(
+        tmp_path, monkeypatch, capsys):
+    """Review of PR #414: `launcher` reads the entry's `command`, but `parse_proxy_opts`
+    matches on `args` alone — so an entry with no `command` runs a proxy, gets `wraps` and
+    a guessed ledger identity filled in, and had its detail line withheld anyway. That is
+    #399's symptom on exactly the row `terse stats` would flag ambiguous."""
+    cfg, pol = _folded_and_live_cfg(tmp_path, {"args": [
+        "terse", "proxy", "--policy", "P", "--", "/usr/bin/python", "-m", "server_a"]})
+    cfg.write_text(cfg.read_text().replace('"P"', json.dumps(str(pol))), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["mcp-status"]) == 0
+    out = capsys.readouterr().out
+    assert "wraps=/usr/bin/python -m server_a" in out
+    assert "no --server-name baked in" in out
+
+
 def test_mcp_status_stays_quiet_for_a_folded_and_live_entry_that_runs_no_proxy(
         tmp_path, monkeypatch, capsys):
     # The other direction, and why the state alone is not the condition: a live half that
