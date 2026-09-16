@@ -29,6 +29,7 @@ import json
 import os
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -824,6 +825,61 @@ def _is_launcher_basename(label: str) -> bool:
     return name in _LAUNCHER_BASENAMES or bool(_LAUNCHER_RE.fullmatch(name))
 
 
+# How the CLIENT resolves a server defined in more than one scope: it connects once, to the
+# highest-precedence definition. Lower number wins. An unknown scope sorts last — it cannot
+# outrank a scope we do understand on the strength of not being recognised.
+_SCOPE_PRECEDENCE = {"local": 0, "project": 1, "user": 2}
+
+
+def _precedence_winner(scan_rows: list[dict[str, Any]],
+                       eligible: Callable[[dict[str, Any]], bool]) -> dict[str, int]:
+    """`{server name: index in scan_rows}` for the one row per name that the client would
+    actually launch, among rows `eligible` accepts.
+
+    De-duplicating by name is right in kind — the same server in two scopes is one server to
+    the client, and counting it twice would manufacture a collision with itself — but both
+    consumers did it FIRST-WINS over rows emitted user -> project -> local, so the row that
+    took the slot was the **user** one: the single definition guaranteed not to be running
+    (#398). A shadowed `kb` in user scope could therefore delete the measurement of an
+    unrelated entry that legitimately owned every row under its label.
+
+    Returns INDICES rather than rows, so a caller can keep iterating in emission order and
+    skip the losers. The alternative — iterating in precedence order — would also reorder
+    the report, which is a second change wearing the first one's clothes.
+
+    `eligible` admits a row to the contest at all — the two consumers disagree on which
+    STATES they speak for (`_WRITES_LEDGER_ROWS` vs `_PAYS_PRIMER`). It deliberately does
+    NOT test whether the row is useful to the caller beyond that. Tried and rejected:
+    admitting only rows that guess a label let a SHADOWED user-scope entry beat the
+    project-scope one the client actually launches, re-creating #398 one level in. If the
+    row that runs guesses nothing, the honest answer is that this name contributes no
+    guess — not that some other definition's guess stands in for it.
+
+    That also subsumes the guard added in review of #309, where a row guessing nothing
+    shadowed a same-named lower-precedence row that did: the case it was built from is a
+    raw re-add in USER scope hiding a collision between two PROJECT entries, and project
+    now outranks user on the merits."""
+    def rank(row: dict[str, Any]) -> int:
+        # ONE spelling of the default, used for both sides of the comparison below. Two
+        # copies is not a style point: mutating one of them left the other disagreeing, so
+        # an unknown scope lost anyway and the mutant read as equivalent (review of #398).
+        return _SCOPE_PRECEDENCE.get(str(row.get("scope")), len(_SCOPE_PRECEDENCE))
+
+    best: dict[str, int] = {}
+    for i, row in enumerate(scan_rows):
+        name = row.get("server")
+        if not name or not eligible(row):
+            continue
+        name = str(name)
+        prev = best.get(name)
+        # Strict `<`: ties keep the FIRST row at that rank, which is the pre-existing
+        # behaviour for two entries in one scope (impossible through the config format, but
+        # a hand-merged file can carry it) and keeps this function order-stable.
+        if prev is None or rank(row) < rank(scan_rows[prev]):
+            best[name] = i
+    return best
+
+
 def _guessed_label(row: dict[str, Any]) -> str:
     """The ledger label a WRAPPED entry's records are GUESSED to carry — the downstream
     command's basename. Empty when the entry baked an explicit `--server-name` (nothing is
@@ -858,17 +914,19 @@ def _ambiguous_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
     re-add in user scope hid a genuine `python` collision between two project-scope
     entries, which the pre-#309 code caught).
 
-    Which row wins the slot when several DO guess is a separate, pre-existing defect, named
-    here so the next reader does not mistake the order for a decision: rows arrive user →
-    project → local and first wins, while the client resolves the opposite way (local >
-    project > user). The kept row can therefore be the one definition that is never
-    launched. Skipping empty guesses moves the slot toward higher-precedence rows, which is
-    the right direction, but it does not fix the tiebreak — `primer_liability`'s own `seen`
-    dedup has the same inversion, and correcting both moves published numbers."""
+    Which row wins the slot when several DO guess is `_precedence_winner`'s job (#398):
+    rows arrive user → project → local and first-wins kept the USER row, while the client
+    connects to the highest-precedence definition (local > project > user), so the kept row
+    was the one guaranteed not to be running. Both this function and `primer_liability`
+    share that helper now; they differ only in which rows are admitted to the contest."""
+    winners = _precedence_winner(scan_rows,
+                                 lambda r: r.get("state") in _WRITES_LEDGER_ROWS)
     by_name: dict[str, str] = {}
-    for row in scan_rows:
+    for i, row in enumerate(scan_rows):
         name = row.get("server")
         if row.get("state") not in _WRITES_LEDGER_ROWS or not name or name in by_name:
+            continue
+        if winners.get(str(name)) != i:
             continue
         # NOT also gated on `row["stats"]`: an entry baked with `--no-stats` writes no
         # ledger records, so in principle it cannot be one of the two fighting over a
@@ -1459,14 +1517,20 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         else:
             encoded_by_label[lbl] = (encoded_by_label.get(lbl) or 0) + enc
     servers: list[dict[str, Any]] = []
+    # Which row speaks for a name defined in several scopes — the one the client launches,
+    # not the first emitted (#398). Rendering order below is unchanged: the loop still walks
+    # `scan_rows` as emitted and skips the rows that lost.
+    winners = _precedence_winner(scan_rows, lambda r: r.get("state") in _PAYS_PRIMER)
     seen: set[str] = set()
     # Computed over ALL rows before any is rendered: whether one entry's guessed label is
     # ambiguous is a fact about the fleet, not about that row (#285).
     ambiguous = _ambiguous_labels(scan_rows)
     live = _live_labels(scan_rows)
-    for row in scan_rows:
+    for i, row in enumerate(scan_rows):
         name, state = row.get("server"), row.get("state")
         if state not in _PAYS_PRIMER or not name or name in seen:
+            continue
+        if winners.get(str(name)) != i:
             continue
         seen.add(name)
         is_router = state in ("router", "router-ambiguous")

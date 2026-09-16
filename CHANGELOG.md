@@ -15,6 +15,22 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **`terse stats` no longer reads the server definition the client ignores (#398).** A
+  server defined in more than one scope is one server to the client, which connects to the
+  **highest-precedence** definition (local > project > user). Both `_ambiguous_labels` and
+  `primer_liability` de-duplicated by name first-wins over rows emitted user → project →
+  local, so the row that took the slot was the **user** one — the single definition
+  guaranteed not to be running. A shadowed user entry guessing a launcher label could
+  therefore manufacture a collision and delete the measurement of an unrelated entry that
+  legitimately owned every row under that label. Both now share `_precedence_winner`, which
+  picks the row the client would launch; reporting order is unchanged, and a name whose
+  winning row guesses nothing contributes no guess rather than borrowing another
+  definition's.
+
+## [0.33.5] - 2026-09-16
+
+### Fixed
+
 - **`mcp-status` no longer withholds a `folded-and-live` entry's detail line (#399).** #309
   taught the scan to fill `wraps` / `diff` / `stats` / `launcher` / `ledger_identity` for
   such an entry when its live half really runs a terse proxy, and `--json` showed them, but

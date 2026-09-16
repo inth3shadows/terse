@@ -1386,6 +1386,80 @@ def test_the_verdicts_sort_by_what_needs_action_not_by_rate(tmp_path):
     assert [ln.split()[1] for ln in rows] == ["UNWRAP", "TUNE", "INSUFFICIENT", "KEEP"]
 
 
+def test_the_scope_the_client_LAUNCHES_wins_the_name_slot(tmp_path):
+    """#398, the issue's own repro. `kb` is defined twice: a shadowed user entry launching
+    `python -m kb_old`, and the project entry that actually runs, which bakes
+    `--server-name`. Rows arrive user -> project -> local and both consumers de-duplicated
+    first-wins, so the USER row took the slot — the one definition the client never
+    launches. Its guessed `python` label then collided with `zz`, whose 120 `python` rows
+    are entirely its own, and `zz` lost a correct measurement to a server that is not
+    running."""
+    pol = _policy(tmp_path)
+    rows = [_scan("kb", "wrapped", "/usr/bin/python -m kb_old", pol, scope="user",
+                  identity="python", explicit=False),
+            _scan("kb", "wrapped", "/opt/kb-mcp", pol, scope="project",
+                  identity="kb", explicit=True),
+            _scan("zz", "wrapped", "/usr/bin/python -m server_zz", pol, scope="user",
+                  identity="python", explicit=False)]
+    liab = primer_liability(rows, _agg(("python", 120, 12_000, 6_000)))
+    served = {r["server"]: r for r in liab["servers"]}
+
+    assert served["zz"]["break_even_verdict"] != "ambiguous ledger label"
+    assert served["zz"]["blocks"] == 120
+    # `kb` is reported once, and from the definition that runs: an explicit --server-name,
+    # so it claims `kb` rows and never enters the `python` contest at all.
+    assert served["kb"]["ledger_labels"] == ["kb"]
+
+
+def test_two_rows_in_ONE_scope_keep_the_first(tmp_path):
+    # A hand-merged config can carry the same name twice in one scope. Precedence cannot
+    # separate them, so the tiebreak stays first-wins — the pre-existing behaviour, pinned
+    # so "highest precedence" is not read as "last one seen".
+    pol = _policy(tmp_path)
+    rows = [_scan("dup", "wrapped", "/usr/bin/python -m first", pol, scope="project",
+                  identity="first", explicit=True),
+            _scan("dup", "wrapped", "/usr/bin/python -m second", pol, scope="project",
+                  identity="second", explicit=True)]
+    liab = primer_liability(rows, _agg(("first", 5, 500, 250), ("second", 5, 500, 250)))
+    assert [r["ledger_labels"] for r in liab["servers"]] == [["first"]]
+
+
+def test_a_row_with_no_scope_cannot_outrank_one_that_has_it(tmp_path):
+    # Defensive: a row from an older scan, or a caller's hand-built one, carries no `scope`.
+    # It must sort LAST — not win by being unrecognised, which would hand the slot to the
+    # one row whose precedence nobody can establish.
+    pol = _policy(tmp_path)
+    noscope = _scan("kb", "wrapped", "/usr/bin/python -m kb_old", pol,
+                    identity="python", explicit=False)
+    del noscope["scope"]
+    rows = [noscope,
+            _scan("kb", "wrapped", "/opt/kb-mcp", pol, scope="user",
+                  identity="kb", explicit=True),
+            _scan("zz", "wrapped", "/usr/bin/python -m server_zz", pol, scope="user",
+                  identity="python", explicit=False)]
+    liab = primer_liability(rows, _agg(("python", 120, 12_000, 6_000)))
+    served = {r["server"]: r for r in liab["servers"]}
+    assert served["kb"]["ledger_labels"] == ["kb"]
+    assert served["zz"]["blocks"] == 120
+
+
+def test_a_shadowed_entry_does_not_take_the_slot_from_the_one_that_runs(tmp_path):
+    # The same inversion inside `_ambiguous_labels`, isolated: a REAL collision between two
+    # project-scope entries must still be caught when a user-scope row shares one's name.
+    pol = _policy(tmp_path)
+    rows = [_scan("a", "wrapped", "/opt/a-mcp", pol, scope="user",
+                  identity="a-mcp", explicit=True),
+            _scan("a", "wrapped", "/usr/bin/python -m a", pol, scope="project",
+                  identity="python", explicit=False),
+            _scan("b", "wrapped", "/usr/bin/python -m b", pol, scope="project",
+                  identity="python", explicit=False)]
+    liab = primer_liability(rows, _agg(("python", 30, 3000, 1500)))
+    served = {r["server"]: r for r in liab["servers"]}
+    for name in ("a", "b"):
+        assert served[name]["break_even_verdict"] == "ambiguous ledger label", name
+        assert served[name]["blocks"] is None
+
+
 def test_a_folded_and_live_peer_collides_with_a_wrapped_entry_over_a_launcher_label(tmp_path):
     """#309. `folded-and-live` is "named in the peers file AND live under its own name", so
     when that live entry launches via terse it runs its OWN proxy and writes its OWN ledger
