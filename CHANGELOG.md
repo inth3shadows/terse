@@ -15,6 +15,41 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **An entry that writes no ledger rows neither collides nor claims a label (#397).** An
+  entry baked with `--no-stats`, or pointed at another file with `--stats-log`, was counted
+  as one of two servers fighting over a launcher label — flagging the label ambiguous and
+  deleting the measurement of the entry that legitimately owned every row under it. Skipping
+  it in the ambiguity contest alone was tried in PR #395 and reverted with the measurement
+  in hand: `_wrapped_labels` still handed it the label, so both entries then reported the
+  SAME blocks (#285's double count, relocated). Both paths change together — it is excluded
+  from the contest AND owns no label — and it reports a new reason, `writes no ledger rows`,
+  distinct from `no ledger label` (rows looked for, not found) and `ambiguous ledger label`
+  (rows exist, shared). A row from a scan predating the `stats` field keeps its measurement:
+  absence of the field is not evidence of silence.
+
+  BOTH sides are resolved against the ledger the report is actually reading (`terse stats
+  --log FILE`, else the default): an entry writing to the file being read is its OWNER, and
+  an entry with no `--stats-log` writes to the DEFAULT ledger, so it owns nothing in any
+  other one. An entry that runs no terse proxy at all (`stats` explicitly `None`, #416)
+  writes nothing anywhere. A row carrying neither field comes from a scan predating this and
+  keeps its measurement — neither half of the rule may be applied to it. The verdict reaches the prose and the `1x?` legend, which named two
+  causes where there are now three.
+
+  A silent ROUTER claims none of its peers' labels either, and is named in the prose
+  whatever its cadence — the `uncertain` bucket the explanation hangs off is
+  `once/session (?)`, which a router never is, so its verdict used to appear in a table cell
+  nothing explained. Both the break-even legend and `--recommend`'s INSUFFICIENT legend name
+  the new cause.
+
+  Scope, stated rather than fixed: ownership is decided from the config as it is NOW, while
+  the ledger may hold rows an entry wrote before `--no-stats` was baked. Those rows keep
+  their label and, if it is a shared launcher basename, go to whichever entry still claims
+  it.
+
+## [0.33.7] - 2026-09-16
+
+### Fixed
+
 - **A downstream server's `--no-stats` / `--no-diff` is no longer read as terse's own
   (#397).** Both fields were derived over the entry's ENTIRE arg vector, so a flag
   belonging to the wrapped server — anything after the `--`, such as a containerized

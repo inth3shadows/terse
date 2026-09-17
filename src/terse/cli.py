@@ -284,7 +284,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     # printing without the liability line.
     try:
         from .install_mcp import scan_scopes
-        liability = primer_liability(scan_scopes(), agg)
+        liability = primer_liability(scan_scopes(), agg, ledger_path=log_path)
     except Exception as e:  # noqa: BLE001
         print(f"stats: could not size the primer liability ({e}) — ledger totals below "
               f"EXCLUDE the primer cost, recurring and one-time alike", file=sys.stderr)

@@ -586,6 +586,43 @@ def test_stats_cmd_reports_over_a_ledger(tmp_path, capsys):
     assert "saved 90" in out and "runecho" in out and "structure" in out
 
 
+def test_stats_cmd_compares_stats_log_against_the_LEDGER_IT_WAS_GIVEN(
+        tmp_path, monkeypatch, capsys):
+    """Review of PR #417: the unit was pinned and the CALL was not. Dropping
+    `ledger_path=log_path` at this command's one call site left the whole suite green,
+    while `terse stats --log FILE` silently fell back to the default ledger — so an entry
+    baked `--stats-log FILE`, the owner of every row in the file being read, reported
+    `writes no ledger rows` and lost its measurement.
+
+    Drives the real command, and asserts on `--json` so the claim is about published
+    output rather than a rendering."""
+    import terse.install_mcp as install_mcp
+    from terse.stats import append_stats
+
+    pol = tmp_path / "pol.json"
+    pol.write_text(json.dumps({"version": 1,
+                               "policies": [{"match": {"tool": "*"},
+                                             "tiers": ["minify"]}]}), encoding="utf-8")
+    log = tmp_path / "elsewhere.jsonl"
+    for _ in range(4):
+        append_stats({"ts": 1, "server": "kb", "tool": "t", "decision": "compressed",
+                      "raw_chars": 400, "out_chars": 40,
+                      "raw_tokens": 100, "out_tokens": 10}, log)
+    monkeypatch.setattr(install_mcp, "scan_scopes",
+                        lambda *a, **k: [{"scope": "user", "server": "kb",
+                                          "state": "wrapped", "wraps": "/opt/kb-mcp",
+                                          "policy": str(pol), "stats": True,
+                                          "stats_log": str(log),
+                                          "ledger_identity": "kb",
+                                          "ledger_identity_explicit": True}])
+
+    assert main(["stats", "--log", str(log), "--json"]) == 0
+    srv = json.loads(capsys.readouterr().out)["primer_liability"]["servers"][0]
+    assert srv["ledger_labels"] == ["kb"], "the entry writing the file being READ owns it"
+    assert srv["blocks"] == 4
+    assert srv["break_even_verdict"] != "writes no ledger rows"
+
+
 def test_stats_cmd_json_output(tmp_path, capsys):
     from terse.stats import append_stats
     log = tmp_path / "stats.jsonl"

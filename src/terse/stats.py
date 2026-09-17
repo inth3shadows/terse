@@ -901,7 +901,8 @@ def _guessed_label(row: dict[str, Any]) -> str:
     return server_label(wraps.split()) if wraps else ""
 
 
-def _ambiguous_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
+def _ambiguous_labels(scan_rows: list[dict[str, Any]],
+                      ledger_path: str | None = None) -> set[str]:
     """Guessed launcher labels that MORE THAN ONE installed entry resolves to — the only
     state in which reading ledger rows under one is provably attributing another server's
     traffic (#285).
@@ -937,15 +938,17 @@ def _ambiguous_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
             continue
         if row.get("state") not in _WRITES_LEDGER_ROWS:
             continue
-        # NOT also gated on `row["stats"]`: an entry baked with `--no-stats` writes no
-        # ledger records, so in principle it cannot be one of the two fighting over a
-        # label — but skipping it HERE only removes the collision. Nothing downstream stops
-        # that same entry from claiming the label anyway (`_wrapped_labels` still returns
-        # its guess, and `primer_liability` still renders it), so both entries then report
-        # the SAME blocks: #285's double count, relocated rather than fixed. Tried in
-        # review of #309 and reverted with the measurement in hand. The `--no-stats` hole
-        # is real in both directions and pre-dates this — it needs the label path and this
-        # one changed together, which moves published numbers. Tracked separately.
+        # An entry that writes no rows into this ledger cannot be one of the two servers
+        # fighting over a label (#397). Counting it flagged the label ambiguous and deleted
+        # the measurement of the entry that legitimately owned every row under it.
+        #
+        # Skipping it HERE ALONE was tried in PR #395 and reverted with the measurement in
+        # hand: `_wrapped_labels` still handed the same entry the label, so both entries
+        # then reported the SAME blocks — #285's double count, relocated rather than fixed.
+        # The two paths only make sense changed together, and they are: see
+        # `_wrapped_labels`.
+        if not _writes_ledger_rows(row, ledger_path):
+            continue
         lbl = _guessed_label(row)
         if not lbl:
             continue
@@ -1018,7 +1021,8 @@ def _superseded_labels(row: dict[str, Any], labels: list[str],
     return [guess] if by_label.get(guess) else []
 
 
-def _wrapped_labels(row: dict[str, Any], wraps: str, ambiguous: set[str]) -> list[str]:
+def _wrapped_labels(row: dict[str, Any], wraps: str, ambiguous: set[str],
+                    ledger_path: str | None = None) -> list[str]:
     """The ledger label(s) a WRAPPED (standalone) entry's records are written under.
 
     `--server-name` (#83, baked by `install-mcp` since #152) overrides what the proxy
@@ -1040,6 +1044,13 @@ def _wrapped_labels(row: dict[str, Any], wraps: str, ambiguous: set[str]) -> lis
     Saying "cannot say" there is the same unknown-is-not-zero discipline `_break_even`'s
     vocabulary already keeps — and it gets its OWN reason string, because `no ledger label`
     is documented as "matched no ledger rows", which is not what happened here."""
+    # The other half of #397's fix, and the half PR #395's reverted attempt lacked. An
+    # entry that writes no rows into this ledger owns no label in it — not even an explicit
+    # `--server-name`, which says what it WOULD write, not that it wrote anything. Without
+    # this, excluding it from the ambiguity contest just lets it claim another server's
+    # rows outright.
+    if not _writes_ledger_rows(row, ledger_path):
+        return []
     ident = row.get("ledger_identity")
     if ident and row.get("ledger_identity_explicit"):
         return [ident]
@@ -1069,14 +1080,97 @@ KEEP, TUNE, UNWRAP, INSUFFICIENT = "KEEP", "TUNE", "UNWRAP", "INSUFFICIENT"
 # `_break_even` reasons that describe MISSING DATA rather than a measured outcome. `never
 # called` is NOT here: it is a real measurement whose meaning depends on cadence (see
 # `_recommend`), which is the whole idle-router/free-standalone split (#211).
+#
+# `writes no ledger rows` is listed for MEANING, not for behaviour: measured 2026-09-16, a
+# silent entry reaches the same INSUFFICIENT through branch 6 of `_recommend` (no labels ->
+# no token data), so removing it from this tuple changes no output and no test can tell the
+# difference. It belongs here anyway — it is missing data, not a measured outcome — and any
+# future branch that reads this tuple inherits the right answer instead of the accidental
+# one.
 _NO_DATA_REASONS = ("no ledger label", "ambiguous ledger label", "no token data",
-                    "primer unknown")
+                    "primer unknown", "writes no ledger rows")
 
 # A guessed label two installed entries share (#285). Distinct from `no ledger label`, whose
 # documented meaning is "matched no ledger rows": here rows exist, they just belong to more
 # than one server. Collapsing the two would tell an operator to go looking for traffic that
 # is sitting right there under a name they can fix with `--server-name`.
 _R_AMBIGUOUS = "ambiguous ledger label"
+
+# An entry configured not to write into the ledger `terse stats` reads (#397). Distinct
+# again from both neighbours: `no ledger label` means the rows were looked for and not
+# found, `ambiguous` means they exist and belong to more than one server, and this one
+# means the entry never wrote any to look for. The operator's fix is different in each
+# case — bake `--server-name`, or turn stats back on, or nothing at all.
+_R_NO_LEDGER_ROWS = "writes no ledger rows"
+
+
+def _writes_ledger_rows(row: dict[str, Any], ledger_path: str | None = None) -> bool:
+    """Does this entry write records into the ledger THIS REPORT IS READING?
+
+    False in exactly two configured cases: `--no-stats` (the proxy writes nothing at all)
+    and `--stats-log` pointing at a DIFFERENT file from the one being read (it writes real
+    records this report never sees). Both make the entry unable to own a ledger label, and
+    unable to be one of two servers colliding over one.
+
+    `ledger_path` is the file the report was built from (`terse stats --log FILE`, else
+    `default_stats_log()`). Comparing against it is not a refinement — without it the
+    predicate deletes exactly the measurement it exists to protect (review of PR #417):
+    `--stats-log /srv/kb.jsonl` read back with `terse stats --log /srv/kb.jsonl` is the
+    entry that owns every row in the file, and a hand-edited entry that simply spells the
+    default path out is the same case. `parse_proxy_opts`' docstring calls hand-edited
+    entries "the one population this has to read correctly".
+
+    Resolved before comparing, so `~/x.jsonl` and `/home/u/x.jsonl` are one file — a tilde
+    stays LITERAL inside a JSON MCP config while `default_stats_log()` is already expanded,
+    which is the spelling that matters.
+
+    A RELATIVE baked path is resolved against the cwd of whoever runs `terse stats`, NOT the
+    config's directory, so it can compare equal to a different file (or unequal to the same
+    one). That is a real hole, not an excluded case: `install-mcp` has no `--stats-log` flag
+    and never writes one, so EVERY entry carrying it is hand-edited — the population the
+    caller's docstring calls the one that has to be read correctly. Left as a limitation
+    because there is no defensible base to resolve against (the proxy's cwd at launch is the
+    client's, not the config's), and the cost is a mislabelled row in a report. An earlier
+    draft of this paragraph claimed `install-mcp` writes the flag; it does not.
+
+    BOTH sides are resolved, which the first cut got half-right: an entry with NO
+    `--stats-log` writes to `default_stats_log()`, and that is not the file being read
+    whenever `terse stats --log FILE` names another one. Unconditionally answering True
+    there let an entry claim blocks out of a file it never writes to, and made it contest a
+    label against the entry that owns every row in it (review of PR #417).
+
+    A row carrying NEITHER `stats` nor `stats_log` short-circuits to True and skips the path
+    comparison entirely: a scan predating #397 cannot say where the entry writes, and
+    neither half of the rule may be applied to it. Reading absence as silence would retract
+    the measurement of every entry recorded before #397. Unknown is not zero — the same discipline `codec_call_rate` keeps for a missing
+    counter. `stats` PRESENT AND NOT TRUE is False, and the distinction is #416's: it sets
+    the field to None deliberately, for an entry whose args carry no `proxy` subcommand, so
+    that this function would not read "runs no proxy at all" as "writes normally". The first
+    cut used `is False` and read that None as True — the exact assertion #416's comment says
+    it exists to prevent."""
+    if "stats" in row and row["stats"] is not True:
+        return False
+    if "stats" not in row and "stats_log" not in row:
+        # A row from a scan predating #397 carries NEITHER field. It cannot say where — or
+        # whether — this entry writes, so it keeps the measurement it had. Applying the
+        # default-ledger rule below would retract every such row the moment the report reads
+        # a non-default ledger, on evidence the row does not carry. Either field present
+        # means the scan looked.
+        return True
+    read = ledger_path or str(default_stats_log())
+    baked = row.get("stats_log")
+    return _same_file(str(baked) if baked else str(default_stats_log()), read)
+
+
+def _same_file(a: str, b: str) -> bool:
+    """Do two ledger paths name one file? Expanded and normalised, never `os.path.samefile`
+    — that needs both to EXIST, and a ledger the proxy has not written yet is the common
+    case for a freshly installed entry."""
+    try:
+        return (os.path.realpath(os.path.expanduser(a))
+                == os.path.realpath(os.path.expanduser(b)))
+    except Exception:  # noqa: BLE001 - a malformed path is "not the same file", not a crash
+        return a == b
 
 # Verdict reason vocabulary beyond the `_break_even` strings it passes through. Closed set --
 # `--json` consumers switch on these.
@@ -1197,6 +1291,11 @@ def _break_even(primer_tokens: int | None, blocks: int | None,
                         basename is a launcher (`python`, `npx`, ...) that ANOTHER installed
                         entry also resolves to, so its rows cannot be told from that
                         server's. Rows exist; attribution does not (#285).
+      writes no ledger rows
+                        the entry is configured not to write into the ledger this report
+                        reads — `--no-stats`, or `--stats-log` naming a different file. It
+                        owns no label here and cannot collide over one; there is nothing to
+                        look for, as opposed to looking and not finding (#397).
       never called      installed, pays a primer, banked nothing this window.
       no token data     called, but every matching row was recorded without tiktoken. The
                         savings in TOKENS are unknown, not zero — and dividing a cl100k
@@ -1227,9 +1326,10 @@ def _break_even(primer_tokens: int | None, blocks: int | None,
     a server that is in fact paying for itself (found in review of #197).
     """
     if blocks is None:
-        # `no_label_reason` refines WHY there is no label when the caller knows — today only
-        # `ambiguous ledger label`. Defaulted, so every existing caller keeps the original
-        # string and this stays additive to the `--json` vocabulary.
+        # `no_label_reason` refines WHY there is no label when the caller knows:
+        # `ambiguous ledger label` (#285) or `writes no ledger rows` (#397). Defaulted, so
+        # every existing caller keeps the original string and this stays additive to the
+        # `--json` vocabulary.
         return {"saved_per_block": None, "blocks_to_break_even": None,
                 "break_even_verdict": no_label_reason or "no ledger label"}
     if blocks == 0:
@@ -1379,7 +1479,8 @@ def _contributors(labels: list[str], blocks_by: dict[str, int], saved_by: dict[s
     return sorted(rows, key=lambda r: r["saved_tokens"], reverse=True)
 
 
-def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> dict[str, Any]:
+def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
+                     ledger_path: str | None = None) -> dict[str, Any]:
     """Primer cost of the INSTALLED wrapped servers, against the window's savings.
 
     Installed, not ledger-derived, and that distinction is the whole point: an eagerly-primed
@@ -1532,7 +1633,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
     winners = _precedence_winner(scan_rows)
     # Computed over ALL rows before any is rendered: whether one entry's guessed label is
     # ambiguous is a fact about the fleet, not about that row (#285).
-    ambiguous = _ambiguous_labels(scan_rows)
+    ambiguous = _ambiguous_labels(scan_rows, ledger_path)
     live = _live_labels(scan_rows)
     for i, row in enumerate(scan_rows):
         name, state = row.get("server"), row.get("state")
@@ -1560,7 +1661,15 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
         peers = ([] if peerless
                  else [p for p in (q.strip() for q in wraps.split(",")) if p]
                  ) if is_router else []
-        labels = peers if is_router else _wrapped_labels(row, wraps, ambiguous)
+        # A SILENT router owns no labels either (review of PR #417). The peer names are
+        # the labels a router's rows carry, but a router baked `--no-stats` (or writing to
+        # another ledger) wrote none of them — and leaving this branch ungated let it claim
+        # every peer's savings, including rows a `folded-and-live` peer wrote through its
+        # own proxy. That is the same "excluded from the contest, still owning the label"
+        # shape this fix exists to remove, one state over.
+        writes = _writes_ledger_rows(row, ledger_path)
+        labels = (peers if writes else []) if is_router \
+            else _wrapped_labels(row, wraps, ambiguous, ledger_path)
         pol_path = row.get("policy")
         tokens: int | None = None
         try:
@@ -1658,10 +1767,18 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any]) -> di
                           sum(saved_by_label.get(lbl, 0) for lbl in labels),
                           # Same shape as `no ledger label` — nothing measurable — but a
                           # different CAUSE, and the only one with an actionable fix.
-                          no_label_reason=(_R_AMBIGUOUS
-                                           if not labels and not is_router
-                                           and _guessed_label(row) in ambiguous
-                                           else None)),
+                          no_label_reason=(
+                              # Order matters: a silent entry has no labels for a reason
+                              # that is not ambiguity, and its guess may well ALSO be in
+                              # `ambiguous` because another entry shares the basename.
+                              # Reporting that would send the operator to bake
+                              # `--server-name` on an entry whose rows do not exist.
+                              _R_NO_LEDGER_ROWS
+                              if not labels and not writes
+                              else _R_AMBIGUOUS
+                              if not labels and not is_router
+                              and _guessed_label(row) in ambiguous
+                              else None)),
             "contributors": _contributors(labels, by_label, saved_by_label,
                                           tokenized_by_label),
             # Reported, never summed into anything above — see `_superseded_labels`.
@@ -1792,18 +1909,49 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     if liab["unresolved"]:
         lines.append(f"  {liab['unresolved']} server(s) have an unreadable policy and are "
                      f"NOT counted — treat both figures as lower bounds.")
-    if liab.get("uncertain"):
+    # Silent entries are named whatever their CADENCE. `uncertain` is `_ONCE_UNKNOWN`, which
+    # a router never is (it primes eagerly, so `_cadence` returns `_PER_TURN` before it ever
+    # looks at `blocks`), so a silent ROUTER printed the verdict in a table cell that nothing
+    # in the report explained — the very gap this split was widened to close, one state over
+    # (review of PR #417).
+    silent_any = sorted(s["server"] for s in liab["servers"]
+                        if s.get("break_even_verdict") == _R_NO_LEDGER_ROWS)
+    if liab.get("uncertain") or silent_any:
         # Split by CAUSE, because only one of the two has a fix the operator can act on.
         # `mcp-status` already tells this entry to bake `--server-name`; saying "no ledger
         # label" here and nothing else made the two commands read as unrelated complaints.
-        unknown = set(liab["uncertain"])
-        amb = sorted(s["server"] for s in liab["servers"]
-                     if s["server"] in unknown
-                     and s.get("break_even_verdict") == _R_AMBIGUOUS)
-        rest = [n for n in sorted(unknown) if n not in set(amb)]
+        unknown = set(liab.get("uncertain") or [])
+
+        def _named(reason: str) -> list[str]:
+            return sorted(s["server"] for s in liab["servers"]
+                          if s["server"] in unknown
+                          and s.get("break_even_verdict") == reason)
+
+        amb = _named(_R_AMBIGUOUS)
+        # THREE causes now, not two (review of PR #417). A silent entry reached the `rest`
+        # bucket and was told "no ledger label", whose documented meaning is "rows were
+        # looked for and not found" — sending the operator to hunt for rows that do not
+        # exist, four lines under a table that already said `writes no ledger rows`.
+        silent = silent_any
+        # Named by its OWN reason rather than "everything left over": a fourth reason added
+        # later would otherwise inherit the "no ledger label" caption, which is the same
+        # mislabelling this split exists to remove.
+        #
+        # Measured equivalent TODAY — `uncertain` is exactly the `blocks is None` population
+        # and those three reasons are its only causes, so no test can tell the two spellings
+        # apart (mutation P5 survives, and is listed as equivalent rather than as a kill).
+        # It is the cheap half of a defect that has now been fixed twice.
+        # No subtraction: a server carries ONE verdict string, so these three are disjoint
+        # by construction (the filter that used to sit here was dead — review of PR #417).
+        rest = _named("no ledger label")
         if rest:
             lines.append(f"  no ledger label, so it is unknown whether the lazy primer ever "
                          f"attached: {', '.join(rest)}")
+        if silent:
+            lines.append("  writes no ledger rows — baked `--no-stats`, or `--stats-log` "
+                         "pointing elsewhere, so this report")
+            lines.append(f"  cannot see what they banked and they claim no ledger label: "
+                         f"{', '.join(silent)}")
         if amb:
             lines.append(f"  ambiguous ledger label — these entries share a launcher "
                          f"basename, so their rows cannot be told apart: {', '.join(amb)}")
@@ -1938,6 +2086,12 @@ def _fmt_denominator(srv: dict[str, Any]) -> str:
     return f"{blocks:,}"
 
 
+# The widest a rendered break-even row may get, reason strings included. 79 is the numeric
+# guarantee; the slack is the longest reason the last cell can carry (`ambiguous ledger
+# label`). A new reason longer than that folds the table and must be abbreviated instead.
+_BREAK_EVEN_MAX_WIDTH = 84
+
+
 def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
     """Per-server `saved/block` and the block count that pays for that server's primer.
 
@@ -1972,6 +2126,12 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
     # 15 with bare digits in the pair form holds a million-block ledger; the sum below is
     # 2 + 14+1 + 6+1 + 15+1 + 11+1 + 9+1 + 17 = 79, and `test_the_break_even_row_stays_
     # inside_eighty_columns` fails if any of these change without the others.
+    #
+    # The 80 is a guarantee about the NUMERIC cells only, and always has been: the last cell
+    # also carries a reason string, and `ambiguous ledger label` (22) has pushed that row to
+    # 84 since #285 — `writes no ledger rows` (21) is one of the same family, not a new one.
+    # Named here because the test measured only the numeric row and so could never have
+    # caught either (review of PR #417). `_BREAK_EVEN_MAX_WIDTH` below is the real bound.
     lines = ["", f"  {'server':<14} {'primer':>6} {'blocks':>15} {'saved/block':>11} "
                  f"{'cadence':>9} {'to break even':>17}"]
     # Rateless rows sort last as a group rather than tying with a 0.0 rate: `or -1` treated
@@ -2000,8 +2160,8 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
         lines.append("  1x = a lazily-primed standalone entry (#211): the break-even is "
                      "blocks ONCE PER SESSION, a far lower bar.")
         if _ONCE_FREE in shown or _ONCE_UNKNOWN in shown:
-            lines.append("  1x? = called-ness unknown (no ledger label, or an ambiguous "
-                         "one); 1x- = unpaid, either")
+            lines.append("  1x? = called-ness unknown (no ledger label, an ambiguous one, "
+                         "or no rows written at all); 1x- = unpaid, either")
             lines.append("  because it was never triggered or because every primer was "
                          "declined (#286).")
     lines.append("  a BLOCK is one emitted tool-result text block — >=1 per call, so this "
@@ -2064,8 +2224,9 @@ def build_recommend_section(liab: dict[str, Any]) -> list[str]:
         lines.append("  terse has tested no policy change here — `terse policy autotune` is "
                      "the command that does.")
     if INSUFFICIENT in verdicts:
-        lines.append("  INSUFFICIENT = the ledger cannot answer yet (no label, no token "
-                     "data, unreadable policy, or not called).")
+        lines.append("  INSUFFICIENT = the ledger cannot answer yet (no label, an "
+                     "ambiguous one, no rows written at all, no token")
+        lines.append("  data, unreadable policy, or not called).")
     shown = _cadences_of(servers)
     if _PER_TURN in shown:
         lines.append("  coverage on a /turn row is against ONE turn's charge — a router "

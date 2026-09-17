@@ -21,6 +21,7 @@ called", and now mistaking a one-time charge for a recurring one.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -490,8 +491,10 @@ def test_the_rendered_section_separates_the_two_causes_of_an_unknown_label(tmp_p
     assert "no ledger label, so it is unknown whether the lazy primer ever attached: x" in both
 
 
-def test_the_break_even_legend_does_not_re_collapse_the_two_causes(tmp_path):
-    """`1x?` reaches the table from either cause; the legend used to name only one of them.
+def test_the_break_even_legend_does_not_re_collapse_the_causes(tmp_path):
+    """`1x?` reaches the table from any of THREE causes; the legend used to name one, then
+    two (#397 added "writes no ledger rows" — review of PR #417 caught the legend still
+    claiming two).
 
     A CALLED server is in the fleet on purpose: the table is gated on someone having been
     called, so an all-ambiguous install renders no table at all and the primer-section prose
@@ -503,7 +506,8 @@ def test_the_break_even_legend_does_not_re_collapse_the_two_causes(tmp_path):
         _agg(("python3.12", 3, 6152, 2762), ("kb-server", 9, 9000, 3000)))
     lines = "\n".join(_build_break_even_table(liab["servers"]))
     assert "ambiguous ledger label" in lines            # the table cell
-    assert "no ledger label, or an ambiguous one" in lines   # the legend agrees with it
+    # the legend agrees with it, and names every cause that can land an entry in `1x?`
+    assert ("no ledger label, an ambiguous one, or no rows written at all") in lines
 
 
 def test_an_all_ambiguous_fleet_still_says_why_there_is_no_table(tmp_path):
@@ -910,6 +914,35 @@ def test_the_break_even_row_stays_inside_eighty_columns(tmp_path):
     assert len(rows) == 1
     assert max(len(ln) for ln in build_primer_section(liab)
                if ln.startswith("  ") and "1000000/1234567" in ln) <= 80
+
+
+def test_a_verdict_string_row_stays_inside_the_documented_bound(tmp_path):
+    """Review of PR #417: the test above matches the NUMERIC row, so it structurally cannot
+    measure a row whose last cell carries a reason string — and those are the wide ones.
+    `ambiguous ledger label` has pushed such a row to 84 since #285, and #397's
+    `writes no ledger rows` joins the same family. This measures every rendered row against
+    the bound the table documents, so a longer reason added later folds the table loudly."""
+    from terse.stats import _BREAK_EVEN_MAX_WIDTH, _build_break_even_table
+
+    pol = _policy(tmp_path)
+    silent = _scan("secret-broker", "wrapped", "/usr/bin/python -m sb", pol,
+                   identity="python", explicit=False)
+    silent["stats"] = False
+    rows = [silent,
+            _scan("aa", "wrapped", "/usr/bin/python -m aa", pol,
+                  identity="python", explicit=False),
+            _scan("bb", "wrapped", "/usr/bin/python -m bb", pol,
+                  identity="python", explicit=False),
+            _scan("kb", "wrapped", "/opt/kb-mcp", pol, identity="kb", explicit=True)]
+    liab = primer_liability(rows, _agg(("python", 30, 3000, 1500), ("kb", 9, 900, 300)))
+    lines = _build_break_even_table(liab["servers"])
+    printed = "\n".join(lines)
+    assert "writes no ledger rows" in printed and "ambiguous ledger label" in printed
+    # DATA rows only — the legend below the table is prose and wraps on its own terms.
+    names = {r["server"] for r in liab["servers"]}
+    data = [ln for ln in lines if ln[2:].split(" ")[0] in names]
+    assert len(data) == len(names), data
+    assert max(len(ln) for ln in data) <= _BREAK_EVEN_MAX_WIDTH, printed
 
 
 def test_a_called_server_that_never_shipped_a_wire_form_is_not_billed_a_primer(tmp_path):
@@ -1509,6 +1542,310 @@ def test_a_shadowed_entry_does_not_take_the_slot_from_the_one_that_runs(tmp_path
     for name in ("a", "b"):
         assert served[name]["break_even_verdict"] == "ambiguous ledger label", name
         assert served[name]["blocks"] is None
+
+
+def test_a_SILENT_entry_neither_collides_nor_claims_the_label(tmp_path):
+    """#397, both directions at once — and the pair of numbers the reverted PR #395 attempt
+    got wrong. `kb` is baked `--no-stats`, so it writes no ledger rows at all; `zz` wrote
+    every one of the 9 `python` blocks.
+
+        main before #397:  kb blocks=None  zz blocks=None   "ambiguous ledger label"
+        the reverted fix:  kb blocks=9     zz blocks=9      <- both claim the same rows
+        here:              kb "writes no ledger rows"       zz blocks=9
+
+    Skipping the silent entry in `_ambiguous_labels` alone removes the collision but lets
+    it claim the label anyway; giving up the claim alone leaves the false ambiguity. Only
+    both together give `zz` its own measurement back."""
+    pol = _policy(tmp_path)
+    rows = [_scan("kb", "wrapped", "/usr/bin/python -m kb", pol,
+                  identity="python", explicit=False),
+            _scan("zz", "wrapped", "/usr/bin/python -m zz", pol,
+                  identity="python", explicit=False)]
+    rows[0]["stats"] = False
+    from terse.stats import _ambiguous_labels
+    assert _ambiguous_labels(rows) == set()
+
+    served = {r["server"]: r for r in
+              primer_liability(rows, _agg(("python", 9, 6000, 3000)))["servers"]}
+    assert served["kb"]["ledger_labels"] == []
+    assert served["kb"]["blocks"] is None
+    assert served["kb"]["break_even_verdict"] == "writes no ledger rows"
+    assert served["zz"]["blocks"] == 9
+    assert served["zz"]["break_even_verdict"] != "ambiguous ledger label"
+
+
+def test_a_stats_log_elsewhere_entry_is_silent_to_THIS_ledger(tmp_path):
+    # The same case, worse hidden: the rows exist, just not in the file `terse stats` reads.
+    # An explicit `--server-name` does not rescue it — that says what it WOULD write.
+    pol = _policy(tmp_path)
+    rows = [_scan("kb", "wrapped", "/opt/kb-mcp", pol, identity="kb", explicit=True),
+            _scan("zz", "wrapped", "/usr/bin/python -m zz", pol,
+                  identity="python", explicit=False)]
+    rows[0]["stats"] = True
+    rows[0]["stats_log"] = "/elsewhere.jsonl"
+    served = {r["server"]: r for r in
+              primer_liability(rows, _agg(("kb", 40, 4000, 2000)))["servers"]}
+    assert served["kb"]["ledger_labels"] == []
+    assert served["kb"]["break_even_verdict"] == "writes no ledger rows"
+
+
+def test_the_ledger_being_READ_is_what_stats_log_is_compared_against(tmp_path):
+    """Review of PR #417, both reviewers. `--stats-log` alone is not silence: `terse stats
+    --log FILE` exists, so an entry baked `--stats-log /srv/kb.jsonl` is the OWNER of every
+    row in the file when that is the file being read. Treating it as silent deletes the
+    measurement this fix exists to protect, in the mirror direction."""
+    pol = _policy(tmp_path)
+    row = _scan("kb", "wrapped", "/opt/kb-mcp", pol, identity="kb", explicit=True)
+    row["stats_log"] = "/srv/kb.jsonl"
+    agg = _agg(("kb", 40, 4000, 2000))
+
+    reading_it = primer_liability([row], agg, ledger_path="/srv/kb.jsonl")["servers"][0]
+    assert reading_it["ledger_labels"] == ["kb"] and reading_it["blocks"] == 40
+
+    reading_other = primer_liability([row], agg, ledger_path="/var/other.jsonl")["servers"][0]
+    assert reading_other["ledger_labels"] == []
+    assert reading_other["break_even_verdict"] == "writes no ledger rows"
+
+
+def test_the_DEFAULT_ledger_spelled_out_is_not_elsewhere(tmp_path):
+    # A hand-edited entry that spells the default path is the population `parse_proxy_opts`
+    # calls "the one this has to read correctly". `~` and `.` spellings resolve to one file.
+    from terse.stats import default_stats_log
+
+    pol = _policy(tmp_path)
+    row = _scan("kb", "wrapped", "/opt/kb-mcp", pol, identity="kb", explicit=True)
+    row["stats_log"] = str(default_stats_log())
+    served = primer_liability([row], _agg(("kb", 40, 4000, 2000)))["servers"][0]
+    assert served["blocks"] == 40, "the default ledger, spelled out, IS the ledger read"
+
+
+def test_the_ambiguity_contest_uses_the_ledger_path_too(tmp_path):
+    """Review of PR #417: dropping `ledger_path` from the `_ambiguous_labels` call left the
+    suite green, and it is not a no-op. Both entries write to the file being READ, so both
+    own `python` rows and neither may claim them — with the thread dropped, the contest
+    thinks both are silent, finds no collision, and hands each the other's blocks: #285's
+    double count, reopened."""
+    pol = _policy(tmp_path)
+    rows = []
+    for name in ("aa", "bb"):
+        r = _scan(name, "wrapped", f"/usr/bin/python -m {name}", pol,
+                  identity="python", explicit=False)
+        r["stats_log"] = "/srv/kb.jsonl"
+        rows.append(r)
+    from terse.stats import _ambiguous_labels
+    assert _ambiguous_labels(rows, "/srv/kb.jsonl") == {"python"}
+
+    served = {r["server"]: r for r in
+              primer_liability(rows, _agg(("python", 30, 3000, 1500)),
+                               ledger_path="/srv/kb.jsonl")["servers"]}
+    for name in ("aa", "bb"):
+        assert served[name]["ledger_labels"] == [], name
+        assert served[name]["break_even_verdict"] == "ambiguous ledger label", name
+
+
+def test_a_tilde_or_dotted_ledger_path_is_the_same_file(tmp_path, monkeypatch):
+    """Review of PR #417: replacing `_same_file`'s body with `a == b` left the suite green,
+    because both existing tests spelled the path identically on each side. A tilde stays
+    LITERAL inside a JSON MCP config, and `default_stats_log()` returns it expanded — so
+    without normalisation the hand-edited entry that spells `~/...` is misread as silent.
+    That is the population `parse_proxy_opts`' docstring calls the one to read correctly."""
+    from terse.stats import default_stats_log
+
+    # A FIXED home, so the tilde spelling is exercised on every machine. The first cut read
+    # the real `default_stats_log()` and asserted it sat under `$HOME` — true on the author's
+    # box, false in CI, where `XDG_STATE_HOME` points elsewhere and all four jobs went red.
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    pol = _policy(tmp_path)
+    default = default_stats_log()
+    home = str(tmp_path)
+    assert str(default).startswith(home), "the fixture owns $HOME here"
+    tilde = "~" + str(default)[len(home):]
+    # `os.path.join`, NOT `pathlib`: pathlib DROPS a "." component, so the "dotted" spelling
+    # in the first cut was byte-identical to the plain one and asserted nothing — it
+    # survived the `a == b` mutant (review of PR #417). A ".." round trip survives as text.
+    dotted = os.path.join(str(default.parent), "..", default.parent.name, default.name)
+    assert dotted != str(default), "the fixture must not collapse before the code sees it"
+
+    for spelling in (tilde, dotted):
+        row = _scan("kb", "wrapped", "/opt/kb-mcp", pol, identity="kb", explicit=True)
+        row["stats_log"] = spelling
+        served = primer_liability([row], _agg(("kb", 40, 4000, 2000)))["servers"][0]
+        assert served["blocks"] == 40, f"{spelling} names the default ledger"
+
+
+def test_an_entry_on_the_DEFAULT_ledger_owns_nothing_in_another_one(tmp_path):
+    """Review of PR #417 (third pass): the first cut compared only the BAKED side. An entry
+    with no `--stats-log` writes to the default ledger, so when the report reads another
+    file it writes nothing into it — yet it claimed 40 blocks out of a file it never touches,
+    and contested the label against the entry that owns every row in it."""
+    pol = _policy(tmp_path)
+    plain = _scan("zz", "wrapped", "/opt/zz-mcp", pol, identity="zz", explicit=True)
+    plain["stats"] = True                      # measured: the scan read the arg segment
+    served = primer_liability([plain], _agg(("zz", 40, 4000, 2000)),
+                              ledger_path="/srv/kb.jsonl")["servers"][0]
+    assert served["ledger_labels"] == []
+    assert served["break_even_verdict"] == "writes no ledger rows"
+
+    # …and the entry that DOES write there keeps its rows, uncontested.
+    owner = _scan("kb", "wrapped", "/usr/bin/python -m kb", pol,
+                  identity="python", explicit=False)
+    owner["stats"] = True
+    owner["stats_log"] = "/srv/kb.jsonl"
+    noisy = _scan("aa", "wrapped", "/usr/bin/python -m aa", pol,
+                  identity="python", explicit=False)
+    noisy["stats"] = True
+    from terse.stats import _ambiguous_labels
+    assert _ambiguous_labels([owner, noisy], "/srv/kb.jsonl") == set()
+    served = {r["server"]: r for r in
+              primer_liability([owner, noisy], _agg(("python", 30, 3000, 1500)),
+                               ledger_path="/srv/kb.jsonl")["servers"]}
+    assert served["kb"]["blocks"] == 30
+    assert served["aa"]["break_even_verdict"] == "writes no ledger rows"
+
+
+def test_an_entry_that_runs_NO_proxy_writes_nothing(tmp_path):
+    """#416 sets `stats = None` deliberately for an entry whose args carry no `proxy`
+    subcommand — "saying stats=True for an entry that provably runs no proxy is an
+    assertion, not a default". The first cut tested `is False` and read that None as True,
+    so `uv run --with terse -- python -m a` still made `python` ambiguous and deleted the
+    measurement of the real proxy beside it (review of PR #417)."""
+    pol = _policy(tmp_path)
+    fake = _scan("fake", "wrapped-unstashed", "python -m server_a", pol,
+                 identity="python", explicit=False)
+    fake["stats"] = None                       # measured: no `proxy` subcommand
+    real = _scan("real", "wrapped", "/usr/bin/python -m server_b", pol,
+                 identity="python", explicit=False)
+    real["stats"] = True
+    from terse.stats import _ambiguous_labels
+    assert _ambiguous_labels([fake, real]) == set()
+    served = {r["server"]: r for r in
+              primer_liability([fake, real], _agg(("python", 9, 900, 300)))["servers"]}
+    assert served["real"]["blocks"] == 9
+    assert served["fake"]["ledger_labels"] == []
+
+
+def test_a_round_tripped_blob_without_uncertain_still_renders(tmp_path):
+    # `build_primer_section` degrades rather than raises for a blob written by an older
+    # terse (#197). Widening the gate to `or silent_any` left `liab["uncertain"]` indexed
+    # directly two lines down, which raised KeyError (review of PR #417).
+    #
+    # Scoped to that key. `idle` is hard-indexed too and predates this branch, so the
+    # fixture supplies it rather than quietly widening this PR into a second fix.
+    from terse.stats import build_primer_section
+
+    blob = {"servers": [{"server": "kb", "primer_tokens": 500, "blocks": None,
+                         "break_even_verdict": "writes no ledger rows",
+                         "cadence": "once/session (?)"}],
+            "per_turn_tokens": 500, "session_once_tokens": 0, "unresolved": 0,
+            "saved_tokens": 0, "turns_covered": None, "idle": []}
+    assert "uncertain" not in blob, "the key this widening made load-bearing"
+    out = "\n".join(build_primer_section(blob))
+    assert "writes no ledger rows" in out and "kb" in out
+
+
+def test_a_SILENT_router_claims_no_peer_labels(tmp_path):
+    """Review of PR #417: the router branch never consulted the predicate, so a router baked
+    `--no-stats` still claimed every peer's rows — including rows a `folded-and-live` peer
+    wrote through its own proxy. That is the "excluded from the contest, still owning the
+    label" shape this fix removes, one state over."""
+    pol = _policy(tmp_path)
+    router = _scan("terse", "router", "kb, zz", pol)
+    router["stats"] = False
+    served = {r["server"]: r for r in
+              primer_liability([router], _agg(("kb", 40, 4000, 2000)))["servers"]}
+    assert served["terse"]["ledger_labels"] == []
+    assert served["terse"]["blocks"] is None
+    assert served["terse"]["break_even_verdict"] == "writes no ledger rows"
+
+
+def test_a_silent_ROUTER_is_explained_in_the_prose_too(tmp_path):
+    """Review of PR #417: the prose bucket was reached only through `uncertain`, which is
+    `cadence == _ONCE_UNKNOWN` — and a router primes eagerly, so it is `_PER_TURN` and never
+    lands there. A silent router therefore printed `writes no ledger rows` in a table cell
+    with nothing in the report explaining it: the same gap the bucket was added to close."""
+    from terse.stats import build_primer_section
+
+    pol = _policy(tmp_path)
+    router = _scan("terse", "router", "kb, zz", pol)
+    router["stats"] = False
+    prose = "\n".join(build_primer_section(
+        primer_liability([router, _scan("kb2", "wrapped", "/opt/kb-mcp", pol,
+                                        identity="kb2", explicit=True)],
+                         _agg(("kb", 40, 4000, 2000), ("kb2", 9, 900, 300)))))
+    assert "writes no ledger rows" in prose
+    assert "terse" in prose.split("writes no ledger rows")[1]
+
+
+def test_a_silent_entry_whose_guess_is_ALSO_ambiguous_names_the_silence(tmp_path):
+    """A surviving mutation the first cut missed (review of PR #417): testing `_R_AMBIGUOUS`
+    first passed the whole suite. Both facts are true here — `kb` is silent AND two live
+    entries make `python` ambiguous — and only one of them is actionable. "Bake
+    `--server-name`" sends the operator to fix attribution for rows that do not exist."""
+    pol = _policy(tmp_path)
+    kb = _scan("kb", "wrapped", "/usr/bin/python -m kb", pol,
+               identity="python", explicit=False)
+    kb["stats"] = False
+    rows = [kb,
+            _scan("aa", "wrapped", "/usr/bin/python -m aa", pol,
+                  identity="python", explicit=False),
+            _scan("bb", "wrapped", "/usr/bin/python -m bb", pol,
+                  identity="python", explicit=False)]
+    served = {r["server"]: r for r in
+              primer_liability(rows, _agg(("python", 30, 3000, 1500)))["servers"]}
+    assert served["kb"]["break_even_verdict"] == "writes no ledger rows"
+    assert served["aa"]["break_even_verdict"] == "ambiguous ledger label"
+
+
+def test_the_prose_advice_agrees_with_the_table_cell(tmp_path):
+    """Review of PR #417: a silent entry fell into the `rest` bucket and was told "no ledger
+    label, so it is unknown whether the lazy primer ever attached" — four lines under a
+    table cell reading `writes no ledger rows`. "No ledger label" is documented as "rows
+    were looked for and not found", which sends the operator hunting for rows that do not
+    exist."""
+    from terse.stats import build_primer_section
+
+    pol = _policy(tmp_path)
+    kb = _scan("kb", "wrapped", "/usr/bin/python -m kb", pol,
+               identity="python", explicit=False)
+    kb["stats"] = False
+    rows = [kb, _scan("zz", "wrapped", "/usr/bin/python -m zz", pol,
+                      identity="python", explicit=False)]
+    prose = "\n".join(build_primer_section(
+        primer_liability(rows, _agg(("python", 9, 6000, 3000)))))
+    assert "writes no ledger rows" in prose and "kb" in prose
+    assert "no ledger label, so it is unknown whether the lazy primer ever attached: kb" \
+        not in prose
+
+
+def test_a_silent_entry_is_INSUFFICIENT_not_UNWRAP(tmp_path):
+    """Unmeasured by configuration is not a measured zero: "it banks nothing, remove it" is
+    a verdict about evidence nobody collected.
+
+    Pins the OUTCOME, not the route. Measured while mutating: dropping the reason from
+    `_NO_DATA_REASONS` leaves this green, because a silent entry has no labels and so
+    reaches the same INSUFFICIENT through `_recommend`'s last branch. The tuple entry is
+    kept for meaning — see the comment there — and this test cannot distinguish the two
+    paths, which is worth saying rather than implying otherwise."""
+    from terse.stats import build_recommend_section
+
+    pol = _policy(tmp_path)
+    rows = [_scan("kb", "wrapped", "/usr/bin/python -m kb", pol,
+                  identity="python", explicit=False)]
+    rows[0]["stats"] = False
+    liab = primer_liability(rows, _agg(("python", 9, 6000, 3000)))
+    assert liab["servers"][0]["verdict"] == "INSUFFICIENT"
+    assert "INSUFFICIENT" in build_recommend_section(liab)[1]
+
+
+def test_a_scan_row_predating_the_stats_field_keeps_its_measurement(tmp_path):
+    # `stats` MISSING must not read as silence: every row recorded before #397 lacks it,
+    # and retracting their measurements would be a regression dressed as a fix.
+    pol = _policy(tmp_path)
+    rows = [_scan("kb", "wrapped", "/opt/kb-mcp", pol, identity="kb", explicit=True)]
+    assert "stats" not in rows[0]
+    served = primer_liability(rows, _agg(("kb", 40, 4000, 2000)))["servers"][0]
+    assert served["ledger_labels"] == ["kb"] and served["blocks"] == 40
 
 
 def test_a_folded_and_live_peer_collides_with_a_wrapped_entry_over_a_launcher_label(tmp_path):
