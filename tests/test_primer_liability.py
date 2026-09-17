@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import os
-import pathlib
 
 import pytest
 
@@ -1644,7 +1643,7 @@ def test_the_ambiguity_contest_uses_the_ledger_path_too(tmp_path):
         assert served[name]["break_even_verdict"] == "ambiguous ledger label", name
 
 
-def test_a_tilde_or_dotted_ledger_path_is_the_same_file(tmp_path):
+def test_a_tilde_or_dotted_ledger_path_is_the_same_file(tmp_path, monkeypatch):
     """Review of PR #417: replacing `_same_file`'s body with `a == b` left the suite green,
     because both existing tests spelled the path identically on each side. A tilde stays
     LITERAL inside a JSON MCP config, and `default_stats_log()` returns it expanded — so
@@ -1652,10 +1651,15 @@ def test_a_tilde_or_dotted_ledger_path_is_the_same_file(tmp_path):
     That is the population `parse_proxy_opts`' docstring calls the one to read correctly."""
     from terse.stats import default_stats_log
 
+    # A FIXED home, so the tilde spelling is exercised on every machine. The first cut read
+    # the real `default_stats_log()` and asserted it sat under `$HOME` — true on the author's
+    # box, false in CI, where `XDG_STATE_HOME` points elsewhere and all four jobs went red.
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
     pol = _policy(tmp_path)
     default = default_stats_log()
-    home = str(pathlib.Path.home())
-    assert str(default).startswith(home), "fixture assumes the default ledger is under $HOME"
+    home = str(tmp_path)
+    assert str(default).startswith(home), "the fixture owns $HOME here"
     tilde = "~" + str(default)[len(home):]
     # `os.path.join`, NOT `pathlib`: pathlib DROPS a "." component, so the "dotted" spelling
     # in the first cut was byte-identical to the plain one and asserted nothing — it
