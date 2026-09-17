@@ -27,11 +27,13 @@ fails that pull request until the section has moved.
   (rows exist, shared). A row from a scan predating the `stats` field keeps its measurement:
   absence of the field is not evidence of silence.
 
-  `--stats-log` is compared against the ledger the report is actually reading (`terse stats
-  --log FILE`, else the default), not treated as silence on sight — an entry writing to the
-  file being read is its OWNER, and the first cut deleted exactly the measurement this fix
-  exists to protect. A silent ROUTER likewise claims none of its peers' labels. The verdict
-  reaches the prose and the `1x?` legend, which named two causes where there are now three.
+  BOTH sides are resolved against the ledger the report is actually reading (`terse stats
+  --log FILE`, else the default): an entry writing to the file being read is its OWNER, and
+  an entry with no `--stats-log` writes to the DEFAULT ledger, so it owns nothing in any
+  other one. An entry that runs no terse proxy at all (`stats` explicitly `None`, #416)
+  writes nothing anywhere. A row carrying neither field comes from a scan predating this and
+  keeps its measurement — neither half of the rule may be applied to it. The verdict reaches the prose and the `1x?` legend, which named two
+  causes where there are now three.
 
   A silent ROUTER claims none of its peers' labels either, and is named in the prose
   whatever its cadence — the `uncertain` bucket the explanation hangs off is
@@ -43,8 +45,6 @@ fails that pull request until the section has moved.
   the ledger may hold rows an entry wrote before `--no-stats` was baked. Those rows keep
   their label and, if it is a shared launcher basename, go to whichever entry still claims
   it.
-
-### Added
 
 ## [0.33.7] - 2026-09-16
 
@@ -62,6 +62,8 @@ fails that pull request until the section has moved.
   `--`. Display-only today, but #397's remaining work reads `stats` to decide whether an
   entry can own a ledger label, which would have turned a wrong status line into a wrong
   published number.
+
+### Added
 
 - **A scan row can say where its ledger rows land (#397).** `parse_proxy_opts` now reads
   `--stats-log`, and `scan_scopes` carries it as `stats_log`. `terse stats` reads one

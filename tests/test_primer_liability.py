@@ -21,6 +21,7 @@ called", and now mistaking a one-time charge for a recurring one.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 
 import pytest
@@ -1656,13 +1657,87 @@ def test_a_tilde_or_dotted_ledger_path_is_the_same_file(tmp_path):
     home = str(pathlib.Path.home())
     assert str(default).startswith(home), "fixture assumes the default ledger is under $HOME"
     tilde = "~" + str(default)[len(home):]
-    dotted = str(default.parent / "." / default.name)
+    # `os.path.join`, NOT `pathlib`: pathlib DROPS a "." component, so the "dotted" spelling
+    # in the first cut was byte-identical to the plain one and asserted nothing — it
+    # survived the `a == b` mutant (review of PR #417). A ".." round trip survives as text.
+    dotted = os.path.join(str(default.parent), "..", default.parent.name, default.name)
+    assert dotted != str(default), "the fixture must not collapse before the code sees it"
 
     for spelling in (tilde, dotted):
         row = _scan("kb", "wrapped", "/opt/kb-mcp", pol, identity="kb", explicit=True)
         row["stats_log"] = spelling
         served = primer_liability([row], _agg(("kb", 40, 4000, 2000)))["servers"][0]
         assert served["blocks"] == 40, f"{spelling} names the default ledger"
+
+
+def test_an_entry_on_the_DEFAULT_ledger_owns_nothing_in_another_one(tmp_path):
+    """Review of PR #417 (third pass): the first cut compared only the BAKED side. An entry
+    with no `--stats-log` writes to the default ledger, so when the report reads another
+    file it writes nothing into it — yet it claimed 40 blocks out of a file it never touches,
+    and contested the label against the entry that owns every row in it."""
+    pol = _policy(tmp_path)
+    plain = _scan("zz", "wrapped", "/opt/zz-mcp", pol, identity="zz", explicit=True)
+    plain["stats"] = True                      # measured: the scan read the arg segment
+    served = primer_liability([plain], _agg(("zz", 40, 4000, 2000)),
+                              ledger_path="/srv/kb.jsonl")["servers"][0]
+    assert served["ledger_labels"] == []
+    assert served["break_even_verdict"] == "writes no ledger rows"
+
+    # …and the entry that DOES write there keeps its rows, uncontested.
+    owner = _scan("kb", "wrapped", "/usr/bin/python -m kb", pol,
+                  identity="python", explicit=False)
+    owner["stats"] = True
+    owner["stats_log"] = "/srv/kb.jsonl"
+    noisy = _scan("aa", "wrapped", "/usr/bin/python -m aa", pol,
+                  identity="python", explicit=False)
+    noisy["stats"] = True
+    from terse.stats import _ambiguous_labels
+    assert _ambiguous_labels([owner, noisy], "/srv/kb.jsonl") == set()
+    served = {r["server"]: r for r in
+              primer_liability([owner, noisy], _agg(("python", 30, 3000, 1500)),
+                               ledger_path="/srv/kb.jsonl")["servers"]}
+    assert served["kb"]["blocks"] == 30
+    assert served["aa"]["break_even_verdict"] == "writes no ledger rows"
+
+
+def test_an_entry_that_runs_NO_proxy_writes_nothing(tmp_path):
+    """#416 sets `stats = None` deliberately for an entry whose args carry no `proxy`
+    subcommand — "saying stats=True for an entry that provably runs no proxy is an
+    assertion, not a default". The first cut tested `is False` and read that None as True,
+    so `uv run --with terse -- python -m a` still made `python` ambiguous and deleted the
+    measurement of the real proxy beside it (review of PR #417)."""
+    pol = _policy(tmp_path)
+    fake = _scan("fake", "wrapped-unstashed", "python -m server_a", pol,
+                 identity="python", explicit=False)
+    fake["stats"] = None                       # measured: no `proxy` subcommand
+    real = _scan("real", "wrapped", "/usr/bin/python -m server_b", pol,
+                 identity="python", explicit=False)
+    real["stats"] = True
+    from terse.stats import _ambiguous_labels
+    assert _ambiguous_labels([fake, real]) == set()
+    served = {r["server"]: r for r in
+              primer_liability([fake, real], _agg(("python", 9, 900, 300)))["servers"]}
+    assert served["real"]["blocks"] == 9
+    assert served["fake"]["ledger_labels"] == []
+
+
+def test_a_round_tripped_blob_without_uncertain_still_renders(tmp_path):
+    # `build_primer_section` degrades rather than raises for a blob written by an older
+    # terse (#197). Widening the gate to `or silent_any` left `liab["uncertain"]` indexed
+    # directly two lines down, which raised KeyError (review of PR #417).
+    #
+    # Scoped to that key. `idle` is hard-indexed too and predates this branch, so the
+    # fixture supplies it rather than quietly widening this PR into a second fix.
+    from terse.stats import build_primer_section
+
+    blob = {"servers": [{"server": "kb", "primer_tokens": 500, "blocks": None,
+                         "break_even_verdict": "writes no ledger rows",
+                         "cadence": "once/session (?)"}],
+            "per_turn_tokens": 500, "session_once_tokens": 0, "unresolved": 0,
+            "saved_tokens": 0, "turns_covered": None, "idle": []}
+    assert "uncertain" not in blob, "the key this widening made load-bearing"
+    out = "\n".join(build_primer_section(blob))
+    assert "writes no ledger rows" in out and "kb" in out
 
 
 def test_a_SILENT_router_claims_no_peer_labels(tmp_path):

@@ -1122,21 +1122,44 @@ def _writes_ledger_rows(row: dict[str, Any], ledger_path: str | None = None) -> 
 
     Resolved before comparing, so `~/x.jsonl` and `/home/u/x.jsonl` are one file — a tilde
     stays LITERAL inside a JSON MCP config while `default_stats_log()` is already expanded,
-    which is the spelling that matters. A RELATIVE path resolves against the cwd of whoever
-    runs `terse stats`, not against the config's directory, so two relative spellings can
-    compare equal while naming different files; baked paths are absolute in practice
-    (`install-mcp` writes one), and a wrong answer here mislabels a report, nothing more.
+    which is the spelling that matters.
 
-    `stats` MISSING is True, not False: a row from a scan that predates the field cannot
-    say, and reading absence as silence would retract the measurement of every entry
-    recorded before #397. Unknown is not zero — the same discipline `codec_call_rate`
-    keeps for a missing counter."""
-    if row.get("stats") is False:
+    A RELATIVE baked path is resolved against the cwd of whoever runs `terse stats`, NOT the
+    config's directory, so it can compare equal to a different file (or unequal to the same
+    one). That is a real hole, not an excluded case: `install-mcp` has no `--stats-log` flag
+    and never writes one, so EVERY entry carrying it is hand-edited — the population the
+    caller's docstring calls the one that has to be read correctly. Left as a limitation
+    because there is no defensible base to resolve against (the proxy's cwd at launch is the
+    client's, not the config's), and the cost is a mislabelled row in a report. An earlier
+    draft of this paragraph claimed `install-mcp` writes the flag; it does not.
+
+    BOTH sides are resolved, which the first cut got half-right: an entry with NO
+    `--stats-log` writes to `default_stats_log()`, and that is not the file being read
+    whenever `terse stats --log FILE` names another one. Unconditionally answering True
+    there let an entry claim blocks out of a file it never writes to, and made it contest a
+    label against the entry that owns every row in it (review of PR #417).
+
+    A row carrying NEITHER `stats` nor `stats_log` short-circuits to True and skips the path
+    comparison entirely: a scan predating #397 cannot say where the entry writes, and
+    neither half of the rule may be applied to it. Reading absence as silence would retract
+    the measurement of every entry recorded before #397. Unknown is not zero — the same discipline `codec_call_rate` keeps for a missing
+    counter. `stats` PRESENT AND NOT TRUE is False, and the distinction is #416's: it sets
+    the field to None deliberately, for an entry whose args carry no `proxy` subcommand, so
+    that this function would not read "runs no proxy at all" as "writes normally". The first
+    cut used `is False` and read that None as True — the exact assertion #416's comment says
+    it exists to prevent."""
+    if "stats" in row and row["stats"] is not True:
         return False
-    baked = row.get("stats_log")
-    if not baked:
+    if "stats" not in row and "stats_log" not in row:
+        # A row from a scan predating #397 carries NEITHER field. It cannot say where — or
+        # whether — this entry writes, so it keeps the measurement it had. Applying the
+        # default-ledger rule below would retract every such row the moment the report reads
+        # a non-default ledger, on evidence the row does not carry. Either field present
+        # means the scan looked.
         return True
-    return _same_file(str(baked), ledger_path or str(default_stats_log()))
+    read = ledger_path or str(default_stats_log())
+    baked = row.get("stats_log")
+    return _same_file(str(baked) if baked else str(default_stats_log()), read)
 
 
 def _same_file(a: str, b: str) -> bool:
@@ -1897,7 +1920,7 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         # Split by CAUSE, because only one of the two has a fix the operator can act on.
         # `mcp-status` already tells this entry to bake `--server-name`; saying "no ledger
         # label" here and nothing else made the two commands read as unrelated complaints.
-        unknown = set(liab["uncertain"])
+        unknown = set(liab.get("uncertain") or [])
 
         def _named(reason: str) -> list[str]:
             return sorted(s["server"] for s in liab["servers"]
@@ -1918,7 +1941,9 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         # and those three reasons are its only causes, so no test can tell the two spellings
         # apart (mutation P5 survives, and is listed as equivalent rather than as a kill).
         # It is the cheap half of a defect that has now been fixed twice.
-        rest = [n for n in _named("no ledger label") if n not in set(amb) | set(silent)]
+        # No subtraction: a server carries ONE verdict string, so these three are disjoint
+        # by construction (the filter that used to sit here was dead — review of PR #417).
+        rest = _named("no ledger label")
         if rest:
             lines.append(f"  no ledger label, so it is unknown whether the lazy primer ever "
                          f"attached: {', '.join(rest)}")
@@ -2199,8 +2224,9 @@ def build_recommend_section(liab: dict[str, Any]) -> list[str]:
         lines.append("  terse has tested no policy change here — `terse policy autotune` is "
                      "the command that does.")
     if INSUFFICIENT in verdicts:
-        lines.append("  INSUFFICIENT = the ledger cannot answer yet (no label, no rows "
-                     "written at all, no token data, unreadable policy, or not called).")
+        lines.append("  INSUFFICIENT = the ledger cannot answer yet (no label, an "
+                     "ambiguous one, no rows written at all, no token")
+        lines.append("  data, unreadable policy, or not called).")
     shown = _cadences_of(servers)
     if _PER_TURN in shown:
         lines.append("  coverage on a /turn row is against ONE turn's charge — a router "
