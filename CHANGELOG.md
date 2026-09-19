@@ -15,6 +15,17 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **A `folded-and-live` peer whose live duplicate runs its own proxy now reports that
+  proxy's primer cost (#396).** The router's union primer covers the folded route, but the
+  separately live `terse proxy` is another process and can attach its own lazy primer once
+  per session. Primer liability previously excluded every folded state, understating that
+  duplicate's real cost. Raw live re-adds still remain excluded: scan data leaves their
+  proxy launch fields empty, so state alone never manufactures a second charge.
+
+## [0.33.8] - 2026-09-17
+
+### Fixed
+
 - **An entry that writes no ledger rows neither collides nor claims a label (#397).** An
   entry baked with `--no-stats`, or pointed at another file with `--stats-log`, was counted
   as one of two servers fighting over a launcher label — flagging the label ambiguous and

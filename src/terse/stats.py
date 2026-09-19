@@ -773,9 +773,10 @@ def build_version_section(agg: dict[str, Any]) -> list[str]:
 # banked, and how far those savings go against it. Same decision for the operator, no
 # fabricated denominator.
 
-# States whose entry runs its own `terse proxy`/`multiproxy` and therefore pays a primer.
-# "folded*" peers are stashed BEHIND a router — the router pays one union primer for the
-# fleet and the peers pay nothing, so counting them would double-charge.
+# States that unconditionally run their own `terse proxy`/`multiproxy` and pay a primer.
+# A `folded-and-live` peer is conditional: its live half may run its own proxy, or may be a
+# raw re-add that pays nothing beyond the router's union primer. The render loop admits only
+# the former, using the launch fields `scan_scopes` fills when it proves that proxy exists.
 _PAYS_PRIMER = ("wrapped", "wrapped-unstashed", "router", "router-ambiguous")
 
 # States whose entry WRITES ITS OWN LEDGER ROWS. A different question from the one above,
@@ -1640,7 +1641,12 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         # The winner check subsumes the old `seen` dedup: one index per name, fleet-wide.
         if not name or winners.get(str(name)) != i:
             continue
-        if state not in _PAYS_PRIMER:
+        # A folded peer normally pays nothing itself: the router covers it in one union
+        # primer. `folded-and-live` is the exception only when its live duplicate launches
+        # another terse proxy. `scan_scopes` proves that by filling `wraps`; a raw re-add
+        # leaves it None. State alone cannot distinguish the two (#396).
+        live_duplicate_proxy = state == "folded-and-live" and row.get("wraps") is not None
+        if state not in _PAYS_PRIMER and not live_duplicate_proxy:
             continue
         is_router = state in ("router", "router-ambiguous")
         # `wraps` means two different things by state, and reading it the wrong way is how
