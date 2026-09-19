@@ -163,6 +163,36 @@ def test_folded_peers_do_not_double_charge_behind_their_router(tmp_path):
     assert [s["server"] for s in liab["servers"]] == ["terse"]
 
 
+def test_a_proxy_backed_folded_and_live_peer_pays_its_own_lazy_primer(tmp_path):
+    """#396. The router pays its union primer, but a live duplicate that launches another
+    `terse proxy` is a second process and attaches its own once-per-session primer too."""
+    pol = _policy(tmp_path)
+    rows = [_scan("terse", "router", "kb", pol),
+            _scan("kb", "folded-and-live", "kb-server --stdio", pol,
+                  identity="kb", explicit=True)]
+    liab = primer_liability(rows, _agg(("kb", 4, 4_000, 1_000)))
+    by_name = {s["server"]: s for s in liab["servers"]}
+
+    assert set(by_name) == {"terse", "kb"}
+    assert by_name["terse"]["cadence"] == "per-turn"
+    assert by_name["kb"]["cadence"] == "once/session"
+    assert by_name["kb"]["ledger_labels"] == ["kb"]
+    assert liab["per_turn_tokens"] == by_name["terse"]["primer_tokens"]
+    assert liab["session_once_tokens"] == by_name["kb"]["primer_tokens"]
+
+
+def test_a_raw_folded_and_live_peer_pays_no_second_primer(tmp_path):
+    """State alone is insufficient: a raw live re-add runs no proxy, so only the router's
+    union primer is real. Scan rows represent that case with no live launch fields."""
+    pol = _policy(tmp_path)
+    rows = [_scan("terse", "router", "kb", pol),
+            _scan("kb", "folded-and-live", None, pol)]
+    liab = primer_liability(rows, _agg(("kb", 4, 4_000, 1_000)))
+
+    assert [s["server"] for s in liab["servers"]] == ["terse"]
+    assert liab["session_once_tokens"] == 0
+
+
 def test_a_router_is_sized_by_the_union_over_PEER_names_not_its_own(tmp_path):
     """Each peer's policy is gated against its OWN name. Gating the union on the router's
     name tests a rule like `kb.*` against "terse", which matches nothing — so the default
@@ -1851,9 +1881,9 @@ def test_a_scan_row_predating_the_stats_field_keeps_its_measurement(tmp_path):
 def test_a_folded_and_live_peer_collides_with_a_wrapped_entry_over_a_launcher_label(tmp_path):
     """#309. `folded-and-live` is "named in the peers file AND live under its own name", so
     when that live entry launches via terse it runs its OWN proxy and writes its OWN ledger
-    rows — under the downstream basename when nothing baked `--server-name`. It pays no
-    primer of its own (the router pays one union primer for the fleet), which is why it is
-    correctly absent from `_PAYS_PRIMER` and gets no row here.
+    rows — under the downstream basename when nothing baked `--server-name`. #396 established
+    that this second proxy also pays its own lazy primer; the router's union primer covers the
+    folded route, not a separate live process.
 
     Ambiguity is a different question, and the two shared one filter. The fleet below is
     #309's: both entries launch `python -m ...`, both write rows labelled `python`. Skipping
@@ -1867,10 +1897,11 @@ def test_a_folded_and_live_peer_collides_with_a_wrapped_entry_over_a_launcher_la
                   identity="python", explicit=False)]
     liab = primer_liability(rows, _agg(("python", 9, 6000, 3000)))
     served = {r["server"]: r for r in liab["servers"]}
-    # The folded peer pays nothing, so it is not billed a primer — that part was right.
-    assert list(served) == ["server-b"]
-    assert served["server-b"]["break_even_verdict"] == "ambiguous ledger label"
-    assert served["server-b"]["blocks"] is None
+    assert set(served) == {"server-a", "server-b"}
+    for row in served.values():
+        assert row["break_even_verdict"] == "ambiguous ledger label"
+        assert row["blocks"] is None
+        assert row["cadence"] == "once/session (?)"
 
 
 def test_a_folded_and_live_peer_that_is_NOT_terse_launched_manufactures_no_collision(tmp_path):

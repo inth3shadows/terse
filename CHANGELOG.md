@@ -68,6 +68,13 @@ fails that pull request until the section has moved.
   (model, payload, question) then read 100% on two more runs (20 trials each, vs the
   first run's 7) with no change to the answering path. The reason now scopes the rate to
   "this run"; whether it is the model's or the run's needs more than one run to tell.
+- **A `folded-and-live` peer whose live duplicate runs its own proxy now reports that
+  proxy's primer cost (#396).** The router's union primer covers the folded route, but the
+  separately live `terse proxy` is another process and can attach its own lazy primer once
+  per session. Primer liability previously excluded every folded state, understating that
+  duplicate's real cost. Raw live re-adds still remain excluded: scan data leaves their
+  proxy launch fields empty, so state alone never manufactures a second charge.
+
 - **The diff tier's published framing said "does not pay" where the measurement says
   "starved" (#419).** Four sites across `README.md` and `BENCHMARKS.md` reported the
   0.67% all-time hit rate and attributed what remained to "the workload", with README
