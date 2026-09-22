@@ -1,8 +1,9 @@
 {
   "name": "terse-bench-toon",
   "private": true,
-  "description": "Throwaway workspace: pins the official TOON encoder for the terse-vs-TOON benchmark. node_modules is gitignored; run `npm install` in this dir to reproduce.",
+  "description": "Throwaway workspace: pins the third-party encoders the terse benchmarks compare against (TOON for §1/§6, compressmcp for §4/§6). node_modules is gitignored; run `npm install` in this dir to reproduce.",
   "dependencies": {
-    "@toon-format/toon": "2.3.1"
+    "@toon-format/toon": "4.1.1",
+    "compressmcp": "0.4.0"
   }
 }

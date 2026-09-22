@@ -48,8 +48,9 @@ terse measure --corpus "$CORPUS"   # per-tool codec %, shape bucket, tier attrib
 terse stats   --log    "$LEDGER"   # decisions + diff-reason breakdown
 terse policy generate --corpus "$CORPUS"   # what terse auto-authors for these tools
 
-# competitor column (#138) — TOON on the SAME captured payloads, not a re-run:
-#   requires `cd scripts/bench && npm install` for the pinned @toon-format/toon encoder
+# competitor columns (#138) — TOON *and* compressmcp on the SAME captured payloads,
+# not a re-run. Requires `cd scripts/bench && npm install`, which pins both encoders
+# (@toon-format/toon 4.1.1 and compressmcp 0.4.0).
 uv run python toon_column.py "$CORPUS" [more CORPUS dirs...]
 ```
 
@@ -74,6 +75,11 @@ Swap the server command for the others:
 | everything | `npx -y @modelcontextprotocol/server-everything` |
 | duckduckgo-mcp-server | `uvx duckduckgo-mcp-server` |
 | hn-mcp-server | `npx -y @devabdultech/hn-mcp-server` |
+
+**Verify `everything`'s tool arguments before trusting a round.** As of 2026-09-22
+`get-structured-content` **requires** a `location` enum (`New York`/`Chicago`/`Los Angeles`);
+calling it with `{}`, as earlier rounds did, returns `isError: true` and poisons the corpus.
+Tool schemas drift — read `tools/list` rather than reusing an old `_calls.json` blindly.
 
 **`--with 'mcp<1.10'` is load-bearing, not optional**, as of 2026-07-30: `mcp-server-git`
 and `mcp-server-fetch` are built on the low-level `mcp` SDK's `@server.list_tools()`

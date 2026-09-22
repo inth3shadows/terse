@@ -13,6 +13,127 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Changed
+
+- **Every data-backed claim in `BENCHMARKS.md`, `README.md` and `docs/POSITIONING.md` was
+  re-derived on 2026-09-22, and three of them were wrong rather than merely stale.**
+  Documentation only — no code behaviour changes.
+
+  **Withdrawn claims.** "The only directly-comparable public tool is TOON" — a prior-art
+  sweep (#298) names ten projects in the niche, and `compressmcp` is a closer architectural
+  match (an MCP-layer lossless JSON compressor). "TOON wins only on `gh_labels`" — under
+  TOON 4.1.1 it wins three of nine payloads. "terse is new (pre-PyPI as of this date)" —
+  terse has shipped on PyPI since v0.3.1 (2026-07-18). Star counts are removed from the docs
+  entirely: they drifted constantly and never informed whether terse works.
+
+  **§1 re-run on TOON 4.1.1** (the harness was pinned to 2.3.1; there is no 3.x). The 2.3.1
+  run was executed FIRST and reproduced every published cell byte-identically, so the deltas
+  are TOON's upgrade and not a terse regression. terse is unchanged at 59.1% under both;
+  TOON's weighted total moves −7.1% → −6.5%, entirely from the small and shallow payloads
+  (`gh_rate_limit` −36.7% → +18.8%).
+
+  **§4 gains three measured entrants and loses none to hearsay.** compressmcp 0.4.0 is
+  lossless on all nine corpus payloads at 4.5% weighted, and goes NEGATIVE on small objects
+  where its `Keys:` legend outweighs the abbreviation. `@sliday/tamp` declined 7 of 9
+  payloads at its own defaults — cause executed rather than guessed (`compress.js:499`
+  returns null when minification wins nothing, and 7 of 9 corpus files are already
+  byte-minified) — and the one it did process emitted output that does not parse as JSON.
+  `token-smithers`' `--pipe` returned every payload byte-identical because
+  `create_pipeline()` registers `PassthroughStrategy()`, so that 0% measures the CLI, not
+  the compressor. headroom was NOT re-run (its integration point needs provider
+  credentials) and its table is retained at its 2026-08-05 date. A new subsection records
+  that three of four registry names resolve to DIFFERENT projects — `npm tamp`,
+  `npm llmtrim` and `pip headroom` are all somebody else's package.
+
+  **§5's ledger is re-derived and now reports a PAIR.** 4,461 blocks, 11,676,854 →
+  8,956,106 cl100k = 23.3% blended, but 19.3% lossless-only: `codegraph_explore`'s opt-in
+  drop-to-retrieve rule is 604,892 of the 2,720,748 saved — 22.2% of all savings from the
+  fleet's one lossy row. Since terse's wedge is "unconditionally lossless", the
+  lossless-only figure is the one published beside that claim. **A second fleet belonging
+  to the same operator makes this much sharper**: it reads 51.8% blended but **8.8%
+  lossless-only**, with **92.7% of everything it saved** coming from that one lossy rule —
+  a headline 2.2x HIGHER than this fleet's while its lossless result is 2.2x LOWER. Across
+  the two, the blended headline is anti-correlated with codec quality; it mostly measures
+  how much traffic hits a drop rule. That fleet's LOSSLESS figure is low for a reason that
+  is config rather than workload: its `mcp-status` reports `secret-broker  unwrapped`, and
+  on this fleet that same server is the largest lossless contributor (65.6% over 1,879,016
+  raw tokens). By §7's decision rule it is the worst server to leave unwrapped — its
+  results carry `structuredContent`, so its primer is free. **A fleet's lossless headline
+  is mostly a function of which servers were wrapped, and it is easy to leave the best one
+  out.** (That fleet also runs terse 0.14.2; comparing only the tools both fleets wrap, the
+  older build runs 2-4 points lower on five of seven — real, but far too small to explain
+  8.8% vs 19.3%.)
+  The retired snapshot said
+  2,357 blocks / 15.1%. The "~71% ceiling" projection is marked unrealised: the diff tier
+  fires on 30 of 4,461 blocks (0.67%), with `diff_off` the largest single reason — expected
+  since #170, not a misconfiguration.
+
+  **§6 re-run cold on v0.33.8 with a THIRD encoder column.** `toon_column.py` now measures
+  terse, TOON 4.1.1 and compressmcp on the identical captured bytes. Two cells reproduce
+  the 2026-08-04 round byte-identically (`directory_tree` on django/db at 57.3%,
+  `sequentialthinking` at 34.1%). Two weighted totals are published rather than one,
+  because `fs-django-big` is 96.4% of the basis: all 12 JSON payloads give terse 77.4% /
+  TOON 48.2% / compressmcp 51.8%, while excluding that one tree gives 52.2% / 50.8% /
+  45.1%. **terse's margin scales with payload size**; below a few thousand tokens the three
+  encoders land within ~7 points and TOON wins the smallest row outright.
+
+### Added
+
+- **`BENCHMARKS.md` §7 — topology: one proxy per server vs one router.** The axis the docs
+  never measured. `ab_session.py`'s "+23.1% standalone → +0.0% multiproxy" table is
+  explicitly PRE-#211 and is now labelled history rather than guidance, because the two
+  topologies pay on different cadences: a router primes eagerly and is re-read EVERY TURN
+  (live: 502 tok/turn), while a standalone wrapped entry has been lazy and once-per-session
+  since #211 (live, recorded: codegraph 502/session, runecho 248/session, and secret-broker
+  0 across 62 unattached emissions). So the arithmetic is `one union primer x turns` versus
+  `sum(per-server primers) x 1`, and the old advice to "fold to escape a token tax" is
+  backwards for small fleets — matching what `install-mcp --multiproxy --help` already says.
+
+- **A cost basis, in `BENCHMARKS.md`'s honesty notes and `docs/POSITIONING.md`'s economic
+  model.** Derived from 1,093 real Claude Code sessions / 118,288 usage records over 30
+  days: 96.9% of raw input tokens are cache reads billed at 0.1x, so **a raw-token basis
+  overstates input cost by 7.47x**. Tool results are 47.2% of message content by character,
+  so terse compresses a large part of the context but not a proportional part of the bill.
+  arXiv:2607.12161 is cited as convergent only, with its unreviewed / vendor-authored
+  caveat carried rather than dropped.
+
+- **`scripts/bench/compressmcp_encode.mjs`** and a `compressmcp` pin in
+  `scripts/bench/package.json`, so the new competitor column is reproducible by anyone
+  rather than being a one-off local measurement. Counts the `Keys:` legend against
+  compressmcp (as terse's own legend counts against terse) and accounts its status banner
+  separately (as terse's primer is accounted separately).
+
+- **`tests/test_published_claims_2026_09_22.py` — guards for every claim this pass
+  retracted or added.** Each of the three wrong claims had stood for weeks because nothing
+  watched it, which is principle #134: a claim that must stay in step with a moving number
+  needs a test, not a note asking people to remember. The withdrawal guard pins the claim
+  being ASSERTED rather than the substring, so a retraction may quote the sentence it
+  retracts — and a companion test feeds the guard both shapes to prove it can fail. All
+  ten were mutation-tested: reverting the 19.3% pair, the 7.47x cost basis, the pre-PyPI
+  wording, the `summarize` wording, or the TOON pin each kills a test.
+
+### Fixed
+
+- **Docs described `summarize` as "deferred" / "designed but not yet built" in five
+  places across `README.md` and `TECHNICAL.md`.** It is closed **permanently** (#261) —
+  terse is deterministic-only by decision, and a model in the proxy breaks the no-ML
+  guarantee. "Deferred" reads as a roadmap item and misrepresented what terse is. The
+  schema still accepts the value so existing policies keep loading, which is now stated.
+
+- **`docs/POSITIONING.md`'s "Future work" cited a closed issue as the live roadmap.** It
+  named #249 as "open as of 2026-08-19" and said "nothing currently open" covered the
+  primer follow-ups; #249 has closed and its follow-up #325 is open. Rewritten against the
+  actual open set (#325 primer modes, #270 router `initialize` blocking, #252 drop-rule
+  auto-tune, #295/#403/#412 verdict apparatus, #298 prior art), and it now states plainly
+  what is settled — including that `summarize` is closed permanently rather than pending.
+
+- **`scripts/bench/mcp_servers/README.md` records two traps that silently corrupt a §6
+  round**: `everything`'s `get-structured-content` now REQUIRES a `location` enum, so the
+  older `{}` call returns `isError: true` and poisons the corpus; and repo fixtures must be
+  verified non-shallow before `git_log` is trusted.
+
+## [0.33.8] - 2026-09-17
+
 ### Fixed
 
 - **An entry that writes no ledger rows neither collides nor claims a label (#397).** An
