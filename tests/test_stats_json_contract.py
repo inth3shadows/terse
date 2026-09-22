@@ -87,6 +87,11 @@ LIABILITY_SERVER = {"server", "scope", "state", "primer_tokens", "ledger_labels"
                     # BEFORE `--server-name` was baked in, reported so the split history is
                     # visible and never summed into any rate above it.
                     "superseded_labels",
+                    # #396 review: labels a router and the separately-live duplicate of one
+                    # of its peers BOTH write under. Reported, never counted — and reported
+                    # on both rows, because a router that keeps other labels carries no
+                    # `break_even_verdict` that could otherwise say why its blocks shrank.
+                    "contested_labels",
                     # #311: where `primer_tokens` came from. "recorded" = the proxy wrote
                     # down an emission this window; "estimated" = sized from the installed
                     # policy and INFERRED to have been paid, which is the pre-#311
@@ -112,7 +117,7 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "server": (str,), "tool": (str,), "scope": (str, type(None)),
     "state": (str, type(None)), "primer_tokens": (int, type(None)),
     "ledger_labels": (list,), "tokenized_blocks": (int, type(None)),
-    "superseded_labels": (list,),
+    "superseded_labels": (list,), "contested_labels": (list,),
     "cadence": (str,), "saved_per_block": (float, int, type(None)),
     # #311: always one of exactly two strings, never null -- there is always an answer to
     # "where did this number come from", even when the answer is "we inferred it".

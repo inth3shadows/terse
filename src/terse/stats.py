@@ -990,6 +990,59 @@ def _live_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
     return live
 
 
+def _router_duplicate_labels(scan_rows: list[dict[str, Any]],
+                             ledger_path: str | None = None) -> set[str]:
+    """Ledger labels written by BOTH a router and a separately-live duplicate of one of its
+    peers — provably unattributable, so neither entry may count them (#396 review).
+
+    `folded-and-live` means "named in the peers file AND live under its own name". The
+    router tags each peer's records with that peer's name; a live duplicate that launches
+    its own `terse proxy` writes under its own `--server-name`, which for the duplicate of
+    peer `kb` is `kb`. Two processes, one label, no field in the record that distinguishes
+    them — so summing the label's blocks and savings into BOTH liability rows let each one
+    clear break-even off the other's traffic and report KEEP. Reproduced with router peers
+    `[gh, kb]` and a live duplicate labelled `kb`.
+
+    Not `_ambiguous_labels`' job, and it is worth being explicit about why: that contest is
+    scoped to GUESSED launcher basenames (`_is_launcher_basename`), because sharing a
+    non-launcher basename means two entries launching one binary — one logical server, one
+    honest label. Here the collision is exact and DELIBERATE: `--server-name kb` is what
+    makes it so. An entry that bakes a DISTINCT name is absent from this set and stays
+    measurable, which is the operator's fix (the other being `mcp-status`' standing advice
+    to delete the duplicate).
+
+    Both halves are gated on `_writes_ledger_rows`: a silent router or a silent duplicate
+    writes none of the rows under that label, so there is nobody to contest it with — the
+    same manufactured-collision direction #397 removed from `_ambiguous_labels`."""
+    from .install_mcp import NO_PEERS  # local: same cycle break as `primer_liability`
+
+    winners = _precedence_winner(scan_rows)
+    peers_of_routers: set[str] = set()
+    live_duplicates: set[str] = set()
+    for i, row in enumerate(scan_rows):
+        name = row.get("server")
+        if not name or winners.get(str(name)) != i:
+            continue
+        state, wraps = row.get("state"), row.get("wraps") or ""
+        if not _writes_ledger_rows(row, ledger_path):
+            continue
+        if state in ("router", "router-ambiguous"):
+            if wraps != NO_PEERS:
+                peers_of_routers.update(
+                    p for p in (q.strip() for q in wraps.split(",")) if p)
+        elif state == "folded-and-live":
+            # A truthy identity IS the proof that this duplicate runs a proxy, so no
+            # separate `wraps is not None` gate: `scan_scopes` fills `ledger_identity` and
+            # `wraps` in the same block, behind the same `parse_proxy_opts` check, and a raw
+            # `claude mcp add` re-add leaves BOTH None. Adding the second test back makes a
+            # branch no input can reach (mutation M8 survived on it).
+            ident = row.get("ledger_identity") or (server_label(wraps.split()) if wraps
+                                                   else "")
+            if ident:
+                live_duplicates.add(str(ident))
+    return peers_of_routers & live_duplicates
+
+
 def _superseded_labels(row: dict[str, Any], labels: list[str],
                        by_label: dict[str, int], live: set[str]) -> list[str]:
     """Ledger labels that hold rows this entry almost certainly WROTE, but which its current
@@ -1089,7 +1142,8 @@ KEEP, TUNE, UNWRAP, INSUFFICIENT = "KEEP", "TUNE", "UNWRAP", "INSUFFICIENT"
 # future branch that reads this tuple inherits the right answer instead of the accidental
 # one.
 _NO_DATA_REASONS = ("no ledger label", "ambiguous ledger label", "no token data",
-                    "primer unknown", "writes no ledger rows")
+                    "primer unknown", "writes no ledger rows",
+                    "router/live duplicate label")
 
 # A guessed label two installed entries share (#285). Distinct from `no ledger label`, whose
 # documented meaning is "matched no ledger rows": here rows exist, they just belong to more
@@ -1103,6 +1157,17 @@ _R_AMBIGUOUS = "ambiguous ledger label"
 # means the entry never wrote any to look for. The operator's fix is different in each
 # case — bake `--server-name`, or turn stats back on, or nothing at all.
 _R_NO_LEDGER_ROWS = "writes no ledger rows"
+
+# A label claimed by BOTH a multiproxy router and the separately-live duplicate of one of
+# its peers (#396 review). The fourth distinct cause of "no attributable label", and the
+# only one whose fix is not `--server-name` on a launcher guess: the router tags each peer's
+# records with that PEER's name, and a `folded-and-live` entry running its own proxy under
+# the same name writes rows that are byte-identical in provenance. An explicit
+# `--server-name kb` does not help — it is what makes the collision EXACT — so
+# `_ambiguous_labels`, which only contests guessed launcher basenames, never sees it. Left
+# unfixed, both rows consumed the same blocks and the same savings and each independently
+# reported KEEP: #285's double count, one state over.
+_R_ROUTER_DUP = "router/live duplicate label"
 
 
 def _writes_ledger_rows(row: dict[str, Any], ledger_path: str | None = None) -> bool:
@@ -1635,6 +1700,9 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
     # Computed over ALL rows before any is rendered: whether one entry's guessed label is
     # ambiguous is a fact about the fleet, not about that row (#285).
     ambiguous = _ambiguous_labels(scan_rows, ledger_path)
+    # Same fleet-level discipline, a different collision: a label shared by a router and the
+    # separately-live duplicate of one of its peers (#396 review).
+    contested = _router_duplicate_labels(scan_rows, ledger_path)
     live = _live_labels(scan_rows)
     for i, row in enumerate(scan_rows):
         name, state = row.get("server"), row.get("state")
@@ -1674,8 +1742,14 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         # own proxy. That is the same "excluded from the contest, still owning the label"
         # shape this fix exists to remove, one state over.
         writes = _writes_ledger_rows(row, ledger_path)
-        labels = (peers if writes else []) if is_router \
+        claimed = (peers if writes else []) if is_router \
             else _wrapped_labels(row, wraps, ambiguous, ledger_path)
+        # Dropped from BOTH claimants, not arbitrated between them: the ledger records no
+        # fact that could pick a winner, and handing the label to either one is the
+        # fabricated attribution #285 removed. A router keeps its uncontested peers and
+        # stays measurable on those; only the shared name goes dark (#396 review).
+        labels = [lbl for lbl in claimed if lbl not in contested]
+        contested_here = [lbl for lbl in claimed if lbl in contested]
         pol_path = row.get("policy")
         tokens: int | None = None
         try:
@@ -1781,6 +1855,13 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
                               # `--server-name` on an entry whose rows do not exist.
                               _R_NO_LEDGER_ROWS
                               if not labels and not writes
+                              # Before the ambiguity branch, and applying to a ROUTER too
+                              # (the one no-label cause that does): this entry HAS a label
+                              # and a second process answers to it. Reporting `ambiguous`
+                              # would send the operator to bake `--server-name`, which for
+                              # this collision is what created it (#396 review).
+                              else _R_ROUTER_DUP
+                              if not labels and contested_here
                               else _R_AMBIGUOUS
                               if not labels and not is_router
                               and _guessed_label(row) in ambiguous
@@ -1789,6 +1870,12 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
                                           tokenized_by_label),
             # Reported, never summed into anything above — see `_superseded_labels`.
             "superseded_labels": _superseded_labels(row, labels, by_label, live),
+            # Also reported, never counted, and for the same reason: these rows exist and
+            # this entry wrote SOME of them, but nothing in the ledger says which. A router
+            # that keeps other labels carries no `break_even_verdict` to say so, so without
+            # this field its blocks would simply be smaller than last release with no
+            # published reason (#396 review).
+            "contested_labels": contested_here,
         }
         # Last, and from the finished row: the verdict is a rollup of the published fields,
         # so it is computed from them rather than alongside them.
@@ -1963,6 +2050,15 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
                          f"basename, so their rows cannot be told apart: {', '.join(amb)}")
             lines.append("  bake `--server-name <name>` into each (re-run `install-mcp`) to "
                          "make them measurable.")
+        # FOURTH cause, and the one whose fix is the opposite of the line above: here the
+        # `--server-name` is exactly what both writers agree on (#396 review). Telling this
+        # operator to bake one would be advice to do again what already broke it.
+        dup = _named(_R_ROUTER_DUP)
+        if dup:
+            lines.append(f"  router/live duplicate label — a router and a separately-live "
+                         f"copy of the same peer write under one name: {', '.join(dup)}")
+            lines.append("  remove the duplicate entry (`mcp-status` names it), or give the "
+                         "live one a DISTINCT `--server-name`.")
     # Reported here rather than folded into the rate above: the split is a FACT about the
     # ledger, and merging the two identities would be the guessing #285 removed.
     for srv in liab["servers"]:

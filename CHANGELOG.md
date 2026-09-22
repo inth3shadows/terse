@@ -75,6 +75,34 @@ fails that pull request until the section has moved.
   duplicate's real cost. Raw live re-adds still remain excluded: scan data leaves their
   proxy launch fields empty, so state alone never manufactures a second charge.
 
+  Two review blockers shipped with it, both reproduced before being fixed:
+
+  - **A `proxy` token is no longer mistaken for a proxy invocation.** `parse_proxy_opts`
+    located the subcommand with `args.index("proxy")`, which reads a WORD, not an
+    invocation. `terse --help proxy -- kb-mcp` prints help and exits, and
+    `terse stats --server-name proxy` has `proxy` as a flag VALUE — both returned a segment,
+    both had `wraps` filled off the `--`, and the new charge above then billed a primer to
+    a process that can never attach one. terse's top-level parser takes no option but
+    `--version`/`-h` (both terminating) and requires a subcommand, so the position is
+    knowable exactly: `proxy` must be the first token of terse's own argv. Every shape
+    `terse_invocation`/`$TERSE_MCP_CMD` emits still parses.
+  - **A label a router and its live duplicate BOTH write under is now unattributable.**
+    multiproxy tags each peer's records with that peer's name; a `folded-and-live`
+    duplicate that baked `--server-name kb` writes rows under the same `kb`. Nothing in a
+    ledger record distinguishes them, so both liability rows consumed all of that label's
+    blocks and savings and each could independently report `KEEP`. The label is now dropped
+    from both claimants and published in a new `contested_labels` field (`--json`, reported
+    never counted, like `superseded_labels`), with its own `break_even_verdict` of
+    `router/live duplicate label`. It gets a distinct reason and distinct advice because
+    `--server-name` — the fix every other no-label cause prescribes — is what creates this
+    one: the report says to remove the duplicate or give the live entry a DIFFERENT name.
+    A router keeps its uncontested peers and stays measurable on those.
+
+  **`--json` consumers:** `primer_liability.servers[]` gains `contested_labels`, and
+  `break_even_verdict` gains the value `router/live duplicate label`. A fleet with a
+  duplicated peer will see that label's `blocks`/`saved_per_block` leave both rows — that
+  drop IS the correction.
+
 - **The diff tier's published framing said "does not pay" where the measurement says
   "starved" (#419).** Four sites across `README.md` and `BENCHMARKS.md` reported the
   0.67% all-time hit rate and attributed what remained to "the workload", with README

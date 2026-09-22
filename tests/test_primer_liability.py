@@ -165,20 +165,97 @@ def test_folded_peers_do_not_double_charge_behind_their_router(tmp_path):
 
 def test_a_proxy_backed_folded_and_live_peer_pays_its_own_lazy_primer(tmp_path):
     """#396. The router pays its union primer, but a live duplicate that launches another
-    `terse proxy` is a second process and attaches its own once-per-session primer too."""
+    `terse proxy` is a second process and attaches its own once-per-session primer too.
+
+    The duplicate here writes under a label the router does NOT claim — it bakes no
+    `--server-name`, so it guesses its downstream basename `kb-server` while the router tags
+    that peer's rows `kb`. That separation is what makes the charge attributable; the
+    collision case is the next test."""
     pol = _policy(tmp_path)
     rows = [_scan("terse", "router", "kb", pol),
             _scan("kb", "folded-and-live", "kb-server --stdio", pol,
-                  identity="kb", explicit=True)]
-    liab = primer_liability(rows, _agg(("kb", 4, 4_000, 1_000)))
+                  identity="kb-server", explicit=False)]
+    liab = primer_liability(rows, _agg(("kb", 4, 4_000, 1_000),
+                                       ("kb-server", 3, 3_000, 900)))
     by_name = {s["server"]: s for s in liab["servers"]}
 
     assert set(by_name) == {"terse", "kb"}
     assert by_name["terse"]["cadence"] == "per-turn"
+    assert by_name["terse"]["ledger_labels"] == ["kb"]
     assert by_name["kb"]["cadence"] == "once/session"
-    assert by_name["kb"]["ledger_labels"] == ["kb"]
+    assert by_name["kb"]["ledger_labels"] == ["kb-server"]
+    assert by_name["kb"]["blocks"] == 3
     assert liab["per_turn_tokens"] == by_name["terse"]["primer_tokens"]
     assert liab["session_once_tokens"] == by_name["kb"]["primer_tokens"]
+
+
+def test_a_live_duplicate_sharing_its_router_peer_label_is_unattributable(tmp_path):
+    """#396 review, blocker 2. A `folded-and-live` duplicate baked `--server-name kb` is the
+    EXACT name the router already tags that peer's rows with. Two processes, one label, and
+    nothing in a ledger record that says which wrote it — so counting the label into both
+    rows let each clear break-even off the other's traffic and independently report KEEP.
+
+    The label goes dark for BOTH claimants. The router keeps its uncontested peer `gh` and
+    stays measurable on that alone; the duplicate is left with no label at all and a reason
+    string of its own, because `--server-name` — the fix every other no-label cause
+    prescribes — is what created this one."""
+    pol = _policy(tmp_path)
+    rows = [_scan("terse", "router", "gh, kb", pol),
+            _scan("kb", "folded-and-live", "kb-server --stdio", pol,
+                  identity="kb", explicit=True)]
+    liab = primer_liability(rows, _agg(("kb", 10, 10_000, 4_000),
+                                       ("gh", 5, 5_000, 2_000)))
+    by_name = {s["server"]: s for s in liab["servers"]}
+
+    assert by_name["terse"]["ledger_labels"] == ["gh"]
+    assert by_name["terse"]["blocks"] == 5          # NOT 15 — `kb`'s ten are unattributable
+    assert by_name["terse"]["contested_labels"] == ["kb"]
+    assert [c["label"] for c in by_name["terse"]["contributors"]] == ["gh"]
+
+    assert by_name["kb"]["ledger_labels"] == []
+    assert by_name["kb"]["blocks"] is None
+    assert by_name["kb"]["contested_labels"] == ["kb"]
+    assert by_name["kb"]["break_even_verdict"] == "router/live duplicate label"
+    assert by_name["kb"]["verdict"] == "INSUFFICIENT"
+    assert liab["uncertain"] == ["kb"]
+
+
+def test_the_report_names_the_router_duplicate_and_does_not_prescribe_server_name(tmp_path):
+    """The prose split matters more here than in the other three causes, because the advice
+    the `ambiguous` line gives — bake `--server-name` — is what CREATES this collision. An
+    operator following it would rename the live duplicate to the peer name it is already
+    fighting over. The only two fixes are deleting the duplicate or choosing a DIFFERENT
+    name, and the report has to say which one it means."""
+    pol = _policy(tmp_path)
+    rows = [_scan("terse", "router", "gh, kb", pol),
+            _scan("kb", "folded-and-live", "kb-server --stdio", pol,
+                  identity="kb", explicit=True)]
+    liab = primer_liability(rows, _agg(("kb", 10, 10_000, 4_000),
+                                       ("gh", 5, 5_000, 2_000)))
+    text = "\n".join(build_primer_section(liab))
+
+    assert "router/live duplicate label" in text
+    assert "remove the duplicate entry" in text and "DISTINCT `--server-name`" in text
+    # The line the `ambiguous` cause prints, which must NOT appear for this one.
+    assert "share a launcher basename" not in text
+    assert "bake `--server-name <name>` into each" not in text
+
+
+def test_a_live_duplicate_contests_nothing_when_its_router_writes_no_rows(tmp_path):
+    """The contest needs two WRITERS. A router baked `--no-stats` wrote none of the rows
+    under `kb`, so the live duplicate is the only process that could have — the same
+    manufactured-collision direction #397 removed from `_ambiguous_labels`."""
+    pol = _policy(tmp_path)
+    router = _scan("terse", "router", "kb", pol)
+    router["stats"] = False
+    rows = [router, _scan("kb", "folded-and-live", "kb-server --stdio", pol,
+                          identity="kb", explicit=True)]
+    liab = primer_liability(rows, _agg(("kb", 4, 4_000, 1_000)))
+    by_name = {s["server"]: s for s in liab["servers"]}
+
+    assert by_name["kb"]["ledger_labels"] == ["kb"]
+    assert by_name["kb"]["blocks"] == 4
+    assert by_name["kb"]["contested_labels"] == []
 
 
 def test_a_raw_folded_and_live_peer_pays_no_second_primer(tmp_path):

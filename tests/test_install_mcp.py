@@ -1329,6 +1329,40 @@ def test_parse_proxy_opts_returns_none_for_non_terse_entries():
         {"command": "/usr/bin/python", "args": ["-m", "terse", "capture"]}) is None  # no proxy
 
 
+def test_a_proxy_token_outside_the_subcommand_position_is_not_a_proxy(tmp_path):
+    """#396 review, blocker 1. `args.index("proxy")` read a WORD, not an invocation, and
+    everything downstream — `wraps`, the `stats`/`diff` labels, and #396's primer charge —
+    treated the match as proof that this entry runs a `terse proxy`.
+
+    Both populations below were reproduced against `mcp-status`. Neither can attach a primer:
+    the first prints help and exits, and the second is `stats` with `proxy` as a FLAG VALUE,
+    which no deny-list of terminating flags would have caught."""
+    assert im.parse_proxy_opts(
+        {"command": "terse", "args": ["--help", "proxy", "--", "kb-mcp"]}) is None
+    assert im.parse_proxy_opts(
+        {"command": "terse", "args": ["--version", "proxy", "--", "kb-mcp"]}) is None
+    assert im.parse_proxy_opts(
+        {"command": "terse", "args": ["stats", "--server-name", "proxy"]}) is None
+    assert im.parse_proxy_opts(
+        {"command": "/usr/bin/python",
+         "args": ["-m", "terse", "--help", "proxy", "--", "kb-mcp"]}) is None
+    # The same entries under the SEGMENT reader, which is what `scan_scopes` calls to decide
+    # whether `stats`/`diff` may be asserted at all.
+    assert im.proxy_arg_segment(
+        {"command": "terse", "args": ["--help", "proxy", "--no-stats", "--", "k"]}) is None
+    # ...and every shape `terse_invocation` / $TERSE_MCP_CMD actually emits still parses.
+    assert im.parse_proxy_opts(
+        {"command": "terse", "args": ["proxy", "--policy", "/p.json", "--", "k"]}) == {
+            "policy": "/p.json"}
+    assert im.parse_proxy_opts(
+        {"command": "/usr/bin/python",
+         "args": ["-m", "terse", "proxy", "--policy", "/p.json", "--", "k"]}) == {
+            "policy": "/p.json"}
+    assert im.parse_proxy_opts(
+        {"command": "uv",
+         "args": ["run", "--with", "terse", "terse", "proxy", "--", "k"]}) == {}
+
+
 def test_discover_wrapped_opts_collects_only_wrapped_in_order():
     config = {"mcpServers": {
         "a": {"command": "/usr/bin/python",
@@ -2474,6 +2508,28 @@ def test_a_terse_launched_folded_and_live_peer_carries_its_launch_fields(tmp_pat
     assert rows["gh"]["ledger_identity"] is None
     assert rows["gh"]["ledger_identity_explicit"] is None
     assert rows["gh"]["launcher"] is None and rows["gh"]["stats"] is None
+
+
+def test_a_help_only_folded_and_live_peer_is_not_read_as_a_second_proxy(tmp_path):
+    """#396 review, blocker 1. The sibling above is the `_looks_like_terse_launcher` false
+    positive; this is the one INSIDE `parse_proxy_opts`, which was that fix's discriminator.
+
+    `terse --help proxy -- <cmd>` carries a real `proxy` token and a real `--`, so the old
+    `args.index("proxy")` returned a segment and this block filled `wraps` and a ledger
+    identity for a process that prints help and exits. #396 then reads exactly that `wraps`
+    as proof a second `terse proxy` is running and bills it a primer — a charge against a
+    process that cannot attach one. Reproduced against `mcp-status` in review."""
+    from terse.install_mcp import do_install, scan_scopes
+    cfg, pol = _multi_cfg(tmp_path)
+    do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    live = json.loads(cfg.read_text())
+    live["mcpServers"]["kb"] = {"command": "terse", "args": [
+        "--help", "proxy", "--policy", str(pol), "--", "/usr/bin/python", "-m", "server_a"]}
+    cfg.write_text(json.dumps(live), encoding="utf-8")
+    row = {r["server"]: r for r in scan_scopes(cfg=cfg) if r["scope"] == "user"}["kb"]
+    assert row["state"] == "folded-and-live"
+    assert row["wraps"] is None and row["ledger_identity"] is None
+    assert row["stats"] is None and row["diff"] is None
 
 
 def test_merely_MENTIONING_terse_does_not_make_a_folded_and_live_peer_a_proxy(tmp_path):
