@@ -410,6 +410,37 @@ the per-block path could never reach:
 > ~0.6% hit rate returns. The honest reading is that terse's production win is the
 > **always-on codec**, not cross-call diffing; the range below describes a tier that is dark
 > in this deployment. It is kept for the mechanism, not as a forecast.
+>
+> **Added 2026-09-22 (#419) — the hit rate hides a working mechanism.** Segment the
+> attempts by whether the diff BASE had matching arguments:
+>
+> ```
+> base args MATCH      emitted 26   not_smaller_same_args   4    ->  87% win rate
+> base args DIFFER     emitted  0   not_smaller_diff_args 251    ->   0% win rate
+> never re-called      no_prior 318
+> ```
+>
+> The diff wins **87% of the time it gets a same-args base**, and almost never gets one:
+> `proxy.py:345` keeps ONE base slot per tool, so an interleaved different-args call evicts
+> the base that would have paid. `stats.py:630` already names `not_smaller_diff_args` an
+> "arg-keying opportunity". **The tier is starved, not weak** — which is a different claim
+> from "does not pay", and the only one of the two that is actionable.
+>
+> **The probe was then run, and it cuts the prize by ~73%.** Classifying the 253 by whether
+> that tool's arguments can recur at all within a session:
+>
+> ```
+> 115 (45.5%)  WRITE     kb.propose.merge_or_create / extend / delete — payload differs every call
+>  60 (23.7%)  QUERY     kb.read.search — a different query string nearly every time
+>  69 (27.3%)  RE-READ   runecho structure (36), kb.read.get (32) — args CAN recur
+>   9 ( 3.6%)  other
+> ```
+>
+> Arg-keying moves the writes and queries to `no_prior` — the same non-win, relabelled.
+> **Only ~69 are addressable**, worth at most ~60 extra diffs at 87%: roughly 26 -> 86, a
+> **~3.3x on a tier firing at 0.67%**, which still has to clear the 502 tok/turn primer.
+> Real and cheap, but not large — #419 carries it at that reduced size. The drop tier is
+> where the measured tokens are (#252, #271, #273).
 
 **So the production figure is a range, not a point:**
 
@@ -1038,6 +1069,34 @@ compressing a real and substantial part of it. But a 59% cut in tool-result toke
 Where the saving is real: a smaller result shrinks the prefix that is re-read on every
 subsequent turn, and it delays the point at which the window fills. Both matter. Neither is
 the headline percentage.
+
+### And the published figure is a WIRE basis, not a context basis (#420)
+
+A second layer of the same problem, found 2026-09-22 and not yet fixed in the tooling.
+
+`terse stats` folds the text block and the typed `structuredContent` field into one
+`raw_tokens`/`out_tokens` pair (`stats.py:196`) — a deliberate **wire** basis. But terse's
+own measurement says the mirror text block never reaches the model (`policy.py:152`):
+against `claude` 2.1.218, context went `raw 2,596 chars -> "compress" 1,008 -> "replace"
+1,008` — **no change**, because the client had already discarded the block.
+
+Over the live ledger (4,467 rows; 2,193 carry `structuredContent`, 2,274 do not):
+
+```
+WIRE basis    (what terse stats publishes)   11,704,038 -> 8,966,822   saved 2,737,216   23.4%
+CONTEXT basis (what the model receives)       6,364,272 -> 4,927,232   saved 1,437,040   22.6%
+```
+
+**The percentage survives — 23.4% vs 22.6%** — because terse compresses both halves at
+similar rates. **The absolute token counts do not: the published saving is 1.90x the
+context saving.** Anything derived from an absolute inherits that, including
+`primer_liability.turns_covered`, published as 5,419 and closer to **~2,862** on a context
+basis.
+
+This is client-dependent: for a client that forwards both fields, wire basis *is* context
+basis. And it **compounds** with the cost table above — raw overstates context ~1.8x, then
+context overstates billed cost ~7.5x. Each layer is separately measured; neither was
+documented before 2026-09-22.
 
 This converges with published work reaching the same conclusion from the opposite direction
 — notably *Token Reduction Is Not Cost Reduction* (arXiv:2607.12161), which measured a 38.4%
