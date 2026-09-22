@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.33.8] - 2026-09-17
+
 ### Fixed
 
 - **An entry that writes no ledger rows neither collides nor claims a label (#397).** An
