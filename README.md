@@ -30,8 +30,9 @@ tabularization primitive is public (formats like [TOON](https://toonformat.dev/)
 it standalone, MIT-licensed, ~40% on flat arrays), so a motivated competitor could clone
 the codec in a weekend.
 
-**2. The stateful cross-call diff — the axis nobody else can reach, and it still does not
-pay here.** When the same tool is called again — poll a list, re-read a file — terse emits
+**2. The stateful cross-call diff — the axis nobody else can reach. It does not pay as
+shipped, but the reason is not what it looks like.** When the same tool is called again —
+poll a list, re-read a file — terse emits
 a lossless *delta* against the prior result instead of the whole payload (**~73% smaller on
 the repeated call** in the model below). This is the one axis a stateless encoder
 **architecturally cannot reach**: TOON, headroom's stateless per-call compressor, and
@@ -47,7 +48,8 @@ workload.
 
 ```
 decisions:    compressed=3356  passthrough=659  unchanged=416  diff=30
-diff reasons: diff_off=1387  joined=587  multiblock=444  no_prior=318  emitted=26
+diff reasons: diff_off=1387  joined=587  multiblock=444  no_prior=318
+              not_smaller_diff_args=251  emitted=26  not_smaller_same_args=4
 ```
 
 The tier fires on **0.67% of blocks** (30 of 4,461; 26 emitted diffs), while the live
@@ -55,14 +57,45 @@ router's primer costs **502 tokens every turn** — re-read as `cache_read` on e
 `diff_off=1387` is the largest single reason and is *expected*: #170 made diffing opt-in
 precisely because the primer paragraph costs more per turn than this hit rate returns.
 
-The dominant *structural* exclusion is gone — the cross-block join removed it — and what
-remains is the workload: `no_prior` (318), i.e. the call was the first for that tool in
-the session. No codec change reaches that.
+**But segment the attempts by whether the diff BASE had matching arguments, and the
+picture inverts (#419):**
 
-So it is **opt-in and not the headline** (#170, re-confirmed on post-join evidence). When a
-loop really does re-fetch mostly-unchanged results it compounds hard; short sessions with
-wide tool variety never exercise it. How often *your* loop repeats a call is yours to
-measure (`terse stats`).
+```
+base args MATCH      emitted 26   not_smaller_same_args   4    ->  87% win rate
+base args DIFFER     emitted  0   not_smaller_diff_args 251    ->   0% win rate
+never re-called      no_prior 318
+```
+
+**When the diff gets a same-args base it wins 87% of the time. It almost never gets one.**
+`proxy.py:345` keeps **one base slot per tool** (`self.last: dict[str, Any]  # tool ->
+previous result object`), so any interleaved call to that tool with different arguments
+evicts the base that would have paid. 251 attempts diffed against the wrong base.
+
+So the tier is **starved rather than weak**, and an earlier edition of this section — which
+called the remaining exclusions "the workload" and said "no codec change reaches that" — is
+**withdrawn**. `no_prior` (318) is genuinely workload; the 251 are a data-structure choice.
+
+**But most of those 251 are not recoverable, and the probe says so.** Classifying them by
+whether that tool's arguments can recur at all within a session:
+
+```
+115 (45.5%)  WRITE     kb.propose.merge_or_create / extend / delete — payload differs every call
+ 60 (23.7%)  QUERY     kb.read.search — a different query string nearly every time
+ 69 (27.3%)  RE-READ   runecho structure (36), kb.read.get (32) — args CAN recur
+  9 ( 3.6%)  other
+```
+
+Arg-keying moves the writes and queries from `not_smaller_diff_args` to `no_prior` — the
+same non-win, relabelled. **Only ~69 are addressable**, worth at most ~60 extra diffs at the
+measured 87%: roughly 26 → 86, a **~3.3x on a tier that fires on 0.67% of blocks**, which
+still has to clear the 502 tok/turn primer. Real and cheap, but small. #419 carries it at
+that reduced size. The drop tier is where the measured tokens are (#252, #271, #273):
+`codegraph_explore`'s single rule accounts for 604,892 saved tokens here, 22.2% of all
+savings.
+
+It remains **opt-in and not the headline** (#170). When a loop really does re-fetch
+mostly-unchanged results it compounds hard; short sessions with wide tool variety never
+exercise it. How often *your* loop repeats a call is yours to measure (`terse stats`).
 
 Around those two sits the **bundle** that turns a byte filter into a control plane you
 don't want to rip out: MCP-native proxy packaging (transparent to any downstream
@@ -310,7 +343,9 @@ and shallow end.
 answer for" it. That is too strong — `@sliday/tamp` ships `diff` and `read-diff` stages in
 its default pipeline. What it does not do is offer them losslessly. Separately, be aware
 that terse's diff tier is **off by default** (#170) and fires on **0.67%** of this
-author's live traffic (30 of 4,461 blocks); see the note on it below before weighting it.
+author's live traffic (30 of 4,461 blocks) — though it wins **87%** of the times its base
+has matching arguments, and is starved rather than weak (#419). See the note on it below
+before weighting it.
 
 Competitor-by-competitor notes (headroom, LLMLingua-2, mcp-compressor, code-execution
 approaches, and more — all hands-on tested, no invented numbers), the full per-payload
@@ -388,8 +423,15 @@ same paragraph rides `initialize` and is re-read every turn, which only widens t
 14-day #250 window (17 of 908 blocks, 1.9% / 3.7%, 1,344 tokens):** the structural
 exclusion is gone and the verdict is unchanged — the tier fires on **30 of 4,461 blocks
 (0.67%)**, 26 of them emitted, against a live router primer of **502 tokens per turn**.
-The remaining exclusions are workload, not structure (`diff_off` 1,387, `no_prior` 318,
-`not_smaller_diff_args` 251).
+
+**Correction to an earlier edition of this line, which called the remaining exclusions
+"workload, not structure".** That is true of `no_prior` (318) and false of
+`not_smaller_diff_args` (**251**), which is a data-structure choice: the diff base is one
+slot per tool (`proxy.py:345`), so an interleaved different-args call evicts the base that
+would have paid. Segmented by whether the base's args matched, the tier wins **87%** of
+the time it gets a same-args base (26 of 30) and **0%** when it does not (0 of 251). It is
+**starved, not weak**. #419 proposes `(tool, args_key)` keying, with a probe first — the
+251 do not all convert, and 87% rests on 30 events.
 Its full
 validation program did pass: pair fluency
 (`fluency --diff`, 4-model panel 100% — per the 0.26.0 changelog entry (#249), this

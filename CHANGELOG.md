@@ -13,6 +13,54 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The diff tier's published framing said "does not pay" where the measurement says
+  "starved" (#419).** Four sites across `README.md` and `BENCHMARKS.md` reported the
+  0.67% all-time hit rate and attributed what remained to "the workload", with README
+  asserting "no codec change reaches that". Segmenting the attempts by whether the diff
+  BASE had matching arguments shows that is only half true:
+
+  ```
+  base args MATCH    emitted 26   not_smaller_same_args   4   ->  87% win rate
+  base args DIFFER   emitted  0   not_smaller_diff_args 251   ->   0% win rate
+  never re-called    no_prior 318
+  ```
+
+  `no_prior` (318) is genuinely workload. `not_smaller_diff_args` (**251**) is not — it is
+  a data-structure choice: `proxy.py:345` keeps ONE diff base per tool, so an interleaved
+  different-args call evicts the base that would have paid, and `stats.py:630` already
+  calls that an "arg-keying opportunity". The tier wins **87% of the time it gets a
+  same-args base** and gets one 30 times out of 281.
+
+  **The probe was then run against the raw ledger and cut the prize by ~73%**, so the docs
+  publish the reduced number rather than the headline: of the 253, **115 (45.5%) are WRITES**
+  (`propose.*`, payload differs every call) and **60 (23.7%) are free-text QUERIES**
+  (`kb.read.search`) whose arguments cannot recur — arg-keying moves those to `no_prior`,
+  the same non-win relabelled. **Only ~69 (27.3%) are re-reads** (`runecho structure` 36,
+  `kb.read.get` 32) where args CAN recur, worth at most ~60 extra diffs at 87%: roughly
+  26 -> 86, a ~3.3x on a tier firing at 0.67% that must still clear the 502 tok/turn
+  primer. Real and cheap, not large. The shipped behaviour is unchanged.
+
+- **The published saving is a WIRE basis; the context basis is ~1.9x smaller in absolute
+  tokens (#420).** `terse stats` folds the text block and the typed `structuredContent`
+  field into one `raw_tokens`/`out_tokens` pair (`stats.py:196`) — deliberately, since #141
+  fixed the opposite bug. But terse's own measurement (`policy.py:152`) says the mirror
+  text block never reaches the model: against `claude` 2.1.218 context went `raw 2,596 ->
+  "compress" 1,008 -> "replace" 1,008`, no change, because the client had already discarded
+  it. Over the live ledger (2,193 of 4,467 rows carry a typed field):
+
+  ```
+  WIRE basis    11,704,038 -> 8,966,822   saved 2,737,216   23.4%
+  CONTEXT basis  6,364,272 -> 4,927,232   saved 1,437,040   22.6%
+  ```
+
+  **The percentage survives** (23.4% vs 22.6% — both halves compress at similar rates) so
+  no headline is retracted. **The absolutes do not**, and anything derived from one inherits
+  it: `primer_liability.turns_covered` publishes 5,419 where the context basis gives ~2,862.
+  Documented in the honesty notes; the aggregation fix is #420. Compounds with the cost
+  basis above — raw overstates context ~1.8x, then context overstates billed cost ~7.5x.
+
 ### Changed
 
 - **Every data-backed claim in `BENCHMARKS.md`, `README.md` and `docs/POSITIONING.md` was
