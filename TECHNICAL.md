@@ -337,8 +337,9 @@ off by default because it failed rung 4 at the measured hit rate.
 - **`critical`:** a denylist against lossy ops — a `critical` field is never truncated
   or dropped, even if also marked `lossy`.
 - **`lossy`:** `truncate` and `drop-to-retrieve` are implemented (opt-in, off by default);
-  `summarize` is accepted by the schema but deferred — it emits a warning and leaves the
-  field lossless.
+  `summarize` is accepted by the schema but **permanently closed (#261)** — it emits a
+  warning and leaves the field lossless. The schema still accepts it so an existing policy
+  keeps loading, NOT because an implementation is pending.
 - Validation: unknown tiers and unsupported versions raise `ValueError` at load time.
 
 `policy.example.json` ships a policy that encodes the measured insight (gh/runecho
@@ -434,7 +435,7 @@ by the next patch (PyPI versions cannot be re-uploaded).
 
 ## Known Limitations
 
-- **Tier 1 (lossy) — `truncate` and `drop-to-retrieve` built; `summarize` deferred.**
+- **Tier 1 (lossy) — `truncate` and `drop-to-retrieve` built; `summarize` closed permanently (#261).**
   A field marked `{"lossy":"truncate","max":N}` (and not `{"critical":true}`) is capped +
   annotated, gated by `lossy.acceptable_loss`: only marked, non-critical fields may differ,
   each only as a valid truncation. A field marked `{"lossy":"drop-to-retrieve"}` (with an
@@ -457,7 +458,8 @@ by the next patch (PyPI versions cannot be re-uploaded).
   untouched — the marker-collision guard falls out of the gate rather than needing its own
   check. A dropped text payload is never used as a CDC diff base (the base would depend on
   which spans cleared the size floor); the next raw text re-anchors as a full. `summarize`
-  (needs a model in the proxy) is parsed but deferred — warned and left lossless. All lossy
+  (needs a model in the proxy) is parsed but **closed permanently (#261)** — warned and
+  left lossless. It is not a roadmap item: terse is deterministic-only by decision. All lossy
   is off by default; each mode replaces the round-trip gate with its own acceptable-loss
   gate only where a field is explicitly marked.
   **Behavioral gate (#46):** `droppable_loss` proves a drop is recoverable *if* the model

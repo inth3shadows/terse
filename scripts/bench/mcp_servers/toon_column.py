@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""TOON's number on the SAME third-party-server payloads §6 measures terse on (#138).
+"""Competitor numbers on the SAME third-party-server payloads §6 measures terse on (#138).
 
 §6 reports what terse does zero-config to real MCP servers. It had no competitor column,
 so a reader could not tell whether the codec %s are good or merely non-zero. This script
-adds TOON's, measured on the identical captured payloads — not on a re-run with different
+adds TOON's and compressmcp's, measured on the identical captured payloads — not on a re-run with different
 arguments, which is the one way a head-to-head can quietly cheat.
 
     python toon_column.py <capture-dir> [<capture-dir> ...]
@@ -41,6 +41,7 @@ from terse.measure import measure_payload
 from terse.tokenize import count_cl100k
 
 TOON_SCRIPT = Path(__file__).resolve().parents[1] / "toon_encode.mjs"
+CMCP_SCRIPT = Path(__file__).resolve().parents[1] / "compressmcp_encode.mjs"
 
 
 def toon_encode(raw: str) -> tuple[str, bool] | None:
@@ -59,6 +60,26 @@ def toon_encode(raw: str) -> tuple[str, bool] | None:
         return None
     out = json.loads(proc.stdout)
     return out["toon"], bool(out["lossless"])
+
+
+def compressmcp_encode(raw: str) -> tuple[str, bool] | None:
+    """Encode `raw` with compressmcp's TerseJSON codec via the pinned package.
+
+    Same contract as `toon_encode`: (text, lossless), or None when the payload is not JSON
+    — rendered `n/a`, never a 0% tie. compressmcp is a JSON codec, so "cannot encode" and
+    "encoded and tied" are different facts.
+
+    The `payload` figure is used, not `full`: it is the Keys legend plus the compressed
+    JSON, which is the part comparable to terse's and TOON's encodings. compressmcp's
+    status banner is accounted separately, the same way terse's primer is."""
+    proc = subprocess.run(["node", str(CMCP_SCRIPT)], input=raw, capture_output=True,
+                          text=True)
+    if proc.returncode != 0:
+        return None
+    out = json.loads(proc.stdout)
+    if not out.get("json") or "error" in out:
+        return None
+    return out["payload"], bool(out["lossless"])
 
 
 def load_payloads(dirs: list[Path]) -> list[dict]:
@@ -107,6 +128,9 @@ def measure_one(env: dict) -> dict:
         "toon_tok": None,
         "toon_pct": None,
         "toon_lossless": None,
+        "cmcp_tok": None,
+        "cmcp_pct": None,
+        "cmcp_lossless": None,
     }
     enc = toon_encode(raw)
     if enc is not None:
@@ -114,6 +138,12 @@ def measure_one(env: dict) -> dict:
         row["toon_tok"] = count_cl100k(toon_txt)
         row["toon_pct"] = _pct(raw_tok, row["toon_tok"])
         row["toon_lossless"] = lossless
+    cenc = compressmcp_encode(raw)
+    if cenc is not None:
+        cmcp_txt, closs = cenc
+        row["cmcp_tok"] = count_cl100k(cmcp_txt)
+        row["cmcp_pct"] = _pct(raw_tok, row["cmcp_tok"])
+        row["cmcp_lossless"] = closs
     return row
 
 
@@ -135,19 +165,21 @@ def main(argv: list[str]) -> int:
     # Never bank a number a lossy encoder produced. A False `toon_lossless` is a real
     # finding (TOON encoded it but lost data), distinct from `None` (could not encode).
     lossy = [r for r in rows if not r["terse_lossless"]
-             or r["toon_lossless"] is False]
+             or r["toon_lossless"] is False
+             or r["cmcp_lossless"] is False]
     good = [r for r in rows if r not in lossy]
 
-    print(f"\nterse vs TOON on captured third-party MCP server payloads "
+    print(f"\nterse vs TOON vs compressmcp on captured third-party MCP server payloads "
           f"({len(rows)} payloads, cl100k)\n")
     print(f"{'server':<22}{'tool':<26}{'shape':<20}{'raw tok':>9}"
-          f"{'terse':>8}{'TOON':>9}")
-    print("-" * 94)
+          f"{'terse':>8}{'TOON':>9}{'cmcp':>9}")
+    print("-" * 103)
     for r in rows:
         toon = "  n/a" if r["toon_pct"] is None else f"{r['toon_pct']:>6.1f}%"
+        cmcp = "  n/a" if r["cmcp_pct"] is None else f"{r['cmcp_pct']:>6.1f}%"
         flag = "  !LOSSY-DROP" if r in lossy else ""
         print(f"{r['server']:<22}{r['tool']:<26}{r['shape']:<20}{r['raw_tok']:>9,}"
-              f"{r['terse_pct']:>7.1f}%{toon:>9}{flag}")
+              f"{r['terse_pct']:>7.1f}%{toon:>9}{cmcp:>9}{flag}")
 
     # The weighted total covers only rows TOON can actually encode: mixing in text-only
     # payloads would let a corpus of prose decide the winner, when neither tool claims
@@ -156,10 +188,15 @@ def main(argv: list[str]) -> int:
     if encodable:
         tot_raw = sum(r["raw_tok"] for r in encodable)
         t_out = sum(round(r["raw_tok"] * (1 - r["terse_pct"] / 100)) for r in encodable)
-        print("-" * 94)
+        c_rows = [r for r in encodable if r["cmcp_tok"] is not None]
+        c_raw = sum(r["raw_tok"] for r in c_rows)
+        cmcp_tot = (f"{_pct(c_raw, sum(r['cmcp_tok'] for r in c_rows)):>8.1f}%"
+                    if c_rows else "     n/a")
+        print("-" * 103)
         print(f"{'TOTAL (JSON only)':<48}{len(encodable)} payloads{tot_raw:>13,}"
               f"{_pct(tot_raw, t_out):>7.1f}%"
-              f"{_pct(tot_raw, sum(r['toon_tok'] for r in encodable)):>8.1f}%")
+              f"{_pct(tot_raw, sum(r['toon_tok'] for r in encodable)):>8.1f}%"
+              f"{cmcp_tot}")
     n_text = sum(1 for r in rows if r["toon_pct"] is None)
     print(f"\n{n_text} of {len(rows)} payloads are not JSON — TOON cannot encode them "
           f"at all (terse scores 0% one-shot on those same rows).")

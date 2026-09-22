@@ -40,12 +40,24 @@ remember the last result — terse can only do it because it lives in the sessio
 transparent proxy.
 
 That is an architectural claim, and it survives. The economic one does not, at this
-workload. Measured over 14 days of terse's own post-join traffic (#250): the tier fired on
-**1.9% of blocks** (3.7% on the newest build — the highest hit rate ever measured here) and
-banked **1,344 tokens**, while its primer paragraph costs **190 tokens every turn** behind a
-router. The dominant exclusion is no longer structural — the cross-block join removed that
-one — it is the workload: `no_prior`, i.e. the call was the first for that tool in the
-session. No codec change reaches that.
+workload.
+
+**Re-derived 2026-09-22 over the full all-time ledger (4,461 blocks), superseding the
+14-day #250 window that reported 1.9% / 3.7%:**
+
+```
+decisions:    compressed=3356  passthrough=659  unchanged=416  diff=30
+diff reasons: diff_off=1387  joined=587  multiblock=444  no_prior=318  emitted=26
+```
+
+The tier fires on **0.67% of blocks** (30 of 4,461; 26 emitted diffs), while the live
+router's primer costs **502 tokens every turn** — re-read as `cache_read` on each one.
+`diff_off=1387` is the largest single reason and is *expected*: #170 made diffing opt-in
+precisely because the primer paragraph costs more per turn than this hit rate returns.
+
+The dominant *structural* exclusion is gone — the cross-block join removed it — and what
+remains is the workload: `no_prior` (318), i.e. the call was the first for that tool in
+the session. No codec change reaches that.
 
 So it is **opt-in and not the headline** (#170, re-confirmed on post-join evidence). When a
 loop really does re-fetch mostly-unchanged results it compounds hard; short sessions with
@@ -103,7 +115,10 @@ then (optionally) serves it through a per-tool policy that decides which tiers r
   replaces a marked field with a handle, stores the original per session, and serves it
   back via a synthetic `terse.retrieve` tool the proxy injects — gated so a drop is
   accepted only if the handle resolves to the exact original. `summarize` (needs a model)
-  is still parsed but deferred — warned and left lossless. Off everywhere by default.
+  is parsed but **will not be built** — it is closed permanently (#261), because a
+  model in the proxy breaks terse's no-ML guarantee. It is warned and left lossless,
+  and the schema keeps accepting it only so an existing policy does not fail to load.
+  Off everywhere by default.
 
 Every transform has an exact inverse, and a round-trip gate asserts
 `decompress(compress(x)) == x` over the whole corpus. The transformed bytes *are*
@@ -263,25 +278,39 @@ the nested, record-shaped output that dominates real MCP tool traffic. Lossless 
 verified per payload, counted in `cl100k_base`. The corpus is already-compact JSON, so
 every number is *pure structural* gain, the hardest honest case.
 
-The only directly-comparable public tool is **[TOON](https://toonformat.dev/)** — a
-lossless encoding that shares terse's tabularization primitive:
+**terse is not alone in this niche.** A prior-art sweep (#298) found at least ten projects
+in the same space; three were installed and measured on 2026-09-22 against the same corpus
+(`BENCHMARKS.md` §4). The closest architectural match is **compressmcp**, an MCP-layer
+lossless JSON compressor — not TOON. An earlier edition of this section called TOON "the
+only directly-comparable public tool"; that is **withdrawn**.
 
-| payload (real GitHub API) | records | raw tok | terse | TOON |
-|---|--:|--:|--:|--:|
-| gh_pulls | 30 | 151,165 | **76.1%** | −8.4% |
-| gh_labels | 9 | 632 | 15.2% | **19.0%** |
-| **weighted total** | | 365,144 | **59.1%** | **−7.1%** |
+Measured head-to-head, cl100k, all lossless-verified per payload:
+
+| payload (real GitHub API) | records | raw tok | terse | TOON 4.1.1 | compressmcp 0.4.0 |
+|---|--:|--:|--:|--:|--:|
+| gh_pulls | 30 | 151,165 | **76.1%** | −8.0% | 6.3% |
+| gh_labels | 9 | 632 | 15.2% | **19.0%** | −3.0% |
+| **weighted total** | | 365,144 | **59.1%** | −6.5% | 4.5% |
 
 *(% = fewer cl100k tokens than raw; higher is better; **bold** = winner.)*
 
-**terse wins decisively on real nested records; TOON regresses to −7% (worse than raw).**
-TOON is built for flat, uniform arrays; GitHub records are deeply nested and repeat
-subtrees (a PR embeds the same `user`/`repo` object 60 times), which terse's dictionary
-tier folds and TOON's tabular layout cannot. TOON does lead on flat, short-valued, uniform
-tables like `gh_labels` — the boundary is **value repetition, not column width** (a seeded
-width sweep found no clean crossover). terse also has an axis TOON has no answer for:
-**cross-call diff** — a lossless delta against the prior result on a repeated call (poll,
-re-read), **73.2%** smaller than a full re-send on this corpus.
+**terse wins decisively on real nested records.** TOON still regresses in aggregate to
+−6.5% (worse than raw): it is built for flat, uniform arrays, while GitHub records are
+deeply nested and repeat subtrees (a PR embeds the same `user`/`repo` object 60 times),
+which terse's dictionary tier folds and TOON's tabular layout cannot. compressmcp is
+genuinely lossless but abbreviates keys only, which is a small win on nested records and a
+**net loss on small objects**, where its `Keys:` legend costs more than it saves.
+
+TOON leads on flat, short-valued, uniform tables like `gh_labels` — the boundary is
+**value repetition, not column width** (a seeded width sweep found no clean crossover).
+Note that TOON 4.x narrowed this: it now wins 3 of the 9 payloads, not 1, all on the small
+and shallow end.
+
+**On cross-call diff:** terse has it, and an earlier edition claimed competitors had "no
+answer for" it. That is too strong — `@sliday/tamp` ships `diff` and `read-diff` stages in
+its default pipeline. What it does not do is offer them losslessly. Separately, be aware
+that terse's diff tier is **off by default** (#170) and fires on **0.67%** of this
+author's live traffic (30 of 4,461 blocks); see the note on it below before weighting it.
 
 Competitor-by-competitor notes (headroom, LLMLingua-2, mcp-compressor, code-execution
 approaches, and more — all hands-on tested, no invented numbers), the full per-payload
@@ -291,10 +320,21 @@ with the exact reproduce commands. The running competitor queue, including every
 screened out and why, is
 [docs/competitors-to-benchmark.md](docs/competitors-to-benchmark.md).
 
-Adoption honesty: terse is new (just published to PyPI, few/no stars); TOON (25.0k★) and
-headroom (63.5k★) are far more established. terse's wedge is narrow and specific —
-unconditionally lossless, no expiring retrieve-cache, no ML dependency, MCP-transparent,
-plus cross-call diffing — not breadth of adoption.
+Adoption honesty: terse has been on PyPI since v0.3.1 (2026-07-18) and is at v0.33.8;
+TOON, headroom and the other measured entrants are far more established. terse's wedge is
+narrow and specific — unconditionally lossless, no expiring retrieve-cache, no ML
+dependency, MCP-transparent — not breadth of adoption.
+
+*(Star counts were removed from these docs on 2026-09-22: they drifted constantly and
+never informed whether terse works. What a project measurably **does** is the comparison
+worth carrying.)*
+
+**And a token saved is not a dollar saved.** Measured over 1,093 of this author's own
+sessions (2026-09-22, 30-day window), 96.9% of raw input tokens are **cache reads**,
+billed at a tenth of input price — so a raw-token basis overstates input cost by
+**7.47x**. terse shrinks the prefix that gets re-read every turn and delays the context
+window filling up; it does not cut the invoice by the codec percentage. Full derivation in
+[BENCHMARKS.md](BENCHMARKS.md) → Methodology & honesty notes.
 
 ## Related Documentation
 
@@ -344,11 +384,12 @@ attached once per session to each wrapped server that emits a terse form
 which roughly 27 primer attaches erase — about two a day across that window, which an
 active fleet passes immediately. That is the standalone cadence; behind a router the
 same paragraph rides `initialize` and is re-read every turn, which only widens the gap.
-**Re-measured post-join, 14 days to 2026-09-15 (#250):** the structural exclusion is gone
-and the verdict is unchanged — 17 of 908 blocks (1.9%; 3.7% on the newest build) banking
-**1,344 tokens**, against 190 tokens per turn of primer behind a router. Break-even would
-need about seven turns a fortnight. The remaining exclusions are workload, not structure
-(`no_prior` 162, `not_smaller_diff_args` 140).
+**Re-derived 2026-09-22 over the full all-time ledger (4,461 blocks), superseding the
+14-day #250 window (17 of 908 blocks, 1.9% / 3.7%, 1,344 tokens):** the structural
+exclusion is gone and the verdict is unchanged — the tier fires on **30 of 4,461 blocks
+(0.67%)**, 26 of them emitted, against a live router primer of **502 tokens per turn**.
+The remaining exclusions are workload, not structure (`diff_off` 1,387, `no_prior` 318,
+`not_smaller_diff_args` 251).
 Its full
 validation program did pass: pair fluency
 (`fluency --diff`, 4-model panel 100% — per the 0.26.0 changelog entry (#249), this
@@ -367,16 +408,24 @@ the structural exclusion that kept 71% of real traffic out of the diff tier enti
 the re-measurement above is what that removal was worth: a higher hit rate on payloads too
 small to pay for the primer.
 The Tier 1 lossy modes `truncate` and
-`drop-to-retrieve` are built (opt-in, off by default); `summarize` remains designed but
-not yet built — see TECHNICAL.md "Known Limitations".
+`drop-to-retrieve` are built (opt-in, off by default). **`summarize` is closed
+permanently (#261), not pending** — terse is deterministic-only by decision, and a
+model-in-the-proxy tier is out of scope for good. See TECHNICAL.md "Known Limitations".
 
 Evidence now spans three kinds: a fixed public corpus (BENCHMARKS §1–4), terse's own
 live production ledger (§5), and **popular third-party MCP servers** measured zero-config
-with pinned fixtures (§6) — filesystem, git, memory, fetch, plus serena and
-playwright-mcp. The §6 headline: the codec pays on JSON output (18–58%, depending on
-whether the server pretty-prints) while *every* text-shaped tool is 0% one-shot yet still
-wins on a repeat — so the codec is the JSON-specific lever and the diff is the broad,
-shape-independent one.
+with pinned fixtures (§6) — filesystem, git, memory, serena, sequential-thinking and
+everything, re-run cold on 2026-09-22 against terse, TOON 4.1.1 **and** compressmcp on the
+identical captured bytes.
+
+The §6 headline, stated as a pair because one payload dominates the basis: over all 12
+JSON payloads **terse 77.4% / TOON 48.2% / compressmcp 51.8%**, but the 133k `directory_tree`
+is 96.4% of that basis — excluding it the same three read **52.2% / 50.8% / 45.1%**. So
+**terse's margin scales with payload size**: below a few thousand tokens the three encoders
+land within ~7 points of each other and TOON wins the smallest row outright; on the large
+nested tree terse pulls 30 points clear, because that is where repeated subtrees exist to
+fold. Every text-shaped tool is 0% one-shot for all three — the codec is the JSON-specific
+lever.
 
 <!-- docvet:anchors
 install-mcp -> src/terse/cli.py

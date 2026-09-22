@@ -1,11 +1,20 @@
 # terse — Benchmarks
 
-**Last updated: 2026-08-04.** Every figure is dated by section — §1, §3, and the terse
-column of §4 were re-measured 2026-08-04 on the merge of #202; §2 was produced 2026-07-17
-and re-runs byte-identical today; §5 is a live number pulled fresh each time; **§6 was
-re-measured 2026-08-04**, a fresh, cold, argument-recording run against the same merge —
-see the note there for what moved and what didn't. Nothing here is hand-typed or
-estimated. If you re-run and get different numbers, the code changed; open an issue.
+**Last updated: 2026-09-22.** Every figure is dated by section. What was re-derived in the
+2026-09-22 pass, and what was not:
+
+| section | status |
+|---|---|
+| §1 terse vs TOON | **re-run 2026-09-22** on TOON **4.1.1** (pin was 2.3.1). The 2.3.1 run was executed first and reproduced every published cell byte-identically, so the deltas are TOON's upgrade, not a terse regression. |
+| §2 width sweep | produced 2026-07-17, re-runs byte-identical; **not re-run** this pass |
+| §4 competitors | **new entrants measured 2026-09-22** (compressmcp, @sliday/tamp, token-smithers). headroom **not re-run** — its integration point needs provider credentials; its 2026-08-05 table is retained at that date. |
+| §5 live ledger | **re-derived 2026-09-22**: 4,461 blocks, 23.3% blended / 19.3% lossless-only. Supersedes the 2026-08-11 snapshot (2,357 blocks, 15.1%). |
+| §6 popular MCP servers | **re-run 2026-09-22** on v0.33.8, fresh cold round, plus a **third encoder column** (compressmcp). Two cells reproduce the 2026-08-04 round byte-identically. |
+| §7 topology | **new 2026-09-22.** Its A/B table is explicitly pre-#211 and is history, not guidance. |
+| honesty notes | **new cost-basis derivation 2026-09-22** over 1,093 sessions. |
+
+Nothing here is hand-typed or estimated. If you re-run and get different numbers, the code
+changed; open an issue.
 
 Two different kinds of evidence live here, and the difference matters:
 
@@ -47,33 +56,41 @@ cat scripts/bench/mcp_servers/README.md  # §6  popular third-party MCP servers 
 The corpus is real GitHub API output (`scripts/bench/corpus/`) — the nested, record-shaped
 tool traffic terse targets. `cl100k` tokens, all lossless.
 
-Re-measured **2026-08-04** on the merge of #202, straight from
-`uv run scripts/bench/benchmark.py` — both columns from the same run, no hand-patched
-cells. Union-schema tabularize moved exactly one payload here and the total: `gh_issues`
-32.7% → 38.8%, weighted 58.3% → 59.1%. Every other row, and the whole TOON column, is
-byte-identical to the previous measurement. §3 moved with it — its "full re-send"
-column *is* this codec — and was re-measured the same day. See
-[`scripts/bench/version_sweep.md`](scripts/bench/version_sweep.md) for why 58.3% had
-stood unchanged from `v0.5.1` to `v0.17.0`.
+Re-measured **2026-09-22** against **TOON 4.1.1** (the harness had been pinned to 2.3.1;
+there is no 3.x — TOON went 2.3.1 → 4.0.0). Both columns from the same
+`uv run scripts/bench/benchmark.py` run, no hand-patched cells.
 
-| payload | records | raw tok | **terse** | TOON |
-|---|--:|--:|--:|--:|
-| gh_pulls | 30 | 151,165 | **76.1%** | −8.4% |
-| gh_workflow_runs | 20 | 76,032 | **80.4%** | −7.5% |
-| gh_issues | 30 | 48,032 | **38.8%** | −8.0% |
-| gh_commits | 30 | 69,652 | **26.5%** | −4.5% |
-| gh_dir_listing | 24 | 6,736 | **31.4%** | −7.7% |
-| gh_rate_limit | 1 obj | 357 | **13.4%** | −36.7% |
-| gh_repo_single | 1 obj | 1,652 | **0.0%** | −4.4% |
-| gh_commits_flat | 30 | 10,886 | **2.4%** | 1.7% |
-| gh_labels | 9 | 632 | 15.2% | **19.0%** |
-| **weighted total** | | **365,144** | **59.1%** | **−7.1%** |
+**The pinned 2.3.1 run was executed first, on the same day, and reproduced every published
+cell byte-identically** — so the changes below are TOON's upgrade, not a terse regression.
+terse's column is unchanged at **59.1%** under both encoders. See
+[`scripts/bench/version_sweep.md`](scripts/bench/version_sweep.md) for why 58.3% stood
+unchanged from `v0.5.1` to `v0.17.0` before #202's union-schema tabularize moved it.
 
-**Plain reading:** on real nested records terse cuts tokens **59%**; TOON *regresses* to −7%
-(worse than raw) because it adds a key-path per nesting level, while terse folds the repeated
-subtrees and long repeated strings (e.g. `gh_pulls` = 60 copies of the same repo object
-collapsed to one legend entry → 76%). TOON wins only on `gh_labels` — a flat, short-valued
-uniform table, its designed sweet spot.
+| payload | records | raw tok | **terse** | TOON 4.1.1 | TOON 2.3.1 |
+|---|--:|--:|--:|--:|--:|
+| gh_pulls | 30 | 151,165 | **76.1%** | −8.0% | −8.4% |
+| gh_workflow_runs | 20 | 76,032 | **80.4%** | −7.5% | −7.5% |
+| gh_issues | 30 | 48,032 | **38.8%** | −8.0% | −8.0% |
+| gh_commits | 30 | 69,652 | **26.5%** | −4.5% | −4.5% |
+| gh_dir_listing | 24 | 6,736 | **31.4%** | 10.4% | −7.7% |
+| gh_rate_limit | 1 obj | 357 | 13.4% | **18.8%** | −36.7% |
+| gh_repo_single | 1 obj | 1,652 | **0.0%** | −3.9% | −4.4% |
+| gh_commits_flat | 30 | 10,886 | **2.4%** | 1.7% | 1.7% |
+| gh_labels | 9 | 632 | 15.2% | **19.0%** | 19.0% |
+| **weighted total** | | **365,144** | **59.1%** | **−6.5%** | **−7.1%** |
+
+**Plain reading:** on real nested records terse cuts tokens **59%**; TOON still *regresses*
+in aggregate to −6.5% (worse than raw) because it adds a key-path per nesting level, while
+terse folds the repeated subtrees and long repeated strings (e.g. `gh_pulls` = 60 copies of
+the same repo object collapsed to one legend entry → 76%).
+
+**What changed in TOON 4.x, and it is worth stating plainly: TOON now wins three of the nine
+payloads, not one.** The whole of its improvement is on the small and shallow end —
+`gh_rate_limit` −36.7% → **+18.8%** and `gh_dir_listing` −7.7% → **+10.4%**, with
+`gh_pulls` and `gh_repo_single` moving less than half a point. The five large nested payloads
+that carry the weighted total are **byte-identical** across the two versions. So the aggregate
+barely moved while the per-payload story changed materially, and the previous edition of this
+section — which said TOON "wins only on `gh_labels`" — is **withdrawn**.
 
 ---
 
@@ -131,13 +148,59 @@ own traffic). Do **not** read §3 as a claim about aggregate real-world savings;
 
 ---
 
-## §4 — Competitor landscape (hands-on, tested 2026-07-17)
+## §4 — Competitor landscape (hands-on; new entrants tested 2026-09-22)
 
-Installed and tested, not cited from marketing. Only TOON (§1) is directly comparable on a
-lossless token axis; the rest measure *different guarantees*, so no head-to-head % is
-claimed. TOON's row reproduced byte-identical on 2026-07-30 (see §1); headroom was
-re-tested on 2026-08-05 on real proxied traffic (below) — LLMLingua-2, mcp-compressor, and
-the native context-editing row are unchanged from the 2026-07-17 hands-on test.
+Installed and tested, not cited from marketing. **Every row in this section was executed
+here.** A project that could not be run is named with the reason and gets no number —
+this section deliberately does not reprint anyone's self-reported figures.
+
+**terse is not alone in this niche, and the previous edition of this section said it was.**
+A prior-art sweep (#298, 2026-08-18) found at least ten projects occupying the same space.
+Three of them were installed and measured on 2026-09-22 against the §1 corpus, same cl100k
+basis, same lossless bar — results below. The claim that TOON was "the only directly
+comparable public tool" is **withdrawn**: `compressmcp` is an MCP-layer lossless JSON
+compressor, which is a closer architectural match to terse than TOON is.
+
+TOON's row was re-measured 2026-09-22 on **4.1.1** (see §1); headroom was last tested
+2026-08-05 on real proxied traffic and is **not re-run this round** — see the version note
+below. LLMLingua-2, mcp-compressor and the native context-editing row are unchanged from
+the 2026-07-17 hands-on test.
+
+### New entrants, measured 2026-09-22
+
+Same method as §1: each tool's own encode path, its own defaults, cl100k tokens, and a
+per-payload round-trip check. A row that fails its round-trip is reported as failing, not
+dropped silently.
+
+| Tool | weighted | lossless? | what actually happened |
+|---|--:|---|---|
+| **terse** (reference) | **59.1%** | yes, all 9 | — |
+| **compressmcp** 0.4.0 | **4.5%** | **yes, all 9** | Its "TerseJSON" tier abbreviates keys and prepends a `Keys:` legend. Real and genuinely lossless — but key abbreviation alone is a small win on nested records, and it **regresses on small objects** where the legend costs more than it saves: `gh_rate_limit` −23.2%, `gh_repo_single` −29.4%, `gh_labels` −3.0%. |
+| **@sliday/tamp** 0.8.21 | **not measurable here** | **no** | Declined **7 of 9** payloads at its own defaults. Cause executed, not guessed: `compress.js:499` returns `null` when `minified.length >= text.length`, and 7 of the 9 corpus files are already byte-minified. Of the two it did process, `gh_commits_flat` (1.7%) **emitted output that does not parse as JSON**. Its default stage list is `cmd-strip, minify, toon, strip-lines, whitespace, llmlingua, dedup, diff, read-diff, prune` — lossy by construction. |
+| **token-smithers** | **no codec measured** | n/a | Its `--pipe` CLI returned every payload **byte-identical (0.0%)**. That is not its compressor: `src/token_sieve/cli/main.py: create_pipeline()` registers `PassthroughStrategy()` for `ContentType.TEXT`, so pipe mode is a no-op by construction. Its real codec runs only in MCP-proxy mode, which this round did not stand up. |
+
+**On `tamp` specifically:** it confirms #298's observation that terse's cross-call diff tier
+is *not* a unique axis — `diff` and `read-diff` are in tamp's default pipeline. What tamp
+does not do is offer it losslessly.
+
+### Registry name collisions — verify identity before benchmarking anything here
+
+Three of the four projects worth testing are **not** the package their obvious registry name
+resolves to. Getting this wrong publishes a number attributed to the wrong project:
+
+| You might type | What actually installs | The real project |
+|---|---|---|
+| `npm i tamp` | `tamp@0.0.3` — oztu, "Encoder for the Tamper protocol" | **`@sliday/tamp`** (scoped), v0.8.21 |
+| `npm i llmtrim` | `llmtrim@1.4.0` — VincenzoManto, a token-trimming library | `fkiene/llmtrim` — GitHub only (Rust) |
+| `pip install headroom` | a different tool entirely | **`headroom-ai`** |
+| `pip install token-smithers` | 404 — on no registry | `shacharbard/token-smithers` — GitHub only |
+
+`npm i compressmcp` is the one that resolves correctly (TheDecipherist's).
+
+**Version drift note:** `headroom-ai` has moved 0.34.0 (tested 2026-08-05) → **0.38.0**
+(published, checked 2026-09-22). Its measurable integration point is a live LLM-API proxy
+against a real provider, which needs provider credentials, so it was **not re-measured this
+round**. The table below is retained at its 2026-08-05 date and should be read as such.
 
 **Headroom re-tested 2026-08-05, on its real integration point.** `headroom-ai` moved from
 v0.33.0 (2026-07-30) to v0.34.0 (this run) — same architecture, same numbers below,
@@ -206,14 +269,83 @@ savings ledger (sizes + decisions only, never content). Unlike those, a stranger
 reproduce *these* numbers (they're one person's traffic); the point is the opposite — here is
 what an honest production figure looks like, and the one command that gives you *yours*.
 
-**Headline (measured 2026-08-11, `terse stats`, all-time, ledger spans 2026-07-15 to
-2026-08-11):**
+**Headline (measured 2026-09-22, `terse stats`, all-time, ledger spans 2026-07-15 to
+2026-09-22):**
 
 ```
-2,357 blocks   4,701,499 -> 3,991,185 tok   15.1% blended
+4,461 blocks   11,676,854 -> 8,956,106 tok   23.3% blended
+                                             19.3% lossless-only
 ```
 
-That 15.1% is honest and *incomplete*, for three reasons now — the two below plus a
+*(Previous edition: 2,357 blocks, 4,701,499 → 3,991,185, 15.1%, snapshot 2026-08-11.)*
+
+**Two numbers, because one would overstate the lossless claim.** The fleet now includes
+exactly one lossy row — `codegraph_explore`, whose `$text.code_blocks` drop-to-retrieve rule
+(#139) takes 738,172 → 133,280 tokens, i.e. **81.9%, and 604,892 of the 2,720,748 total
+saved — 22.2% of all savings from one tool.** Excluding it, the strictly-lossless fleet
+figure is 10,938,682 → 8,822,826 = **19.3%**. terse's wedge is "unconditionally lossless",
+so the lossless-only number is the one that belongs next to that claim; 23.3% is what the
+context actually shrank by, with one opt-in lossy rule live.
+
+The top of the per-tool table, same run:
+
+```
+secret-broker  secret.list_credentials   103 blocks   1,879,016 ->   647,232   65.6%
+codegraph      codegraph_explore         203 blocks     738,172 ->   133,280   81.9%  (LOSSY)
+kb             kb.read.list_principles   896 blocks   2,675,293 -> 2,274,721   15.0%
+kb             kb.read.list_nodes         63 blocks   2,044,614 -> 1,801,313   11.9%
+kb             kb.read.search            573 blocks     557,489 ->   484,668   13.1%
+```
+
+**A second fleet makes the point much harder to dismiss.** The same operator runs terse on
+a second machine with a different workload. Read the same day, same command:
+
+| fleet | terse | blocks | blended | **lossless-only** | share of savings from the one lossy row |
+|---|---|--:|--:|--:|--:|
+| A (this section) | 0.33.8 | 4,461 | 23.3% | **19.3%** | 22.2% |
+| B (second machine) | 0.14.2 | 389 | **51.8%** | **8.8%** | **92.7%** |
+
+Fleet B's headline is **2.2x higher** than fleet A's while its lossless result is **2.2x
+lower**. It leans heavily on `codegraph_explore`, whose drop-to-retrieve rule takes
+839,904 → 133,467 there: **92.7% of everything that fleet saved is one lossy rule.**
+
+**So the blended headline mostly measures how much of your traffic hits a drop rule, not
+how good the codec is** — across these two fleets it is actually *anti-correlated* with
+lossless codec performance. Anyone choosing terse on a 51.8% figure would be choosing it
+for a drop rule they have to opt into, on one tool.
+
+**And fleet B's *lossless* figure is low for a reason that is config, not workload.** Its
+`mcp-status` reads:
+
+```
+codegraph       folded  behind=terse
+kb              folded  behind=terse
+runecho         folded  behind=terse
+secret-broker   unwrapped
+```
+
+`secret-broker` is installed on that machine and **is not wrapped**, so terse never sees
+it and it cannot appear in that ledger at all. On fleet A the same server is the single
+largest lossless contributor — `secret.list_credentials`, **65.6% over 1,879,016 raw
+tokens**. Fleet B's lossless surface is therefore almost entirely kb prose tools, which
+cap in the low teens on any version.
+
+By §7's own decision rule that is the **worst** server to leave unwrapped: its results
+carry `structuredContent`, so its primer is free (fleet A: 62 emissions, every one
+`attached: false`, 0 tokens). It is unconditionally-lossless savings available at zero
+primer cost, not taken.
+
+**The lesson worth carrying off this pair: a fleet's lossless headline is mostly a
+function of WHICH SERVERS YOU WRAPPED, and it is easy to leave the best one out.** Run
+`terse mcp-status` before reading anything into a low number.
+
+*Caveat, stated rather than buried: fleet B runs terse **0.14.2**, nineteen minor versions
+behind fleet A, so its 8.8% is NOT a clean read on the current codec (it predates #202's
+union-schema tabularize, among others). Comparing the tools both fleets DO wrap, the older
+build runs 2–4 points lower on five of seven — real, but far too small to explain 8.8% vs
+19.3%. The unwrapped server and the drop-rule composition are what explain it.*
+
+That 23.3% is honest and *incomplete*, for three reasons now — the two below plus a
 third this section didn't have when it was first written.
 
 **1. This ledger spans multiple codec changes, not one fixed codec.** An all-time ledger from
@@ -263,12 +395,29 @@ the per-block path could never reach:
   calls in this 7-day ledger), so in a real agent loop a large fraction of calls after the
   first are near-empty diffs.
 
+> **Correction (2026-09-22): the "~71% ceiling" below was never reached, and the live ledger
+> says why.** That projection assumed the diff tier would fire on the diff-eligible share.
+> It does not, because #170 made diffing **opt-in** and nothing turned it on. The decision
+> mix over all 4,461 blocks:
+>
+> ```
+> compressed=3356   passthrough=659   unchanged=416   diff=30
+> diff reasons: diff_off=1387  joined=587  multiblock=444  no_prior=318  emitted=26
+> ```
+>
+> **26 emitted diffs in 4,461 blocks.** `diff_off=1387` is the single largest reason and is
+> *expected*, not a misconfiguration — the primer paragraph costs more every turn than a
+> ~0.6% hit rate returns. The honest reading is that terse's production win is the
+> **always-on codec**, not cross-call diffing; the range below describes a tier that is dark
+> in this deployment. It is kept for the mechanism, not as a forecast.
+
 **So the production figure is a range, not a point:**
 
 - **Floor** — every call, no repeats: the joined codec alone, ~9–12%, dominated by prose
   ceilings.
-- **Ceiling** — repeat-heavy loop with data stable between calls: re-weighting the ledger's
-  own token mix, the diff-eligible 71% collapsing ~99% each puts the aggregate near **~71%**.
+- **Ceiling (unrealised — see the correction above)** — repeat-heavy loop with data stable
+  between calls: re-weighting the ledger's own token mix, the diff-eligible 71% collapsing
+  ~99% each puts the aggregate near **~71%**.
 - **Reality sits between**, set by *your* repeat rate and how fast *your* data changes — which
   no benchmark can tell you. So measure it:
 
@@ -284,7 +433,7 @@ claim, and a better pitch besides.
 
 ---
 
-## §6 — Popular third-party MCP servers (re-measured 2026-08-04)
+## §6 — Popular third-party MCP servers (re-measured 2026-09-22)
 
 > **Re-measured against the merge of #202** (union-schema tabularize), superseding the
 > 2026-07-30 numbers below. This was a genuinely fresh, cold run — new `express`/`fastapi`
@@ -302,6 +451,77 @@ claim, and a better pitch besides.
 zero-config** to the output of widely-used, **credential-free** MCP servers that anyone can
 run. Reproduce with `scripts/bench/mcp_servers/` (pinned repo fixtures, a static local web
 fixture, one command per server).
+
+### Re-measured 2026-09-22 — three-way, on record-shaped public payloads
+
+A fresh cold round against **v0.33.8**: new full (non-shallow) clones of the pinned repo
+fixtures, every server relaunched, every payload re-captured, and a **third encoder column
+added** — compressmcp, which §4 identifies as terse's closest architectural match.
+`toon_column.py` now measures terse, TOON **4.1.1** and compressmcp **0.4.0** on the
+*identical captured bytes*, so no encoder gets a different input.
+
+| server | tool | shape | raw tok | **terse** | TOON | compressmcp |
+|---|---|---|--:|--:|--:|--:|
+| filesystem (django, whole pkg) | `directory_tree` | array-of-records | 133,370 | **78.3%** | 48.1% | 52.0% |
+| filesystem (django, `db/`) | `directory_tree` | array-of-records | 2,696 | **57.3%** | 56.3% | 50.4% |
+| filesystem (fastapi) | `directory_tree` | array-of-records | 1,328 | **50.5%** | 49.5% | 49.3% |
+| filesystem (express) | `directory_tree` | array-of-records | 116 | 54.3% | **69.0%** | 41.4% |
+| memory | `search_nodes` | array-of-records | 168 | **44.0%** | 36.9% | 31.5% |
+| memory | `read_graph` | array-of-records | 215 | **43.7%** | 37.2% | 34.4% |
+| memory | `create_entities` | array-of-records | 203 | **42.4%** | 36.0% | 36.5% |
+| sequential-thinking | `sequentialthinking` | pretty-json | 41 | **34.1%** | 31.7% | −22.0% |
+| serena | `get_symbols_overview` | compact-json | 130 | **18.5%** | 16.9% | 6.9% |
+| everything | `get-structured-content` | compact-json | 14 | 0.0% | 0.0% | −107.1% |
+| filesystem | `read_text_file` | long-text | 3,524 | 0.0% | n/a | n/a |
+| git | `git_log` | long-text | 4,541 | 0.0% | n/a | n/a |
+
+**Two weighted totals, because one of them is really one payload:**
+
+```
+all 12 JSON payloads          raw 138,323   terse 77.4%   TOON 48.2%   compressmcp 51.8%
+excluding the 133k tree       raw   4,953   terse 52.2%   TOON 50.8%   compressmcp 45.1%
+```
+
+`fs-django-big` alone is **96.4%** of the weighted basis. Quoting 77.4% without that is
+quoting one directory tree. The honest reading of the pair: **terse's margin scales with
+payload size.** Below a few thousand tokens all three encoders land within ~7 points of
+each other and TOON actually wins the smallest row (express, 116 tok, 69.0%); on the 133k
+tree terse pulls 30 points clear, because that is where repeated subtrees and repeated
+long strings exist to fold.
+
+**compressmcp goes negative on small payloads** — −22.0%, −107.1%, −300.0% on the three
+smallest — for the same reason §4 found: its `Keys:` legend is a fixed cost that a tiny
+object cannot amortise. Its 51.8% on the full set is almost entirely the one large tree.
+
+**Reproductions of the 2026-08-04 round:** `directory_tree` on django's `db/` returns
+**57.3%**, byte-identical to the previously published cell, and `sequentialthinking`
+returns **34.1%**, likewise. Those two are unchanged across seven weeks and a terse major.
+
+**Two upstream changes found while re-running, both of which would have silently corrupted
+the round:**
+
+- `everything`'s `get-structured-content` now **requires** a `location` enum argument. The
+  2026-08-04 probe called it with `{}`; that now returns `isError: true`. Per this repo's
+  own rule a `TOOL ERROR` payload is discarded and re-run, which is what happened here.
+- The repo fixtures must be verified non-shallow before `git_log` is trusted — the
+  2026-08-04 round was bitten by 1-commit shallow clones. Checked explicitly this round
+  (express 6,103 / fastapi 7,521 commits).
+
+### Still not covered here
+
+`playwright`, `fetch`, `duckduckgo` and `hn` were **not re-run** this round — all four are
+text-shaped, where every encoder scores `n/a`/0%, and playwright additionally needs a
+Chromium build. Dropping them costs no comparison. `mcp-server-sqlite` would be the ideal
+record-array addition (SQL result sets are uniform record arrays) but remains unrunnable:
+it is built on the `mcp` SDK's removed `@server.list_tools()` API with no known-good pin,
+the same wall that keeps `mcp-server-time` and `mcp-server-calculator` out of this table.
+
+### The 2026-08-04 round, retained for the rows the 2026-09-22 round did not re-run
+
+Superseded where the two overlap — the table above is current for `filesystem`, `memory`,
+`sequential-thinking`, `serena`, `git` and `everything`. This one is kept because it is the
+only measurement of the text-shaped servers (`playwright`, `fetch`, `duckduckgo`, `hn`) and
+of the repeat/diff column, and because its methodology notes still apply.
 
 Servers: the official reference set (`modelcontextprotocol/servers`) plus four widely-used
 credential-free third-party servers — **serena**, **playwright-mcp**,
@@ -615,6 +835,166 @@ a feature that is decisive on one traffic mix can be inert on another.
 
 ---
 
+## §7 — Topology: one proxy per server, or all of them behind one router?
+
+`terse install-mcp` writes one wrapped entry per server by default; `--multiproxy` folds the
+named servers into a single router process instead. **This choice is worth more than most
+policy tuning, and the advice on it inverted in #211 — so the older measurement below must
+not be read as current guidance.**
+
+### The pre-#211 measurement (`scripts/bench/ab_session.py`, 2026-07-28)
+
+Real billed tokens from Claude Code transcripts, not terse's own ledger — the `usage` block
+the API returned, diffed across two matched sessions:
+
+| wrapped servers | calls | RAW input | n |
+|---|--:|--:|--:|
+| 1 (runecho only) | 4 | **−14.0%** | 1 |
+| 3 (codegraph, kb, runecho) | 4 | +1.4% | 3 |
+| 6, one proxy each | 4 | **+23.1%** | 1 |
+| 6, behind one multiproxy | 4 | **+0.0%** | 4 |
+
+At the time each standalone proxy injected its primer into that server's MCP `instructions`,
+which the client re-read **every turn**, so cost scaled with (servers × turns). Folding
+collapsed N primers into one and erased the six-server penalty. Hence the old advice: fold.
+
+### What #211 changed, and why the advice is no longer "always fold"
+
+The two topologies now pay on **different cadences**, and `src/terse/stats.py:1492` states
+the contract:
+
+> ```
+> router / router-ambiguous    still prime EAGERLY, one union_primer in the router's own
+>                              merged initialize.instructions, re-read every turn as
+>                              cache_read. RECURRING.
+> wrapped / wrapped-unstashed  lazy since #211: the primer attaches to the FIRST result
+>                              carrying a terse wire form. Paid ONCE per session if that
+>                              result comes, and NOT AT ALL if it never does.
+> ```
+
+So the arithmetic is no longer "N primers vs one". It is:
+
+```
+standalone wrapped:   sum(per-server primers)  x  1        (per session, and only if called)
+multiproxy router:    one union primer         x  turns    (every turn, called or not)
+```
+
+**Live evidence, this author's fleet, `terse stats --json`, 2026-09-22:**
+
+| entry | state | primer | cadence | source |
+|---|---|--:|---|---|
+| `terse` (router: kb, codegraph, runecho) | `router` | 502 tok | **per-turn** | estimated |
+| `codegraph` standalone | — | 502 tok / 4 emissions | **once/session** | **recorded** |
+| `runecho` standalone | — | 248 tok / 1 emission | **once/session** | **recorded** |
+| `secret-broker` | `wrapped` | 0 tok | once/session (**unpaid**) | recorded |
+
+`secret-broker`'s row is the clearest demonstration of the lazy primer: 62 emissions, all
+`attached: false`, **0 tokens** — its results carry `structuredContent`, so the client would
+have discarded the primer unread and the proxy declined to send it. A standalone wrap of that
+server is free.
+
+### The break-even, stated plainly
+
+A router costs `502 × turns`. The same three servers wrapped standalone cost roughly
+`502 + 248 + kb` **once**. On those figures the router is the cheaper topology only for about
+the first two turns of a session, and is more expensive after that. The live fleet's
+`turns_covered` is **5,419** — the savings cover that many turns of router primer, which is
+comfortable here, but it is a budget being spent every turn rather than once.
+
+**Current guidance, matching `install-mcp --multiproxy --help`:** consolidate for *operational*
+reasons — one policy, one process, one permission surface — **not** to escape a token tax.
+Since #211 the token argument points the other way for small fleets. The six-server
+penalty the old table shows was a property of the eager primer, and that property is gone.
+
+### Which servers to wrap alone, and which to pool — a decision rule from the cadence
+
+The cadence contract above turns into a rule, and the live fleet supplies the decisive
+case for each branch.
+
+**Wrap alone (the default) when any of these is true:**
+
+1. **The server's results carry `structuredContent`.** Its primer is then *free*, not
+   cheap. Measured: `secret-broker` has **62 primer emissions, every one `attached:
+   false`, 0 tokens** — the client would have discarded the primer unread, so the proxy
+   declines to send it. That server compresses at 65.6% over 774 blocks and pays nothing
+   at all for the privilege.
+2. **The server is called rarely, or not every session.** Since #211 an unc­alled wrapped
+   server pays **zero** — the primer attaches to the first compressible result, and no
+   result means no charge. A router charges whether or not any peer is ever called.
+3. **The server is record-shaped and high-volume.** It clears a once-per-session primer
+   almost immediately: `secret-broker` banks 11,959 tokens per block against a primer
+   ceiling of ~502.
+
+**Pool behind a router for operational reasons, not token reasons:** one policy file, one
+process, one permission surface to approve. That is a real benefit and it is why
+`--multiproxy` exists. Accept that it costs **502 tokens every turn** (this fleet's live
+figure) in exchange.
+
+**The anti-pattern, stated plainly: never pool a server that would otherwise pay zero.**
+Folding `secret-broker` behind the router would move it from 0 tokens to a share of a
+recurring per-turn charge, for a server whose results the primer never reaches anyway.
+Before #211 pooling was the way to escape N primers; now it can *create* a charge that
+standalone wrapping avoids entirely.
+
+`terse stats --recommend` prints the verdict per installed entry rather than per peer,
+because a router pays one union primer for its whole fleet — see the `contributors[]`
+note in USAGE.md for why there is no honest per-peer primer to divide by.
+
+### Server suitability by output shape — measured anchors, and what they imply
+
+Everything below is measured in §1, §4 or §6 except where marked **inferred**.
+
+| output shape | measured anchor | terse | verdict |
+|---|---|--:|---|
+| large nested records, repeated subtrees | `directory_tree` (django, 133k tok) | **78.3%** | ideal — wrap it |
+| nested API records | `gh_pulls`, `gh_workflow_runs` | **76–80%** | ideal |
+| small record arrays | `memory/read_graph`, `search_nodes` | **42–44%** | worth it |
+| pretty-printed JSON | `sequentialthinking` | **34.1%** | worth it |
+| already-compact JSON | `serena/get_symbols_overview` | **18.5%** | marginal |
+| already field-projected | `kb.read.get` (live ledger) | **3.3%** | not worth a primer |
+| tiny objects (< ~50 tok) | `everything/get-structured-content` | **0.0%** | below the floor |
+| prose / source text / logs | `git_log`, `read_text_file` | **0.0%** | codec cannot help |
+
+**The rule this gives you:** terse pays where a payload repeats structure — the same keys
+across many records, the same subtree across many rows. It cannot help where there is no
+repetition to fold (prose) or none left (an already-projected result). Payload *size*
+matters too, and independently: §6's small rows land within ~7 points of TOON and
+compressmcp, while the 133k tree puts terse 30 points clear.
+
+### Not yet measured: frontend / UI-focused servers
+
+An open hypothesis, recorded because it is plausible and **untested**: design- and
+browser-tool servers (Figma, Chrome DevTools, Storybook) return deeply nested node trees
+and uniform lists — network-request tables, DOM/accessibility node arrays, style and fill
+objects repeated across hundreds of nodes. That is structurally the same shape as
+`directory_tree`, terse's single best measured result at 78.3%, so these servers **should
+compress well**. That is an **inference from shape, not a measurement**, and no number
+should be quoted for it until it is run.
+
+Status of the obvious candidates, checked 2026-09-22:
+
+- **`figma-developer-mcp` 0.13.2** — needs a Figma API token. Out of scope for this
+  benchmark set, which is credential-free by design.
+- **`chrome-devtools-mcp` 1.9.0** — credential-free (drives a local Chrome), and the
+  strongest candidate to test the hypothesis. Needs a Chromium build, the same dependency
+  that keeps `playwright` out of the 2026-09-22 round.
+- **`storybook-mcp` 0.5.1** — needs a running Storybook instance to point at.
+
+Note the one counter-signal already in the data: `playwright`'s `browser_snapshot` returns
+an accessibility tree as **text**, and scored **0%** one-shot in the 2026-08-04 round. "UI
+server" is not itself a predictor — whether the server hands back JSON or rendered text is.
+
+### What is still unmeasured here
+
+The table above is **pre-#211 and has not been re-run post-#211.** A clean A/B at 1/3/6
+servers on the current lazy-primer build is the missing experiment; `scripts/bench/ab_session.py`
+is the harness and its protocol is in its docstring. Until that runs, the cadence contract and
+the live primer rows above are the evidence, and the percentages in the old table are history.
+Related open work: #270 (a router's `initialize` blocks on its slowest peer) and router-level
+lazy priming, which would remove the per-turn charge entirely.
+
+---
+
 ## Methodology & honesty notes
 
 - Tokenizer is `cl100k_base`; absolute % shift under a different vocabulary but the ranking is
@@ -622,8 +1002,46 @@ a feature that is decisive on one traffic mix can be inert on another.
 - §1 corpus is real, public GitHub API output. §2 is **synthetic and seeded** — illustrative
   of a mechanism, not production-representative; the exact numbers depend on the construction
   (short keys, value cardinality), which is why §2's takeaway is "no crossover," not a constant.
-- Every terse figure is verified lossless per payload. §4's headroom row is the only place a
-  "reduction %" is reported for a tool that achieves it by *discarding* data — flagged inline.
-- Adoption honesty: terse is new (pre-PyPI as of this date); TOON and headroom are far more
-  established. terse's wedge is narrow and specific — *unconditionally lossless, no ML, no
-  egress* — not breadth of adoption.
+- Every terse figure in §1–§4 is verified lossless per payload. §4's headroom and tamp rows,
+  and §5's `codegraph_explore` row, are the only places a "reduction %" is reported for a
+  mechanism that achieves it by *discarding* data — each flagged inline.
+- Adoption honesty: terse has been on PyPI since v0.3.1 (2026-07-18) and is at v0.33.8;
+  TOON, headroom and the other §4 entrants are far more established. terse's wedge is narrow
+  and specific — *unconditionally lossless, no ML, no egress* — not breadth of adoption.
+- **Star counts have been deliberately removed from these docs.** They were a popularity
+  proxy that drifted constantly and never informed a decision about whether terse works.
+  What a project *does*, measured here, is the comparison worth carrying.
+
+### A token reduction is not a proportional cost reduction
+
+This is the most important caveat in this document, and earlier editions did not state it.
+
+Every percentage above is a **token** figure. Billed cost does not move with it one-for-one,
+because context is not billed at one price. Measured 2026-09-22 over this author's own
+Claude Code transcripts — **1,093 sessions, 118,288 messages carrying a `usage` block, last
+30 days** — using Anthropic's published multipliers relative to base input price (fresh
+input 1.00x, 5-minute cache write 1.25x, cache read 0.10x):
+
+| component | raw input tokens | share of raw | billed-equivalent | share of billed |
+|---|--:|--:|--:|--:|
+| fresh input | 125,545,227 | 0.6% | 125,545,227 | 4.7% |
+| cache write | 495,678,913 | 2.5% | 619,598,641 | 23.0% |
+| **cache read** | **19,493,766,658** | **96.9%** | 1,949,376,666 | 72.3% |
+| **total** | **20,114,990,798** | | **2,694,520,534** | |
+
+**96.9% of raw input tokens are cache reads, billed at a tenth of input price. A raw-token
+basis therefore overstates input cost by 7.47x.** Tool results are a large share of what is
+*in* the context — 47.2% of message content by character, in the same window — so terse is
+compressing a real and substantial part of it. But a 59% cut in tool-result tokens is not a
+59% cut in the bill.
+
+Where the saving is real: a smaller result shrinks the prefix that is re-read on every
+subsequent turn, and it delays the point at which the window fills. Both matter. Neither is
+the headline percentage.
+
+This converges with published work reaching the same conclusion from the opposite direction
+— notably *Token Reduction Is Not Cost Reduction* (arXiv:2607.12161), which measured a 38.4%
+cut in delivered tool-output tokens alongside a **6.8% increase** in billed cost. **Citation
+caveat, carried deliberately:** that paper is unreviewed and authored by a cloud-cost
+optimisation vendor. It is cited here as convergent, not as authority; the table above is
+this project's own measurement and does not depend on it.

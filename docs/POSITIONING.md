@@ -2,18 +2,56 @@
 
 terse has never stated this plainly, and a full measurement session showed why it
 needs to: the same codec measures **59.1%** on public GitHub API payloads
-(`BENCHMARKS.md` §1, re-measured 2026-08-04) and **15.1%** on this operator's own
-personal MCP fleet, all-time (`terse stats`, 2,357 blocks, snapshot 2026-08-11 —
-re-run the command for a current figure, this one will drift). Both numbers are
-correct — they are the same tool measured on two different shapes of input. Quoted
-without the shape attached, either one misrepresents what terse does. This doc is
-that attachment.
+(`BENCHMARKS.md` §1, re-measured 2026-09-22 against TOON 4.1.1) and **19.3%** on this
+operator's own personal MCP fleet, all-time (`terse stats`, 4,461 blocks, snapshot
+2026-09-22 — re-run the command for a current figure, this one will drift). Both
+numbers are correct — they are the same tool measured on two different shapes of
+input. Quoted without the shape attached, either one misrepresents what terse does.
+This doc is that attachment.
+
+**Prefer the public number when judging terse.** The 59.1% comes from a corpus anyone
+can re-run (`scripts/bench/benchmark.py`, real GitHub API output committed to the repo);
+the fleet figure comes from private servers nobody else has. The fleet number is kept for
+honesty about a real deployment, not as the claim — and `BENCHMARKS.md` §6 is the
+credential-free public-server equivalent, which is the table to read if you want to know
+what terse will do to servers *you* run.
+
+**Two fleet figures, not one.** All-time blended is **23.3%** (11,676,854 → 8,956,106
+cl100k); strictly-lossless is **19.3%**. The gap is one tool: `codegraph_explore`'s
+opt-in `$text.code_blocks` drop-to-retrieve rule (#139) saves 604,892 tokens — **22.2% of
+all savings from a single lossy row**. terse's wedge is "unconditionally lossless", so
+19.3% is the figure that belongs beside that claim.
+
+*(Previous edition of this paragraph: 15.1%, 2,357 blocks, snapshot 2026-08-11.)*
 
 The personal-fleet figure moves with call composition, not just time: a handful of
 large, multi-block calls routed through the multiproxy fleet dominate the token
 total and pull the blended number up from what a typical single small call sees.
 Re-run `terse stats` on your own ledger rather than trusting this snapshot once
 your fleet's mix has changed (new servers wrapped, a router added, etc.).
+
+## A token saved is not a dollar saved
+
+Every percentage in this document is a **token** figure, and billed cost does not track
+it one-for-one. Measured 2026-09-22 over this operator's own Claude Code transcripts —
+1,093 sessions, 118,288 messages carrying a `usage` block, last 30 days:
+
+| component | raw input | share of raw | billed-equivalent | share of billed |
+|---|--:|--:|--:|--:|
+| fresh input | 125,545,227 | 0.6% | 125,545,227 | 4.7% |
+| cache write (1.25x) | 495,678,913 | 2.5% | 619,598,641 | 23.0% |
+| **cache read (0.10x)** | **19,493,766,658** | **96.9%** | 1,949,376,666 | 72.3% |
+
+**96.9% of raw input tokens are cache reads, billed at a tenth of input price — so a
+raw-token basis overstates input cost by 7.47x.** Tool results are 47.2% of message
+content by character in the same window, so terse is compressing a large part of the
+context; it is not compressing a proportional part of the bill.
+
+What the saving buys, stated honestly: a smaller result shrinks the prefix re-read on
+every later turn, and it pushes back the point where the context window fills. Those are
+the real wins. A 59% codec figure is not a 59% invoice reduction, and this document will
+not imply that it is. See `BENCHMARKS.md` → "Methodology & honesty notes" for the full
+derivation and the prior-art caveat.
 
 ## The economic model, stated once
 
@@ -130,19 +168,32 @@ side of the ledger.
 
 ## Where it does not — pre-projected personal servers
 
-From the live proxy ledger (2,357 blocks, spans 2026-07-15 to 2026-08-11, snapshot
-2026-08-11 — `terse stats`), same codec:
+From the live proxy ledger (**4,461 blocks, spans 2026-07-15 to 2026-09-22, snapshot
+2026-09-22** — `terse stats`), same codec. `saved/block` is tokens saved divided by
+ledger blocks, re-derived this snapshot:
 
-| tool | calls | saved/call | its server's primer | calls to clear it |
+| tool | blocks | raw → out | saved/block | saved % |
 |---|--:|--:|--:|--:|
-| kb.read.list_nodes | 27 | 3,351 | 312 | 0.093 |
-| codegraph_explore | 72 | 2,797 | 312 | 0.112 |
-| secret.list_credentials | 10 | 2,080 | 248 | 0.119 |
-| kb.read.list_principles | 875 | 358 | 312 | 0.872 |
-| kb.read.get | 100 | 67 | 312 | 4.63 |
-| kb.read.search | 251 | 47 | 312 | 6.71 |
-| runecho structure | 229 | 29 | 248 | 8.45 |
-| secret.* proxy ops | 59 | 0 | 248 | never |
+| secret.list_credentials | 103 | 1,879,016 → 647,232 | **11,959** | 65.6% |
+| kb.read.list_nodes | 63 | 2,044,614 → 1,801,313 | 3,862 | 11.9% |
+| kb.read.list_decisions | 8 | 170,975 → 143,780 | 3,399 | 15.9% |
+| codegraph_explore *(lossy)* | 203 | 738,172 → 133,280 | 2,980 | **81.9%** |
+| runecho-mcp structure | 8 | 88,609 → 83,219 | 674 | 6.1% |
+| kb.read.list_principles | 896 | 2,675,293 → 2,274,721 | 447 | 15.0% |
+| searxng search | 140 | 288,853 → 248,824 | 286 | 13.9% |
+| kb.read.recent_sessions | 140 | 426,873 → 392,983 | 242 | 7.9% |
+| kb.read.search | 573 | 557,489 → 484,668 | 127 | 13.1% |
+| kb.read.get | 353 | 579,597 → 560,613 | 54 | 3.3% |
+
+`codegraph_explore` is marked *(lossy)* deliberately — it is the only row here whose
+saving comes from a drop-to-retrieve rule rather than the lossless codec, and at 81.9%
+it would otherwise flatter every aggregate it appears in.
+
+*(The previous edition of this table — 2,357 blocks, snapshot 2026-08-11 — carried a
+"calls to clear its primer" column computed against per-server primers of 248/312. Those
+figures are superseded: the live router now reports a single union primer of **502
+tokens on a per-turn cadence**, which is not comparable to a per-server once-per-session
+charge and must not be divided into a per-call saving. See `BENCHMARKS.md` §7.)*
 
 The primer column is per server, and rule ORDER decides it — not whether a server
 has a drop rule of its own. `codegraph` carries the example policy's only
@@ -154,16 +205,17 @@ from whatever grants its tiers, which is a carve-out rule in the live policy and
 `defaults` in the example policy, where it matches no rule at all. Both the live policy and
 `policy.example.json` produce exactly these values.
 
-Mean 301 tokens saved per call across the whole ledger (710,314 saved / 2,357
-blocks) — roughly two orders of magnitude below the public corpus (23,962), not
-three; that gap narrowed as the fleet's call mix shifted toward bigger calls.
+Mean **610 tokens saved per block** across the whole ledger (2,720,748 saved / 4,461
+blocks) — up from 301 at the previous snapshot, and still one to two orders of magnitude
+below the public corpus (23,962). The gap keeps narrowing as the fleet's call mix shifts
+toward bigger calls.
 
 The relationship between call volume and compression quality used to be uniformly
 inverse here — the more a tool was called, the worse it compressed. That has
-broken for `kb.read.list_principles` specifically: at 875 calls it is now the
+broken for `kb.read.list_principles` specifically: at 896 blocks it is the
 single most-called tool in the ledger, and it no longer compresses worst —
-currently 358 tokens/call, ahead of both `kb.read.get` (67/call, 100 calls) and
-`kb.read.search` (47/call, 251 calls), which remain the pattern's clearest
+currently 447 tokens/block, ahead of both `kb.read.get` (54/block, 353 blocks) and
+`kb.read.search` (127/block, 573 blocks), which remain the pattern's clearest
 holdouts. The live policy's stated reason for `kb` overall — "already
 field-projected + high-cardinality content" — is still true for `kb.read.get` and
 `kb.read.search`; it has not stopped being a real constraint for those two. What
@@ -223,27 +275,36 @@ measure the same way it measures JSON.
 
 ## Future work
 
-Router-level primer economics are resolved (see above, #212, closed as no-op): the
-shared `union_primer` is bounded at ~555 tokens independent of peer count, not a
-scaling liability. Standalone-server primer economics are resolved too (#211,
-lazy primer). There is no open tracker for diff-tier defaults or an mcp-status
-classifier surfacing this trade-off at wrap time — #168 (per-server primer
-gating) and #172 (mcp-status stash-membership classification) are both closed;
-nothing currently open covers either follow-up.
+*Rewritten 2026-09-22. The previous edition cited #249 as "open as of 2026-08-19" and said
+"nothing currently open" covers the primer follow-ups. #249 has since closed, and its
+follow-up is open — the section had become a snapshot of a roadmap that had moved.*
 
-**This entire doc assumes the primer is paid, only asking whether it's worth
-paying.** #249 (open as of 2026-08-19) is testing a prior question — whether a
-capable model needs the primer at all to read terse's wire form. Early results
-are model-dependent (helps some, hurts one measured so far, no measured effect
-on the strongest tested — Opus 5, but at a single trial, unconfirmed, the same
-caveat carried by every other single-trial read in this thread), not a clean
-"drop it" — so no number on this page should be treated as obsolete yet. Two
-outcomes would move it: if #249 lands on `--primer=auto|never`, the 248/312/555
-arithmetic above becomes a legacy-mode footnote for whichever models still need
-it; if it instead lands on "keep the primer but shrink it" (the issue's other
-pre-registered branch — 155 of the 248 baseline tokens are one paragraph), those
-same numbers move downward without disappearing. Revisit this doc once that
-issue closes, under either outcome.
+**What is settled.** Standalone-server primer economics (#211, lazy primer: attached once
+per session, to the first result carrying a terse wire form, and not at all if none comes).
+`summarize` and every model-in-the-loop tier are **closed permanently** (#261) — terse is
+deterministic-only by decision, not by sequencing, and no amount of demand reopens it.
+
+**What is open, and what would move the numbers on this page:**
+
+- **#325 — `--primer=auto|always|never`, keyed on payload shape rather than model.** The
+  live follow-up to #249. If it lands, the primer arithmetic on this page becomes a
+  legacy-mode footnote for whichever payloads still need the explanation.
+- **#270 — a multiproxy router's `initialize` blocks on its slowest peer**, so a fast first
+  request races MCP registration and voids the prompt cache. Router-level *lazy* priming
+  remains unbuilt, which is why `BENCHMARKS.md` §7 shows the router paying **502 tokens
+  every turn** while a standalone entry pays once per session. #212 closed as a no-op on a
+  different question (union-primer size vs peer count); it did not resolve the cadence.
+- **#252 — auto-tune drop rules from the observed retrieve rate.** The deterministic
+  ceiling-raiser, and the general form of the per-tool drop-rule work in #271 and #273.
+- **#295 / #403 / #412 — what a compression verdict MEANS.** The codec-verdict apparatus
+  (SAFE/UNSAFE/UNRESOLVED per tool and shape, never a global percentage) is built and has
+  produced both verdicts; #412 is the open question of whether its compliance gate is
+  stable enough across runs for its number to be quoted as a property of a model.
+- **#298 — the niche is crowded.** The "only directly-comparable tool" framing is gone
+  (see `BENCHMARKS.md` §4, where three competitors are now measured rather than cited).
+
+**What this page still assumes.** That the primer is paid, and only asks whether it is
+worth paying. #325 is the issue that would change the question rather than the arithmetic.
 
 ## Related
 
