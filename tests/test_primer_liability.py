@@ -2501,3 +2501,53 @@ def test_a_real_scan_of_a_real_config_drives_the_collision_end_to_end(tmp_path):
     # zz must NOT read the `python` rows as its own — kb writes them too.
     assert served["zz"]["break_even_verdict"] == "ambiguous ledger label"
     assert served["zz"]["blocks"] is None
+
+
+def test_the_break_even_is_taken_on_the_CONTEXT_basis_not_the_wire(tmp_path):
+    """#420: a result carrying `structuredContent` reaches a mirror-discarding client as the
+    typed field alone, so its text-block saving never lands in context. Driven through the
+    real `aggregate`, not `_agg`, because the defect was the aggregate handing the wire sum
+    to a break-even whose primer is paid in context — `turns_covered` credited ~1.9x."""
+    from terse.stats import aggregate, build_record
+
+    pol = _policy(tmp_path)
+    text_raw = json.dumps([{"id": i, "name": f"node-{i}"} for i in range(40)])
+    typed = json.dumps({"rows": [{"id": i} for i in range(40)]})
+    typed_out = '{"__terse_table__":1,"n":40,"cols":["id"],"rows":[[0]]}'
+    # Typed-field row: the text block shrinks a lot on the wire, the typed field a little.
+    with_typed = build_record("kb", "kb.read.list", text_raw, "[]", False, None,
+                              typed, typed_out)
+    # Plain row: no typed field, so the text block IS the context and both bases agree.
+    plain = build_record("kb", "kb.read.list", text_raw, "[]", False)
+    agg = aggregate([with_typed, plain])
+
+    wire = agg["total"]["raw_tokens"] - agg["total"]["out_tokens"]
+    ctx_typed = with_typed["structured_tokens"] - with_typed["structured_out_tokens"]
+    ctx_plain = plain["raw_tokens"] - plain["out_tokens"]
+    assert agg["total"]["context_raw_tokens"] - agg["total"]["context_out_tokens"] \
+        == ctx_typed + ctx_plain
+    assert ctx_typed + ctx_plain < wire             # the fixture can tell the bases apart
+
+    liab = primer_liability([_scan("terse", "router", "kb", pol)], agg)
+    assert liab["saved_tokens"] == ctx_typed + ctx_plain
+    assert liab["wire_saved_tokens"] == wire
+    assert liab["turns_covered"] == (ctx_typed + ctx_plain) / liab["per_turn_tokens"]
+    srv = liab["servers"][0]
+    assert srv["saved_per_block"] == (ctx_typed + ctx_plain) / 2
+
+
+def test_an_untouched_typed_field_does_not_flip_a_paying_server_to_UNWRAP(tmp_path):
+    """Review of #420, reproduced: 30 results whose text block compressed and whose typed
+    field was left alone (`"leave"`). On the first cut of the fix the saving read 0, the
+    break-even `never`, and the verdict UNWRAP — for a text-reading client that is exactly
+    backwards. An untouched field proves nothing about the client, so it stays on the wire."""
+    from terse.stats import aggregate, build_record
+
+    pol = _policy(tmp_path)
+    text_raw = json.dumps([{"id": i, "name": f"node-{i}"} for i in range(40)])
+    typed = json.dumps({"rows": [{"id": i} for i in range(40)]})
+    recs = [build_record("kb", "kb.read.list", text_raw, "[]", False, None, typed, typed)
+            for _ in range(30)]
+    liab = primer_liability([_scan("terse", "router", "kb", pol)], aggregate(recs))
+    assert liab["saved_tokens"] == liab["wire_saved_tokens"] > 0
+    assert liab["servers"][0]["break_even_verdict"] != "never"

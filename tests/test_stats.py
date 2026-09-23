@@ -439,3 +439,45 @@ def test_version_section_warns_when_the_table_is_partial():
     text = "\n".join(build_version_section(agg))
     assert "0.2.0" in text
     assert "predate the version field" in text
+
+
+def test_context_basis_is_the_typed_field_alone_when_one_rode_along():
+    # #420: wire = text + typed field; context = what a mirror-discarding client reads.
+    original = json.dumps({"rows": [{"id": i} for i in range(20)]}, separators=(",", ":"))
+    compressed = '{"__terse_table__":1,"n":20,"cols":["id"],"rows":[[0]]}'
+    rec = build_record("s", "records", RAW, "{}", False, None, original, compressed)
+    assert stats_mod.context_tokens(rec, rec["raw_tokens"], rec["out_tokens"]) == (
+        rec["structured_tokens"], rec["structured_out_tokens"])
+    # No typed field: the text block IS the context, so the two bases are identical.
+    plain = build_record("s", "records", RAW, "{}", False)
+    assert stats_mod.context_tokens(plain, plain["raw_tokens"], plain["out_tokens"]) == (
+        plain["raw_tokens"], plain["out_tokens"])
+    # A pre-split record carries only the raw side and could not have been rewritten, so it
+    # proves nothing about the client and stays on the wire basis.
+    legacy = {"structured_tokens": 7}
+    assert stats_mod.context_tokens(legacy, 50, 40) == (50, 40)
+
+
+def test_an_untouched_typed_field_stays_on_the_wire_basis():
+    # Review of #420: `"leave"` (every client but claude-code under `"auto"`) records the typed
+    # field untouched, and those clients may read the TEXT block. Zeroing their saving made
+    # `saved_per_block` read `never` and the verdict UNWRAP a server paying for itself.
+    dup = json.dumps({"rows": [{"id": i} for i in range(20)]}, separators=(",", ":"))
+    rec = build_record("s", "records", RAW, "{}", False, None, dup, dup)
+    assert rec["structured_tokens"] == rec["structured_out_tokens"] > 0
+    assert stats_mod.context_tokens(rec, rec["raw_tokens"], rec["out_tokens"]) == (
+        rec["raw_tokens"], rec["out_tokens"])
+
+
+def test_the_report_prints_both_bases_only_when_they_differ():
+    original = json.dumps({"rows": [{"id": i} for i in range(20)]}, separators=(",", ":"))
+    compressed = '{"__terse_table__":1,"n":20,"cols":["id"],"rows":[[0]]}'
+    typed = build_record("s", "records", RAW, "{}", False, None, original, compressed)
+    plain = build_record("s", "records", RAW, "{}", False)
+    text = build_stats_report(aggregate([typed, plain]), log_path="l")
+    ctx_raw = typed["structured_tokens"] + plain["raw_tokens"]
+    ctx_out = typed["structured_out_tokens"] + plain["out_tokens"]
+    # The NUMBERS, not just the label: a `context:` line printing the wire sums survived
+    # the first version of this test.
+    assert f"context:        {ctx_raw:,} -> {ctx_out:,}   saved {ctx_raw - ctx_out:,}" in text
+    assert "context:" not in build_stats_report(aggregate([plain]), log_path="l")

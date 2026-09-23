@@ -13,7 +13,27 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **The primer break-even is taken on what the model receives, not what crossed the pipe
+  (#420).** A result carrying `structuredContent` reaches a client that drops the text
+  mirror (claude-code) as the typed field alone, but `terse stats` credited the whole
+  wire saving — text block included — against a primer charged in context. On the live
+  ledger `turns_covered` read ~5,400 where the context basis gives ~2,950, and
+  `saved_per_block` / `blocks_to_break_even` inherited the same inflation. The ledger does
+  not record the client, so only a row whose typed field terse REWROTE (which proves a
+  mirror-dropping client) moves to the context basis; an untouched typed field stays on the
+  wire, because zeroing it would read `never` and UNWRAP a server that a text-reading client
+  is paying for.
+
+### Changed
+
+- **`terse stats --json`:** `total` and each tool row gain `context_raw_tokens` /
+  `context_out_tokens`; `primer_liability.saved_tokens` is now the context-basis saving,
+  and the wire figure it used to carry is `primer_liability.wire_saved_tokens`. The same
+  basis change reaches `primer_liability.servers[].saved_per_block` and
+  `contributors[].saved_tokens`. The text report prints a `context:` line under the token
+  line whenever the two bases differ, and labels the break-even section's basis.
 
 ## [0.34.1] - 2026-09-23
 
