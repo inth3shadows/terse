@@ -21,8 +21,8 @@ fails that pull request until the section has moved.
   timing (two separate captures read as 1 result), and the identity note told every
   hand-built corpus to "re-capture", which could never add the id. `terse capture` now
   stamps `manual:<file stem>` (`capture_payload(manual=True)`) — the stem, not the sha
-  alone, so `kb.search` and `search --server kb` stay two results. An existing envelope
-  keeps its first sighting's identity: an old hand capture and a pre-#148 proxy block are
+  alone, so `kb.search` and `search --server kb` stay two results. An existing timed
+  envelope keeps its first sighting's identity: an old hand capture and a pre-#148 proxy block are
   identical on disk, and re-homing the proxy one would split a real result. The note's
   remedy now says what works: "Re-capture into a fresh corpus".
 - **`terse tune` says what a legacy sample costs, not just its share (#380).** Under the

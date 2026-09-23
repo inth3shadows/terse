@@ -202,7 +202,6 @@ def _sha8(raw: str) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
 
 
-
 # Retention cap, PER TOOL rather than over the whole corpus. Every consumer of this
 # corpus — measure, probes, policy generate/autotune — reasons per tool, so a global
 # byte cap (the shape stats.py and history.py use) would let one chatty tool evict the
@@ -242,8 +241,11 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
     format is additive — a corpus captured before they existed stays loadable, and every
     consumer treats their absence as "unknown", never as a value (#148, #152).
 
-    `manual` marks a hand capture (`terse capture`): the payload is one whole result, so a
-    NEW envelope gets its own id, `manual:<file stem>` (an existing one keeps its own). Without one, a hand capture was indistinguishable
+    `manual` marks a hand capture (`terse capture`): the payload is one whole result, so it
+    gets its own id, `manual:<file stem>` — unless an existing TIMED envelope is being
+    rewritten, which keeps its first sighting's id or its absence (an untimed or unreadable
+    prior was never a first sighting, as for a proxy id). Mutually exclusive with
+    `result_id`. Without it, a hand capture was indistinguishable
     from a pre-#148 proxy envelope (`captured_at`, no id): consecutive hand captures were
     grouped by TIMING into one guessed result, and the identity note told the operator to
     re-capture a corpus no re-capture could fix (#380). Keyed by the file stem — tool
@@ -255,6 +257,8 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
     deliberate one-shot `terse capture` run building a fixed corpus, not for a proxy
     capturing a live session indefinitely.
     """
+    if manual and result_id is not None:
+        raise ValueError("capture_payload: `manual` and `result_id` are mutually exclusive")
     corpus = Path(corpus_dir)
     mkdir_restricted(corpus)
     sha = _sha8(raw)

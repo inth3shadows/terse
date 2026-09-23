@@ -1416,13 +1416,25 @@ def test_a_hand_capture_never_re_homes_a_legacy_proxy_block(tmp_path):
 
     corpus = tmp_path / "c"
     raws = [json.dumps([{"id": i, "team": "platform-infra"}]) for i in range(3)]
-    for raw in raws:                                   # one legacy proxy result, 3 blocks
-        capture_payload("search", raw, corpus, server="kb")
+    for i, raw in enumerate(raws):                     # one legacy proxy result, 3 blocks
+        path = capture_payload("search", raw, corpus, server="kb")
+        # Pinned 1 ms apart, not left to the wall clock: a slow runner writing >50 ms apart
+        # would split the legacy result by itself and fail this test for no reason.
+        path.write_text(json.dumps(json.loads(path.read_text()) | {"captured_at": 10**9 + i
+                                                                   * 10**6}))
     assert main(["capture", str(_write(tmp_path, "b.json", raws[1])), "--tool", "search",
                  "--server", "kb", "--corpus", str(corpus)]) == 0
     envs = load_corpus(corpus)
     assert [len(g) for g in group_results(envs)["kb.search"]] == [3]
     assert heuristic_share(envs) == (3, 3)
+
+
+def test_manual_and_an_explicit_result_id_cannot_both_be_given(tmp_path):
+    """`manual` would silently replace the caller's id, splitting whatever result it named."""
+    from terse.capture import capture_payload
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        capture_payload("t", "[1]", tmp_path / "c", result_id="s:1.2", manual=True)
 
 
 def test_the_legacy_note_names_a_remedy_that_works():

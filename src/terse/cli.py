@@ -344,8 +344,9 @@ def _print_corpus_identity_note(envelopes: list, out=None) -> None:
     * without a server, a rule is authored under the bare tool name, and a bare rule sits
       dead behind any deployed server-scoped glob.
 
-    Silent on a fully-identified corpus, which is the steady state after a re-capture into a fresh corpus — the
-    remedy in both cases, since neither field can be recovered after the fact.
+    Silent on a fully-identified corpus, which is the steady state after a re-capture into
+    a fresh corpus — the remedy in both cases, since neither field can be recovered after
+    the fact.
     """
     from .policy_gen import heuristic_share
 
@@ -369,8 +370,9 @@ def tune_sample_provenance(envelopes: list) -> tuple[int, int, int]:
     `tune` prints its payload COUNT, and the count is not the sample. A `result_id` dates
     an envelope: its absence marks a capture from before `#116` folded a multi-block
     result into one envelope (a hand capture's `manual:` id says instead that the payload
-    was captured whole, so it was never a fragment either), and modern captures fold to a record list 14x more often
-    than the fossils do (#374: 25.0% vs 1.8% `array-of-records`). And a record list is
+    was captured whole, so it was never a fragment either), and modern captures fold to a
+    record list 14x more often than the fossils do (#374: 25.0% vs 1.8%
+    `array-of-records`). And a record list is
     the shape `--drop-eval` can ask a question over (`_questions_and_staging`), so a
     `~34% tok` figure over a sample that is 4% record lists came from fragments of the
     field, not from the responses the field appears in. Neither share is a verdict; both
