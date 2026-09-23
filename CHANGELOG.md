@@ -20,8 +20,9 @@ fails that pull request until the section has moved.
   "20 zero-failure trials", although SAFE rests on the same one-run rate — the cell that
   read 29% read 100% on the next two runs. The SAFE "why" now adds
   "tool-call compliance raw X%, terse Y% in this run — not measured across runs": the
-  LOWEST passing rate per arm across the cell's models (named when there are several),
-  never rounded up to 100%, and only when every row carries the counters.
+  LOWEST passing rate per arm across the cell's models (naming the model(s) at it unless
+  all share it), never rounded up to 100%, and only when every model's rows all carry the
+  counters — a partly counted model withholds the rate rather than dropping out of it.
 
 - **A `folded-and-live` peer whose live duplicate runs its own proxy now reports that
   proxy's primer cost (#396).** The router's union primer covers the folded route, but the

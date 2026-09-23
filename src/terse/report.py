@@ -2004,16 +2004,25 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
             # clear the floor, so the weakest is the one that let the cell through. Reading
             # the tie-break model alone printed 100% or 80% for the same evidence depending
             # on which model name sorted first (review of #432).
-            lowest: dict[str, tuple[float, str]] = {}
-            for model, (_, g) in verdicts.items():
-                for arm, rate in _codec_call_rates(g.rows):
-                    if arm not in lowest or rate < lowest[arm][0]:
-                        lowest[arm] = (rate, model)
+            # An arm is quoted only when EVERY model has a full reading for it: a model with
+            # uncounted rows passed the gate on a partial rate (or none), and dropping just
+            # that model would quote a better-measured one's 100% for the cell (review 2).
+            rates_by_model = {m: dict(_codec_call_rates(g.rows)) for m, (_, g) in verdicts.items()}
+            # Every model AT the lowest rate is named, so a tie does not single one out by
+            # sort order; a rate every model shares names nobody (review 2 of #432).
+            lowest: dict[str, tuple[float, list[str]]] = {}
+            for arm in ("raw", "terse"):
+                if all(arm in rates for rates in rates_by_model.values()):
+                    low = min(rates[arm] for rates in rates_by_model.values())
+                    lowest[arm] = (low, [m for m, rates in rates_by_model.items()
+                                         if rates[arm] == low])
             if lowest:
-                many = len(verdicts) > 1
-                shown = ", ".join(
-                    f"{arm} {_codec_rate_text(rate)}" + (f" (`{m}`)" if many else "")
-                    for arm, (rate, m) in lowest.items())
+                def _who(ms: list[str]) -> str:
+                    if len(ms) == len(verdicts):
+                        return ""
+                    return " (" + ", ".join(f"`{m}`" for m in ms) + ")"
+                shown = ", ".join(f"{arm} {_codec_rate_text(rate)}{_who(ms)}"
+                                  for arm, (rate, ms) in lowest.items())
                 why += (f"; tool-call compliance {shown} in this run — not measured across "
                         f"runs")
         out.append(f"| `{tool}` | {shape} | {questions} | {n_col} | **{worst_verdict}** | "
