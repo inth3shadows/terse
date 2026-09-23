@@ -13,7 +13,61 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **The primer break-even divided a WIRE saving by a primer charged in CONTEXT, crediting
+  every entry with roughly twice the runway it has (#420).** `build_record` folds the text
+  block and the typed field into one figure — a deliberate wire basis, and #141 fixed the
+  opposite bug — but terse also documents that a `structuredContent`-reading client
+  discards the mirror block (`policy.py`: raw 2,596 chars in context -> `"compress"` 1,008
+  -> `"replace"` 1,008, no change). So `"replace"` saves stdio bytes and nothing at all off
+  the model's context, while the primer it is measured against is charged in context, every
+  turn.
+
+  Measured over the live ledger (4,479 tokenized rows):
+
+  ```
+  WIRE     11,753,342 -> 9,012,368   saved 2,740,974   23.3%
+  CONTEXT   6,385,440 -> 4,961,826   saved 1,423,614   22.3%
+  ```
+
+  The percentage survives — terse compresses both halves at similar rates, so no published
+  ratio is retracted. The absolutes do not: raw is inflated **1.84x** and the saving
+  **1.93x**. `turns_covered` read **5,460** where the context basis says **2,836**, and
+  `saved_per_block` / `blocks_to_break_even` / `break_even_coverage` carried the same
+  inflation into every KEEP/UNWRAP verdict.
+
+  `aggregate` now carries both bases over exactly the same record set, break-even uses the
+  context one, and the report names which basis it is quoting. **No new ledger field** —
+  `structured_tokens` / `structured_out_tokens` were recorded by #134/#141 precisely so the
+  split is recoverable, which also means every record already on disk is repaired at read
+  time.
+
+  **What this assumes, because it is load-bearing for about a third of the ledger.** A
+  record says a typed field was present; it never says which client read it. Of 4,479 rows,
+  2,275 carry no typed field (the block IS the context, unambiguous) and 825 had the field
+  compressed, which only a `STRUCTURED_SAFE_CLIENTS` client gets (unambiguous). The
+  remaining 1,388 are unknowable in both directions: `auto` resolves to `"leave"` for a
+  non-safe client, an explicit `"leave"` rule is indistinguishable, and `compress` on an
+  already-compact field also leaves the size unchanged. Reading every one of them the other
+  way moves the ledger-wide saving to 1,470,859 and `turns_covered` to 2,930 — **a 3.3%
+  band**, three orders of magnitude clear of the 1.0 break-even threshold. The typed-only
+  reading is published and the band is stated; a range was rejected as doubling the surface
+  of every figure for an uncertainty that changes no verdict.
+
+  **`--json` consumers:** `total` and each `tools[]` row gain `ctx_raw_tokens` /
+  `ctx_out_tokens`; `primer_liability` gains `wire_saved_tokens`. **`saved_tokens` is
+  REDEFINED** to the context basis, because it is the numerator of `turns_covered` whose
+  denominator is charged in context — a consumer will see it roughly halve on a fleet whose
+  results carry `structuredContent`, and that drop is the correction, exactly as
+  `per_turn_tokens`' drop was in the #211 follow-up. The wire figure is published beside it,
+  never lost. An aggregate from an older terse carries no `ctx_*` key and falls back to the
+  wire pair rather than to zero — the two bases agree for a record with no typed field,
+  which is what every pre-#134 ledger is made of.
+
+  **Verdict flips on the live fleet: none.** `terse` reads `break_even_coverage` 2,840 on
+  the wire basis and 1,739 on the context basis, both far clear of 1.0; `secret-broker` is
+  `once/session (unpaid)` and has no coverage figure at all.
 
 ## [0.34.1] - 2026-09-23
 
