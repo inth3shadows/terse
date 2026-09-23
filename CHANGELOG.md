@@ -44,19 +44,39 @@ fails that pull request until the section has moved.
   time.
 
   **What this assumes, because it is load-bearing for about a third of the ledger.** A
-  record says a typed field was present; it never says which client read it. Of 4,479 rows,
-  2,275 carry no typed field (the block IS the context, unambiguous) and 825 had the field
-  compressed, which only a `STRUCTURED_SAFE_CLIENTS` client gets (unambiguous). The
-  remaining 1,388 are unknowable in both directions: `auto` resolves to `"leave"` for a
-  non-safe client, an explicit `"leave"` rule is indistinguishable, and `compress` on an
-  already-compact field also leaves the size unchanged. Reading every one of them the other
-  way moves the ledger-wide saving to 1,470,859 and `turns_covered` to 2,930 — **a 3.3%
-  band**, three orders of magnitude clear of the 1.0 break-even threshold. The typed-only
-  reading is published and the band is stated; a range was rejected as doubling the surface
-  of every figure for an uncertainty that changes no verdict.
+  record says a typed field was present; it never says which client read it. Of 4,479 rows
+  (2026-09-23): **2,266** carry no typed field, **825** had the field rewritten, **1,388**
+  carry one left untouched. Only the first group is unambiguous — the block IS the context.
+  A rewritten field is a property of the POLICY, not of the client: `structured_mode_for_client`
+  gates only `"auto"` on `STRUCTURED_SAFE_CLIENTS`, so an explicit `"compress"`/`"replace"`
+  rule is honoured for any client. It implies a safe client on this fleet only because all
+  nine rules resolve through `auto`.
+
+  Reading the 1,388 the other way moves the ledger-wide saving to 1,470,859 and
+  `turns_covered` to 2,930 — **a 3.3% band**, three orders of magnitude clear of the 1.0
+  threshold. On a fleet whose rules name `"compress"` explicitly the middle group stops
+  being evidence too, and the band widens to the whole distance back to wire (92.5%); the
+  conclusion survives there but the argument does not, so the 3.3% is a fact about this
+  fleet and not about the method. The typed-only reading is published and the band stated;
+  a range was rejected as doubling the surface of every figure for an uncertainty that
+  changes no verdict here.
+
+  A multi-block result attributes its typed field to block 0 only, so blocks 1..N-1 sit in
+  the first group above and have their text counted as context the client discarded. Live
+  magnitude 3 rows / 39 raw tokens; structural, filed as #437. `terse.retrieve` round-trips
+  are a context COST that `saved_tokens` does not net — 10.2% of the context saving against
+  5.3% of the wire one, which is why the redefinition raises it: #438.
 
   **`--json` consumers:** `total` and each `tools[]` row gain `ctx_raw_tokens` /
-  `ctx_out_tokens`; `primer_liability` gains `wire_saved_tokens`. **`saved_tokens` is
+  `ctx_out_tokens`; `primer_liability` gains `wire_saved_tokens` and `saved_basis`
+  (`"context"`, or `"wire"` when the aggregate predates this change and could not supply
+  the context figure — there every saving in the document is on the inflated basis, said
+  rather than left to look measured, the same discipline `primer_source` keeps). Also on
+  the context basis now, and named here because they change silently otherwise:
+  `servers[].saved_per_block`, `servers[].blocks_to_break_even`,
+  `servers[].break_even_coverage`, and `contributors[].saved_tokens` /
+  `contributors[].saved_per_block` — the last two feed the `--recommend` pooled ranking,
+  which also gains a basis line since that screen replaces the ledger tables entirely. **`saved_tokens` is
   REDEFINED** to the context basis, because it is the numerator of `turns_covered` whose
   denominator is charged in context — a consumer will see it roughly halve on a fleet whose
   results carry `structuredContent`, and that drop is the correction, exactly as

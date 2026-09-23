@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from terse.stats import _context_tokens, aggregate, primer_liability
 
+_ABSENT = object()
+
 
 def _rec(server="kb", raw=100, out=40, structured=None, structured_out=None, **kw):
     """One ledger record. `structured*` are the recoverable typed-field split (#134/#141);
@@ -24,8 +26,13 @@ def _rec(server="kb", raw=100, out=40, structured=None, structured_out=None, **k
          "raw_chars": raw, "out_chars": out, "raw_tokens": raw, "out_tokens": out}
     if structured is not None:
         r["structured_tokens"] = structured
-        r["structured_out_tokens"] = (structured if structured_out is None
-                                      else structured_out)
+        # Only when asked. Writing it unconditionally is what made the legacy-record test
+        # below unable to fail: `structured_out_tokens` was always present, so the
+        # `else st` fallback it claimed to cover was never reached, and mutating that
+        # fallback to `0` left the whole suite green (review of PR #435).
+        if structured_out is not _ABSENT:
+            r["structured_out_tokens"] = (structured if structured_out is None
+                                          else structured_out)
     r.update(kw)
     return r
 
@@ -48,9 +55,24 @@ def test_a_typed_field_is_the_whole_context_payload():
 
 def test_an_untouched_typed_field_lands_the_same_size_on_both_sides():
     """`structured_out` defaults to `structured` in `build_record` for a field terse left
-    alone, and for every record written before the split existed. Reading only one of the
-    two would report a saving on a field nothing touched."""
+    alone. Reading only one of the two would report a saving on a field nothing touched."""
     assert _context_tokens(_rec(structured=30), 100, 40) == (30, 30)
+
+
+def test_a_record_predating_the_out_side_split_reads_one_value_on_both_sides():
+    """The legacy branch, and it needs its own test because the helper above always writes
+    BOTH keys — which is why mutating `else st` to `else 0` once left all 2,370 tests green
+    (review of PR #435). 27 rows of the live ledger carry `structured_tokens` with no
+    `structured_out_tokens`; reading the missing side as 0 would report a 100% context
+    saving on a field nothing touched, which is the inflation #420 exists to remove."""
+    legacy = _rec(structured=30, structured_out=_ABSENT)
+    assert "structured_out_tokens" not in legacy
+    assert _context_tokens(legacy, 100, 40) == (30, 30)
+    # A present-but-unreadable out side takes the same fallback, never a fabricated zero.
+    assert _context_tokens({"structured_tokens": 30, "structured_out_tokens": None},
+                           100, 40) == (30, 30)
+    assert _context_tokens({"structured_tokens": 30, "structured_out_tokens": "12"},
+                           100, 40) == (30, 30)
 
 
 def test_an_untokenized_typed_field_falls_back_rather_than_claiming_zero():
@@ -144,9 +166,135 @@ def test_the_report_names_the_basis_and_publishes_the_wire_figure(tmp_path):
                      for _ in range(20)])
     text = "\n".join(build_primer_section(primer_liability(scan, agg)))
 
-    assert "basis: CONTEXT (what the model received)" in text
-    assert "12,000 tok left the stdio pipe" in text       # the wire figure, named as wire
+    assert "the figures above and the saved/block column below are CONTEXT tokens" in text
+    assert "12,000 tok left the stdio" in text            # the wire figure, named as wire
     assert "3,600 tok of CONTEXT saved" in text
+    # Said BELOW the figures it labels, including the break-even table's saved/block column
+    # — an earlier draft's comment claimed "every figure above" while printing first.
+    assert text.index("3,600 tok of CONTEXT saved") < text.index("are CONTEXT tokens")
+
+
+def test_an_uncalled_entry_never_prints_the_wire_figure_alone(tmp_path):
+    """Review of PR #435. The basis line was gated on the two bases DIFFERING, but the
+    context figure only renders inside the turns/session blocks — both None for an entry
+    that was never called. So the section printed `… 12,000 tok left the stdio pipe` and
+    the context saving appeared nowhere, under a header announcing the context basis. An
+    operator reads the wire number as the context one: #141's confusion, re-created."""
+    import json
+
+    from terse.stats import build_primer_section
+    pol = tmp_path / "p.json"
+    pol.write_text(json.dumps({"version": 1,
+                               "policies": [{"match": {"tool": "kb.*"},
+                                             "tiers": ["minify", "tabularize"]}]}),
+                   encoding="utf-8")
+    # Wrapped, with typed fields in the ledger under a label this entry does NOT own, so
+    # both ratios are None.
+    scan = [{"server": "kb", "state": "wrapped", "wraps": "other-server", "scope": "user",
+             "policy": str(pol)}]
+    agg = aggregate([_rec(server="zzz", raw=1000, out=400, structured=300,
+                          structured_out=120) for _ in range(20)])
+    liab = primer_liability(scan, agg)
+    text = "\n".join(build_primer_section(liab))
+
+    assert liab["turns_covered"] is None and liab["session_covered"] is None
+    assert "CONTEXT tokens" not in text
+    assert "left the stdio" not in text
+
+
+def test_the_verdict_screen_names_the_basis_too(tmp_path):
+    """`--recommend` REPLACES the ledger tables, so the line `build_primer_section` adds
+    never reaches it — and that is the screen USAGE documents as the one an operator reads
+    for the verdict. Its `coverage` column moved 2,840 -> 1,739 on the live fleet with
+    nothing on screen saying why (review of PR #435)."""
+    import json
+
+    from terse.stats import build_recommend_report
+    pol = tmp_path / "p.json"
+    pol.write_text(json.dumps({"version": 1,
+                               "policies": [{"match": {"tool": "kb.*"},
+                                             "tiers": ["minify", "tabularize"]}]}),
+                   encoding="utf-8")
+    scan = [{"server": "terse", "state": "router", "wraps": "kb", "scope": "user",
+             "policy": str(pol)}]
+    agg = aggregate([_rec(raw=1000, out=400, structured=300, structured_out=120)
+                     for _ in range(20)])
+    out = build_recommend_report(agg, log_path="x.jsonl",
+                                 liability=primer_liability(scan, agg))
+    assert "are CONTEXT tokens" in out
+    assert "wire saving (#420)" in out
+
+
+def test_a_legacy_aggregate_says_its_saving_is_on_the_WIRE_basis(tmp_path):
+    """Review of PR #435. The fallback to the wire pair is right — zero would publish "this
+    server saved nothing" — but it is not silently equivalent, and an earlier comment said
+    it was. The realistic legacy shape is a PRE-#420 aggregate over a POST-#134 ledger: no
+    `ctx_*` keys, plenty of typed fields, and the two bases differ by the full inflation
+    (3.33x on this fixture). So the row says which basis it is on, the same discipline
+    `primer_source` keeps for the primer half."""
+    import json
+    pol = tmp_path / "p.json"
+    pol.write_text(json.dumps({"version": 1,
+                               "policies": [{"match": {"tool": "kb.*"},
+                                             "tiers": ["minify", "tabularize"]}]}),
+                   encoding="utf-8")
+    scan = [{"server": "terse", "state": "router", "wraps": "kb", "scope": "user",
+             "policy": str(pol)}]
+    recs = [_rec(raw=1000, out=400, structured=300, structured_out=120) for _ in range(20)]
+
+    modern = primer_liability(scan, aggregate(recs))
+    assert modern["saved_basis"] == "context"
+    assert modern["saved_tokens"] == 3_600
+
+    legacy = aggregate(recs)
+    legacy["total"] = {k: v for k, v in legacy["total"].items() if not k.startswith("ctx_")}
+    legacy["tools"] = [{k: v for k, v in r.items() if not k.startswith("ctx_")}
+                       for r in legacy["tools"]]
+    blob = primer_liability(scan, legacy)
+    assert blob["saved_basis"] == "wire"          # says so rather than looking measured
+    assert blob["saved_tokens"] == 12_000         # ...and falls back, never to zero
+
+
+def test_every_saving_figure_in_the_section_names_its_basis(tmp_path):
+    """Review of PR #435. Three of the four `saved` render sites were relabelled and the
+    fourth — the one-time NET NEGATIVE branch — was missed. That is the single sentence in
+    this report designed to stop an operator, and it was the only saving figure left with
+    no basis on it.
+
+    Driven through the renderer rather than asserted per line, so a fifth site added later
+    fails here without anyone remembering to update a list."""
+    import json
+    import re
+
+    from terse.stats import build_primer_section
+    pol = tmp_path / "p.json"
+    pol.write_text(json.dumps({"version": 1,
+                               "policies": [{"match": {"tool": "kb.*"},
+                                             "tiers": ["minify", "tabularize"]}]}),
+                   encoding="utf-8")
+    # A lazy standalone whose one record saves far less than its one-time primer.
+    scan = [{"server": "kb", "state": "wrapped", "wraps": "kb", "scope": "user",
+             "policy": str(pol)}]
+    agg = aggregate([_rec(server="kb", raw=100, out=60, structured=30, structured_out=20)])
+    liab = primer_liability(scan, agg)
+    text = "\n".join(build_primer_section(liab))
+
+    assert liab["session_covered"] is not None and liab["session_covered"] < 1
+    assert "NET NEGATIVE" in text
+
+    # ...and the ROUTER's net-negative branch, which is a different line in a different
+    # block. Both have to be driven or half the vocabulary stays unmeasured.
+    router = [{"server": "terse", "state": "router", "wraps": "kb", "scope": "user",
+               "policy": str(pol)}]
+    r_liab = primer_liability(router, agg)
+    r_text = "\n".join(build_primer_section(r_liab))
+    assert r_liab["turns_covered"] is not None and r_liab["turns_covered"] < 1
+    assert "NET NEGATIVE" in r_text
+
+    # Every "N tok saved"/"N tok covers" figure in either rendering carries the basis word.
+    bare = [ln for ln in (text + "\n" + r_text).split("\n")
+            if re.search(r"\d[\d,]* tok (saved|covers)", ln) and "CONTEXT" not in ln]
+    assert not bare, bare
 
 
 def test_a_fleet_with_no_typed_fields_prints_no_basis_line(tmp_path):
@@ -164,5 +312,5 @@ def test_a_fleet_with_no_typed_fields_prints_no_basis_line(tmp_path):
     agg = aggregate([_rec(raw=1000, out=400) for _ in range(20)])
     text = "\n".join(build_primer_section(primer_liability(scan, agg)))
 
-    assert "basis: CONTEXT" not in text
+    assert "are CONTEXT tokens" not in text
     assert "12,000 tok of CONTEXT saved" in text

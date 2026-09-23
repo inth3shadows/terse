@@ -421,21 +421,46 @@ def _context_tokens(rec: dict[str, Any], raw_t: int, out_t: int) -> tuple[int, i
     A record says a typed field was present; it never says which client read it. Partitioned
     over the live ledger (4,479 tokenized rows, 2026-09-23):
 
-        2,275  no typed field                          unambiguous — the block is the context
-          825  typed field COMPRESSED (out < raw)      unambiguous — only a
-                                                       STRUCTURED_SAFE client gets `compress`
-        1,388  typed field present but untouched       the client is unknowable
+        2,266  no typed field                          the block IS the context
+          825  typed field COMPRESSED (out < raw)      the field was rewritten
+        1,388  typed field present but untouched       says nothing either way
 
-    The last group is ambiguous in BOTH directions and no reading of the record settles it:
+    (measured 2026-09-23 over 4,479 tokenized rows; the three parts sum to the total, which
+    is the only part of this worth asserting — the counts drift as the ledger grows.)
+
+    The middle group is NOT proof of a safe client, and an earlier draft of this comment
+    said it was. `structured_mode_for_client` gates only `"auto"` on
+    `STRUCTURED_SAFE_CLIENTS`; an explicit `"compress"` or `"replace"` in a rule is returned
+    unchanged for any client, including none at all. So a rewritten field is a property of
+    the POLICY, not of the client — it happens to imply a safe client on this fleet only
+    because all nine rules resolve through `auto`.
+
+    The third group is ambiguous in both directions and no reading of the record settles it:
     `auto` resolves to "leave" for a non-safe client, an explicit `"leave"` rule is
     indistinguishable, and `compress` on an already-compact field also leaves the size
     unchanged. Reading every one of them the other way (both fields forwarded) moves the
     ledger-wide saving from 1,423,614 to 1,470,859 and `turns_covered` from 2,836 to 2,930 —
-    a 3.3% band, three orders of magnitude clear of the 1.0 break-even threshold. So this
-    takes the typed-only reading and the honesty notes state the band once. A published
-    RANGE was rejected: it doubles the surface of every figure for an uncertainty that
-    changes no verdict, and a ledger `client` field was rejected because it cannot repair
-    the 4,479 records already written.
+    a 3.3% band, three orders of magnitude clear of the 1.0 break-even threshold.
+
+    THE BAND IS A FACT ABOUT THIS FLEET, not about the basis. On a fleet whose rules name
+    `"compress"` explicitly, the middle group stops being evidence too, and reading every
+    typed row the other way returns the whole distance to wire — a 92.5% band, not 3.3%.
+    The conclusion survives there (no verdict flips at 1,700x coverage) but the argument
+    does not, so do not quote the 3.3% as a property of the method.
+
+    So this takes the typed-only reading and states the band. A published RANGE was
+    rejected: it doubles the surface of every figure for an uncertainty that changes no
+    verdict here. A ledger `client` field was rejected because it cannot repair the records
+    already written.
+
+    A MULTI-BLOCK result is a known hole, and the partition above quietly includes it.
+    `_emit_stats` attaches `structured`/`structured_out` to the first pair only ("per-RESULT,
+    not per-block" — counting them once per block would inflate the very number they exist
+    to make honest), so blocks 1..N-1 of such a result carry no typed-field split and land
+    in the first group above. They are typed-field rows wearing a no-typed-field record,
+    and their text is counted as model context when the client discarded all of it. Live
+    magnitude: 3 follower rows, 39 raw tokens. Structural, not material, and it wants a
+    per-result grouping the ledger cannot express today (#437).
 
     Untokenized is never zero. A record whose typed field exists but whose
     `structured_tokens` is not an int (no tiktoken at write time) cannot state its context
@@ -1827,8 +1852,6 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
     # by the other, and rolling them up in the same pass keeps them from being taken over
     # different row sets.
     saved_by_label: dict[str, int] = {}
-    # The wire saving, kept beside it and reported but never divided by a primer (#420).
-    wire_saved_by_label: dict[str, int] = {}
     tokenized_by_label: dict[str, int] = {}
     encoded_by_label: dict[str, int | None] = {}
     for trow in agg.get("tools", []):
@@ -1842,16 +1865,26 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         #
         # `or` the wire pair, never 0: an agg from an older terse (or a hand-rolled one in
         # a test) carries no `ctx_*` key at all, and defaulting that to zero would publish
-        # "this server saved nothing" for every such caller. Wire is the right fallback —
-        # it is what the two bases agree on for a record with no typed field, which is what
-        # every pre-#134 ledger is made of.
+        # "this server saved nothing" for every such caller — the unknown-is-not-zero
+        # failure, in the direction that tells an operator to unwrap a server that is
+        # paying for itself.
+        #
+        # But wire is NOT a silently-equivalent fallback, and an earlier draft of this
+        # comment claimed it was ("what the two bases agree on for a record with no typed
+        # field, which is what every pre-#134 ledger is made of"). That conflates the LEDGER
+        # version with the AGGREGATOR version. The realistic legacy shape is a pre-#420
+        # `aggregate` over a POST-#134 ledger — no `ctx_*` keys, plenty of typed fields —
+        # and there the two bases differ by the full inflation: measured 3.33x on one
+        # fixture. So the fallback restores the exact over-credit #420 removes, and the row
+        # has to SAY so rather than publish a number that looks measured. `saved_basis`
+        # below is that marker, the same discipline `primer_source` already keeps for the
+        # primer half of this row (review of PR #435).
         raw_t, out_t = trow.get("raw_tokens") or 0, trow.get("out_tokens") or 0
         ctx_raw = trow.get("ctx_raw_tokens")
         ctx_out = trow.get("ctx_out_tokens")
         ctx_raw = raw_t if ctx_raw is None else ctx_raw
         ctx_out = out_t if ctx_out is None else ctx_out
         saved_by_label[lbl] = saved_by_label.get(lbl, 0) + (ctx_raw - ctx_out)
-        wire_saved_by_label[lbl] = wire_saved_by_label.get(lbl, 0) + (raw_t - out_t)
         # `.get("tokenized")`, defaulted: a caller may hand us a hand-rolled agg (the tests
         # do) or one produced before this counter existed. Falling back to `blocks` there
         # keeps the old — merely coarser — behaviour instead of reporting `no token data`
@@ -2167,6 +2200,10 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
     unresolved = sum(1 for s in servers if s["primer_tokens"] is None)
     total = agg.get("total") or {}
     wire_saved = (total.get("raw_tokens") or 0) - (total.get("out_tokens") or 0)
+    # Which basis `saved_tokens` is actually in, published so a consumer never has to guess
+    # — an aggregate from a pre-#420 terse cannot supply the context figure and falls back
+    # to wire, which is the inflated number this change exists to stop publishing silently.
+    saved_basis = "context" if total.get("ctx_raw_tokens") is not None else "wire"
     # Same fallback as the per-label sums above, and for the same reason.
     ctx_raw = total.get("ctx_raw_tokens")
     ctx_out = total.get("ctx_out_tokens")
@@ -2211,6 +2248,10 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         # What left the stdio pipe — the honest "what terse actually removed" number, and
         # the one the codec is judged on. Reported, never divided by a primer (#420).
         "wire_saved_tokens": wire_saved,
+        # "context" or "wire". `wire` means this aggregate predates #420 and could not
+        # supply the context figure, so every saving here — fleet and per server — is on
+        # the inflated basis. Never absent, so a consumer reads it unconditionally.
+        "saved_basis": saved_basis,
         # NOT `(saved - once) / per_turn`. `once` is charged per SESSION and `saved` is the
         # whole window, which spans an unknown number of sessions — a `terse proxy` is one
         # process per session and `Interceptor._primer_sent` re-arms at every `initialize`.
@@ -2415,12 +2456,6 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     # over-credited the fleet by 1.93x ledger-wide (#420). The wire figure is still the
     # honest "what terse removed from the pipe" number and is published in `--json`; it is
     # simply not the unit a primer break-even is denominated in.
-    wire = liab.get("wire_saved_tokens")
-    if wire is not None and wire != saved:
-        lines.append(f"  basis: CONTEXT (what the model received). {wire:,} tok left the "
-                     f"stdio pipe; a mirror text block a")
-        lines.append("  `structuredContent`-reading client discards is wire saving, not "
-                     "context saving (#420).")
     if turns is not None:
         # Below 1.0 the ratio is not the interesting number — the shortfall is. `~0.4 turns`
         # and `~0x over` both round to a `0` that reads as a measured zero, the same
@@ -2452,8 +2487,9 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
             lines.append("  window spans more than one session, which it usually does; "
                          "each of them paid that charge again.")
         else:
-            lines.append(f"  NET NEGATIVE over this window: the {saved:,} tok saved does "
-                         f"not cover the {once:,} tok one-time charge even once, and each "
+            lines.append(f"  NET NEGATIVE over this window: the {saved:,} tok of CONTEXT "
+                         f"saved does not cover the {once:,} tok one-time charge even "
+                         f"once, and each "
                          f"session in the window paid it again.")
     if turns is not None and liab.get("session_covered") is not None:
         lines.append("  each line above credits the SAME savings against its own charge "
@@ -2473,6 +2509,19 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
                      "and the primer was")
         lines.append(f"  declined and never attached (#211, #286): "
                      f"{', '.join(sorted(liab['free']))}")
+    wire = liab.get("wire_saved_tokens")
+    # Gated on a CONTEXT figure actually being rendered below, not merely on the two bases
+    # differing. Both ratios are None for an entry that was never called, and then this
+    # printed the WIRE number as the section's only figure — directly under a header
+    # announcing the context basis, which is the #141 confusion re-created (review of PR
+    # #435). Said BELOW the turns lines, because the figures it labels are the ones after
+    # it, including `_build_break_even_table`'s `saved/block` column.
+    shows_context = turns is not None or liab.get("session_covered") is not None
+    if wire is not None and wire != saved and shows_context:
+        lines.append(f"  the figures above and the saved/block column below are CONTEXT "
+                     f"tokens. {wire:,} tok left the stdio")
+        lines.append("  pipe; a mirror text block a `structuredContent`-reading client "
+                     "discards is wire saving, not context (#420).")
     lines += _build_break_even_table(servers)
     return lines
 
@@ -2758,6 +2807,18 @@ def build_recommend_report(agg: dict[str, Any], *, log_path: str | Path,
         lines.append("savings against. `terse stats` still reports the ledger totals.")
         return "\n".join(lines) + "\n"
     lines += section
+    # The basis, on the VERDICT screen. `--recommend` replaces the ledger tables rather than
+    # appending to them, so the line `build_primer_section` adds never reaches this output —
+    # and every number here moved when the basis did (`coverage` 2,840 -> 1,739 on the live
+    # fleet, and the pooled "by tokens saved" ranking halved). USAGE documents this as the
+    # screen an operator reads for the verdict, so it was the one screen that said nothing
+    # about why its numbers changed (review of PR #435).
+    if (liability or {}).get("saved_basis") == "context":
+        lines.append("")
+        lines.append("coverage and the pooled savings above are CONTEXT tokens — what the "
+                     "model received, not what left")
+        lines.append("the stdio pipe. A mirror text block a `structuredContent`-reading "
+                     "client discards is wire saving (#420).")
     lines.append("")
     lines.append("run without --recommend for the arithmetic behind these words.")
     return "\n".join(lines) + "\n"

@@ -89,6 +89,11 @@ LIABILITY = {"servers", "per_turn_tokens", "session_once_tokens", "unresolved",
              # across versions sees `saved_tokens` roughly halve on a fleet whose results
              # carry `structuredContent`; that drop is the correction.
              "wire_saved_tokens",
+             # Which basis `saved_tokens` is actually on: "context", or "wire" when this
+             # aggregate predates #420 and could not supply the context figure. Published
+             # so a consumer never has to guess which of its numbers is inflated — the same
+             # discipline `primer_source` keeps for the primer half of a server row.
+             "saved_basis",
              # #396 round 4: contested label -> the NON-ROUTER entries writing it, sorted.
              # Per-label because a remedy is a fact about a label: a fleet-wide scan printed
              # one sentence claiming that renaming one entry addressed two independent
@@ -134,6 +139,7 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "diffs": (int,), "raw_chars": (int,), "out_chars": (int,),
     "raw_tokens": (int,), "out_tokens": (int,),
     "ctx_raw_tokens": (int,), "ctx_out_tokens": (int,), "wire_saved_tokens": (int,),
+    "saved_basis": (str,),
     "untokenized": (int,), "unversioned": (int,),
     "server": (str,), "tool": (str,), "scope": (str, type(None)),
     "state": (str, type(None)), "primer_tokens": (int, type(None)),

@@ -870,7 +870,7 @@ needs both flags.
 field name and type at nine shapes — the top level, `total`, each `tools[]` row, each value
 of the `versions` object, each `retrieves[]` row, each `primers[]` row, the `primer_liability`
 blob, each of its `servers[]` rows, and each of those rows' `contributors[]` — so a rename or
-a removal fails CI rather than a consumer's script. Five things worth knowing before you
+a removal fails CI rather than a consumer's script. Six things worth knowing before you
 parse it:
 
 - **`primers[]` rows carry an `attached` flag.** `true` is a primer that went out and cost
@@ -889,6 +889,21 @@ parse it:
   no ledger label was recoverable — *we never found the rows to ask* — which is a different
   claim from `blocks: 0`, "installed and never called". Same for `turns_covered`,
   `session_covered`, `saved_per_block` and `primer_tokens`.
+- **Savings come on TWO bases, and `saved_tokens` is the CONTEXT one (#420).** `total` and
+  each `tools[]` row carry `raw_tokens`/`out_tokens` (the WIRE basis: what left the stdio
+  pipe) alongside `ctx_raw_tokens`/`ctx_out_tokens` (what the model received). Where a
+  result carried `structuredContent` a `structuredContent`-reading client discards the
+  mirror text block, so compressing that block is wire saving and not context saving —
+  ledger-wide the two differ by 1.84x on raw and 1.93x on the saving. Every break-even
+  figure (`turns_covered`, `saved_per_block`, `blocks_to_break_even`,
+  `break_even_coverage`, and `contributors[].saved_tokens`) is on the CONTEXT basis,
+  because the primer they are divided by is charged in context. `primer_liability`
+  publishes the wire total as `wire_saved_tokens` and names the basis in `saved_basis`,
+  which reads `"wire"` when the aggregate predates #420 and could not supply the context
+  figure — there, every saving in the document is on the inflated basis. **If you parsed
+  `saved_tokens` before this shipped you were reading the wire number**; it roughly halves
+  on a fleet whose results carry `structuredContent`, and that drop is the correction.
+
 - **`primer_liability` itself can be `null`**, when the install could not be sized (a
   malformed MCP config). The ledger half of the document is still complete and correct; the
   reason is on stderr.
