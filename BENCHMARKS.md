@@ -929,8 +929,9 @@ server is free.
 A router costs `502 × turns`. The same three servers wrapped standalone cost roughly
 `502 + 248 + kb` **once**. On those figures the router is the cheaper topology only for about
 the first two turns of a session, and is more expensive after that. The live fleet's
-`turns_covered` is **5,419** — the savings cover that many turns of router primer, which is
-comfortable here, but it is a budget being spent every turn rather than once.
+`turns_covered` is **~2,944** on the context basis (2026-09-23; it read 5,419 before #420
+moved the break-even off the wire basis) — the savings cover that many turns of router
+primer, which is comfortable here, but it is a budget being spent every turn rather than once.
 
 **Current guidance, matching `install-mcp --multiproxy --help`:** consolidate for *operational*
 reasons — one policy, one process, one permission surface — **not** to escape a token tax.
@@ -1072,7 +1073,12 @@ the headline percentage.
 
 ### And the published figure is a WIRE basis, not a context basis (#420)
 
-A second layer of the same problem, found 2026-09-22 and not yet fixed in the tooling.
+A second layer of the same problem, found 2026-09-22. **Fixed 2026-09-23:** `terse stats`
+now prints a `context:` line beside the wire one, and the primer break-even
+(`turns_covered`, `saved_per_block`) is taken on the context basis. Only a row whose typed
+field terse REWROTE moves to it — that proves a mirror-dropping client; an untouched typed
+field is ambiguous about the client and stays on the wire, which is why the tool's context
+line (1,478,089 saved, 19.2%) differs from the hand measurement below.
 
 `terse stats` folds the text block and the typed `structuredContent` field into one
 `raw_tokens`/`out_tokens` pair (`stats.py:196`) — a deliberate **wire** basis. But terse's

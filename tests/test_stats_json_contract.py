@@ -46,14 +46,17 @@ TOP_LEVEL = {"total", "decisions", "diff_reasons", "tools", "versions", "retriev
              "primers",
              "primer_liability"}
 
+# `context_*_tokens` added on purpose (#420): what the model RECEIVES when the client drops
+# the text mirror of a typed field, beside the wire sums. Same row set as the wire sums.
 TOTAL = {"blocks", "raw_chars", "out_chars", "raw_tokens", "out_tokens",
-         "untokenized", "unversioned"}
+         "context_raw_tokens", "context_out_tokens", "untokenized", "unversioned"}
 
 # `encoded` is the newest and the one most likely to be dropped by someone tidying
 # `aggregate`: `primer_liability` reads it to tell a server that merely was CALLED from one
 # whose lazy primer could actually have fired, so losing it silently reverts that fix.
 TOOL_ROW = {"server", "tool", "blocks", "tokenized", "encoded", "diffs",
-            "raw_chars", "out_chars", "raw_tokens", "out_tokens"}
+            "raw_chars", "out_chars", "raw_tokens", "out_tokens",
+            "context_raw_tokens", "context_out_tokens"}
 
 VERSION_ROW = {"blocks", "tokenized", "raw_tokens", "out_tokens"}
 
@@ -73,6 +76,9 @@ PRIMER_ROW = {"server", "cadence", "attached", "emissions", "bytes", "tokens",
 
 LIABILITY = {"servers", "per_turn_tokens", "session_once_tokens", "unresolved",
              "idle", "free", "uncertain", "saved_tokens", "turns_covered",
+             # #420: `saved_tokens` is now the CONTEXT basis the break-even needs; the wire
+             # figure it used to carry moved here rather than vanishing.
+             "wire_saved_tokens",
              "session_covered",
              # #396 round 4: contested label -> the NON-ROUTER entries writing it, sorted.
              # Per-label because a remedy is a fact about a label: a fleet-wide scan printed
@@ -118,6 +124,7 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "blocks": (int, type(None)), "tokenized": (int,), "encoded": (int,),
     "diffs": (int,), "raw_chars": (int,), "out_chars": (int,),
     "raw_tokens": (int,), "out_tokens": (int,),
+    "context_raw_tokens": (int,), "context_out_tokens": (int,),
     "untokenized": (int,), "unversioned": (int,),
     "server": (str,), "tool": (str,), "scope": (str, type(None)),
     "state": (str, type(None)), "primer_tokens": (int, type(None)),
@@ -140,7 +147,7 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "blocks_to_break_even": (float, int, type(None)),
     "break_even_verdict": (str, type(None)),
     "per_turn_tokens": (int,), "session_once_tokens": (int,), "unresolved": (int,),
-    "idle": (list,), "free": (list,), "uncertain": (list,), "saved_tokens": (int,),
+    "idle": (list,), "free": (list,), "uncertain": (list,), "saved_tokens": (int,), "wire_saved_tokens": (int,),
     "turns_covered": (float, int, type(None)),
     "session_covered": (float, int, type(None)),
     "servers": (list,),

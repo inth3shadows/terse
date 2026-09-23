@@ -205,6 +205,49 @@ def build_record(server: str, tool: str, raw: str, emitted: str,
     }
 
 
+def context_tokens(rec: dict[str, Any], raw_t: int, out_t: int) -> tuple[int, int]:
+    """A record's (raw, out) tokens on the CONTEXT basis — what the model receives, not what
+    crossed the pipe (#420).
+
+    `raw_tokens`/`out_tokens` are the WIRE basis: text block plus typed field, which is right
+    for "what left the pipe" (#141). But a client that reads `structuredContent` discards the
+    text mirror unread (`policy.py`'s `"replace"` note, measured on claude-code 2.1.218), so
+    for a row carrying a typed field the model pays for that field ALONE. Over the live
+    ledger the wire saving was 1.90x the context saving; the percentage barely moved.
+
+    The ledger does not record the client, so only a row that PROVES a mirror-dropping client
+    moves to the typed-field basis: one whose typed field was REWRITTEN (`structured_out_tokens`
+    differs from `structured_tokens`), which `"auto"` does only for `STRUCTURED_SAFE_CLIENTS`.
+    An UNTOUCHED typed field is ambiguous — claude-code would drop the text, while the
+    `"leave"` clients are exactly the ones that may read it — so it stays on the wire basis.
+    Moving it too was tried in review and is wrong in the direction that matters: it zeroes a
+    text-reading client's real saving, and `saved_per_block` then reads `never` and the
+    verdict says UNWRAP for a server that is paying for itself. Over the live ledger those
+    rows carry ~47k of the ~1.3M wire overstatement, so leaving them costs little accuracy.
+    A row without a typed field is unchanged: there the text block IS the context, and so
+    is a pre-split row with no emitted-side count, which could not have been rewritten.
+
+    Known residual: the proxy attaches the typed field's size to block 0 only, so blocks
+    1..N of a multi-block result that carried one still count their text here. That
+    overstates the context saving by those blocks — the direction this fix narrows, not
+    the one it introduces."""
+    s_raw = rec.get("structured_tokens")
+    if not isinstance(s_raw, int) or isinstance(s_raw, bool) or s_raw <= 0:
+        return raw_t, out_t
+    s_out = rec.get("structured_out_tokens")
+    if not isinstance(s_out, int) or isinstance(s_out, bool) or s_out == s_raw:
+        return raw_t, out_t
+    return s_raw, s_out
+
+
+def _context_saved(row: dict[str, Any]) -> int:
+    """A total's or tool row's saving on the context basis (#420), or the wire saving for a
+    row that predates the context sums (a hand-rolled or older agg)."""
+    if "context_raw_tokens" in row:
+        return (row.get("context_raw_tokens") or 0) - (row.get("context_out_tokens") or 0)
+    return (row.get("raw_tokens") or 0) - (row.get("out_tokens") or 0)
+
+
 RETRIEVE_EVENT = "retrieve"
 
 PRIMER_EVENT = "primer"
@@ -411,7 +454,10 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     # N and a joined/partial one contributes 1 per folded unit. Naming it `blocks` keeps
     # the count honest — it moves with join behaviour by design, not by call volume (#141).
     total = {"blocks": 0, "raw_chars": 0, "out_chars": 0,
-             "raw_tokens": 0, "out_tokens": 0, "untokenized": 0, "unversioned": 0}
+             "raw_tokens": 0, "out_tokens": 0,
+             # The CONTEXT basis (#420), summed over exactly the same tokenized rows.
+             "context_raw_tokens": 0, "context_out_tokens": 0,
+             "untokenized": 0, "unversioned": 0}
     decisions: dict[str, int] = {}
     # Which terse wrote each record (forward-only — see `_ledger_version`), carrying the
     # SAME token sums as the per-tool rows. A `{version: count}` counter would have been
@@ -517,6 +563,7 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             total["unversioned"] += 1
         row = tools.setdefault(key, {"blocks": 0, "tokenized": 0, "encoded": 0,
                                      "raw_tokens": 0, "out_tokens": 0,
+                                     "context_raw_tokens": 0, "context_out_tokens": 0,
                                      "raw_chars": 0, "out_chars": 0, "diffs": 0})
         row["blocks"] += 1
         # Blocks on which a terse WIRE FORM shipped, as opposed to blocks emitted at all.
@@ -556,6 +603,11 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             total["out_tokens"] += out_t
             row["raw_tokens"] += raw_t
             row["out_tokens"] += out_t
+            ctx_raw, ctx_out = context_tokens(rec, raw_t, out_t)
+            total["context_raw_tokens"] += ctx_raw
+            total["context_out_tokens"] += ctx_out
+            row["context_raw_tokens"] += ctx_raw
+            row["context_out_tokens"] += ctx_out
             # Per-row, not just `total["untokenized"]`: the #175 break-even divides this
             # row's savings by its call count, and `blocks` counts untokenized records the
             # token sums skipped. Only this counter makes the two halves the same row set.
@@ -645,7 +697,17 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
                          "measured cost > saving; enable per server with `--diff`)")
     if tok_raw or tok_out:
         lines.append(f"tokens (cl100k): {tok_raw:,} -> {tok_out:,}   "
-                     f"saved {tok_raw - tok_out:,} ({_pct_saved(tok_raw, tok_out).strip()})")
+                     f"saved {tok_raw - tok_out:,} ({_pct_saved(tok_raw, tok_out).strip()})"
+                     "   [wire]")
+        ctx_raw, ctx_out = total.get("context_raw_tokens"), total.get("context_out_tokens")
+        if isinstance(ctx_raw, int) and isinstance(ctx_out, int) and (ctx_raw, ctx_out) != (
+                tok_raw, tok_out):
+            # Printed only when the bases differ, i.e. some row carried a typed field. The
+            # wire line is what crossed the pipe; this is what the model received (#420).
+            lines.append(f"  context:        {ctx_raw:,} -> {ctx_out:,}   "
+                         f"saved {ctx_raw - ctx_out:,} "
+                         f"({_pct_saved(ctx_raw, ctx_out).strip()})   [context: a rewritten "
+                         "typed field counts alone, #420]")
         if total["untokenized"]:
             lines.append(f"  ({total['untokenized']} result(s) uncounted — tiktoken "
                          f"unavailable when they were recorded; chars below cover them)")
@@ -1770,7 +1832,10 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         by_label[trow["server"]] = by_label.get(trow["server"], 0) + trow["blocks"]
         lbl = trow["server"]
         raw_t, out_t = trow.get("raw_tokens") or 0, trow.get("out_tokens") or 0
-        saved_by_label[lbl] = saved_by_label.get(lbl, 0) + (raw_t - out_t)
+        # CONTEXT basis (#420): the break-even divides this by a primer charged in context,
+        # so a wire saving here credited ~1.9x the runway. Wire is the fallback only for an
+        # agg built before the context sums existed.
+        saved_by_label[lbl] = saved_by_label.get(lbl, 0) + _context_saved(trow)
         # `.get("tokenized")`, defaulted: a caller may hand us a hand-rolled agg (the tests
         # do) or one produced before this counter existed. Falling back to `blocks` there
         # keeps the old — merely coarser — behaviour instead of reporting `no token data`
@@ -2085,7 +2150,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
     once = sum(s["primer_tokens"] or 0 for s in servers if s["cadence"] == _ONCE)
     unresolved = sum(1 for s in servers if s["primer_tokens"] is None)
     total = agg.get("total") or {}
-    saved = (total.get("raw_tokens") or 0) - (total.get("out_tokens") or 0)
+    saved = _context_saved(total)
     return {
         "servers": servers,
         # REDEFINED by the #211 follow-up: recurring (eager-priming) entries only. It used
@@ -2115,7 +2180,10 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         # Lazy, but no ledger label was recoverable, so we cannot say whether the attach
         # ever fired. Neither total counts it — same discipline as `unresolved`.
         "uncertain": [s["server"] for s in servers if s["cadence"] == _ONCE_UNKNOWN],
+        # CONTEXT basis since #420 — the unit the primer it is weighed against is paid in.
+        # The wire figure it used to carry is `wire_saved_tokens`, beside it.
         "saved_tokens": saved,
+        "wire_saved_tokens": (total.get("raw_tokens") or 0) - (total.get("out_tokens") or 0),
         # NOT `(saved - once) / per_turn`. `once` is charged per SESSION and `saved` is the
         # whole window, which spans an unknown number of sessions — a `terse proxy` is one
         # process per session and `Interceptor._primer_sent` re-arms at every `initialize`.
@@ -2308,6 +2376,8 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
                 lines.append(f"  `{lbl}`: remove one of them, or {fix}.")
     # Reported here rather than folded into the rate above: the split is a FACT about the
     # ledger, and merging the two identities would be the guessing #285 removed.
+    lines.append("  (savings in this section are on the CONTEXT basis — what the model "
+                 "receives — so they can sit below the per-tool table's wire figures, #420)")
     for srv in liab["servers"]:
         sup = srv.get("superseded_labels") or []
         if sup:
@@ -2320,8 +2390,8 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         # and `~0x over` both round to a `0` that reads as a measured zero, the same
         # print-as-zero hole `_fmt_rate` closed in review of #197.
         if turns >= 1:
-            lines.append(f"  the {saved:,} tok saved in this window pays for ~{turns:,.0f} "
-                         f"turn(s) of the recurring primer.")
+            lines.append(f"  the {saved:,} tok saved in context this window pays for "
+                         f"~{turns:,.0f} turn(s) of the recurring primer.")
         else:
             lines.append(f"  NET NEGATIVE over this window: the {saved:,} tok saved does "
                          f"not cover even a single turn of the {per_turn:,} tok recurring "
