@@ -974,6 +974,8 @@ python scripts/gen_stress_corpus.py corpus-stress
 #     `capture: false` by policy). Opt-in: they would otherwise dominate `terse verify`'s
 #     bundled sample, and the `synthetic.` prefix keeps them apart in every report.
 python scripts/gen_stress_corpus.py corpus-stress --fleet-shapes
+#     A directory generated before v0.33.11 keeps its old, id-less envelopes on a re-run
+#     (a rewrite never re-homes an envelope); generate into a fresh directory instead.
 
 # 2a. keyless: writes an eval pack you can drive by hand, then score
 uv run terse fluency --corpus corpus-stress

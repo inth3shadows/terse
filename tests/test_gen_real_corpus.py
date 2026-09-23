@@ -173,8 +173,9 @@ def test_a_tool_dropped_from_prefixes_is_reported_as_scored_but_unwritten(
 
 
 def test_every_generated_envelope_is_its_own_hand_result(tmp_path, monkeypatch, capsys):
-    """#380: without `manual=True` each envelope reads as a legacy proxy block, and
-    `policy generate`/`tune` timing-group the whole corpus into guessed results."""
+    """#380: without `manual=True` each envelope reads as a legacy proxy block, and the
+    identity note tells the operator the corpus predates result ids. (Grouping is
+    unaffected here: `max_per_tool=1` leaves one envelope per tool.)"""
     out_dir = tmp_path / "corpus-real"
     rc, _, _ = _run(out_dir, monkeypatch, capsys)
     assert rc == 0

@@ -172,14 +172,19 @@ def test_the_command_line_writes_the_fleet_shapes_when_asked(tmp_path):
     assert "synthetic.secret.list_credentials" in r.stdout
 
 
-def test_the_command_line_writes_hand_results_not_legacy_blocks(tmp_path):
-    """#380, driven through the subprocess layer `terse verify` runs: every envelope carries
-    its own `manual:` id, so the fleet shapes are never timing-grouped into one result."""
+@pytest.mark.parametrize("args, extra", [((), 0), ((gsc.FLEET_FLAG,), len(gsc.SYNTHETIC))],
+                         ids=["verify-path", "fleet-shapes"])
+def test_the_command_line_writes_hand_results_not_legacy_blocks(tmp_path, args, extra):
+    """#380, through the subprocess layer: the no-flag run is exactly what `terse verify`
+    executes, the flagged run is the codec corpus. Every envelope carries its own `manual:`
+    id, so no two payloads are timing-grouped into one result. The count guards against a
+    run that writes nothing, which every `all(...)` below would pass vacuously."""
     from terse.policy_gen import group_results, heuristic_share
 
-    r = _run_script(tmp_path, gsc.FLEET_FLAG)
+    r = _run_script(tmp_path, *args)
     assert r.returncode == 0, r.stderr
     envs = capture.load_corpus(tmp_path)
+    assert len(envs) == len(gsc.PAYLOADS) + extra
     assert all(str(e.get("result_id", "")).startswith("manual:") for e in envs)
     assert heuristic_share(envs) == (0, len(envs))
     assert all(len(g) == 1 for groups in group_results(envs).values() for g in groups)

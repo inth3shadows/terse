@@ -126,8 +126,7 @@ def main() -> int:
         raw = minify(obj)
         # `capture_payload` is the same path the proxy and `terse capture` use, so the
         # envelopes this writes are indistinguishable from a real captured corpus —
-        # `manual=True`, as `terse capture` passes, or each one reads as a legacy capture
-        # that `policy generate`/`tune` timing-groups with its neighbours (#380).
+        # given `manual=True`, as `terse capture` passes (see `capture_payload`, #380).
         # max_per_tool=1: envelopes are named by content sha, so re-running with a
         # different PREFIXES value would otherwise ADD a second envelope for the same
         # tool rather than replace it, and `load_corpus` would then score that tool

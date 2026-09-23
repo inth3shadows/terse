@@ -213,9 +213,7 @@ def main(corpus_dir: str = "corpus-stress", with_fleet_shapes: bool = False) -> 
     for tool, obj in payloads:
         records = extract_records(obj)
         size = f"{len(records)} records" if records else f"{len(obj)} keys"
-        # `manual=True`, as `terse capture` passes: each payload is one whole result. Without
-        # it, payloads written back-to-back read as blocks of ONE legacy result and are
-        # timing-grouped together by `policy generate`/`tune` (#380).
+        # `manual=True`, as `terse capture` passes (see `capture_payload`, #380).
         path = capture_payload(tool, minify(obj), corpus_dir, manual=True)
         print(f"wrote {tool} ({size}) -> {path}")
     return 0
