@@ -15,6 +15,10 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **The codec compliance reason no longer reads as a fact about the model (#412).** It
+  printed "terse arm delivered 29% of its answers through the tool call", and the same
+  (model, payload, question) then read 100% on two more runs with no change to the
+  answering path. The reason now says the rate is this run's, not the model's.
 - **The diff tier's published framing said "does not pay" where the measurement says
   "starved" (#419).** Four sites across `README.md` and `BENCHMARKS.md` reported the
   0.67% all-time hit rate and attributed what remained to "the workload", with README
