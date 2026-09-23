@@ -157,6 +157,43 @@ def test_a_SAFE_cell_without_compliance_counters_claims_nothing_about_them():
     assert "**SAFE**" in cell and "compliance" not in cell
 
 
+def _safe_cell(results: dict) -> str:
+    cell = next(ln for ln in build_codec_verdict_report(results).splitlines()
+                if ln.startswith("| `t` |"))
+    assert "**SAFE**" in cell, cell
+    return cell
+
+
+def _tagged_t(rows):
+    return _tagged(rows, "t", "array-of-records")
+
+
+def test_a_multi_model_SAFE_cell_quotes_the_lowest_passing_rate_whatever_the_names():
+    """Review of #432: the caveat read the tie-break model (first by NAME), so identical
+    evidence printed terse 100% or 80%. The weakest model is what let the cell through."""
+    full = [_row(f"q{i}", 1, 1, raw_calls=1, terse_calls=1) for i in range(20)]
+    floor = [_row(f"q{i}", 1, 1, raw_calls=1, terse_calls=int(i >= 4)) for i in range(20)]
+    for strong in ("a", "z"):                       # sorts before AND after `b`
+        cell = _safe_cell({strong: _tagged_t(full), "b": _tagged_t(floor)})
+        assert "raw 100% (`" in cell and "terse 80% (`b`)" in cell, cell
+
+
+def test_a_near_full_SAFE_rate_never_prints_as_full():
+    """199/200 is one prose answer, not full compliance; `:.0%` rounded it to 100%."""
+    rows = [_row(f"q{i}", 10, 10, trials=10, raw_calls=10, terse_calls=10 - (i == 0))
+            for i in range(20)]
+    cell = _safe_cell({"m": _tagged_t(rows)})
+    assert "terse 99.5%" in cell and "terse 100%" not in cell, cell
+
+
+def test_a_SAFE_cell_mixing_old_and_new_rows_claims_no_rate():
+    """`codec_call_rate` counts only the rows carrying the counter; quoting that as the
+    cell's rate would describe 10 of 20 trials as all of them."""
+    rows = ([_row(f"q{i}", 1, 1, raw_calls=1, terse_calls=1) for i in range(10)]
+            + [_row(f"p{i}", 1, 1) for i in range(10)])
+    assert "compliance" not in _safe_cell({"m": _tagged_t(rows)})
+
+
 def test_report_gates_on_the_worst_model_within_a_group():
     clean = [_row(f"q{i}", 1, 1) for i in range(_CODEC_MIN_TRIALS)]
     broken = [_row("q-bad", 1, 0)]

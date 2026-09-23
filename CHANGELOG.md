@@ -19,8 +19,9 @@ fails that pull request until the section has moved.
   (#412).** #423 labelled a LOW rate "in this run"; a passing one printed only
   "20 zero-failure trials", although SAFE rests on the same one-run rate — the cell that
   read 29% read 100% on the next two runs. The SAFE "why" now adds
-  "tool-call compliance raw X%, terse Y% in this run — not measured across runs" whenever
-  the rows carry the counters (pre-#403 rows claim nothing).
+  "tool-call compliance raw X%, terse Y% in this run — not measured across runs": the
+  LOWEST passing rate per arm across the cell's models (named when there are several),
+  never rounded up to 100%, and only when every row carries the counters.
 
 - **A `folded-and-live` peer whose live duplicate runs its own proxy now reports that
   proxy's primer cost (#396).** The router's union primer covers the folded route, but the
@@ -130,6 +131,7 @@ fails that pull request until the section has moved.
   router in `folded-and-live` is dropped (#427), and an estimated primer is still sized
   against the `mcpServers` key rather than the ledger identity (#428). A `folded` row in a
   higher-precedence scope also still shadows the live lower-scope entry (#424).
+
 ## [0.34.0] - 2026-09-23
 
 ### Changed
