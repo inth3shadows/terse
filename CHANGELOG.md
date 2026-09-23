@@ -93,7 +93,7 @@ fails that pull request until the section has moved.
     one: the report says to remove the duplicate or give the live entry a DIFFERENT name.
     A router keeps its uncontested peers and stays measurable on those.
 
-  Review of the above found four more, all reproduced before being fixed:
+  Review of the above found five more, all reproduced before being fixed:
 
   - **A row that had a label taken away publishes no measurement at all.** Where the
     surviving sum was `0` this reported `never called` — the hard claim — which `_recommend`
@@ -127,14 +127,36 @@ fails that pull request until the section has moved.
     pointing at `mcp-status`, whose duplicate warning fires only on `folded-and-live` and is
     therefore silent for exactly the cross-scope case above.
 
-  A `folded` row in a higher-precedence scope still shadows the live lower-scope entry that
-  is actually running, which caps this fix's reach. That is a `_precedence_winner` defect in
-  #398's territory with fleet-wide blast radius, filed as #424 rather than fixed here.
+
+
+  A third round found four more. A contested row was discarding a primer record it
+  provably wrote — a primer row is written at one site, `run_proxy`'s
+  `build_primer_writer`, and a router's peers are built `lazy_primer=False`, so a
+  `once/session` row under a contested label can only be a standalone proxy's; where exactly
+  one standalone answers to that label the record is fully attributable, and blacking it out
+  published a measured 777-token attach as `session_once_tokens: 0`. The blackout now stands
+  down entirely when the contested label has NO rows in the window, where what survives is
+  already the pooled truth. `contested_labels` is derived from what an entry WRITES rather
+  than what it may COUNT, so a co-writer whose own guess is ambiguous is named in the
+  stanza instead of leaving it saying "more than one installed entry" above a list of one.
+  And the remedy the stanza prints is one the named entries can take: `--server-name` is
+  refused with `--config`, so a router-vs-router contest is told to rename the peer instead.
+  Both rendered legends name the new cause; they were closed enumerations in which none of
+  the listed causes was true of a contested row.
 
   **`--json` consumers:** `primer_liability.servers[]` gains `contested_labels`, and
   `break_even_verdict` gains the value `router/live duplicate label`. A fleet with a
-  duplicated peer will see that label's `blocks`/`saved_per_block` leave both rows — that
-  drop IS the correction.
+  duplicated peer that wrote rows this window will see `blocks`, `tokenized_blocks`,
+  `saved_per_block`, `blocks_to_break_even` and `break_even_coverage` all go null on every
+  claimant — for a router the whole row goes dark, not just that label's share — while
+  `primer_tokens`, `primer_source` and `cadence` survive wherever the record is
+  attributable. That drop IS the correction.
+
+  Three limits are filed rather than fixed: two entries that each bake the same explicit
+  `--server-name` with no router present are still uncounted (#426), a hand-edited nested
+  router in `folded-and-live` is dropped (#427), and an estimated primer is still sized
+  against the `mcpServers` key rather than the ledger identity (#428). A `folded` row in a
+  higher-precedence scope also still shadows the live lower-scope entry (#424).
 
 ## [0.33.9] - 2026-09-23
 

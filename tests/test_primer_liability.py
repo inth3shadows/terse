@@ -371,6 +371,79 @@ def test_two_routers_folding_one_peer_name_contest_it(tmp_path):
     assert all(s["verdict"] == "INSUFFICIENT" for s in liab["servers"])
 
 
+def test_the_stanza_names_a_co_writer_whose_own_guess_is_ambiguous(tmp_path):
+    """Re-review of PR #422, finding 2. `contested_here` was derived from `claimed`, which
+    is `_wrapped_labels` — and that answers [] for a guess in `ambiguous`. So a co-writer
+    the CONTEST had counted carried `contested_labels: []`, never entered the naming set,
+    and the stanza printed "more than one installed entry writes under one name" above a
+    list of one, with "remove one of them" having no second referent.
+
+    The two halves were asking different questions of the same row. Being contested also
+    has to OUTRANK being ambiguous in the reason, because the ambiguity line prescribes
+    baking `--server-name` — and on an entry named after a router's peer, that bakes the
+    collision exact."""
+    pol = _policy(tmp_path)
+    rows = [_scan("terse", "router", "python", pol),
+            _scan("python", "folded-and-live", "/usr/bin/python -m server_a", pol,
+                  identity="python", explicit=False),
+            _scan("zzz", "wrapped", "/usr/bin/python -m server_b", pol,
+                  identity="python", explicit=False)]
+    liab = primer_liability(rows, _agg(("python", 100, 100_000, 10_000)))
+    by_name = {s["server"]: s for s in liab["servers"]}
+    text = "\n".join(build_primer_section(liab))
+
+    assert by_name["python"]["contested_labels"] == ["python"]
+    assert by_name["python"]["break_even_verdict"] == "router/live duplicate label"
+    named = text.split("writes under one name:")[1].split("\n")[0]
+    assert "terse" in named and "python" in named, named
+    # ...and it is no longer told to bake the name that makes the collision exact.
+    amb_line = [ln for ln in text.split("\n") if "share a launcher basename" in ln]
+    assert not any("python," in ln or ln.rstrip().endswith("python") for ln in amb_line), \
+        amb_line
+
+
+def test_the_remedy_named_is_one_the_named_entries_can_actually_take(tmp_path):
+    """Re-review of PR #422, finding 3. `--server-name` is REFUSED with `--config` (`cli.py`
+    exits 2), and in a router-vs-router contest every named entry is a router — so the flag
+    was advice neither of them could take, and multiproxy would tag rows with the peer name
+    regardless. Advice that does not fire for a case the line itself names is exactly what
+    the `mcp-status` pointer was removed for one commit earlier."""
+    pol = _policy(tmp_path)
+    agg = _agg(("kb", 10, 10_000, 1_000), ("gh", 5, 5_000, 2_000))
+
+    routers = "\n".join(build_primer_section(primer_liability(
+        [_scan("terse", "router", "gh, kb", pol, scope="user"),
+         _scan("terse-repo", "router", "kb", pol, scope="project")], agg)))
+    assert "rename the peer in one of the peers files" in routers
+    assert "`--server-name`" not in routers
+
+    standalone = "\n".join(build_primer_section(primer_liability(
+        [_scan("terse", "router", "gh, kb", pol),
+         _scan("kb", "folded-and-live", "kb-server --stdio", pol,
+               identity="kb", explicit=True)], agg)))
+    assert "give kb a DISTINCT `--server-name`" in standalone
+
+
+def test_an_idle_duplicate_does_not_black_out_a_complete_measurement(tmp_path):
+    """Re-review of PR #422, finding 5. The blackout keyed on "is anything contested", not
+    on "could the contest have moved a number". A contested label with NO rows this window
+    contributes zero to every sum, so what survives IS the pooled truth — and a correct,
+    complete measurement was turned into INSUFFICIENT because an idle duplicate happened to
+    be installed. The duplication is still reported; only the blackout stands down."""
+    pol = _policy(tmp_path)
+    rows = [_scan("terse", "router", "gh, kb", pol),
+            _scan("kb", "folded-and-live", "kb-server --stdio", pol,
+                  identity="kb", explicit=True)]
+    # `kb` is contested but wrote NOTHING this window; every row under `gh` is the router's.
+    liab = primer_liability(rows, _agg(("gh", 20, 20_000, 5_000)))
+    router = next(s for s in liab["servers"] if s["server"] == "terse")
+
+    assert router["contested_labels"] == ["kb"]   # still reported
+    assert router["blocks"] == 20                 # ...and still measured
+    assert router["verdict"] == "KEEP"
+    assert "writes under one name" in "\n".join(build_primer_section(liab))
+
+
 def test_one_router_alone_contests_none_of_its_own_peers(tmp_path):
     """The false-positive direction of counting writers: a label written by ONE entry is
     that entry's, however many peers the router fronts. Without this, the widening above
@@ -838,9 +911,11 @@ def test_the_rendered_section_separates_the_two_causes_of_an_unknown_label(tmp_p
 
 
 def test_the_break_even_legend_does_not_re_collapse_the_causes(tmp_path):
-    """`1x?` reaches the table from any of THREE causes; the legend used to name one, then
+    """`1x?` reaches the table from any of FOUR causes; the legend used to name one, then
     two (#397 added "writes no ledger rows" — review of PR #417 caught the legend still
-    claiming two).
+    claiming two), and #396 added a label shared with another writer (re-review finding 4:
+    the legend was a CLOSED enumeration and the new cause was in none of it, so a contested
+    entry printed `1x?` beside three reasons that were all false of it).
 
     A CALLED server is in the fleet on purpose: the table is gated on someone having been
     called, so an all-ambiguous install renders no table at all and the primer-section prose
@@ -853,7 +928,8 @@ def test_the_break_even_legend_does_not_re_collapse_the_causes(tmp_path):
     lines = "\n".join(_build_break_even_table(liab["servers"]))
     assert "ambiguous ledger label" in lines            # the table cell
     # the legend agrees with it, and names every cause that can land an entry in `1x?`
-    assert ("no ledger label, an ambiguous one, or no rows written at all") in lines
+    assert "no ledger label, an ambiguous one, a label shared with another writer," in lines
+    assert "written at all); 1x- = unpaid" in lines
 
 
 def test_an_all_ambiguous_fleet_still_says_why_there_is_no_table(tmp_path):
