@@ -172,6 +172,19 @@ def test_the_command_line_writes_the_fleet_shapes_when_asked(tmp_path):
     assert "synthetic.secret.list_credentials" in r.stdout
 
 
+def test_the_command_line_writes_hand_results_not_legacy_blocks(tmp_path):
+    """#380, driven through the subprocess layer `terse verify` runs: every envelope carries
+    its own `manual:` id, so the fleet shapes are never timing-grouped into one result."""
+    from terse.policy_gen import group_results, heuristic_share
+
+    r = _run_script(tmp_path, gsc.FLEET_FLAG)
+    assert r.returncode == 0, r.stderr
+    envs = capture.load_corpus(tmp_path)
+    assert all(str(e.get("result_id", "")).startswith("manual:") for e in envs)
+    assert heuristic_share(envs) == (0, len(envs))
+    assert all(len(g) == 1 for groups in group_results(envs).values() for g in groups)
+
+
 def test_a_mistyped_flag_is_refused_rather_than_silently_ignored(tmp_path):
     # Both spellings of the same silent no-op: exit 0, a corpus with no fleet shapes in it,
     # and nothing saying so — then a codec-verdict run measuring nothing about the shape the

@@ -125,12 +125,14 @@ def main() -> int:
         obj = prefix_of(json.loads(src.read_text(encoding="utf-8")), n)
         raw = minify(obj)
         # `capture_payload` is the same path the proxy and `terse capture` use, so the
-        # envelopes this writes are indistinguishable from a real captured corpus.
+        # envelopes this writes are indistinguishable from a real captured corpus —
+        # `manual=True`, as `terse capture` passes, or each one reads as a legacy capture
+        # that `policy generate`/`tune` timing-groups with its neighbours (#380).
         # max_per_tool=1: envelopes are named by content sha, so re-running with a
         # different PREFIXES value would otherwise ADD a second envelope for the same
         # tool rather than replace it, and `load_corpus` would then score that tool
         # twice at two different sizes. Capping at one per tool evicts the stale one.
-        capture_payload(tool, raw, out_dir, max_per_tool=1)
+        capture_payload(tool, raw, out_dir, manual=True, max_per_tool=1)
         raw_tok = count_cl100k(raw)
         cmp_text = compress(obj)
         cmp_tok = count_cl100k(cmp_text)

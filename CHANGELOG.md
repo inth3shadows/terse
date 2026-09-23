@@ -15,6 +15,21 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **The bundled corpus generators write what `terse capture` writes (#380).**
+  `scripts/gen_stress_corpus.py` (the `terse verify` sample and the `--fleet-shapes`
+  codec corpus) and `scripts/gen_real_corpus.py` now pass `manual=True`, so each payload
+  carries its own `manual:` result id instead of reading as a legacy proxy block.
+  **Scoring shift:** `policy generate`/`tune` over these corpora no longer timing-groups
+  payloads written back-to-back into one result — the three
+  `synthetic.secret.list_credentials` fleet shapes were ONE joined 3-block result and are
+  now three results (measured with `group_results` on both versions of the script). `terse verify` and the fluency/codec evals ignore `result_id` and are
+  unaffected. An existing generated directory keeps its old envelopes; regenerate into a
+  fresh one.
+
+## [0.33.10] - 2026-09-23
+
+### Fixed
+
 - **A `terse capture` payload is its own result, not a legacy envelope (#380).** It wrote
   `captured_at` and no `result_id`, which is exactly a pre-#148 proxy capture. So
   `policy generate`/`autotune`/`tune` grouped consecutive hand captures of one tool by
