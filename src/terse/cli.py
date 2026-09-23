@@ -40,7 +40,6 @@ from .capture import (
     extract_records,
     is_sidecar_filename,
     load_corpus,
-    manual_result_id,
     qualify,
 )
 from .html_report import build_html_diff_report, build_html_report
@@ -92,8 +91,7 @@ def _cmd_capture(args: argparse.Namespace) -> int:
     raw = _read(args.file)
     # A hand-captured file IS one whole result, so it gets its own id. Leaving it absent
     # made it read as a pre-#148 proxy capture: grouped by timing, and flagged as legacy.
-    path = capture_payload(args.tool, raw, args.corpus, server=args.server,
-                           result_id=manual_result_id(raw))
+    path = capture_payload(args.tool, raw, args.corpus, server=args.server, manual=True)
     print(f"captured {args.tool} ({classify_shape(raw)}, {len(raw)} bytes) -> {path}")
     return 0
 
@@ -370,7 +368,8 @@ def tune_sample_provenance(envelopes: list) -> tuple[int, int, int]:
 
     `tune` prints its payload COUNT, and the count is not the sample. A `result_id` dates
     an envelope: its absence marks a capture from before `#116` folded a multi-block
-    result into one envelope, and modern captures fold to a record list 14x more often
+    result into one envelope (a hand capture's `manual:` id says instead that the payload
+    was captured whole, so it was never a fragment either), and modern captures fold to a record list 14x more often
     than the fossils do (#374: 25.0% vs 1.8% `array-of-records`). And a record list is
     the shape `--drop-eval` can ask a question over (`_questions_and_staging`), so a
     `~34% tok` figure over a sample that is 4% record lists came from fragments of the
@@ -1264,8 +1263,9 @@ def _cmd_tune(args: argparse.Namespace) -> int:
     # The sample's provenance, on the line under its count (#380).
     print(_tune_sample_line(envelopes))
     # What the share above costs, and the remedy — the same note `policy generate` and
-    # `autotune` print (#380). Silent on a fully-identified corpus, which a `terse capture`
-    # corpus now is (`capture.manual_result_id`).
+    # `autotune` print (#380). A `terse capture` corpus no longer trips the result-id half
+    # (`capture_payload(manual=True)`); one captured without `--server` still trips the
+    # server half, correctly.
     _print_corpus_identity_note(envelopes)
 
     # Rationale in `_tune_ledger_warnings`'s own docstring (#274) — this call site just

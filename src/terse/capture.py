@@ -202,16 +202,6 @@ def _sha8(raw: str) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
 
 
-def manual_result_id(raw: str) -> str:
-    """The `result_id` a hand `terse capture` stamps: the payload is one whole result.
-
-    Absent, a hand capture was indistinguishable from a pre-#148 proxy envelope (both carry
-    `captured_at` and no id), so `policy_gen` grouped consecutive hand captures by TIMING
-    into one guessed "result", and the identity note told the operator to re-capture a
-    corpus that no re-capture could fix (#380). Keyed by content, so re-capturing the same
-    file stays idempotent and two different files never share a group."""
-    return f"manual:{_sha8(raw)}"
-
 
 # Retention cap, PER TOOL rather than over the whole corpus. Every consumer of this
 # corpus — measure, probes, policy generate/autotune — reasons per tool, so a global
@@ -243,6 +233,7 @@ def _prune_tool_samples(corpus: Path, safe_tool: str, keep: int) -> None:
 
 def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
                     server: str | None = None, result_id: str | None = None,
+                    manual: bool = False,
                     max_per_tool: int | None = MAX_SAMPLES_PER_TOOL) -> Path:
     """Persist one captured payload as a shape-tagged envelope. Idempotent by sha.
 
@@ -250,6 +241,14 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
     tool RESULT this payload was one content block of. Both are optional because the
     format is additive — a corpus captured before they existed stays loadable, and every
     consumer treats their absence as "unknown", never as a value (#148, #152).
+
+    `manual` marks a hand capture (`terse capture`): the payload is one whole result, so it
+    gets its own id, `manual:<file stem>`. Without one, a hand capture was indistinguishable
+    from a pre-#148 proxy envelope (`captured_at`, no id): consecutive hand captures were
+    grouped by TIMING into one guessed result, and the identity note told the operator to
+    re-capture a corpus no re-capture could fix (#380). Keyed by the file stem — tool
+    spelling AND sha — not the sha alone: two spellings that qualify to one runtime tool
+    (`kb.search` vs `search --server kb`) are two captures and must stay two results.
 
     `max_per_tool` bounds how many envelopes this tool keeps; the oldest are evicted past
     it. Pass `None` to retain everything (the pre-cap behavior) — appropriate for a
@@ -284,6 +283,12 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
                     result_id = None
         except (json.JSONDecodeError, OSError):
             pass
+    # A hand capture fills a MISSING id even on rewrite, unlike a proxy id above: its group
+    # is this one envelope, so no other block's clock can disagree with it. That is what
+    # makes "re-capture" a real remedy for a hand corpus written before the id existed. A
+    # prior PROXY id is kept — the first sighting was a real multi-block result.
+    if manual and result_id is None:
+        result_id = f"manual:{path.stem}"
     envelope: dict[str, Any] = {
         "tool": tool,
         "shape": classify_shape(raw),

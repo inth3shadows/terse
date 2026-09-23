@@ -1391,6 +1391,51 @@ def test_a_hand_capture_is_its_own_result_not_a_legacy_envelope(tmp_path, capsys
     assert "[note]" not in out
 
 
+def test_two_spellings_of_one_tool_stay_two_hand_results(tmp_path):
+    """Review of #380: an id keyed by content alone let `kb.search` and `search --server
+    kb` — two files that qualify to one runtime tool — share `manual:<sha>`, so the same
+    payload joined with itself and earned `dictionary` off the duplicate."""
+    from terse.capture import load_corpus
+    from terse.policy_gen import group_results
+
+    corpus = tmp_path / "c"
+    f = _write(tmp_path, "p.json", json.dumps({"id": 7, "team": "platform-infra"}))
+    assert main(["capture", str(f), "--tool", "kb.search", "--corpus", str(corpus)]) == 0
+    assert main(["capture", str(f), "--tool", "search", "--server", "kb",
+                 "--corpus", str(corpus)]) == 0
+    groups = group_results(load_corpus(corpus))
+    assert [len(g) for g in groups["kb.search"]] == [1, 1]
+
+
+def test_re_capturing_an_old_hand_corpus_is_a_real_remedy(tmp_path, capsys):
+    """Review of #380: the note says "Re-capture to make this exact", but a proxy-style
+    rewrite keeps a prior envelope's MISSING id, so re-running `terse capture` over a hand
+    corpus written before the id existed changed nothing. A hand id fills the gap."""
+    from terse.capture import capture_payload, load_corpus
+
+    corpus = tmp_path / "c"
+    raw = json.dumps([{"id": 1}, {"id": 2}])
+    capture_payload("kb.x", raw, corpus, server="kb")            # an old hand capture
+    assert main(["capture", str(_write(tmp_path, "p.json", raw)), "--tool", "kb.x",
+                 "--server", "kb", "--corpus", str(corpus)]) == 0
+    (env,) = load_corpus(corpus)
+    assert env["result_id"] == "manual:kb.x__" + env["sha"]
+    capsys.readouterr()
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    assert "[note]" not in capsys.readouterr().out
+
+
+def test_a_hand_capture_keeps_a_prior_proxy_result_id(tmp_path):
+    """The first sighting was a real multi-block proxy result; a later hand capture of
+    the same block must not re-home it into a group of one."""
+    from terse.capture import capture_payload, load_corpus
+
+    corpus = tmp_path / "c"
+    capture_payload("kb.x", "[1]", corpus, server="kb", result_id="abcd1234:1.7")
+    capture_payload("kb.x", "[1]", corpus, server="kb", manual=True)
+    assert load_corpus(corpus)[0]["result_id"] == "abcd1234:1.7"
+
+
 def test_tune_names_a_legacy_sample_and_its_remedy(tmp_path, capsys):
     """#380 part 2: the `sample:` line states the result_id share; the note says what a
     low one costs. A proxy-shaped envelope with no id is the case that earns it."""

@@ -603,6 +603,7 @@ then presents drop-to-retrieve candidates **safe-first**, classified by field ro
 terse tune --corpus corpus/ --out policy.json
 # # terse tune — 40 payload(s), 6 tool(s), 3 drop candidate(s)
 # #   sample: 31 with result_id (78%), 12 record-list (30%)
+#   [note] 9/40 payload(s) predate result ids; their results were grouped by capture timing, which can merge parallel calls into one. Re-capture to make this exact.
 # SAFE candidates — supporting prose, enable after a dropeval pass:
 #   kb.read.nodes    result[].description   ~41% tok, 100% uniq  [prose]
 #   → enabling all 1 here: ≈12,400 tok, ~18% of corpus (gross, before the per-record retrieve-handle cost)
@@ -1117,8 +1118,10 @@ your-tool | uv run terse capture --tool your.tool.name -
 
 Add `--server <name>` if that tool comes from a named MCP server, so the rule generated for
 it is authored under the same qualified name the proxy looks it up by (see *Rule names carry
-the server* above). A payload captured this way records no result id — it has no result to
-belong to — so it is scored as a single-block result, which is the honest reading.
+the server* above). A payload captured this way records its own result id (`manual:<file>`),
+so it is scored as one whole result, never grouped with a neighbouring capture by timing.
+A payload hand-captured before that id existed reads as a legacy capture until you run the
+same `terse capture` again, which adds it.
 
 Each capture is saved locally. **Only capture output you're comfortable storing** —
 captured files can contain whatever the tool returned. Do not capture anything with
