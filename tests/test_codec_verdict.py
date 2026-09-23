@@ -137,6 +137,74 @@ def test_report_groups_by_tool_and_shape_not_globally():
     assert report.count("| **SAFE**") == 2
 
 
+def test_a_SAFE_cell_scopes_its_compliance_to_the_run_too():
+    """#412's silent direction: a run that happened to comply licenses SAFE, and the cell
+    said nothing about the rate that let it through. The same (model, payload, question)
+    read 29% and then 100%, so a passing rate is one run's as much as a failing one."""
+    rows = [_row(f"q{i}", 1, 1, raw_calls=1, terse_calls=1) for i in range(_CODEC_MIN_TRIALS)]
+    cell = next(ln for ln in build_codec_verdict_report(
+        {"m": _tagged(rows, "t", "array-of-records")}).splitlines() if ln.startswith("| `t` |"))
+    assert "**SAFE**" in cell
+    assert "tool-call compliance raw 100%, terse 100% in this run" in cell
+    assert "not measured across runs" in cell
+
+
+def test_a_SAFE_cell_without_compliance_counters_claims_nothing_about_them():
+    """Pre-#403 rows never measured compliance; the caveat must not invent a rate."""
+    rows = [_row(f"q{i}", 1, 1) for i in range(_CODEC_MIN_TRIALS)]
+    cell = next(ln for ln in build_codec_verdict_report(
+        {"m": _tagged(rows, "t", "array-of-records")}).splitlines() if ln.startswith("| `t` |"))
+    assert "**SAFE**" in cell and "compliance" not in cell
+
+
+def _safe_cell(results: dict) -> str:
+    cell = next(ln for ln in build_codec_verdict_report(results).splitlines()
+                if ln.startswith("| `t` |"))
+    assert "**SAFE**" in cell, cell
+    return cell
+
+
+def _tagged_t(rows):
+    return _tagged(rows, "t", "array-of-records")
+
+
+def test_a_multi_model_SAFE_cell_quotes_the_lowest_passing_rate_whatever_the_names():
+    """Review of #432: the caveat read the tie-break model (first by NAME), so identical
+    evidence printed terse 100% or 80%. The weakest model is what let the cell through."""
+    full = [_row(f"q{i}", 1, 1, raw_calls=1, terse_calls=1) for i in range(20)]
+    floor = [_row(f"q{i}", 1, 1, raw_calls=1, terse_calls=int(i >= 4)) for i in range(20)]
+    for strong in ("a", "z"):                       # sorts before AND after `b`
+        cell = _safe_cell({strong: _tagged_t(full), "b": _tagged_t(floor)})
+        # raw ties at 100% across both models: nobody is singled out by sort order.
+        assert "compliance raw 100%, terse 80% (`b`) in this run" in cell, cell
+
+
+def test_a_partly_counted_model_withholds_the_cell_rate_rather_than_vanishing():
+    """Review 2 of #432: `b` passed the gate on 8/10 counted rows plus 10 uncounted ones.
+    Skipping `b` and quoting `a`'s 100% claimed more compliance than `b`'s evidence."""
+    full = [_row(f"q{i}", 1, 1, raw_calls=1, terse_calls=1) for i in range(20)]
+    part = ([_row(f"q{i}", 1, 1, raw_calls=1, terse_calls=int(i >= 2)) for i in range(10)]
+            + [_row(f"p{i}", 1, 1) for i in range(10)])
+    assert "compliance" not in _safe_cell({"a": _tagged_t(full), "b": _tagged_t(part)})
+
+
+def test_a_near_full_SAFE_rate_never_prints_as_full():
+    """2499/2500 is one prose answer, not full compliance; `:.0%` rounded it to 100%, and
+    so would a one-decimal ROUND (100.0%) — only truncation keeps it under (99.9%)."""
+    rows = [_row(f"q{i}", 125, 125, trials=125, raw_calls=125, terse_calls=125 - (i == 0))
+            for i in range(20)]
+    cell = _safe_cell({"m": _tagged_t(rows)})
+    assert "terse 99.9%" in cell and "terse 100" not in cell, cell
+
+
+def test_a_SAFE_cell_mixing_old_and_new_rows_claims_no_rate():
+    """`codec_call_rate` counts only the rows carrying the counter; quoting that as the
+    cell's rate would describe 10 of 20 trials as all of them."""
+    rows = ([_row(f"q{i}", 1, 1, raw_calls=1, terse_calls=1) for i in range(10)]
+            + [_row(f"p{i}", 1, 1) for i in range(10)])
+    assert "compliance" not in _safe_cell({"m": _tagged_t(rows)})
+
+
 def test_report_gates_on_the_worst_model_within_a_group():
     clean = [_row(f"q{i}", 1, 1) for i in range(_CODEC_MIN_TRIALS)]
     broken = [_row("q-bad", 1, 0)]

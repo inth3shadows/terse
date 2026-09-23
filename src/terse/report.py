@@ -1405,6 +1405,32 @@ def fixed_ideal_sufficient(n: int | None) -> bool:
 _VERDICT_RANK = {"SAFE": 0, "UNRESOLVED": 1, "UNSAFE": 2}  # worst wins when grouping models
 
 
+def _codec_call_rates(rows: list[dict[str, Any]]) -> list[tuple[str, float]]:
+    """`(arm, rate)` for every arm whose tool-call compliance was measured on ALL of `rows`.
+
+    All, not any: `codec_call_rate` counts only the rows carrying the counter, so a cell
+    mixing pre- and post-#403 rows would quote a rate over part of its trials as the cell's.
+    For the SAFE caveat only: the GATE (`_codec_low_call_arms`) deliberately reads any
+    carrying row, and routing it through this stricter rule would change verdicts."""
+    out = []
+    for form in ("raw_ok", "terse_ok"):
+        key = form.replace("_ok", "_calls")
+        if rows and all(key in r for r in rows):
+            rate = codec_call_rate(rows, form)
+            if rate is not None:
+                out.append((form[:-len("_ok")], rate))
+    return out
+
+
+def _codec_rate_text(rate: float) -> str:
+    """`:.0%`, except a rate short of 100% never prints AS 100%: 199/200 is not full
+    compliance, and saying so hides the one prose answer (review of #432)."""
+    shown = f"{rate:.0%}"
+    if rate < 1.0 and shown == "100%":
+        return f"{math.floor(rate * 1000) / 10:.1f}%"
+    return shown
+
+
 def _codec_low_call_arms(rows: list[dict[str, Any]]) -> list[tuple[str, float]]:
     """`(arm, rate)` for EVERY arm whose tool-call compliance is below
     `_CODEC_MIN_CALL_RATE`, worst first; empty when every measured arm clears it.
@@ -1970,6 +1996,35 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
                 model_col = ", ".join(f"`{m}`" for m, _ in per_model)
         else:
             why = f"{n} zero-failure trials"
+            # The other half of #412: a LOW compliance rate is labelled one run's, and so must
+            # a passing one be. SAFE licenses "the value survives into a real tool argument"
+            # on a rate that read 29% and then 100% on the same cell, so the rate that let
+            # this cell through is stated, scoped to the run, beside the verdict it carried.
+            # The LOWEST passing rate per arm across every model: SAFE needs all of them to
+            # clear the floor, so the weakest is the one that let the cell through. Reading
+            # the tie-break model alone printed 100% or 80% for the same evidence depending
+            # on which model name sorted first (review of #432).
+            # An arm is quoted only when EVERY model has a full reading for it: a model with
+            # uncounted rows passed the gate on a partial rate (or none), and dropping just
+            # that model would quote a better-measured one's 100% for the cell (review 2).
+            rates_by_model = {m: dict(_codec_call_rates(g.rows)) for m, (_, g) in verdicts.items()}
+            # Every model AT the lowest rate is named, so a tie does not single one out by
+            # sort order; a rate every model shares names nobody (review 2 of #432).
+            lowest: dict[str, tuple[float, list[str]]] = {}
+            for arm in ("raw", "terse"):
+                if all(arm in rates for rates in rates_by_model.values()):
+                    low = min(rates[arm] for rates in rates_by_model.values())
+                    lowest[arm] = (low, [m for m, rates in rates_by_model.items()
+                                         if rates[arm] == low])
+            if lowest:
+                n_models = len(verdicts)
+                shown = ", ".join(
+                    f"{arm} {_codec_rate_text(rate)}"
+                    + ("" if len(ms) == n_models else
+                       " (" + ", ".join(f"`{m}`" for m in ms) + ")")
+                    for arm, (rate, ms) in lowest.items())
+                why += (f"; tool-call compliance {shown} in this run — not measured across "
+                        f"runs")
         out.append(f"| `{tool}` | {shape} | {questions} | {n_col} | **{worst_verdict}** | "
                    f"{model_col} | {why} |")
     out.append("")
