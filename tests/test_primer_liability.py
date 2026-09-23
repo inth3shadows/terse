@@ -208,8 +208,9 @@ def test_a_live_duplicate_sharing_its_router_peer_label_is_unattributable(tmp_pa
     by_name = {s["server"]: s for s in liab["servers"]}
 
     assert by_name["terse"]["ledger_labels"] == ["gh"]
-    assert by_name["terse"]["blocks"] == 5          # NOT 15 — `kb`'s ten are unattributable
+    assert by_name["terse"]["blocks"] is None       # NOT 15, and NOT gh's 5 either
     assert by_name["terse"]["contested_labels"] == ["kb"]
+    # The attributable half is still VISIBLE, just not summed into a verdict.
     assert [c["label"] for c in by_name["terse"]["contributors"]] == ["gh"]
 
     assert by_name["kb"]["ledger_labels"] == []
@@ -249,23 +250,55 @@ def test_a_router_whose_surviving_peers_are_quiet_reports_unknown_not_never_call
     assert liab["idle"] == []                   # NOT ["terse"] — it is not "pure cost"
 
 
-def test_a_surviving_label_with_real_volume_is_still_measured(tmp_path):
-    """The other half of the rule above, and the reason the blackout is scoped to a ZERO
-    sum. A router that keeps a peer with real rows has an honest measurement over fewer
-    labels — under-complete, and understating savings, so every verdict it produces is
-    conservative. Blacking that out too would delete a correct measurement, which is the
-    #285/#397 failure direction this fix must not repeat. `contested_labels` is what tells
-    a consumer the row is incomplete."""
-    pol = _policy(tmp_path)
-    rows = [_scan("terse", "router", "gh, kb", pol),
-            _scan("kb", "folded-and-live", "kb-server --stdio", pol,
-                  identity="kb", explicit=True)]
-    liab = primer_liability(rows, _agg(("kb", 10, 10_000, 1_000), ("gh", 5, 5_000, 2_000)))
-    router = next(s for s in liab["servers"] if s["server"] == "terse")
+def test_a_contested_row_is_not_measured_even_where_a_label_survives(tmp_path):
+    """Re-review of PR #422, finding 1. The first fix blacked out only a ZERO surviving sum
+    and justified the rest with "dropping labels only understates savings, so the verdict is
+    conservative". Both halves of that are false, and this pins the replacement: any
+    contested label leaves the row unmeasured.
 
-    assert router["ledger_labels"] == ["gh"] and router["contested_labels"] == ["kb"]
-    assert router["blocks"] == 5               # gh's rows, and only gh's
-    assert router["break_even_verdict"] is None and router["verdict"] == "KEEP"
+    COVERAGE is `saved/primer`, so dropping a label whose savings are NEGATIVE raises it.
+    Below, `kb` expands payloads and `gh` saves a little: pooled, the router is structurally
+    losing and reads UNWRAP/`never` — the one verdict documented as stopping an operator.
+    Contest `kb` away and the old rule read TUNE, "arithmetically reachable", off the
+    surviving `gh` alone."""
+    pol = _policy(tmp_path)
+    router = _scan("terse", "router", "gh, kb", pol)
+    # kb EXPANDS: out > raw, so its contribution to `saved` is negative.
+    agg = _agg(("kb", 50, 1_000, 6_000), ("gh", 10, 3_000, 1_000))
+
+    pooled = primer_liability([router], agg)["servers"][0]
+    assert pooled["saved_per_block"] < 0
+    assert pooled["verdict"] == "UNWRAP"
+
+    contested = primer_liability(
+        [router, _scan("kb", "folded-and-live", "kb-server --stdio", pol,
+                       identity="kb", explicit=True)], agg)
+    terse = next(s for s in contested["servers"] if s["server"] == "terse")
+    assert terse["contested_labels"] == ["kb"]
+    assert terse["blocks"] is None            # NOT gh's 10, which would read as a win
+    assert terse["saved_per_block"] is None
+    assert terse["verdict"] == "INSUFFICIENT"  # NOT TUNE, and NOT a cleared KEEP
+
+
+def test_dropping_a_low_rate_label_cannot_inflate_the_published_rate(tmp_path):
+    """The second half of the same finding, and the one a sign test on the dropped label
+    would have missed. The RATE is `saved/tokenized` and has no monotone direction: drop a
+    high-volume/low-rate label and it inflates without bound. Measured, a row rendered
+    `600/block` against a true pooled `266.7` — and the break-even table's own closing line
+    is "wrap a server when it clears its own row"."""
+    pol = _policy(tmp_path)
+    router = _scan("terse", "router", "gh, kb", pol)
+    #        gh: 3,000 saved over 5   = 600/block     kb: 1,000 over 10 = 100/block
+    agg = _agg(("gh", 5, 5_000, 2_000), ("kb", 10, 11_000, 10_000))
+
+    assert primer_liability([router], agg)["servers"][0]["saved_per_block"] == 4_000 / 15
+
+    terse = next(s for s in primer_liability(
+        [router, _scan("kb", "folded-and-live", "kb-server --stdio", pol,
+                       identity="kb", explicit=True)], agg)["servers"]
+        if s["server"] == "terse")
+    assert terse["saved_per_block"] is None   # NOT 600.0, 2.25x the pooled truth
+    assert terse["blocks_to_break_even"] is None
 
 
 def test_a_duplicate_at_ANOTHER_SCOPE_contests_the_label_too(tmp_path):
@@ -285,11 +318,70 @@ def test_a_duplicate_at_ANOTHER_SCOPE_contests_the_label_too(tmp_path):
     by_name = {s["server"]: s for s in liab["servers"]}
 
     assert by_name["terse"]["ledger_labels"] == ["gh"]
-    assert by_name["terse"]["blocks"] == 5           # NOT 15
+    assert by_name["terse"]["blocks"] is None        # NOT 15
     assert by_name["terse"]["contested_labels"] == ["kb"]
     assert by_name["kb"]["ledger_labels"] == []
     assert by_name["kb"]["blocks"] is None           # NOT 10, counted a second time
     assert by_name["kb"]["break_even_verdict"] == "router/live duplicate label"
+
+
+def test_an_ambiguous_guess_still_contests_a_router_peer_name(tmp_path):
+    """Re-review of PR #422, finding 2 — a REGRESSION the first fix introduced. Routing the
+    claimant through `_wrapped_labels` inherited its `ambiguous` filter, which the
+    hand-rolled read it replaced did not have.
+
+    `_wrapped_labels` answers the COUNTING question ("may this entry bank these rows"), and
+    returns [] for a guess two entries share. The contest asks the WRITING question, and an
+    ambiguous entry writes under that label all the same. With the filter in place, a router
+    peer named `python` beside another entry guessing `python` stopped being contested and
+    the router reported a cleared KEEP over rows three processes wrote."""
+    pol = _policy(tmp_path)
+    rows = [_scan("terse", "router", "python", pol),
+            # The live duplicate of peer `python`, guessing (no baked --server-name).
+            _scan("python", "folded-and-live", "/usr/bin/python -m server_a", pol,
+                  identity="python", explicit=False),
+            # An unrelated wrap that guesses the same launcher basename.
+            _scan("zzz", "wrapped", "/usr/bin/python -m server_b", pol,
+                  identity="python", explicit=False)]
+    liab = primer_liability(rows, _agg(("python", 100, 100_000, 10_000)))
+    by_name = {s["server"]: s for s in liab["servers"]}
+
+    assert by_name["terse"]["contested_labels"] == ["python"]
+    assert by_name["terse"]["blocks"] is None        # NOT 100, written by three processes
+    assert by_name["terse"]["verdict"] == "INSUFFICIENT"
+
+
+def test_two_routers_folding_one_peer_name_contest_it(tmp_path):
+    """Re-review of PR #422, finding 1 (the skill pass). The contest used to intersect "a
+    router's peers" with "a duplicate's label", so a router could only ever sit on the
+    left-hand side — but a router is itself an entry running a proxy under that peer's name.
+
+    `--router-name` gives two routers distinct names, so `_precedence_winner`'s name dedup
+    does not save this. Counting WRITERS per label answers it without a second rule, and
+    answers the `router-ambiguous` pair (two routers over one peers file) the same way."""
+    pol = _policy(tmp_path)
+    rows = [_scan("terse", "router", "gh, kb", pol, scope="user"),
+            _scan("terse-repo", "router", "kb", pol, scope="project")]
+    liab = primer_liability(rows, _agg(("kb", 10, 10_000, 1_000), ("gh", 5, 5_000, 2_000)))
+    by_name = {s["server"]: s for s in liab["servers"]}
+
+    assert by_name["terse"]["contested_labels"] == ["kb"]
+    assert by_name["terse-repo"]["contested_labels"] == ["kb"]
+    assert by_name["terse"]["blocks"] is None and by_name["terse-repo"]["blocks"] is None
+    assert all(s["verdict"] == "INSUFFICIENT" for s in liab["servers"])
+
+
+def test_one_router_alone_contests_none_of_its_own_peers(tmp_path):
+    """The false-positive direction of counting writers: a label written by ONE entry is
+    that entry's, however many peers the router fronts. Without this, the widening above
+    would black out every fleet in existence."""
+    pol = _policy(tmp_path)
+    liab = primer_liability([_scan("terse", "router", "gh, kb", pol)],
+                            _agg(("kb", 10, 10_000, 1_000), ("gh", 5, 5_000, 2_000)))
+    row = liab["servers"][0]
+    assert row["ledger_labels"] == ["gh", "kb"]
+    assert row["blocks"] == 15 and row["contested_labels"] == []
+    assert row["verdict"] == "KEEP"
 
 
 def test_a_plain_folded_peer_never_contests_its_own_router(tmp_path):
@@ -321,10 +413,21 @@ def test_every_reason_in_the_vocabulary_fits_the_break_even_cell(tmp_path):
     from terse.stats import (
         _BREAK_EVEN_MAX_WIDTH,
         _NO_DATA_REASONS,
+        _R_ROUTER_DUP,
+        _break_even,
         _build_break_even_table,
     )
 
-    vocabulary = set(_NO_DATA_REASONS) | {"never called", "no primer", "losing tokens"}
+    # DERIVED by driving `_break_even` itself, not hand-listed. The first draft listed
+    # `losing tokens`, a string this codebase never produces, and omitted the real `never`
+    # — so the guarantee below held only for `_NO_DATA_REASONS` and a long string added on
+    # the other side would still have folded the table (re-review finding, both reviewers).
+    probes = [(None, None, None, 0), (200, 0, 0, 0), (200, 5, 0, 0), (None, 5, 5, 900),
+              (0, 5, 5, 900), (200, 5, 5, -900), (200, 5, 5, 900)]
+    vocabulary = {v for v in (_break_even(*p)["break_even_verdict"] for p in probes) if v}
+    vocabulary |= set(_NO_DATA_REASONS)
+    assert vocabulary >= {"never called", "no token data", "primer unknown", "no primer",
+                          _R_ROUTER_DUP}, vocabulary
     # Every cell at its DECLARED width — name 14, primer 6 — since the 79-column arithmetic
     # in `_build_break_even_table` is stated in those terms. A value wider than its own cell
     # is a different (and already-pinned) overflow; this test measures the reason string.
@@ -360,12 +463,17 @@ def test_the_report_names_the_router_duplicate_and_does_not_prescribe_server_nam
     text = "\n".join(build_primer_section(liab))
 
     assert "router/live duplicate label" in text
-    assert "remove the duplicate entry" in text and "DISTINCT `--server-name`" in text
+    assert "remove one of them" in text and "DISTINCT `--server-name`" in text
+    # NOT a pointer to `mcp-status`: that warning fires only on `folded-and-live`, so it is
+    # silent for the cross-scope duplicate this contest was widened to catch (re-review
+    # finding). The shared LABEL is named instead, which is true in every case.
+    assert "mcp-status" not in text
+    assert "the shared label(s): kb." in text
     # Review of PR #422, finding 4: BOTH claimants are named. The stanza was built with
     # `_named`, which intersects with `uncertain` (cadence `1x?`) — and a router is always
     # `per-turn`, so it printed this verdict in a table cell nothing explained. The same gap
     # `silent_any` was added for in #417, one reason later.
-    named = text.split("write under one name:")[1].split("\n")[0]
+    named = text.split("writes under one name:")[1].split("\n")[0]
     assert "terse" in named and "kb" in named, named
     # The line the `ambiguous` cause prints, which must NOT appear for this one.
     assert "share a launcher basename" not in text

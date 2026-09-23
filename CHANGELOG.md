@@ -100,18 +100,27 @@ fails that pull request until the section has moved.
 
   Review of the above found four more, all reproduced before being fixed:
 
-  - **A row that had a label taken away no longer reports a measured zero.** Dropping a
-    contested label leaves a ROUTER with a non-empty but incomplete label set; where the
-    surviving peers were quiet this window the sum was `0`, which `_break_even` reads as the
-    hard claim `never called`, `_recommend` escalates to `UNWRAP`, and the `idle` line prints
-    as "pure cost". A real fleet flipped `KEEP` -> `UNWRAP` on it, with the report
-    contradicting itself two lines apart. It now reports unknown. A non-zero surviving sum is
-    still measured — it understates savings, so the verdict it yields is conservative.
-  - **A duplicate at ANOTHER SCOPE is contested too.** The contest was keyed on
-    `folded-and-live`, but `folded` is computed per scope, so a peer folded behind a
-    user-scope router and separately wrapped at project scope was `wrapped` and never
-    contested — two plain `install-mcp` runs reproduced the same double count. The key is
-    now the LABEL: any entry that runs its own proxy and claims a router's peer name.
+  - **A row that had a label taken away publishes no measurement at all.** Where the
+    surviving sum was `0` this reported `never called` — the hard claim — which `_recommend`
+    escalates to `UNWRAP` and the `idle` line prints as "pure cost"; a real fleet flipped
+    `KEEP` -> `UNWRAP` with the report contradicting itself two lines apart. A non-zero
+    surviving sum is no safer, and a first fix wrongly called it "conservative": coverage is
+    `saved/primer`, so dropping a LOSS-making label raises it (a structurally unearnable
+    `UNWRAP`/`never` read `TUNE`), and the rate is `saved/tokenized`, which has no monotone
+    direction at all (a row rendered `600/block` against a true pooled `266.7`). Any
+    contested label now blacks the row out. `contributors` still lists the labels that
+    survived, so nothing attributable is hidden.
+  - **The contest counts WRITERS per label instead of matching two fixed roles.** Keyed on
+    `folded-and-live`, it missed a duplicate at another scope (`folded` is per-scope, so the
+    same peer wrapped at project scope is `wrapped`); keyed on an intersection, it could
+    only ever put a router on one side, so two routers folding one peer name were never
+    contested. Counting writers answers both, and the `router-ambiguous` pair as well. One
+    side must still be a router — two plain wrapped entries resolving to one non-launcher
+    label are one logical server installed twice, which #285 ruled honest.
+  - **The label a claimant WRITES, not the one it may COUNT.** Resolving it through
+    `_wrapped_labels` inherited that function's `ambiguous` filter, so a router peer named
+    `python` beside another entry guessing `python` stopped being contested and the router
+    reported a cleared `KEEP` over rows three processes wrote.
   - **The new reason no longer folds the break-even table.** `router/live duplicate label`
     is 27 characters against a documented bound of 84 for a 62-column row; it is abbreviated
     in that one cell and published in full everywhere else. The width test now drives the
@@ -119,7 +128,13 @@ fails that pull request until the section has moved.
   - **Every entry whose labels were taken is named in the stanza that explains it.** The
     line was built from the `uncertain` set, which a router can never be in, so a contested
     router printed a verdict nothing in the report explained — the gap `silent_any` closed
-    in #417, one reason later.
+    in #417, one reason later. The stanza names the shared LABEL rather than
+    pointing at `mcp-status`, whose duplicate warning fires only on `folded-and-live` and is
+    therefore silent for exactly the cross-scope case above.
+
+  A `folded` row in a higher-precedence scope still shadows the live lower-scope entry that
+  is actually running, which caps this fix's reach. That is a `_precedence_winner` defect in
+  #398's territory with fleet-wide blast radius, filed as #424 rather than fixed here.
 
   **`--json` consumers:** `primer_liability.servers[]` gains `contested_labels`, and
   `break_even_verdict` gains the value `router/live duplicate label`. A fleet with a

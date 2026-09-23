@@ -990,53 +990,72 @@ def _live_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
     return live
 
 
-def _router_duplicate_labels(scan_rows: list[dict[str, Any]], ambiguous: set[str],
-                             ledger_path: str | None = None) -> set[str]:
-    """Ledger labels written by BOTH a router and a separately-live duplicate of one of its
-    peers — provably unattributable, so neither entry may count them (#396 review).
+def _contested_labels(scan_rows: list[dict[str, Any]],
+                      ledger_path: str | None = None) -> set[str]:
+    """Ledger labels that MORE THAN ONE running terse process writes — provably
+    unattributable, so no entry may count them (#396 review).
 
-    The router tags each peer's records with that PEER's name; any OTHER entry running its
-    own `terse proxy` under that same name writes records that are identical in provenance.
-    Two processes, one label, no field that distinguishes them — so summing the label's
-    blocks and savings into both liability rows let each clear break-even off the other's
-    traffic and report KEEP. Reproduced with router peers `[gh, kb]` and a duplicate
-    labelled `kb`.
+    A multiproxy router tags each peer's records with that PEER's name. Any other entry
+    running its own `terse proxy` under that same name writes records identical in
+    provenance: two processes, one label, no field that distinguishes them. Summing the
+    label's blocks and savings into both liability rows let each clear break-even off the
+    other's traffic and report KEEP — #285's double count, one state over.
 
-    Keyed on the LABEL, not on the state, and that distinction is the fix's whole reach
-    (review of PR #422, finding 2). The first draft admitted only `folded-and-live`, which
-    is a per-SCOPE classification: `folded` is computed from that scope's peers file, so a
-    peer folded behind a user-scope router and separately wrapped at PROJECT scope is
-    `wrapped`, never `folded-and-live` — and two plain `install-mcp` runs then reproduced
-    the very double count this exists to remove, with `mcp-status` silent because no state
-    names the duplication. Every state in `_WRITES_LEDGER_ROWS` that is not a router can
-    contest, which is exactly "runs its own proxy and writes its own rows".
+    **Counted by WRITER, not matched between two fixed roles.** The first draft intersected
+    "a router's peers" with "a folded-and-live duplicate's label", which missed two shapes
+    review then reproduced:
 
-    Not `_ambiguous_labels`' job, and it is worth being explicit about why: that contest is
-    scoped to GUESSED launcher basenames (`_is_launcher_basename`), because sharing a
-    non-launcher basename means two entries launching one binary — one logical server, one
-    honest label. Here the collision is exact and DELIBERATE: `--server-name kb` is what
-    makes it so. An entry that bakes a DISTINCT name is absent from this set and stays
-    measurable, which is the operator's fix (the other being `mcp-status`' standing advice
-    to delete the duplicate).
+      * a duplicate at ANOTHER SCOPE. `folded` is computed per scope from that scope's peers
+        file, so a peer folded behind a user-scope router and separately wrapped at project
+        scope is `wrapped`, never `folded-and-live`. Two plain `install-mcp` runs reproduced
+        the full double count (review of PR #422, finding 2).
+      * a SECOND ROUTER folding the same peer name. A router is itself an entry running a
+        proxy under that name, but the intersection could only ever put a router on the
+        left-hand side (finding 1 of the re-review). `--router-name` defeats
+        `_precedence_winner`'s name dedup, so two distinct routers really can coexist.
 
-    Both halves are gated on `_writes_ledger_rows`: a silent router or a silent duplicate
-    writes none of the rows under that label, so there is nobody to contest it with — the
-    same manufactured-collision direction #397 removed from `_ambiguous_labels`.
+    Both fall out of asking one question per label — *how many installed entries write it?*
+    — instead of two. That also answers the `router-ambiguous` pair (two routers fronting
+    one peers file), which was reported as a pre-existing hole in the same review.
 
-    A `folded` peer is deliberately NOT a claimant. It is launched BY the router, so the
-    router's process is what writes its rows — admitting it would have every fleet contest
-    every one of its own peers. The state tuple is belt-and-braces for that, not the
-    mechanism: `scan_scopes` fills no `ledger_identity` or `wraps` for a plain `folded` row,
-    so `_wrapped_labels` answers [] and the row claims nothing whatever the tuple says
-    (mutation F2b survives on widening it, and is listed as equivalent, not as a kill —
-    the same disclosure `measured_zero`'s `all()` carries below). The BEHAVIOUR is pinned by
-    `test_a_plain_folded_peer_never_contests_its_own_router`; the tuple states the intent so
-    a later change to `_wrapped_labels` inherits the right answer."""
+    The label a claimant WRITES, not the label it may COUNT. `_wrapped_labels` was tried
+    here and is wrong: it returns [] for a guess in `ambiguous`, so a router peer named
+    `python` beside another entry guessing `python` stopped being contested and the router
+    reported a cleared KEEP over rows three processes wrote (re-review finding 2, a
+    regression against the commit it was remediating). An ambiguous entry still WRITES under
+    that label — it merely may not bank it — and writing is the whole question here.
+
+    One side must be a ROUTER. Two plain wrapped entries resolving to one non-launcher
+    label are one logical server installed twice, which #285 ruled an honest label and
+    `test_ambiguity_needs_a_LAUNCHER_not_merely_a_shared_label` pins; widening to any shared
+    label would delete that measurement. A router's peer NAME is different in kind — the
+    router chose it, so a second entry answering to it duplicates that peer.
+
+    Gated on `_writes_ledger_rows`: an entry baked `--no-stats`, or pointed at another
+    ledger, writes none of the rows under that label and cannot be one of the writers
+    fighting over it — the manufactured-collision direction #397 removed from
+    `_ambiguous_labels`.
+
+    A plain `folded` peer is not a writer. It is launched BY the router, so the router's
+    process writes its rows; admitting it would have every fleet contest its own peers.
+    `_WRITES_LEDGER_ROWS` states that, and `scan_scopes` independently leaves such a row's
+    `ledger_identity` and `wraps` None, so it claims nothing either way (mutation F2b
+    survives on widening the tuple and is disclosed as equivalent, not a kill — the same
+    note `measured_zero`'s `all()` carries). The behaviour is pinned by
+    `test_a_plain_folded_peer_never_contests_its_own_router`."""
     from .install_mcp import NO_PEERS  # local: same cycle break as `primer_liability`
 
     winners = _precedence_winner(scan_rows)
-    peers_of_routers: set[str] = set()
-    own_proxy_labels: set[str] = set()
+    # label -> the server NAMES writing it. Names, not row indices: `_precedence_winner`
+    # already admits one row per name, so a count of names is a count of processes.
+    writers: dict[str, set[str]] = {}
+    # A contest needs a ROUTER on one side, and that is a deliberate limit rather than an
+    # oversight. Two plain wrapped entries that resolve to one non-launcher label are ONE
+    # logical server installed twice — #285 decided that is an honest label, and
+    # `test_ambiguity_needs_a_LAUNCHER_not_merely_a_shared_label` pins it. A router's peer
+    # name is different in kind: the router chose it, so a second entry answering to it is a
+    # duplicate of that peer, which is the population #396 is about.
+    router_labels: set[str] = set()
     for i, row in enumerate(scan_rows):
         name = row.get("server")
         if not name or winners.get(str(name)) != i:
@@ -1045,17 +1064,23 @@ def _router_duplicate_labels(scan_rows: list[dict[str, Any]], ambiguous: set[str
         if not _writes_ledger_rows(row, ledger_path):
             continue
         if state in ("router", "router-ambiguous"):
-            if wraps != NO_PEERS:
-                peers_of_routers.update(
-                    p for p in (q.strip() for q in wraps.split(",")) if p)
+            # `(no peers)` is the scan's empty-peers-file SENTINEL, never a peer name.
+            written = ([] if wraps == NO_PEERS
+                       else [p for p in (q.strip() for q in wraps.split(",")) if p])
         elif state in _WRITES_LEDGER_ROWS:
-            # `_wrapped_labels`, not `ledger_identity` directly: it is the ONE resolution
-            # rule the render loop below uses for these same rows, and it already answers []
-            # for a raw `claude mcp add` re-add (no identity, no `wraps`) and for a guess
-            # that is `ambiguous` — neither of which claims a label, so neither can contest
-            # one. Re-deriving the identity here instead is how the two paths drift.
-            own_proxy_labels.update(_wrapped_labels(row, wraps, ambiguous, ledger_path))
-    return peers_of_routers & own_proxy_labels
+            # `resolve_ledger_identity`'s answer, which is what the proxy puts in the record:
+            # the baked `--server-name`, else the downstream command's basename. A raw
+            # `claude mcp add` re-add has neither and writes nothing to contest.
+            ident = row.get("ledger_identity") or (server_label(wraps.split()) if wraps
+                                                   else "")
+            written = [str(ident)] if ident else []
+        else:
+            continue
+        if state in ("router", "router-ambiguous"):
+            router_labels.update(written)
+        for lbl in written:
+            writers.setdefault(lbl, set()).add(str(name))
+    return {lbl for lbl in router_labels if len(writers.get(lbl, ())) > 1}
 
 
 def _superseded_labels(row: dict[str, Any], labels: list[str],
@@ -1725,7 +1750,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
     ambiguous = _ambiguous_labels(scan_rows, ledger_path)
     # Same fleet-level discipline, a different collision: a label shared by a router and the
     # separately-live duplicate of one of its peers (#396 review).
-    contested = _router_duplicate_labels(scan_rows, ambiguous, ledger_path)
+    contested = _contested_labels(scan_rows, ledger_path)
     live = _live_labels(scan_rows)
     for i, row in enumerate(scan_rows):
         name, state = row.get("server"), row.get("state")
@@ -1851,23 +1876,32 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         encoded = (0 if peerless
                    else None if (not labels or any(e is None for e in per_label_enc))
                    else sum(e or 0 for e in per_label_enc))
-        # A row that had a label TAKEN AWAY cannot then report a measured zero. `blocks == 0`
+        # A row that had a label TAKEN AWAY publishes no measurement at all. `blocks == 0`
         # is the hard claim "never called", which `_break_even` turns into that verdict,
-        # `_recommend` escalates to UNWRAP for a per-turn row, and the `idle` bucket prints
-        # as "pure cost" — three conclusions drawn from a sum the contest emptied.
+        # `_recommend` escalates to UNWRAP for a per-turn row, and `idle` prints as "pure
+        # cost" — three conclusions drawn from a sum the contest emptied. But a NON-zero
+        # surviving sum is no safer, and the first fix said it was.
         #
-        # Only the MIXED case needs this, and only a router can be in it: `_wrapped_labels`
-        # returns at most one label, so contesting it always empties the list and the
-        # `not labels` path above already answers None. A router keeps its uncontested peers,
-        # and if those happen to be quiet this window the surviving sum is 0 — measured at
-        # zero volume for the peers we can still see, unknown for the one we cannot. Unknown
-        # wins, per the rule this module exists to keep (review of PR #422, finding 1: a real
-        # fleet flipped KEEP -> UNWRAP + "pure cost" on exactly this).
+        # That claim was "dropping labels only understates savings, so the verdict is
+        # conservative". Both halves are false, each demonstrated on a real fleet in review
+        # of this PR:
         #
-        # A NON-zero surviving sum is left alone: it is an honest measurement over fewer
-        # labels, and it understates savings, so the verdict it produces is conservative.
-        # `contested_labels` is what tells a consumer the row is incomplete.
-        blackout = bool(contested_here) and blocks == 0
+        #   * COVERAGE is `saved/primer`. Dropping a label whose savings are NEGATIVE raises
+        #     `saved`, so the verdict moves the optimistic way: a fleet reading UNWRAP/`never`
+        #     — documented as the one verdict that should stop an operator, structurally
+        #     unearnable — read TUNE, "arithmetically reachable", once its loss-making peer
+        #     was contested away.
+        #   * The RATE is `saved/tokenized`, which has no monotone direction at all. Dropping
+        #     a high-volume/low-rate label inflates it without bound; a measured row rendered
+        #     `600` against a true pooled `3.08`, with nothing in the row saying a label was
+        #     missing.
+        #
+        # A sign test on the dropped label would fix only the first. So the rule is the
+        # simple one the module's own discipline already implies: a label taken away leaves
+        # a row that cannot be measured, whatever the surviving sum happens to be.
+        # `contributors` still lists the labels that DID survive, so nothing attributable is
+        # hidden — only the entry-level verdict declines to be stated.
+        blackout = bool(contested_here)
         if blackout:
             blocks = tokenized = encoded = None
         row_out: dict[str, Any] = {
@@ -1903,7 +1937,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
                               # would send the operator to bake `--server-name`, which for
                               # this collision is what created it (#396 review).
                               else _R_ROUTER_DUP
-                              if contested_here and (not labels or blackout)
+                              if blackout
                               else _R_AMBIGUOUS
                               if not labels and not is_router
                               and _guessed_label(row) in ambiguous
@@ -2051,10 +2085,8 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     # (review of PR #417).
     silent_any = sorted(s["server"] for s in liab["servers"]
                         if s.get("break_even_verdict") == _R_NO_LEDGER_ROWS)
-    # Same reason, same shape: read straight off the verdict. A contested duplicate happens
-    # to be `uncertain` today (its labels always empty, so its cadence is `1x?`), which kept
-    # the stanza alive by accident — the outer gate must not depend on that.
-    # On `contested_labels`, not on the verdict. A fully-dark claimant carries the verdict,
+    # On `contested_labels`, not on the verdict, and not via `_named` (which intersects with
+    # `uncertain`, a set no router can be in). A fully-dark claimant carries the verdict,
     # but a router that keeps other peers does NOT — it reports a real KEEP over a block
     # count that quietly shrank, with nothing in the report saying a label was taken from
     # it. Both need naming, and only the field is true of both.
@@ -2112,10 +2144,16 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         # the first that has to read the verdict directly.
         dup = dup_any
         if dup:
-            lines.append(f"  router/live duplicate label — a router and a separately-live "
-                         f"copy of the same peer write under one name: {', '.join(dup)}")
-            lines.append("  remove the duplicate entry (`mcp-status` names it), or give the "
-                         "live one a DISTINCT `--server-name`.")
+            shared = sorted({lbl for s in liab["servers"]
+                             for lbl in (s.get("contested_labels") or [])})
+            lines.append(f"  router/live duplicate label — more than one installed entry "
+                         f"writes under one name: {', '.join(dup)}")
+            # NOT "(`mcp-status` names it)": that warning fires only on `folded-and-live`
+            # (`cli.py`), so it is silent for exactly the cross-scope duplicate this contest
+            # was widened to catch — sending the operator to a command that reports nothing
+            # (re-review finding). The labels are named here instead, which is always true.
+            lines.append(f"  remove one of them, or give one a DISTINCT `--server-name`; "
+                         f"the shared label(s): {', '.join(shared)}.")
     # Reported here rather than folded into the rate above: the split is a FACT about the
     # ledger, and merging the two identities would be the guessing #285 removed.
     for srv in liab["servers"]:
