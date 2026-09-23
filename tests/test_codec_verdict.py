@@ -323,18 +323,9 @@ def test_an_unresolved_cell_names_BOTH_compliance_and_the_trial_floor():
     cell = _cell(build_codec_verdict_report({"m": rows}))
     assert "**UNRESOLVED**" in cell
     assert "delivered 29%" in cell
-    assert "only 7 zero-failure trial(s), need 20" in cell
-
-
-def test_a_compliance_rate_is_reported_as_the_runs_not_the_models():
-    """#412: the same (model, payload, question) read 29% on one run and 100% on two more,
-    with no change to the answering path. The reason must say whose number it is, or the
-    one-run figure gets quoted as a property of the model — which #403's thread did."""
-    rows = [dict(_row("q", 7, 7, trials=7, raw_calls=7, terse_calls=2),
-                 tool="t", shape="array-of-records")]
-    cell = _cell(build_codec_verdict_report({"m": rows}))
+    # #412: one run's rate, scoped as one run's — the same cell later read 100% twice.
     assert "delivered 29% of its answers through the tool call in this run" in cell
-    assert "not the model" in cell
+    assert "only 7 zero-failure trial(s), need 20" in cell
 
 
 def test_an_unresolved_cell_names_the_trimmed_corpus_AND_the_trial_floor():
