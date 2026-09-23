@@ -167,11 +167,18 @@ jobs:
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
         with:
           enable-cache: true
+      # Minus ONE test: the graduation check asks whether the PREVIOUS release's CHANGELOG
+      # section was filed, which says nothing about whether THIS commit is fit to tag. Gating
+      # on it skipped a release outright: #422's PR CI ran green before v0.34.0 was tagged,
+      # it merged after, and this step then failed on v0.34.0's ungraduated entry — no tag,
+      # no PyPI publish, until the next PR graduated it. PR CI still runs it (the header's
+      # "next PR goes red" mechanism is unchanged); `tests/test_changelog_graduation.py`
+      # pins that this id still names a real test, so a rename cannot deselect nothing.
       - name: Test before tagging
         if: steps.decide.outputs.release == 'true'
         run: |
           uv sync --dev
-          uv run pytest -q
+          uv run pytest -q --deselect tests/test_changelog_covers_every_release.py::test_unreleased_does_not_describe_work_that_already_shipped
       # Only NOW create + push the tag — the gate passed. Skipped for a hand-pushed tag
       # (needtag=false), which is already on origin.
       - name: Create + push the version tag

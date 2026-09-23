@@ -129,3 +129,16 @@ def test_the_section_date_comes_from_the_tag_not_the_day_you_ran_it(tmp_path):
     out = f.read_text(encoding="utf-8")
     assert "## [1.0.0] - 2020-03-04" in out, p.stdout + p.stderr
     assert datetime.date.today().isoformat() not in out.split("## [0.9.0]")[0]
+
+
+def test_the_release_gate_deselects_only_the_graduation_check_and_it_still_exists():
+    """The release job must not fail on the PREVIOUS release's bookkeeping (it skipped
+    #422's release), so it deselects that one check — and nothing else. A `--deselect` of a
+    renamed test silently deselects nothing, so the id is resolved against the real module."""
+    root = Path(__file__).resolve().parent.parent
+    wf = (root / ".github/workflows/release.yml").read_text()
+    ids = re.findall(r"--deselect\s+(\S+)", wf)
+    assert ids == ["tests/test_changelog_covers_every_release.py::"
+                   "test_unreleased_does_not_describe_work_that_already_shipped"], ids
+    path, name = ids[0].split("::")
+    assert f"\ndef {name}(" in (root / path).read_text(), f"{ids[0]} names no test"
