@@ -126,7 +126,8 @@ def main() -> int:
         raw = minify(obj)
         # `capture_payload` is the same path the proxy and `terse capture` use, so the
         # envelopes this writes are indistinguishable from a real captured corpus —
-        # given `manual=True`, as `terse capture` passes (see `capture_payload`, #380).
+        # each one a hand capture with its own `manual:` id (explicit here; it is also
+        # `capture_payload`'s default for a non-proxy caller, #380).
         # max_per_tool=1: envelopes are named by content sha, so re-running with a
         # different PREFIXES value would otherwise ADD a second envelope for the same
         # tool rather than replace it, and `load_corpus` would then score that tool

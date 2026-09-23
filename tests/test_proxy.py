@@ -2304,6 +2304,20 @@ def test_every_block_of_one_result_carries_the_same_result_id():
     assert {c["result_id"] for c in calls} == {"0.4"}
 
 
+def test_an_id_less_proxy_block_stays_legacy_through_the_real_closure(tmp_path):
+    """#380: with `capture_payload` defaulting to a hand-capture id, the proxy's own opt-out
+    is what keeps a session-less block legacy. Driven through the REAL closure and the real
+    writer, not a fake — the fake-based test pins the keyword, this pins the envelope."""
+    from terse.capture import load_corpus
+    from terse.proxy import _build_capture_and_audit
+
+    cap, _ = _build_capture_and_audit(str(tmp_path), None, session=None)
+    assert cap is not None
+    cap("t", '{"a":1}', server="kb", result_id="0.1")
+    (env,) = load_corpus(tmp_path)
+    assert "result_id" not in env
+
+
 def test_result_ids_are_scoped_to_the_proxy_run_not_bare_jsonrpc_ids():
     # A JSON-RPC id restarts at 1 every session while one corpus dir accumulates many
     # sessions, so two runs' `id: 1` would fuse into one "result" if stored bare.
@@ -2311,7 +2325,10 @@ def test_result_ids_are_scoped_to_the_proxy_run_not_bare_jsonrpc_ids():
 
     seen: list[str | None] = []
 
-    def fake(tool, raw, corpus_dir, *, server=None, result_id=None):
+    def fake(tool, raw, corpus_dir, *, server=None, result_id=None, manual=None):
+        # The proxy must opt OUT of the hand-capture default: an id-less proxy block is
+        # part of a real result, never a whole payload (#380).
+        assert manual is False
         seen.append(result_id)
 
     import terse.capture as capture_mod

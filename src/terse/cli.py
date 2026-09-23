@@ -1266,8 +1266,8 @@ def _cmd_tune(args: argparse.Namespace) -> int:
     print(_tune_sample_line(envelopes))
     # What the share above costs, and the remedy — the same note `policy generate` and
     # `autotune` print (#380). A `terse capture` corpus no longer trips the result-id half
-    # (`capture_payload(manual=True)`); one captured without `--server` still trips the
-    # server half, correctly.
+    # (a hand-capture id, `capture_payload`'s default); one captured without `--server`
+    # still trips the server half, correctly.
     _print_corpus_identity_note(envelopes)
 
     # Rationale in `_tune_ledger_warnings`'s own docstring (#274) — this call site just

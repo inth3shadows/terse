@@ -1417,7 +1417,7 @@ def test_a_hand_capture_never_re_homes_a_legacy_proxy_block(tmp_path):
     corpus = tmp_path / "c"
     raws = [json.dumps([{"id": i, "team": "platform-infra"}]) for i in range(3)]
     for i, raw in enumerate(raws):                     # one legacy proxy result, 3 blocks
-        path = capture_payload("search", raw, corpus, server="kb")
+        path = capture_payload("search", raw, corpus, server="kb", manual=False)
         # Pinned 1 ms apart, not left to the wall clock: a slow runner writing >50 ms apart
         # would split the legacy result by itself and fail this test for no reason.
         path.write_text(json.dumps(json.loads(path.read_text()) | {"captured_at": 10**9 + i
@@ -1456,7 +1456,7 @@ def test_tune_names_a_legacy_sample_and_its_remedy(tmp_path, capsys):
     from terse.capture import capture_payload
 
     corpus = tmp_path / "c"
-    capture_payload("kb.a", json.dumps([{"id": 1}, {"id": 2}]), corpus, server="kb")
+    capture_payload("kb.a", json.dumps([{"id": 1}, {"id": 2}]), corpus, server="kb", manual=False)
     assert main(["tune", "--corpus", str(corpus)]) == 0
     assert "1/1 payload(s) predate result ids" in capsys.readouterr().out
 
@@ -1728,12 +1728,12 @@ def test_tune_header_states_the_samples_result_id_and_record_list_shares(tmp_pat
     records = json.dumps({"result": [{"id": i, "description": "d" * 250 + str(i)}
                                      for i in range(20)]})
     capture_payload("kb.a", records, corpus, result_id="r-1")            # modern, list
-    capture_payload("kb.b", records.replace('"id"', '"n"'), corpus)      # legacy, list
-    capture_payload("kb.c", json.dumps({"ok": True}), corpus)            # legacy, single
-    capture_payload("kb.d", "plain text " * 300, corpus)                 # legacy, text
+    capture_payload("kb.b", records.replace('"id"', '"n"'), corpus, manual=False)      # legacy, list
+    capture_payload("kb.c", json.dumps({"ok": True}), corpus, manual=False)            # legacy, single
+    capture_payload("kb.d", "plain text " * 300, corpus, manual=False)                 # legacy, text
     # A non-string `result_id` is NOT "with result_id": `policy_gen` groups only `str`
     # ids exactly, and this line claims to count the same set (review finding).
-    path = capture_payload("kb.e", json.dumps({"ok": True}), corpus)
+    path = capture_payload("kb.e", json.dumps({"ok": True}), corpus, manual=False)
     path.write_text(json.dumps(json.loads(path.read_text()) | {"result_id": 7}))
     assert main(["tune", "--corpus", str(corpus)]) == 0
     lines = capsys.readouterr().out.splitlines()
@@ -1762,7 +1762,7 @@ def test_tune_sample_provenance_reads_shape_live_not_from_the_stored_bucket(tmp_
 
     corpus = tmp_path / "corpus"
     path = capture_payload("kb.a", json.dumps([{"id": 1, "v": "x"}, {"id": 2, "v": "y"}]),
-                           corpus)
+                           corpus, manual=False)
     env = json.loads(path.read_text())
     env["shape"] = "compact-json"           # what an older classifier would have stored
     path.write_text(json.dumps(env))

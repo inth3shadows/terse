@@ -13,6 +13,18 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Changed
+
+- **`capture_payload` writes a hand-capture id by default (#380).** `manual` now defaults
+  to "a hand capture unless a `result_id` is given", not `False`. The opt-in flag had to be
+  remembered by every non-proxy caller (#425 and #429 each fixed callers that forgot), so
+  the next script or harness would have silently re-created the legacy-looking envelope.
+  The proxy — the one caller whose id-less block really is part of a larger result —
+  passes `manual=False` explicitly, pinned by a test. A library caller that relied on the
+  old default to write an id-less envelope must now pass `manual=False`.
+
+## [0.33.11] - 2026-09-23
+
 ### Fixed
 
 - **The bundled corpus generators write what `terse capture` writes (#380).**
