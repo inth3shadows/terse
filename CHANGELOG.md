@@ -73,17 +73,25 @@ fails that pull request until the section has moved.
   the context figure — there every saving in the document is on the inflated basis, said
   rather than left to look measured, the same discipline `primer_source` keeps). Also on
   the context basis now, and named here because they change silently otherwise:
-  `servers[].saved_per_block`, `servers[].blocks_to_break_even`,
+  `session_covered`, `servers[].saved_per_block`, `servers[].blocks_to_break_even`,
   `servers[].break_even_coverage`, and `contributors[].saved_tokens` /
-  `contributors[].saved_per_block` — the last two feed the `--recommend` pooled ranking,
+  `contributors[].saved_per_block`. `primer_liability` also publishes `wire_raw_tokens` and
+  `ctx_raw_tokens`, which the report's basis line reads: the two RAW sides are equal
+  exactly when no record carried a typed field, and unlike the two savings they cannot
+  cancel — a peer whose text block EXPANDED saves less on wire than on context and offsets
+  one whose text compressed, so comparing savings reads "identical" while every peer's rate
+  moved — the last two feed the `--recommend` pooled ranking,
   which also gains a basis line since that screen replaces the ledger tables entirely. **`saved_tokens` is
   REDEFINED** to the context basis, because it is the numerator of `turns_covered` whose
   denominator is charged in context — a consumer will see it roughly halve on a fleet whose
   results carry `structuredContent`, and that drop is the correction, exactly as
   `per_turn_tokens`' drop was in the #211 follow-up. The wire figure is published beside it,
   never lost. An aggregate from an older terse carries no `ctx_*` key and falls back to the
-  wire pair rather than to zero — the two bases agree for a record with no typed field,
-  which is what every pre-#134 ledger is made of.
+  wire pair rather than to zero, because zero would publish "this server saved nothing".
+  **That fallback is not silently equivalent** — the realistic legacy shape is a pre-#420
+  aggregate over a post-#134 ledger, where the two bases differ by the full inflation
+  (3.33x on the pinned fixture) — which is exactly why `saved_basis` is published rather
+  than leaving an inflated number looking measured.
 
   **Verdict flips on the live fleet: none.** `terse` reads `break_even_coverage` 2,840 on
   the wire basis and 1,739 on the context basis, both far clear of 1.0; `secret-broker` is

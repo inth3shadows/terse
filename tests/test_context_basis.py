@@ -166,12 +166,15 @@ def test_the_report_names_the_basis_and_publishes_the_wire_figure(tmp_path):
                      for _ in range(20)])
     text = "\n".join(build_primer_section(primer_liability(scan, agg)))
 
-    assert "the figures above and the saved/block column below are CONTEXT tokens" in text
-    assert "12,000 tok left the stdio" in text            # the wire figure, named as wire
+    assert "every primer figure in THIS section" in text
+    assert "is CONTEXT tokens" in text
+    # The wire figure, named as wire, AND the ledger totals named as the wire ones — the
+    # sentence used to say "the figures above", which is false of `build_stats_report`'s
+    # ledger header sitting above this section (re-review of PR #435).
+    assert "The ledger totals above are WIRE: 12,000 tok left the stdio pipe" in text
     assert "3,600 tok of CONTEXT saved" in text
-    # Said BELOW the figures it labels, including the break-even table's saved/block column
-    # — an earlier draft's comment claimed "every figure above" while printing first.
-    assert text.index("3,600 tok of CONTEXT saved") < text.index("are CONTEXT tokens")
+    # Said BELOW the figures it labels, including the break-even table's saved/block column.
+    assert text.index("3,600 tok of CONTEXT saved") < text.index("is CONTEXT tokens")
 
 
 def test_an_uncalled_entry_never_prints_the_wire_figure_alone(tmp_path):
@@ -262,9 +265,9 @@ def test_every_saving_figure_in_the_section_names_its_basis(tmp_path):
     no basis on it.
 
     Driven through the renderer rather than asserted per line, so a fifth site added later
-    fails here without anyone remembering to update a list."""
+    fails here without anyone remembering to update a list — and without the predicate
+    having to guess how that site will be phrased."""
     import json
-    import re
 
     from terse.stats import build_primer_section
     pol = tmp_path / "p.json"
@@ -291,10 +294,116 @@ def test_every_saving_figure_in_the_section_names_its_basis(tmp_path):
     assert r_liab["turns_covered"] is not None and r_liab["turns_covered"] < 1
     assert "NET NEGATIVE" in r_text
 
-    # Every "N tok saved"/"N tok covers" figure in either rendering carries the basis word.
-    bare = [ln for ln in (text + "\n" + r_text).split("\n")
-            if re.search(r"\d[\d,]* tok (saved|covers)", ln) and "CONTEXT" not in ln]
-    assert not bare, bare
+    # Every rendering that carries a CONTEXT figure also carries the basis word. Keyed on
+    # the SECTION, not on a phrase: the first version of this matched the literal
+    # `tok saved` / `tok covers`, which structurally could not see the break-even table's
+    # `saved/block` cell — a bare number — so the one figure the gate was leaving unlabelled
+    # sat outside the invariant this test claims is exhaustive (re-review of PR #435). A
+    # site phrased "3,600 tok banked" would have slipped past it too.
+    for rendering in (text, r_text):
+        assert "CONTEXT" in rendering, rendering
+
+
+def test_the_saved_per_block_column_is_labelled_even_with_no_ratio(tmp_path):
+    """Re-review of PR #435. The gate asked whether either RATIO renders; the break-even
+    table asks `any(s.get("blocks"))`. Those are different questions, so the `saved/block`
+    column — the one the basis line's own text promises to cover — rendered unlabelled
+    whenever both ratios were None.
+
+    Reachable on the #286 shape: a recorded SUPPRESSION makes both primer totals 0, so
+    neither ratio exists while the table prints a context rate. Observed on the live fleet
+    as `secret-broker 678/block` against 1,616 derivable from the wire table above it —
+    2.38x apart, nothing on screen saying why."""
+    import json
+
+    from terse.stats import (
+        PRIMER_CADENCE_ONCE,
+        build_primer_record,
+        build_primer_section,
+    )
+    pol = tmp_path / "p.json"
+    pol.write_text(json.dumps({"version": 1,
+                               "policies": [{"match": {"tool": "kb.*"},
+                                             "tiers": ["minify", "tabularize"]}]}),
+                   encoding="utf-8")
+    scan = [{"server": "kb", "state": "wrapped", "wraps": "kb", "scope": "user",
+             "policy": str(pol)}]
+    recs = [_rec(server="kb", raw=1000, out=400, structured=300, structured_out=120)
+            for _ in range(20)]
+    recs.append(build_primer_record("kb", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40,
+                                    attached=False))
+    liab = primer_liability(scan, aggregate(recs))
+    text = "\n".join(build_primer_section(liab))
+
+    assert liab["turns_covered"] is None and liab["session_covered"] is None
+    assert "saved/block" in text                      # the table DID render...
+    assert "is CONTEXT tokens" in text                # ...so the basis must be on screen
+
+
+def test_two_peers_whose_basis_gaps_cancel_still_get_the_label(tmp_path):
+    """Re-review of PR #435. `wire != saved` is a FLEET total gating a PER-SERVER column.
+    Two peers can move in opposite directions and sum to equal totals while every
+    per-server rate changed, which suppressed the label on a screen where it was needed.
+
+    `wire_saved = text_saving + ctx_saved`, so a peer whose TEXT block expanded has
+    `wire_saved < ctx_saved` and cancels one whose text compressed. Peer `a` saves 600 wire
+    / 180 context; peer `b` expands its text and saves 100 wire / 520 context; the fleet
+    reads 700 both ways."""
+    import json
+
+    from terse.stats import build_primer_section
+    pol = tmp_path / "p.json"
+    pol.write_text(json.dumps({"version": 1,
+                               "policies": [{"match": {"tool": "*"},
+                                             "tiers": ["minify", "tabularize"]}]}),
+                   encoding="utf-8")
+    scan = [{"server": "terse", "state": "router", "wraps": "a, b", "scope": "user",
+             "policy": str(pol)}]
+    agg = aggregate([_rec(server="a", raw=1000, out=400, structured=300, structured_out=120),
+                     # text block 100 -> 520 (expanded), typed field 600 -> 80
+                     _rec(server="b", raw=700, out=600, structured=600, structured_out=80)])
+    liab = primer_liability(scan, agg)
+    row = liab["servers"][0]
+
+    # The two SAVINGS cancel to the digit, fleet-wide AND in the pooled router row.
+    assert liab["wire_saved_tokens"] == liab["saved_tokens"] == 700
+    by_label = {c["label"]: c["saved_tokens"] for c in row["contributors"]}
+    assert by_label == {"a": 180, "b": 520}          # ...while every peer's rate moved
+    # The RAW sides cannot cancel — a typed field is a subset of the fold — so the gate
+    # asks them instead and the label still prints.
+    assert liab["ctx_raw_tokens"] < liab["wire_raw_tokens"]
+    assert "is CONTEXT tokens" in "\n".join(build_primer_section(liab))
+
+
+def test_a_half_present_context_pair_never_mixes_the_two_bases(tmp_path):
+    """Re-review of PR #435. The two `ctx_*` keys fell back independently, so an aggregate
+    carrying one and not the other computed `ctx_raw - out_t` — a wire figure that includes
+    the mirror block subtracted from a context figure that excludes it. That publishes a
+    large NEGATIVE saving under `saved_basis: "context"`, which drives NET NEGATIVE prose
+    and an UNWRAP verdict off an arithmetic error.
+
+    `aggregate` always writes both, so this guards exactly the hand-rolled aggregates the
+    fallback exists for."""
+    import json
+    pol = tmp_path / "p.json"
+    pol.write_text(json.dumps({"version": 1,
+                               "policies": [{"match": {"tool": "kb.*"},
+                                             "tiers": ["minify", "tabularize"]}]}),
+                   encoding="utf-8")
+    scan = [{"server": "terse", "state": "router", "wraps": "kb", "scope": "user",
+             "policy": str(pol)}]
+    half = {"total": {"raw_tokens": 20_000, "out_tokens": 8_000, "blocks": 20,
+                      "ctx_raw_tokens": 6_000},          # ...and no ctx_out_tokens
+            "tools": [{"server": "kb", "tool": "t", "blocks": 20, "tokenized": 20,
+                       "raw_tokens": 20_000, "out_tokens": 8_000,
+                       "ctx_raw_tokens": 6_000}],
+            "decisions": {}, "diff_reasons": {}}
+    liab = primer_liability(scan, half)
+
+    assert liab["saved_basis"] == "wire"        # says so rather than claiming context
+    assert liab["saved_tokens"] == 12_000       # wire on BOTH sides, never 6,000 - 8,000
+    assert liab["servers"][0]["saved_per_block"] == 600.0
+    assert liab["saved_tokens"] > 0
 
 
 def test_a_fleet_with_no_typed_fields_prints_no_basis_line(tmp_path):
@@ -312,5 +421,5 @@ def test_a_fleet_with_no_typed_fields_prints_no_basis_line(tmp_path):
     agg = aggregate([_rec(raw=1000, out=400) for _ in range(20)])
     text = "\n".join(build_primer_section(primer_liability(scan, agg)))
 
-    assert "are CONTEXT tokens" not in text
+    assert "is CONTEXT tokens" not in text
     assert "12,000 tok of CONTEXT saved" in text

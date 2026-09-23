@@ -89,6 +89,11 @@ LIABILITY = {"servers", "per_turn_tokens", "session_once_tokens", "unresolved",
              # across versions sees `saved_tokens` roughly halve on a fleet whose results
              # carry `structuredContent`; that drop is the correction.
              "wire_saved_tokens",
+             # #420 re-review: the two RAW sides. Equal exactly when no record carried a
+             # typed field, which is the only cancellation-proof way to ask whether the two
+             # bases can differ — comparing the two SAVINGS is a difference of differences
+             # and two peers moving opposite ways sum to equal totals.
+             "wire_raw_tokens", "ctx_raw_tokens",
              # Which basis `saved_tokens` is actually on: "context", or "wire" when this
              # aggregate predates #420 and could not supply the context figure. Published
              # so a consumer never has to guess which of its numbers is inflated — the same
@@ -139,6 +144,7 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "diffs": (int,), "raw_chars": (int,), "out_chars": (int,),
     "raw_tokens": (int,), "out_tokens": (int,),
     "ctx_raw_tokens": (int,), "ctx_out_tokens": (int,), "wire_saved_tokens": (int,),
+    "wire_raw_tokens": (int,),
     "saved_basis": (str,),
     "untokenized": (int,), "unversioned": (int,),
     "server": (str,), "tool": (str,), "scope": (str, type(None)),

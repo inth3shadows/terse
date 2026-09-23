@@ -895,10 +895,12 @@ parse it:
   result carried `structuredContent` a `structuredContent`-reading client discards the
   mirror text block, so compressing that block is wire saving and not context saving —
   ledger-wide the two differ by 1.84x on raw and 1.93x on the saving. Every break-even
-  figure (`turns_covered`, `saved_per_block`, `blocks_to_break_even`,
-  `break_even_coverage`, and `contributors[].saved_tokens`) is on the CONTEXT basis,
+  figure — `turns_covered`, `session_covered`, `servers[].saved_per_block`,
+  `servers[].blocks_to_break_even`, `servers[].break_even_coverage`, and both
+  `contributors[].saved_tokens` and `contributors[].saved_per_block` — is on the CONTEXT basis,
   because the primer they are divided by is charged in context. `primer_liability`
-  publishes the wire total as `wire_saved_tokens` and names the basis in `saved_basis`,
+  publishes the wire total as `wire_saved_tokens`, the two raw sides as `wire_raw_tokens` /
+  `ctx_raw_tokens`, and names the basis in `saved_basis`,
   which reads `"wire"` when the aggregate predates #420 and could not supply the context
   figure — there, every saving in the document is on the inflated basis. **If you parsed
   `saved_tokens` before this shipped you were reading the wire number**; it roughly halves
