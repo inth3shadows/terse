@@ -207,3 +207,15 @@ def test_recapturing_an_existing_sha_evicts_nothing(tmp_path):
     capture_payload("gh.api.items", json.dumps({"n": 0}), tmp_path,
                             max_per_tool=3)
     assert len(list(tmp_path.glob("gh.api.items__*.json"))) == 3
+
+
+def test_manual_and_an_explicit_result_id_cannot_both_be_given(tmp_path):
+    """`manual` would silently replace the caller's id, splitting whatever result it named.
+    Refused before anything is written — no corpus dir is left behind on the error path."""
+    import pytest
+
+    from terse.capture import capture_payload
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        capture_payload("t", "[1]", tmp_path / "c", result_id="s:1.2", manual=True)
+    assert not (tmp_path / "c").exists()

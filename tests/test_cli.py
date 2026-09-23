@@ -1368,6 +1368,99 @@ def test_autotune_names_what_it_guessed_about_an_old_corpus(tmp_path, capsys):
     assert "1/1 payload(s) record no server" in out
 
 
+def test_a_hand_capture_is_its_own_result_not_a_legacy_envelope(tmp_path, capsys):
+    """#380 review: `terse capture` wrote `captured_at` and no `result_id`, which is exactly
+    a pre-#148 proxy envelope. So two hand captures of one tool taken within the timing
+    window were MERGED into one guessed result, and every hand-built corpus was told to
+    "re-capture" — which could never add the id. Driven through the real command."""
+    from terse.capture import load_corpus
+    from terse.policy_gen import group_results, heuristic_share
+
+    corpus = tmp_path / "c"
+    for i in range(2):
+        f = _write(tmp_path, f"p{i}.json", json.dumps([{"id": i, "v": "x" * 40}]))
+        assert main(["capture", str(f), "--tool", "kb.x", "--server", "kb",
+                     "--corpus", str(corpus)]) == 0
+    envs = load_corpus(corpus)
+    assert heuristic_share(envs) == (0, 2)
+    assert len(group_results(envs)["kb.x"]) == 2      # two results, not one merged guess
+    capsys.readouterr()
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    out = capsys.readouterr().out
+    assert "#   sample: 2 with result_id (100%)" in out
+    assert "[note]" not in out
+
+
+def test_two_spellings_of_one_tool_stay_two_hand_results(tmp_path):
+    """Review of #380: an id keyed by content alone let `kb.search` and `search --server
+    kb` — two files that qualify to one runtime tool — share `manual:<sha>`, so the same
+    payload joined with itself and earned `dictionary` off the duplicate."""
+    from terse.capture import load_corpus
+    from terse.policy_gen import group_results
+
+    corpus = tmp_path / "c"
+    f = _write(tmp_path, "p.json", json.dumps({"id": 7, "team": "platform-infra"}))
+    assert main(["capture", str(f), "--tool", "kb.search", "--corpus", str(corpus)]) == 0
+    assert main(["capture", str(f), "--tool", "search", "--server", "kb",
+                 "--corpus", str(corpus)]) == 0
+    groups = group_results(load_corpus(corpus))
+    assert [len(g) for g in groups["kb.search"]] == [1, 1]
+
+
+def test_a_hand_capture_never_re_homes_a_legacy_proxy_block(tmp_path):
+    """Review of #380: an old hand envelope and a pre-#148 proxy block are identical on
+    disk. Filling a `manual:` id on rewrite split an 8-block proxy result into eight groups
+    of one (45.6% -> 26.5%) and silenced the note. A rewrite keeps the missing id."""
+    from terse.capture import capture_payload, load_corpus
+    from terse.policy_gen import group_results, heuristic_share
+
+    corpus = tmp_path / "c"
+    raws = [json.dumps([{"id": i, "team": "platform-infra"}]) for i in range(3)]
+    for i, raw in enumerate(raws):                     # one legacy proxy result, 3 blocks
+        path = capture_payload("search", raw, corpus, server="kb")
+        # Pinned 1 ms apart, not left to the wall clock: a slow runner writing >50 ms apart
+        # would split the legacy result by itself and fail this test for no reason.
+        path.write_text(json.dumps(json.loads(path.read_text()) | {"captured_at": 10**9 + i
+                                                                   * 10**6}))
+    assert main(["capture", str(_write(tmp_path, "b.json", raws[1])), "--tool", "search",
+                 "--server", "kb", "--corpus", str(corpus)]) == 0
+    envs = load_corpus(corpus)
+    assert [len(g) for g in group_results(envs)["kb.search"]] == [3]
+    assert heuristic_share(envs) == (3, 3)
+
+
+def test_the_legacy_note_names_a_remedy_that_works():
+    """Re-capturing IN PLACE keeps the first sighting's identity (above), so "Re-capture"
+    alone sent the operator to do something that changes nothing."""
+    from terse.cli import _print_corpus_identity_note
+
+    buf = io.StringIO()
+    _print_corpus_identity_note([{"tool": "t", "raw": "{}", "captured_at": 1}], out=buf)
+    assert "Re-capture into a fresh corpus" in buf.getvalue()
+
+
+def test_a_hand_capture_keeps_a_prior_proxy_result_id(tmp_path):
+    """The first sighting was a real multi-block proxy result; a later hand capture of
+    the same block must not re-home it into a group of one."""
+    from terse.capture import capture_payload, load_corpus
+
+    corpus = tmp_path / "c"
+    capture_payload("kb.x", "[1]", corpus, server="kb", result_id="abcd1234:1.7")
+    capture_payload("kb.x", "[1]", corpus, server="kb", manual=True)
+    assert load_corpus(corpus)[0]["result_id"] == "abcd1234:1.7"
+
+
+def test_tune_names_a_legacy_sample_and_its_remedy(tmp_path, capsys):
+    """#380 part 2: the `sample:` line states the result_id share; the note says what a
+    low one costs. A proxy-shaped envelope with no id is the case that earns it."""
+    from terse.capture import capture_payload
+
+    corpus = tmp_path / "c"
+    capture_payload("kb.a", json.dumps([{"id": 1}, {"id": 2}]), corpus, server="kb")
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    assert "1/1 payload(s) predate result ids" in capsys.readouterr().out
+
+
 def test_an_untimed_payload_is_not_reported_as_grouped_by_timing(capsys):
     # It became its own single-block group; the timing heuristic never ran on it. Saying
     # otherwise is a false alarm about the one number the note exists to qualify.

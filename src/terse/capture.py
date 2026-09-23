@@ -232,6 +232,7 @@ def _prune_tool_samples(corpus: Path, safe_tool: str, keep: int) -> None:
 
 def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
                     server: str | None = None, result_id: str | None = None,
+                    manual: bool = False,
                     max_per_tool: int | None = MAX_SAMPLES_PER_TOOL) -> Path:
     """Persist one captured payload as a shape-tagged envelope. Idempotent by sha.
 
@@ -240,11 +241,24 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
     format is additive — a corpus captured before they existed stays loadable, and every
     consumer treats their absence as "unknown", never as a value (#148, #152).
 
+    `manual` marks a hand capture (`terse capture`): the payload is one whole result, so it
+    gets its own id, `manual:<file stem>` — unless an existing TIMED envelope is being
+    rewritten, which keeps its first sighting's id or its absence (an untimed or unreadable
+    prior was never a first sighting, as for a proxy id). Mutually exclusive with
+    `result_id`. Without it, a hand capture was indistinguishable
+    from a pre-#148 proxy envelope (`captured_at`, no id): consecutive hand captures were
+    grouped by TIMING into one guessed result, and the identity note told the operator to
+    re-capture a corpus no re-capture could fix (#380). Keyed by the file stem — tool
+    spelling AND sha — not the sha alone: two spellings that qualify to one runtime tool
+    (`kb.search` vs `search --server kb`) are two captures and must stay two results.
+
     `max_per_tool` bounds how many envelopes this tool keeps; the oldest are evicted past
     it. Pass `None` to retain everything (the pre-cap behavior) — appropriate for a
     deliberate one-shot `terse capture` run building a fixed corpus, not for a proxy
     capturing a live session indefinitely.
     """
+    if manual and result_id is not None:
+        raise ValueError("capture_payload: `manual` and `result_id` are mutually exclusive")
     corpus = Path(corpus_dir)
     mkdir_restricted(corpus)
     sha = _sha8(raw)
@@ -255,6 +269,15 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
     # the sha-based filename does NOT preserve it. Preserved on rewrite so the value is
     # stable at a payload's FIRST sighting and re-capturing the same content stays idempotent.
     captured_at = time.time_ns()
+    if manual:
+        # Set BEFORE the rewrite branch below, so it obeys the same first-sighting rule as a
+        # proxy id: an existing timed envelope keeps whatever id it had, INCLUDING none. Not
+        # filled on rewrite, although that would let "re-capture" repair an old hand corpus:
+        # an old hand envelope and a pre-#148 PROXY envelope are identical on disk
+        # (`captured_at`, no id, same `<tool>__<sha>` path), and filling the proxy one would
+        # split a real multi-block result into groups of one and silence the note that
+        # reports it (#380 review, measured 45.6% -> 26.5% on an 8-block result).
+        result_id = f"manual:{path.stem}"
     if path.exists():
         try:
             prior = json.loads(path.read_text(encoding="utf-8"))

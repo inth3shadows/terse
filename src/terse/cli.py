@@ -89,9 +89,9 @@ def _cmd_gate(args: argparse.Namespace) -> int:
 
 def _cmd_capture(args: argparse.Namespace) -> int:
     raw = _read(args.file)
-    # No `result_id`: a hand-captured payload has no result to belong to. Left absent
-    # rather than invented, which keeps it a single-block result — the honest reading.
-    path = capture_payload(args.tool, raw, args.corpus, server=args.server)
+    # A hand-captured file IS one whole result, so it gets its own id. Leaving it absent
+    # made it read as a pre-#148 proxy capture: grouped by timing, and flagged as legacy.
+    path = capture_payload(args.tool, raw, args.corpus, server=args.server, manual=True)
     print(f"captured {args.tool} ({classify_shape(raw)}, {len(raw)} bytes) -> {path}")
     return 0
 
@@ -344,8 +344,9 @@ def _print_corpus_identity_note(envelopes: list, out=None) -> None:
     * without a server, a rule is authored under the bare tool name, and a bare rule sits
       dead behind any deployed server-scoped glob.
 
-    Silent on a fully-identified corpus, which is the steady state after a re-capture — the
-    remedy in both cases, since neither field can be recovered after the fact.
+    Silent on a fully-identified corpus, which is the steady state after a re-capture into
+    a fresh corpus — the remedy in both cases, since neither field can be recovered after
+    the fact.
     """
     from .policy_gen import heuristic_share
 
@@ -353,7 +354,7 @@ def _print_corpus_identity_note(envelopes: list, out=None) -> None:
     if guessed:
         print(f"  [note] {guessed}/{total} payload(s) predate result ids; their results were "
               f"grouped by capture timing, which can merge parallel calls into one. "
-              f"Re-capture to make this exact.", file=out)
+              f"Re-capture into a fresh corpus to make this exact.", file=out)
     unnamed = sum(1 for e in envelopes if not isinstance(e.get("server"), str) or not e["server"])
     if unnamed:
         print(f"  [note] {unnamed}/{total} payload(s) record no server, so their rules are "
@@ -368,8 +369,10 @@ def tune_sample_provenance(envelopes: list) -> tuple[int, int, int]:
 
     `tune` prints its payload COUNT, and the count is not the sample. A `result_id` dates
     an envelope: its absence marks a capture from before `#116` folded a multi-block
-    result into one envelope, and modern captures fold to a record list 14x more often
-    than the fossils do (#374: 25.0% vs 1.8% `array-of-records`). And a record list is
+    result into one envelope (a hand capture's `manual:` id says instead that the payload
+    was captured whole, so it was never a fragment either), and modern captures fold to a
+    record list 14x more often than the fossils do (#374: 25.0% vs 1.8%
+    `array-of-records`). And a record list is
     the shape `--drop-eval` can ask a question over (`_questions_and_staging`), so a
     `~34% tok` figure over a sample that is 4% record lists came from fragments of the
     field, not from the responses the field appears in. Neither share is a verdict; both
@@ -1261,6 +1264,11 @@ def _cmd_tune(args: argparse.Namespace) -> int:
           f"{len(cands)} drop candidate(s)")
     # The sample's provenance, on the line under its count (#380).
     print(_tune_sample_line(envelopes))
+    # What the share above costs, and the remedy — the same note `policy generate` and
+    # `autotune` print (#380). A `terse capture` corpus no longer trips the result-id half
+    # (`capture_payload(manual=True)`); one captured without `--server` still trips the
+    # server half, correctly.
+    _print_corpus_identity_note(envelopes)
 
     # Rationale in `_tune_ledger_warnings`'s own docstring (#274) — this call site just
     # prints whatever it finds. Printed BEFORE `--out` writes the policy below: writing

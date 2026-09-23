@@ -167,7 +167,10 @@ off by default because it failed rung 4 at the measured hit rate.
   long-text), `capture_payload` (writes a sha-idempotent envelope to `corpus/`),
   `load_corpus`, `coverage`, `extract_records`, `bare_and_server` / `qualify` /
   `qualified_tool`.
-  The envelope records `server` and `result_id` when the proxy knows them, so a tune-time
+  The envelope records `server` and `result_id` when the proxy knows them (a hand
+  `terse capture` writes `result_id` as `manual:<file stem>` — one whole payload, not a
+  `<session>:<gen>.<msgid>` proxy result — except when rewriting an existing timed
+  envelope, which keeps its first sighting's id or its absence), so a tune-time
   reader can tell *which downstream* sent a payload and *which result* its blocks arrived
   in, rather than inferring both. Both are optional and omitted when unknown — the format
   is additive, so a corpus captured before them stays loadable, and both are preserved
