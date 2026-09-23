@@ -2017,12 +2017,12 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
                     lowest[arm] = (low, [m for m, rates in rates_by_model.items()
                                          if rates[arm] == low])
             if lowest:
-                def _who(ms: list[str]) -> str:
-                    if len(ms) == len(verdicts):
-                        return ""
-                    return " (" + ", ".join(f"`{m}`" for m in ms) + ")"
-                shown = ", ".join(f"{arm} {_codec_rate_text(rate)}{_who(ms)}"
-                                  for arm, (rate, ms) in lowest.items())
+                n_models = len(verdicts)
+                shown = ", ".join(
+                    f"{arm} {_codec_rate_text(rate)}"
+                    + ("" if len(ms) == n_models else
+                       " (" + ", ".join(f"`{m}`" for m in ms) + ")")
+                    for arm, (rate, ms) in lowest.items())
                 why += (f"; tool-call compliance {shown} in this run — not measured across "
                         f"runs")
         out.append(f"| `{tool}` | {shape} | {questions} | {n_col} | **{worst_verdict}** | "
