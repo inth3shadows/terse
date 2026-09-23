@@ -53,6 +53,7 @@ def text() -> str:
     return CHANGELOG.read_text(encoding="utf-8")
 
 
+@pytest.mark.changelog_bookkeeping
 def test_every_release_but_the_newest_has_a_changelog_section(text):
     """The rule the file's own header states. A tag is a published PyPI release (hatch-vcs
     cuts from tags), so a tag without a section is a shipped change nobody can look up.
@@ -82,6 +83,7 @@ def test_every_release_but_the_newest_has_a_changelog_section(text):
         "pushed, and a user on that version has no other way to find out what changed.")
 
 
+@pytest.mark.changelog_bookkeeping
 def test_unreleased_does_not_describe_work_that_already_shipped():
     """The failure this file was written for, encoded as the invariant rather than a size
     heuristic.

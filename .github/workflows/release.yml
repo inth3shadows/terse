@@ -161,24 +161,29 @@ jobs:
           {
             echo "tag=${new}"; echo "release=true"; echo "needtag=true"
           } >> "$GITHUB_OUTPUT"
-      # GATE before the tag is pushed. Same invocation as tests.yml (keeps CI keyless).
+      # GATE before the tag is pushed. tests.yml's suite (keyless) MINUS the
+      # `changelog_bookkeeping` tests — see the block below.
       # A red suite fails the job here, so no tag is ever pushed for a broken build.
       - if: steps.decide.outputs.release == 'true'
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
         with:
           enable-cache: true
-      # Minus ONE test: the graduation check asks whether the PREVIOUS release's CHANGELOG
-      # section was filed, which says nothing about whether THIS commit is fit to tag. Gating
-      # on it skipped a release outright: #422's PR CI ran green before v0.34.0 was tagged,
-      # it merged after, and this step then failed on v0.34.0's ungraduated entry — no tag,
-      # no PyPI publish, until the next PR graduated it. PR CI still runs it (the header's
-      # "next PR goes red" mechanism is unchanged); `tests/test_changelog_graduation.py`
-      # pins that this id still names a real test, so a rename cannot deselect nothing.
+      # Minus the `changelog_bookkeeping` tests: they audit whether PREVIOUS releases were
+      # filed in CHANGELOG.md, which says nothing about whether THIS commit is fit to tag —
+      # and their answer can flip between a PR's green CI and its squash on main. It did:
+      # #422's branch moved v0.34.0's entry, so on the branch `git blame` gave that line to
+      # an untagged commit (green), while on the squash it blamed back into v0.34.0 (red).
+      # This step failed, and #422 got no tag and no PyPI publish until #432 graduated the
+      # section. The newest-tag exemption has the same exposure when two releases land
+      # while a PR sits green. PR CI and tests.yml's push-to-main run still execute them,
+      # so a missed graduation still goes red; the cost is that several releases can now
+      # pile up ungraduated, which the graduation test then tells you to split by hand.
+      # `tests/test_changelog_graduation.py` pins this exact command and the marked set.
       - name: Test before tagging
         if: steps.decide.outputs.release == 'true'
         run: |
           uv sync --dev
-          uv run pytest -q --deselect tests/test_changelog_covers_every_release.py::test_unreleased_does_not_describe_work_that_already_shipped
+          uv run pytest -q -m "not changelog_bookkeeping"
       # Only NOW create + push the tag — the gate passed. Skipped for a hand-pushed tag
       # (needtag=false), which is already on origin.
       - name: Create + push the version tag
