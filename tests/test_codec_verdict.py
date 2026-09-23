@@ -323,6 +323,8 @@ def test_an_unresolved_cell_names_BOTH_compliance_and_the_trial_floor():
     cell = _cell(build_codec_verdict_report({"m": rows}))
     assert "**UNRESOLVED**" in cell
     assert "delivered 29%" in cell
+    # #412: one run's rate, scoped as one run's — the same cell later read 100% twice.
+    assert "delivered 29% of its answers through the tool call in this run" in cell
     assert "only 7 zero-failure trial(s), need 20" in cell
 
 

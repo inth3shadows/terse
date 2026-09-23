@@ -1739,8 +1739,13 @@ def codec_unresolved_reasons(rows: list[dict[str, Any]], excluded_from_group: in
         # contradiction. Truncated, not rounded, so 79.96% cannot print as 80.0% either.
         shown = (f"{math.floor(rate * 1000) / 10:.1f}%"
                  if f"{rate:.0%}" == f"{_CODEC_MIN_CALL_RATE:.0%}" else f"{rate:.0%}")
-        reasons.append(f"{arm} arm delivered {shown} of its answers through the tool call, "
-                       f"need {_CODEC_MIN_CALL_RATE:.0%} — the run cannot show a value "
+        # "in this run", not a bare rate: the same (model, payload, question) read 29% on a
+        # 7-trial run and 100% on two 20-trial runs, on unchanged answering code (#412), and
+        # the unqualified sentence was already being cited as a property of the model. Not
+        # "not the model" either — one run cannot separate the two.
+        reasons.append(f"{arm} arm delivered {shown} of its answers through the tool call "
+                       f"in this run, need {_CODEC_MIN_CALL_RATE:.0%} — the run cannot "
+                       f"show a value "
                        f"surviving into a downstream tool argument")
     n = sum(_arm_trials(r, "terse_ok") for r in rows)
     if n < _CODEC_MIN_TRIALS:
