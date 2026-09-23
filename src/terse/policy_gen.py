@@ -693,7 +693,8 @@ def heuristic_share(envelopes: list[dict[str, Any]]) -> tuple[int, int]:
     neither is a `terse capture` payload, which carries its own `manual:` result id
     (`capture_payload(manual=True)`) — reporting either as "grouped by timing" would be a false
     alarm. One written by `terse capture` BEFORE that id existed is indistinguishable from a
-    legacy proxy envelope and is counted as one — re-capturing it adds the id.
+    legacy proxy envelope and is counted as one; re-capturing it in place keeps it so (the
+    first sighting's identity is preserved), so only a fresh corpus clears it.
 
     Surfaced rather than smoothed over: an old corpus cannot be made exact retroactively,
     and quietly re-measuring one downward would be a worse answer than saying which part of

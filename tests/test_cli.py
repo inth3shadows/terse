@@ -1407,22 +1407,32 @@ def test_two_spellings_of_one_tool_stay_two_hand_results(tmp_path):
     assert [len(g) for g in groups["kb.search"]] == [1, 1]
 
 
-def test_re_capturing_an_old_hand_corpus_is_a_real_remedy(tmp_path, capsys):
-    """Review of #380: the note says "Re-capture to make this exact", but a proxy-style
-    rewrite keeps a prior envelope's MISSING id, so re-running `terse capture` over a hand
-    corpus written before the id existed changed nothing. A hand id fills the gap."""
+def test_a_hand_capture_never_re_homes_a_legacy_proxy_block(tmp_path):
+    """Review of #380: an old hand envelope and a pre-#148 proxy block are identical on
+    disk. Filling a `manual:` id on rewrite split an 8-block proxy result into eight groups
+    of one (45.6% -> 26.5%) and silenced the note. A rewrite keeps the missing id."""
     from terse.capture import capture_payload, load_corpus
+    from terse.policy_gen import group_results, heuristic_share
 
     corpus = tmp_path / "c"
-    raw = json.dumps([{"id": 1}, {"id": 2}])
-    capture_payload("kb.x", raw, corpus, server="kb")            # an old hand capture
-    assert main(["capture", str(_write(tmp_path, "p.json", raw)), "--tool", "kb.x",
+    raws = [json.dumps([{"id": i, "team": "platform-infra"}]) for i in range(3)]
+    for raw in raws:                                   # one legacy proxy result, 3 blocks
+        capture_payload("search", raw, corpus, server="kb")
+    assert main(["capture", str(_write(tmp_path, "b.json", raws[1])), "--tool", "search",
                  "--server", "kb", "--corpus", str(corpus)]) == 0
-    (env,) = load_corpus(corpus)
-    assert env["result_id"] == "manual:kb.x__" + env["sha"]
-    capsys.readouterr()
-    assert main(["tune", "--corpus", str(corpus)]) == 0
-    assert "[note]" not in capsys.readouterr().out
+    envs = load_corpus(corpus)
+    assert [len(g) for g in group_results(envs)["kb.search"]] == [3]
+    assert heuristic_share(envs) == (3, 3)
+
+
+def test_the_legacy_note_names_a_remedy_that_works():
+    """Re-capturing IN PLACE keeps the first sighting's identity (above), so "Re-capture"
+    alone sent the operator to do something that changes nothing."""
+    from terse.cli import _print_corpus_identity_note
+
+    buf = io.StringIO()
+    _print_corpus_identity_note([{"tool": "t", "raw": "{}", "captured_at": 1}], out=buf)
+    assert "Re-capture into a fresh corpus" in buf.getvalue()
 
 
 def test_a_hand_capture_keeps_a_prior_proxy_result_id(tmp_path):

@@ -344,7 +344,7 @@ def _print_corpus_identity_note(envelopes: list, out=None) -> None:
     * without a server, a rule is authored under the bare tool name, and a bare rule sits
       dead behind any deployed server-scoped glob.
 
-    Silent on a fully-identified corpus, which is the steady state after a re-capture — the
+    Silent on a fully-identified corpus, which is the steady state after a re-capture into a fresh corpus — the
     remedy in both cases, since neither field can be recovered after the fact.
     """
     from .policy_gen import heuristic_share
@@ -353,7 +353,7 @@ def _print_corpus_identity_note(envelopes: list, out=None) -> None:
     if guessed:
         print(f"  [note] {guessed}/{total} payload(s) predate result ids; their results were "
               f"grouped by capture timing, which can merge parallel calls into one. "
-              f"Re-capture to make this exact.", file=out)
+              f"Re-capture into a fresh corpus to make this exact.", file=out)
     unnamed = sum(1 for e in envelopes if not isinstance(e.get("server"), str) or not e["server"])
     if unnamed:
         print(f"  [note] {unnamed}/{total} payload(s) record no server, so their rules are "
