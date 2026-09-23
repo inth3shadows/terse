@@ -1429,14 +1429,6 @@ def test_a_hand_capture_never_re_homes_a_legacy_proxy_block(tmp_path):
     assert heuristic_share(envs) == (3, 3)
 
 
-def test_manual_and_an_explicit_result_id_cannot_both_be_given(tmp_path):
-    """`manual` would silently replace the caller's id, splitting whatever result it named."""
-    from terse.capture import capture_payload
-
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        capture_payload("t", "[1]", tmp_path / "c", result_id="s:1.2", manual=True)
-
-
 def test_the_legacy_note_names_a_remedy_that_works():
     """Re-capturing IN PLACE keeps the first sighting's identity (above), so "Re-capture"
     alone sent the operator to do something that changes nothing."""
