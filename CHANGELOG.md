@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.34.1] - 2026-09-23
+
 ### Fixed
 
 - **A SAFE codec cell states the compliance rate that let it through, scoped to the run
