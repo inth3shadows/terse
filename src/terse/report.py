@@ -1974,10 +1974,10 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
             # a passing one be. SAFE licenses "the value survives into a real tool argument"
             # on a rate that read 29% and then 100% on the same cell, so the rate that let
             # this cell through is stated, scoped to the run, beside the verdict it carried.
-            rates = [(form[:-len("_ok")], r) for form in ("raw_ok", "terse_ok")
-                     if (r := codec_call_rate(worst_gap.rows, form)) is not None]
+            rates = [(form[:-len("_ok")], rate) for form in ("raw_ok", "terse_ok")
+                     if (rate := codec_call_rate(worst_gap.rows, form)) is not None]
             if rates:
-                shown = ", ".join(f"{arm} {r:.0%}" for arm, r in rates)
+                shown = ", ".join(f"{arm} {rate:.0%}" for arm, rate in rates)
                 why += (f"; tool-call compliance {shown} in this run — not measured across "
                         f"runs")
         out.append(f"| `{tool}` | {shape} | {questions} | {n_col} | **{worst_verdict}** | "
