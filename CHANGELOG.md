@@ -13,6 +13,116 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `folded-and-live` peer whose live duplicate runs its own proxy now reports that
+  proxy's primer cost (#396).** The router's union primer covers the folded route, but the
+  separately live `terse proxy` is another process and can attach its own lazy primer once
+  per session. Primer liability previously excluded every folded state, understating that
+  duplicate's real cost. Raw live re-adds still remain excluded: scan data leaves their
+  proxy launch fields empty, so state alone never manufactures a second charge.
+
+  Two review blockers shipped with it, both reproduced before being fixed:
+
+  - **A `proxy` token is no longer mistaken for a proxy invocation.** `parse_proxy_opts`
+    located the subcommand with `args.index("proxy")`, which reads a WORD, not an
+    invocation. `terse --help proxy -- kb-mcp` prints help and exits, and
+    `terse stats --server-name proxy` has `proxy` as a flag VALUE — both returned a segment,
+    both had `wraps` filled off the `--`, and the new charge above then billed a primer to
+    a process that can never attach one. terse's top-level parser takes no option but
+    `--version`/`-h` (both terminating) and requires a subcommand, so the position is
+    knowable exactly: `proxy` must be the first token of terse's own argv. Every shape
+    `terse_invocation`/`$TERSE_MCP_CMD` emits still parses.
+  - **A label a router and its live duplicate BOTH write under is now unattributable.**
+    multiproxy tags each peer's records with that peer's name; a `folded-and-live`
+    duplicate that baked `--server-name kb` writes rows under the same `kb`. Nothing in a
+    ledger record distinguishes them, so both liability rows consumed all of that label's
+    blocks and savings and each could independently report `KEEP`. The label is now dropped
+    from both claimants and published in a new `contested_labels` field (`--json`, reported
+    never counted, like `superseded_labels`), with its own `break_even_verdict` of
+    `router/live duplicate label`. It gets a distinct reason and distinct advice because
+    `--server-name` — the fix every other no-label cause prescribes — is what creates this
+    one: the report says to remove the duplicate or give the live entry a DIFFERENT name.
+    A router keeps its uncontested peers and stays measurable on those.
+
+  Review of the above found five more, all reproduced before being fixed:
+
+  - **A row that had a label taken away publishes no measurement at all.** Where the
+    surviving sum was `0` this reported `never called` — the hard claim — which `_recommend`
+    escalates to `UNWRAP` and the `idle` line prints as "pure cost"; a real fleet flipped
+    `KEEP` -> `UNWRAP` with the report contradicting itself two lines apart. A non-zero
+    surviving sum is no safer, and a first fix wrongly called it "conservative": coverage is
+    `saved/primer`, so dropping a LOSS-making label raises it (a structurally unearnable
+    `UNWRAP`/`never` read `TUNE`), and the rate is `saved/tokenized`, which has no monotone
+    direction at all (a row rendered `600/block` against a true pooled `266.7`). Any
+    contested label now blacks the row out. `contributors` still lists the labels that
+    survived, so nothing attributable is hidden.
+  - **The contest counts WRITERS per label instead of matching two fixed roles.** Keyed on
+    `folded-and-live`, it missed a duplicate at another scope (`folded` is per-scope, so the
+    same peer wrapped at project scope is `wrapped`); keyed on an intersection, it could
+    only ever put a router on one side, so two routers folding one peer name were never
+    contested. Counting writers answers both, and the `router-ambiguous` pair as well. One
+    side must still be a router — two plain wrapped entries resolving to one non-launcher
+    label are one logical server installed twice, which #285 ruled honest.
+  - **The label a claimant WRITES, not the one it may COUNT.** Resolving it through
+    `_wrapped_labels` inherited that function's `ambiguous` filter, so a router peer named
+    `python` beside another entry guessing `python` stopped being contested and the router
+    reported a cleared `KEEP` over rows three processes wrote.
+  - **The new reason no longer folds the break-even table.** `router/live duplicate label`
+    is 27 characters against a documented bound of 84 for a 62-column row; it is abbreviated
+    in that one cell and published in full everywhere else. The width test now drives the
+    reason VOCABULARY rather than a fixture that never produced it.
+  - **Every entry whose labels were taken is named in the stanza that explains it.** The
+    line was built from the `uncertain` set, which a router can never be in, so a contested
+    router printed a verdict nothing in the report explained — the gap `silent_any` closed
+    in #417, one reason later. The stanza names the shared LABEL rather than
+    pointing at `mcp-status`, whose duplicate warning fires only on `folded-and-live` and is
+    therefore silent for exactly the cross-scope case above.
+
+
+
+  A third round found four more. A contested row was discarding a primer record it
+  provably wrote — a primer row is written at one site, `run_proxy`'s
+  `build_primer_writer`, and a router's peers are built `lazy_primer=False`, so a
+  `once/session` row under a contested label can only be a standalone proxy's; where exactly
+  one standalone answers to that label the record is fully attributable, and blacking it out
+  published a measured 777-token attach as `session_once_tokens: 0`. The blackout now stands
+  down entirely when the contested label has NO rows in the window, where what survives is
+  already the pooled truth. `contested_labels` is derived from what an entry WRITES rather
+  than what it may COUNT, so a co-writer whose own guess is ambiguous is named in the
+  stanza instead of leaving it saying "more than one installed entry" above a list of one.
+  And the remedy the stanza prints is one the named entries can take: `--server-name` is
+  refused with `--config`, so a router-vs-router contest is told to rename the peer instead.
+  Both rendered legends name the new cause; they were closed enumerations in which none of
+  the listed causes was true of a contested row.
+
+  A fourth round found that the fixes above kept re-deriving facts the contest had already
+  computed, so this entry ends with a small refactor rather than a fifth patch.
+  `_contested_labels` publishes both writer sets per label, and the render loop and the
+  report's remedy line consume them. Three defects collapse into that: a `--no-stats` entry
+  was named as a writer (its re-derivation skipped the `_writes_ledger_rows` gate) and, by
+  being named, suppressed the real collision's remedy; the remedy line scanned the fleet
+  rather than one label, so two independent contests printed one sentence claiming a single
+  rename addressed both; and the remedy is now chosen per label, so a `router-ambiguous`
+  pair — which by definition fronts ONE peers file — is told to point one of them at its own
+  file rather than to rename a peer that moves for both. Separately, the idle-duplicate
+  stand-down was being applied one step too late: `labels` dropped the contested label before
+  `blackout` could decline to, so an entry whose ONLY label was the idle one still went dark.
+
+  **`--json` consumers:** `primer_liability` gains `contests` (contested label -> the
+  non-router entries writing it), `primer_liability.servers[]` gains `contested_labels`, and
+  `break_even_verdict` gains the value `router/live duplicate label`. A fleet with a
+  duplicated peer that wrote rows this window will see `blocks`, `tokenized_blocks`,
+  `saved_per_block`, `blocks_to_break_even` and `break_even_coverage` all go null on every
+  claimant — for a router the whole row goes dark, not just that label's share — while
+  `primer_tokens`, `primer_source` and `cadence` survive wherever the record is
+  attributable. That drop IS the correction.
+
+  Three limits are filed rather than fixed: two entries that each bake the same explicit
+  `--server-name` with no router present are still uncounted (#426), a hand-edited nested
+  router in `folded-and-live` is dropped (#427), and an estimated primer is still sized
+  against the `mcpServers` key rather than the ledger identity (#428). A `folded` row in a
+  higher-precedence scope also still shadows the live lower-scope entry (#424).
 ### Changed
 
 - **`capture_payload` writes a hand-capture id by default (#380).** `manual` now defaults

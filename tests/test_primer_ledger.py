@@ -189,6 +189,117 @@ def test_a_session_that_suppresses_then_attaches_records_both_and_the_attach_win
     assert row["server"] not in liab["free"]
 
 
+def test_a_contested_label_keeps_a_primer_record_only_this_entry_could_have_written():
+    """Re-review of PR #422, finding 1. The contest blacks out a contested row's BLOCKS —
+    several processes write them and the ledger cannot say whose. It must not black out the
+    PRIMER record, which is a different question with a different answer.
+
+    A primer row is written at exactly one site: `run_proxy`'s `build_primer_writer`. A
+    router's peers are built `lazy_primer=False` so no peer attach can fire, and the
+    router's own union primer is eager and recorded nowhere. So a `once/session` row under a
+    contested label can only be a STANDALONE proxy's — and where exactly one standalone
+    answers to that label, it is fully attributable however many routers also claim it.
+
+    Blacking it out reported a measured 777-token attach as `session_once_tokens: 0`, under
+    the report's own line "Only servers that were actually called are billed here", and
+    flipped `primer_source` from `recorded` to `estimated`. A measured cost published as
+    zero is the direction this whole module exists to prevent."""
+    rec = build_primer_record("gh", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)
+    agg = _agg_with(blocks_for="gh", primer_rows=[rec])
+    live = _scan_row(name="gh", state="folded-and-live", wraps="gh-server")
+    live["ledger_identity"], live["ledger_identity_explicit"] = "gh", True
+
+    alone = primer_liability([live], agg)["servers"][0]
+    assert alone["primer_source"] == "recorded"
+
+    # Same ledger, same entry — plus the router that makes `gh` contested.
+    liab = primer_liability([_scan_row(name="terse", state="router", wraps="gh"), live], agg)
+    row = next(r for r in liab["servers"] if r["server"] == "gh")
+    assert row["contested_labels"] == ["gh"]
+    assert row["blocks"] is None                       # blocks stay unattributable...
+    assert row["primer_source"] == "recorded"          # ...the primer does not
+    assert row["primer_tokens"] == alone["primer_tokens"] == count_cl100k("P" * 40)
+    assert liab["session_once_tokens"] == row["primer_tokens"]   # NOT 0
+
+
+def test_an_idle_contested_label_does_not_spread_one_primer_record_across_claimants():
+    """Round 4 narrow pass, finding 1. Keeping an idle contested label in `labels` was right
+    for BLOCKS — attributing zero to two claimants cannot be wrong — and wrong for the
+    PRIMER, because primer records are a separate population that `_label_has_rows` never
+    reads. The label then reached `primer_labels` through the UNGUARDED first term, so ONE
+    record was published as `recorded` on every standalone claimant.
+
+    The suppression variant is the live-reachable one: a `structuredContent`-only downstream
+    (#286's flagship shape) writes a decline row and NO tool row, so the label is idle by
+    blocks while carrying real primer evidence. Both entries were then declared provably
+    `free` off a record only one of them wrote — a fabricated measured zero."""
+    def _live(name, state="wrapped"):
+        r = _scan_row(name=name, state=state, wraps="kb-server")
+        r["ledger_identity"], r["ledger_identity_explicit"] = "kb", True
+        return r
+
+    for attached in (True, False):
+        rec = build_primer_record("kb", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40,
+                                  attached=attached)
+        # `kb` is idle in TOOL rows — every block belongs to `gh` — but carries a primer row.
+        agg = _agg_with(blocks_for="gh", primer_rows=[rec])
+        liab = primer_liability([_scan_row(name="terse", state="router", wraps="gh, kb"),
+                                 _live("kb", "folded-and-live"), _live("kb2")], agg)
+        rows = {r["server"]: r for r in liab["servers"]}
+
+        for name in ("kb", "kb2"):
+            assert rows[name]["primer_source"] == "estimated", (name, attached)
+            assert rows[name]["cadence"] == "once/session (?)", (name, attached)
+        assert liab["session_once_tokens"] == 0, attached   # NOT 2x the one record
+        assert liab["free"] == [], attached                 # NOT "provably free"
+
+
+def test_one_standalone_still_keeps_the_record_under_an_idle_contested_label():
+    """The guard above must not cost round 3's fix. With a single standalone writing the
+    label the record is attributable however many routers claim it, idle blocks or not —
+    both the attach and the decline stay MEASURED."""
+    def _live():
+        r = _scan_row(name="kb", state="folded-and-live", wraps="kb-server")
+        r["ledger_identity"], r["ledger_identity_explicit"] = "kb", True
+        return r
+
+    attach = primer_liability(
+        [_scan_row(name="terse", state="router", wraps="gh, kb"), _live()],
+        _agg_with(blocks_for="gh", primer_rows=[
+            build_primer_record("kb", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)]))
+    kb = next(r for r in attach["servers"] if r["server"] == "kb")
+    assert kb["primer_source"] == "recorded" and kb["cadence"] == "once/session"
+    assert attach["session_once_tokens"] == kb["primer_tokens"] > 0
+
+    decline = primer_liability(
+        [_scan_row(name="terse", state="router", wraps="gh, kb"), _live()],
+        _agg_with(blocks_for="gh", primer_rows=[
+            build_primer_record("kb", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40,
+                                attached=False)]))
+    kb = next(r for r in decline["servers"] if r["server"] == "kb")
+    assert kb["primer_source"] == "recorded" and kb["primer_tokens"] == 0
+    assert decline["free"] == ["kb"]
+
+
+def test_two_standalone_writers_of_one_contested_label_keep_no_primer_record():
+    """The other side of the rule above: the record is attributable because ONE standalone
+    proxy answers to the label. Add a second and nothing in the row says which of them
+    attached, so the estimate is the only honest answer."""
+    rec = build_primer_record("gh", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)
+    agg = _agg_with(blocks_for="gh", primer_rows=[rec])
+
+    def _live(name):
+        r = _scan_row(name=name, state="folded-and-live", wraps="gh-server")
+        r["ledger_identity"], r["ledger_identity_explicit"] = "gh", True
+        return r
+
+    liab = primer_liability(
+        [_scan_row(name="terse", state="router", wraps="gh"), _live("gh"), _live("gh2")], agg)
+    for row in (r for r in liab["servers"] if r["server"] in ("gh", "gh2")):
+        assert row["contested_labels"] == ["gh"]
+        assert row["primer_source"] == "estimated"
+
+
 def test_a_session_that_never_calls_a_wrapped_tool_records_nothing():
     rows: list[tuple[str, str]] = []
     inter = Interceptor(FULL, stats_primer=lambda c, t: rows.append((c, t)))

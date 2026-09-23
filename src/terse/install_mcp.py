@@ -935,6 +935,41 @@ def _looks_like_terse_launcher(entry: dict) -> bool:
 NO_PEERS = "(no peers)"
 
 
+def _proxy_subcommand_index(entry: dict, args: list) -> int | None:
+    """Index of the `proxy` token, but only where it sits in terse's SUBCOMMAND position —
+    else None, meaning this entry runs no proxy however many times the word appears.
+
+    `args.index("proxy")` was the whole test, and it reads a word, not an invocation. Two
+    populations it admits, both reproduced in review of #396:
+
+      * `terse --help proxy -- kb-mcp` — terse prints help and exits. The old parse
+        returned a segment, `scan_scopes` filled `wraps` off the `--`, and #396's liability
+        gate then billed that entry a primer a process which cannot attach one.
+      * `terse stats --server-name proxy` — `proxy` as a FLAG VALUE. Same false positive,
+        no help flag involved, so a deny-list of terminating flags would not have caught it.
+
+    The position is knowable exactly, because terse's top-level parser takes no option but
+    `--version`/`-h` (both terminating) and requires a subcommand: terse's own argv starts
+    right after the terse reference, and its first token IS the subcommand. So the console
+    script form must have `proxy` at `args[0]`, and the `-m terse` / `uvx terse` forms must
+    have it immediately after the bare `terse` token — which is exactly what `wrap` writes
+    (`[*terse_cmd[1:], "proxy", ...]`).
+
+    Blind spot, stated rather than guarded: for the non-console-script forms this takes the
+    FIRST adjacent `terse proxy` pair, so a non-executing entry whose DOWNSTREAM is itself
+    `... -- <something> terse proxy` would match on the downstream's copy. That needs a
+    hand-edit which both fails to run a proxy and wraps one; the pair is accepted as the
+    narrower wrong answer than accepting any `proxy` token anywhere."""
+    cmd = entry.get("command")
+    if isinstance(cmd, str) and _launcher_basename(cmd) == "terse":
+        # The console script IS terse: `args` is terse's argv with nothing in front of it.
+        return 0 if args and args[0] == "proxy" else None
+    for i in range(len(args) - 1):
+        if args[i] == "terse" and args[i + 1] == "proxy":
+            return i + 1
+    return None
+
+
 def proxy_arg_segment(entry: dict) -> list[str] | None:
     """The tokens between the `proxy` subcommand and the first `--` — TERSE's own flags,
     with the downstream's excluded — or None when `entry` is not a terse-wrapped entry.
@@ -950,9 +985,8 @@ def proxy_arg_segment(entry: dict) -> list[str] | None:
     args = entry.get("args")
     if not isinstance(args, list):
         return None
-    try:
-        start = args.index("proxy")
-    except ValueError:
+    start = _proxy_subcommand_index(entry, args)
+    if start is None:
         return None
     try:
         end = args.index("--", start + 1)
