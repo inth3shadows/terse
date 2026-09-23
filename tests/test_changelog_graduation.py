@@ -145,10 +145,10 @@ def test_the_release_gate_excludes_exactly_the_bookkeeping_tests_and_PR_CI_runs_
     assert "PYTEST_ADDOPTS" not in release + tests_yml
     gate = [ln.strip() for ln in release.splitlines() if "pytest" in ln and "uv run" in ln]
     assert gate == ['uv run pytest -q -m "not changelog_bookkeeping"'], gate
+    # Exact, not a flag blocklist: a path argument or `--co` narrows the run just as surely
+    # as `-m`/`-k`, and a blocklist cannot enumerate every way to do that (review 3).
     pr = [ln.strip() for ln in tests_yml.splitlines() if "pytest" in ln and "run:" in ln]
-    filters = (re.compile(r"pytest\b.*\s-m\s"), re.compile(r"\s-k\s"),
-               re.compile(r"--deselect"), re.compile(r"--ignore"))
-    assert pr and not any(f.search(ln) for ln in pr for f in filters), pr
+    assert pr == ["- run: uv run pytest -q --cov --cov-report=term-missing"], pr
     # The marked set, by a text scan of every test file in the repo — the gate runs bare
     # `pytest` from the root, so a marked test outside tests/ would be excluded too. A scan,
     # not a `pytest --co` subprocess: that re-collected the whole suite (~2.5s) per run and

@@ -174,8 +174,8 @@ jobs:
       # #422's branch moved v0.34.0's entry, so on the branch `git blame` gave that line to
       # an untagged commit (green), while on the squash it blamed back into v0.34.0 (red).
       # This step failed, and #422 got no tag and no PyPI publish until #432 graduated the
-      # section. The newest-tag exemption has the same exposure when two releases land
-      # while a PR sits green. PR CI and tests.yml's push-to-main run still execute them,
+      # section. The newest-tag exemption has the same exposure: a single release landing
+      # while a PR sits green moves "newest" past the tag that PR's CI exempted. PR CI and tests.yml's push-to-main run still execute them,
       # so a missed graduation still goes red; the cost is that several releases can now
       # pile up ungraduated, which the graduation test then tells you to split by hand.
       # `tests/test_changelog_graduation.py` pins this exact command and the marked set.
