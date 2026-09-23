@@ -13,54 +13,6 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-### Changed
-
-- **`capture_payload` writes a hand-capture id by default (#380).** `manual` now defaults
-  to "a hand capture unless a `result_id` is given", not `False`. The opt-in flag had to be
-  remembered by every non-proxy caller (#425 and #429 each fixed callers that forgot), so
-  the next script or harness would have silently re-created the legacy-looking envelope.
-  The proxy — the one caller whose id-less block really is part of a larger result —
-  passes `manual=False` explicitly, pinned by a test. A library caller that relied on the
-  old default to write an id-less envelope must now pass `manual=False`.
-
-## [0.33.11] - 2026-09-23
-
-### Fixed
-
-- **The bundled corpus generators write what `terse capture` writes (#380).**
-  `scripts/gen_stress_corpus.py` (the `terse verify` sample and the `--fleet-shapes`
-  codec corpus) and `scripts/gen_real_corpus.py` now pass `manual=True`, so each payload
-  carries its own `manual:` result id instead of reading as a legacy proxy block.
-  **Scoring shift (stress corpus only):** `policy generate`/`tune` no longer timing-group
-  its back-to-back payloads — the three `synthetic.secret.list_credentials` fleet shapes
-  were ONE joined 3-block result and are now three (`group_results` on both versions of
-  the script). `gen_real_corpus` keeps one envelope per tool, so its grouping never
-  changed; only its identity note and `tune` sample line do. `terse verify` output is
-  byte-identical; the fluency/codec evals never read `result_id`. A directory generated
-  before this keeps its old envelopes; regenerate into a fresh one.
-
-## [0.33.10] - 2026-09-23
-
-### Fixed
-
-- **A `terse capture` payload is its own result, not a legacy envelope (#380).** It wrote
-  `captured_at` and no `result_id`, which is exactly a pre-#148 proxy capture. So
-  `policy generate`/`autotune`/`tune` grouped consecutive hand captures of one tool by
-  timing (two separate captures read as 1 result), and the identity note told every
-  hand-built corpus to "re-capture", which could never add the id. `terse capture` now
-  stamps `manual:<file stem>` (`capture_payload(manual=True)`) — the stem, not the sha
-  alone, so `kb.search` and `search --server kb` stay two results. An existing timed
-  envelope keeps its first sighting's identity: an old hand capture and a pre-#148 proxy
-  block are identical on disk, and re-homing the proxy one would split a real result.
-  `capture_payload(manual=True, result_id=...)` raises `ValueError` rather than silently
-  replacing the caller's id. The note's
-  remedy now says what works: "Re-capture into a fresh corpus".
-- **`terse tune` says what a legacy sample costs, not just its share (#380).** Under the
-  `sample:` line it now prints the identity note `policy generate`/`autotune` already print
-  (timing-grouped results, bare-name rules), and stays silent on a fully-identified corpus.
-
-## [0.33.9] - 2026-09-23
-
 ### Fixed
 
 - **A `folded-and-live` peer whose live duplicate runs its own proxy now reports that
@@ -171,6 +123,51 @@ fails that pull request until the section has moved.
   router in `folded-and-live` is dropped (#427), and an estimated primer is still sized
   against the `mcpServers` key rather than the ledger identity (#428). A `folded` row in a
   higher-precedence scope also still shadows the live lower-scope entry (#424).
+### Changed
+
+- **`capture_payload` writes a hand-capture id by default (#380).** `manual` now defaults
+  to "a hand capture unless a `result_id` is given", not `False`. The opt-in flag had to be
+  remembered by every non-proxy caller (#425 and #429 each fixed callers that forgot), so
+  the next script or harness would have silently re-created the legacy-looking envelope.
+  The proxy — the one caller whose id-less block really is part of a larger result —
+  passes `manual=False` explicitly, pinned by a test. A library caller that relied on the
+  old default to write an id-less envelope must now pass `manual=False`.
+
+## [0.33.11] - 2026-09-23
+
+### Fixed
+
+- **The bundled corpus generators write what `terse capture` writes (#380).**
+  `scripts/gen_stress_corpus.py` (the `terse verify` sample and the `--fleet-shapes`
+  codec corpus) and `scripts/gen_real_corpus.py` now pass `manual=True`, so each payload
+  carries its own `manual:` result id instead of reading as a legacy proxy block.
+  **Scoring shift (stress corpus only):** `policy generate`/`tune` no longer timing-group
+  its back-to-back payloads — the three `synthetic.secret.list_credentials` fleet shapes
+  were ONE joined 3-block result and are now three (`group_results` on both versions of
+  the script). `gen_real_corpus` keeps one envelope per tool, so its grouping never
+  changed; only its identity note and `tune` sample line do. `terse verify` output is
+  byte-identical; the fluency/codec evals never read `result_id`. A directory generated
+  before this keeps its old envelopes; regenerate into a fresh one.
+
+## [0.33.10] - 2026-09-23
+
+### Fixed
+
+- **A `terse capture` payload is its own result, not a legacy envelope (#380).** It wrote
+  `captured_at` and no `result_id`, which is exactly a pre-#148 proxy capture. So
+  `policy generate`/`autotune`/`tune` grouped consecutive hand captures of one tool by
+  timing (two separate captures read as 1 result), and the identity note told every
+  hand-built corpus to "re-capture", which could never add the id. `terse capture` now
+  stamps `manual:<file stem>` (`capture_payload(manual=True)`) — the stem, not the sha
+  alone, so `kb.search` and `search --server kb` stay two results. An existing timed
+  envelope keeps its first sighting's identity: an old hand capture and a pre-#148 proxy
+  block are identical on disk, and re-homing the proxy one would split a real result.
+  `capture_payload(manual=True, result_id=...)` raises `ValueError` rather than silently
+  replacing the caller's id. The note's
+  remedy now says what works: "Re-capture into a fresh corpus".
+- **`terse tune` says what a legacy sample costs, not just its share (#380).** Under the
+  `sample:` line it now prints the identity note `policy generate`/`autotune` already print
+  (timing-grouped results, bare-name rules), and stays silent on a fully-identified corpus.
 
 ## [0.33.9] - 2026-09-23
 

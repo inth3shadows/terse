@@ -491,6 +491,49 @@ def test_each_contested_label_gets_its_own_remedy(tmp_path):
     assert "`kb`: remove one of them, or rename the peer in one of the peers files." in text
 
 
+def test_a_router_ambiguous_pair_is_told_to_split_the_peers_file(tmp_path):
+    """Round 4 narrow pass, finding 2: the third remedy branch shipped with nothing pinning
+    it — three mutations survived, including `all` -> `any`.
+
+    `router-ambiguous` means, by `_detect_routers`' definition, two entries fronting ONE
+    peers file. "Rename the peer in one of the peers files" has no "one of" to pick and
+    renaming moves it for both, so that pair gets its own remedy."""
+    pol = _policy(tmp_path)
+    liab = primer_liability([_scan("r1", "router-ambiguous", "kb", pol),
+                             _scan("r2", "router-ambiguous", "kb", pol, scope="project")],
+                            _agg(("kb", 10, 10_000, 1_000)))
+    text = "\n".join(build_primer_section(liab))
+    assert "`kb`: remove one of them, or point one of them at its own peers file." in text
+    assert "rename the peer" not in text
+
+
+def test_a_mixed_router_contest_is_not_told_to_split_a_peers_file(tmp_path):
+    """The `all` in that branch is load-bearing, not decoration (the `all` -> `any` mutation
+    survived). Where a plain `router` also writes the label, repointing a peers file is
+    advice that does not apply to it — only a `router-ambiguous` pair shares one file."""
+    pol = _policy(tmp_path)
+    liab = primer_liability([_scan("r1", "router-ambiguous", "kb", pol),
+                             _scan("r2", "router", "kb", pol, scope="project")],
+                            _agg(("kb", 10, 10_000, 1_000)))
+    text = "\n".join(build_primer_section(liab))
+    assert "`kb`: remove one of them, or rename the peer in one of the peers files." in text
+    assert "its own peers file" not in text
+
+
+def test_two_standalone_claimants_are_named_as_a_choice_not_as_a_list(tmp_path):
+    """`give one of a, b a DISTINCT --server-name` — renaming EITHER resolves the collision,
+    so the line must not read as an instruction to rename both (the `one of` mutation
+    survived)."""
+    pol = _policy(tmp_path)
+    rows = [_scan("terse", "router", "kb", pol)]
+    for n, sc in (("kb", "user"), ("kb2", "project")):
+        rows.append(_scan(n, "wrapped", "kb-x", pol, scope=sc, identity="kb", explicit=True))
+    text = "\n".join(build_primer_section(primer_liability(
+        rows, _agg(("kb", 10, 10_000, 1_000)))))
+    assert "`kb`: remove one of them, or give one of kb, kb2 a DISTINCT `--server-name`." \
+        in text
+
+
 def test_an_idle_duplicate_leaves_a_single_label_entry_measured(tmp_path):
     """Round 4, finding 2. The round-3 stand-down was applied one step too late: `labels`
     dropped the contested label unconditionally, so by the time `blackout` declined to null

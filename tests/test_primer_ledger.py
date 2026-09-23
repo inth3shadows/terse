@@ -222,6 +222,65 @@ def test_a_contested_label_keeps_a_primer_record_only_this_entry_could_have_writ
     assert liab["session_once_tokens"] == row["primer_tokens"]   # NOT 0
 
 
+def test_an_idle_contested_label_does_not_spread_one_primer_record_across_claimants():
+    """Round 4 narrow pass, finding 1. Keeping an idle contested label in `labels` was right
+    for BLOCKS — attributing zero to two claimants cannot be wrong — and wrong for the
+    PRIMER, because primer records are a separate population that `_label_has_rows` never
+    reads. The label then reached `primer_labels` through the UNGUARDED first term, so ONE
+    record was published as `recorded` on every standalone claimant.
+
+    The suppression variant is the live-reachable one: a `structuredContent`-only downstream
+    (#286's flagship shape) writes a decline row and NO tool row, so the label is idle by
+    blocks while carrying real primer evidence. Both entries were then declared provably
+    `free` off a record only one of them wrote — a fabricated measured zero."""
+    def _live(name, state="wrapped"):
+        r = _scan_row(name=name, state=state, wraps="kb-server")
+        r["ledger_identity"], r["ledger_identity_explicit"] = "kb", True
+        return r
+
+    for attached in (True, False):
+        rec = build_primer_record("kb", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40,
+                                  attached=attached)
+        # `kb` is idle in TOOL rows — every block belongs to `gh` — but carries a primer row.
+        agg = _agg_with(blocks_for="gh", primer_rows=[rec])
+        liab = primer_liability([_scan_row(name="terse", state="router", wraps="gh, kb"),
+                                 _live("kb", "folded-and-live"), _live("kb2")], agg)
+        rows = {r["server"]: r for r in liab["servers"]}
+
+        for name in ("kb", "kb2"):
+            assert rows[name]["primer_source"] == "estimated", (name, attached)
+            assert rows[name]["cadence"] == "once/session (?)", (name, attached)
+        assert liab["session_once_tokens"] == 0, attached   # NOT 2x the one record
+        assert liab["free"] == [], attached                 # NOT "provably free"
+
+
+def test_one_standalone_still_keeps_the_record_under_an_idle_contested_label():
+    """The guard above must not cost round 3's fix. With a single standalone writing the
+    label the record is attributable however many routers claim it, idle blocks or not —
+    both the attach and the decline stay MEASURED."""
+    def _live():
+        r = _scan_row(name="kb", state="folded-and-live", wraps="kb-server")
+        r["ledger_identity"], r["ledger_identity_explicit"] = "kb", True
+        return r
+
+    attach = primer_liability(
+        [_scan_row(name="terse", state="router", wraps="gh, kb"), _live()],
+        _agg_with(blocks_for="gh", primer_rows=[
+            build_primer_record("kb", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40)]))
+    kb = next(r for r in attach["servers"] if r["server"] == "kb")
+    assert kb["primer_source"] == "recorded" and kb["cadence"] == "once/session"
+    assert attach["session_once_tokens"] == kb["primer_tokens"] > 0
+
+    decline = primer_liability(
+        [_scan_row(name="terse", state="router", wraps="gh, kb"), _live()],
+        _agg_with(blocks_for="gh", primer_rows=[
+            build_primer_record("kb", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40,
+                                attached=False)]))
+    kb = next(r for r in decline["servers"] if r["server"] == "kb")
+    assert kb["primer_source"] == "recorded" and kb["primer_tokens"] == 0
+    assert decline["free"] == ["kb"]
+
+
 def test_two_standalone_writers_of_one_contested_label_keep_no_primer_record():
     """The other side of the rule above: the record is attributable because ONE standalone
     proxy answers to the label. Add a second and nothing in the row says which of them

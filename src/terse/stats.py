@@ -1789,9 +1789,19 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         else:
             encoded_by_label[lbl] = (encoded_by_label.get(lbl) or 0) + enc
     def _label_has_rows(lbl: str) -> bool:
-        """Did this label record anything at all in the window? One definition, because the
+        """Did this label record any TOOL rows in the window? One definition, because the
         `labels` filter and the blackout must agree about it — they disagreed once already
-        and an idle duplicate deleted a complete measurement (round 4)."""
+        and an idle duplicate deleted a complete measurement (round 4).
+
+        TOOL rows only, and the name says so on purpose: primer records live in a different
+        population and this must not be read as "this label is silent" (see `primer_labels`,
+        where reading it that way published one attach as two).
+
+        `by_label` alone decides it against any real aggregate — `aggregate` does
+        `row["blocks"] += 1` per record, so a label with token sums always has a block count.
+        The other two terms are defensive against a hand-rolled `agg` and cannot fire
+        otherwise; all three mutations that drop them survive, and they are kept for the same
+        reason `measured_zero`'s `all()` is."""
         return bool(by_label.get(lbl) or tokenized_by_label.get(lbl)
                     or saved_by_label.get(lbl))
 
@@ -1905,9 +1915,23 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         # attributable for a PRIMER record when this entry is the only standalone proxy
         # answering to it — see `_contested_labels`. Keeping the two questions apart is what
         # stops the blackout reporting a measured 777-token attach as zero.
-        primer_labels = labels + [lbl for lbl in contested_here
-                                  if not is_router
-                                  and contests[lbl].standalone == {str(name)}]
+        #
+        # EVERY contested label reaches this through the sole-standalone term, and the
+        # subtraction on the left is what guarantees it. `labels` deliberately keeps a
+        # contested label with no TOOL rows — attributing zero blocks to two claimants
+        # cannot be wrong — but that reasoning does not transfer: primer records are a
+        # separate population (`agg["primers"]`) that `_label_has_rows` never reads, so an
+        # idle-by-blocks label can still carry a real attach. Letting it in on the left
+        # published one 777-token record as `recorded` on BOTH claimants (1,554 tok/session
+        # fleet-wide), and the suppression variant — reachable from a `structuredContent`-only
+        # downstream, #286's flagship shape, which writes a decline row and no tool row —
+        # declared both entries provably `free` off a record only one of them wrote.
+        primer_labels = [lbl for lbl in labels if lbl not in contested] + \
+            [lbl for lbl in contested_here
+             if not is_router and contests[lbl].standalone == {str(name)}]
+        # A contested label this entry could not claim for the primer leaves the primer
+        # question unanswerable for it -- distinct from answering "unpaid".
+        primer_unknown = any(lbl not in primer_labels for lbl in contested_here)
         rec_tok = sum(recorded_tokens.get(lbl, 0) for lbl in primer_labels)
         rec_em = sum(recorded_emissions.get(lbl, 0) for lbl in primer_labels)
         # `rec_tok > 0` mirrors the accumulator's `tokenized_emissions <= 0` skip. The
@@ -2006,7 +2030,16 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
             # `_ONCE` ("pays once per session") whenever `encoded > 0`, and #286's shape
             # compresses plenty -- it just never attaches. Without this the flagship case
             # renders `1x` beside a zero and never reaches the `free` list.
-            "cadence": _cadence(state, blocks, encoded, recorded=measured,
+            #
+            # `blocks`/`encoded` are passed as None -- "cannot say" -- when a contested
+            # label was kept for BLOCKS but refused for the PRIMER. Those two fields are
+            # honest about blocks and `_cadence` reads them as evidence about the primer, so
+            # an idle contested label made them argue `never called` -> `_ONCE_FREE`, and
+            # the entry was declared provably FREE while an unattributable attach record sat
+            # under its label. `1x?` is the answer: some process paid, and nothing in the
+            # ledger says which.
+            "cadence": _cadence(state, None if primer_unknown else blocks,
+                                None if primer_unknown else encoded, recorded=measured,
                                 unpaid=measured_zero),
             **_break_even(tokens, blocks, tokenized,
                           sum(saved_by_label.get(lbl, 0) for lbl in labels),
