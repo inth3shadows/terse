@@ -444,6 +444,80 @@ def test_an_idle_duplicate_does_not_black_out_a_complete_measurement(tmp_path):
     assert "writes under one name" in "\n".join(build_primer_section(liab))
 
 
+def test_a_silent_entry_is_not_named_as_a_writer_and_does_not_suppress_the_remedy(tmp_path):
+    """Round 4, finding 1a. `_contested_labels` gates writers on `_writes_ledger_rows`; the
+    render loop re-derived the same answer inline and did not. So a `--no-stats` entry was
+    named as one of the entries "writing under one name" four lines below the stanza saying
+    it writes no rows — and because the remedy was chosen from that set, the REAL collision's
+    remedy (`rename the peer`) was suppressed in favour of renaming an entry whose rows do
+    not exist.
+
+    The fix is structural: `contested_here` now comes straight out of the contest, which
+    applied every gate once. Two rounds running, a second derivation of this fact drifted
+    from the first."""
+    pol = _policy(tmp_path)
+    silent = _scan("kbsilent", "wrapped", "kb-x", pol, identity="kb", explicit=True)
+    silent["stats"] = False
+    rows = [_scan("terse", "router", "kb", pol),
+            _scan("terse2", "router", "kb", pol, scope="project"),
+            silent]
+    liab = primer_liability(rows, _agg(("kb", 10, 10_000, 1_000)))
+    by_name = {s["server"]: s for s in liab["servers"]}
+    text = "\n".join(build_primer_section(liab))
+
+    assert by_name["kbsilent"]["contested_labels"] == []
+    named = text.split("writes under one name:")[1].split("\n")[0]
+    assert "kbsilent" not in named, named
+    # ...and the remedy is the one that addresses the router/router collision.
+    assert "`kb`: remove one of them, or rename the peer in one of the peers files." in text
+    assert "DISTINCT `--server-name`" not in text
+
+
+def test_each_contested_label_gets_its_own_remedy(tmp_path):
+    """Round 4, finding 1b. `standalone` and the shared-label list were fleet-wide scans, so
+    a fleet with two INDEPENDENT contests printed one sentence claiming that renaming one
+    entry addressed both labels — and the other label's real remedy was never printed. A
+    remedy is a fact about a label."""
+    pol = _policy(tmp_path)
+    rows = [_scan("r1", "router", "kb", pol),
+            _scan("r2", "router", "kb", pol, scope="project"),
+            _scan("r3", "router", "gh", pol, scope="local"),
+            _scan("gh2", "wrapped", "gh-x", pol, identity="gh", explicit=True)]
+    liab = primer_liability(rows, _agg(("kb", 10, 10_000, 1_000), ("gh", 5, 5_000, 2_000)))
+    text = "\n".join(build_primer_section(liab))
+
+    assert liab["contests"] == {"gh": ["gh2"], "kb": []}
+    assert "`gh`: remove one of them, or give gh2 a DISTINCT `--server-name`." in text
+    assert "`kb`: remove one of them, or rename the peer in one of the peers files." in text
+
+
+def test_an_idle_duplicate_leaves_a_single_label_entry_measured(tmp_path):
+    """Round 4, finding 2. The round-3 stand-down was applied one step too late: `labels`
+    dropped the contested label unconditionally, so by the time `blackout` declined to null
+    the sums there was nothing left to null. An entry whose ONLY label is the idle contested
+    one still went dark — the exact outcome that fix claimed to remove, and its test asserted
+    only on the router, which survives merely because a router has OTHER peers.
+
+    Attributing zero to each of two claimants is arithmetically impossible to get wrong, so
+    the entry keeps its measurement; the duplication is still reported through
+    `contested_labels`."""
+    pol = _policy(tmp_path)
+    live = _scan("kb", "folded-and-live", "kb-server", pol, identity="kb", explicit=True)
+    # `kb` is contested and IDLE — every row in the window belongs to `gh`.
+    agg = _agg(("gh", 20, 20_000, 5_000))
+
+    control = primer_liability([live], agg)["servers"][0]
+    liab = primer_liability([_scan("terse", "router", "gh, kb", pol), live], agg)
+    dup = next(s for s in liab["servers"] if s["server"] == "kb")
+
+    assert dup["ledger_labels"] == control["ledger_labels"] == ["kb"]
+    assert dup["blocks"] == control["blocks"] == 0        # measured, not None
+    assert dup["break_even_verdict"] == control["break_even_verdict"] == "never called"
+    assert dup["cadence"] == control["cadence"]
+    assert "kb" in liab["free"] and liab["uncertain"] == []
+    assert dup["contested_labels"] == ["kb"]              # still reported
+
+
 def test_one_router_alone_contests_none_of_its_own_peers(tmp_path):
     """The false-positive direction of counting writers: a label written by ONE entry is
     that entry's, however many peers the router fronts. Without this, the widening above
@@ -536,12 +610,12 @@ def test_the_report_names_the_router_duplicate_and_does_not_prescribe_server_nam
     text = "\n".join(build_primer_section(liab))
 
     assert "router/live duplicate label" in text
-    assert "remove one of them" in text and "DISTINCT `--server-name`" in text
+    assert "`kb`: remove one of them, or give kb a DISTINCT `--server-name`." in text
     # NOT a pointer to `mcp-status`: that warning fires only on `folded-and-live`, so it is
     # silent for the cross-scope duplicate this contest was widened to catch (re-review
     # finding). The shared LABEL is named instead, which is true in every case.
     assert "mcp-status" not in text
-    assert "the shared label(s): kb." in text
+
     # Review of PR #422, finding 4: BOTH claimants are named. The stanza was built with
     # `_named`, which intersects with `uncertain` (cadence `1x?`) — and a router is always
     # `per-turn`, so it printed this verdict in a table cell nothing explained. The same gap

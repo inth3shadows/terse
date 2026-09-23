@@ -73,7 +73,12 @@ PRIMER_ROW = {"server", "cadence", "attached", "emissions", "bytes", "tokens",
 
 LIABILITY = {"servers", "per_turn_tokens", "session_once_tokens", "unresolved",
              "idle", "free", "uncertain", "saved_tokens", "turns_covered",
-             "session_covered"}
+             "session_covered",
+             # #396 round 4: contested label -> the NON-ROUTER entries writing it, sorted.
+             # Per-label because a remedy is a fact about a label: a fleet-wide scan printed
+             # one sentence claiming that renaming one entry addressed two independent
+             # contests. Empty dict — never absent — when nothing is contested.
+             "contests"}
 
 LIABILITY_SERVER = {"server", "scope", "state", "primer_tokens", "ledger_labels",
                     "blocks", "tokenized_blocks", "cadence",
@@ -118,6 +123,7 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "state": (str, type(None)), "primer_tokens": (int, type(None)),
     "ledger_labels": (list,), "tokenized_blocks": (int, type(None)),
     "superseded_labels": (list,), "contested_labels": (list,),
+    "contests": (dict,),
     "cadence": (str,), "saved_per_block": (float, int, type(None)),
     # #311: always one of exactly two strings, never null -- there is always an answer to
     # "where did this number come from", even when the answer is "we inferred it".

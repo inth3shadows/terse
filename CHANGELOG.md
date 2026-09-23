@@ -144,7 +144,21 @@ fails that pull request until the section has moved.
   Both rendered legends name the new cause; they were closed enumerations in which none of
   the listed causes was true of a contested row.
 
-  **`--json` consumers:** `primer_liability.servers[]` gains `contested_labels`, and
+  A fourth round found that the fixes above kept re-deriving facts the contest had already
+  computed, so this entry ends with a small refactor rather than a fifth patch.
+  `_contested_labels` publishes both writer sets per label, and the render loop and the
+  report's remedy line consume them. Three defects collapse into that: a `--no-stats` entry
+  was named as a writer (its re-derivation skipped the `_writes_ledger_rows` gate) and, by
+  being named, suppressed the real collision's remedy; the remedy line scanned the fleet
+  rather than one label, so two independent contests printed one sentence claiming a single
+  rename addressed both; and the remedy is now chosen per label, so a `router-ambiguous`
+  pair — which by definition fronts ONE peers file — is told to point one of them at its own
+  file rather than to rename a peer that moves for both. Separately, the idle-duplicate
+  stand-down was being applied one step too late: `labels` dropped the contested label before
+  `blackout` could decline to, so an entry whose ONLY label was the idle one still went dark.
+
+  **`--json` consumers:** `primer_liability` gains `contests` (contested label -> the
+  non-router entries writing it), `primer_liability.servers[]` gains `contested_labels`, and
   `break_even_verdict` gains the value `router/live duplicate label`. A fleet with a
   duplicated peer that wrote rows this window will see `blocks`, `tokenized_blocks`,
   `saved_per_block`, `blocks_to_break_even` and `break_even_coverage` all go null on every
