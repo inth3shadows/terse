@@ -1902,7 +1902,10 @@ def _build_capture_and_audit(
             # process by the caller; without it the id is dropped rather than stored
             # ambiguously.
             key = None if result_id is None or session is None else f"{session}:{result_id}"
-            capture_payload(tool, raw, capture_dir, server=server, result_id=key)
+            # `manual=False`: an id-less proxy block belongs to a real (unknown) result, so it
+            # must stay legacy, never be stamped as a whole hand-captured payload.
+            capture_payload(tool, raw, capture_dir, server=server, result_id=key,
+                            manual=False)
 
     audit: Callable[[dict], None] | None = None
     if debug_log is not None:

@@ -2311,7 +2311,10 @@ def test_result_ids_are_scoped_to_the_proxy_run_not_bare_jsonrpc_ids():
 
     seen: list[str | None] = []
 
-    def fake(tool, raw, corpus_dir, *, server=None, result_id=None):
+    def fake(tool, raw, corpus_dir, *, server=None, result_id=None, manual=None):
+        # The proxy must opt OUT of the hand-capture default: an id-less proxy block is
+        # part of a real result, never a whole payload (#380).
+        assert manual is False
         seen.append(result_id)
 
     import terse.capture as capture_mod
