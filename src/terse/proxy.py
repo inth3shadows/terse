@@ -1903,7 +1903,8 @@ def _build_capture_and_audit(
             # ambiguously.
             key = None if result_id is None or session is None else f"{session}:{result_id}"
             # `manual=False`: an id-less proxy block belongs to a real (unknown) result, so it
-            # must stay legacy, never be stamped as a whole hand-captured payload.
+            # must stay legacy, never be stamped as a whole hand-captured payload. Both
+            # production builders always pass a session, so this guards the default path.
             capture_payload(tool, raw, capture_dir, server=server, result_id=key,
                             manual=False)
 

@@ -115,7 +115,8 @@ def test_coverage_keys_on_the_qualified_name_the_policy_uses(tmp_path):
 
 
 def test_coverage_leaves_a_serverless_legacy_tool_bare(tmp_path):
-    capture.capture_payload("gh.issues", json.dumps([{"n": 1}]), tmp_path)   # no server
+    capture.capture_payload("gh.issues", json.dumps([{"n": 1}]), tmp_path,   # no server,
+                            manual=False)                                  # no id: legacy
     cov = capture.coverage(capture.load_corpus(tmp_path))
     assert cov["by_tool"] == {"gh.issues": 1}
 

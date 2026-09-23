@@ -691,7 +691,7 @@ def heuristic_share(envelopes: list[dict[str, Any]]) -> tuple[int, int]:
     Counts only the payloads the timing heuristic actually ran on. An envelope with no
     `captured_at` at all becomes its own single-block group and is not guessed at, and
     neither is a `terse capture` payload, which carries its own `manual:` result id
-    (`capture_payload(manual=True)`) — reporting either as "grouped by timing" would be a false
+    (`capture_payload`'s default for any non-proxy caller) — reporting either as "grouped by timing" would be a false
     alarm. One written by `terse capture` BEFORE that id existed is indistinguishable from a
     legacy proxy envelope and is counted as one; re-capturing it in place keeps it so (the
     first sighting's identity is preserved), so only a fresh corpus clears it.

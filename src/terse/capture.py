@@ -241,11 +241,13 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
     format is additive — a corpus captured before they existed stays loadable, and every
     consumer treats their absence as "unknown", never as a value (#148, #152).
 
-    `manual` marks a hand capture: the payload is one whole result, so it
-    gets its own id, `manual:<file stem>` — unless an existing TIMED envelope is being
+    `manual` marks a hand capture: the payload is one whole result, so it gets its own id,
+    `manual:<file stem>`. Left unset (None), it is a hand capture exactly when no
+    `result_id` is given — every caller except the proxy, which passes `manual=False` for
+    its id-less blocks. The id is written — unless an existing TIMED envelope is being
     rewritten, which keeps its first sighting's id or its absence (an untimed or unreadable
-    prior was never a first sighting, as for a proxy id). Mutually exclusive with
-    `result_id`. Without it, a hand capture was indistinguishable
+    prior was never a first sighting, as for a proxy id). `manual=True` with a `result_id`
+    raises. Without the id, a hand capture was indistinguishable
     from a pre-#148 proxy envelope (`captured_at`, no id): consecutive hand captures were
     grouped by TIMING into one guessed result, and the identity note told the operator to
     re-capture a corpus no re-capture could fix (#380). Keyed by the file stem — tool

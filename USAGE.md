@@ -1120,7 +1120,8 @@ your-tool | uv run terse capture --tool your.tool.name -
 
 Add `--server <name>` if that tool comes from a named MCP server, so the rule generated for
 it is authored under the same qualified name the proxy looks it up by (see *Rule names carry
-the server* above). A payload captured this way records its own result id
+the server* above). A payload captured this way (or by the bundled corpus generators)
+records its own result id
 (`manual:<tool>__<sha8>`), so it is scored as one whole result, never grouped with a
 neighbouring capture by timing. A payload hand-captured before that id existed reads as a
 legacy capture; capture it again into a **fresh** corpus directory to clear that —

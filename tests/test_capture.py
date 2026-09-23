@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import stat
-from pathlib import Path
 
 from terse.capture import (
     append_audit,
@@ -154,14 +153,13 @@ def test_qualified_tool_mirrors_the_runtime_lookup():
     assert qualified_tool({"tool": "structure", "server": ""}) == "structure"
 
 
-def test_a_legacy_envelope_does_not_adopt_a_new_result_id():
+def test_a_legacy_envelope_does_not_adopt_a_new_result_id(tmp_path):
     # Review finding: keeping the FIRST `captured_at` while adopting a LATER `result_id` is
     # the exact disagreement the preservation rule exists to prevent — the block would join
     # the new result's group but sort by the old result's timestamp within it. A payload
     # first seen before the field stays legacy until a different payload replaces it.
-    import tempfile
 
-    corpus = Path(tempfile.mkdtemp())
+    corpus = tmp_path
     first = json.loads(capture_payload("t", '{"a":1}', corpus, manual=False).read_text())
     assert "result_id" not in first
     again = json.loads(capture_payload("t", '{"a":1}', corpus, result_id="s:9").read_text())
