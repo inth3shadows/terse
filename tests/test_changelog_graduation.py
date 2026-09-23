@@ -129,3 +129,41 @@ def test_the_section_date_comes_from_the_tag_not_the_day_you_ran_it(tmp_path):
     out = f.read_text(encoding="utf-8")
     assert "## [1.0.0] - 2020-03-04" in out, p.stdout + p.stderr
     assert datetime.date.today().isoformat() not in out.split("## [0.9.0]")[0]
+
+
+def test_the_release_gate_excludes_exactly_the_bookkeeping_tests_and_PR_CI_runs_them():
+    """The release job must not fail on PAST releases' CHANGELOG filing (it skipped #422's
+    release), so it excludes the `changelog_bookkeeping` marker — and nothing else. Pinned
+    three ways: the exact gate command (any extra -k/--ignore/--deselect fails it), the
+    marked set (a rename or a new marked test fails it), and tests.yml running the suite
+    unfiltered so the checks still run somewhere. Neither workflow may set PYTEST_ADDOPTS,
+    which would filter the suite without touching the run line. (#436 tracks making the
+    marked checks deterministic so they can rejoin the gate.)"""
+    root = Path(__file__).resolve().parent.parent
+    release = (root / ".github/workflows/release.yml").read_text()
+    tests_yml = (root / ".github/workflows/tests.yml").read_text()
+    assert "PYTEST_ADDOPTS" not in release + tests_yml
+    gate = [ln.strip() for ln in release.splitlines() if "pytest" in ln and "uv run" in ln]
+    assert gate == ['uv run pytest -q -m "not changelog_bookkeeping"'], gate
+    # Exact, not a flag blocklist: a path argument or `--co` narrows the run just as surely
+    # as `-m`/`-k`, and a blocklist cannot enumerate every way to do that (review 3).
+    pr = [ln.strip() for ln in tests_yml.splitlines() if "pytest" in ln and "run:" in ln]
+    assert pr == ["- run: uv run pytest -q --cov --cov-report=term-missing"], pr
+    # The marked set, by a text scan of every test file in the repo — the gate runs bare
+    # `pytest` from the root, so a marked test outside tests/ would be excluded too. A scan,
+    # not a `pytest --co` subprocess: that re-collected the whole suite (~2.5s) per run and
+    # broke under an inherited PYTEST_ADDOPTS.
+    marked = []
+    for f in sorted(root.rglob("test_*.py")):
+        if ".venv" in f.parts or "node_modules" in f.parts:
+            continue
+        marked += [(f.relative_to(root).as_posix(), m) for m in re.findall(
+            r"@pytest\.mark\.changelog_bookkeeping\s*\n\s*def (\w+)\(", f.read_text())]
+        assert not re.search(r"^pytestmark\s*=.*changelog_bookkeeping", f.read_text(),
+                             re.M), f"module-level mark in {f}"
+    assert sorted(marked) == [
+        ("tests/test_changelog_covers_every_release.py",
+         "test_every_release_but_the_newest_has_a_changelog_section"),
+        ("tests/test_changelog_covers_every_release.py",
+         "test_unreleased_does_not_describe_work_that_already_shipped"),
+    ], marked

@@ -11,6 +11,15 @@ from pathlib import Path
 import pytest
 
 
+def pytest_configure(config):
+    # Tests that audit the PREVIOUS releases' CHANGELOG bookkeeping against git tags and
+    # blame. PR CI runs them; the release job's pre-tag gate excludes them, because their
+    # answer can change between a PR's CI and its squash (see `.github/workflows/release.yml`
+    # and `tests/test_changelog_graduation.py`).
+    config.addinivalue_line(
+        "markers", "changelog_bookkeeping: audits past releases' CHANGELOG filing")
+
+
 @pytest.fixture(autouse=True)
 def _isolate_launcher_selection(monkeypatch):
     """Make `install_mcp.terse_invocation()` return the same thing on a developer's box as
