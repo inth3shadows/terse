@@ -137,6 +137,26 @@ def test_report_groups_by_tool_and_shape_not_globally():
     assert report.count("| **SAFE**") == 2
 
 
+def test_a_SAFE_cell_scopes_its_compliance_to_the_run_too():
+    """#412's silent direction: a run that happened to comply licenses SAFE, and the cell
+    said nothing about the rate that let it through. The same (model, payload, question)
+    read 29% and then 100%, so a passing rate is one run's as much as a failing one."""
+    rows = [_row(f"q{i}", 1, 1, raw_calls=1, terse_calls=1) for i in range(_CODEC_MIN_TRIALS)]
+    cell = next(ln for ln in build_codec_verdict_report(
+        {"m": _tagged(rows, "t", "array-of-records")}).splitlines() if ln.startswith("| `t` |"))
+    assert "**SAFE**" in cell
+    assert "tool-call compliance raw 100%, terse 100% in this run" in cell
+    assert "not measured across runs" in cell
+
+
+def test_a_SAFE_cell_without_compliance_counters_claims_nothing_about_them():
+    """Pre-#403 rows never measured compliance; the caveat must not invent a rate."""
+    rows = [_row(f"q{i}", 1, 1) for i in range(_CODEC_MIN_TRIALS)]
+    cell = next(ln for ln in build_codec_verdict_report(
+        {"m": _tagged(rows, "t", "array-of-records")}).splitlines() if ln.startswith("| `t` |"))
+    assert "**SAFE**" in cell and "compliance" not in cell
+
+
 def test_report_gates_on_the_worst_model_within_a_group():
     clean = [_row(f"q{i}", 1, 1) for i in range(_CODEC_MIN_TRIALS)]
     broken = [_row("q-bad", 1, 0)]

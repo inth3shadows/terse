@@ -15,6 +15,13 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **A SAFE codec cell states the compliance rate that let it through, scoped to the run
+  (#412).** #423 labelled a LOW rate "in this run"; a passing one printed only
+  "20 zero-failure trials", although SAFE rests on the same one-run rate — the cell that
+  read 29% read 100% on the next two runs. The SAFE "why" now adds
+  "tool-call compliance raw X%, terse Y% in this run — not measured across runs" whenever
+  the rows carry the counters (pre-#403 rows claim nothing).
+
 - **A `folded-and-live` peer whose live duplicate runs its own proxy now reports that
   proxy's primer cost (#396).** The router's union primer covers the folded route, but the
   separately live `terse proxy` is another process and can attach its own lazy primer once
@@ -123,6 +130,8 @@ fails that pull request until the section has moved.
   router in `folded-and-live` is dropped (#427), and an estimated primer is still sized
   against the `mcpServers` key rather than the ledger identity (#428). A `folded` row in a
   higher-precedence scope also still shadows the live lower-scope entry (#424).
+## [0.34.0] - 2026-09-23
+
 ### Changed
 
 - **`capture_payload` writes a hand-capture id by default (#380).** `manual` now defaults
