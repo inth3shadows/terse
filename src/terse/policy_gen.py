@@ -690,8 +690,10 @@ def heuristic_share(envelopes: list[dict[str, Any]]) -> tuple[int, int]:
 
     Counts only the payloads the timing heuristic actually ran on. An envelope with no
     `captured_at` at all becomes its own single-block group and is not guessed at, and
-    neither is a hand-written `terse capture` payload, which has no result to belong to —
-    reporting either as "grouped by timing" would be a false alarm.
+    neither is a `terse capture` payload, which carries its own `manual:` result id
+    (`capture.manual_result_id`) — reporting either as "grouped by timing" would be a false
+    alarm. One written by `terse capture` BEFORE that id existed is indistinguishable from a
+    legacy proxy envelope and is counted as one; nothing in it says otherwise.
 
     Surfaced rather than smoothed over: an old corpus cannot be made exact retroactively,
     and quietly re-measuring one downward would be a worse answer than saying which part of

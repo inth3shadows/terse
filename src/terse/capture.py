@@ -202,6 +202,17 @@ def _sha8(raw: str) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
 
 
+def manual_result_id(raw: str) -> str:
+    """The `result_id` a hand `terse capture` stamps: the payload is one whole result.
+
+    Absent, a hand capture was indistinguishable from a pre-#148 proxy envelope (both carry
+    `captured_at` and no id), so `policy_gen` grouped consecutive hand captures by TIMING
+    into one guessed "result", and the identity note told the operator to re-capture a
+    corpus that no re-capture could fix (#380). Keyed by content, so re-capturing the same
+    file stays idempotent and two different files never share a group."""
+    return f"manual:{_sha8(raw)}"
+
+
 # Retention cap, PER TOOL rather than over the whole corpus. Every consumer of this
 # corpus — measure, probes, policy generate/autotune — reasons per tool, so a global
 # byte cap (the shape stats.py and history.py use) would let one chatty tool evict the

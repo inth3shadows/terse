@@ -40,6 +40,7 @@ from .capture import (
     extract_records,
     is_sidecar_filename,
     load_corpus,
+    manual_result_id,
     qualify,
 )
 from .html_report import build_html_diff_report, build_html_report
@@ -89,9 +90,10 @@ def _cmd_gate(args: argparse.Namespace) -> int:
 
 def _cmd_capture(args: argparse.Namespace) -> int:
     raw = _read(args.file)
-    # No `result_id`: a hand-captured payload has no result to belong to. Left absent
-    # rather than invented, which keeps it a single-block result — the honest reading.
-    path = capture_payload(args.tool, raw, args.corpus, server=args.server)
+    # A hand-captured file IS one whole result, so it gets its own id. Leaving it absent
+    # made it read as a pre-#148 proxy capture: grouped by timing, and flagged as legacy.
+    path = capture_payload(args.tool, raw, args.corpus, server=args.server,
+                           result_id=manual_result_id(raw))
     print(f"captured {args.tool} ({classify_shape(raw)}, {len(raw)} bytes) -> {path}")
     return 0
 
@@ -1261,6 +1263,10 @@ def _cmd_tune(args: argparse.Namespace) -> int:
           f"{len(cands)} drop candidate(s)")
     # The sample's provenance, on the line under its count (#380).
     print(_tune_sample_line(envelopes))
+    # What the share above costs, and the remedy — the same note `policy generate` and
+    # `autotune` print (#380). Silent on a fully-identified corpus, which a `terse capture`
+    # corpus now is (`capture.manual_result_id`).
+    _print_corpus_identity_note(envelopes)
 
     # Rationale in `_tune_ledger_warnings`'s own docstring (#274) — this call site just
     # prints whatever it finds. Printed BEFORE `--out` writes the policy below: writing

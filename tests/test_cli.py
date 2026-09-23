@@ -1368,6 +1368,40 @@ def test_autotune_names_what_it_guessed_about_an_old_corpus(tmp_path, capsys):
     assert "1/1 payload(s) record no server" in out
 
 
+def test_a_hand_capture_is_its_own_result_not_a_legacy_envelope(tmp_path, capsys):
+    """#380 review: `terse capture` wrote `captured_at` and no `result_id`, which is exactly
+    a pre-#148 proxy envelope. So two hand captures of one tool taken within the timing
+    window were MERGED into one guessed result, and every hand-built corpus was told to
+    "re-capture" — which could never add the id. Driven through the real command."""
+    from terse.capture import load_corpus
+    from terse.policy_gen import group_results, heuristic_share
+
+    corpus = tmp_path / "c"
+    for i in range(2):
+        f = _write(tmp_path, f"p{i}.json", json.dumps([{"id": i, "v": "x" * 40}]))
+        assert main(["capture", str(f), "--tool", "kb.x", "--server", "kb",
+                     "--corpus", str(corpus)]) == 0
+    envs = load_corpus(corpus)
+    assert heuristic_share(envs) == (0, 2)
+    assert len(group_results(envs)["kb.x"]) == 2      # two results, not one merged guess
+    capsys.readouterr()
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    out = capsys.readouterr().out
+    assert "#   sample: 2 with result_id (100%)" in out
+    assert "[note]" not in out
+
+
+def test_tune_names_a_legacy_sample_and_its_remedy(tmp_path, capsys):
+    """#380 part 2: the `sample:` line states the result_id share; the note says what a
+    low one costs. A proxy-shaped envelope with no id is the case that earns it."""
+    from terse.capture import capture_payload
+
+    corpus = tmp_path / "c"
+    capture_payload("kb.a", json.dumps([{"id": 1}, {"id": 2}]), corpus, server="kb")
+    assert main(["tune", "--corpus", str(corpus)]) == 0
+    assert "1/1 payload(s) predate result ids" in capsys.readouterr().out
+
+
 def test_an_untimed_payload_is_not_reported_as_grouped_by_timing(capsys):
     # It became its own single-block group; the timing heuristic never ran on it. Saying
     # otherwise is a false alarm about the one number the note exists to qualify.

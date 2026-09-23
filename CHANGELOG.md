@@ -15,6 +15,21 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **A `terse capture` payload is its own result, not a legacy envelope (#380).** It wrote
+  `captured_at` and no `result_id`, which is exactly a pre-#148 proxy capture. So
+  `policy generate`/`autotune`/`tune` grouped consecutive hand captures of one tool by
+  timing (two separate captures read as 1 result), and the identity note told every
+  hand-built corpus to "re-capture", which could never add the id. `terse capture` now
+  stamps `manual:<sha8>` (`capture.manual_result_id`). Corpora captured before this keep
+  the old reading; nothing in their envelopes can tell them apart from legacy proxy ones.
+- **`terse tune` says what a legacy sample costs, not just its share (#380).** Under the
+  `sample:` line it now prints the identity note `policy generate`/`autotune` already print
+  (timing-grouped results, bare-name rules), and stays silent on a fully-identified corpus.
+
+## [0.33.9] - 2026-09-23
+
+### Fixed
+
 - **The codec compliance reason no longer reads as a fact about the model (#412).** It
   printed "terse arm delivered 29% of its answers through the tool call", and the same
   (model, payload, question) then read 100% on two more runs (20 trials each, vs the
