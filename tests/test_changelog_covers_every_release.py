@@ -105,7 +105,7 @@ def test_unreleased_does_not_describe_work_that_already_shipped():
     (untagged) move commit and slips past. Verified — that mutation passes. This catches the
     drift that actually happened (entries written under `[Unreleased]` and never moved out,
     still blaming their original tagged commit) and not a deliberate relocation, which is
-    not a failure mode anyone has. `test_every_release_tag_has_a_changelog_section` is the
+    not a failure mode anyone has. `test_every_release_but_the_newest_has_a_changelog_section` is the
     backstop there: the relocated entry's release still needs a section."""
     lines = CHANGELOG.read_text(encoding="utf-8").splitlines()
     try:
