@@ -98,6 +98,29 @@ fails that pull request until the section has moved.
     one: the report says to remove the duplicate or give the live entry a DIFFERENT name.
     A router keeps its uncontested peers and stays measurable on those.
 
+  Review of the above found four more, all reproduced before being fixed:
+
+  - **A row that had a label taken away no longer reports a measured zero.** Dropping a
+    contested label leaves a ROUTER with a non-empty but incomplete label set; where the
+    surviving peers were quiet this window the sum was `0`, which `_break_even` reads as the
+    hard claim `never called`, `_recommend` escalates to `UNWRAP`, and the `idle` line prints
+    as "pure cost". A real fleet flipped `KEEP` -> `UNWRAP` on it, with the report
+    contradicting itself two lines apart. It now reports unknown. A non-zero surviving sum is
+    still measured — it understates savings, so the verdict it yields is conservative.
+  - **A duplicate at ANOTHER SCOPE is contested too.** The contest was keyed on
+    `folded-and-live`, but `folded` is computed per scope, so a peer folded behind a
+    user-scope router and separately wrapped at project scope was `wrapped` and never
+    contested — two plain `install-mcp` runs reproduced the same double count. The key is
+    now the LABEL: any entry that runs its own proxy and claims a router's peer name.
+  - **The new reason no longer folds the break-even table.** `router/live duplicate label`
+    is 27 characters against a documented bound of 84 for a 62-column row; it is abbreviated
+    in that one cell and published in full everywhere else. The width test now drives the
+    reason VOCABULARY rather than a fixture that never produced it.
+  - **Every entry whose labels were taken is named in the stanza that explains it.** The
+    line was built from the `uncertain` set, which a router can never be in, so a contested
+    router printed a verdict nothing in the report explained — the gap `silent_any` closed
+    in #417, one reason later.
+
   **`--json` consumers:** `primer_liability.servers[]` gains `contested_labels`, and
   `break_even_verdict` gains the value `router/live duplicate label`. A fleet with a
   duplicated peer will see that label's `blocks`/`saved_per_block` leave both rows — that
