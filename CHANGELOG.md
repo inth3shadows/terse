@@ -63,11 +63,6 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
-- **The codec compliance reason no longer reads as a fact about the model (#412).** It
-  printed "terse arm delivered 29% of its answers through the tool call", and the same
-  (model, payload, question) then read 100% on two more runs (20 trials each, vs the
-  first run's 7) with no change to the answering path. The reason now scopes the rate to
-  "this run"; whether it is the model's or the run's needs more than one run to tell.
 - **A `folded-and-live` peer whose live duplicate runs its own proxy now reports that
   proxy's primer cost (#396).** The router's union primer covers the folded route, but the
   separately live `terse proxy` is another process and can attach its own lazy primer once
@@ -141,6 +136,15 @@ fails that pull request until the section has moved.
   duplicated peer will see that label's `blocks`/`saved_per_block` leave both rows — that
   drop IS the correction.
 
+## [0.33.9] - 2026-09-23
+
+### Fixed
+
+- **The codec compliance reason no longer reads as a fact about the model (#412).** It
+  printed "terse arm delivered 29% of its answers through the tool call", and the same
+  (model, payload, question) then read 100% on two more runs (20 trials each, vs the
+  first run's 7) with no change to the answering path. The reason now scopes the rate to
+  "this run"; whether it is the model's or the run's needs more than one run to tell.
 - **The diff tier's published framing said "does not pay" where the measurement says
   "starved" (#419).** Four sites across `README.md` and `BENCHMARKS.md` reported the
   0.67% all-time hit rate and attributed what remained to "the workload", with README
