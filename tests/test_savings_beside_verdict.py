@@ -57,9 +57,10 @@ def _sections(report: str) -> tuple[str, str]:
 # An UNSAFE group still publishes its savings
 # --------------------------------------------------------------------------- #
 def test_an_unsafe_group_still_renders_its_savings_number():
-    # One demonstrated excess terse miss -> UNSAFE, full stop. The savings figure is an
+    # Consistent harm across questions -> UNSAFE (sign test). The savings figure is an
     # independent measurement of the same payload and must survive that verdict.
-    results = {"m1": _tagged([_row("q1", 1, 0)], "tool-a", "array-of-records")}
+    results = {"m1": _tagged([_row(f"q{i}", 1, 0) for i in range(5)], "tool-a",
+                             "array-of-records")}
     verdict, savings = _sections(build_codec_verdict_report(results))
     assert "**UNSAFE**" in verdict
     assert _SAVED in savings and _SAVED_PCT in savings
@@ -72,7 +73,7 @@ def test_every_verdict_grade_gets_a_savings_row():
     # only ever renders one verdict.
     clean = [_row(f"q{i}", 1, 1, sha="safe-sha") for i in range(_CODEC_MIN_TRIALS)]
     results = {"m1": (_tagged(clean, "tool-safe", "array-of-records")
-                      + _tagged([_row("q1", 1, 0, sha="unsafe-sha")],
+                      + _tagged([_row(f"q{i}", 1, 0, sha="unsafe-sha") for i in range(5)],
                                 "tool-unsafe", "array-of-records")
                       + _tagged([_row("q1", 1, 1, sha="thin-sha")],
                                 "tool-thin", "array-of-records"))}

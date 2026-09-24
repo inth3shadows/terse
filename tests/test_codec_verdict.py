@@ -46,13 +46,28 @@ def _row(qid: str, raw_ok: int, terse_ok: int, trials: int = 1,
 # --------------------------------------------------------------------------- #
 # codec_verdict
 # --------------------------------------------------------------------------- #
-def test_a_single_structural_failure_is_UNSAFE_regardless_of_sample_size():
-    # 1 failure out of a large, otherwise-clean sample — a ratio-shaped gate would round
-    # this down to "safe enough"; the demonstrated-corruption gate must not.
+def test_a_single_worse_question_is_not_UNSAFE_but_it_blocks_SAFE():
+    # Sign test (replacing zero tolerance): one discordant question is p=0.5 — a
+    # non-deterministic reader produces that from noise alone. It can never read SAFE either:
+    # terse leaned worse, which `codec_unresolved_reasons` names.
     rows = [_row(f"q{i}", 1, 1) for i in range(50)]
-    rows.append(_row("q-bad", 1, 0))  # one paired miss
+    rows.append(_row("q-bad", 1, 0))
     verdict, gap = codec_verdict(rows)
-    assert verdict == "UNSAFE"
+    assert verdict == "UNRESOLVED"
+
+
+def test_consistent_harm_across_questions_is_UNSAFE():
+    # Five questions all worse, none better: p = 1/32 < 0.05.
+    rows = [_row(f"q{i}", 1, 1) for i in range(20)]
+    rows += [_row(f"bad{i}", 1, 0) for i in range(5)]
+    assert codec_verdict(rows)[0] == "UNSAFE"
+
+
+def test_noise_on_both_arms_is_not_UNSAFE():
+    # The defect the sign test fixes: the same 50% reader on both arms, flipping per question.
+    rows = [_row(f"w{i}", 2, 1, trials=3) for i in range(3)]
+    rows += [_row(f"b{i}", 1, 2, trials=3) for i in range(3)]
+    assert codec_verdict(rows)[0] != "UNSAFE"
 
 
 def test_zero_failures_below_the_trial_floor_is_UNRESOLVED_not_SAFE():
@@ -73,7 +88,7 @@ def test_identical_failure_on_both_arms_is_not_UNSAFE():
 def test_identical_partial_failure_on_both_arms_at_the_trial_floor_is_SAFE():
     # A single row, 25 trials each, raw and terse both succeed on the SAME 20/25 — no
     # excess terse-specific miss, and n clears the floor.
-    rows = [_row("q1", raw_ok=20, terse_ok=20, trials=25)]
+    rows = [_row(f"q{i}", raw_ok=20, terse_ok=20, trials=25) for i in range(5)]
     verdict, gap = codec_verdict(rows)
     assert verdict == "SAFE"
 
@@ -81,7 +96,7 @@ def test_identical_partial_failure_on_both_arms_at_the_trial_floor_is_SAFE():
 def test_a_genuine_terse_specific_regression_is_UNSAFE_even_when_raw_is_imperfect():
     # raw succeeds MORE often than terse on the same row — a real excess, not just raw's
     # own baseline imperfection. Must still be UNSAFE.
-    rows = [_row("q1", raw_ok=20, terse_ok=15, trials=25)]
+    rows = [_row(f"q{i}", raw_ok=20, terse_ok=15, trials=25) for i in range(5)]
     verdict, gap = codec_verdict(rows)
     assert verdict == "UNSAFE"
 
@@ -109,10 +124,10 @@ def test_empty_rows_is_UNRESOLVED():
     assert verdict == "UNRESOLVED"
 
 
-def test_a_single_failure_beats_an_otherwise_unresolved_thin_sample():
-    # A thin sample (below the floor) that ALSO shows a failure must still be UNSAFE, not
-    # UNRESOLVED — the failure is dispositive; sample size only gates a clean run.
-    rows = [_row("q1", 1, 0)]
+def test_significant_harm_beats_an_otherwise_unresolved_thin_sample():
+    # Below the trial floor, but five questions all worse: significance is dispositive;
+    # sample size only gates a clean run.
+    rows = [_row(f"q{i}", 1, 0) for i in range(5)]
     verdict, gap = codec_verdict(rows)
     assert verdict == "UNSAFE"
 
@@ -207,7 +222,7 @@ def test_a_SAFE_cell_mixing_old_and_new_rows_claims_no_rate():
 
 def test_report_gates_on_the_worst_model_within_a_group():
     clean = [_row(f"q{i}", 1, 1) for i in range(_CODEC_MIN_TRIALS)]
-    broken = [_row("q-bad", 1, 0)]
+    broken = [_row(f"q-bad{i}", 1, 0) for i in range(5)]
     results = {
         "good-model": _tagged(clean, "tool-a", "array-of-records"),
         "bad-model": _tagged(broken, "tool-a", "array-of-records"),
@@ -255,10 +270,10 @@ def test_exactly_at_the_call_rate_floor_is_SAFE():
     per_arm = 10
     at_floor = round(_CODEC_MIN_CALL_RATE * per_arm)
     rows = [_row(f"q{i}", per_arm, per_arm, trials=per_arm,
-                 raw_calls=per_arm, terse_calls=at_floor) for i in range(2)]
+                 raw_calls=per_arm, terse_calls=at_floor) for i in range(5)]
     assert codec_verdict(rows)[0] == "SAFE"
     one_under = [_row(f"q{i}", per_arm, per_arm, trials=per_arm,
-                      raw_calls=per_arm, terse_calls=at_floor - 1) for i in range(2)]
+                      raw_calls=per_arm, terse_calls=at_floor - 1) for i in range(5)]
     assert codec_verdict(one_under)[0] == "UNRESOLVED"
 
 
@@ -267,7 +282,7 @@ def test_low_compliance_does_NOT_suppress_an_UNSAFE_verdict():
     # an observed excess is real regardless of compliance — withholding it would suppress
     # the finding this tier exists to make.
     rows = [_row(f"q{i}", 2, 2, trials=2, raw_calls=0, terse_calls=0) for i in range(20)]
-    rows.append(_row("q-bad", 2, 0, trials=2, raw_calls=0, terse_calls=0))
+    rows += [_row(f"q-bad{i}", 2, 0, trials=2, raw_calls=0, terse_calls=0) for i in range(5)]
     assert codec_verdict(rows)[0] == "UNSAFE"
 
 
@@ -310,7 +325,7 @@ def test_the_table_names_the_arm_and_the_rate_when_compliance_withholds_SAFE():
     assert "**UNRESOLVED**" in out
     assert "terse arm delivered 0%" in out
     assert f"need {_CODEC_MIN_CALL_RATE:.0%}" in out
-    assert "zero-failure trial(s), need" not in out
+    assert "trial(s), need" not in out
 
 
 def test_the_table_names_BOTH_arms_worst_first_when_both_are_non_compliant():
@@ -393,7 +408,7 @@ def test_an_unresolved_cell_names_BOTH_compliance_and_the_trial_floor():
     assert "delivered 29%" in cell
     # #412: one run's rate, scoped as one run's — the same cell later read 100% twice.
     assert "delivered 29% of its answers through the tool call in this run" in cell
-    assert "only 7 zero-failure trial(s), need 20" in cell
+    assert "only 7 trial(s), need 20" in cell
 
 
 def test_an_unresolved_cell_names_the_trimmed_corpus_AND_the_trial_floor():
@@ -405,7 +420,7 @@ def test_an_unresolved_cell_names_the_trimmed_corpus_AND_the_trial_floor():
                                  arm="raw", tokens=99, limit=10)]
     cell = _cell(build_codec_verdict_report({"m": rows}, excluded=excluded))
     assert "trimmed corpus" in cell
-    assert "only 3 zero-failure trial(s)" in cell
+    assert "only 3 trial(s)" in cell
 
 
 def test_all_three_reasons_at_once_are_all_named():
@@ -416,18 +431,19 @@ def test_all_three_reasons_at_once_are_all_named():
     excluded = [OversizedPayload(model="m", tool="t", shape="array-of-records", sha="s",
                                  arm="raw", tokens=99, limit=10)]
     cell = _cell(build_codec_verdict_report({"m": rows}, excluded=excluded))
-    assert cell.count(";") == 2, cell
-    for part in ("trimmed corpus", "delivered 0%", "only 5 zero-failure"):
+    assert cell.count(";") == 3, cell
+    for part in ("trimmed corpus", "delivered 0%", "only 5 trial(s)",
+                 "only 1 complete question(s)"):
         assert part in cell, part
 
 
 def test_a_single_reason_is_still_rendered_alone():
     # Full compliance and nothing excluded — only the trial floor fails. The join must not
     # invent a separator around a lone reason.
-    rows = [dict(_row("q", 5, 5, trials=5, raw_calls=5, terse_calls=5),
-                 tool="t", shape="array-of-records")]
+    rows = [dict(_row(f"q{i}", 1, 1, trials=1, raw_calls=1, terse_calls=1),
+                 tool="t", shape="array-of-records") for i in range(5)]
     cell = _cell(build_codec_verdict_report({"m": rows}))
-    assert "only 5 zero-failure trial(s), need 20" in cell
+    assert "only 5 trial(s), need 20" in cell
     assert ";" not in cell.split("**UNRESOLVED**")[1]
 
 
@@ -441,7 +457,7 @@ def test_a_cell_unresolved_for_two_models_names_BOTH_models_reasons():
               tool="t", shape="array-of-records")]
     cell = _cell(build_codec_verdict_report({"a": a, "b": b}))
     assert "**UNRESOLVED**" in cell
-    assert "`a`: only 7 zero-failure trial(s), need 20" in cell
+    assert "`a`: only 7 trial(s), need 20" in cell
     assert "`b`: terse arm delivered 30%" in cell
 
 
@@ -457,8 +473,8 @@ def test_every_column_speaks_for_every_unresolved_model_once_why_does():
                  shape="array-of-records"),
             dict(_row("q2", 7, 7, trials=7, raw_calls=7, terse_calls=7), tool="t",
                  shape="array-of-records", qtype="enumerate")]
-    safe = [dict(_row("q", 25, 25, trials=25, raw_calls=25, terse_calls=25),
-                 tool="t", shape="array-of-records")]
+    safe = [dict(_row(f"q{i}", 25, 25, trials=25, raw_calls=25, terse_calls=25),
+                 tool="t", shape="array-of-records") for i in range(5)]
     cols = [c.strip() for c in
             _cell(build_codec_verdict_report({"a": dead, "b": thin, "c": safe})).split("|")]
     _, _, _, questions, n, verdict, models, why, _ = cols
@@ -467,14 +483,15 @@ def test_every_column_speaks_for_every_unresolved_model_once_why_does():
     assert questions == "`a`: — · `b`: deref 1, enumerate 1"
     assert n == "`a`: 0 · `b`: 14"
     assert models == "`a`, `b`"  # the SAFE model is in no column
-    assert why == f"`a`: {label} · `b`: only 14 zero-failure trial(s), need 20"
+    assert why == (f"`a`: {label} · `b`: only 14 trial(s), need 20; "
+                   "only 2 complete question(s), need 5 — fewer could never show harm")
 
 
 def test_a_single_unresolved_model_keeps_the_plain_columns():
     thin = [dict(_row("q", 7, 7, trials=7, raw_calls=7, terse_calls=7),
                  tool="t", shape="array-of-records")]
-    safe = [dict(_row("q", 25, 25, trials=25, raw_calls=25, terse_calls=25),
-                 tool="t", shape="array-of-records")]
+    safe = [dict(_row(f"q{i}", 25, 25, trials=25, raw_calls=25, terse_calls=25),
+                 tool="t", shape="array-of-records") for i in range(5)]
     cols = [c.strip() for c in
             _cell(build_codec_verdict_report({"a": safe, "b": thin})).split("|")]
     assert cols[3:7] == ["deref 1", "7", "**UNRESOLVED**", "`b`"]
@@ -513,7 +530,8 @@ def test_a_cell_withheld_by_arm_gap_names_that_not_a_thin_sample():
     why = _cell(build_codec_verdict_report({"a": dead})).split("|")[-2].strip()
     assert why == label
     why = _cell(build_codec_verdict_report({"a": dead, "b": thin})).split("|")[-2].strip()
-    assert why == f"`a`: {label} · `b`: only 7 zero-failure trial(s), need 20"
+    assert why == (f"`a`: {label} · `b`: only 7 trial(s), need 20; "
+                   "only 1 complete question(s), need 5 — fewer could never show harm")
 
 
 def test_a_withheld_model_that_ALSO_lost_a_payload_names_both():
@@ -561,12 +579,12 @@ def test_a_rate_just_below_the_floor_never_prints_as_the_floor():
 
 
 def test_a_SAFE_model_beside_an_unresolved_one_adds_no_reason():
-    a = [dict(_row("q", 7, 7, trials=7, raw_calls=7, terse_calls=7),
-              tool="t", shape="array-of-records")]
-    b = [dict(_row("q", 20, 20, trials=20, raw_calls=20, terse_calls=20),
-              tool="t", shape="array-of-records")]
+    a = [dict(_row(f"q{i}", 1, 1, trials=1, raw_calls=1, terse_calls=1),
+              tool="t", shape="array-of-records") for i in range(5)]
+    b = [dict(_row(f"q{i}", 20, 20, trials=20, raw_calls=20, terse_calls=20),
+              tool="t", shape="array-of-records") for i in range(5)]
     why = _cell(build_codec_verdict_report({"a": a, "b": b})).split("|")[-2]
-    assert why.strip() == "only 7 zero-failure trial(s), need 20"
+    assert why.strip() == "only 5 trial(s), need 20"
 
 
 def test_the_verdict_is_UNRESOLVED_exactly_when_a_reason_is_named():
@@ -610,6 +628,236 @@ def test_reasons_are_not_a_verdict_on_their_own():
     # UNSAFE cell. A caller must ask `codec_verdict` whether, and this function why.
     from terse.report import codec_unresolved_reasons
 
-    rows = [_row("q", 5, 4, trials=5, raw_calls=5, terse_calls=0)]
+    rows = [_row(f"q{i}", 5, 4, trials=5, raw_calls=5, terse_calls=0) for i in range(5)]
     assert codec_verdict(rows)[0] == "UNSAFE"
     assert codec_unresolved_reasons(rows)
+
+
+# --------------------------------------------------------------------------- #
+# Review of the sign test: lost calls, every model described, question floor
+# --------------------------------------------------------------------------- #
+def _lost_row(qid, raw_ok, terse_ok, trials, raw_answered, terse_answered):
+    r = _row(qid, raw_ok, terse_ok, trials=trials)
+    r.update(raw_answered=raw_answered, terse_answered=terse_answered,
+             fails=(trials - raw_answered) + (trials - terse_answered))
+    return r
+
+
+def test_a_lost_raw_call_cannot_buy_a_SAFE_against_real_harm():
+    # q-bad: terse wrong every time. q-lost: one raw call LOST (scored as a raw miss), which
+    # made it look like terse did better. Counted, it cancelled q-bad and the cell read SAFE.
+    rows = [_row(f"q{i}", 7, 7, trials=7) for i in range(5)]
+    rows.append(_row("q-bad", 7, 0, trials=7))
+    rows.append(_lost_row("q-lost", 6, 7, 7, raw_answered=6, terse_answered=7))
+    verdict, _g = codec_verdict(rows)
+    assert verdict != "SAFE"
+    from terse.report import codec_sign
+    # SAFE side: the lost raw call is charged as a raw success, so q-lost is a tie, not a
+    # "better" that cancels q-bad (fix plan D2).
+    assert codec_sign(rows, "safe")[:2] == (1, 0)
+
+
+def test_every_verdict_names_lost_calls():
+    safe = [dict(_row(f"q{i}", 20, 20, trials=20), tool="t", shape="array-of-records")
+            for i in range(5)]
+    safe.append(dict(_lost_row("q-lost", 19, 20, 20, 19, 20), tool="t",
+                     shape="array-of-records"))
+    assert "1 of " in _cell(build_codec_verdict_report({"m": safe}))
+    thin = [dict(_lost_row("q", 3, 2, 3, 3, 2), tool="t", shape="array-of-records")]
+    cell = _cell(build_codec_verdict_report({"m": thin}))
+    assert "**UNRESOLVED**" in cell and "1 of 6 calls lost" in cell
+
+
+def test_a_SAFE_row_describes_every_model_not_the_first_name():
+    a = [dict(_row(f"q{i}", 20, 20, trials=20), tool="t", shape="array-of-records")
+         for i in range(5)]
+    b = [dict(_row(f"q{i}", 20, 20, trials=20), tool="t", shape="array-of-records")
+         for i in range(5)]
+    b += [dict(_row("w1", 20, 19, trials=20), tool="t", shape="array-of-records"),
+          dict(_row("b1", 19, 20, trials=20), tool="t", shape="array-of-records")]
+    cell = _cell(build_codec_verdict_report({"a": a, "b": b}))
+    assert "**SAFE**" in cell
+    assert "`b`: worse on 1 question(s), better on 1" in cell
+
+
+def test_significant_harm_survives_a_trimmed_corpus():
+    # Restores what test_an_exclusion_never_suppresses_an_UNSAFE_that_survived pinned before
+    # the sign test: evidence that survived the trim is still UNSAFE.
+    from terse.codeceval import OversizedPayload
+    rows = [dict(_row(f"q{i}", 7, 0, trials=7), tool="t", shape="array-of-records")
+            for i in range(5)]
+    excluded = [OversizedPayload(model="m", tool="t", shape="array-of-records", sha="s",
+                                 arm="raw", tokens=99, limit=10)]
+    assert "**UNSAFE**" in _cell(build_codec_verdict_report({"m": rows}, excluded=excluded))
+
+
+# --------------------------------------------------------------------------- #
+# Fix plan D1-D3: the dual review's reproductions, verbatim
+# --------------------------------------------------------------------------- #
+def _answered_row(qid, raw_ok, terse_ok, trials, raw_ans=None, terse_ans=None, **extra):
+    raw_ans = trials if raw_ans is None else raw_ans
+    terse_ans = trials if terse_ans is None else terse_ans
+    r = _row(qid, raw_ok, terse_ok, trials=trials)
+    r.update(raw_answered=raw_ans, terse_answered=terse_ans,
+             fails=(trials - raw_ans) + (trials - terse_ans), **extra)
+    return r
+
+
+def test_one_lost_terse_call_on_a_harmed_question_cannot_buy_SAFE():
+    rows = [_answered_row(f"c{i}", 4, 4, 4) for i in range(5)]
+    rows.append(_answered_row("harm", 4, 0, 4, terse_ans=3))
+    assert codec_verdict(rows)[0] != "SAFE"
+
+
+def test_one_lost_call_per_question_cannot_hide_a_significant_UNSAFE():
+    rows = [_answered_row(f"q{i}", 20, 0, 20, terse_ans=19) for i in range(6)]
+    assert codec_verdict(rows)[0] == "UNSAFE"
+
+
+def test_never_answered_trials_do_not_count_toward_the_trial_floor():
+    rows = [_answered_row(f"c{i}", 3, 3, 3) for i in range(6)]
+    assert codec_verdict(rows)[0] == "UNRESOLVED"                   # 18 < 20
+    rows.append(_answered_row("dead", 0, 0, 3, raw_ans=0, terse_ans=0))
+    assert codec_verdict(rows)[0] == "UNRESOLVED", "calls that never happened bought a SAFE"
+
+
+def test_total_corruption_on_one_question_is_UNSAFE_at_any_cell_size():
+    assert codec_verdict([_answered_row("q", 20, 0, 20)])[0] == "UNSAFE"
+
+
+def test_noise_cannot_cancel_two_always_wrong_questions():
+    rows = [_answered_row(f"bad{i}", 20, 0, 20) for i in range(2)]
+    rows += [_answered_row(f"n{i}", 10, 11, 20) for i in range(3)]
+    assert codec_verdict(rows)[0] == "UNSAFE"
+
+
+def test_an_unparsed_text_reply_is_unanswered_not_corruption():
+    # The primed terse arm explains instead of replying with bare JSON on every trial. That
+    # is a format problem the primer caused, not a wrong value: UNRESOLVED, never UNSAFE.
+    rows = [_answered_row(f"q{i}", 20, 0, 20, channel="text",
+                          raw_parsed=20, terse_parsed=0) for i in range(6)]
+    verdict, _g = codec_verdict(rows)
+    assert verdict == "UNRESOLVED"
+    from terse.report import codec_unresolved_reasons
+    assert any("terse arm replied with a bare JSON value 0%" in r
+               for r in codec_unresolved_reasons(rows))
+
+
+def test_a_text_reader_that_rarely_replies_in_json_cannot_read_SAFE():
+    rows = [_answered_row(f"q{i}", 1, 1, 20, channel="text",
+                          raw_parsed=1, terse_parsed=1) for i in range(5)]
+    assert codec_verdict(rows)[0] == "UNRESOLVED"
+
+
+def test_an_UNSAFE_row_names_lost_calls_too():
+    rows = [dict(_answered_row(f"q{i}", 20, 0, 20, terse_ans=19), tool="t",
+                 shape="array-of-records") for i in range(6)]
+    cell = _cell(build_codec_verdict_report({"m": rows}))
+    assert "**UNSAFE**" in cell and "6 of 240 calls lost" in cell
+
+
+def test_the_n_column_counts_answered_trials_only():
+    # Pins the unit directly: a lost-call row leans worse on the SAFE side anyway, so the
+    # verdict alone could not show whether the floor counted the never-answered trials.
+    rows = [dict(_answered_row(f"c{i}", 3, 3, 3), tool="t", shape="array-of-records")
+            for i in range(6)]
+    rows.append(dict(_answered_row("dead", 0, 0, 3, raw_ans=0, terse_ans=0), tool="t",
+                     shape="array-of-records"))
+    cols = [c.strip() for c in _cell(build_codec_verdict_report({"m": rows})).split("|")]
+    assert cols[4] == "18"
+
+
+def test_a_lean_worse_reason_says_how_much_of_it_is_lost_calls():
+    from terse.report import codec_unresolved_reasons
+    rows = [_answered_row(f"c{i}", 5, 5, 5) for i in range(5)]
+    rows.append(_answered_row("lost", 4, 4, 5, raw_ans=4))   # 4 v 4 seen; +1 lost raw -> "worse"
+    assert any("1 of those only by counting lost calls against terse" in r
+               for r in codec_unresolved_reasons(rows))
+
+
+# --------------------------------------------------------------------------- #
+# Review round 3 (of ea8355c): reproductions and pins
+# --------------------------------------------------------------------------- #
+def test_R1_an_always_wrong_question_plus_one_lucky_flip_is_not_SAFE():
+    rows = [_answered_row(f"c{i}", 4, 4, 4) for i in range(5)]
+    rows += [_answered_row("bad", 4, 0, 4), _answered_row("flip", 3, 4, 4)]
+    verdict, _g = codec_verdict(rows)
+    assert verdict == "UNRESOLVED"
+    from terse.report import codec_unresolved_reasons
+    assert any("one question reads worse on terse (raw 4/4, terse 0/4" in r
+               for r in codec_unresolved_reasons(rows))
+
+
+def test_R2_a_tool_channel_reply_with_no_value_is_unanswered_not_wrong():
+    rows = [_answered_row(f"q{i}", 20, 0, 20, raw_parsed=20, terse_parsed=0,
+                          raw_calls=20, terse_calls=0) for i in range(6)]
+    assert codec_verdict(rows)[0] != "UNSAFE"
+
+
+def test_R4_text_rows_without_the_format_counters_license_neither_verdict():
+    bad = [_answered_row(f"q{i}", 20, 0, 20, channel="text") for i in range(6)]
+    clean = [_answered_row(f"q{i}", 20, 20, 20, channel="text") for i in range(6)]
+    assert codec_verdict(bad)[0] == "UNRESOLVED"
+    assert codec_verdict(clean)[0] == "UNRESOLVED"
+
+
+def test_R5_trials_answered_on_both_arms_are_the_guaranteed_count():
+    rows = [_answered_row(f"c{i}", 3, 3, 3) for i in range(5)]
+    rows += [_answered_row(f"x{i}", 1, 2, 2, raw_ans=1, terse_ans=2) for i in range(3)]
+    rows = [dict(r, tool="t", shape="array-of-records") for r in rows]
+    cols = [c.strip() for c in _cell(build_codec_verdict_report({"m": rows})).split("|")]
+    assert cols[4] == "18" and cols[5] != "**SAFE**"
+
+
+def test_R6_the_UNSAFE_why_prints_the_counts_the_test_used():
+    rows = [dict(_answered_row("q", 20, 0, 20, terse_ans=14), tool="t",
+                 shape="array-of-records")]
+    cell = _cell(build_codec_verdict_report({"m": rows}))
+    assert "**UNSAFE**" in cell and "terse 6/20" in cell
+
+
+def test_R7_a_lost_raw_call_cannot_create_UNSAFE():
+    # raw 3/5 with 2 raw calls lost vs terse 0/5: charged as raw WRONG on the UNSAFE side,
+    # p = C(5,3)... not significant; charged as raw right (5/5 vs 0/5) it would read UNSAFE.
+    assert codec_verdict([_answered_row("q", 3, 0, 5, raw_ans=3)])[0] != "UNSAFE"
+
+
+def test_R7_incomplete_questions_do_not_count_toward_the_question_floor():
+    from terse.report import codec_unresolved_reasons
+    rows = [_answered_row(f"c{i}", 5, 5, 5) for i in range(4)]
+    rows.append(_answered_row("lost", 5, 5, 5, terse_ans=4))
+    assert any("only 4 complete question(s)" in r for r in codec_unresolved_reasons(rows))
+
+
+def test_R7_legacy_rows_fall_back_to_trials_minus_fails():
+    from terse.report import _codec_answered
+    legacy = {"qid": "q", "trials": 5, "raw_ok": 5, "terse_ok": 5, "fails": 2}
+    assert _codec_answered(legacy, "raw") == 3 and _codec_answered(legacy, "terse") == 3
+
+
+def test_R7_parsed_is_capped_by_answered():
+    from terse.report import _codec_answered
+    r = _answered_row("q", 5, 5, 5, terse_ans=3, raw_parsed=5, terse_parsed=5)
+    assert _codec_answered(r, "terse") == 3
+    r2 = dict(r, trials=4)
+    assert _codec_answered(r2, "raw") == 4
+
+
+def test_R7_the_text_parse_gate_divides_by_answered_trials():
+    from terse.report import codec_unresolved_reasons
+    # 20 answered, 15 parsed on terse = 75% < 80%; with 25 trials the floor is met, so the
+    # parse gate is the reason — and a denominator of `trials` would not change it, but one
+    # of `parsed` would read 100%.
+    rows = [_answered_row(f"q{i}", 20, 15, 25, raw_ans=25, terse_ans=20, channel="text",
+                          raw_parsed=25, terse_parsed=15) for i in range(5)]
+    assert any("terse arm replied with a bare JSON value 75%" in r
+               for r in codec_unresolved_reasons(rows))
+
+
+def test_a_rarely_JSON_text_reader_is_held_back_by_the_parse_gate_itself():
+    # Replaces a test that passed for the wrong reason (the trial floor fired first).
+    from terse.report import codec_unresolved_reasons
+    rows = [_answered_row(f"q{i}", 1, 1, 20, channel="text",
+                          raw_parsed=1, terse_parsed=1) for i in range(25)]
+    reasons = codec_unresolved_reasons(rows)
+    assert any("bare JSON value 5%" in r for r in reasons)

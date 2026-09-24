@@ -232,8 +232,10 @@ def test_an_errored_trial_is_not_counted_in_the_compliance_denominator():
     state = {"n": 0}
 
     def errors_every_other_call(messages):
+        # Every other raw/terse PAIR fails: trials are interleaved (raw, terse, raw, ...),
+        # so failing every other single call would hit only the raw arm.
         state["n"] += 1
-        if state["n"] % 2:
+        if ((state["n"] - 1) // 2) % 2:
             raise RuntimeError("connection refused")
         return Turn(text="", tool_calls=[
             ToolCall(call_id="c1", name=codeceval.RECORD_VALUE_TOOL,

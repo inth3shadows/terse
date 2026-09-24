@@ -114,13 +114,16 @@ def test_a_gap_outside_the_ship_tolerance_publishes_a_FAIL():
 
 
 def _codec_row(n: int) -> list[dict]:
-    """One question, `n` trials, both arms perfect — zero demonstrated corruption.
+    """`n` trials in total, spread over 5 questions, both arms perfect.
 
-    `codec_verdict` counts TRIALS, not questions (`min_paired=0` opts out of #334's
-    question floor), so this is the shape its sample-size gate actually sees."""
-    return [{"qid": "q0", "qtype": "lookup", "transform": "table", "trials": n,
-             "raw_ok": n, "raw_trials": n, "terse_ok": n, "terse_trials": n,
-             "attempts": n * 2, "fails": 0}]
+    Five questions, not one: since the sign test SAFE also needs `_CODEC_MIN_QUESTIONS`
+    complete questions, and a one-question fixture would read UNRESOLVED on that floor and
+    stop pinning THIS one. The trials are split as evenly as possible (19 -> 4,4,4,4,3)."""
+    q = 5
+    return [{"qid": f"q{i}", "qtype": "lookup", "transform": "table",
+             "trials": (t := n // q + (1 if i < n % q else 0)),
+             "raw_ok": t, "raw_trials": t, "terse_ok": t, "terse_trials": t,
+             "attempts": t * 2, "fails": 0} for i in range(q)]
 
 
 def test_the_codec_call_rate_floor_is_eighty_percent():
@@ -249,3 +252,43 @@ def test_a_model_exactly_at_the_loss_share_is_still_measured():
         r["attempts"] for r in over_the_line) > UNMEASURED_FAIL_SHARE
     assert _unmeasured(over_the_line), (
         "a model past UNMEASURED_FAIL_SHARE was still published")
+
+
+def test_the_codec_sign_test_level_and_question_floor_are_pinned():
+    """The two numbers the sign-test verdict adds. Literal, like every constant here, with a
+    boundary each: 5 all-worse questions are p = 1/32 < 0.05 (UNSAFE) and 4 are 1/16 (not),
+    and SAFE needs 5 complete questions — 4 perfect ones stay UNRESOLVED."""
+    from terse.report import _CODEC_MIN_QUESTIONS, _CODEC_SIGN_ALPHA
+    assert _CODEC_SIGN_ALPHA == 0.05
+    assert _CODEC_MIN_QUESTIONS == 5
+
+    def rows(worse: int, clean: int) -> list[dict]:
+        out = _codec_row(clean * 5)[:clean] if clean else []
+        # ONE trial per worse question, so the per-question exact test (p = 0.5) cannot
+        # fire and the boundary is the sign test's alone.
+        out += [{"qid": f"w{i}", "qtype": "lookup", "transform": "table", "trials": 1,
+                 "raw_ok": 1, "raw_trials": 1, "terse_ok": 0, "terse_trials": 1,
+                 "attempts": 2, "fails": 0} for i in range(worse)]
+        return out
+
+    assert codec_verdict(rows(5, 0))[0] == "UNSAFE"
+    assert codec_verdict(rows(4, 0))[0] == "UNRESOLVED"
+    four_clean = [dict(r, qid=f"c{i}", trials=5, raw_ok=5, terse_ok=5, raw_trials=5,
+                       terse_trials=5) for i, r in enumerate(_codec_row(20)[:4])]
+    assert codec_verdict(four_clean)[0] == "UNRESOLVED"
+    assert codec_verdict(four_clean + [dict(four_clean[0], qid="c4")])[0] == "SAFE"
+
+
+def test_the_per_question_exact_test_boundary():
+    """The magnitude half (fix plan D1): one question's own trials, one-sided Fisher, against
+    `_CODEC_SIGN_ALPHA / Q`. With Q=1: raw 3/3 vs terse 0/3 is p = 1/20 = 0.05, not below 0.05
+    (not UNSAFE); raw 4/4 vs terse 0/4 is p = 1/70 (UNSAFE). Pins alpha and the Bonferroni
+    divisor together: a divisor of 1 with Q=2 would flip the second case below."""
+    def one(raw, terse, trials, qid="q"):
+        return {"qid": qid, "qtype": "lookup", "transform": "table", "trials": trials,
+                "raw_ok": raw, "raw_trials": trials, "terse_ok": terse,
+                "terse_trials": trials, "attempts": 2 * trials, "fails": 0}
+    assert codec_verdict([one(3, 0, 3)])[0] != "UNSAFE"
+    assert codec_verdict([one(4, 0, 4)])[0] == "UNSAFE"
+    # 1/70 = 0.0143 is above 0.05/4 = 0.0125: with three clean questions beside it, not UNSAFE.
+    assert codec_verdict([one(4, 0, 4)] + [one(4, 4, 4, f"c{i}") for i in range(3)])[0] != "UNSAFE"

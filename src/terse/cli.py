@@ -1066,7 +1066,8 @@ def _discover_model_limits(base_url: str | None, api_key: str | None,
     return out
 
 
-def _build_answerers(args: argparse.Namespace, make_openai, mode_name: str = "--drop-eval") -> dict:
+def _build_answerers(args: argparse.Namespace, make_openai, mode_name: str = "--drop-eval",
+                     make_cli=None) -> dict:
     """Assemble named answerers from env + flags. Empty means keyless (pack) mode.
 
     Shared by plain `fluency` (`make_openai=fluency.openai_answerer`) and every
@@ -1102,6 +1103,11 @@ def _build_answerers(args: argparse.Namespace, make_openai, mode_name: str = "--
                 # panel to "unmeasured" instead of refusing loudly at config time.
                 raise SystemExit(f"terse fluency: {m!r}: cli: needs a model alias after "
                                  f"the prefix, e.g. cli:opus")
+            if make_cli is not None:
+                # A mode that can score a TEXT reply supplies its own `cli:` adapter
+                # (`--codec-verdict`: `codeceval.cli_text_answerer`, whole-reply JSON).
+                answerers[m] = make_cli(cli_alias)
+                continue
             if make_openai is not fluency.openai_answerer:
                 # Every tool-calling mode needs a TOOL-CALLING answerer; `claude -p
                 # --output-format json` returns prose, not tool calls. Refusing loudly
@@ -1375,6 +1381,11 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         build_terminal_fluency_report,
     )
 
+    # `--primer` only means something to `--codec-verdict`; elsewhere it was a silent no-op.
+    if getattr(args, "primer", False) and not getattr(args, "codec_verdict", False):
+        print("terse fluency: --primer applies only to --codec-verdict", file=sys.stderr)
+        return 2
+
     envelopes = load_corpus(args.corpus)
     if not envelopes:
         print(f"no payloads in {args.corpus}/ — capture some first (`terse capture`).")
@@ -1431,8 +1442,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
 
     # Codec-verdict mode (#295): does a real tool-calling model's downstream tool-call
     # argument stay structurally identical whether it read raw JSON or terse's compressed
-    # form? Replaces the comprehension-accuracy tolerance with a demonstrated-corruption
-    # gate, rendered per (tool, shape) rather than as one global number. Live-model-only,
+    # form? Replaces the comprehension-accuracy tolerance with a paired sign test over
+    # questions, rendered per (tool, shape) rather than as one global number. Live-model-only,
     # same as --drop-eval and --diff — this measures real tool-call behavior, not a
     # ground-truth-scored reply.
     if args.codec_verdict:
@@ -1444,6 +1455,7 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             lambda base, key, m: dropeval.openai_tool_answerer(
                 base, key, m, tools=[codeceval.RECORD_VALUE_TOOL_DEF]),
             mode_name="--codec-verdict",
+            make_cli=codeceval.cli_text_answerer,
         )
         if not answerers:
             print("`fluency --codec-verdict` needs a configured model: set "
@@ -1468,10 +1480,32 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             print(f"[fluency --codec-verdict] no max_input_tokens for "
                   f"{', '.join(unknown)} — scored over the whole corpus; pass "
                   f"--max-input-tokens MODEL=N to check them", file=sys.stderr)
+        primer = ""
+        if getattr(args, "primer", False):
+            # The primer production sends, not the full catalogue: the router's union primer
+            # over this corpus's servers under the policy the proxy runs, which carries only
+            # the forms that policy can emit. From `--policy`, explicitly — resolving it from
+            # the MCP wiring can pick the wrong one when several are installed, and a wrong
+            # primer measures a delivery nobody gets.
+            if not args.policy:
+                print("terse fluency --codec-verdict --primer: needs --policy <file> (the "
+                      "policy the proxy runs), to build the primer production sends",
+                      file=sys.stderr)
+                return 2
+            from .proxy import union_primer
+            pol = load_policy(args.policy)
+            servers = sorted({e.get("server") for e in envelopes}, key=lambda x: x or "")
+            primer = union_primer([(pol, srv) for srv in servers])
+            if not primer:
+                print(f"terse fluency --codec-verdict --primer: {args.policy} emits no "
+                      f"compressed form for these servers, so production sends no primer",
+                      file=sys.stderr)
+                return 2
         try:
             run = codeceval.run_codec_fluency(
                 envelopes, answerers, trials=args.trials, progress=_stderr_progress,
-                limits=limits, tool_defs=[codeceval.RECORD_VALUE_TOOL_DEF])
+                limits=limits, tool_defs=[codeceval.RECORD_VALUE_TOOL_DEF],
+                primer=primer, policy=load_policy(args.policy) if primer else None)
         except codeceval.PreflightError as exc:
             print(str(exc), file=sys.stderr)   # no report: nothing was measured (#403)
             return 2
@@ -2263,7 +2297,14 @@ def main(argv: list[str] | None = None) -> int:
                         "JSON or terse's compressed form? scored on deref and enumerate "
                         "questions, "
                         "rendered as SAFE/UNSAFE/UNRESOLVED per (tool, shape) rather than a "
-                        "global accuracy tolerance; needs a configured tool-calling model")
+                        "global accuracy tolerance; needs a configured tool-calling model, "
+                        "or a cli:<alias> (real Anthropic via `claude -p`), scored on a "
+                        "whole-reply JSON answer since that backend cannot call tools")
+    f.add_argument("--primer", action="store_true",
+                   help="--codec-verdict: put the primer the proxy sends (built from "
+                        "--policy for the corpus's servers) inline ahead of the TERSE arm's "
+                        "payload, as the router delivers it; the raw arm gets none (terse "
+                        "installed vs not). Requires --policy")
     f.add_argument("--accept-degraded", action="store_true",
                    help="--drop-eval: render a verdict even when enough calls failed to "
                         "trip the INCONCLUSIVE gate. For when the cause is known and "
@@ -2277,8 +2318,8 @@ def main(argv: list[str] | None = None) -> int:
                         "stripped, so final-accuracy is a gap between two measured arms "
                         "rather than against an unrun 100%% ideal (#269). Skipping halves "
                         "the calls and restores the old, confounded number")
-    f.add_argument("--policy", help="policy file with a drop-to-retrieve field (used only "
-                                    "by --drop-eval)")
+    f.add_argument("--policy", help="policy file: the drop-to-retrieve rules for --drop-eval, "
+                                    "or the policy whose primer --codec-verdict --primer sends")
     f.add_argument("--base-url", help="OpenAI-compatible base URL (else $TERSE_FLUENCY_BASE_URL)")
     f.add_argument("--models", help="comma-separated model ids (else $TERSE_FLUENCY_MODELS); "
                    "a cli:<alias> id (e.g. cli:opus) runs `claude -p` on the OAuth "
