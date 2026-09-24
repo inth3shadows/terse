@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.37.0] - 2026-09-24
+
 ### Changed
 
 - **A multiproxy router primes lazily (#212).** Its union primer no longer rides
