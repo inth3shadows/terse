@@ -53,7 +53,8 @@ diff reasons: diff_off=1387  joined=587  multiblock=444  no_prior=318
 ```
 
 The tier fires on **0.67% of blocks** (30 of 4,461; 26 emitted diffs), while the live
-router's primer costs **502 tokens every turn** — re-read as `cache_read` on each one.
+router's primer cost **502 tokens every turn** at the time — re-read as `cache_read` on
+each one (the router primes lazily since #212: once per session, on its first terse result).
 `diff_off=1387` is the largest single reason and is *expected*: #170 made diffing opt-in
 precisely because the primer paragraph costs more per turn than this hit rate returns.
 
@@ -88,7 +89,7 @@ whether that tool's arguments can recur at all within a session:
 Arg-keying moves the writes and queries from `not_smaller_diff_args` to `no_prior` — the
 same non-win, relabelled. **Only ~69 are addressable**, worth at most ~60 extra diffs at the
 measured 87%: roughly 26 → 86, a **~3.3x on a tier that fires on 0.67% of blocks**, which
-still has to clear the 502 tok/turn primer. Real and cheap, but small. #419 carries it at
+had to clear the 502 tok/turn router primer (once per session since #212). Real and cheap, but small. #419 carries it at
 that reduced size. The drop tier is where the measured tokens are (#252, #271, #273):
 `codegraph_explore`'s single rule accounts for 604,892 saved tokens here, 22.2% of all
 savings.
@@ -417,12 +418,12 @@ paragraph adds 190 cl100k tokens to that server's primer — the largest single 
 attached once per session to each wrapped server that emits a terse form
 (#211), against a measured 0.38% hit rate. The tier banked 5,052 tokens over 13.3 days,
 which roughly 27 primer attaches erase — about two a day across that window, which an
-active fleet passes immediately. That is the standalone cadence; behind a router the
-same paragraph rides `initialize` and is re-read every turn, which only widens the gap.
+active fleet passes immediately. That is the standalone cadence, and since #212 a
+router's union primer follows it too — once per session, not every turn.
 **Re-derived 2026-09-22 over the full all-time ledger (4,461 blocks), superseding the
 14-day #250 window (17 of 908 blocks, 1.9% / 3.7%, 1,344 tokens):** the structural
 exclusion is gone and the verdict is unchanged — the tier fires on **30 of 4,461 blocks
-(0.67%)**, 26 of them emitted, against a live router primer of **502 tokens per turn**.
+(0.67%)**, 26 of them emitted, against the live router primer of **502 tokens per turn** at the time (lazy since #212).
 
 **Correction to an earlier edition of this line, which called the remaining exclusions
 "workload, not structure".** That is true of `no_prior` (318) and false of

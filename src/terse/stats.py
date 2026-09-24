@@ -25,6 +25,7 @@ file. Timestamps are real wall-clock here (unlike the corpus, principle #31): a
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -278,6 +279,27 @@ def _context_differs_from_wire(total: dict[str, Any]) -> bool:
 
 RETRIEVE_EVENT = "retrieve"
 
+# One row per multiproxy router `initialize` (#212): the proof that a LAZY router was
+# running. An eager (pre-#212) router writes nothing, and neither does an idle lazy one's
+# primer path, so without this row the two are indistinguishable and an idle lazy router
+# would be billed a per-turn primer it never sent -- or an old eager one billed nothing.
+ROUTER_SESSION_EVENT = "router_session"
+
+
+def router_ledger_label(peers_file: str | Path) -> str:
+    """The ledger label a multiproxy router writes its OWN rows under (#212).
+
+    Never a peer's name: `_contested_labels` relies on a primer row under a peer label
+    having been written by a standalone proxy answering to it (#396). The router process is
+    launched `proxy --config <peers file>` and does not know its own config name, so the
+    peers file is the identity both sides share -- `run_multi_proxy` writes under it and
+    `primer_liability` reads a router scan row's `peers_file`. Hashed over the RESOLVED path:
+    every project-scope peers file has the same basename (`peers_path` hashes only the
+    literal "project" prefix), so the basename alone would merge every repo's router."""
+    resolved = str(Path(peers_file).expanduser().resolve())
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:10]
+    return f"router:{Path(peers_file).name}:{digest}"
+
 PRIMER_EVENT = "primer"
 
 # The two primer cadences, public because the WRITE sites (proxy, multiproxy) have to name
@@ -496,7 +518,7 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     versions: dict[str, dict[str, int]] = {}
     # Phase 1: why the cross-call diff did/didn't fire (only present on newer records).
     diff_reasons: dict[str, int] = {}
-    tools: dict[tuple[str, str], dict[str, int]] = {}
+    tools: dict[tuple[str, str], dict[str, Any]] = {}
     # Drop-rule COST rows (#251): a `terse.retrieve` round-trip, keyed by the rule that
     # caused the drop. Deliberately accumulated in its own map, never folded into `tools`
     # — a retrieve is not a compressed block, and adding it to a tool's `blocks` would
@@ -511,7 +533,15 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     # about the same server and must never merge into one row. That third key is what makes
     # "this server provably pays nothing" expressible at all (#286).
     primers: dict[tuple[str, str, bool], dict[str, int]] = {}
+    # Lazy-router sessions by router label (#212): the proof a lazy router ran at all, even
+    # in a window where no result reached it.
+    router_sessions: dict[str, dict[str, Any]] = {}
     for rec in records:
+        if rec.get("event") == ROUTER_SESSION_EVENT:
+            srow = router_sessions.setdefault(str(rec.get("server", "unknown")),
+                                              {"sessions": 0})
+            srow["sessions"] += 1
+            continue
         if rec.get("event") == PRIMER_EVENT:
             psrv = str(rec.get("server", "unknown"))
             # A row with no `attached` key predates the field and can only be an attach --
@@ -592,8 +622,15 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         row = tools.setdefault(key, {"blocks": 0, "tokenized": 0, "encoded": 0,
                                      "raw_tokens": 0, "out_tokens": 0,
                                      "context_raw_tokens": 0, "context_out_tokens": 0,
-                                     "raw_chars": 0, "out_chars": 0, "diffs": 0})
+                                     "raw_chars": 0, "out_chars": 0, "diffs": 0,
+                                     "router_stamps": {}})
         row["blocks"] += 1
+        # Rows written by a LAZY router's peer, by that router's label (#212). A row with no
+        # stamp came from a pre-#212 (eager) router or from a standalone proxy, and keeps
+        # any router claiming its label on the per-turn bill.
+        stamp = rec.get("router")
+        if isinstance(stamp, str):
+            row["router_stamps"][stamp] = row["router_stamps"].get(stamp, 0) + 1
         # Blocks on which a terse WIRE FORM shipped, as opposed to blocks emitted at all.
         # `unchanged` ran the codec and shipped the original; `passthrough` never ran it.
         # Only these two decisions can put a `__terse_` marker on the wire — which is what
@@ -655,6 +692,10 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             # ledger cannot say", not as "no primer was sent".
             "primers": [{"server": s, "cadence": c, "attached": a, **row}
                         for (s, c, a), row in sorted(primers.items())],
+            # Lazy-router sessions (#212). Empty on any ledger with no lazy router -- read
+            # as "this ledger cannot say the router was lazy", never as "zero sessions".
+            "router_sessions": [{"server": s, **row}
+                                for s, row in sorted(router_sessions.items())],
             # Costliest rule first: tokens the model spent fetching dropped values back.
             "retrieves": [{"server": s, "tool": t, "path": p, **row}
                           for (s, t, p), row in sorted(
@@ -720,9 +761,15 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
         # 0.38% hit rate; the ~900-2,700x once quoted here was computed against the pre-#211
         # per-turn charge, see `policy.py`). Say so where the question is actually asked,
         # not only in the dataclass.
-        if diff_reasons.get("diff_off") and len(diff_reasons) == 1:
+        # `primer_hold` (#212) rides beside `diff_off` on every default router fleet, so it
+        # must not suppress the note; and it gets its own line, since nothing else explains it.
+        if diff_reasons.get("diff_off") and set(diff_reasons) <= {"diff_off", "primer_hold"}:
             lines.append("  (diff_off = cross-call diffing is OFF by default since #170 — "
                          "measured cost > saving; enable per server with `--diff`)")
+        if diff_reasons.get("primer_hold"):
+            lines.append("  (primer_hold = a router result carrying `structuredContent`, "
+                         "passed through whole until the session's lazy primer attached, "
+                         "#212)")
     if tok_raw or tok_out:
         lines.append(f"tokens (cl100k): {tok_raw:,} -> {tok_out:,}   "
                      f"saved {tok_raw - tok_out:,} ({_pct_saved(tok_raw, tok_out).strip()})"
@@ -883,10 +930,12 @@ _PAYS_PRIMER = ("wrapped", "wrapped-unstashed", "router", "router-ambiguous")
 # well as the collision tests here).
 _WRITES_LEDGER_ROWS = _PAYS_PRIMER + ("folded-and-live",)
 
-# Of those, the states that still prime EAGERLY at `initialize.instructions`, which the
-# client re-reads every turn as `cache_read` — a recurring per-turn charge. Everything else
-# in `_PAYS_PRIMER` is a standalone `run_proxy` entry, lazy since #211: one attach, to the
-# first compressible result, and nothing at all if that result never comes.
+# Of those, the states that primed EAGERLY at `initialize.instructions` before #212, which
+# the client re-reads every turn as `cache_read` — a recurring per-turn charge. Since #212 a
+# router is lazy too, but it is still billed per turn UNLESS the ledger proves it (its own
+# session rows or stamped peer rows, and no unstamped peer row -- see `primer_liability`):
+# an older router records nothing and stamps nothing. Every
+# other state in `_PAYS_PRIMER` is a standalone `run_proxy` entry, lazy since #211.
 _PRIMES_EAGERLY = ("router", "router-ambiguous")
 
 # Command basenames that name a LAUNCHER, not a server. `server_label` of such a command is
@@ -1122,11 +1171,10 @@ def _contested_labels(scan_rows: list[dict[str, Any]],
     (#396 review).
 
     The map, not just the set, because every consumer needs a different slice of it — see
-    `_Contest`. One in particular: a measurement on a contested row survives. A primer record is written at exactly one site, `run_proxy`'s
-    `build_primer_writer` — a router's peers are built `lazy_primer=False`, so no peer attach
-    can fire, and the router's own union primer is eager and recorded nowhere. So a
-    `once/session` primer row under a contested label can only have been written by a
-    STANDALONE proxy answering to it. Where exactly one non-router entry writes the label,
+    `_Contest`. One in particular: a measurement on a contested row survives. A primer record under a PEER label is written only by
+    `run_proxy`'s `build_primer_writer` — a router's own primer (lazy since #212) is recorded
+    under its `router_ledger_label`, never a peer's name. So a `once/session` primer row under
+    a contested label can only have been written by a STANDALONE proxy answering to it. Where exactly one non-router entry writes the label,
     that record is fully attributable however many routers also claim it, and blacking it out
     turned a measured 777-token attach into `session_once_tokens: 0` under the line "Only
     servers that were actually called are billed here" (re-review finding 1).
@@ -1456,7 +1504,8 @@ def _cadences_of(servers: list[dict[str, Any]]) -> set[str]:
 
 
 def _cadence(state: str | None, blocks: int | None, encoded: int | None,
-             recorded: bool = False, unpaid: bool = False) -> str:
+             recorded: bool = False, unpaid: bool = False,
+             lazy_router: bool = False) -> str:
     """How often this entry actually pays its primer, post-#211.
 
     `blocks` is the ledger's answer to "was it called", and its three-way None/0/N is load
@@ -1488,7 +1537,9 @@ def _cadence(state: str | None, blocks: int | None, encoded: int | None,
     block carries no marker, and the `structuredContent` gap at the same guard can suppress
     the attach on results that do. So a non-zero count bills, which stays the over-billing
     direction the module argues is the safe one."""
-    if state in _PRIMES_EAGERLY:
+    # `lazy_router` (#212): the ledger proved this router primed lazily for the whole window,
+    # so it is billed like a standalone entry below; otherwise a router is per-turn.
+    if state in _PRIMES_EAGERLY and not lazy_router:
         return _PER_TURN
     # `recorded` ENDS the inference above, and is checked before every other branch (#311
     # review). Everything this docstring argues is about evidence: `encoded` is "strong
@@ -1766,9 +1817,12 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
     TWO CADENCES, never summed (#211 follow-up). Before the lazy primer every entry here
     paid at `initialize` and `per_turn_tokens` was one honest total. It no longer is:
 
-      router / router-ambiguous   still prime EAGERLY, one `union_primer` in the router's
-                                  own merged `initialize.instructions`, re-read every turn
-                                  as `cache_read`. RECURRING — `per_turn_tokens`.
+      router / router-ambiguous   lazy since #212 (one union primer, once per session) when
+                                  the window proves it: the router's own session or stamped
+                                  rows, and NO unstamped row under a peer it writes.
+                                  Otherwise — an older router's rows in the window — billed
+                                  as the eager `initialize` primer. RECURRING —
+                                  `per_turn_tokens`.
       wrapped / wrapped-unstashed lazy since #211: the primer attaches to the FIRST result
                                   carrying a terse wire form. Paid ONCE per session if that
                                   result comes, and NOT AT ALL if it never does.
@@ -1954,6 +2008,16 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         return bool(by_label.get(lbl) or tokenized_by_label.get(lbl)
                     or saved_by_label.get(lbl))
 
+    # Lazy-router evidence (#212): sessions per router label, and per peer label how many
+    # rows were stamped by which lazy router -- so a label with ANY unstamped row (an eager
+    # router's, or a standalone duplicate's) keeps its router on the per-turn bill.
+    router_sessions = {str(r.get("server")): r for r in agg.get("router_sessions") or []}
+    stamps_by_label: dict[str, dict[str, int]] = {}
+    for trow in agg.get("tools", []):
+        dest = stamps_by_label.setdefault(trow["server"], {})
+        for rl, n in (trow.get("router_stamps") or {}).items():
+            dest[rl] = dest.get(rl, 0) + n
+
     servers: list[dict[str, Any]] = []
     # Which row speaks for a name defined in several scopes — the one the client launches,
     # not the first emitted (#398). Rendering order below is unchanged: the loop still walks
@@ -2081,6 +2145,41 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         # A contested label this entry could not claim for the primer leaves the primer
         # question unanswerable for it -- distinct from answering "unpaid".
         primer_unknown = any(lbl not in primer_labels for lbl in contested_here)
+        # A LAZY router (#212) records its primer under its OWN label, never a peer's, so
+        # its attach evidence comes from that label alone. Lazy only with its own evidence
+        # (session or stamped rows) and no UNSTAMPED peer row -- an unstamped row means some
+        # of the window ran an eager (pre-#212) router, and the per-turn bill stands.
+        lazy_router = False
+        if is_router and writes and row.get("peers_file"):
+            rlbl = router_ledger_label(str(row["peers_file"]))
+            # No row under any label this router WRITES (`claimed`, contested included: an
+            # unstamped row there may be an eager router's own) may be unstamped.
+            # Positive, per row -- a `--since` cut or a rotation cannot fake it, where the
+            # round-2 timestamp comparison read a lazy-all-along fleet as per-turn (round 4).
+            # `writes` first: a router now baked `--no-stats` claims nothing, so an empty
+            # `claimed` would otherwise pass vacuously on old session rows (round 4, L1).
+            # Evidence is a session row OR a stamped row: a stamp alone proves a lazy router
+            # wrote it (a `--since` past every session start keeps only stamped rows). With
+            # neither -- no sessions, no rows -- an idle lazy router and an idle eager one
+            # look the same, and the per-turn bill stands.
+            stamped = sum((stamps_by_label.get(lbl) or {}).get(rlbl, 0) for lbl in claimed)
+            evidence = bool((router_sessions.get(rlbl) or {}).get("sessions")) or stamped > 0
+            # "No UNSTAMPED row", not "every row stamped by me": a row stamped by ANOTHER
+            # lazy router (two routers fronting one peer name) is no evidence of an eager
+            # period, and demanding my own stamp billed both routers per turn for good while
+            # the report blamed an unstamped row that did not exist (round 5). The evidence
+            # that THIS router ran lazily must still be its own.
+            lazy_router = evidence and all(
+                sum((stamps_by_label.get(lbl) or {}).values()) == by_label.get(lbl, 0)
+                for lbl in claimed)
+            if lazy_router:
+                primer_labels = [rlbl]
+                # The router's own label is never contested (except by a `router-ambiguous` twin
+                # fronting the same peers file, which pools it -- over-billing), so a contested PEER says
+                # nothing about its primer (review round 3: a name-only contest sent
+                # `blocks=None` to `_cadence` -> `1x?` and dropped the primer from both
+                # totals beside 5 real blocks).
+                primer_unknown = False
         rec_tok = sum(recorded_tokens.get(lbl, 0) for lbl in primer_labels)
         rec_em = sum(recorded_emissions.get(lbl, 0) for lbl in primer_labels)
         # `rec_tok > 0` mirrors the accumulator's `tokenized_emissions <= 0` skip. The
@@ -2089,7 +2188,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         # truncated ledger can, and without this it publishes `primer_tokens: 0` under the
         # `recorded` label: a claim that we MEASURED a free primer. Unknown must degrade to
         # the labelled estimate, never to a fabricated zero.
-        measured = rec_em > 0 and rec_tok > 0 and not is_router
+        measured = rec_em > 0 and rec_tok > 0 and (not is_router or lazy_router)
         # A measured ZERO: the proxy recorded a SUPPRESSION for every label of this entry
         # and no attach anywhere. `not any(... attached_label)` is what makes an attach win
         # and is the load-bearing term -- `not measured` alone was NOT enough, because an
@@ -2100,10 +2199,9 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         # are structurally identical today and no test can distinguish them. Kept because it
         # states the intent for whoever makes an entry multi-label, not because it fires.
         #
-        # Routers are excluded because they prime EAGERLY at `initialize` and no eager site
-        # records anything -- a router has no primer rows by construction, and reading that
-        # as proof of non-payment would zero the recurring cost of the one shape that
-        # genuinely pays every turn.
+        # Routers are excluded here because an EAGER (pre-#212) router records nothing, and
+        # reading that as proof of non-payment would zero a recurring cost. A LAZY router is
+        # proven by its session/stamped rows (above) and is handled just below.
         #
         # An entry with NO primer rows reaches neither branch and keeps the policy estimate.
         # That fallback is what makes a truncated `--since` window or a rotated ledger safe:
@@ -2111,6 +2209,11 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         measured_zero = (not measured and not is_router and bool(primer_labels)
                          and not any(lbl in attached_label for lbl in primer_labels)
                          and all(lbl in suppressed_label for lbl in primer_labels))
+        # A lazy router with sessions and NO attach is NOT declared a measured zero (review
+        # round 2): every client window runs its own router process under ONE label and rows
+        # carry no process id, so peer rows in the window can belong to a session whose own
+        # attach row fell outside it. It keeps the standard evidence path: `encoded > 0`
+        # bills the estimate once per session, `encoded == 0` (never called) is free.
         if measured_zero:
             tokens = 0
         if measured:
@@ -2164,8 +2267,25 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         # still reported: `contested_labels` is populated either way, so the entry is still
         # named in the stanza and the operator still sees it.
         blackout = any(_label_has_rows(lbl) for lbl in contested_here)
+        # The PRIMER question for a proven-lazy router (#212) is answered from its own
+        # evidence, not the blackout: the blackout is about which process banked a contested
+        # label's SAVINGS. Nulling it sent `blocks=None` to `_cadence` -> `1x?`, dropping a
+        # paid primer from both totals (round 5). `labels` omits a contested label that has
+        # rows, so the router's OWN-stamped rows there are added back -- they are the proof
+        # it was called; leaving them out read a router called only through a contested peer
+        # as "cost nothing at all" (round 6). `encoded` becomes unknown (None) whenever they
+        # are added, so `_cadence` bills on blocks -- the over-billing direction.
+        cadence_blocks, cadence_encoded = blocks, encoded
+        if lazy_router:
+            own_contested = sum((stamps_by_label.get(lbl) or {}).get(rlbl, 0)
+                                for lbl in contested_here)
+            if own_contested:
+                cadence_blocks = (cadence_blocks or 0) + own_contested
+                cadence_encoded = None
         if blackout:
             blocks = tokenized = encoded = None
+            if not lazy_router:
+                cadence_blocks = cadence_encoded = None
         row_out: dict[str, Any] = {
             "server": name, "scope": row.get("scope"), "state": state,
             "primer_tokens": tokens, "ledger_labels": labels, "blocks": blocks,
@@ -2187,9 +2307,13 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
             # the entry was declared provably FREE while an unattributable attach record sat
             # under its label. `1x?` is the answer: some process paid, and nothing in the
             # ledger says which.
-            "cadence": _cadence(state, None if primer_unknown else blocks,
-                                None if primer_unknown else encoded, recorded=measured,
-                                unpaid=measured_zero),
+            "cadence": _cadence(state, None if primer_unknown else cadence_blocks,
+                                None if primer_unknown else cadence_encoded,
+                                # An attach row under a lazy router's own label is proof it
+                                # paid even when untokenized (not `measured`) -- never "free".
+                                recorded=measured or (lazy_router and any(
+                                    lbl in attached_label for lbl in primer_labels)),
+                                unpaid=measured_zero, lazy_router=lazy_router),
             **_break_even(tokens, blocks, tokenized,
                           sum(net_saved_by_label.get(lbl, 0) for lbl in labels),
                           # Same shape as `no ledger label` — nothing measurable — but a
@@ -2351,15 +2475,15 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     lines = ["", f"primer liability across {len(servers)} wrapped server(s) — NOT in the "
                  f"totals above:"]
     if _PER_TURN in cadences:
-        lines.append(f"  recurring  {per_turn:,} tok/turn — a multiproxy router primes "
-                     f"eagerly at `initialize`, and the")
-        lines.append("             client re-reads those instructions every turn as "
-                     "cache_read.")
+        lines.append(f"  recurring  {per_turn:,} tok/turn — a multiproxy router that primed "
+                     f"at `initialize` (pre-#212, or not")
+        lines.append("             proven lazy: an unstamped peer row in this window): "
+                     "re-read every turn as cache_read.")
     if cadences - {_PER_TURN}:
         lines.append(f"  one-time   {once:,} tok/session — a standalone `terse proxy` "
-                     f"attaches its primer to the")
-        lines.append("             first compressible result and not again (#211). Only "
-                     "servers that were")
+                     f"(#211) or a lazy router (#212)")
+        lines.append("             attaches its primer to the first compressible result "
+                     "and not again. Only servers that were")
         lines.append("             actually called are billed here.")
     if len(cadences) > 1 and _PER_TURN in cadences:
         lines.append("  the two figures are different units and are deliberately not "
@@ -2398,14 +2522,15 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         lines.append(f"  {liab['unresolved']} server(s) have an unreadable policy and are "
                      f"NOT counted — treat both figures as lower bounds.")
     # Silent entries are named whatever their CADENCE. `uncertain` is `_ONCE_UNKNOWN`, which
-    # a router never is (it primes eagerly, so `_cadence` returns `_PER_TURN` before it ever
-    # looks at `blocks`), so a silent ROUTER printed the verdict in a table cell that nothing
+    # an eagerly-billed router never is (`_cadence` returns `_PER_TURN` before it ever looks
+    # at `blocks`; a router proven lazy (#212) CAN be, e.g. with no recoverable label), so a
+    # silent ROUTER printed the verdict in a table cell that nothing
     # in the report explained — the very gap this split was widened to close, one state over
     # (review of PR #417).
     silent_any = sorted(s["server"] for s in liab["servers"]
                         if s.get("break_even_verdict") == _R_NO_LEDGER_ROWS)
     # On `contested_labels`, not on the verdict, and not via `_named` (which intersects with
-    # `uncertain`, a set no router can be in). A fully-dark claimant carries the verdict,
+    # `uncertain`, which a per-turn router is never in). A fully-dark claimant carries the verdict,
     # but a router that keeps other peers does NOT — it reports a real KEEP over a block
     # count that quietly shrank, with nothing in the report saying a label was taken from
     # it. Both need naming, and only the field is true of both.
@@ -2454,9 +2579,11 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
         # FOURTH cause, and the one whose fix is the opposite of the line above: here the
         # `--server-name` is exactly what both writers agree on (#396 review). Telling this
         # operator to bake one would be advice to do again what already broke it.
-        # NOT `_named`, which intersects with `uncertain` (cadence `1x?`). A router is
-        # always `_PER_TURN` — `_cadence` answers that for `_PRIMES_EAGERLY` before it ever
-        # looks at `blocks` — so a contested ROUTER could never appear in that set, and
+        # NOT `_named`, which intersects with `uncertain` (cadence `1x?`). A per-turn router
+        # never reaches that set — `_cadence` answers `_PRIMES_EAGERLY` before it looks at
+        # `blocks` — though a proven-lazy one CAN reach `1x?` (e.g. twins with rows under every
+        # peer); `dup_any` names it regardless, so a contested ROUTER no longer relies on
+        # that set, and
         # printed this verdict in a table cell nothing in the report explained. Exactly the
         # gap `silent_any` was added for in #417, reintroduced one reason later (review of
         # PR #422, finding 4). This cause is the first that applies to a router, so it is
@@ -2702,11 +2829,12 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
     # prose above does not tell a router-only install about a one-time charge.
     shown = _cadences_of(servers)
     if _PER_TURN in shown:
-        lines.append("  /turn = an eagerly-primed router: the break-even is blocks per "
-                     "TURN, and it recurs.")
+        lines.append("  /turn = an eagerly-primed router (pre-#212, or not yet proven lazy): "
+                     "the break-even is blocks per TURN, and it recurs.")
     if shown - {_PER_TURN}:
-        lines.append("  1x = a lazily-primed standalone entry (#211): the break-even is "
-                     "blocks ONCE PER SESSION, a far lower bar.")
+        lines.append("  1x = a lazily-primed entry — standalone (#211) or a router proven lazy "
+                     "(#212): the break-even is")
+        lines.append("  blocks ONCE PER SESSION, a far lower bar.")
         if _ONCE_FREE in shown or _ONCE_UNKNOWN in shown:
             lines.append("  1x? = called-ness unknown (no ledger label, an ambiguous one, "
                          "a label shared with another writer, or no rows")
@@ -2830,8 +2958,8 @@ def build_recommend_section(liab: dict[str, Any]) -> list[str]:
                      "called).")
     shown = _cadences_of(servers)
     if _PER_TURN in shown:
-        lines.append("  coverage on a /turn row is against ONE turn's charge — a router "
-                     "pays it every turn, so compare it")
+        lines.append("  coverage on a /turn row is against ONE turn's charge — an eagerly "
+                     "billed router pays it every turn, so compare it")
         lines.append("  against your own turn count.")
     if shown - {_PER_TURN}:
         lines.append("  coverage on a 1x row treats the whole window as one session — the "
@@ -2894,7 +3022,7 @@ def build_recommend_report(agg: dict[str, Any], *, log_path: str | Path,
     return "\n".join(lines) + "\n"
 
 
-def build_stats_writer(stats_log: str | Path, server: str):
+def build_stats_writer(stats_log: str | Path, server: str, router: str | None = None):
     """The proxy-side callback: (tool, raw, emitted, passthrough) -> appended record.
     Owns all I/O and NOTHING else, kept here so both run_proxy and run_multi_proxy wire
     it identically. A write failure propagates: stats is still never load-bearing, but
@@ -2904,9 +3032,14 @@ def build_stats_writer(stats_log: str | Path, server: str):
     def stats(tool: str, raw: str, emitted: str, passthrough: bool,
               diff_reason: str | None = None, structured: str | None = None,
               structured_out: str | None = None) -> None:
-        append_stats(build_record(server, tool, raw, emitted, passthrough, diff_reason,
-                                  structured, structured_out),
-                     stats_log)
+        rec = build_record(server, tool, raw, emitted, passthrough, diff_reason,
+                           structured, structured_out)
+        if router is not None:
+            # The stamp (#212): this row was written by a peer of the LAZY router `router`.
+            # `primer_liability` reads a router as lazy only if no row it claims is unstamped
+            # -- a positive proof per row that `--since` and rotation cannot cut.
+            rec["router"] = router
+        append_stats(rec, stats_log)
 
     return stats
 
@@ -2919,27 +3052,27 @@ def build_primer_writer(stats_log: str | Path, server: str):
     code path -- at most once per session, on the lazy attach. Widening the result writer
     would put a branch taken at most once on the hot path for every compressed block.
 
-    Wired at exactly ONE site, `run_proxy`, and deliberately NOT alongside the other two in
-    `multiproxy._build_peers` (#311; an earlier draft of this docstring claimed otherwise
-    and was corrected in review). Two independent reasons, either sufficient:
-
-      * Peers run `lazy_primer=False`, so a peer's `_primer_sent` starts True and its lazy
-        attach can never fire. A per-peer writer would be dead code.
-      * The router emits ONE `union_primer` for N peers. Wiring this into the peer loop with
-        `spec.name` would bill N primers for the one the client receives -- the over-count
-        that sank #312's design.
-
-    The router's own union primer is therefore not recorded at all. It does not need to be:
-    it is emitted unconditionally at `initialize`, which is the same predicate
-    `primer_liability` already evaluates from the installed policy, so inference there is
-    exact. Recording it would also require a ledger identity the router does not have --
-    the reader derives a router's identity from its PEER names, so no synthetic label would
-    join."""
+    Wired at two sites. `run_proxy` labels it with the proxy's own ledger identity. Since
+    #212, `multiproxy._build_peers` also wires it into every peer -- but under the ROUTER's
+    `router_ledger_label`, never `spec.name`, and the peers share one `PrimerLatch`, so the
+    ONE union primer the client receives is one row. (Before #212 the router primed eagerly
+    at `initialize` and recorded nothing; billing N peer labels for one primer is the
+    over-count that sank #312's design.)"""
     def primer(cadence: str, text: str, attached: bool = True) -> None:
         append_stats(build_primer_record(server, cadence=cadence, primer=text,
                                          attached=attached), stats_log)
 
     return primer
+
+
+def build_router_session_writer(stats_log: str | Path, server: str):
+    """One `router_session` row per lazy-router `initialize` (#212). `server` is the
+    router's own `router_ledger_label`. Fail-open like every writer: the caller swallows."""
+    def session() -> None:
+        append_stats({"ts": int(time.time()), "version": _ledger_version(),
+                      "server": server, "event": ROUTER_SESSION_EVENT}, stats_log)
+
+    return session
 
 
 def build_retrieve_writer(stats_log: str | Path, server: str):

@@ -73,6 +73,7 @@ from .proxy import (
     RETRIEVE_TOOL_DEF,
     SWALLOW,
     Interceptor,
+    PrimerLatch,
     _build_capture_and_audit,
     _ignore_sigterm,
     _install_sigterm_to_exit,
@@ -81,7 +82,13 @@ from .proxy import (
     pump,
     union_primer,
 )
-from .stats import build_retrieve_writer, build_stats_writer
+from .stats import (
+    build_primer_writer,
+    build_retrieve_writer,
+    build_router_session_writer,
+    build_stats_writer,
+    router_ledger_label,
+)
 from .transport import Transport, build_transport
 
 # Tool-name prefix separator — defined in policy.py (not here) so Policy.select can
@@ -384,8 +391,23 @@ class Router:
     reader thread (that direction genuinely is 1:1, so pump is the right tool)."""
 
     def __init__(self, peers: list[Peer], out: TextIO, out_lock: Lock, *,
-                 debug: bool = False, broadcast_timeout: float = BROADCAST_TIMEOUT):
+                 debug: bool = False, broadcast_timeout: float = BROADCAST_TIMEOUT,
+                 primer_latch: PrimerLatch | None = None,
+                 on_session: Callable[[], None] | None = None):
         self.peers = peers
+        # Writes one `router_session` ledger row per client `initialize` (#212) -- the
+        # proof, for `primer_liability`, that a LAZY router ran this session even when no
+        # result ever attached its primer. Fail-open: see `_broadcast`.
+        self.on_session = on_session
+        # The LAZY union primer (#212), shared by every peer's Interceptor: attached once
+        # per session to the first terse-marked result from ANY peer, instead of riding
+        # `initialize.instructions` into every turn's system prompt. None keeps the old
+        # eager path (`_merge_initialize` prepends `union_primer`) -- tests pin both.
+        # Measured before building: 71% of router sessions never see a terse marker,
+        # and the eager primer was 0.25% of all spend (program plan, 2.2).
+        self.primer_latch = primer_latch
+        if primer_latch is not None:
+            primer_latch.set_text(union_primer([(p.inter.policy, p.name) for p in peers]))
         self.by_name = {p.name: i for i, p in enumerate(peers)}
         self.out = out
         self.out_lock = out_lock
@@ -844,6 +866,12 @@ class Router:
                 # initialize reply, so this peer's init_id has no other purpose.
                 peer.inter.clear_init_id()
             self._write_peer(i, line)
+        if kind == "initialize" and self.on_session is not None:
+            try:
+                self.on_session()
+            except Exception as exc:  # noqa: BLE001 — a ledger sink is never load-bearing
+                if self.debug:
+                    sys.stderr.write(f"[terse-multiproxy] session ledger: {exc}\n")
 
     def _broadcast_notification(self, line: str) -> None:
         for sender in self._senders:
@@ -1341,10 +1369,10 @@ class Router:
         to agree in practice). `capabilities` = a shallow dict-union (last-peer-wins on a
         key clash — no ordering guarantee stronger than "arrival order", documented).
         `serverInfo` names US, not any one peer (merging N identities into one isn't
-        meaningful). `instructions` = ONE primer covering the union of what any peer can
-        emit (#168), first, then each peer's own
-        non-empty instructions (skipping one that already carries the primer, so a peer
-        that is ITSELF a terse proxy doesn't duplicate it)."""
+        meaningful). `instructions` = each peer's own non-empty instructions (skipping one that
+        already carries the primer, so a peer that is ITSELF a terse proxy doesn't duplicate
+        it) -- preceded by ONE union primer (#168) only on the eager path; with a
+        `primer_latch` the primer attaches lazily to a result instead (#212)."""
         protocol_version: str | None = None
         capabilities: dict = {}
         instructions_parts: list[str] = []
@@ -1370,7 +1398,10 @@ class Router:
         # (#168). Peers may carry different policies (`downstreams[].policy`), and a form
         # documented by none of them is a form the client will never see — but a form ANY
         # peer can emit must be documented, so the union is the only sound scope here.
-        instructions = union_primer([(p.inter.policy, p.name) for p in self.peers])
+        # Lazy router (#212): the union primer is NOT sent here -- the shared latch attaches
+        # it to the first terse-marked result. Peers' own instructions still ride along.
+        instructions = ("" if self.primer_latch is not None
+                        else union_primer([(p.inter.policy, p.name) for p in self.peers]))
         if instructions_parts:
             instructions = ((instructions + "\n\n") if instructions else "") \
                 + "\n\n".join(instructions_parts)
@@ -1463,7 +1494,9 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                  diff_override: bool | None = None,
                  diff_keyframe_override: int | None = None,
                  join_blocks_override: bool | None = None,
-                 stats_log: str | None = None) -> list[Peer]:
+                 stats_log: str | None = None,
+                 primer_latch: PrimerLatch | None = None,
+                 primer_label: str | None = None) -> list[Peer]:
     """Build every `Peer`: its own `Transport` (stdio or HTTP, via `build_transport`)
     and its own `Interceptor` (per-peer diff/compress state, but the drop store —
     including its byte-eviction counter — is injected shared). Raises on a bad spec —
@@ -1491,21 +1524,33 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
             # Per-peer stats writer so the ledger's `server` field is the peer's own
             # config name (the tool field is already peer-qualified; this keeps the
             # grouping key meaningful without parsing prefixes back out).
-            stats = (build_stats_writer(stats_log, spec.name)
+            # Stamped with the lazy router's label (#212): the per-row proof `primer_liability`
+            # needs to bill this router once per session instead of per turn.
+            stats = (build_stats_writer(stats_log, spec.name,
+                                        router=primer_label if primer_latch is not None
+                                        else None)
                      if stats_log is not None else None)
             stats_retrieve = (build_retrieve_writer(stats_log, spec.name)
                               if stats_log is not None else None)
-            # lazy_primer=False: the router already primes eagerly, once, via
-            # `union_primer` in `_merge_initialize` (#168) — a peer going lazy too would
-            # attach its OWN primer on its own first compression, on top of that, a
-            # redundant (not wrong, just wasteful) double explanation. Peer behavior is
-            # deliberately unchanged by #168 phase 2; see that plan's Scope section.
+            # lazy_primer=False: a peer never primes on its OWN -- that would attach one
+            # primer per peer on top of the router's (#168). With `primer_latch` (#212) the
+            # peer attaches the router's ONE union primer through the shared latch; without
+            # it the router primes eagerly in `_merge_initialize`.
+            #
+            # The primer record is written under `primer_label` -- the ROUTER's label, never
+            # this peer's. `_contested_labels` relies on a primer row under a PEER label
+            # having been written by a standalone proxy answering to it (#396).
+            stats_primer = (build_primer_writer(stats_log, primer_label)
+                            if stats_log is not None and primer_latch is not None
+                            and primer_label else None)
             inter = Interceptor(pol, debug=debug, capture=capture, audit=audit,
                                 stats=stats, stats_retrieve=stats_retrieve,
+                                stats_primer=stats_primer,
                                 server_name=spec.name, store=store,
                                 store_lock=store_lock, dropped_bytes=dropped_bytes,
                                 origins=origins, ledger_label=spec.name,
-                                log_prefix="[terse-multiproxy]", lazy_primer=False)
+                                log_prefix="[terse-multiproxy]", lazy_primer=False,
+                                shared_primer=primer_latch)
             transport = build_transport(spec.target, headers=spec.headers or None,
                                         env=spec.env, cwd=spec.cwd)
             peers.append(Peer(name=spec.name, transport=transport, inter=inter))
@@ -1569,6 +1614,12 @@ def run_multi_proxy(
     # attribution exactly on the fleet shape that has a lossy-by-default rule (#251).
     origins: dict[str, tuple[str, str, str]] = {}
 
+    # ONE lazy primer for the whole router (#212), recorded under `router_ledger_label` --
+    # never a peer's name. The router is launched `proxy --config <peers>` and does not know
+    # its own config name; the peers file's resolved path is the identity the scan shares.
+    primer_latch = PrimerLatch()
+    primer_label = router_ledger_label(config_path)
+
     try:
         peers = _build_peers(specs, default_policy, debug=debug, capture=capture,
                              audit=audit, store=store, store_lock=store_lock,
@@ -1576,7 +1627,8 @@ def run_multi_proxy(
                              diff_override=diff_override,
                              diff_keyframe_override=diff_keyframe_override,
                              join_blocks_override=join_blocks_override,
-                             stats_log=stats_log)
+                             stats_log=stats_log, primer_latch=primer_latch,
+                             primer_label=primer_label)
     except OSError as exc:
         sys.stderr.write(f"[terse-multiproxy] failed to launch a downstream peer: {exc}\n")
         return 127
@@ -1585,7 +1637,10 @@ def run_multi_proxy(
         return 2
 
     out_lock = Lock()
-    router = Router(peers, cout, out_lock, debug=debug, broadcast_timeout=broadcast_timeout)
+    router = Router(peers, cout, out_lock, debug=debug, broadcast_timeout=broadcast_timeout,
+                    primer_latch=primer_latch,
+                    on_session=(build_router_session_writer(stats_log, primer_label)
+                                if stats_log is not None else None))
 
     sigterm_token = _install_sigterm_to_exit()
 

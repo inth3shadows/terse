@@ -176,9 +176,12 @@ nothing at all. The same 1/3/6-server sweep re-run against it is flat — **-3.8
 So consolidate for the operational reasons above, not to rescue a scaling loss. The
 router keeps one shared `union_primer`, which is a boolean OR over five fixed sections
 rather than a concatenation of N — bounded at 555 cl100k tokens whether it fronts 1 peer
-or 20 — but it still rides `initialize`, so unlike a standalone entry it is paid from the
-first turn whether or not any peer is ever called. `terse stats` reports the two cadences
-separately for exactly this reason.
+or 20 — and since #212 it is lazy too: attached once per session to the first result from
+any peer that carries a terse wire form, and not at all in a session that never gets one.
+Until that first primer has attached, a router passes any result carrying `structuredContent`
+through whole, since the client would discard a primer riding beside it. `terse stats` reads a router as lazy
+only when its own session or stamped rows are in the window and no row under a peer it writes
+is unstamped; any unstamped row (an older, eager router's) keeps the per-turn bill.
 
 This rewrites permission entries — `mcp__kb__kb.read.search` becomes
 `mcp__terse__kb.read.search` — so run `--print` first and update your allowlist before
@@ -867,12 +870,17 @@ command that answers the what-if. The verdict is in `--json` either way, so a sc
 needs both flags.
 
 `--json` is a **contract**, not a debug dump: `tests/test_stats_json_contract.py` pins every
-field name and type at nine shapes — the top level, `total`, each `tools[]` row, each value
-of the `versions` object, each `retrieves[]` row, each `primers[]` row, the `primer_liability`
+field name and type at ten shapes — the top level, `total`, each `tools[]` row, each value
+of the `versions` object, each `retrieves[]` row, each `primers[]` row, each
+`router_sessions[]` row, the `primer_liability`
 blob, each of its `servers[]` rows, and each of those rows' `contributors[]` — so a rename or
 a removal fails CI rather than a consumer's script. Things worth knowing before you
 parse it:
 
+- **A multiproxy router's own rows (#212).** `router_sessions[]` counts its `initialize`s
+  under `router:<peers file>:<hash>`, and each `tools[]` row's `router_stamps` counts rows a
+  lazy router's peer wrote, by that label. `terse stats` bills a router once per session only
+  when its own session or stamped rows exist and no row under a peer it writes is unstamped.
 - **`primers[]` rows carry an `attached` flag.** `true` is a primer that went out and cost
   its `tokens`; `false` is one the proxy declined to send because the result carried
   `structuredContent` (the client would have discarded it unread), which costs nothing. A
@@ -1053,8 +1061,8 @@ largest single section — attached once per session to each wrapped server that
 a terse form (#211), against a measured **0.38% hit rate** (7 diffs in 1,828 blocks over
 13.3 days, banking 5,052 tokens). Those 5,052 tokens are erased by about 27 primer
 attaches: roughly two session-server pairs a day across the whole 13.3-day window, which
-an active fleet passes immediately. That is the standalone cadence; behind a router the
-paragraph rides `initialize` and is re-read every turn, which only widens the gap. So
+an active fleet passes immediately. That is the standalone cadence, and since #212 a router's
+union primer follows it too — once per session, not every turn. So
 #170 flipped it off. The ~900–2,700x multiplier
 this paragraph used to quote was the same comparison against the pre-#211 per-turn charge;
 #211 shrank the cost side by the session turn count and left the verdict intact. Turn it

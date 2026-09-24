@@ -31,7 +31,7 @@ from terse.multiproxy import (
     run_multi_proxy,
 )
 from terse.policy import Policy, Rule
-from terse.proxy import SWALLOW, Interceptor
+from terse.proxy import PRIMER_HEAD, SWALLOW, Interceptor
 from terse.transport import build_transport
 
 FAKE = pathlib.Path(__file__).parent / "fake_mcp_server.py"
@@ -192,8 +192,12 @@ def test_stats_ledger_records_peer_name_and_qualified_tool(tmp_path):
     rc = run_multi_proxy(str(cfg), PLAIN_POLICY, stdin=cin, stdout=cout,
                          stats_log=str(log))
     assert rc == 0
-    recs = load_stats(log)
+    from terse.stats import router_ledger_label
+    recs = [r for r in load_stats(log) if not r.get("event")]
     assert len(recs) == 1
+    # The lazy router primer (#212) is billed to the ROUTER's label, never the peer's.
+    primers = [r for r in load_stats(log) if r.get("event") == "primer"]
+    assert [p["server"] for p in primers] == [router_ledger_label(cfg)]
     # server = the peer's config name; tool = the peer-qualified name the client sees
     assert recs[0]["server"] == "gh" and recs[0]["tool"] == "gh__gh.api.items"
     assert "active" not in log.read_text(encoding="utf-8")   # payload-free
@@ -302,8 +306,9 @@ def test_initialize_broadcast_merges_once(tmp_path):
     msgs = _lines(cout)
     assert len(msgs) == 1                          # one merged reply, not two
     result = msgs[0]["result"]
-    # a single TERSE_PRIMER, not duplicated, plus the http peer's own instructions
-    assert result["instructions"].count("Some tool results are 'terse'-compressed") == 1
+    # LAZY router (#212): no primer at initialize -- it attaches to the first terse-marked
+    # result instead -- but the http peer's own instructions still ride along.
+    assert "Some tool results are 'terse'-compressed" not in result["instructions"]
     assert "HTTP PEER NOTES." in result["instructions"]
     # both servers actually reached: http proven via its request log, gh via the
     # marker capability its fake sets specifically for this (see fake_mcp_server.py)
@@ -405,8 +410,11 @@ def test_dead_peer_does_not_wedge_broadcast_or_live_routed_calls(tmp_path, capsy
     assert 1 in msgs                                     # merged reply still went out
     assert msgs[1]["result"]["capabilities"] == {"stdio_peer": True}  # only the live peer's
     assert 2 in msgs                                     # the live peer still serves routed calls
-    text = msgs[2]["result"]["content"][0]["text"]
-    assert transforms.decompress(text) == {"result": RECORDS}
+    # Block 0 is the lazy router primer (#212), attached to the session's first
+    # terse-marked result; the payload follows it.
+    content = msgs[2]["result"]["content"]
+    assert content[0]["text"].startswith(PRIMER_HEAD)
+    assert transforms.decompress(content[-1]["text"]) == {"result": RECORDS}
     # a routed call TO the dead peer must not wedge the client forever either —
     # it gets a timeout error instead of never answering.
     assert 3 in msgs

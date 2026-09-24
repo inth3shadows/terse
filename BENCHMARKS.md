@@ -891,8 +891,9 @@ collapsed N primers into one and erased the six-server penalty. Hence the old ad
 
 ### What #211 changed, and why the advice is no longer "always fold"
 
-The two topologies now pay on **different cadences**, and `src/terse/stats.py:1492` states
-the contract:
+The two topologies paid on **different cadences** until #212 made the router lazy too; the
+contract as it stood (the current one is the cadence table in `primer_liability`'s
+docstring, `src/terse/stats.py`):
 
 > ```
 > router / router-ambiguous    still prime EAGERLY, one union_primer in the router's own
@@ -907,7 +908,8 @@ So the arithmetic is no longer "N primers vs one". It is:
 
 ```
 standalone wrapped:   sum(per-server primers)  x  1        (per session, and only if called)
-multiproxy router:    one union primer         x  turns    (every turn, called or not)
+multiproxy router:    one union primer         x  turns    (pre-#212: every turn, called or not;
+                                                             since #212: x 1 per session, like standalone)
 ```
 
 **Live evidence, this author's fleet, `terse stats --json`, 2026-09-22:**
@@ -926,17 +928,19 @@ server is free.
 
 ### The break-even, stated plainly
 
-A router costs `502 × turns`. The same three servers wrapped standalone cost roughly
-`502 + 248 + kb` **once**. On those figures the router is the cheaper topology only for about
-the first two turns of a session, and is more expensive after that. The live fleet's
+Before #212 a router cost `502 × turns`, while the same three servers wrapped standalone cost
+roughly `502 + 248 + kb` **once** — the router was cheaper only for about the first two turns.
+Since #212 the router also pays once per session (one union primer, on its first terse-marked
+result), so the router is now the cheaper topology whenever the called servers' own primers
+sum to more than the union (502 tok on this fleet, from the table above). The live fleet's
 `turns_covered` is **~2,944** on the context basis (2026-09-23; it read 5,419 before #420
 moved the break-even off the wire basis) — the savings cover that many turns of router
-primer, which is comfortable here, but it is a budget being spent every turn rather than once.
+primer, which is comfortable here — measured while the router still paid every turn.
 
 **Current guidance, matching `install-mcp --multiproxy --help`:** consolidate for *operational*
 reasons — one policy, one process, one permission surface — **not** to escape a token tax.
-Since #211 the token argument points the other way for small fleets. The six-server
-penalty the old table shows was a property of the eager primer, and that property is gone.
+The six-server penalty the old table shows was a property of the eager primer, and that
+property is gone — for standalone entries since #211 and for the router since #212.
 
 ### Which servers to wrap alone, and which to pool — a decision rule from the cadence
 
@@ -952,21 +956,21 @@ case for each branch.
    at all for the privilege.
 2. **The server is called rarely, or not every session.** Since #211 an unc­alled wrapped
    server pays **zero** — the primer attaches to the first compressible result, and no
-   result means no charge. A router charges whether or not any peer is ever called.
+   result means no charge. Since #212 a router behaves the same way for its whole fleet.
 3. **The server is record-shaped and high-volume.** It clears a once-per-session primer
    almost immediately: `secret-broker` banks 11,959 tokens per block against a primer
    ceiling of ~502.
 
 **Pool behind a router for operational reasons, not token reasons:** one policy file, one
 process, one permission surface to approve. That is a real benefit and it is why
-`--multiproxy` exists. Accept that it costs **502 tokens every turn** (this fleet's live
-figure) in exchange.
+`--multiproxy` exists. Before #212 it cost **502 tokens every turn** (this fleet's live
+figure); since #212 it is one union primer per session.
 
-**The anti-pattern, stated plainly: never pool a server that would otherwise pay zero.**
-Folding `secret-broker` behind the router would move it from 0 tokens to a share of a
-recurring per-turn charge, for a server whose results the primer never reaches anyway.
-Before #211 pooling was the way to escape N primers; now it can *create* a charge that
-standalone wrapping avoids entirely.
+**The pooling cost since #212 is compression, not a charge.** While the router's primer is
+still owed, a result carrying `structuredContent` passes through uncompressed (the primer
+cannot ride it). A structured-only server like `secret-broker` pooled behind a router
+therefore compresses nothing until some OTHER peer's text result primes the session —
+standalone, it compresses from the first call and pays nothing (#286).
 
 `terse stats --recommend` prints the verdict per installed entry rather than per peer,
 because a router pays one union primer for its whole fleet — see the `contributors[]`
@@ -1022,8 +1026,8 @@ The table above is **pre-#211 and has not been re-run post-#211.** A clean A/B a
 servers on the current lazy-primer build is the missing experiment; `scripts/bench/ab_session.py`
 is the harness and its protocol is in its docstring. Until that runs, the cadence contract and
 the live primer rows above are the evidence, and the percentages in the old table are history.
-Related open work: #270 (a router's `initialize` blocks on its slowest peer) and router-level
-lazy priming, which would remove the per-turn charge entirely.
+Related open work: #270 (a router's `initialize` blocks on its slowest peer). Router-level
+lazy priming shipped as #212 and removes the per-turn router charge this section describes.
 
 ---
 

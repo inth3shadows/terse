@@ -131,8 +131,8 @@ def _args_key(arguments: Any) -> str:
 #     ABSENT_MARKER in EVERY absent cell, no `absent_cols`/`sentinel_cols` arrays: 87 tokens
 #     total, also 100% on the same probe), traded away because it costs more on the wire at
 #     scale (31.8% vs 33.5% saved on a 200-record table) — the primer is paid once per
-#     session (per turn for a router), the wire per payload. The trade only got better
-#     for standalone entries when #211 made the primer lazy.
+#     session (per turn for a router before #212), the wire per payload. The trade only got
+#     better when #211 made the standalone primer lazy, and #212 the router's.
 #   * `subcols` (+26), which the codec has emitted since nested key folding shipped and this
 #     paragraph never named. Found by making the coupling a test rather than a promise: the
 #     guard derives the required vocabulary from a real emission, so a header key added to
@@ -254,6 +254,46 @@ def union_primer(pairs: list[tuple[policy_mod.Policy, str | None]]) -> str:
     )
 
 
+class PrimerLatch:
+    """ONE lazy primer shared by every peer behind a multiproxy router (#212).
+
+    A standalone proxy latches its own primer (`Interceptor._primer_sent`). A router cannot:
+    it fronts N peers, each with its own `Interceptor` on its own reader thread, and the
+    client must read the UNION primer exactly once per session, on whichever peer's result
+    first carries a terse wire form. So the latch lives here and every peer shares it.
+    `claim` is a test-and-set under one lock -- two peers answering concurrently must not
+    both attach.
+
+    `text` is assigned after the peers are built (`Router.__init__`), because the union is
+    over their loaded policies; nothing reads it before the first `tools/call` result."""
+
+    def __init__(self, text: str = "") -> None:
+        self._lock = Lock()
+        self.text = text
+        self.sent = not text
+
+    def set_text(self, text: str) -> None:
+        with self._lock:
+            self.text = text
+            self.sent = not text
+
+    def reset(self) -> None:
+        """A re-handshake: the client's context -- and the primer it read -- is gone."""
+        with self._lock:
+            self.sent = not self.text
+
+    def pending(self) -> bool:
+        return not self.sent
+
+    def claim(self) -> bool:
+        with self._lock:
+            if self.sent:
+                return False
+            self.sent = True
+            return True
+
+
+
 class Interceptor:
     """Pure JSON-RPC message logic. Tracks request id -> tool name and compresses
     matching results. No I/O; both methods take and return a single line of text
@@ -292,7 +332,8 @@ class Interceptor:
                  stats_primer: Callable[[str, str, bool], None] | None = None,
                  ledger_label: str | None = None,
                  log_prefix: str = "[terse-proxy]",
-                 lazy_primer: bool = True):
+                 lazy_primer: bool = True,
+                 shared_primer: PrimerLatch | None = None):
         self.policy = pol
         # The downstream server's name, when the caller knows it (`proxy --server-name`,
         # or a multiproxy peer's config name). Passed to every `policy.select`/`apply` so
@@ -419,14 +460,18 @@ class Interceptor:
         # primer instead attaches to the first `tools/call` result that actually carries a
         # terse wire form — paid once per SESSION, not once per TURN. False preserves the
         # old always-eager `_augment_initialize` behavior; multiproxy passes False for every
-        # peer, since the router already primes eagerly once via `union_primer` and a peer
-        # going lazy too would just double the explanation on top of that (see
-        # `_build_peers`). Computed once here, not lazily: `pol` is finalized by every
+        # peer, which never primes on its OWN -- it attaches the router's one union primer
+        # through `shared_primer` instead (#212; see `_build_peers`). Computed once here, not lazily: `pol` is finalized by every
         # caller before construction, so there's nothing to gain by deferring it, and
         # deferring would mean recomputing `build_primer` on every reconnect reset instead
         # of once.
-        self._lazy_primer = lazy_primer
-        self._primer_text = build_primer(pol, server_name) if lazy_primer else ""
+        # `shared_primer` (#212): a multiproxy peer. Lazy, but the latch and the UNION text
+        # belong to the router's `PrimerLatch`, so the session is primed once across all
+        # peers rather than once per peer. `_primer_text` is unused on that path.
+        self._shared_primer = shared_primer
+        self._lazy_primer = lazy_primer or shared_primer is not None
+        self._primer_text = (build_primer(pol, server_name)
+                             if lazy_primer and shared_primer is None else "")
         # True = "nothing left to do" — collapses `lazy_primer=False` and "this policy
         # emits no compressible form at all" (`build_primer` returns "" for a default-deny
         # policy) into the same no-op state, so neither needs its own branch later.
@@ -438,6 +483,8 @@ class Interceptor:
         # authoritative. Bounded to one per process so a server that returns
         # `structuredContent` on every call writes one row, not one per result.
         self._primer_suppressed_logged = False
+        # Per-result: see the tools/call branch of `transform_response` (#212).
+        self._structured_hold = False
         # The two proxy pump threads call note_request (client->server) and
         # transform_response (server->client) concurrently, both mutating pending/last/
         # since_keyframe/init_id state. `_local_lock` serializes each method against the
@@ -515,6 +562,10 @@ class Interceptor:
                 # the wire forms to the NEW context.
                 self._primer_sent = not (self._lazy_primer and self._primer_text)
                 self._primer_suppressed_logged = False
+                if self._shared_primer is not None:
+                    # Every peer sees the router's broadcast initialize and resets the ONE
+                    # shared latch -- idempotent, and done before any tools/call can land.
+                    self._shared_primer.reset()
                 # A reconnecting client restarts its JSON-RPC ids at 1 while this process
                 # keeps one session id, so `sess:1` from before and after the reconnect
                 # would name two unrelated results the same and the corpus would fuse them
@@ -639,6 +690,16 @@ class Interceptor:
                         return injected
                 return line
             tool, capture_tool, args_key = tracked
+            # Hold `structuredContent` RAW while a router's shared primer is still owed
+            # (#212 review, user decision). The primer cannot attach to a result carrying
+            # `structuredContent` (the client discards the text block), so before #212 the
+            # router's eager `initialize` primer was the only thing explaining a rewritten
+            # typed field -- live, `kb` returns one on half its results. Read ONCE per result,
+            # under this peer's lock, so `_compress_structured` and `_mirror_to_drop` cannot
+            # disagree if another peer attaches mid-transform. A peer that loses that race
+            # compresses a result delivered alongside the primer, in the same turn.
+            self._structured_hold = (self._shared_primer is not None
+                                     and self._shared_primer.pending())
 
             result = msg.get("result")
             content = result.get("content") if isinstance(result, dict) else None
@@ -687,10 +748,32 @@ class Interceptor:
             # of `structuredContent`? Decided HERE, against the RAW block, because every
             # branch below rewrites that text in place and the comparison is only
             # meaningful before they do.
-            mirror = self._mirror_to_drop(result, text_blocks, tool,
-                                          error_result=error_result)
+            # While a router's primer is still owed (#212), a result carrying
+            # `structuredContent` passes through WHOLE -- text block included. The primer
+            # cannot ride it (a structured-reading client discards the text block), and a
+            # text-reading client would otherwise read a terse text block no primer ever
+            # explained (review round 2). Recorded as passthrough, so the ledger never credits
+            # a saving the model did not receive.
+            hold_all = (self._structured_hold and isinstance(result, dict)
+                        and "structuredContent" in result)
+            mirror = (None if hold_all else
+                      self._mirror_to_drop(result, text_blocks, tool,
+                                           error_result=error_result))
 
-            if mirror is not None:
+            if hold_all:
+                diff_reason = "primer_hold"
+                if self.diff:
+                    # The client received the RAW text, so no diff base may reference a
+                    # prior compressed form of this tool's result (same as the mirror drop).
+                    self.last.pop(tool, None)
+                    self.last_args.pop(tool, None)
+                    self.last_joined.pop(tool, None)
+                    self.since_keyframe.pop(tool, None)
+                    self.last_text.pop(tool, None)
+                    self.since_text_keyframe.pop(tool, None)
+                emitted_pairs = ([(r, r) for r in raw_texts]
+                                 if raw_texts is not None else [])
+            elif mirror is not None:
                 # Do not compress a block that is about to be deleted: it is wasted work,
                 # and it would leave a diff base the client never received — the next
                 # result would then diff against text nobody has seen.
@@ -742,7 +825,7 @@ class Interceptor:
                         changed = partial_changed
                         diff_reason = "multiblock_partial"
 
-            if mirror is not None:
+            if hold_all or mirror is not None:
                 pass                       # handled above; the drop itself happens below
             elif partial_done:
                 # #140: `_partial_join` already rebuilt `content` in place and dropped any
@@ -904,7 +987,7 @@ class Interceptor:
             # tests the contrivance. Its one behavioural consequence -- no suppression is
             # recorded once the primer has been sent -- IS pinned, by
             # `test_no_suppression_is_recorded_after_the_primer_has_already_attached`.
-            primer_pending = not self._primer_sent and self._lazy_primer
+            primer_pending = self._primer_pending()
             marker_in_text = primer_pending and any(
                 isinstance(b, dict) and b.get("type") == "text"
                 and isinstance(b.get("text"), str) and '"__terse_' in b["text"]
@@ -920,8 +1003,12 @@ class Interceptor:
             # shape. `primer_pending` already does the cost-avoidance `changed` was added for.
             wire_form_emitted = (primer_pending
                                  and (marker_in_text or rewrote_structured))
+            # `_claim_suppression` LAST: it is a test-and-set, so it may only run once the
+            # other terms have decided a suppression is owed.
+            # Under a router, `_claim_suppression` always declines (#212): a structured
+            # result is held whole while the primer is owed, so none is ever declined.
             suppressed_owed = (structured_present and wire_form_emitted
-                               and not self._primer_suppressed_logged)
+                               and self._claim_suppression())
             if suppressed_owed:
                 # The SUPPRESSION, written down rather than left to be inferred (#286,
                 # #317-redesign). This branch is the one #286 is about: the result carries a
@@ -942,15 +1029,14 @@ class Interceptor:
                 # result carrying no terse marker owes no primer, so suppressing one is not
                 # a fact worth recording. Checked across the WHOLE result, not just text --
                 # `structuredContent` itself may be what got compressed (#141).
-                self._primer_suppressed_logged = True
                 deferred.append((
                     "primer ledger", "(primer)",
                     partial(self._emit_primer, PRIMER_CADENCE_ONCE,
-                            self._primer_text, False),
+                            self._primer_body(), False),
                 ))
-            if primer_pending and not structured_present and marker_in_text:
-                content.insert(0, {"type": "text", "text": self._primer_text})
-                self._primer_sent = True
+            if (primer_pending and not structured_present and marker_in_text
+                    and self._claim_primer()):
+                content.insert(0, {"type": "text", "text": self._primer_body()})
                 changed = True
                 # DEFERRED, not called here (review of #311). The decision to bill is
                 # made inside this branch -- the branch that actually attached it, so
@@ -966,14 +1052,15 @@ class Interceptor:
                 deferred.append((
                     "primer ledger", "(primer)",
                     partial(self._emit_primer, PRIMER_CADENCE_ONCE,
-                            self._primer_text),
+                            self._primer_body()),
                 ))
             if self.stats is not None:
                 deferred.append((
                     "stats", capture_tool,
                     partial(self._emit_stats, tool, emitted_pairs,
                             display_tool=capture_tool, diff_reason=diff_reason,
-                            structured=structured_raw, structured_out=structured_out),
+                            structured=structured_raw, structured_out=structured_out,
+                            force_passthrough=hold_all),
                 ))
 
             if not changed:
@@ -1003,8 +1090,9 @@ class Interceptor:
         not_smaller_diff_args | text_emitted | text_dropped | non_json | passthrough |
         error), for the ledger.
 
-        Two labels the ledger carries do NOT originate here, so the enumeration above is
-        not the whole value set: `diff_off` and `mirror_dropped` are both set by
+        Three labels the ledger carries do NOT originate here, so the enumeration above is
+        not the whole value set: `diff_off`, `mirror_dropped` and `primer_hold` (a result
+        held whole until a router's lazy primer has attached, #212) are all set by
         `transform_response`. `mirror_dropped` means the text block was deleted as a
         redundant `structuredContent` mirror (#128) and no diff decision was reached at
         all — which is why it displaces the `diff_off` a single-block result would
@@ -1388,6 +1476,8 @@ class Interceptor:
     def _structured_mode(self, tool: str) -> str:
         """This tool's `structured` setting, resolved against the connected client. One
         place, so the mirror-drop guard and the codec can never disagree about the mode."""
+        if self._structured_hold:
+            return "leave"
         return policy_mod.structured_mode_for_client(
             self.policy.select(tool, self.server_name).structured, self.client_name)
 
@@ -1697,6 +1787,36 @@ class Interceptor:
         except Exception as exc:  # noqa: BLE001 — audit is never load-bearing
             self._warn_sink("audit", shown_tool, exc)
 
+    def _primer_body(self) -> str:
+        return self._shared_primer.text if self._shared_primer is not None \
+            else self._primer_text
+
+    def _primer_pending(self) -> bool:
+        if not self._lazy_primer:
+            return False
+        if self._shared_primer is not None:
+            return self._shared_primer.pending()
+        return not self._primer_sent
+
+    def _claim_primer(self) -> bool:
+        """Test-and-set the attach. Shared under a router: two peers can reach here
+        concurrently, and exactly one may attach (#212)."""
+        if self._shared_primer is not None:
+            return self._shared_primer.claim()
+        self._primer_sent = True
+        return True
+
+    def _claim_suppression(self) -> bool:
+        if self._shared_primer is not None:
+            # Never under a router (#212): while its primer is owed, a result carrying
+            # `structuredContent` is held whole (`hold_all`), so no wire form reaches the
+            # model and no primer is declined -- there is nothing to record.
+            return False
+        if self._primer_suppressed_logged:
+            return False
+        self._primer_suppressed_logged = True
+        return True
+
     def _emit_primer(self, cadence: str, text: str, attached: bool = True) -> None:
         """Record a primer that actually went out, with the cadence of the site that sent
         it (#311, #286).
@@ -1732,7 +1852,8 @@ class Interceptor:
     def _emit_stats(self, tool: str, pairs: list[tuple[str, str]], *,
                     display_tool: str | None = None, diff_reason: str | None = None,
                     structured: str | None = None,
-                    structured_out: str | None = None) -> None:
+                    structured_out: str | None = None,
+                    force_passthrough: bool = False) -> None:
         """Hand the stats callback one
         (tool, raw, emitted, passthrough, diff_reason, structured, structured_out) per
         emitted block, for the payload-free savings ledger (stats.py). Same fail-open
@@ -1750,7 +1871,9 @@ class Interceptor:
         if stats is None:
             return
         shown_tool = display_tool if display_tool is not None else tool
-        passthrough = not self.policy.select(tool, self.server_name).tiers
+        # `force_passthrough`: a result held whole for the router's primer (#212) ran no
+        # codec, whatever its rule's tiers say.
+        passthrough = force_passthrough or not self.policy.select(tool, self.server_name).tiers
         for index, (raw, emitted) in enumerate(pairs):
             try:
                 stats(shown_tool, raw, emitted, passthrough, diff_reason,

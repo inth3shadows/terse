@@ -2369,9 +2369,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="fold the named servers into ONE terse proxy fronting them all "
                          "(writes a peers file next to the config): one policy, one "
                          "process, one permission surface. Consolidate for those reasons, "
-                         "NOT to escape a token tax — #211 made the standalone primer "
-                         "lazy and once-per-session, while the router's shared primer "
-                         "rides `initialize` and IS re-read every turn. "
+                         "NOT to escape a token tax — both are lazy now: a standalone "
+                         "primer once per session per server (#211), the router's ONE "
+                         "shared primer once per session (#212). "
                          "REWRITES PERMISSION ENTRIES — see --print.")
     im.add_argument("--router-name", default="terse", metavar="NAME",
                     help="name of the single merged server entry (default: terse)")
