@@ -15,6 +15,22 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **A `folded` definition no longer hides the live entry the client actually launches
+  (#424).** `terse stats` kept the highest-precedence definition of a server name, but a
+  `folded` (or `folded-unstashed`, `orphaned-stash`) row is ABSENT from its scope's
+  `mcpServers`, so the client falls through to the lower scope and runs that entry. The
+  kept row was the one not running: a project-scope router with its `kb` peer folded beside
+  a user-scope `kb` proxy credited itself with that proxy's rows and read KEEP, and the
+  running entry was missing from the report. A present definition now outranks an absent
+  one at any scope, so the label is contested (#396) and both entries report it.
+  `--json` consumers: `servers[]` can gain an entry that was missing (a running definition
+  shadowed by an absent row), and a guessed launcher label can become `ambiguous` where the
+  running entry shares it.
+
+## [0.36.1] - 2026-09-24
+
+### Fixed
+
 - **`terse stats --recommend` now says which basis its numbers are on (#441).** It replaces
   the ledger tables, so the basis line #420 added never reached the one screen that decides
   KEEP/UNWRAP (`grep -ci "context|wire"` returned 0). The line is gated on the RAW sides,

@@ -920,10 +920,16 @@ def _is_launcher_basename(label: str) -> bool:
 # outrank a scope we do understand on the strength of not being recognised.
 _SCOPE_PRECEDENCE = {"local": 0, "project": 1, "user": 2}
 
+# Scan states whose entry is ABSENT from that scope's `mcpServers` (`_scan_target`): folded
+# behind a router (with or without its stash record), or a stash whose entry vanished. The
+# client cannot launch what is not there, so it resolves the name to the next scope that
+# DOES define it (#424). Every other state is a present entry.
+_ABSENT_FROM_SCOPE = ("folded", "folded-unstashed", "orphaned-stash")
+
 
 def _precedence_winner(scan_rows: list[dict[str, Any]]) -> dict[str, int]:
     """`{server name: index in scan_rows}` for the one row per name that the client would
-    actually launch, among rows `eligible` accepts.
+    actually launch.
 
     De-duplicating by name is right in kind — the same server in two scopes is one server to
     the client, and counting it twice would manufacture a collision with itself — but both
@@ -956,12 +962,23 @@ def _precedence_winner(scan_rows: list[dict[str, Any]]) -> dict[str, int]:
     scope precedence cannot separate two rows, so a same-scope row that guesses nothing can
     still take the slot from one that does. `scan_scopes` emits one row per (scope, server)
     and cannot produce that, but a hand-built row list can — see
-    `test_two_rows_in_ONE_scope_keep_the_first`."""
-    def rank(row: dict[str, Any]) -> int:
+    `test_two_rows_in_ONE_scope_keep_the_first`.
+
+    A row ABSENT from its scope (`_ABSENT_FROM_SCOPE`) ranks below every PRESENT row, whatever
+    the scopes (#424). Scope precedence decides between definitions the client can see; a
+    `folded` row is not one — its entry was removed from that scope's `mcpServers` when it
+    was stashed behind the router — so the client launches the lower-scope definition, and
+    keeping the folded row made the winner once again "the one guaranteed not to be running",
+    #398 one state over. The router then banked rows that lower-scope proxy wrote, because
+    the writer was deleted before `_contested_labels` could count it. Still a total order:
+    an absent row wins when nothing present defines the name, which is every plain folded
+    peer behind its own router."""
+    def rank(row: dict[str, Any]) -> tuple[bool, int]:
         # ONE spelling of the default, used for both sides of the comparison below. Two
         # copies is not a style point: mutating one of them left the other disagreeing, so
         # an unknown scope lost anyway and the mutant read as equivalent (review of #398).
-        return _SCOPE_PRECEDENCE.get(str(row.get("scope")), len(_SCOPE_PRECEDENCE))
+        return (row.get("state") in _ABSENT_FROM_SCOPE,
+                _SCOPE_PRECEDENCE.get(str(row.get("scope")), len(_SCOPE_PRECEDENCE)))
 
     best: dict[str, int] = {}
     for i, row in enumerate(scan_rows):
@@ -1015,9 +1032,10 @@ def _ambiguous_labels(scan_rows: list[dict[str, Any]],
 
     Which row wins the slot when several DO guess is `_precedence_winner`'s job (#398):
     rows arrive user → project → local and first-wins kept the USER row, while the client
-    connects to the highest-precedence definition (local > project > user), so the kept row
-    was the one guaranteed not to be running. Both this function and `primer_liability`
-    share that helper now; they differ only in which rows are admitted to the contest."""
+    connects to the highest-precedence PRESENT definition (local > project > user; a row
+    absent from its scope's `mcpServers` ranks below all of them, #424), so the kept row
+    was the one guaranteed not to be running. This function, `_contested_labels` and
+    `primer_liability` all share that helper; they differ only in which winners they use."""
     winners = _precedence_winner(scan_rows)
     by_name: dict[str, str] = {}
     for i, row in enumerate(scan_rows):
@@ -1126,11 +1144,11 @@ def _contested_labels(scan_rows: list[dict[str, Any]],
       * a duplicate at ANOTHER SCOPE. `folded` is computed per scope from that scope's peers
         file, so a peer folded behind a user-scope router and separately wrapped at project
         scope is `wrapped`, never `folded-and-live`. Two plain `install-mcp` runs reproduced
-        the full double count (review of PR #422, finding 2). ONE ORIENTATION ONLY: when the
+        the full double count (review of PR #422, finding 2). BOTH orientations: when the
         duplicate sits at a LOWER-precedence scope than the router, the router's own scope
-        contributes a `folded` row for that name which wins `_precedence_winner` and deletes
-        the writer, so the contest never sees it. That is #424's mechanism and is not fixed
-        here — do not read this bullet as closing the cross-scope case in general.
+        contributes a `folded` row for that name, and that row used to win
+        `_precedence_winner` and delete the writer before this contest saw it (#424). An
+        absent row now ranks below every present one, so the live duplicate is the writer.
       * a SECOND ROUTER folding the same peer name. A router is itself an entry running a
         proxy under that name, but the intersection could only ever put a router on the
         left-hand side (finding 1 of the re-review). `--router-name` defeats
