@@ -240,12 +240,40 @@ def context_tokens(rec: dict[str, Any], raw_t: int, out_t: int) -> tuple[int, in
     return s_raw, s_out
 
 
+def _has_context_sums(row: dict[str, Any]) -> bool:
+    """Does this total/tool row carry BOTH context sums (#420)? The one test every basis
+    decision goes through (#440).
+
+    Both, never one: a half-present pair computed `context_raw - out_tokens` -- a context
+    figure that excludes the text mirror minus a wire figure that includes it -- and
+    published a large NEGATIVE saving under a context label. `aggregate` writes the pair in
+    one branch, so a half pair only comes from the hand-rolled or older aggs the fallback
+    exists for. `bool` is excluded because it is an `int` subclass, not a count."""
+    return all(isinstance(row.get(k), int) and not isinstance(row.get(k), bool)
+               for k in ("context_raw_tokens", "context_out_tokens"))
+
+
 def _context_saved(row: dict[str, Any]) -> int:
     """A total's or tool row's saving on the context basis (#420), or the wire saving for a
-    row that predates the context sums (a hand-rolled or older agg)."""
-    if "context_raw_tokens" in row:
-        return (row.get("context_raw_tokens") or 0) - (row.get("context_out_tokens") or 0)
+    row that predates the context sums (a hand-rolled or older agg). Which one it was is
+    published as `primer_liability.saved_basis` (#440) -- the fallback is right, since zero
+    would read "saved nothing", but it is not silently equivalent."""
+    if _has_context_sums(row):
+        return row["context_raw_tokens"] - row["context_out_tokens"]
     return (row.get("raw_tokens") or 0) - (row.get("out_tokens") or 0)
+
+
+def _context_differs_from_wire(total: dict[str, Any]) -> bool:
+    """Did any row move to the context basis? Asked of the RAW sides only (#441).
+
+    Never of the two savings: `wire_saved = text_saving + context_saved`, so comparing
+    savings is a difference of differences -- a peer whose text block EXPANDED offsets one
+    whose text compressed, the totals read identical while every rate moved, and a router
+    is one pooled row so it cannot be fixed per server. The raw sides cannot cancel: a
+    moved row counts its typed field alone, a subset of the fold, so `context_raw <= raw`
+    per record, with equality exactly when no record moved."""
+    return _has_context_sums(total) and total["context_raw_tokens"] != (
+        total.get("raw_tokens") or 0)
 
 
 RETRIEVE_EVENT = "retrieve"
@@ -699,10 +727,10 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
         lines.append(f"tokens (cl100k): {tok_raw:,} -> {tok_out:,}   "
                      f"saved {tok_raw - tok_out:,} ({_pct_saved(tok_raw, tok_out).strip()})"
                      "   [wire]")
-        ctx_raw, ctx_out = total.get("context_raw_tokens"), total.get("context_out_tokens")
-        if isinstance(ctx_raw, int) and isinstance(ctx_out, int) and (ctx_raw, ctx_out) != (
-                tok_raw, tok_out):
-            # Printed only when the bases differ, i.e. some row carried a typed field. The
+        if _context_differs_from_wire(total):
+            ctx_raw, ctx_out = total["context_raw_tokens"], total["context_out_tokens"]
+            # Printed only when the bases differ, i.e. some row moved to the context basis
+            # -- the same raw-side predicate the liability's basis line uses (#441). The
             # wire line is what crossed the pipe; this is what the model received (#420).
             lines.append(f"  context:        {ctx_raw:,} -> {ctx_out:,}   "
                          f"saved {ctx_raw - ctx_out:,} "
@@ -1385,6 +1413,7 @@ def _same_file(a: str, b: str) -> bool:
 _R_CLEARED = "cleared"                 # coverage >= 1 against its own primer
 _R_SHORT = "short of break-even"       # positive rate, coverage < 1
 _R_EXPANDING = "expanding"             # negative rate with no primer to offset it
+_R_RETRIEVED = "retrieved back"        # ...negative only because retrieves outspent it (#443)
 
 # Render order for the recommend table: what needs ACTION first. Deliberately different from
 # the break-even table, which sorts by rate — that one answers "which server is the best
@@ -1661,7 +1690,16 @@ def _recommend(srv: dict[str, Any]) -> dict[str, Any]:
     #      the reason string says why the two cells disagree.
     if v == "no primer":
         if rate is not None and rate < 0:
-            return out(UNWRAP, _R_EXPANDING)
+            # Which cause, from the published fields (#443): the rate is NET of retrieves
+            # since #438, so an entry can go negative because the model fetched back more
+            # than terse withheld. Calling that `expanding` names the wrong cause. The test
+            # is "retrieves, not expansion, took the net below zero" -- gross >= 0 in total,
+            # so a pooled router can still hold one peer that expanded (its contributor row
+            # shows it). Gross = net + retrieves, over the same labels. `round`: the net is
+            # an integer sum and `rate * tok` does not always reproduce it (-1019.0000000001
+            # at gross 0 read `expanding`, review finding).
+            gross = round(rate * (tok or 0)) + (srv.get("retrieve_tokens") or 0)
+            return out(UNWRAP, _R_RETRIEVED if gross >= 0 else _R_EXPANDING)
         return out(KEEP, v)
 
     # 6. A real finite break-even. `v is None` here by `_break_even`'s construction, but the
@@ -2157,6 +2195,10 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
                               if not labels and not is_router
                               and _guessed_label(row) in ambiguous
                               else None)),
+            # What this entry's retrieves took back out of its saving (#438), over the SAME
+            # labels its rate was netted across. Published so `_recommend` can tell a rate
+            # driven negative by retrieves from one driven negative by expansion (#443).
+            "retrieve_tokens": sum(retrieve_by_label.get(lbl, 0) for lbl in labels),
             "contributors": _contributors(labels, by_label, net_saved_by_label,
                                           tokenized_by_label),
             # Reported, never summed into anything above — see `_superseded_labels`.
@@ -2184,6 +2226,11 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
                  if by_label.get(str(r.get("server", "unknown")))]
     retrieve_tokens = sum(retrieve_by_label.values())
     saved = _context_saved(total) - retrieve_tokens
+    # The per-server rates were netted row by row through `_context_saved` too, so the basis
+    # is only `context` when the total AND every tool row carried the pair.
+    rows_ctx = {_has_context_sums(t) for t in agg.get("tools", [])} | {_has_context_sums(total)}
+    saved_basis = ("context" if rows_ctx == {True} else "wire" if rows_ctx == {False}
+                   else "mixed")
     return {
         "servers": servers,
         # REDEFINED by the #211 follow-up: recurring (eager-priming) entries only. It used
@@ -2217,6 +2264,16 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         # The wire figure it used to carry is `wire_saved_tokens`, beside it.
         # NET of `retrieve_tokens` since #438: gross is `saved_tokens + retrieve_tokens`.
         "saved_tokens": saved,
+        # WHICH basis `saved_tokens` and every per-server rate are on (#440) -- the saving's
+        # twin of `primer_source`. `wire` means the aggregate carried no context sums (it
+        # predates #420, or was hand-rolled) and the figures can overstate what the model
+        # received; `mixed` means some rows did and some did not. `aggregate` itself always
+        # yields `context`.
+        "saved_basis": saved_basis,
+        # Whether the context basis actually moved anything (#441), on the RAW sides -- see
+        # `_context_differs_from_wire`. False on a fleet with no rewritten typed field, where
+        # the two bases are the same number and naming one is noise.
+        "context_differs_from_wire": _context_differs_from_wire(total),
         # What `terse.retrieve` hits spent fetching dropped values back, in context. The
         # one definition #252's retrieve-rate tuning should read, not a second one.
         "retrieve_tokens": retrieve_tokens,
@@ -2418,8 +2475,7 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
                 lines.append(f"  `{lbl}`: remove one of them, or {fix}.")
     # Reported here rather than folded into the rate above: the split is a FACT about the
     # ledger, and merging the two identities would be the guessing #285 removed.
-    lines.append("  (savings in this section are on the CONTEXT basis — what the model "
-                 "receives — so they can sit below the per-tool table's wire figures, #420)")
+    lines += _basis_lines(liab)
     lines += _retrieve_net_lines(liab)
     for srv in liab["servers"]:
         sup = srv.get("superseded_labels") or []
@@ -2644,6 +2700,35 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _basis_lines(liab: dict[str, Any]) -> list[str]:
+    """Which basis the savings on this screen are on -- ONE helper for both screens (#441).
+
+    `--recommend` REPLACES the ledger tables, so the line `build_primer_section` printed
+    never reached the one screen whose numbers decide KEEP/UNWRAP. Gated on the published
+    fields, never recomputed: `context_differs_from_wire` is the raw-side test, which cannot
+    cancel the way comparing the two savings does. `.get` throughout, so a blob round-
+    tripped through an older terse -- no `saved_basis` -- says nothing rather than claim
+    one; an absent field is not a basis."""
+    basis = liab.get("saved_basis")
+    if basis == "context":
+        if not liab.get("context_differs_from_wire"):
+            # No row moved: the two bases are one number here, and naming one is noise.
+            return []
+        return ["  (savings are on the CONTEXT basis — what the model receives — so they can "
+                "sit below the wire",
+                "  figures `terse stats` prints for the same ledger, #420)"]
+    if basis in ("wire", "mixed"):
+        if basis == "mixed":
+            return ["  (savings are PARTLY on the WIRE basis: some rows of this aggregate "
+                    "carry no context sums,",
+                    "  so those can overstate what the model received — re-run `terse "
+                    "stats` on this terse, #440)"]
+        return ["  (savings are on the WIRE basis: this aggregate carries no context sums,",
+                "  so they can overstate what the model received — re-run `terse stats` "
+                "on this terse, #440)"]
+    return []
+
+
 def _retrieve_net_lines(liab: dict[str, Any]) -> list[str]:
     """The retrieve deduction, said wherever a netted saving is read (#438).
 
@@ -2746,6 +2831,7 @@ def build_recommend_section(liab: dict[str, Any]) -> list[str]:
             ranked = "; ".join(f"{c['label']} {c['saved_tokens']:,}"
                                for c in srv["contributors"])
             lines.append(f"    {srv['server']} pools, by tokens saved: {ranked}")
+    lines += _basis_lines(liab)
     lines += _retrieve_net_lines(liab)
     return lines
 

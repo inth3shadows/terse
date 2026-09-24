@@ -81,6 +81,8 @@ LIABILITY = {"servers", "per_turn_tokens", "session_once_tokens", "unresolved",
              "wire_saved_tokens",
              # #438: `saved_tokens` is NET of these; gross = saved_tokens + retrieve_tokens.
              "retrieve_tokens", "retrieve_untokenized",
+             # #440/#441: which basis the savings are on, and whether it moved anything.
+             "saved_basis", "context_differs_from_wire",
              "session_covered",
              # #396 round 4: contested label -> the NON-ROUTER entries writing it, sorted.
              # Per-label because a remedy is a fact about a label: a fleet-wide scan printed
@@ -110,7 +112,10 @@ LIABILITY_SERVER = {"server", "scope", "state", "primer_tokens", "ledger_labels"
                     # policy and INFERRED to have been paid, which is the pre-#311
                     # behaviour and the defect #286 reported. Published so a consumer never
                     # has to guess which of its numbers is a measurement.
-                    "primer_source"}
+                    "primer_source",
+                    # #443: the retrieve cost netted out of THIS entry's rate (#438), so a
+                    # consumer can tell a retrieve-driven negative rate from expansion.
+                    "retrieve_tokens"}
 
 # Deliberately verdict-INCAPABLE (#238): no `primer_tokens`, no `blocks_to_break_even`, no
 # `break_even_verdict`, no `verdict`. A peer has no primer to divide by -- the router pays one
@@ -151,6 +156,7 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "per_turn_tokens": (int,), "session_once_tokens": (int,), "unresolved": (int,),
     "idle": (list,), "free": (list,), "uncertain": (list,), "saved_tokens": (int,), "wire_saved_tokens": (int,),
     "retrieve_tokens": (int,), "retrieve_untokenized": (int,),
+    "saved_basis": (str,), "context_differs_from_wire": (bool,),
     "turns_covered": (float, int, type(None)),
     "session_covered": (float, int, type(None)),
     "servers": (list,),
