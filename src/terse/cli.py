@@ -1381,6 +1381,11 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         build_terminal_fluency_report,
     )
 
+    # `--primer` only means something to `--codec-verdict`; elsewhere it was a silent no-op.
+    if getattr(args, "primer", False) and not getattr(args, "codec_verdict", False):
+        print("terse fluency: --primer applies only to --codec-verdict", file=sys.stderr)
+        return 2
+
     envelopes = load_corpus(args.corpus)
     if not envelopes:
         print(f"no payloads in {args.corpus}/ — capture some first (`terse capture`).")
@@ -1475,12 +1480,32 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             print(f"[fluency --codec-verdict] no max_input_tokens for "
                   f"{', '.join(unknown)} — scored over the whole corpus; pass "
                   f"--max-input-tokens MODEL=N to check them", file=sys.stderr)
+        primer = ""
+        if getattr(args, "primer", False):
+            # The primer production sends, not the full catalogue: the router's union primer
+            # over this corpus's servers under the policy the proxy runs, which carries only
+            # the forms that policy can emit. From `--policy`, explicitly — resolving it from
+            # the MCP wiring can pick the wrong one when several are installed, and a wrong
+            # primer measures a delivery nobody gets.
+            if not args.policy:
+                print("terse fluency --codec-verdict --primer: needs --policy <file> (the "
+                      "policy the proxy runs), to build the primer production sends",
+                      file=sys.stderr)
+                return 2
+            from .proxy import union_primer
+            pol = load_policy(args.policy)
+            servers = sorted({e.get("server") for e in envelopes}, key=lambda x: x or "")
+            primer = union_primer([(pol, srv) for srv in servers])
+            if not primer:
+                print(f"terse fluency --codec-verdict --primer: {args.policy} emits no "
+                      f"compressed form for these servers, so production sends no primer",
+                      file=sys.stderr)
+                return 2
         try:
-            from .proxy import TERSE_PRIMER
             run = codeceval.run_codec_fluency(
                 envelopes, answerers, trials=args.trials, progress=_stderr_progress,
                 limits=limits, tool_defs=[codeceval.RECORD_VALUE_TOOL_DEF],
-                primer=TERSE_PRIMER if getattr(args, "primer", False) else "")
+                primer=primer)
         except codeceval.PreflightError as exc:
             print(str(exc), file=sys.stderr)   # no report: nothing was measured (#403)
             return 2
@@ -2276,9 +2301,10 @@ def main(argv: list[str] | None = None) -> int:
                         "or a cli:<alias> (real Anthropic via `claude -p`), scored on a "
                         "whole-reply JSON answer since that backend cannot call tools")
     f.add_argument("--primer", action="store_true",
-                   help="--codec-verdict: give the TERSE arm terse's primer as a system "
-                        "message, as the proxy delivers it in production; the raw arm gets "
-                        "none (the comparison is terse installed vs not)")
+                   help="--codec-verdict: put the primer the proxy sends (built from "
+                        "--policy for the corpus's servers) inline ahead of the TERSE arm's "
+                        "payload, as the router delivers it; the raw arm gets none (terse "
+                        "installed vs not). Requires --policy")
     f.add_argument("--accept-degraded", action="store_true",
                    help="--drop-eval: render a verdict even when enough calls failed to "
                         "trip the INCONCLUSIVE gate. For when the cause is known and "
@@ -2292,8 +2318,8 @@ def main(argv: list[str] | None = None) -> int:
                         "stripped, so final-accuracy is a gap between two measured arms "
                         "rather than against an unrun 100%% ideal (#269). Skipping halves "
                         "the calls and restores the old, confounded number")
-    f.add_argument("--policy", help="policy file with a drop-to-retrieve field (used only "
-                                    "by --drop-eval)")
+    f.add_argument("--policy", help="policy file: the drop-to-retrieve rules for --drop-eval, "
+                                    "or the policy whose primer --codec-verdict --primer sends")
     f.add_argument("--base-url", help="OpenAI-compatible base URL (else $TERSE_FLUENCY_BASE_URL)")
     f.add_argument("--models", help="comma-separated model ids (else $TERSE_FLUENCY_MODELS); "
                    "a cli:<alias> id (e.g. cli:opus) runs `claude -p` on the OAuth "

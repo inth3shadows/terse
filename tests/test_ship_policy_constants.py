@@ -264,9 +264,11 @@ def test_the_codec_sign_test_level_and_question_floor_are_pinned():
 
     def rows(worse: int, clean: int) -> list[dict]:
         out = _codec_row(clean * 5)[:clean] if clean else []
-        out += [{"qid": f"w{i}", "qtype": "lookup", "transform": "table", "trials": 5,
-                 "raw_ok": 5, "raw_trials": 5, "terse_ok": 0, "terse_trials": 5,
-                 "attempts": 10, "fails": 0} for i in range(worse)]
+        # ONE trial per worse question, so the per-question exact test (p = 0.5) cannot
+        # fire and the boundary is the sign test's alone.
+        out += [{"qid": f"w{i}", "qtype": "lookup", "transform": "table", "trials": 1,
+                 "raw_ok": 1, "raw_trials": 1, "terse_ok": 0, "terse_trials": 1,
+                 "attempts": 2, "fails": 0} for i in range(worse)]
         return out
 
     assert codec_verdict(rows(5, 0))[0] == "UNSAFE"
@@ -275,3 +277,18 @@ def test_the_codec_sign_test_level_and_question_floor_are_pinned():
                        terse_trials=5) for i, r in enumerate(_codec_row(20)[:4])]
     assert codec_verdict(four_clean)[0] == "UNRESOLVED"
     assert codec_verdict(four_clean + [dict(four_clean[0], qid="c4")])[0] == "SAFE"
+
+
+def test_the_per_question_exact_test_boundary():
+    """The magnitude half (fix plan D1): one question's own trials, one-sided Fisher, against
+    `_CODEC_SIGN_ALPHA / Q`. With Q=1: raw 3/3 vs terse 0/3 is p = 1/20 = 0.05, not below 0.05
+    (not UNSAFE); raw 4/4 vs terse 0/4 is p = 1/70 (UNSAFE). Pins alpha and the Bonferroni
+    divisor together: a divisor of 1 with Q=2 would flip the second case below."""
+    def one(raw, terse, trials, qid="q"):
+        return {"qid": qid, "qtype": "lookup", "transform": "table", "trials": trials,
+                "raw_ok": raw, "raw_trials": trials, "terse_ok": terse,
+                "terse_trials": trials, "attempts": 2 * trials, "fails": 0}
+    assert codec_verdict([one(3, 0, 3)])[0] != "UNSAFE"
+    assert codec_verdict([one(4, 0, 4)])[0] == "UNSAFE"
+    # 1/70 = 0.0143 is above 0.05/4 = 0.0125: with three clean questions beside it, not UNSAFE.
+    assert codec_verdict([one(4, 0, 4)] + [one(4, 4, 4, f"c{i}") for i in range(3)])[0] != "UNSAFE"

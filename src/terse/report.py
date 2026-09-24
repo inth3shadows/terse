@@ -1352,38 +1352,104 @@ def _codec_lost_text(rows: list[dict[str, Any]]) -> str:
 _CODEC_MIN_QUESTIONS = 5
 
 
+def _codec_answered(r: dict[str, Any], arm: str) -> int:
+    """Trials of `arm` ("raw"/"terse") that produced a SCORABLE answer.
+
+    Tool channel: calls the backend answered (`<arm>_answered`). Text channel: replies that
+    were a whole JSON value (`<arm>_parsed`) — a text reply that is not one delivered no
+    value, so it is unanswered, not wrong (fix plan D3): scoring it wrong let a primer that
+    makes the model explain first read as corruption on the primed arm only. A row that
+    predates both counters falls back to `trials - fails` on each arm, the conservative
+    reading once the lost calls are charged against the verdict they would help."""
+    trials = int(r.get("trials", 0))
+    if r.get("channel") == "text" and f"{arm}_parsed" in r:
+        return min(int(r[f"{arm}_parsed"]), trials)
+    if f"{arm}_answered" in r:
+        return int(r[f"{arm}_answered"])
+    return max(0, trials - int(r.get("fails", 0)))
+
+
+def _codec_lost(r: dict[str, Any], arm: str) -> int:
+    return max(0, int(r.get("trials", 0)) - _codec_answered(r, arm))
+
+
 def _codec_complete(r: dict[str, Any]) -> bool:
-    """Did both arms of this question answer EVERY trial? Only such rows enter the sign test.
-
-    An errored call is scored as a miss on its arm, so a lost RAW call turns a question into
-    a "better" one and buys a SAFE against real harm on another question (review of the sign
-    test: raw 7/7 vs terse 0/7 on q1, plus one lost raw call on q2, read SAFE). Dropping the
-    whole question removes the loss from both directions; `_codec_lost_text` still says it
-    happened. A row that predates the `<arm>_answered` counters falls back to `fails`."""
-    trials = r.get("trials")
-    if "raw_answered" in r and "terse_answered" in r and isinstance(trials, int):
-        return int(r["raw_answered"]) == trials and int(r["terse_answered"]) == trials
-    return int(r.get("fails", 0)) == 0
+    """Did both arms of this question produce a scorable answer on EVERY trial? Only such
+    questions count toward `_CODEC_MIN_QUESTIONS`. They are NOT the only ones the tests see —
+    see `codec_sign` for how an incomplete question is scored."""
+    return _codec_lost(r, "raw") == 0 and _codec_lost(r, "terse") == 0
 
 
-def codec_sign(rows: list[dict[str, Any]]) -> tuple[int, int, float]:
+def _codec_counts(r: dict[str, Any], side: str) -> tuple[int, int]:
+    """`(raw, terse)` correct counts with every unanswered trial charged AGAINST the verdict
+    it could otherwise help (fix plan D2).
+
+    `side="unsafe"`: an unanswered terse trial counts as terse-correct and an unanswered raw
+    trial as raw-wrong, so a lost call can never create or strengthen UNSAFE.
+    `side="safe"`: the reverse, so a lost call can never remove a "terse did worse".
+
+    The first sign-test fix dropped any question with a lost call instead. Review showed that
+    flips verdicts both ways: one lost terse call on a harmed question removed the only
+    "worse" and bought a SAFE, and one lost call per question turned a significant UNSAFE
+    (6 of 6 questions raw 20/20, terse 0/19) into UNRESOLVED."""
+    raw, terse = int(r["raw_ok"]), int(r["terse_ok"])
+    if side == "unsafe":
+        return raw, terse + _codec_lost(r, "terse")
+    return raw + _codec_lost(r, "raw"), terse
+
+
+def codec_sign(rows: list[dict[str, Any]], side: str = "unsafe") -> tuple[int, int, float]:
     """`(worse, better, p)`: questions (rows) where terse scored below / above raw, and the
     one-sided binomial P(X >= worse) under "terse is no worse" (each discordant question a
-    fair coin). Ties carry no information and are dropped, as in any sign test.
+    fair coin). Ties carry no information and are dropped, as in any sign test. Counts are
+    taken on `side` (`_codec_counts`): the UNSAFE test and the lean-worse gate each see the
+    lost calls charged against themselves.
 
     Question-level, not trial-level, on purpose: repeated trials of one question share the
-    payload and the prompt, so they are not independent draws, and counting them as such is
-    how a single hard question became "27 excess trials". The cost is power — fewer than 5
-    discordant questions can never reach p < 0.05 — which the verdict reports as
-    UNRESOLVED when terse leans worse, never as SAFE."""
-    rows = [r for r in rows if _codec_complete(r)]
-    worse = sum(1 for r in rows if int(r["raw_ok"]) > int(r["terse_ok"]))
-    better = sum(1 for r in rows if int(r["terse_ok"]) > int(r["raw_ok"]))
+    payload and the prompt, so they are not independent draws. The cost is power — fewer
+    than 5 discordant questions can never reach p < 0.05 — and magnitude, which is why
+    `codec_worst_question` runs beside it."""
+    worse = better = 0
+    for r in rows:
+        raw, terse = _codec_counts(r, side)
+        worse += raw > terse
+        better += terse > raw
     n = worse + better
     if n == 0:
         return 0, 0, 1.0
     p = sum(math.comb(n, k) for k in range(worse, n + 1)) / 2 ** n
     return worse, better, p
+
+
+def _fisher_one_sided(raw_ok: int, terse_ok: int, trials: int) -> float:
+    """One-sided Fisher exact p that raw's success rate exceeds terse's, two arms of `trials`
+    each: P(raw successes >= observed) under the hypergeometric with both margins fixed."""
+    total, k = 2 * trials, raw_ok + terse_ok
+    if trials <= 0 or raw_ok <= terse_ok:
+        return 1.0
+    denom = math.comb(total, trials)
+    return sum(math.comb(k, x) * math.comb(total - k, trials - x)
+               for x in range(raw_ok, min(k, trials) + 1)) / denom
+
+
+def codec_worst_question(rows: list[dict[str, Any]]) -> tuple[float, dict[str, Any] | None]:
+    """`(p, row)` for the question with the strongest evidence that terse did worse, by a
+    one-sided Fisher exact test on its own trials (UNSAFE-side counts, `_codec_counts`).
+
+    The sign test counts questions and ignores how badly each one failed, so review showed a
+    small cell could never read UNSAFE (1 question at raw 20/20, terse 0/20 read UNRESOLVED)
+    and two always-wrong questions could be cancelled by three one-trial flips. This is the
+    magnitude half: `codec_verdict` compares its p to `_CODEC_SIGN_ALPHA / Q`, Bonferroni
+    over the Q questions in the cell. Trials of one question are not independent draws at
+    temperature 0, so the p is a statement about THIS reader reproducing the failure — which
+    is the claim a per-reader verdict makes."""
+    best: tuple[float, dict[str, Any] | None] = (1.0, None)
+    for r in rows:
+        raw, terse = _codec_counts(r, "unsafe")
+        p = _fisher_one_sided(raw, terse, int(r.get("trials", 0)))
+        if p < best[0]:
+            best = (p, r)
+    return best
 
 # The share of an arm's trials that must have delivered their value through the tool call
 # for that arm to license SAFE (#403). Reuses `UNMEASURED_FAIL_SHARE` rather than
@@ -1509,6 +1575,15 @@ def _codec_low_call_arms(rows: list[dict[str, Any]]) -> list[tuple[str, float]]:
     return sorted(low, key=lambda t: t[1])
 
 
+def _codec_unsafe(rows: list[dict[str, Any]]) -> bool:
+    """Either test proves harm: breadth (sign test over questions) or magnitude (one
+    question's own trials, Bonferroni over the cell's questions)."""
+    if codec_sign(rows, "unsafe")[2] < _CODEC_SIGN_ALPHA:
+        return True
+    p, _row = codec_worst_question(rows)
+    return bool(rows) and p < _CODEC_SIGN_ALPHA / len(rows)
+
+
 def codec_verdict(rows: list[dict[str, Any]],
                   excluded_from_group: int = 0) -> tuple[str, ArmGap]:
     """SAFE / UNSAFE / UNRESOLVED for one model's codec-eval rows, already scoped to one
@@ -1549,7 +1624,7 @@ def codec_verdict(rows: list[dict[str, Any]],
         return "UNRESOLVED", g
     # Paired sign test, not zero tolerance (see `_CODEC_SIGN_ALPHA`): UNSAFE needs terse to
     # do worse on significantly more questions than it does better on.
-    if codec_sign(g.rows)[2] < _CODEC_SIGN_ALPHA:
+    if _codec_unsafe(g.rows):
         return "UNSAFE", g
     # Every SAFE-blocking gate lives in `codec_unresolved_reasons` and nowhere else, so the
     # verdict IS "any reason named" — a gate cannot exist without the sentence the table
@@ -1809,10 +1884,18 @@ def codec_unresolved_reasons(rows: list[dict[str, Any]], excluded_from_group: in
     reasons: list[str] = []
     # Terse leaned worse without reaching significance: not evidence of corruption, and not
     # evidence of its absence either. Blocks SAFE only.
-    worse, better, p = codec_sign(rows)
+    worse, better, p = codec_sign(rows, "safe")
     if worse > better:
-        reasons.append(f"terse did worse on {worse} question(s) and better on {better} — "
-                       f"not significant (sign test p={p:.2f}, need <{_CODEC_SIGN_ALPHA})")
+        # Lost calls are charged as raw successes on this side (`_codec_counts`), so part of
+        # "worse" can be loss rather than a wrong answer; say how much, or a quota wall reads
+        # as terse misreading 22 questions.
+        observed = sum(1 for r in rows if int(r["raw_ok"]) > int(r["terse_ok"]))
+        from_loss = max(0, worse - observed)
+        reasons.append(f"terse did worse on {worse} question(s) and better on {better}"
+                       + (f" ({from_loss} of those only by counting lost calls against "
+                          f"terse)" if from_loss else "")
+                       + f" — not significant (sign test p={p:.2f}, need "
+                         f"<{_CODEC_SIGN_ALPHA})")
     # A payload this cell never asked, because it exceeded a model's input limit (#403
     # Blocker 4), blocks SAFE — never UNSAFE.
     #
@@ -1847,7 +1930,18 @@ def codec_unresolved_reasons(rows: list[dict[str, Any]], excluded_from_group: in
                        f"in this run, need {_CODEC_MIN_CALL_RATE:.0%} — the run cannot "
                        f"show a value "
                        f"surviving into a downstream tool argument")
-    n = sum(_arm_trials(r, "terse_ok") for r in rows)
+    # Text channel's counterpart of the compliance gate (fix plan D3): a reply that is not a
+    # whole JSON value delivered no value. Blocks SAFE only — such replies are unanswered,
+    # already charged against both verdicts by `_codec_counts`.
+    text_rows = [r for r in rows if r.get("channel") == "text"]
+    for arm in ("raw", "terse"):
+        answered = sum(int(r.get(f"{arm}_answered", r.get("trials", 0))) for r in text_rows)
+        parsed = sum(_codec_answered(r, arm) for r in text_rows)
+        if answered and parsed / answered < _CODEC_MIN_CALL_RATE:
+            reasons.append(f"{arm} arm replied with a bare JSON value "
+                           f"{_codec_rate_text(parsed / answered)} of the time in this run, "
+                           f"need {_CODEC_MIN_CALL_RATE:.0%}")
+    n = _codec_answered_trials(rows)
     if n < _CODEC_MIN_TRIALS:
         reasons.append(f"only {n} trial(s), need {_CODEC_MIN_TRIALS}")
     complete = sum(1 for r in rows if _codec_complete(r))
@@ -1857,9 +1951,17 @@ def codec_unresolved_reasons(rows: list[dict[str, Any]], excluded_from_group: in
     return reasons
 
 
+def _codec_answered_trials(rows: list[dict[str, Any]]) -> int:
+    """Trials answered on BOTH arms — the unit the trial floor and the table's `n` count in.
+    `terse_trials` stays fixed at `trials` whatever was lost, so summing it let calls that
+    never happened buy a SAFE (review: 6 complete questions at 3/3 plus one question with
+    zero answered calls read SAFE at "21 trials"). Fix plan D2."""
+    return sum(min(_codec_answered(r, "raw"), _codec_answered(r, "terse")) for r in rows)
+
+
 def _codec_trials(g: ArmGap) -> int:
-    """Terse-arm trials in the rows a codec verdict was computed over — the table's `n`."""
-    return sum(_arm_trials(r, "terse_ok") for r in g.rows)
+    """Trials answered on both arms in the rows a codec verdict was computed over — `n`."""
+    return _codec_answered_trials(g.rows)
 
 
 def _codec_questions(g: ArmGap) -> str:
@@ -1943,8 +2045,8 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
                 "tools here, so answered with a whole-reply JSON value; tool-call compliance "
                 "does not apply to it.", ""]
     if any(r.get("primer") for r in all_rows):
-        out += ["**Primer:** the terse arm was given terse's primer as a system message, as "
-                "the proxy delivers it; the raw arm had none.", ""]
+        out += ["**Primer:** the terse arm read terse's primer inline ahead of its payload, as "
+                "the router delivers it (#451); the raw arm had none.", ""]
     # `excluded` keeps the table alive: an all-excluded run has no rows, and returning here
     # would drop the cells those payloads belong to entirely — a cell that silently
     # disappears is indistinguishable from a corpus that never had it.
@@ -2046,10 +2148,22 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
         n = _codec_trials(worst_gap)
         questions, n_col, model_col = _codec_questions(worst_gap), str(n), f"`{worst_model}`"
         if worst_verdict == "UNSAFE":
-            worse, better, p = codec_sign(worst_gap.rows)
-            why = (f"terse did worse on {worse} question(s) and better on {better} "
-                   f"(sign test p={p:.3f}; raw {worst_gap.control_acc:.0%}, "
-                   f"terse {worst_gap.form_acc:.0%})"
+            worse, better, p = codec_sign(worst_gap.rows, "unsafe")
+            fp, frow = codec_worst_question(worst_gap.rows)
+            q = len(worst_gap.rows)
+            if p < _CODEC_SIGN_ALPHA:
+                why = (f"terse did worse on {worse} question(s) and better on {better} "
+                       f"(sign test p={p:.3f}; raw {worst_gap.control_acc:.0%}, "
+                       f"terse {worst_gap.form_acc:.0%})")
+            else:
+                # The magnitude test decided it: name the question and its own counts.
+                assert frow is not None
+                why = (f"one question fails reproducibly on terse: raw "
+                       f"{int(frow['raw_ok'])}/{int(frow['trials'])}, terse "
+                       f"{int(frow['terse_ok'])}/{int(frow['trials'])} (exact test "
+                       f"p={fp:.1e}, need <{_CODEC_SIGN_ALPHA}/{q}); across questions "
+                       f"worse {worse}, better {better}")
+            why = (why
                    + _codec_lost_text(by_model.get(worst_model, [])))
         elif worst_verdict == "UNRESOLVED":
             # ALL of them, not the first — and for EVERY unresolved model, not the one the
@@ -2097,7 +2211,7 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
             # split and lost calls (review of the sign test, same shape as #432's).
             notes = []
             for model, (_v, g) in sorted(verdicts.items()):
-                w, b, _p = codec_sign(g.rows)
+                w, b, _p = codec_sign(g.rows, "safe")
                 note = (f"worse on {w} question(s), better on {b} (raw "
                         f"{g.control_acc:.0%}, terse {g.form_acc:.0%})" if w or b else "")
                 note += _codec_lost_text(by_model.get(model, []))

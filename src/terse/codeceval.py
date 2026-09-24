@@ -305,7 +305,8 @@ def _preflight_miss(turn: Turn, expected: Any) -> str | None:
     return f"failed a 2-record pre-flight question: got {got!r}, expected {expected!r}"
 
 
-def preflight_encoding(answerer: ToolAnswerer, attempts: int = PREFLIGHT_ATTEMPTS) -> str | None:
+def preflight_encoding(answerer: ToolAnswerer, attempts: int = PREFLIGHT_ATTEMPTS,
+                       primer: str = "") -> str | None:
     """`None` if this model can participate in the codec eval, else a one-line reason.
 
     The 2026-09-09 run burned 57 minutes and 324 calls to discover that one of its two
@@ -339,7 +340,10 @@ def preflight_encoding(answerer: ToolAnswerer, attempts: int = PREFLIGHT_ATTEMPT
         answered = calls = 0
         while answered < attempts and calls < 2 * attempts:
             calls += 1
-            turn = _codec_turn(question, payload_text, answerer)
+            # Primed like the terse arm of a `--primer` run: a model that cannot reply in the
+            # required format once the primer is in front of the payload is refused up front,
+            # not discovered as a sweep of unanswered terse trials.
+            turn = _codec_turn(question, with_primer(primer, payload_text), answerer)
             if turn.error:
                 continue
             answered += 1
@@ -434,8 +438,7 @@ def _prose_value(turn: Turn) -> tuple[bool, Any]:
 
 
 def _ask_codec_question(question: fluency.Question, payload_text: str,
-                        answerer: ToolAnswerer,
-                        system: str = "") -> tuple[bool, bool, bool, bool]:
+                        answerer: ToolAnswerer) -> tuple[bool, bool, bool, bool]:
     """One trial: ask `question` over `payload_text`, expect a `RECORD_VALUE_TOOL` call.
     Returns (matched, errored, called, parsed) — `parsed`: the reply carried a scorable value
     at all (a tool call, or a whole-reply JSON value).
@@ -474,7 +477,7 @@ def _ask_codec_question(question: fluency.Question, payload_text: str,
     never on UNSAFE, because a value comparison scored identically on both channels is
     arm-independent again, while a SAFE verdict is a claim about values surviving into a
     real tool call and cannot be made by a run that mostly declined to make one."""
-    turn = _codec_turn(question, payload_text, answerer, system)
+    turn = _codec_turn(question, payload_text, answerer)
     if turn.error:
         # counted as a miss by the caller, kept in the fixed denominator; not a tool call
         return False, True, False, False
@@ -488,22 +491,22 @@ def _ask_codec_question(question: fluency.Question, payload_text: str,
     return parsed and _value_matches(prose, question.expected), False, False, parsed
 
 
-def _codec_turn(question: fluency.Question, payload_text: str, answerer: ToolAnswerer,
-                system: str = "") -> Turn:
+def with_primer(primer: str, payload_text: str) -> str:
+    """`payload_text` as a `--primer` run's terse arm reads it: the primer as its own block
+    ahead of the result, the shape the router emits (#451); unchanged without a primer."""
+    return f"{primer}\n\n{payload_text}" if primer else payload_text
+
+
+def _codec_turn(question: fluency.Question, payload_text: str, answerer: ToolAnswerer) -> Turn:
     """The one request a codec-eval question is sent as — a single user message, no system
     message — shared by the sweep (`_ask_codec_question`) and `preflight_encoding`, so a
-    model that passes the pre-flight passed on the request it is scored on.
-
-    `system` carries terse's primer on the terse arm of a `--primer` run and is omitted
-    otherwise (no empty system message — see the module docstring). The instruction follows
-    the backend's channel, identically on both arms, so the pairing is unaffected."""
+    model that passes the pre-flight passed on the request it is scored on. A `--primer`
+    run's primer is part of `payload_text` (`with_primer`), not a system message. The
+    instruction follows the backend's channel, identically on both arms."""
     instruction = (_TEXT_INSTRUCTION if answer_channel(answerer) == "text"
                    else _codec_instruction())
-    messages: list[dict] = []
-    if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": fluency._user_prompt(
-        question.prompt, instruction, payload_text)})
+    messages: list[dict] = [{"role": "user", "content": fluency._user_prompt(
+        question.prompt, instruction, payload_text)}]
     return _safe_call(answerer, messages)
 
 
@@ -530,12 +533,13 @@ def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
     catches a substantially-down backend and reports UNRESOLVED rather than a confident
     verdict computed over a small, self-selected surviving sample.
 
-    `primer` goes to the TERSE arm only, as a system message: the comparison is "terse not
-    installed" (raw, no primer) against "terse installed" (compressed, primer in the system
-    prompt, where the live router puts it). A text-channel backend's rows OMIT the
+    `primer` goes to the TERSE arm only, INLINE ahead of the payload (`with_primer`): since
+    #451 the router attaches its primer once per session as content block 0 of the first
+    terse-marked result, and every codec question is a fresh one-result conversation. The
+    comparison is "terse not installed" (raw, no primer) against "terse installed". A text-channel backend's rows OMIT the
     `<arm>_calls` counters — tool-call compliance is not a property it can have, and a 0
     there would read as "declined the tool every time" (`report.codec_call_rate`)."""
-    terse_text = fluency.compress(obj)
+    terse_text = with_primer(primer, fluency.compress(obj))
     channel = answer_channel(answerer)
     out: list[dict] = []
     for q in gen_codec_questions(obj):
@@ -552,7 +556,7 @@ def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
             raw_calls += int(called)
             raw_ok += int(ok)  # an errored call scores as a miss, not an exclusion
             raw_parsed += int(parsed)
-            ok, err, called, parsed = _ask_codec_question(q, terse_text, answerer, primer)
+            ok, err, called, parsed = _ask_codec_question(q, terse_text, answerer)
             terse_fail += int(err)
             terse_calls += int(called)
             terse_ok += int(ok)
@@ -670,7 +674,7 @@ class CodecRun(NamedTuple):
 
 
 def request_tokens(question: fluency.Question, payload_text: str,
-                   tool_defs: list[dict] | None = None, system: str = "") -> int | None:
+                   tool_defs: list[dict] | None = None) -> int | None:
     """cl100k count of the REAL request one trial sends, or `None` without a tokenizer.
 
     The whole request, not the payload: `_codec_turn`'s user message plus the serialized
@@ -699,9 +703,7 @@ def request_tokens(question: fluency.Question, payload_text: str,
     model's own tokenizer or a per-content bound; open on #403."""
     text = fluency._user_prompt(question.prompt, _codec_instruction(), payload_text)
     tools = json.dumps(tool_defs if tool_defs is not None else [RECORD_VALUE_TOOL_DEF])
-    # `system`: the primer a `--primer` run sends on the terse arm (~555 cl100k), which the
-    # first cut left out — a terse request really over the limit passed and errored.
-    return count_cl100k(system + text + tools)
+    return count_cl100k(text + tools)
 
 
 def oversized_arms(obj: Any, raw_text: str, limit: int,
@@ -726,9 +728,11 @@ def oversized_arms(obj: Any, raw_text: str, limit: int,
     if not questions:
         return []
     out: list[tuple[str, int]] = []
-    for arm, text, system in (("raw", raw_text, ""), ("terse", fluency.compress(obj), primer)):
+    # The terse arm is measured WITH its primer (inline since #451): leaving the ~0.5k-token
+    # primer out let a terse request really over the limit pass and error on that arm only.
+    for arm, text in (("raw", raw_text), ("terse", with_primer(primer, fluency.compress(obj)))):
         sizes = [n for q in questions
-                 if (n := request_tokens(q, text, tool_defs, system)) is not None]
+                 if (n := request_tokens(q, text, tool_defs)) is not None]
         if sizes and max(sizes) > limit:
             out.append((arm, max(sizes)))
     return out
@@ -850,7 +854,7 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
     # `test_the_cli_refuses_a_codec_verdict_run_a_model_cannot_answer` drives `main`.
     if preflight:
         failed = {name: why for name, a in answerers.items()
-                  if (why := preflight_encoding(a)) is not None}
+                  if (why := preflight_encoding(a, primer=primer)) is not None}
         if failed:
             raise PreflightError(
                 f"terse fluency --codec-verdict: refused before the sweep — {len(failed)} of "

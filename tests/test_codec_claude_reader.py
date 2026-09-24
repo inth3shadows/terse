@@ -82,17 +82,18 @@ def test_a_text_backend_is_asked_for_a_json_reply_not_a_tool_call():
     assert all(m["role"] != "system" for m in seen[-1])   # no primer -> no system message
 
 
-def test_the_primer_reaches_the_terse_arm_only():
+def test_the_primer_reaches_the_terse_arm_only_and_inline():
+    # Since #451 the router attaches the primer as block 0 of the first terse-marked result,
+    # so the terse arm reads it INLINE ahead of the payload; no system message on either arm.
     ans, seen = _text_answerer(_expected)
     rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, ans, trials=1, primer="PRIMER")
     terse_text = fluency.compress(PAYLOAD)
     for msgs in seen:
+        assert all(m["role"] != "system" for m in msgs)
         user = msgs[-1]["content"]
-        has_system = any(m["role"] == "system" and m["content"] == "PRIMER" for m in msgs)
-        # terse arm <=> primer: the counterfactual is terse installed vs not installed
-        assert has_system == (terse_text in user)
+        assert ("PRIMER\n\n" + terse_text in user) == (terse_text in user)
+        assert ("PRIMER" in user) == (terse_text in user)
     assert rows and all(r["primer"] is True for r in rows)
-
 
 def test_text_rows_omit_the_tool_call_counters_so_SAFE_is_reachable():
     ans, _ = _text_answerer(_expected)
@@ -121,14 +122,21 @@ def test_tool_rows_keep_their_counters():
 
 
 def test_a_cli_run_completes_and_primer_reaches_only_the_terse_arm(tmp_path, monkeypatch):
-    """Through `main`, not `_build_answerers`: review found the old version of this test
-    passed on a run the pre-flight refused (rc 2, no report), and that the `--primer` CLI
-    wiring was pinned by nothing — `primer=""` hardcoded in cli.py survived the suite."""
+    """Through `main`: a `cli:` run completes (rc 0) and `--primer` sends the primer the
+    policy builds, inline, on the terse arm only. The first version of this test passed on a
+    run the pre-flight refused, and nothing pinned the CLI wiring of `--primer`."""
     from terse.capture import capture_payload
+    from terse.policy import load_policy
+    from terse.proxy import union_primer
     corpus = tmp_path / "c"
     corpus.mkdir()
     for pl in PAYLOADS:
         capture_payload("kb.read.x", json.dumps(pl), corpus, server="kb", manual=True)
+    policy = tmp_path / "p.json"
+    policy.write_text(json.dumps({"version": 1, "policies": [
+        {"match": {"tool": "kb.*"}, "tiers": ["minify", "tabularize", "dictionary"]}]}))
+    expected_primer = union_primer([(load_policy(str(policy)), "kb")])
+    assert expected_primer
     seen: list[list[dict]] = []
 
     def fake_text(alias):
@@ -138,20 +146,31 @@ def test_a_cli_run_completes_and_primer_reaches_only_the_terse_arm(tmp_path, mon
 
     monkeypatch.setattr(codeceval, "cli_text_answerer", fake_text)
     out = tmp_path / "r.md"
-    assert main(["fluency", "--codec-verdict", "--primer", "--corpus", str(corpus),
-                 "--trials", "20", "--models", "cli:haiku", "--out", str(out)]) == 0
+    assert main(["fluency", "--codec-verdict", "--primer", "--policy", str(policy),
+                 "--corpus", str(corpus), "--trials", "20", "--models", "cli:haiku",
+                 "--out", str(out)]) == 0
     report = out.read_text()
     assert "**SAFE**" in report and "**Primer:**" in report and "**Text channel:**" in report
-    raws = [json.dumps(pl) for pl in PAYLOADS]
     terses = [fluency.compress(pl) for pl in PAYLOADS]
+    raws = [json.dumps(pl) for pl in PAYLOADS]
     sweep = [m for m in seen[0] if any(t in m[-1]["content"] for t in raws + terses)]
     assert sweep
     for msgs in sweep:
-        has_primer = any(m["role"] == "system" for m in msgs)
-        assert has_primer == any(t in msgs[-1]["content"] for t in terses)
-        # the SAME text instruction on both arms — pairing depends on it
-        assert codeceval._TEXT_INSTRUCTION in msgs[-1]["content"]
+        user = msgs[-1]["content"]
+        is_terse = any(t in user for t in terses)
+        assert (expected_primer in user) == is_terse
+        assert codeceval._TEXT_INSTRUCTION in user
 
+
+def test_primer_needs_a_policy_and_the_codec_verdict(tmp_path):
+    from terse.capture import capture_payload
+    corpus = tmp_path / "c"
+    corpus.mkdir()
+    capture_payload("kb.read.x", RAW_TEXT, corpus, server="kb", manual=True)
+    assert main(["fluency", "--codec-verdict", "--primer", "--corpus", str(corpus),
+                 "--models", "cli:haiku", "--out", str(tmp_path / "r.md")]) == 2
+    assert main(["fluency", "--primer", "--corpus", str(corpus),
+                 "--out", str(tmp_path / "f.md")]) == 2
 
 def test_drop_eval_still_refuses_a_cli_model():
     import argparse
@@ -193,21 +212,34 @@ def test_a_right_value_in_the_wrong_format_is_a_format_miss_not_a_parse():
 
 
 def test_the_primer_counts_toward_the_terse_arms_input_limit():
-    # Review: request_tokens ignored the ~555-token primer, so a terse request really over
-    # the limit passed the check and errored on the terse arm only.
+    # Through `run_codec_fluency`, the call site: review found a direct `oversized_arms` test
+    # survived a mutation that stopped the sweep passing the primer.
     import pytest
 
     from terse.tokenize import count_cl100k
     if count_cl100k("x") is None:
         pytest.skip("no tokenizer")
-    q = codeceval.gen_codec_questions(PAYLOAD)[0]
-    terse_text = fluency.compress(PAYLOAD)
-    bare = codeceval.request_tokens(q, terse_text)
     primer = "primer " * 400
-    assert codeceval.request_tokens(q, terse_text, system=primer) > bare
-    limit = max(codeceval.request_tokens(q2, t, None) or 0
-                for q2 in codeceval.gen_codec_questions(PAYLOAD)
+    terse_text = fluency.compress(PAYLOAD)
+    limit = max(codeceval.request_tokens(q, t) or 0
+                for q in codeceval.gen_codec_questions(PAYLOAD)
                 for t in (RAW_TEXT, terse_text)) + 1
-    assert codeceval.oversized_arms(PAYLOAD, RAW_TEXT, limit) == []
-    over = codeceval.oversized_arms(PAYLOAD, RAW_TEXT, limit, primer=primer)
-    assert [arm for arm, _ in over] == ["terse"]
+    env = {"tool": "kb.read.x", "server": "kb", "raw": RAW_TEXT, "sha": "a" * 40,
+           "shape": "array-of-records", "manual": True}
+    ans, _ = _text_answerer(_expected)
+    unprimed = codeceval.run_codec_fluency([env], {"m": ans}, trials=1, preflight=False,
+                                           limits={"m": limit})
+    assert not unprimed.excluded
+    primed = codeceval.run_codec_fluency([env], {"m": ans}, trials=1, preflight=False,
+                                         limits={"m": limit}, primer=primer)
+    assert [e.arm for e in primed.excluded] == ["terse"]
+
+
+
+def test_the_preflight_asks_the_primed_request_when_there_is_a_primer():
+    ans, seen = _text_answerer(_expected)
+    assert codeceval.preflight_encoding(ans, attempts=1, primer="PRIMER") is None
+    assert seen and all(m[-1]["content"].count("PRIMER\n\n") == 1 for m in seen)
+    seen.clear()
+    codeceval.preflight_encoding(ans, attempts=1)
+    assert seen and all("PRIMER" not in m[-1]["content"] for m in seen)

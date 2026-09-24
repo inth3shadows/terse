@@ -487,12 +487,8 @@ def test_excluding_the_payload_that_carries_the_failure_cannot_print_SAFE():
 
     unlimited = codeceval.run_codec_fluency(_two_payload_corpus(), models, trials=20,
                                             preflight=False)
-    # One failing question: under the sign test that is "terse leaned worse" (UNRESOLVED,
-    # never SAFE), not UNSAFE — a single discordant question is p=0.5. The property this
-    # test exists for is unchanged: trimming the payload that carries it must not print SAFE.
-    full = build_codec_verdict_report(unlimited.rows)
-    assert "| **SAFE** |" not in full and "terse did worse on 2 question(s)" in full, (
-        "fixture does not demonstrate a terse-arm failure — it cannot express the flip")
+    assert "**UNSAFE**" in build_codec_verdict_report(unlimited.rows), (
+        "fixture does not demonstrate corruption — it cannot express the flip")
 
     limited = codeceval.run_codec_fluency(_two_payload_corpus(), models, trials=20,
                                           preflight=False, limits={"m": raw - 1})
@@ -516,10 +512,7 @@ def test_an_exclusion_never_suppresses_an_UNSAFE_that_survived():
     assert run.excluded
     report = build_codec_verdict_report(run.rows, excluded=run.excluded,
                                         limits={"m": raw - 1}, models=["m"])
-    # Under the sign test one failing question is named, not UNSAFE; what must hold is that
-    # the trim does not hide it — the surviving evidence is reported beside the trim.
-    assert "terse did worse on 2 question(s)" in report
-    assert "trimmed corpus" in report
+    assert "**UNSAFE**" in report
 
 
 def test_a_cell_whose_every_payload_was_excluded_still_gets_a_row():
