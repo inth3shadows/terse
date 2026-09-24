@@ -285,3 +285,60 @@ def test_R3_the_primer_and_the_payload_come_from_the_same_policy(tmp_path, monke
     assert any(t in u for u in users for t in expected_terse), (
         "the terse arm was not compressed under --policy")
     assert not any(fluency.compress(pl) in u for u in users for pl in payloads)
+
+
+def _dict_payloads():
+    statuses = ["awaiting-triage-from-maintainer", "blocked-on-upstream-dependency"]
+    teams = ["platform-infrastructure-team", "developer-experience-team"]
+    return [{"result": [{"id": i + k * 100, "status": statuses[i % 2],
+                         "team": teams[(i // 2) % 2], "meta": {"n": i}}
+                        for i in range(12)]} for k in range(2)]
+
+
+def _envs(payloads):
+    return [{"tool": "kb.read.x", "server": "kb", "raw": json.dumps(pl, indent=2),
+             "sha": f"{k:040d}", "shape": "array-of-records", "manual": True}
+            for k, pl in enumerate(payloads)]
+
+
+def _policy(tiers):
+    from terse.policy import Policy, Rule
+    return Policy(rules=[Rule(tool_glob="kb.*", tiers=tuple(tiers))])
+
+
+def test_R3_a_payload_the_policy_leaves_alone_is_not_asked():
+    ans, _ = _text_answerer(_expected)
+    run = codeceval.run_codec_fluency(_envs(PAYLOADS), {"m": ans}, trials=4,
+                                      preflight=False, primer="PRIMER", policy=_policy([]))
+    assert run.rows.get("m", []) == [] and run.skipped_unaskable == len(PAYLOADS)
+
+
+def test_R3_savings_and_the_input_limit_use_the_policy_form():
+    from terse.policy import apply as policy_apply
+    from terse.tokenize import count_cl100k
+    if count_cl100k("x") is None:
+        import pytest
+        pytest.skip("no tokenizer")
+    payloads, pol = _dict_payloads(), _policy(["minify", "tabularize"])
+    envs = _envs(payloads)
+    policy_form = [policy_apply(e["raw"], "kb.read.x", pol, server="kb",
+                                force_lossless=True).text for e in envs]
+    default_form = [fluency.compress(pl) for pl in payloads]
+    assert policy_form != default_form
+    ans, _ = _text_answerer(lambda m: "[]")
+    run = codeceval.run_codec_fluency(envs, {"m": ans}, trials=1, preflight=False,
+                                      policy=pol)
+    tokens = {r["sha"]: r["terse_tokens"] for r in run.rows["m"]}
+    assert sorted(tokens.values()) == sorted(count_cl100k(t) for t in policy_form)
+    # The input-limit check sizes the terse arm from the POLICY form: at a limit nothing
+    # fits under, the terse exclusion reports the policy form's largest request, which
+    # differs from the default codec's (the raw arm is always larger, so no limit can sit
+    # between the two forms — the reported size is what pins the call site).
+    qs = codeceval.gen_codec_questions(payloads[0])
+    want = max(codeceval.request_tokens(q, policy_form[0]) or 0 for q in qs)
+    other = max(codeceval.request_tokens(q, default_form[0]) or 0 for q in qs)
+    assert want != other
+    run2 = codeceval.run_codec_fluency(envs[:1], {"m": ans}, trials=1, preflight=False,
+                                       policy=pol, limits={"m": 1})
+    terse_ex = [e for e in run2.excluded if e.arm == "terse"]
+    assert [e.tokens for e in terse_ex] == [want]

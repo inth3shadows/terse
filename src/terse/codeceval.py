@@ -894,8 +894,13 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
             from .policy import apply as policy_apply
             terse = policy_apply(env["raw"], str(env.get("tool", "")), policy,
                                  server=env.get("server"), force_lossless=True).text
+        # Under a policy, "the codec changed it" means the terse arm differs from BOTH what
+        # the raw arm reads and plain minification. `policy.apply` returns the raw text
+        # byte-for-byte on a `tiers: []` rule and on its depth/marker guards; compared with
+        # `minify(obj)` alone that read as changed, so identical JSON was asked on both arms
+        # and every trial was a free match toward SAFE (review round 4, #403 Blocker 2).
         changed = (codec_changes(obj) if terse is None
-                   else obj is not None and terse != minify(obj))
+                   else obj is not None and terse not in (env["raw"], minify(obj)))
         if obj is None or not gen_codec_questions(obj) or not changed:
             # One line per skip, like `run_drop_fluency` (#267): `done` reaches `total`
             # without M near-identical lines per skipped envelope.
