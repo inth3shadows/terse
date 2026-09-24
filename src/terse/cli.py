@@ -1066,7 +1066,8 @@ def _discover_model_limits(base_url: str | None, api_key: str | None,
     return out
 
 
-def _build_answerers(args: argparse.Namespace, make_openai, mode_name: str = "--drop-eval") -> dict:
+def _build_answerers(args: argparse.Namespace, make_openai, mode_name: str = "--drop-eval",
+                     make_cli=None) -> dict:
     """Assemble named answerers from env + flags. Empty means keyless (pack) mode.
 
     Shared by plain `fluency` (`make_openai=fluency.openai_answerer`) and every
@@ -1102,6 +1103,11 @@ def _build_answerers(args: argparse.Namespace, make_openai, mode_name: str = "--
                 # panel to "unmeasured" instead of refusing loudly at config time.
                 raise SystemExit(f"terse fluency: {m!r}: cli: needs a model alias after "
                                  f"the prefix, e.g. cli:opus")
+            if make_cli is not None:
+                # A mode that can score a TEXT reply supplies its own `cli:` adapter
+                # (`--codec-verdict`: `codeceval.cli_text_answerer`, whole-reply JSON).
+                answerers[m] = make_cli(cli_alias)
+                continue
             if make_openai is not fluency.openai_answerer:
                 # Every tool-calling mode needs a TOOL-CALLING answerer; `claude -p
                 # --output-format json` returns prose, not tool calls. Refusing loudly
@@ -1444,6 +1450,7 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             lambda base, key, m: dropeval.openai_tool_answerer(
                 base, key, m, tools=[codeceval.RECORD_VALUE_TOOL_DEF]),
             mode_name="--codec-verdict",
+            make_cli=codeceval.cli_text_answerer,
         )
         if not answerers:
             print("`fluency --codec-verdict` needs a configured model: set "
@@ -1469,9 +1476,11 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
                   f"{', '.join(unknown)} — scored over the whole corpus; pass "
                   f"--max-input-tokens MODEL=N to check them", file=sys.stderr)
         try:
+            from .proxy import TERSE_PRIMER
             run = codeceval.run_codec_fluency(
                 envelopes, answerers, trials=args.trials, progress=_stderr_progress,
-                limits=limits, tool_defs=[codeceval.RECORD_VALUE_TOOL_DEF])
+                limits=limits, tool_defs=[codeceval.RECORD_VALUE_TOOL_DEF],
+                primer=TERSE_PRIMER if getattr(args, "primer", False) else "")
         except codeceval.PreflightError as exc:
             print(str(exc), file=sys.stderr)   # no report: nothing was measured (#403)
             return 2
@@ -2263,7 +2272,13 @@ def main(argv: list[str] | None = None) -> int:
                         "JSON or terse's compressed form? scored on deref and enumerate "
                         "questions, "
                         "rendered as SAFE/UNSAFE/UNRESOLVED per (tool, shape) rather than a "
-                        "global accuracy tolerance; needs a configured tool-calling model")
+                        "global accuracy tolerance; needs a configured tool-calling model, "
+                        "or a cli:<alias> (real Anthropic via `claude -p`), scored on a "
+                        "whole-reply JSON answer since that backend cannot call tools")
+    f.add_argument("--primer", action="store_true",
+                   help="--codec-verdict: give the TERSE arm terse's primer as a system "
+                        "message, as the proxy delivers it in production; the raw arm gets "
+                        "none (the comparison is terse installed vs not)")
     f.add_argument("--accept-degraded", action="store_true",
                    help="--drop-eval: render a verdict even when enough calls failed to "
                         "trip the INCONCLUSIVE gate. For when the cause is known and "

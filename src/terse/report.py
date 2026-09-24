@@ -1853,6 +1853,19 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
         "needs enough trials to trust the zero, or it is UNRESOLVED.",
         "",
     ]
+    # Two run conditions that change what a verdict is ABOUT, stated before the table so a
+    # cell is never read without them: a text-channel model answered in whole-reply JSON (no
+    # tool call, so no compliance gate), and a primer run gave the terse arm terse's primer.
+    all_rows = [r for rows in (results or {}).values() for r in rows]
+    text_models = sorted(m for m, rows in (results or {}).items()
+                         if any(r.get("channel") == "text" for r in rows))
+    if text_models:
+        out += [f"**Text channel:** {', '.join(f'`{m}`' for m in text_models)} cannot call "
+                "tools here, so answered with a whole-reply JSON value; tool-call compliance "
+                "does not apply to it.", ""]
+    if any(r.get("primer") for r in all_rows):
+        out += ["**Primer:** the terse arm was given terse's primer as a system message, as "
+                "the proxy delivers it; the raw arm had none.", ""]
     # `excluded` keeps the table alive: an all-excluded run has no rows, and returning here
     # would drop the cells those payloads belong to entirely — a cell that silently
     # disappears is indistinguishable from a corpus that never had it.

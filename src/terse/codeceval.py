@@ -355,6 +355,17 @@ def preflight_encoding(answerer: ToolAnswerer, attempts: int = PREFLIGHT_ATTEMPT
     return f"{first_reason} [{bad}/{scored} pre-flight answers failed]"
 
 
+# The instruction a TEXT-channel backend gets instead (`cli_text_answerer`): `claude -p`
+# cannot call a tool, so asking it to would score every trial as a prose miss. The grader
+# already scores a whole-reply JSON value (`_prose_value`), so this asks for exactly that.
+_TEXT_INSTRUCTION = "Reply with ONLY that value as compact JSON, and nothing else."
+
+
+def answer_channel(answerer: ToolAnswerer) -> str:
+    """`"tool"` for a tool-calling backend, `"text"` for one that can only reply in text."""
+    return getattr(answerer, "channel", "tool")
+
+
 def _codec_instruction() -> str:
     """The instruction half of the user prompt for a codec-eval trial.
 
@@ -415,7 +426,7 @@ def _prose_value(turn: Turn) -> tuple[bool, Any]:
 
 
 def _ask_codec_question(question: fluency.Question, payload_text: str,
-                        answerer: ToolAnswerer) -> tuple[bool, bool, bool]:
+                        answerer: ToolAnswerer, system: str = "") -> tuple[bool, bool, bool]:
     """One trial: ask `question` over `payload_text`, expect a `RECORD_VALUE_TOOL` call.
     Returns (matched, errored, called).
 
@@ -453,7 +464,7 @@ def _ask_codec_question(question: fluency.Question, payload_text: str,
     never on UNSAFE, because a value comparison scored identically on both channels is
     arm-independent again, while a SAFE verdict is a claim about values surviving into a
     real tool call and cannot be made by a run that mostly declined to make one."""
-    turn = _codec_turn(question, payload_text, answerer)
+    turn = _codec_turn(question, payload_text, answerer, system)
     if turn.error:
         # counted as a miss by the caller, kept in the fixed denominator; not a tool call
         return False, True, False
@@ -464,14 +475,22 @@ def _ask_codec_question(question: fluency.Question, payload_text: str,
     return parsed and _value_matches(prose, question.expected), False, False
 
 
-def _codec_turn(question: fluency.Question, payload_text: str, answerer: ToolAnswerer) -> Turn:
+def _codec_turn(question: fluency.Question, payload_text: str, answerer: ToolAnswerer,
+                system: str = "") -> Turn:
     """The one request a codec-eval question is sent as — a single user message, no system
     message — shared by the sweep (`_ask_codec_question`) and `preflight_encoding`, so a
-    model that passes the pre-flight passed on the request it is scored on."""
-    messages: list[dict] = [
-        {"role": "user", "content": fluency._user_prompt(question.prompt, _codec_instruction(),
-                                                          payload_text)},
-    ]
+    model that passes the pre-flight passed on the request it is scored on.
+
+    `system` carries terse's primer on the terse arm of a `--primer` run and is omitted
+    otherwise (no empty system message — see the module docstring). The instruction follows
+    the backend's channel, identically on both arms, so the pairing is unaffected."""
+    instruction = (_TEXT_INSTRUCTION if answer_channel(answerer) == "text"
+                   else _codec_instruction())
+    messages: list[dict] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": fluency._user_prompt(
+        question.prompt, instruction, payload_text)})
     return _safe_call(answerer, messages)
 
 
@@ -486,7 +505,7 @@ def _recorded_value(turn: Turn) -> tuple[bool, Any]:
 
 
 def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
-                      trials: int = 1) -> list[dict]:
+                      trials: int = 1, primer: str = "") -> list[dict]:
     """Ask each `CODEC_QTYPES` question in `obj` over raw vs terse, `trials` times each, via
     the tool-calling protocol. One row per question.
 
@@ -496,8 +515,15 @@ def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
     enough to flow through `report.arm_gap`/`_form_stats`/`paired_rows` unchanged. `fails`/
     `attempts` still track raw call losses, so `report._unmeasured`'s >20%-loss gate still
     catches a substantially-down backend and reports UNRESOLVED rather than a confident
-    verdict computed over a small, self-selected surviving sample."""
+    verdict computed over a small, self-selected surviving sample.
+
+    `primer` goes to the TERSE arm only, as a system message: the comparison is "terse not
+    installed" (raw, no primer) against "terse installed" (compressed, primer in the system
+    prompt, where the live router puts it). A text-channel backend's rows OMIT the
+    `<arm>_calls` counters — tool-call compliance is not a property it can have, and a 0
+    there would read as "declined the tool every time" (`report.codec_call_rate`)."""
     terse_text = fluency.compress(obj)
+    channel = answer_channel(answerer)
     out: list[dict] = []
     for q in gen_codec_questions(obj):
         raw_ok = terse_ok = raw_fail = terse_fail = raw_calls = terse_calls = 0
@@ -507,12 +533,13 @@ def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
             raw_calls += int(called)
             raw_ok += int(ok)  # an errored call scores as a miss, not an exclusion
         for _ in range(trials):
-            ok, err, called = _ask_codec_question(q, terse_text, answerer)
+            ok, err, called = _ask_codec_question(q, terse_text, answerer, primer)
             terse_fail += int(err)
             terse_calls += int(called)
             terse_ok += int(ok)
-        out.append({
+        row = {
             "qid": q.qid, "qtype": q.qtype, "transform": q.transform, "trials": trials,
+            "channel": channel, "primer": bool(primer),
             "raw_ok": raw_ok, "terse_ok": terse_ok,
             "raw_trials": trials,
             "terse_trials": trials,
@@ -534,7 +561,10 @@ def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
             "terse_answered": trials - terse_fail,
             "fails": raw_fail + terse_fail,
             "attempts": trials * 2,
-        })
+        }
+        if channel == "text":
+            del row["raw_calls"], row["terse_calls"]
+        out.append(row)
     return out
 
 
@@ -738,7 +768,8 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                       progress: Callable[[str], None] | None = None,
                       preflight: bool = True,
                       limits: dict[str, int] | None = None,
-                      tool_defs: list[dict] | None = None) -> CodecRun:
+                      tool_defs: list[dict] | None = None,
+                      primer: str = "") -> CodecRun:
     """Run the codec-tier eval for each named tool-capable answerer over every payload in
     the corpus that has at least one `CODEC_QTYPES` question AND that the codec actually
     encodes (`codec_changes`). Mirrors `dropeval.run_drop_fluency`'s
@@ -885,7 +916,8 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                              f"{str(tags['tool']):<24} {name}: {arms} > {limit:,} "
                              f"max_input_tokens — not asked")
                 continue
-            for row in run_codec_payload(obj, env["raw"], answerer, trials=trials):
+            for row in run_codec_payload(obj, env["raw"], answerer, trials=trials,
+                                         primer=primer):
                 results[name].append({**tags, **toks, **row})
             if progress is not None:
                 progress(fluency.progress_line("fluency --codec-verdict", name, i,
@@ -893,3 +925,29 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
     return CodecRun(results, excluded, skipped_unaskable,
                     limit_check_ran=(not limits) or limit_check_available(),
                     merged_duplicates=merged_duplicates)
+
+
+def cli_text_answerer(alias: str) -> ToolAnswerer:
+    """A REAL Anthropic model (`claude -p`, OAuth subscription) as a codec-eval answerer.
+
+    The only path to the model that actually reads terse's output on a Claude Code fleet —
+    the gateway's `claude-*` ids are DeepSeek aliases (`fluency.cli_answerer`'s docstring).
+    `claude -p` cannot call a tool, so this is a TEXT-channel backend (`channel = "text"`):
+    `_codec_turn` asks for a whole-reply JSON value, which `_prose_value` already scores.
+    Text is the weaker channel for a reader that calls tools in production, so a SAFE here
+    is not flattered by it.
+
+    A `None` from the underlying answerer (transport failure, quota wall, empty reply) is an
+    errored turn, never an empty answer — the same distinction `_safe_call` keeps."""
+    ask = fluency.cli_answerer(alias)
+
+    def answer(messages: list[dict]) -> Turn:
+        system = "".join(m["content"] for m in messages if m["role"] == "system")
+        user = "\n\n".join(m["content"] for m in messages if m["role"] == "user")
+        reply = ask(system, user)
+        if reply is None:
+            return Turn(text="", error=True)
+        return Turn(text=reply)
+
+    answer.channel = "text"  # type: ignore[attr-defined]
+    return answer
