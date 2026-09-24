@@ -13,7 +13,51 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **`terse fluency --codec-verdict` can measure the model that actually reads terse's
+  output, with the primer it actually gets.** Every verdict so far came from small Qwen
+  models on a gateway, with no primer, while a Claude Code fleet is read by Claude with the
+  primer attached. A `cli:<alias>` model (real Anthropic via `claude -p`) is now accepted: it
+  cannot call tools, so it answers with a whole-reply JSON value, which the grader already
+  scored. The new `--primer` flag gives the terse arm the primer production sends and the
+  raw arm none, so the comparison is terse installed against terse not installed (see
+  Changed). The report states both conditions above the table; rows carry `channel`,
+  `primer`, and on the text channel `raw_parsed`/`terse_parsed`.
+
+### Changed
+
+- **The codec verdict proves harm two ways, and lost or unreadable answers cannot move it.**
+  UNSAFE used to mean "any trial where raw succeeded and terse did not", which is sound only
+  for a reader that answers identically every time. None do: `claude -p` has no temperature
+  control, and the gateway models flipped run to run at temperature 0 (#412). A reader scoring
+  50% on both arms read UNSAFE in 183 of 200 simulated runs. Now a cell is UNSAFE when either
+  terse did worse on significantly more questions than better (one-sided sign test,
+  p < 0.05), or one question fails reproducibly on terse across its own trials (one-sided
+  exact test, p < 0.05 divided by the cell's question count). So 20/20 vs 0/20 on a single
+  question is UNSAFE, and one-trial wobbles cannot cancel it. A call that went unanswered is
+  charged against whichever verdict it would help, so it can neither buy a SAFE nor hide an
+  UNSAFE. Leaning worse, fewer than 5 complete questions, or fewer than 20 answered trials is
+  UNRESOLVED. Every verdict names lost calls, and a SAFE row states each model's split.
+- **Raw and terse trials are interleaved.** A backend that died mid-question used to charge
+  the whole loss to the terse arm.
+- **`--primer` sends what production sends, where production sends it.** Since #451 the
+  router attaches its primer once per session, ahead of the first compressed result, so
+  `--primer` puts the primer built from `--policy` for the corpus's servers inline ahead of
+  the terse arm's payload. It is required alongside `--policy`, runs in the pre-flight too,
+  and counts toward the terse arm's input limit. `--primer` outside `--codec-verdict` is an
+  error.
+- **A reply that carries no value is unanswered, not wrong, on either channel.** A reply with
+  no tool call and no bare JSON value delivered nothing to score, so it is charged like a
+  lost call; rows gain `raw_parsed`/`terse_parsed`. On the text channel SAFE needs 80%
+  bare-value replies on each arm, and text rows written before these counters existed read
+  UNRESOLVED.
+- **SAFE also checks every question on its own, uncorrected.** The per-question exact test
+  is corrected for the number of questions before it can call UNSAFE, which left a small
+  always-wrong question invisible to SAFE. Now any question that reads worse at p < 0.05
+  holds the cell at UNRESOLVED.
+- **`--primer` compresses the terse arm under the same `--policy`,** so the primer describes
+  exactly the forms the payload uses.
 
 ## [0.37.0] - 2026-09-24
 
