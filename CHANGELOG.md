@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.35.0] - 2026-09-23
+
 ### Fixed
 
 - **The primer break-even is taken on what the model receives, not what crossed the pipe
