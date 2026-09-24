@@ -46,13 +46,28 @@ def _row(qid: str, raw_ok: int, terse_ok: int, trials: int = 1,
 # --------------------------------------------------------------------------- #
 # codec_verdict
 # --------------------------------------------------------------------------- #
-def test_a_single_structural_failure_is_UNSAFE_regardless_of_sample_size():
-    # 1 failure out of a large, otherwise-clean sample — a ratio-shaped gate would round
-    # this down to "safe enough"; the demonstrated-corruption gate must not.
+def test_a_single_worse_question_is_not_UNSAFE_but_it_blocks_SAFE():
+    # Sign test (replacing zero tolerance): one discordant question is p=0.5 — a
+    # non-deterministic reader produces that from noise alone. It can never read SAFE either:
+    # terse leaned worse, which `codec_unresolved_reasons` names.
     rows = [_row(f"q{i}", 1, 1) for i in range(50)]
-    rows.append(_row("q-bad", 1, 0))  # one paired miss
+    rows.append(_row("q-bad", 1, 0))
     verdict, gap = codec_verdict(rows)
-    assert verdict == "UNSAFE"
+    assert verdict == "UNRESOLVED"
+
+
+def test_consistent_harm_across_questions_is_UNSAFE():
+    # Five questions all worse, none better: p = 1/32 < 0.05.
+    rows = [_row(f"q{i}", 1, 1) for i in range(20)]
+    rows += [_row(f"bad{i}", 1, 0) for i in range(5)]
+    assert codec_verdict(rows)[0] == "UNSAFE"
+
+
+def test_noise_on_both_arms_is_not_UNSAFE():
+    # The defect the sign test fixes: the same 50% reader on both arms, flipping per question.
+    rows = [_row(f"w{i}", 2, 1, trials=3) for i in range(3)]
+    rows += [_row(f"b{i}", 1, 2, trials=3) for i in range(3)]
+    assert codec_verdict(rows)[0] != "UNSAFE"
 
 
 def test_zero_failures_below_the_trial_floor_is_UNRESOLVED_not_SAFE():
@@ -81,7 +96,7 @@ def test_identical_partial_failure_on_both_arms_at_the_trial_floor_is_SAFE():
 def test_a_genuine_terse_specific_regression_is_UNSAFE_even_when_raw_is_imperfect():
     # raw succeeds MORE often than terse on the same row — a real excess, not just raw's
     # own baseline imperfection. Must still be UNSAFE.
-    rows = [_row("q1", raw_ok=20, terse_ok=15, trials=25)]
+    rows = [_row(f"q{i}", raw_ok=20, terse_ok=15, trials=25) for i in range(5)]
     verdict, gap = codec_verdict(rows)
     assert verdict == "UNSAFE"
 
@@ -109,10 +124,10 @@ def test_empty_rows_is_UNRESOLVED():
     assert verdict == "UNRESOLVED"
 
 
-def test_a_single_failure_beats_an_otherwise_unresolved_thin_sample():
-    # A thin sample (below the floor) that ALSO shows a failure must still be UNSAFE, not
-    # UNRESOLVED — the failure is dispositive; sample size only gates a clean run.
-    rows = [_row("q1", 1, 0)]
+def test_significant_harm_beats_an_otherwise_unresolved_thin_sample():
+    # Below the trial floor, but five questions all worse: significance is dispositive;
+    # sample size only gates a clean run.
+    rows = [_row(f"q{i}", 1, 0) for i in range(5)]
     verdict, gap = codec_verdict(rows)
     assert verdict == "UNSAFE"
 
@@ -207,7 +222,7 @@ def test_a_SAFE_cell_mixing_old_and_new_rows_claims_no_rate():
 
 def test_report_gates_on_the_worst_model_within_a_group():
     clean = [_row(f"q{i}", 1, 1) for i in range(_CODEC_MIN_TRIALS)]
-    broken = [_row("q-bad", 1, 0)]
+    broken = [_row(f"q-bad{i}", 1, 0) for i in range(5)]
     results = {
         "good-model": _tagged(clean, "tool-a", "array-of-records"),
         "bad-model": _tagged(broken, "tool-a", "array-of-records"),
@@ -267,7 +282,7 @@ def test_low_compliance_does_NOT_suppress_an_UNSAFE_verdict():
     # an observed excess is real regardless of compliance — withholding it would suppress
     # the finding this tier exists to make.
     rows = [_row(f"q{i}", 2, 2, trials=2, raw_calls=0, terse_calls=0) for i in range(20)]
-    rows.append(_row("q-bad", 2, 0, trials=2, raw_calls=0, terse_calls=0))
+    rows += [_row(f"q-bad{i}", 2, 0, trials=2, raw_calls=0, terse_calls=0) for i in range(5)]
     assert codec_verdict(rows)[0] == "UNSAFE"
 
 
@@ -610,6 +625,6 @@ def test_reasons_are_not_a_verdict_on_their_own():
     # UNSAFE cell. A caller must ask `codec_verdict` whether, and this function why.
     from terse.report import codec_unresolved_reasons
 
-    rows = [_row("q", 5, 4, trials=5, raw_calls=5, terse_calls=0)]
+    rows = [_row(f"q{i}", 5, 4, trials=5, raw_calls=5, terse_calls=0) for i in range(5)]
     assert codec_verdict(rows)[0] == "UNSAFE"
     assert codec_unresolved_reasons(rows)

@@ -35,10 +35,13 @@ def _text_answerer(reply_for):
 
 
 def _expected(messages):
-    """Answer each question correctly, whatever form the payload is in."""
+    """Answer each question correctly, whatever form the payload is in — the pre-flight's
+    questions included, so a CLI run gets past it."""
     user = messages[-1]["content"]
-    for q in codeceval.gen_codec_questions(PAYLOAD):
-        if q.prompt in user:
+    known = [(q, t) for q, t in codeceval.preflight_questions()]
+    known += [(q, None) for q in codeceval.gen_codec_questions(PAYLOAD)]
+    for q, text in known:
+        if q.prompt in user and (text is None or text in user):
             return json.dumps(q.expected)
     raise AssertionError("question not found in prompt")
 
@@ -107,23 +110,39 @@ def test_tool_rows_keep_their_counters():
     assert all(r["channel"] == "tool" and r["raw_calls"] == 1 for r in rows)
 
 
-def test_codec_verdict_accepts_a_cli_model_and_drop_eval_still_refuses_it(tmp_path, monkeypatch):
+def test_a_cli_run_completes_and_primer_reaches_only_the_terse_arm(tmp_path, monkeypatch):
+    """Through `main`, not `_build_answerers`: review found the old version of this test
+    passed on a run the pre-flight refused (rc 2, no report), and that the `--primer` CLI
+    wiring was pinned by nothing — `primer=""` hardcoded in cli.py survived the suite."""
     from terse.capture import capture_payload
     corpus = tmp_path / "c"
     corpus.mkdir()
     capture_payload("kb.read.x", RAW_TEXT, corpus, server="kb", manual=True)
-    built = []
+    seen: list[list[dict]] = []
 
     def fake_text(alias):
-        built.append(alias)
-        ans, _ = _text_answerer(lambda m: "[]")
+        ans, log = _text_answerer(_expected)
+        seen.append(log)  # type: ignore[arg-type]
         return ans
 
     monkeypatch.setattr(codeceval, "cli_text_answerer", fake_text)
-    main(["fluency", "--codec-verdict", "--corpus", str(corpus), "--models", "cli:haiku",
-          "--out", str(tmp_path / "r.md")])
-    assert built == ["haiku"]
-    # Every other tool-calling mode still refuses: it has no text-channel adapter.
+    out = tmp_path / "r.md"
+    assert main(["fluency", "--codec-verdict", "--primer", "--corpus", str(corpus),
+                 "--trials", "20", "--models", "cli:haiku", "--out", str(out)]) == 0
+    report = out.read_text()
+    assert "**SAFE**" in report and "**Primer:**" in report and "**Text channel:**" in report
+    terse_text = fluency.compress(PAYLOAD)
+    sweep = [m for m in seen[0] if RAW_TEXT in m[-1]["content"]
+             or terse_text in m[-1]["content"]]
+    assert sweep
+    for msgs in sweep:
+        has_primer = any(m["role"] == "system" for m in msgs)
+        assert has_primer == (terse_text in msgs[-1]["content"])
+        # the SAME text instruction on both arms — pairing depends on it
+        assert codeceval._TEXT_INSTRUCTION in msgs[-1]["content"]
+
+
+def test_drop_eval_still_refuses_a_cli_model():
     import argparse
 
     import pytest
@@ -132,3 +151,52 @@ def test_codec_verdict_accepts_a_cli_model_and_drop_eval_still_refuses_it(tmp_pa
     ns = argparse.Namespace(base_url=None, api_key_env=None, models="cli:haiku")
     with pytest.raises(SystemExit, match="does not support --drop-eval"):
         _build_answerers(ns, lambda *a: None, mode_name="--drop-eval")
+
+
+def test_a_backend_that_dies_mid_question_costs_both_arms_alike():
+    """Review: raw trials then terse trials turned a quota wall into raw k / terse 0 —
+    UNSAFE from transport loss. Interleaved, the arms lose at most one call apart."""
+    state = {"n": 0}
+
+    def dies_after_five(messages):
+        state["n"] += 1
+        if state["n"] > 5:
+            return Turn(text="", error=True)
+        return Turn(text=_expected(messages))
+    dies_after_five.channel = "text"  # type: ignore[attr-defined]
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, dies_after_five, trials=10)
+    first = rows[0]
+    assert abs(first["raw_answered"] - first["terse_answered"]) <= 1
+    assert abs(first["raw_ok"] - first["terse_ok"]) <= 1
+
+
+def test_a_right_value_in_the_wrong_format_is_a_format_miss_not_a_parse():
+    def explains_first(messages):
+        return Turn(text="Here it is: " + _expected(messages))
+    explains_first.channel = "text"  # type: ignore[attr-defined]
+
+    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, explains_first, trials=2)
+    assert all(r["raw_ok"] == r["terse_ok"] == 0 for r in rows)
+    assert all(r["raw_parsed"] == r["terse_parsed"] == 0 for r in rows)
+
+
+def test_the_primer_counts_toward_the_terse_arms_input_limit():
+    # Review: request_tokens ignored the ~555-token primer, so a terse request really over
+    # the limit passed the check and errored on the terse arm only.
+    import pytest
+
+    from terse.tokenize import count_cl100k
+    if count_cl100k("x") is None:
+        pytest.skip("no tokenizer")
+    q = codeceval.gen_codec_questions(PAYLOAD)[0]
+    terse_text = fluency.compress(PAYLOAD)
+    bare = codeceval.request_tokens(q, terse_text)
+    primer = "primer " * 400
+    assert codeceval.request_tokens(q, terse_text, system=primer) > bare
+    limit = max(codeceval.request_tokens(q2, t, None) or 0
+                for q2 in codeceval.gen_codec_questions(PAYLOAD)
+                for t in (RAW_TEXT, terse_text)) + 1
+    assert codeceval.oversized_arms(PAYLOAD, RAW_TEXT, limit) == []
+    over = codeceval.oversized_arms(PAYLOAD, RAW_TEXT, limit, primer=primer)
+    assert [arm for arm, _ in over] == ["terse"]

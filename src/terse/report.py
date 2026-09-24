@@ -1320,6 +1320,44 @@ def _not_measured_lines(
 # `tests/test_codec_verdict.py`; #337 added the VALUE, which nothing held.)
 _CODEC_MIN_TRIALS = 20
 
+# One-sided significance for the codec verdict's paired sign test. The verdict used to be
+# "any trial where raw succeeded and terse did not is UNSAFE" — sound only for a reader that
+# answers the same way every time. `claude -p` has no temperature control, and even the
+# gateway models at temperature 0 flipped run to run (#412). Simulated: a reader scoring 50%
+# per trial on BOTH arms, 3 payloads x 2 questions x 3 trials, printed UNSAFE in 183 of 200
+# runs; the one real Haiku run printed UNSAFE on raw 43 / terse 42.
+_CODEC_SIGN_ALPHA = 0.05
+
+
+def _codec_lost_text(rows: list[dict[str, Any]]) -> str:
+    """`"; N of M calls lost"` when any call in `rows` never produced a scorable turn, else "".
+
+    Stated beside SAFE and UNSAFE, not only via `_unmeasured`'s 20% gate: a real `claude -p`
+    run lost 144 of 264 calls to a quota wall and its report never said so (review of the
+    claude-reader change)."""
+    lost = sum(int(r.get("fails", 0)) for r in rows)
+    attempts = sum(int(r.get("attempts", 0)) for r in rows)
+    return f"; {lost} of {attempts} calls lost" if lost else ""
+
+
+def codec_sign(rows: list[dict[str, Any]]) -> tuple[int, int, float]:
+    """`(worse, better, p)`: questions (rows) where terse scored below / above raw, and the
+    one-sided binomial P(X >= worse) under "terse is no worse" (each discordant question a
+    fair coin). Ties carry no information and are dropped, as in any sign test.
+
+    Question-level, not trial-level, on purpose: repeated trials of one question share the
+    payload and the prompt, so they are not independent draws, and counting them as such is
+    how a single hard question became "27 excess trials". The cost is power — fewer than 5
+    discordant questions can never reach p < 0.05 — which the verdict reports as
+    UNRESOLVED when terse leans worse, never as SAFE."""
+    worse = sum(1 for r in rows if int(r["raw_ok"]) > int(r["terse_ok"]))
+    better = sum(1 for r in rows if int(r["terse_ok"]) > int(r["raw_ok"]))
+    n = worse + better
+    if n == 0:
+        return 0, 0, 1.0
+    p = sum(math.comb(n, k) for k in range(worse, n + 1)) / 2 ** n
+    return worse, better, p
+
 # The share of an arm's trials that must have delivered their value through the tool call
 # for that arm to license SAFE (#403). Reuses `UNMEASURED_FAIL_SHARE` rather than
 # introducing a second, independently-tunable number: both answer "how much of this arm's
@@ -1480,8 +1518,9 @@ def codec_verdict(rows: list[dict[str, Any]],
     g = arm_gap(rows, "terse_ok", "raw_ok", min_paired=0)
     if g.excluded:
         return "UNRESOLVED", g
-    excess_terse_misses = sum(max(0, int(r["raw_ok"]) - int(r["terse_ok"])) for r in g.rows)
-    if excess_terse_misses > 0:
+    # Paired sign test, not zero tolerance (see `_CODEC_SIGN_ALPHA`): UNSAFE needs terse to
+    # do worse on significantly more questions than it does better on.
+    if codec_sign(g.rows)[2] < _CODEC_SIGN_ALPHA:
         return "UNSAFE", g
     # Every SAFE-blocking gate lives in `codec_unresolved_reasons` and nowhere else, so the
     # verdict IS "any reason named" — a gate cannot exist without the sentence the table
@@ -1739,6 +1778,12 @@ def codec_unresolved_reasons(rows: list[dict[str, Any]], excluded_from_group: in
     review showed the grid test meant to hold them together could not fail: a gate added to
     the verdict alone survived it. Now there is one copy, so that drift is unrepresentable."""
     reasons: list[str] = []
+    # Terse leaned worse without reaching significance: not evidence of corruption, and not
+    # evidence of its absence either. Blocks SAFE only.
+    worse, better, p = codec_sign(rows)
+    if worse > better:
+        reasons.append(f"terse did worse on {worse} question(s) and better on {better} — "
+                       f"not significant (sign test p={p:.2f}, need <{_CODEC_SIGN_ALPHA})")
     # A payload this cell never asked, because it exceeded a model's input limit (#403
     # Blocker 4), blocks SAFE — never UNSAFE.
     #
@@ -1848,9 +1893,10 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
         "structure) and `enumerate` questions (reading one column back out of every row, in",
         "order) — values an agent carries verbatim into its next tool call — each PAIRED",
         "against the same question answered from raw. The Questions column says which types",
-        "a cell was scored on; a verdict covers those, not the tool as a whole. No percentage",
-        "tolerance: any trial where raw succeeded and terse did not is UNSAFE; a clean run",
-        "needs enough trials to trust the zero, or it is UNRESOLVED.",
+        "a cell was scored on; a verdict covers those, not the tool as a whole. UNSAFE means",
+        "terse did worse than raw on significantly more questions than it did better on",
+        f"(one-sided sign test, p < {_CODEC_SIGN_ALPHA}); leaning worse without significance,",
+        "or too few trials, is UNRESOLVED.",
         "",
     ]
     # Two run conditions that change what a verdict is ABOUT, stated before the table so a
@@ -1967,10 +2013,11 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
         n = _codec_trials(worst_gap)
         questions, n_col, model_col = _codec_questions(worst_gap), str(n), f"`{worst_model}`"
         if worst_verdict == "UNSAFE":
-            excess = sum(max(0, int(r["raw_ok"]) - int(r["terse_ok"]))
-                        for r in worst_gap.rows)
-            why = (f"{excess} trial(s) where raw succeeded and terse did not "
-                  f"(raw {worst_gap.control_acc:.0%}, terse {worst_gap.form_acc:.0%})")
+            worse, better, p = codec_sign(worst_gap.rows)
+            why = (f"terse did worse on {worse} question(s) and better on {better} "
+                   f"(sign test p={p:.3f}; raw {worst_gap.control_acc:.0%}, "
+                   f"terse {worst_gap.form_acc:.0%})"
+                   + _codec_lost_text(by_model.get(worst_model, [])))
         elif worst_verdict == "UNRESOLVED":
             # ALL of them, not the first — and for EVERY unresolved model, not the one the
             # tie-break named. A cell held back by two models for different reasons stays
@@ -2008,7 +2055,11 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
                                    for m, _ in per_model)
                 model_col = ", ".join(f"`{m}`" for m, _ in per_model)
         else:
-            why = f"{n} zero-failure trials"
+            worse, better, _p = codec_sign(worst_gap.rows)
+            why = (f"{n} zero-failure trials" if worse == better == 0 else
+                   f"{n} trials; terse did worse on {worse} question(s) and better on "
+                   f"{better}")
+            why += _codec_lost_text(by_model.get(worst_model, []))
             # The other half of #412: a LOW compliance rate is labelled one run's, and so must
             # a passing one be. SAFE licenses "the value survives into a real tool argument"
             # on a rate that read 29% and then 100% on the same cell, so the rate that let

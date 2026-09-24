@@ -426,7 +426,8 @@ def _prose_value(turn: Turn) -> tuple[bool, Any]:
 
 
 def _ask_codec_question(question: fluency.Question, payload_text: str,
-                        answerer: ToolAnswerer, system: str = "") -> tuple[bool, bool, bool]:
+                        answerer: ToolAnswerer,
+                        system: str = "") -> tuple[bool, bool, bool, bool]:
     """One trial: ask `question` over `payload_text`, expect a `RECORD_VALUE_TOOL` call.
     Returns (matched, errored, called).
 
@@ -467,12 +468,15 @@ def _ask_codec_question(question: fluency.Question, payload_text: str,
     turn = _codec_turn(question, payload_text, answerer, system)
     if turn.error:
         # counted as a miss by the caller, kept in the fixed denominator; not a tool call
-        return False, True, False
+        return False, True, False, False
     called, got = _recorded_value(turn)
     if called:
-        return _value_matches(got, question.expected), False, True
+        return _value_matches(got, question.expected), False, True, True
     parsed, prose = _prose_value(turn)
-    return parsed and _value_matches(prose, question.expected), False, False
+    # The 4th value: did the reply carry a scorable value AT ALL (a tool call, or a
+    # whole-reply JSON value)? On the text channel it separates "wrong format" from "wrong
+    # value" — a primer that makes the model explain first would otherwise read as corruption.
+    return parsed and _value_matches(prose, question.expected), False, False, parsed
 
 
 def _codec_turn(question: fluency.Question, payload_text: str, answerer: ToolAnswerer,
@@ -527,16 +531,23 @@ def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
     out: list[dict] = []
     for q in gen_codec_questions(obj):
         raw_ok = terse_ok = raw_fail = terse_fail = raw_calls = terse_calls = 0
+        raw_parsed = terse_parsed = 0
+        # INTERLEAVED, one raw then one terse per trial. The first cut ran every raw trial
+        # and then every terse trial, so a backend that dies mid-question (`claude -p`'s
+        # quota wall is a hard step: every later call fails) charged the whole loss to the
+        # terse arm — raw k, terse 0 — which the verdict read as corruption. Interleaved, a
+        # wall costs both arms alike, give or take one call.
         for _ in range(trials):
-            ok, err, called = _ask_codec_question(q, raw_text, answerer)
+            ok, err, called, parsed = _ask_codec_question(q, raw_text, answerer)
             raw_fail += int(err)
             raw_calls += int(called)
             raw_ok += int(ok)  # an errored call scores as a miss, not an exclusion
-        for _ in range(trials):
-            ok, err, called = _ask_codec_question(q, terse_text, answerer, primer)
+            raw_parsed += int(parsed)
+            ok, err, called, parsed = _ask_codec_question(q, terse_text, answerer, primer)
             terse_fail += int(err)
             terse_calls += int(called)
             terse_ok += int(ok)
+            terse_parsed += int(parsed)
         row = {
             "qid": q.qid, "qtype": q.qtype, "transform": q.transform, "trials": trials,
             "channel": channel, "primer": bool(primer),
@@ -564,6 +575,9 @@ def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
         }
         if channel == "text":
             del row["raw_calls"], row["terse_calls"]
+            # Replies that were a whole JSON value, right or wrong. `<arm>_ok` below it is a
+            # format miss, not a wrong value — the text channel's stand-in for `<arm>_calls`.
+            row["raw_parsed"], row["terse_parsed"] = raw_parsed, terse_parsed
         out.append(row)
     return out
 
@@ -647,7 +661,7 @@ class CodecRun(NamedTuple):
 
 
 def request_tokens(question: fluency.Question, payload_text: str,
-                   tool_defs: list[dict] | None = None) -> int | None:
+                   tool_defs: list[dict] | None = None, system: str = "") -> int | None:
     """cl100k count of the REAL request one trial sends, or `None` without a tokenizer.
 
     The whole request, not the payload: `_codec_turn`'s user message plus the serialized
@@ -676,11 +690,14 @@ def request_tokens(question: fluency.Question, payload_text: str,
     model's own tokenizer or a per-content bound; open on #403."""
     text = fluency._user_prompt(question.prompt, _codec_instruction(), payload_text)
     tools = json.dumps(tool_defs if tool_defs is not None else [RECORD_VALUE_TOOL_DEF])
-    return count_cl100k(text + tools)
+    # `system`: the primer a `--primer` run sends on the terse arm (~555 cl100k), which the
+    # first cut left out — a terse request really over the limit passed and errored.
+    return count_cl100k(system + text + tools)
 
 
 def oversized_arms(obj: Any, raw_text: str, limit: int,
-                   tool_defs: list[dict] | None = None) -> list[tuple[str, int]]:
+                   tool_defs: list[dict] | None = None,
+                   primer: str = "") -> list[tuple[str, int]]:
     """`[(arm, tokens), ...]` for every arm whose LARGEST request exceeds `limit`. Empty
     when the payload fits, or when no tokenizer is available to say.
 
@@ -700,9 +717,9 @@ def oversized_arms(obj: Any, raw_text: str, limit: int,
     if not questions:
         return []
     out: list[tuple[str, int]] = []
-    for arm, text in (("raw", raw_text), ("terse", fluency.compress(obj))):
+    for arm, text, system in (("raw", raw_text, ""), ("terse", fluency.compress(obj), primer)):
         sizes = [n for q in questions
-                 if (n := request_tokens(q, text, tool_defs)) is not None]
+                 if (n := request_tokens(q, text, tool_defs, system)) is not None]
         if sizes and max(sizes) > limit:
             out.append((arm, max(sizes)))
     return out
@@ -901,7 +918,7 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
             # `is not None`, not truthiness: a declared limit of 0 means NOTHING fits, and
             # reading it as "no limit known" would silently disable the check for the one
             # value that most obviously asks for it.
-            over = (oversized_arms(obj, env["raw"], limit, tool_defs)
+            over = (oversized_arms(obj, env["raw"], limit, tool_defs, primer)
                     if limit is not None else [])
             if over and limit is not None:
                 # One line per (model, payload), like the skip lines above: the run says
