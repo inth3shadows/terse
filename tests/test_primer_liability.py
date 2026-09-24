@@ -1428,7 +1428,7 @@ def test_a_pre_cadence_blob_gets_the_recurring_legend_not_the_standalone_one(tmp
                          for s in liab["servers"]]
     text = "\n".join(build_primer_section(legacy))
     assert "/turn = an eagerly-primed router" in text
-    assert "1x = a lazily-primed standalone entry" not in text
+    assert "1x = a lazily-primed entry" not in text
 
 
 def test_the_break_even_row_stays_inside_eighty_columns(tmp_path):

@@ -44,6 +44,8 @@ TOP_LEVEL = {"total", "decisions", "diff_reasons", "tools", "versions", "retriev
              # every ledger written before it shipped, and a consumer must read empty as
              # "this ledger cannot say", never as "no primer was sent".
              "primers",
+             # #212: lazy-router sessions, by router label. Empty = "cannot say".
+             "router_sessions",
              "primer_liability"}
 
 # `context_*_tokens` added on purpose (#420): what the model RECEIVES when the client drops
@@ -56,7 +58,12 @@ TOTAL = {"blocks", "raw_chars", "out_chars", "raw_tokens", "out_tokens",
 # whose lazy primer could actually have fired, so losing it silently reverts that fix.
 TOOL_ROW = {"server", "tool", "blocks", "tokenized", "encoded", "diffs",
             "raw_chars", "out_chars", "raw_tokens", "out_tokens",
-            "context_raw_tokens", "context_out_tokens"}
+            "context_raw_tokens", "context_out_tokens",
+            # #212: rows stamped by a lazy router's peer, by router label. `{}` = none.
+            "router_stamps"}
+
+# #212: one per router label — the proof a lazy router ran, even with no result.
+ROUTER_SESSION_ROW = {"server", "sessions"}
 
 VERSION_ROW = {"blocks", "tokenized", "raw_tokens", "out_tokens"}
 
@@ -129,7 +136,8 @@ LIABILITY_CONTRIBUTOR = {"label", "blocks", "tokenized_blocks", "saved_tokens",
 # consumer that treats `blocks: null` as 0 draws the conclusion the None exists to prevent.
 TYPES: dict[str, tuple[type | None, ...]] = {
     "blocks": (int, type(None)), "tokenized": (int,), "encoded": (int,),
-    "diffs": (int,), "raw_chars": (int,), "out_chars": (int,),
+    "diffs": (int,), "router_stamps": (dict,), "sessions": (int,),
+    "raw_chars": (int,), "out_chars": (int,),
     "raw_tokens": (int,), "out_tokens": (int,),
     "context_raw_tokens": (int,), "context_out_tokens": (int,),
     "untokenized": (int,), "unversioned": (int,),
@@ -245,7 +253,8 @@ def test_every_named_field_also_has_a_pinned_type():
     person to add a field only has to touch the NAME manifest to go green and the type
     promise silently stops applying to it (found in review — the same
     tolerates-growth-silently failure this module's own docstring warns about)."""
-    named = (TOTAL | TOOL_ROW | VERSION_ROW | RETRIEVE_ROW | PRIMER_ROW | LIABILITY
+    named = (TOTAL | TOOL_ROW | VERSION_ROW | RETRIEVE_ROW | PRIMER_ROW | ROUTER_SESSION_ROW
+             | LIABILITY
              | LIABILITY_SERVER | LIABILITY_CONTRIBUTOR)
     assert not named - set(TYPES), (
         f"no type pinned for: {sorted(named - set(TYPES))}. {_ADD_ON_PURPOSE}")
@@ -561,3 +570,16 @@ def test_a_passthrough_only_server_is_still_read_as_never_encoding(stats_json):
     liab = next(s for s in out["primer_liability"]["servers"] if s["server"] == "kb")
     assert liab["cadence"] == "once/session (unpaid)"
     assert out["primer_liability"]["free"] == ["kb"]
+
+
+def test_the_router_session_rows_are_exactly_these_keys(stats_json):
+    """#212, driven through `main(["stats", "--json"])` like every other row."""
+    out = stats_json([_rec(), {"ts": 5, "version": "9.9.9", "server": "router:p.json:abc",
+                                "event": "router_session"}])
+    assert [r["server"] for r in out["router_sessions"]] == ["router:p.json:abc"]
+    for row in out["router_sessions"]:
+        assert set(row) == ROUTER_SESSION_ROW, _ADD_ON_PURPOSE
+        _check_types("router_sessions[]", row)
+    assert out["router_sessions"][0] == {"server": "router:p.json:abc", "sessions": 1}
+    # A session row is not a result: it never reaches the savings totals.
+    assert out["total"]["blocks"] == 1

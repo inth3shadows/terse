@@ -1750,6 +1750,10 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
                     # An unreadable peers file is reported, not raised: every route out of
                     # that state ran through code that used to traceback on it.
                     "peers_error": peers_err,
+                    # A router's peers file: the identity its OWN ledger rows are written
+                    # under (`stats.router_ledger_label`, #212). None for every other row.
+                    "peers_file": (str(peers_p) if state in ("router", "router-ambiguous")
+                                   else None),
                     "ledger_identity": ledger_identity,
                     "ledger_identity_explicit": ledger_identity_explicit})
     return rows

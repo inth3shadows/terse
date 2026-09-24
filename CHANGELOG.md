@@ -13,6 +13,34 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Changed
+
+- **A multiproxy router primes lazily (#212).** Its union primer no longer rides
+  `initialize.instructions` — re-read by the client as `cache_read` on every turn — but
+  attaches ONCE per session to the first result from ANY peer that carries a terse wire
+  form, through one latch shared by every peer. Measured before building over 1,312 router
+  sessions: 71% never saw a terse marker, and the eager primer was 0.25% of all spend
+  (net saving ~0.15%). Peers' own `instructions` still ride `initialize`.
+- **Until that primer has attached, a router passes `structuredContent` results through.** The
+  client discards a text block beside a typed field, so no primer can ride with it, and the
+  eager primer used to be what explained a rewritten one — `kb` returns one on half its
+  results. The WHOLE result passes through (ledgered as `passthrough`, diff reason
+  `primer_hold`), text block included, so a text-reading client never sees an unexplained
+  envelope either; the cost is that result's compression.
+- **`terse stats` bills a router by how it actually primed.** A lazy router writes one
+  `router_session` row per `initialize`, stamps every peer result row with its label
+  (`router:<peers file>:<hash>`, never a peer's — #396), and records its attach under that
+  label. A router with its own session or stamped rows and NO unstamped row under a peer
+  it writes is billed once per session (or listed free when never called) instead of per turn, so an idle one no
+  longer reads UNWRAP. Any unstamped row — an older router's, or a standalone duplicate's
+  under a contested label — keeps it per-turn: the conservative reading. The stamp is per
+  row, so `--since` and ledger rotation cannot fake or hide it.
+- **`terse stats --json`:** new top-level `router_sessions` (`server`, `sessions`); each
+  `tools[]` row gains `router_stamps` (`{router label: rows}`). `mcp-status` rows for a
+  router carry `peers_file`.
+
+## [0.36.2] - 2026-09-24
+
 ### Fixed
 
 - **A `folded` definition no longer hides the live entry the client actually launches

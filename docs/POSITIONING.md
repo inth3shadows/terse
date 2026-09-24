@@ -97,11 +97,12 @@ recurring charge.
 **The question is per server, not per install.** Each wrapped server attaches its
 own primer, once per session, so a six-server fleet pays six of them. What #211
 removed was the *turns* factor, not the *servers* factor — standalone cost went
-from `servers x turns` to `servers x 1`. Only the router is O(1) in peer count — but
-it pays that O(1) primer EVERY TURN rather than once per session, so at any real turn
-count a router is the more expensive shape, not the cheaper one. Consolidate for the
-operational reasons (one policy, one process, one permission surface), not to save
-tokens; `USAGE.md` and `install-mcp --multiproxy` say the same.
+from `servers x turns` to `servers x 1`. Only the router is O(1) in peer count, and
+since #212 it is lazy too: ONE union primer, once per session, on the first terse-marked
+result from any peer (before #212 it paid that primer EVERY TURN, which made it the more
+expensive shape at any real turn count). Consolidate for the operational reasons (one
+policy, one process, one permission surface); `USAGE.md` and `install-mcp --multiproxy`
+say the same.
 
 For a router/multiproxy setup wrapping several servers behind one shared primer, the
 break-even arithmetic is different in *kind*, not degree. The router's
@@ -119,11 +120,11 @@ per-peer primers — so it is O(1) in peer count, not O(N):
 | tail | 8 |
 | **full (all sections gated on)** | **555** |
 
-555 cl100k tokens is the hard ceiling, sent once at `initialize` — and then
-re-read every turn as `cache_read`, so unlike a standalone entry's lazy primer
-it is a RECURRING charge, paid from the first turn whether or not any peer is
-ever called. The diff paragraph alone is 190 of 555 cl100k tokens, so a router at
-that ceiling spends 34% of a recurring charge explaining one wire form — which is
+555 cl100k tokens is the hard ceiling. Before #212 it was sent at `initialize`
+and re-read every turn as `cache_read` — a RECURRING charge, paid from the first
+turn whether or not any peer was ever called. Since #212 it attaches once per
+session to the first terse-marked result, like a standalone entry's lazy primer. The diff paragraph alone is 190 of 555 cl100k tokens, so a router at
+that ceiling spent 34% of a (pre-#212) recurring charge explaining one wire form — which is
 the shape of the cost #170 weighed. A router that enables diffing and nothing else
 does not sit at the ceiling: it pays 438, of which the same paragraph is 43%. That is why
 `terse stats` reports it under a separate cadence from the standalone one, and never
@@ -133,8 +134,9 @@ case #211 fixed, where N wrapped servers meant N separate primers riding N
 `initialize` replies, scaling linearly with server count. A pre-#211 A/B run at 6
 idle peers behind a router (same code path, unchanged since) measured +4.5%
 weighted, inside the noise floor, versus +17.4% weighted for the same 6 servers
-standalone. Full measurement: #212, closed as no-op — no regression found, no code
-change needed.
+standalone. Full measurement: #212, first closed as no-op on that scaling question, then
+reopened and shipped as lazy router priming once 71% of router sessions were measured
+never to see a terse marker.
 
 ## Where terse pays off — public API servers
 
@@ -191,8 +193,8 @@ it would otherwise flatter every aggregate it appears in.
 
 *(The previous edition of this table — 2,357 blocks, snapshot 2026-08-11 — carried a
 "calls to clear its primer" column computed against per-server primers of 248/312. Those
-figures are superseded: the live router now reports a single union primer of **502
-tokens on a per-turn cadence**, which is not comparable to a per-server once-per-session
+figures are superseded: the live router then reported a single union primer of **502
+tokens on a per-turn cadence** (once per session since #212), which is not comparable to a per-server once-per-session
 charge and must not be divided into a per-call saving. See `BENCHMARKS.md` §7.)*
 
 The primer column is per server, and rule ORDER decides it — not whether a server
@@ -290,10 +292,9 @@ deterministic-only by decision, not by sequencing, and no amount of demand reope
   live follow-up to #249. If it lands, the primer arithmetic on this page becomes a
   legacy-mode footnote for whichever payloads still need the explanation.
 - **#270 — a multiproxy router's `initialize` blocks on its slowest peer**, so a fast first
-  request races MCP registration and voids the prompt cache. Router-level *lazy* priming
-  remains unbuilt, which is why `BENCHMARKS.md` §7 shows the router paying **502 tokens
-  every turn** while a standalone entry pays once per session. #212 closed as a no-op on a
-  different question (union-primer size vs peer count); it did not resolve the cadence.
+  request races MCP registration and voids the prompt cache. (Router-level *lazy* priming
+  shipped under #212, reopened after measuring 71% of router sessions never see a terse
+  marker; `BENCHMARKS.md` §7's **502 tokens every turn** is the pre-#212 cadence.)
 - **#252 — auto-tune drop rules from the observed retrieve rate.** The deterministic
   ceiling-raiser, and the general form of the per-tool drop-rule work in #271 and #273.
 - **#295 / #403 / #412 — what a compression verdict MEANS.** The codec-verdict apparatus
