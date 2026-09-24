@@ -889,13 +889,21 @@ parse it:
   no ledger label was recoverable — *we never found the rows to ask* — which is a different
   claim from `blocks: 0`, "installed and never called". Same for `turns_covered`,
   `session_covered`, `saved_per_block` and `primer_tokens`.
+- **`saved_tokens`, `saved_per_block` and `contributors[].saved_tokens` are net of
+  `terse.retrieve` cost (#438)** — the tokens the model spent fetching dropped values back,
+  billed to the label that dropped them. Only a label with tool rows in the window is
+  charged: a retrieve whose drop predates the window pays back a saving the window never
+  counted. `retrieve_tokens` is the amount netted (gross = `saved_tokens + retrieve_tokens`);
+  a non-zero `retrieve_untokenized` makes the net an upper bound. `wire_saved_tokens` stays
+  gross.
 - **`primer_liability` itself can be `null`**, when the install could not be sized (a
   malformed MCP config). The ledger half of the document is still complete and correct; the
   reason is on stderr.
 - **The `verdict` is per installed entry, never per peer.** A multiproxy router pays ONE
   union primer for its whole fleet, so `primer_liability.servers[]` already pools its peers
   into a single row and the verdict is computed against that pool. The per-peer breakdown is
-  in `contributors[]`, which carries evidence (blocks, tokens saved, rate) and deliberately
+  in `contributors[]`, which carries evidence (blocks, tokens saved net of that peer's
+  `terse.retrieve` cost (#438), rate) and deliberately
   no primer, break-even or verdict of its own — there is no honest per-peer primer to divide
   by, and charging each peer the full shared one would recommend unwrapping peers that are
   collectively paying for themselves.

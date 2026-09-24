@@ -79,6 +79,8 @@ LIABILITY = {"servers", "per_turn_tokens", "session_once_tokens", "unresolved",
              # #420: `saved_tokens` is now the CONTEXT basis the break-even needs; the wire
              # figure it used to carry moved here rather than vanishing.
              "wire_saved_tokens",
+             # #438: `saved_tokens` is NET of these; gross = saved_tokens + retrieve_tokens.
+             "retrieve_tokens", "retrieve_untokenized",
              "session_covered",
              # #396 round 4: contested label -> the NON-ROUTER entries writing it, sorted.
              # Per-label because a remedy is a fact about a label: a fleet-wide scan printed
@@ -148,6 +150,7 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "break_even_verdict": (str, type(None)),
     "per_turn_tokens": (int,), "session_once_tokens": (int,), "unresolved": (int,),
     "idle": (list,), "free": (list,), "uncertain": (list,), "saved_tokens": (int,), "wire_saved_tokens": (int,),
+    "retrieve_tokens": (int,), "retrieve_untokenized": (int,),
     "turns_covered": (float, int, type(None)),
     "session_covered": (float, int, type(None)),
     "servers": (list,),

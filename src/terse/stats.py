@@ -1853,6 +1853,34 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
             encoded_by_label[lbl] = None
         else:
             encoded_by_label[lbl] = (encoded_by_label.get(lbl) or 0) + enc
+    # Drop-rule COST, per label (#438). A `terse.retrieve` hit returns the very value the
+    # drop was credited with, so the gross context saving counts a saving the model then
+    # paid back. Netted at the two places a per-label saving becomes a rate or a ranking
+    # (`_break_even`, `_contributors`) through `net_saved_by_label`, and deliberately NOT
+    # folded into `saved_by_label`: `_label_has_rows` reads that map's truthiness, and a
+    # label whose only record in the window is a retrieve would start "having rows". Keyed
+    # on the retrieve's own `server`, which is the ORIGIN label (`build_retrieve_writer`) --
+    # the same key the tool rows use, so a router's retrieves land on the peer that dropped
+    # the value. A miss carries 0 tokens: it cost a call and returned nothing, and the
+    # payload is the only cost measured here.
+    #
+    # PAIRED: only a label with tool rows in this window is charged. A retrieve-only label
+    # is one whose drop landed before the window opened -- its saving is not in this
+    # window's pot, so its payback is not netted from it either (review of #438). Charging
+    # it anyway billed an entry that reads `never called`, and under a contested label
+    # (#396) billed a router for a retrieve the live duplicate may have made, flipping the
+    # router to UNWRAP -- while `_label_has_rows`, reading tool rows, never blacked it out.
+    # The fleet total below sums THIS map, so it and the per-entry figures agree. The
+    # retrieve table in `terse stats` still lists every retrieve.
+    retrieve_by_label: dict[str, int] = {}
+    for rrow in agg.get("retrieves") or []:
+        rlbl = str(rrow.get("server", "unknown"))
+        if not by_label.get(rlbl):
+            continue
+        retrieve_by_label[rlbl] = retrieve_by_label.get(rlbl, 0) + (rrow.get("tokens") or 0)
+    net_saved_by_label = {lbl: saved_by_label.get(lbl, 0) - retrieve_by_label.get(lbl, 0)
+                          for lbl in saved_by_label}
+
     def _label_has_rows(lbl: str) -> bool:
         """Did this label record any TOOL rows in the window? One definition, because the
         `labels` filter and the blackout must agree about it — they disagreed once already
@@ -2107,7 +2135,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
                                 None if primer_unknown else encoded, recorded=measured,
                                 unpaid=measured_zero),
             **_break_even(tokens, blocks, tokenized,
-                          sum(saved_by_label.get(lbl, 0) for lbl in labels),
+                          sum(net_saved_by_label.get(lbl, 0) for lbl in labels),
                           # Same shape as `no ledger label` — nothing measurable — but a
                           # different CAUSE, and the only one with an actionable fix.
                           no_label_reason=(
@@ -2129,7 +2157,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
                               if not labels and not is_router
                               and _guessed_label(row) in ambiguous
                               else None)),
-            "contributors": _contributors(labels, by_label, saved_by_label,
+            "contributors": _contributors(labels, by_label, net_saved_by_label,
                                           tokenized_by_label),
             # Reported, never summed into anything above — see `_superseded_labels`.
             "superseded_labels": _superseded_labels(row, labels, by_label, live),
@@ -2150,7 +2178,12 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
     once = sum(s["primer_tokens"] or 0 for s in servers if s["cadence"] == _ONCE)
     unresolved = sum(1 for s in servers if s["primer_tokens"] is None)
     total = agg.get("total") or {}
-    saved = _context_saved(total)
+    # Paired retrieves only -- the same set the per-entry rates were netted by (see
+    # `retrieve_by_label`), so the headline and the rows it sums cannot disagree.
+    retrieves = [r for r in agg.get("retrieves") or []
+                 if by_label.get(str(r.get("server", "unknown")))]
+    retrieve_tokens = sum(retrieve_by_label.values())
+    saved = _context_saved(total) - retrieve_tokens
     return {
         "servers": servers,
         # REDEFINED by the #211 follow-up: recurring (eager-priming) entries only. It used
@@ -2182,7 +2215,16 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         "uncertain": [s["server"] for s in servers if s["cadence"] == _ONCE_UNKNOWN],
         # CONTEXT basis since #420 — the unit the primer it is weighed against is paid in.
         # The wire figure it used to carry is `wire_saved_tokens`, beside it.
+        # NET of `retrieve_tokens` since #438: gross is `saved_tokens + retrieve_tokens`.
         "saved_tokens": saved,
+        # What `terse.retrieve` hits spent fetching dropped values back, in context. The
+        # one definition #252's retrieve-rate tuning should read, not a second one.
+        "retrieve_tokens": retrieve_tokens,
+        # Retrieves recorded without tiktoken: their cost is unknown, NOT zero, so while
+        # this is non-zero `saved_tokens` is an upper bound.
+        "retrieve_untokenized": sum(r.get("untokenized") or 0 for r in retrieves),
+        # GROSS on purpose: the pipe figure (#141), never a verdict input, and a retrieve is
+        # a separate call rather than a worse compression of this one.
         "wire_saved_tokens": (total.get("raw_tokens") or 0) - (total.get("out_tokens") or 0),
         # NOT `(saved - once) / per_turn`. `once` is charged per SESSION and `saved` is the
         # whole window, which spans an unknown number of sessions — a `terse proxy` is one
@@ -2378,6 +2420,7 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     # ledger, and merging the two identities would be the guessing #285 removed.
     lines.append("  (savings in this section are on the CONTEXT basis — what the model "
                  "receives — so they can sit below the per-tool table's wire figures, #420)")
+    lines += _retrieve_net_lines(liab)
     for srv in liab["servers"]:
         sup = srv.get("superseded_labels") or []
         if sup:
@@ -2601,6 +2644,26 @@ def _build_break_even_table(servers: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _retrieve_net_lines(liab: dict[str, Any]) -> list[str]:
+    """The retrieve deduction, said wherever a netted saving is read (#438).
+
+    ONE helper for both screens, because the cost has to sit beside the number it was
+    netted from: before #438 the retrieve table rendered only in `terse stats`, furthest
+    from the `--recommend` verdict it moves. Silent when nothing was retrieved -- an
+    `.get`, not a key access, so an older `--json` blob without the field stays silent too
+    rather than claiming a measured zero."""
+    cost = liab.get("retrieve_tokens") or 0
+    untok = liab.get("retrieve_untokenized") or 0
+    if not cost and not untok:
+        return []
+    out = [f"  net of {cost:,} tok the model spent on terse.retrieve fetching dropped "
+           f"values back (#438)"]
+    if untok:
+        out.append(f"  ({untok} retrieve(s) recorded without tiktoken — their cost is "
+                   f"unknown, so the net above is an upper bound)")
+    return out
+
+
 def build_recommend_section(liab: dict[str, Any]) -> list[str]:
     """One verdict word per installed entry — the `--recommend` body (#238).
 
@@ -2683,6 +2746,7 @@ def build_recommend_section(liab: dict[str, Any]) -> list[str]:
             ranked = "; ".join(f"{c['label']} {c['saved_tokens']:,}"
                                for c in srv["contributors"])
             lines.append(f"    {srv['server']} pools, by tokens saved: {ranked}")
+    lines += _retrieve_net_lines(liab)
     return lines
 
 

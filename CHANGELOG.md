@@ -13,7 +13,25 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **The primer break-even is net of what `terse.retrieve` spent fetching dropped values
+  back (#438).** A retrieve hit returns the very value a drop rule was credited with, but
+  the saving the verdict reads counted it in full. On the live ledger that was 145,606 tok
+  of a 1,508,007 context saving — 24% of `codegraph_explore`'s own — and the cost rendered
+  only in `terse stats`' retrieve table, never beside the break-even or on `--recommend`.
+  Both screens now print the deduction, and an entry whose retrieves outspend its whole
+  saving reads UNWRAP instead of KEEP. A retrieve is netted only where its label also has
+  tool rows in the window, so a drop that predates `--since` is not charged against a saving
+  the window never counted.
+
+### Changed
+
+- **`terse stats --json`:** `primer_liability.saved_tokens`, each server's
+  `saved_per_block` and `contributors[].saved_tokens` are net of retrieve cost, billed to
+  the label that dropped the value. New beside them: `primer_liability.retrieve_tokens`
+  (gross = `saved_tokens + retrieve_tokens`) and `retrieve_untokenized` (non-zero means the
+  net is an upper bound). `wire_saved_tokens` stays gross.
 
 ## [0.35.0] - 2026-09-23
 
