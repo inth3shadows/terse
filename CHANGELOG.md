@@ -15,6 +15,26 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **`terse stats --recommend` now says which basis its numbers are on (#441).** It replaces
+  the ledger tables, so the basis line #420 added never reached the one screen that decides
+  KEEP/UNWRAP (`grep -ci "context|wire"` returned 0). The line is gated on the RAW sides,
+  which cannot cancel the way comparing the two savings can.
+- **A saving computed from an aggregate without context sums is no longer published as a
+  context saving unmarked (#440),** and a half-present context pair no longer yields a large
+  negative saving: both keys are required, else the wire pair is used and said so.
+- **A no-primer entry driven negative by `terse.retrieve` cost reads `retrieved back`, not
+  `expanding` (#443)** — retrieves, not expansion, took the net below zero.
+
+### Changed
+
+- **`terse stats --json`:** `primer_liability` gains `saved_basis` (`context` | `wire` |
+  `mixed`) and `context_differs_from_wire`; each `servers[]` row gains `retrieve_tokens`;
+  `verdict_reason` gains `retrieved back`.
+
+## [0.36.0] - 2026-09-24
+
+### Fixed
+
 - **The primer break-even is net of what `terse.retrieve` spent fetching dropped values
   back (#438).** A retrieve hit returns the very value a drop rule was credited with, but
   the saving the verdict reads counted it in full. On the live ledger that was 145,606 tok

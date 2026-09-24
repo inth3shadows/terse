@@ -870,7 +870,7 @@ needs both flags.
 field name and type at nine shapes — the top level, `total`, each `tools[]` row, each value
 of the `versions` object, each `retrieves[]` row, each `primers[]` row, the `primer_liability`
 blob, each of its `servers[]` rows, and each of those rows' `contributors[]` — so a rename or
-a removal fails CI rather than a consumer's script. Five things worth knowing before you
+a removal fails CI rather than a consumer's script. Things worth knowing before you
 parse it:
 
 - **`primers[]` rows carry an `attached` flag.** `true` is a primer that went out and cost
@@ -896,6 +896,14 @@ parse it:
   counted. `retrieve_tokens` is the amount netted (gross = `saved_tokens + retrieve_tokens`);
   a non-zero `retrieve_untokenized` makes the net an upper bound. `wire_saved_tokens` stays
   gross.
+- **`saved_basis` says which basis those savings are on (#440)** — `context` from any
+  current `aggregate`; `wire` (or `mixed`) when the aggregate predates the context sums or
+  was hand-rolled, in which case the figures can overstate what the model received.
+  `context_differs_from_wire` is false when no result had a rewritten typed field, so the
+  two bases are one number. Both screens, `--recommend` included, print the basis whenever
+  it matters (#441). Each server row's `retrieve_tokens` is the retrieve cost netted out of
+  its own rate; a no-primer entry driven negative by it reads `retrieved back`, not
+  `expanding` (#443).
 - **`primer_liability` itself can be `null`**, when the install could not be sized (a
   malformed MCP config). The ledger half of the document is still complete and correct; the
   reason is on stderr.
