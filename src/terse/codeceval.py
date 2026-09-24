@@ -9,6 +9,14 @@ tier claims to be *unconditionally lossless* (round-trip proven). A tolerance on
 at the reader instead of the encoder, quietly reintroduces exactly the lossiness the codec
 promises not to have.
 
+AMENDED (sign-test review, 2026-09-24): the verdict this module feeds is no longer zero
+tolerance. "Any trial raw-right / terse-wrong is UNSAFE" is sound only for a reader that
+answers identically every time, and none do (`claude -p` has no temperature control; the
+gateway models flipped run to run at temperature 0, #412). `report.codec_verdict` is now a
+paired sign test over questions — a statistical test, which does tolerate noise, but not a
+fixed budget for damage: consistent harm reads UNSAFE at any size, and a thin sample cannot
+read SAFE (`report._CODEC_MIN_QUESTIONS`).
+
 It also hides WHERE accuracy is lost. Comprehension failures concentrate in the `deref`
 question — reconstructing terse's compressed form (aliased `~N` legend entries, positional
 table rows) back into the original JSON structure. That is exactly what an agent does when
@@ -429,7 +437,8 @@ def _ask_codec_question(question: fluency.Question, payload_text: str,
                         answerer: ToolAnswerer,
                         system: str = "") -> tuple[bool, bool, bool, bool]:
     """One trial: ask `question` over `payload_text`, expect a `RECORD_VALUE_TOOL` call.
-    Returns (matched, errored, called).
+    Returns (matched, errored, called, parsed) — `parsed`: the reply carried a scorable value
+    at all (a tool call, or a whole-reply JSON value).
 
     `errored` means the call never produced a scorable turn — either a transport failure
     (`_safe_call`'s except branch) or a live backend returning 200 with neither text nor a

@@ -1437,8 +1437,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
 
     # Codec-verdict mode (#295): does a real tool-calling model's downstream tool-call
     # argument stay structurally identical whether it read raw JSON or terse's compressed
-    # form? Replaces the comprehension-accuracy tolerance with a demonstrated-corruption
-    # gate, rendered per (tool, shape) rather than as one global number. Live-model-only,
+    # form? Replaces the comprehension-accuracy tolerance with a paired sign test over
+    # questions, rendered per (tool, shape) rather than as one global number. Live-model-only,
     # same as --drop-eval and --diff — this measures real tool-call behavior, not a
     # ground-truth-scored reply.
     if args.codec_verdict:

@@ -95,7 +95,7 @@ def test_the_merged_cell_pools_BOTH_spellings_trials():
 
     alone = codeceval.run_codec_fluency([_env("kb.read.list_nodes", PAYLOAD, "a" * 40)],
                                         {"m": _correct()}, trials=trials, preflight=False)
-    assert "**UNRESOLVED**" in build_codec_verdict_report(alone.rows)
+    assert "trial(s), need" in build_codec_verdict_report(alone.rows)
 
     envs = [_env("kb.read.list_nodes", PAYLOAD, "a" * 40),
             _env("kb__kb.read.list_nodes", OTHER, "b" * 40)]
@@ -103,7 +103,10 @@ def test_the_merged_cell_pools_BOTH_spellings_trials():
                                       preflight=False)
     cells = _cells(build_codec_verdict_report(run.rows))
     assert len(cells) == 1, cells
-    assert "**SAFE**" in cells[0], "the two spellings did not pool into one cell"
+    # Pooled, the TRIAL floor clears. The cell can still be UNRESOLVED on the separate
+    # question floor (`_CODEC_MIN_QUESTIONS`: two payloads give 4 questions), which is not
+    # what this test pins.
+    assert "trial(s), need" not in cells[0], "the two spellings did not pool into one cell"
 
 
 def test_a_genuine_bare_runecho_tool_is_qualified_the_way_policy_names_it():

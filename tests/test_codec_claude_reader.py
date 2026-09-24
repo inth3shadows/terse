@@ -20,6 +20,11 @@ PAYLOAD = {"result": [
     for i, owner in enumerate(["alice", "bob", "carol", "dave", "erin", "frank"], 1)
 ]}
 RAW_TEXT = json.dumps(PAYLOAD)
+# Three payloads, two questions each: SAFE needs 5 complete questions (`_CODEC_MIN_QUESTIONS`).
+PAYLOADS = [{"result": [
+    {"id": i + k * 10, "meta": {"owner": f"{owner}{k}", "tags": ["x", "y"]}}
+    for i, owner in enumerate(["alice", "bob", "carol", "dave", "erin", "frank"], 1)
+]} for k in range(3)]
 
 
 def _text_answerer(reply_for):
@@ -38,10 +43,13 @@ def _expected(messages):
     """Answer each question correctly, whatever form the payload is in — the pre-flight's
     questions included, so a CLI run gets past it."""
     user = messages[-1]["content"]
-    known = [(q, t) for q, t in codeceval.preflight_questions()]
-    known += [(q, None) for q in codeceval.gen_codec_questions(PAYLOAD)]
-    for q, text in known:
-        if q.prompt in user and (text is None or text in user):
+    # Keyed by the payload actually in the prompt (raw or compressed): the payloads share
+    # question wording, so matching the prompt alone would answer from the wrong one.
+    known = [(q, [t]) for q, t in codeceval.preflight_questions()]
+    known += [(q, [json.dumps(pl), fluency.compress(pl)])
+              for pl in [PAYLOAD, *PAYLOADS] for q in codeceval.gen_codec_questions(pl)]
+    for q, texts in known:
+        if q.prompt in user and any(t in user for t in texts):
             return json.dumps(q.expected)
     raise AssertionError("question not found in prompt")
 
@@ -88,8 +96,10 @@ def test_the_primer_reaches_the_terse_arm_only():
 
 def test_text_rows_omit_the_tool_call_counters_so_SAFE_is_reachable():
     ans, _ = _text_answerer(_expected)
-    rows = codeceval.run_codec_payload(PAYLOAD, RAW_TEXT, ans, trials=20)
-    assert rows and all(r["channel"] == "text" for r in rows)
+    rows = [r for pl in PAYLOADS
+            for r in codeceval.run_codec_payload(pl, json.dumps(pl), ans, trials=20)]
+    assert len(rows) >= 5 and all(r["channel"] == "text" for r in rows)
+    assert all(r["raw_parsed"] == r["terse_parsed"] == 20 for r in rows)
     assert all("raw_calls" not in r and "terse_calls" not in r for r in rows)
     assert all(r["raw_ok"] == r["terse_ok"] == 20 for r in rows)
     # A 0 here would read as "declined the tool every time" and block SAFE forever.
@@ -117,7 +127,8 @@ def test_a_cli_run_completes_and_primer_reaches_only_the_terse_arm(tmp_path, mon
     from terse.capture import capture_payload
     corpus = tmp_path / "c"
     corpus.mkdir()
-    capture_payload("kb.read.x", RAW_TEXT, corpus, server="kb", manual=True)
+    for pl in PAYLOADS:
+        capture_payload("kb.read.x", json.dumps(pl), corpus, server="kb", manual=True)
     seen: list[list[dict]] = []
 
     def fake_text(alias):
@@ -131,13 +142,13 @@ def test_a_cli_run_completes_and_primer_reaches_only_the_terse_arm(tmp_path, mon
                  "--trials", "20", "--models", "cli:haiku", "--out", str(out)]) == 0
     report = out.read_text()
     assert "**SAFE**" in report and "**Primer:**" in report and "**Text channel:**" in report
-    terse_text = fluency.compress(PAYLOAD)
-    sweep = [m for m in seen[0] if RAW_TEXT in m[-1]["content"]
-             or terse_text in m[-1]["content"]]
+    raws = [json.dumps(pl) for pl in PAYLOADS]
+    terses = [fluency.compress(pl) for pl in PAYLOADS]
+    sweep = [m for m in seen[0] if any(t in m[-1]["content"] for t in raws + terses)]
     assert sweep
     for msgs in sweep:
         has_primer = any(m["role"] == "system" for m in msgs)
-        assert has_primer == (terse_text in msgs[-1]["content"])
+        assert has_primer == any(t in msgs[-1]["content"] for t in terses)
         # the SAME text instruction on both arms — pairing depends on it
         assert codeceval._TEXT_INSTRUCTION in msgs[-1]["content"]
 

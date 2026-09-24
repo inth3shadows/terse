@@ -535,8 +535,9 @@ UNMEASURED_FAIL_SHARE = 0.20
 # proxy --diff off` before the floor and `**PASS** ... safe to enable proxy --diff` after it.
 # A gate against a false green that manufactures a false green is not a smaller version of
 # the right fix; it is the same defect. `codec_verdict` states the principle one screen
-# down: any paired excess of misses is unsafe "regardless of how small a fraction of the
-# sample it is".
+# down (as it then read — the codec verdict has since become a sign test, whose own floor is
+# `_CODEC_MIN_QUESTIONS`): any paired excess of misses was unsafe "regardless of how small a
+# fraction of the sample it is".
 #
 # So the gate fires only where there is provably nothing to discard. An empty paired subset
 # cannot be hiding a demonstrated regression, which makes this narrow form incapable of the
@@ -1298,7 +1299,9 @@ def _not_measured_lines(
 
 # --------------------------------------------------------------------------- #
 # Codec-tier material-preservation verdict (#295) — replaces a floating accuracy
-# tolerance with a demonstrated-corruption gate. See `codeceval.py`'s module docstring
+# tolerance with a paired test per (tool, shape). It began as a zero-tolerance
+# demonstrated-corruption gate; that fired on reader noise and is now a sign test
+# (`_CODEC_SIGN_ALPHA`). See `codeceval.py`'s module docstring
 # for the full argument; the short version: any percentage tolerance is a budget for how
 # much structural damage terse's *lossless* codec tier is allowed to cause at the reader,
 # which contradicts the round-trip-proven losslessness claim one layer down. So this gate
@@ -1306,8 +1309,10 @@ def _not_measured_lines(
 # any corruption demonstrated, and if not, was there enough evidence to say so."
 # --------------------------------------------------------------------------- #
 
-# A sample-size floor for trusting an observed ZERO failures, not a tolerance for a
-# nonzero one. Clopper-Pearson: n zero-failure trials bounds the true failure rate below
+# A sample-size floor on TRIALS for a SAFE, alongside `_CODEC_MIN_QUESTIONS` (the floor on
+# questions the sign test needs to be able to detect harm at all). Written for the old
+# zero-tolerance rule, where it bounded an observed zero failures; under the sign test it is
+# a minimum amount of evidence, and the Clopper-Pearson reading below is historical. Clopper-Pearson: n zero-failure trials bounds the true failure rate below
 # `1 - 0.05 ** (1/n)` at 95% confidence. At n=20 that is ~14pp — loose, but this is the
 # single most contestable number in this module; it wants explicit sign-off before it is
 # trusted at scale, not a mechanical tuning pass. Raise it once real panels show it holding
@@ -1340,6 +1345,27 @@ def _codec_lost_text(rows: list[dict[str, Any]]) -> str:
     return f"; {lost} of {attempts} calls lost" if lost else ""
 
 
+# SAFE needs at least this many COMPLETE questions: below 5 discordant questions the sign
+# test cannot reach p < 0.05 at all (1/32 is the first value under it), so a cell with fewer
+# questions could never have read UNSAFE, and calling it SAFE would claim an absence the test
+# was unable to detect. `_CODEC_MIN_TRIALS` still applies alongside it, in its own unit.
+_CODEC_MIN_QUESTIONS = 5
+
+
+def _codec_complete(r: dict[str, Any]) -> bool:
+    """Did both arms of this question answer EVERY trial? Only such rows enter the sign test.
+
+    An errored call is scored as a miss on its arm, so a lost RAW call turns a question into
+    a "better" one and buys a SAFE against real harm on another question (review of the sign
+    test: raw 7/7 vs terse 0/7 on q1, plus one lost raw call on q2, read SAFE). Dropping the
+    whole question removes the loss from both directions; `_codec_lost_text` still says it
+    happened. A row that predates the `<arm>_answered` counters falls back to `fails`."""
+    trials = r.get("trials")
+    if "raw_answered" in r and "terse_answered" in r and isinstance(trials, int):
+        return int(r["raw_answered"]) == trials and int(r["terse_answered"]) == trials
+    return int(r.get("fails", 0)) == 0
+
+
 def codec_sign(rows: list[dict[str, Any]]) -> tuple[int, int, float]:
     """`(worse, better, p)`: questions (rows) where terse scored below / above raw, and the
     one-sided binomial P(X >= worse) under "terse is no worse" (each discordant question a
@@ -1350,6 +1376,7 @@ def codec_sign(rows: list[dict[str, Any]]) -> tuple[int, int, float]:
     how a single hard question became "27 excess trials". The cost is power — fewer than 5
     discordant questions can never reach p < 0.05 — which the verdict reports as
     UNRESOLVED when terse leans worse, never as SAFE."""
+    rows = [r for r in rows if _codec_complete(r)]
     worse = sum(1 for r in rows if int(r["raw_ok"]) > int(r["terse_ok"]))
     better = sum(1 for r in rows if int(r["terse_ok"]) > int(r["raw_ok"]))
     n = worse + better
@@ -1491,10 +1518,12 @@ def codec_verdict(rows: list[dict[str, Any]],
     `_GAP_TOLERANCE`. `arm_gap` still does the pairing and exclusion-gating work (so a
     dead backend or an unpaired question set reports UNRESOLVED via the same `_unmeasured`/
     `paired_rows` machinery every other renderer uses) — but the pass/fail decision itself
-    is a demonstrated-corruption gate: ANY paired excess of terse-arm misses beyond what the
-    raw arm ALSO missed is UNSAFE, full stop, regardless of how small a fraction of the
-    sample it is. Zero observed excess is SAFE only once `_CODEC_MIN_TRIALS` zero-failure
-    trials have accumulated; short of that it is UNRESOLVED.
+    is a paired sign test over COMPLETE questions (`codec_sign`): UNSAFE when terse did worse
+    on significantly more questions than it did better on (`_CODEC_SIGN_ALPHA`). Leaning
+    worse without significance, fewer than `_CODEC_MIN_QUESTIONS` complete questions, or
+    fewer than `_CODEC_MIN_TRIALS` trials is UNRESOLVED (`codec_unresolved_reasons`).
+    SUPERSEDED: this used to be zero tolerance — any single trial raw-right / terse-wrong was
+    UNSAFE — which a non-deterministic reader trips by noise alone.
 
     Deliberately NOT `terse_ok < terse_trials` (raw code review, PR #302 F1) — that counts
     every terse miss as codec-caused, including one the model would have missed on raw too
@@ -1820,7 +1849,11 @@ def codec_unresolved_reasons(rows: list[dict[str, Any]], excluded_from_group: in
                        f"surviving into a downstream tool argument")
     n = sum(_arm_trials(r, "terse_ok") for r in rows)
     if n < _CODEC_MIN_TRIALS:
-        reasons.append(f"only {n} zero-failure trial(s), need {_CODEC_MIN_TRIALS}")
+        reasons.append(f"only {n} trial(s), need {_CODEC_MIN_TRIALS}")
+    complete = sum(1 for r in rows if _codec_complete(r))
+    if complete < _CODEC_MIN_QUESTIONS:
+        reasons.append(f"only {complete} complete question(s), need {_CODEC_MIN_QUESTIONS} "
+                       f"— fewer could never show harm")
     return reasons
 
 
@@ -2039,8 +2072,12 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
                     if dropped.get(model):
                         text += "; " + _codec_trimmed_reason(dropped[model], model)
                 else:
+                    # Lost calls named here too: a withheld cell's label already IS the loss,
+                    # but a thin or leaning cell whose only worse question came from a lost
+                    # call said nothing about it (review of the sign test).
                     text = "; ".join(codec_unresolved_reasons(g.rows, dropped.get(model, 0),
                                                               model))
+                    text += _codec_lost_text(by_model.get(model, []))
                 per_model.append((model, text))
             if len(per_model) == 1:
                 why = per_model[0][1]
@@ -2055,11 +2092,21 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
                                    for m, _ in per_model)
                 model_col = ", ".join(f"`{m}`" for m, _ in per_model)
         else:
-            worse, better, _p = codec_sign(worst_gap.rows)
-            why = (f"{n} zero-failure trials" if worse == better == 0 else
-                   f"{n} trials; terse did worse on {worse} question(s) and better on "
-                   f"{better}")
-            why += _codec_lost_text(by_model.get(worst_model, []))
+            # Every model, not the tie-break one: when all are SAFE the worst model is simply
+            # the first name, and a row describing only it hid another model's worse/better
+            # split and lost calls (review of the sign test, same shape as #432's).
+            notes = []
+            for model, (_v, g) in sorted(verdicts.items()):
+                w, b, _p = codec_sign(g.rows)
+                note = (f"worse on {w} question(s), better on {b} (raw "
+                        f"{g.control_acc:.0%}, terse {g.form_acc:.0%})" if w or b else "")
+                note += _codec_lost_text(by_model.get(model, []))
+                if note:
+                    notes.append((model, note.lstrip("; ")))
+            why = f"{n} trials, no question worse on terse" if not notes else f"{n} trials"
+            if notes:
+                why += "; " + " · ".join(
+                    (f"`{m}`: {t}" if len(verdicts) > 1 else t) for m, t in notes)
             # The other half of #412: a LOW compliance rate is labelled one run's, and so must
             # a passing one be. SAFE licenses "the value survives into a real tool argument"
             # on a rate that read 29% and then 100% on the same cell, so the rate that let
