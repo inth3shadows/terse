@@ -1505,7 +1505,7 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             run = codeceval.run_codec_fluency(
                 envelopes, answerers, trials=args.trials, progress=_stderr_progress,
                 limits=limits, tool_defs=[codeceval.RECORD_VALUE_TOOL_DEF],
-                primer=primer)
+                primer=primer, policy=load_policy(args.policy) if primer else None)
         except codeceval.PreflightError as exc:
             print(str(exc), file=sys.stderr)   # no report: nothing was measured (#403)
             return 2

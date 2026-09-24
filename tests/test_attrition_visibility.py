@@ -1361,6 +1361,7 @@ def _crow(qid: str) -> dict:
             "raw_ok": 3, "terse_ok": 0, "raw_trials": 3, "terse_trials": 3,
             "raw_calls": 3, "terse_calls": 3,
             "raw_answered": 3, "terse_answered": 3,
+            "raw_parsed": 3, "terse_parsed": 3,
             "fails": 3, "attempts": 6}
 
 

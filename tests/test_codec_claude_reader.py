@@ -243,3 +243,45 @@ def test_the_preflight_asks_the_primed_request_when_there_is_a_primer():
     seen.clear()
     codeceval.preflight_encoding(ans, attempts=1)
     assert seen and all("PRIMER" not in m[-1]["content"] for m in seen)
+
+
+def test_R3_the_primer_and_the_payload_come_from_the_same_policy(tmp_path, monkeypatch):
+    from terse.capture import capture_payload
+    from terse.policy import apply as policy_apply
+    from terse.policy import load_policy
+    # Long repeated values, so the default codec's dictionary tier fires and the
+    # tabularize-only policy's form differs from it.
+    statuses = ["awaiting-triage-from-maintainer", "blocked-on-upstream-dependency"]
+    teams = ["platform-infrastructure-team", "developer-experience-team"]
+    payloads = [{"result": [{"id": i + k * 100, "status": statuses[i % 2],
+                             "team": teams[(i // 2) % 2], "meta": {"n": i}}
+                            for i in range(12)]} for k in range(2)]
+    corpus = tmp_path / "c"
+    corpus.mkdir()
+    for pl in payloads:
+        capture_payload("kb.read.x", json.dumps(pl), corpus, server="kb", manual=True)
+    policy = tmp_path / "p.json"
+    policy.write_text(json.dumps({"version": 1, "policies": [
+        {"match": {"tool": "kb.*"}, "tiers": ["minify", "tabularize"]}]}))
+    pol = load_policy(str(policy))
+    expected_terse = [policy_apply(json.dumps(pl), "kb.read.x", pol, server="kb",
+                                   force_lossless=True).text for pl in payloads]
+    assert all("__terse_table__" in t and "__terse_dict__" not in t for t in expected_terse)
+    assert all(t != fluency.compress(pl) for t, pl in zip(expected_terse, payloads, strict=True)), (
+        "fixture cannot tell the policy's form from the default codec's")
+    seen: list[list[dict]] = []
+
+    def fake_text(alias):
+        ans, log = _text_answerer(lambda m: "[]")
+        seen.append(log)  # type: ignore[arg-type]
+        return ans
+
+    # The pre-flight is skipped here: its subject is the sweep's payload, not admission.
+    monkeypatch.setattr(codeceval, "preflight_encoding", lambda *a, **k: None)
+    monkeypatch.setattr(codeceval, "cli_text_answerer", fake_text)
+    main(["fluency", "--codec-verdict", "--primer", "--policy", str(policy), "--corpus",
+          str(corpus), "--trials", "1", "--models", "cli:haiku", "--out", str(tmp_path / "r")])
+    users = [m[-1]["content"] for m in seen[0]]
+    assert any(t in u for u in users for t in expected_terse), (
+        "the terse arm was not compressed under --policy")
+    assert not any(fluency.compress(pl) in u for u in users for pl in payloads)

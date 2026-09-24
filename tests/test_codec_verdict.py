@@ -773,3 +773,91 @@ def test_a_lean_worse_reason_says_how_much_of_it_is_lost_calls():
     rows.append(_answered_row("lost", 4, 4, 5, raw_ans=4))   # 4 v 4 seen; +1 lost raw -> "worse"
     assert any("1 of those only by counting lost calls against terse" in r
                for r in codec_unresolved_reasons(rows))
+
+
+# --------------------------------------------------------------------------- #
+# Review round 3 (of ea8355c): reproductions and pins
+# --------------------------------------------------------------------------- #
+def test_R1_an_always_wrong_question_plus_one_lucky_flip_is_not_SAFE():
+    rows = [_answered_row(f"c{i}", 4, 4, 4) for i in range(5)]
+    rows += [_answered_row("bad", 4, 0, 4), _answered_row("flip", 3, 4, 4)]
+    verdict, _g = codec_verdict(rows)
+    assert verdict == "UNRESOLVED"
+    from terse.report import codec_unresolved_reasons
+    assert any("one question reads worse on terse (raw 4/4, terse 0/4" in r
+               for r in codec_unresolved_reasons(rows))
+
+
+def test_R2_a_tool_channel_reply_with_no_value_is_unanswered_not_wrong():
+    rows = [_answered_row(f"q{i}", 20, 0, 20, raw_parsed=20, terse_parsed=0,
+                          raw_calls=20, terse_calls=0) for i in range(6)]
+    assert codec_verdict(rows)[0] != "UNSAFE"
+
+
+def test_R4_text_rows_without_the_format_counters_license_neither_verdict():
+    bad = [_answered_row(f"q{i}", 20, 0, 20, channel="text") for i in range(6)]
+    clean = [_answered_row(f"q{i}", 20, 20, 20, channel="text") for i in range(6)]
+    assert codec_verdict(bad)[0] == "UNRESOLVED"
+    assert codec_verdict(clean)[0] == "UNRESOLVED"
+
+
+def test_R5_trials_answered_on_both_arms_are_the_guaranteed_count():
+    rows = [_answered_row(f"c{i}", 3, 3, 3) for i in range(5)]
+    rows += [_answered_row(f"x{i}", 1, 2, 2, raw_ans=1, terse_ans=2) for i in range(3)]
+    rows = [dict(r, tool="t", shape="array-of-records") for r in rows]
+    cols = [c.strip() for c in _cell(build_codec_verdict_report({"m": rows})).split("|")]
+    assert cols[4] == "18" and cols[5] != "**SAFE**"
+
+
+def test_R6_the_UNSAFE_why_prints_the_counts_the_test_used():
+    rows = [dict(_answered_row("q", 20, 0, 20, terse_ans=14), tool="t",
+                 shape="array-of-records")]
+    cell = _cell(build_codec_verdict_report({"m": rows}))
+    assert "**UNSAFE**" in cell and "terse 6/20" in cell
+
+
+def test_R7_a_lost_raw_call_cannot_create_UNSAFE():
+    # raw 3/5 with 2 raw calls lost vs terse 0/5: charged as raw WRONG on the UNSAFE side,
+    # p = C(5,3)... not significant; charged as raw right (5/5 vs 0/5) it would read UNSAFE.
+    assert codec_verdict([_answered_row("q", 3, 0, 5, raw_ans=3)])[0] != "UNSAFE"
+
+
+def test_R7_incomplete_questions_do_not_count_toward_the_question_floor():
+    from terse.report import codec_unresolved_reasons
+    rows = [_answered_row(f"c{i}", 5, 5, 5) for i in range(4)]
+    rows.append(_answered_row("lost", 5, 5, 5, terse_ans=4))
+    assert any("only 4 complete question(s)" in r for r in codec_unresolved_reasons(rows))
+
+
+def test_R7_legacy_rows_fall_back_to_trials_minus_fails():
+    from terse.report import _codec_answered
+    legacy = {"qid": "q", "trials": 5, "raw_ok": 5, "terse_ok": 5, "fails": 2}
+    assert _codec_answered(legacy, "raw") == 3 and _codec_answered(legacy, "terse") == 3
+
+
+def test_R7_parsed_is_capped_by_answered():
+    from terse.report import _codec_answered
+    r = _answered_row("q", 5, 5, 5, terse_ans=3, raw_parsed=5, terse_parsed=5)
+    assert _codec_answered(r, "terse") == 3
+    r2 = dict(r, trials=4)
+    assert _codec_answered(r2, "raw") == 4
+
+
+def test_R7_the_text_parse_gate_divides_by_answered_trials():
+    from terse.report import codec_unresolved_reasons
+    # 20 answered, 15 parsed on terse = 75% < 80%; with 25 trials the floor is met, so the
+    # parse gate is the reason — and a denominator of `trials` would not change it, but one
+    # of `parsed` would read 100%.
+    rows = [_answered_row(f"q{i}", 20, 15, 25, raw_ans=25, terse_ans=20, channel="text",
+                          raw_parsed=25, terse_parsed=15) for i in range(5)]
+    assert any("terse arm replied with a bare JSON value 75%" in r
+               for r in codec_unresolved_reasons(rows))
+
+
+def test_a_rarely_JSON_text_reader_is_held_back_by_the_parse_gate_itself():
+    # Replaces a test that passed for the wrong reason (the trial floor fired first).
+    from terse.report import codec_unresolved_reasons
+    rows = [_answered_row(f"q{i}", 1, 1, 20, channel="text",
+                          raw_parsed=1, terse_parsed=1) for i in range(25)]
+    reasons = codec_unresolved_reasons(rows)
+    assert any("bare JSON value 5%" in r for r in reasons)

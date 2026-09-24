@@ -521,7 +521,8 @@ def _recorded_value(turn: Turn) -> tuple[bool, Any]:
 
 
 def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
-                      trials: int = 1, primer: str = "") -> list[dict]:
+                      trials: int = 1, primer: str = "",
+                      terse: str | None = None) -> list[dict]:
     """Ask each `CODEC_QTYPES` question in `obj` over raw vs terse, `trials` times each, via
     the tool-calling protocol. One row per question.
 
@@ -539,7 +540,9 @@ def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
     comparison is "terse not installed" (raw, no primer) against "terse installed". A text-channel backend's rows OMIT the
     `<arm>_calls` counters — tool-call compliance is not a property it can have, and a 0
     there would read as "declined the tool every time" (`report.codec_call_rate`)."""
-    terse_text = with_primer(primer, fluency.compress(obj))
+    # `terse`: the compressed form under the run's policy (`run_codec_fluency`), so a primer
+    # built from that policy describes exactly the forms the payload uses (review round 3).
+    terse_text = with_primer(primer, fluency.compress(obj) if terse is None else terse)
     channel = answer_channel(answerer)
     out: list[dict] = []
     for q in gen_codec_questions(obj):
@@ -586,16 +589,18 @@ def run_codec_payload(obj: Any, raw_text: str, answerer: ToolAnswerer,
             "fails": raw_fail + terse_fail,
             "attempts": trials * 2,
         }
+        # Replies that carried a scorable value at all (a tool call, or a whole JSON value),
+        # right or wrong, on BOTH channels. A reply below it delivered no value: the report
+        # treats it as unanswered, not wrong (review round 3 — the tool channel scored it
+        # wrong, so a primer that made the model explain first read as corruption there too).
+        row["raw_parsed"], row["terse_parsed"] = raw_parsed, terse_parsed
         if channel == "text":
             del row["raw_calls"], row["terse_calls"]
-            # Replies that were a whole JSON value, right or wrong. `<arm>_ok` below it is a
-            # format miss, not a wrong value — the text channel's stand-in for `<arm>_calls`.
-            row["raw_parsed"], row["terse_parsed"] = raw_parsed, terse_parsed
         out.append(row)
     return out
 
 
-def _payload_tokens(raw_text: str, obj: Any) -> dict[str, int]:
+def _payload_tokens(raw_text: str, obj: Any, terse: str | None = None) -> dict[str, int]:
     """cl100k token counts for one payload's two arms, stamped onto every row that payload
     produces (#303). Empty when tiktoken is unavailable — `count_cl100k` returns `None`
     there, and a savings table that silently reads a missing count as zero would print a
@@ -625,7 +630,7 @@ def _payload_tokens(raw_text: str, obj: Any) -> dict[str, int]:
     `sha` before summing — summing the rows directly would multiply a payload's tokens by
     its question count, and again by the number of models that answered it."""
     raw_tok = count_cl100k(raw_text)
-    terse_tok = count_cl100k(fluency.compress(obj))
+    terse_tok = count_cl100k(fluency.compress(obj) if terse is None else terse)
     if raw_tok is None or terse_tok is None:
         return {}
     return {"raw_tokens": raw_tok, "terse_tokens": terse_tok}
@@ -708,7 +713,7 @@ def request_tokens(question: fluency.Question, payload_text: str,
 
 def oversized_arms(obj: Any, raw_text: str, limit: int,
                    tool_defs: list[dict] | None = None,
-                   primer: str = "") -> list[tuple[str, int]]:
+                   primer: str = "", terse: str | None = None) -> list[tuple[str, int]]:
     """`[(arm, tokens), ...]` for every arm whose LARGEST request exceeds `limit`. Empty
     when the payload fits, or when no tokenizer is available to say.
 
@@ -730,7 +735,8 @@ def oversized_arms(obj: Any, raw_text: str, limit: int,
     out: list[tuple[str, int]] = []
     # The terse arm is measured WITH its primer (inline since #451): leaving the ~0.5k-token
     # primer out let a terse request really over the limit pass and error on that arm only.
-    for arm, text in (("raw", raw_text), ("terse", with_primer(primer, fluency.compress(obj)))):
+    terse_text = fluency.compress(obj) if terse is None else terse
+    for arm, text in (("raw", raw_text), ("terse", with_primer(primer, terse_text))):
         sizes = [n for q in questions
                  if (n := request_tokens(q, text, tool_defs)) is not None]
         if sizes and max(sizes) > limit:
@@ -799,7 +805,7 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                       preflight: bool = True,
                       limits: dict[str, int] | None = None,
                       tool_defs: list[dict] | None = None,
-                      primer: str = "") -> CodecRun:
+                      primer: str = "", policy: Any = None) -> CodecRun:
     """Run the codec-tier eval for each named tool-capable answerer over every payload in
     the corpus that has at least one `CODEC_QTYPES` question AND that the codec actually
     encodes (`codec_changes`). Mirrors `dropeval.run_drop_fluency`'s
@@ -879,7 +885,18 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
             obj = json.loads(env["raw"])
         except (json.JSONDecodeError, TypeError):
             obj = None  # these questions need parsed JSON; a non-JSON/text payload has none
-        if obj is None or not gen_codec_questions(obj) or not codec_changes(obj):
+        terse = None
+        if obj is not None and policy is not None:
+            # Compressed under the SAME policy the primer was built from, lossless tiers only
+            # (this is the codec verdict, not the drop tier): the default codec applies every
+            # encoding, so a policy without the dictionary form got a primer that never
+            # mentioned the `__terse_dict__` its payload carried (review round 3).
+            from .policy import apply as policy_apply
+            terse = policy_apply(env["raw"], str(env.get("tool", "")), policy,
+                                 server=env.get("server"), force_lossless=True).text
+        changed = (codec_changes(obj) if terse is None
+                   else obj is not None and terse != minify(obj))
+        if obj is None or not gen_codec_questions(obj) or not changed:
             # One line per skip, like `run_drop_fluency` (#267): `done` reaches `total`
             # without M near-identical lines per skipped envelope.
             if progress is not None:
@@ -906,7 +923,7 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                 merged_duplicates[dup_key[0]] = merged_duplicates.get(dup_key[0], 0) + 1
                 continue
             asked_payloads.add(dup_key)
-        toks = _payload_tokens(env["raw"], obj)
+        toks = _payload_tokens(env["raw"], obj, terse)
         # `sha` is OMITTED, never defaulted, when the envelope has no usable one. `tool`
         # defaults because it is a LABEL — a group headed `?` is legible. `shape` carries a
         # label default too, but nothing can reach it: `json.loads(env["raw"])` above already
@@ -931,7 +948,7 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
             # `is not None`, not truthiness: a declared limit of 0 means NOTHING fits, and
             # reading it as "no limit known" would silently disable the check for the one
             # value that most obviously asks for it.
-            over = (oversized_arms(obj, env["raw"], limit, tool_defs, primer)
+            over = (oversized_arms(obj, env["raw"], limit, tool_defs, primer, terse)
                     if limit is not None else [])
             if over and limit is not None:
                 # One line per (model, payload), like the skip lines above: the run says
@@ -947,7 +964,7 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                              f"max_input_tokens — not asked")
                 continue
             for row in run_codec_payload(obj, env["raw"], answerer, trials=trials,
-                                         primer=primer):
+                                         primer=primer, terse=terse):
                 results[name].append({**tags, **toks, **row})
             if progress is not None:
                 progress(fluency.progress_line("fluency --codec-verdict", name, i,
