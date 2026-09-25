@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.38.2] - 2026-09-24
+
 ### Fixed
 
 - **`mcp-status` names a live duplicate in another scope (#447).** Its "runs TWICE" warning
