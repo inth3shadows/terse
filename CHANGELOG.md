@@ -13,6 +13,17 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Fixed
+
+- **An attach row recorded without tiktoken is proof of payment for every entry, not just a
+  lazy router (#452).** A standalone proxy with such a row and no compressed block read
+  `once/session (unpaid)` and was listed as costing nothing beside the row saying it paid.
+- **A lazy router whose claimed rows were all another router's no longer reads `1x?` or
+  `free` depending on an unrelated idle peer (#452).** It wrote nothing, so it is free
+  either way.
+
+## [0.38.0] - 2026-09-24
+
 ### Added
 
 - **`terse fluency --codec-verdict` can measure the model that actually reads terse's
