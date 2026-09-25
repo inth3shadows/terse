@@ -14,6 +14,7 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Changed
+- **`install-mcp` turns cross-call diffing on for design servers.** A server whose name or launch command looks like a design tool (figma, framelink, penpot, sketch) gets `--diff` baked in when neither `--diff` nor `--no-diff` is given; an explicit `--no-diff` still wins. Design sessions re-fetch the same file between edits: a simulated 4-edit loop on a whole Figma file cost 1,143,533 tokens raw and 252,140 with diffing (78% fewer), while the codec alone saves 0% because Framelink returns text. The global default stays off. A diff can only be read next to the result it updates, so a session whose old tool results are cleared (context editing, compaction) cannot rebuild it.
 - **Fluency probes no longer persist `claude -p` sessions (#456).** Persisted probes flooded `~/.claude/projects` (361 of the 399 sessions `/insights` sampled). A per-call JSONL ledger (`$XDG_STATE_HOME/terse/fluency-ledger.jsonl`; `TERSE_FLUENCY_LEDGER` overrides it, empty disables it) now records each probe's model, arm, expected answer, reply and correctness, and keeps unanswered distinct from wrong. `scripts/harvest_fluency_transcripts.py` converts previously persisted probe transcripts into a dataset.
 
 ## [0.38.2] - 2026-09-24

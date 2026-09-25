@@ -81,6 +81,22 @@ def classify_server_sensitivity(name: str, command: object = "") -> bool:
     return bool(SENSITIVE_SERVER_RE.search(" ".join(str(p) for p in parts)))
 
 
+# Design-tool servers re-fetch the same file between edits, which is the one workload where
+# the cross-call diff (off by default, #170) is measured to pay: a simulated 4-edit loop on
+# a whole Figma file cost 1,143,533 tokens raw and 252,140 with diff on (78%), while the
+# codec saves 0% because Framelink returns text.
+DESIGN_SERVER_RE = re.compile(r"figma|framelink|penpot|sketch", re.IGNORECASE)
+
+
+def classify_design_server(name: str, command: object = "") -> bool:
+    """Install-time guess: is this a design-tool server whose results are re-fetched across
+    edits, so `install-mcp` should bake `--diff` onto it? Matches name and launch command,
+    like `classify_server_sensitivity`. Only consulted when the operator passed neither
+    `--diff` nor `--no-diff`."""
+    parts = [name, *(command if isinstance(command, list) else [command])]
+    return bool(DESIGN_SERVER_RE.search(" ".join(str(p) for p in parts)))
+
+
 def add_never_lossy_server(policy_doc: dict, name: str) -> bool:
     """Add `name` to a policy doc's `never_lossy_servers` (deduped + sorted); return True if
     the doc changed. Pure — the caller owns reading/writing the file. `name` is the server's
@@ -1263,8 +1279,18 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
             no_join_blocks=no_join_blocks, never_lossy=never_lossy)
 
     changes = []
+    diff_auto: list[str] = []
     for s in servers:
         before = (node.get("mcpServers") or {}).get(s)
+        # An explicit --diff/--no-diff always wins; only an unstated one is inferred.
+        # Classified on the ORIGINAL entry (the stash on a re-wrap), since a wrapped
+        # entry's command is terse itself.
+        orig = stash.get(s) or before or {}
+        s_diff = diff
+        if diff is None and classify_design_server(
+                s, [orig.get("command", ""), *(orig.get("args") or [])]):
+            s_diff = True
+            diff_auto.append(s)
         # Hand-edits = non-terse-owned keys on the live WRAPPED entry that differ from
         # the stashed original — the drift guard in wrap() carries them forward; name
         # them in the result so the operator sees what survived (and what to move into
@@ -1275,7 +1301,7 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
             and s in stash and (before or {}).get(k) != stash[s].get(k)
         )
         wrap(node, stash, s, policy_abs, terse_cmd, capture_dir=capture_abs,
-             diff=diff, diff_keyframe_interval=diff_keyframe_interval,
+             diff=s_diff, diff_keyframe_interval=diff_keyframe_interval,
              no_join_blocks=no_join_blocks, no_stats=no_stats)
         changes.append({"server": s, "before": before,
                         "after": node["mcpServers"][s], "preserved": preserved})
@@ -1283,7 +1309,7 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
     result = {"config": str(target.cfg), "scope": scope, "policy": policy_abs,
               "available": available, "changes": changes, "dry_run": dry_run,
               "backup": None, "capture_dir": capture_abs, "diff": diff,
-              "no_stats": no_stats, "never_lossy_added": [],
+              "no_stats": no_stats, "never_lossy_added": [], "diff_auto": diff_auto,
               "launcher": " ".join(terse_cmd), "launcher_skew": launcher_skew(terse_cmd)}
     if not dry_run and changes:
         result["backup"] = str(_backup(target.cfg))

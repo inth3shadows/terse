@@ -971,6 +971,53 @@ def test_do_install_never_lossy_bakes_into_policy(tmp_path, monkeypatch):
     assert load_policy(policy).server_never_lossy("runecho") is False
 
 
+def test_classify_design_server():
+    assert im.classify_design_server("figma")
+    assert im.classify_design_server("design", ["npx", "-y", "figma-developer-mcp"])
+    assert im.classify_design_server("Penpot")
+    assert not im.classify_design_server("runecho", ["uvx", "runecho-mcp"])
+    assert not im.classify_design_server("kb")
+
+
+def _design_install(tmp_path, monkeypatch, **kw):
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(
+        figma={"command": "npx", "args": ["-y", "figma-developer-mcp", "--stdio"]},
+        runecho={"command": "uvx", "args": ["runecho-mcp"]})))
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"version": 1, "policies": []}))
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+    res = im.do_install(["figma", "runecho"], str(policy), cfg=cfg, **kw)
+    return res, json.loads(cfg.read_text())["mcpServers"]
+
+
+def test_a_design_server_gets_diff_baked_in_by_default(tmp_path, monkeypatch):
+    """The edit loop (fetch, edit, re-fetch the same file) is where the cross-call diff pays:
+    a simulated 4-edit loop on a whole Figma file cost 78% fewer tokens. So an unstated
+    diff setting is inferred ON for a design server, and left alone for everything else."""
+    res, servers = _design_install(tmp_path, monkeypatch)
+    assert res["diff_auto"] == ["figma"]
+    assert "--diff" in servers["figma"]["args"]
+    assert "--diff" not in servers["runecho"]["args"]
+    assert "--no-diff" not in servers["runecho"]["args"]
+
+
+def test_an_explicit_no_diff_beats_the_design_inference(tmp_path, monkeypatch):
+    res, servers = _design_install(tmp_path, monkeypatch, diff=False)
+    assert res["diff_auto"] == []
+    assert "--diff" not in servers["figma"]["args"]
+    assert "--no-diff" in servers["figma"]["args"]
+
+
+def test_a_rewrap_still_recognises_the_design_server(tmp_path, monkeypatch):
+    """On a re-wrap the live entry's command is terse itself; classification must read the
+    stashed original, or a policy refresh would silently drop the design server's --diff."""
+    _design_install(tmp_path, monkeypatch)
+    policy = tmp_path / "policy.json"
+    res = im.do_install(["figma"], str(policy), cfg=tmp_path / ".claude.json")
+    assert res["diff_auto"] == ["figma"]
+
+
 # --------------------------------------------------- $TERSE_MCP_CMD (the launcher)
 # The override existed since the installer landed and had no test at all, which is
 # how the tilde bug below survived: a wrapped entry is spawned from JSON via execve

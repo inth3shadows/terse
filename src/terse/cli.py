@@ -1829,6 +1829,10 @@ def _cmd_install_mcp(args: argparse.Namespace) -> int:
         print("diff: explicit --diff baked in (overrides a policy-file opt-out)")
     elif res.get("diff") is False:
         print("diff: DISABLED for these server(s) (--no-diff baked in)")
+    if res.get("diff_auto"):
+        print(f"diff: ON for design server(s) {', '.join(res['diff_auto'])} (--diff baked "
+              f"in: re-fetching a file between edits sends only the change; pass "
+              f"--no-diff to opt out)")
     if res.get("no_stats"):
         print("stats: DISABLED for these server(s) (--no-stats baked in)")
     baked = res.get("never_lossy_added") or []
