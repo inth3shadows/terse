@@ -732,3 +732,63 @@ def test_another_routers_stamps_under_a_shared_contested_peer_do_not_bill_this_o
         [_rec(200 + i, server="kb", stamp=lb) for i in range(10)]
     by = {s["server"]: s for s in primer_liability(rows, aggregate(recs))["servers"]}
     assert by["ra"]["cadence"] != "once/session"
+
+
+# --- #452 ---------------------------------------------------------------------------
+
+def _two_routers(tmp_path, a_wraps):
+    from terse.stats import router_ledger_label
+    (tmp_path / "a").mkdir(parents=True)
+    (tmp_path / "b").mkdir(parents=True)
+    pa, pb = _pfile(tmp_path / "a"), _pfile(tmp_path / "b")
+    rows = [{**_router_row(tmp_path, pa, wraps=a_wraps), "server": "ra"},
+            {**_router_row(tmp_path, pb, wraps="kb"), "server": "rb"}]
+    lb = router_ledger_label(pb)
+    recs = [{"ts": 100, "server": router_ledger_label(pa), "event": "router_session"},
+            {"ts": 100, "server": lb, "event": "router_session"}] + \
+        [_rec(200 + i, server="kb", stamp=lb) for i in range(10)]
+    return rows, recs
+
+
+def test_a_router_whose_claimed_rows_are_all_another_routers_reads_free_either_way(
+        tmp_path):
+    """#452 item 2: `ra` wrote nothing (every `kb` row is `rb`'s). It read `1x?` when it
+    fronted only `kb` and `free` when it also fronted an idle `gh` — one fact, two answers."""
+    from terse.stats import aggregate, primer_liability
+    for wraps in ("kb", "gh, kb"):
+        rows, recs = _two_routers(tmp_path / wraps.replace(", ", "_"), wraps)
+        liab = primer_liability(rows, aggregate(recs))
+        ra = next(s for s in liab["servers"] if s["server"] == "ra")
+        assert ra["cadence"] == "once/session (unpaid)", wraps
+        assert "ra" in liab["free"] and "ra" not in liab["uncertain"], wraps
+
+
+def test_a_lazy_router_whose_peers_all_ran_passthrough_is_free(tmp_path):
+    """#452 item 4: every claimed label has rows, all passthrough — the primer never had a
+    marker to ride. `encoded == 0` must reach `_cadence` (mutants that forced it to None
+    billed this router, and no test could see them)."""
+    from terse.stats import aggregate, primer_liability, router_ledger_label
+    pf = _pfile(tmp_path)
+    label = router_ledger_label(pf)
+    passthrough = {"decision": "passthrough", "out_chars": 400, "out_tokens": 100}
+    recs = [{"ts": 100, "server": label, "event": "router_session"},
+            {**_rec(200, stamp=label), **passthrough},
+            {**_rec(201, server="kb", stamp=label), **passthrough}]
+    liab = primer_liability([_router_row(tmp_path, pf)], aggregate(recs))
+    assert liab["servers"][0]["cadence"] == "once/session (unpaid)"
+    assert "terse" in liab["free"]
+
+
+def test_a_standalone_untokenized_attach_is_never_listed_free(tmp_path):
+    """#452 item 3: the round-6 fix was gated to lazy routers; a standalone with an attach
+    row recorded without tiktoken and `encoded == 0` was listed free beside that row."""
+    from terse.stats import aggregate, primer_liability
+    row = {"scope": "user", "server": "kb", "state": "wrapped", "wraps": "kb-server",
+           "policy": _pol(tmp_path)}
+    recs = [{**_rec(200, server="kb-server"), "decision": "passthrough", "out_chars": 400,
+             "out_tokens": 100},
+            {"ts": 201, "server": "kb-server", "event": "primer", "cadence": "once/session",
+             "attached": True, "bytes": 900, "tokens": None}]
+    liab = primer_liability([row], aggregate(recs))
+    assert liab["servers"][0]["cadence"] == "once/session"
+    assert "kb" not in liab["free"]

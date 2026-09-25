@@ -2275,12 +2275,18 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         # it was called; leaving them out read a router called only through a contested peer
         # as "cost nothing at all" (round 6). `encoded` becomes unknown (None) whenever they
         # are added, so `_cadence` bills on blocks -- the over-billing direction.
+        #
+        # Under the blackout the count is promoted None -> 0 even when NONE of those rows are
+        # this router's (#452): its claimed rows are then all another router's, which is
+        # proof it wrote nothing -- "never called" whether or not it also fronts an idle
+        # peer. Left None it read `1x?` beside a sibling install that read `free`.
         cadence_blocks, cadence_encoded = blocks, encoded
         if lazy_router:
             own_contested = sum((stamps_by_label.get(lbl) or {}).get(rlbl, 0)
                                 for lbl in contested_here)
-            if own_contested:
+            if blackout:
                 cadence_blocks = (cadence_blocks or 0) + own_contested
+            if own_contested:
                 cadence_encoded = None
         if blackout:
             blocks = tokenized = encoded = None
@@ -2309,10 +2315,12 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
             # ledger says which.
             "cadence": _cadence(state, None if primer_unknown else cadence_blocks,
                                 None if primer_unknown else cadence_encoded,
-                                # An attach row under a lazy router's own label is proof it
-                                # paid even when untokenized (not `measured`) -- never "free".
-                                recorded=measured or (lazy_router and any(
-                                    lbl in attached_label for lbl in primer_labels)),
+                                # An attach row is proof of payment even when untokenized
+                                # (not `measured`) -- never "free". For every entry, not just
+                                # a lazy router (#452): a standalone with such a row and
+                                # `encoded == 0` was listed free beside it.
+                                recorded=measured or any(
+                                    lbl in attached_label for lbl in primer_labels),
                                 unpaid=measured_zero, lazy_router=lazy_router),
             **_break_even(tokens, blocks, tokenized,
                           sum(net_saved_by_label.get(lbl, 0) for lbl in labels),
