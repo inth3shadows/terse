@@ -230,6 +230,12 @@ def cli_answerer(alias: str, timeout: int = 180) -> Answerer:
                       f"launching more doomed processes", file=sys.stderr)
             return None
         argv = ["claude", "-p", "--model", alias, "--output-format", "json",
+                # Each probe is a throwaway one-question session. Persisted, they
+                # flooded ~/.claude/projects (361 of the 399 sessions /insights
+                # sampled on 2026-09-25 were these), crowding real work out of
+                # the usage report. `--bare` would also skip hooks, but it never
+                # reads OAuth, which this backend depends on.
+                "--no-session-persistence",
                 "--strict-mcp-config", "--mcp-config", mcp_cfg,
                 # No built-in tools either (Bash/Read/Write/...) — openai_answerer sends
                 # none, so the two backends must answer under equivalent conditions. A

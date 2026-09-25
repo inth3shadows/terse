@@ -13,6 +13,11 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Changed
+- **Fluency probes no longer persist `claude -p` sessions (#456).** Persisted probes flooded `~/.claude/projects` (361 of the 399 sessions `/insights` sampled). A per-call JSONL ledger (`$XDG_STATE_HOME/terse/fluency-ledger.jsonl`; `TERSE_FLUENCY_LEDGER` overrides it, empty disables it) now records each probe's model, arm, expected answer, reply and correctness, and keeps unanswered distinct from wrong. `scripts/harvest_fluency_transcripts.py` converts previously persisted probe transcripts into a dataset.
+
+## [0.38.2] - 2026-09-24
+
 ### Fixed
 
 - **`mcp-status` names a live duplicate in another scope (#447).** Its "runs TWICE" warning

@@ -115,6 +115,14 @@ def test_the_named_alias_reaches_the_model_flag(monkeypatch):
     assert argv[argv.index("--model") + 1] == "haiku"
 
 
+def test_probe_sessions_are_not_persisted(monkeypatch):
+    """Persisted probes filled the transcript store and crowded real sessions out of
+    /insights (361 of 399 sampled, 2026-09-25)."""
+    seen = _spy(monkeypatch, _FakeProc(out=_reply("4")))
+    cli_answerer("haiku")("", "q")
+    assert "--no-session-persistence" in seen["argv"]
+
+
 def test_builtin_tools_are_also_disabled_not_just_mcp(monkeypatch):
     """`--strict-mcp-config` only pins off MCP servers — Read/Write/Bash/Glob are still on
     by default. `openai_answerer` sends no tools at all, so the two backends the panel
