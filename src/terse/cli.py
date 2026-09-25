@@ -1915,7 +1915,7 @@ def _cmd_uninstall_mcp(args: argparse.Namespace) -> int:
 
 def _cmd_mcp_status(args: argparse.Namespace) -> int:
     from .install_mcp import scan_scopes
-    from .stats import _WRITES_LEDGER_ROWS
+    from .stats import _WRITES_LEDGER_ROWS, _contested_labels, _precedence_winner
 
     rows = scan_scopes(file=args.file, repo_path=args.repo_path)
     if args.json:
@@ -1928,6 +1928,20 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
     by_scope: dict[str, list[dict]] = {}
     for r in rows:
         by_scope.setdefault(r["scope"], []).append(r)
+    # Duplicates `terse stats` sees, by the SAME predicate (#447): a router's peer name that
+    # another running proxy also answers to. The per-row `folded-and-live` line below only
+    # catches the same-scope shape; a duplicate in ANOTHER scope (a project router folding
+    # `kb` beside a user-scope `kb` proxy, #424) printed nothing here while `terse stats`
+    # reported the label contested. Keyed on the row that actually runs for each name.
+    winners = _precedence_winner(rows)
+    row_index = {id(r): i for i, r in enumerate(rows)}
+    dup_of: dict[int, list[tuple[str, list[str]]]] = {}
+    for lbl, contest in sorted(_contested_labels(rows).items()):
+        for name in sorted(contest.writers):
+            idx = winners.get(name)
+            if idx is not None:
+                dup_of.setdefault(idx, []).append(
+                    (lbl, sorted(contest.writers - {name})))
     for scope in ("user", "project", "local"):
         scope_rows = by_scope.get(scope)
         if not scope_rows:
@@ -1954,6 +1968,11 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
             elif r["state"] == "router-ambiguous":
                 print(f"  {'':<20} another entry fronts the same peers file — delete the "
                       f"duplicate (they are interchangeable) before terse can manage it")
+            # `folded-and-live` already said "runs TWICE" above, in its own words.
+            if r["state"] != "folded-and-live":
+                for lbl, others in dup_of.get(row_index[id(r)], []):
+                    print(f"  {'':<20} `{lbl}` is ALSO run by {', '.join(others)}: "
+                          f"this downstream runs TWICE. Remove one.")
             # `_WRITES_LEDGER_ROWS`, imported rather than re-spelled: this line describes
             # what an entry FRONTS and how it will show up in the ledger, which is exactly
             # that predicate's population. The renderer carried its own copy of the
