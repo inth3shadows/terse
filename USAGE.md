@@ -245,7 +245,12 @@ byte-for-byte. It's **idempotent** (re-running re-wraps from the stashed origina
 instead of nesting proxies). Cross-call diffing is OPT-IN since #170, so a plain
 wrap does NOT diff; pass `install-mcp --diff` to bake an opt-in into a server's
 entry (or `--no-diff` to override a policy-file `"diff": true`), and
-`--diff-keyframe-interval K` to tune re-anchoring. Flags always reflect the latest
+`--diff-keyframe-interval K` to tune re-anchoring. The one exception is a design server
+(name or launch command matching figma, framelink, penpot or sketch): with neither flag
+given, the wrap bakes in `--diff`, because design sessions re-fetch the same file between
+edits (a simulated 4-edit Figma loop cost 78% fewer tokens with diffing). A diff is only
+readable next to the result it updates, so if your client clears old tool results, pass
+`--no-diff`. Flags always reflect the latest
 install invocation. It honors `$CLAUDE_CONFIG` if your config isn't at
 `~/.claude.json`. Start with one high-win, read-only server (e.g. `runecho`) and
 confirm it works before wrapping more.
