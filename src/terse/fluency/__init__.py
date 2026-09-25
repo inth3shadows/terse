@@ -38,6 +38,7 @@ Package layout (#78 — split from one 958-line module; this facade preserves th
   answerers.py  — the Answerer protocol + the stdlib-urllib live backend
   harnesses.py  — paired eval runners (plain / diff / chain-soak / text-diff)
   pack.py       — offline eval packs + the one-time format PRIMER
+  ledger.py     — per-call JSONL ledger, written at harnesses.py's `_ask_n` choke point
 """
 
 from __future__ import annotations
@@ -70,6 +71,10 @@ from .harnesses import (  # noqa: F401
     run_payload,
     run_text_diff_fluency,
     run_text_diff_payload,
+)
+from .ledger import (  # noqa: F401
+    default_ledger_path,
+    log_call,
 )
 from .pack import (  # noqa: F401
     PRIMER,

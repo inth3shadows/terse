@@ -18,6 +18,7 @@ from .. import text_diff
 from ..capture import LONG_TEXT, OTHER, classify_shape
 from ..transforms import compress, diff_wire
 from .answerers import Answerer
+from .ledger import log_call
 from .pack import PRIMER
 from .questions import _text_diff_questions_from_lines, gen_questions
 from .scoring import score
@@ -64,7 +65,8 @@ def _safe_ask(answerer: Answerer, system: str, user: str) -> str | None:
 
 
 def _ask_n(answerer: Answerer, system: str, user: str,
-           qtype: str, expected: Any, trials: int) -> tuple[int, int]:
+           qtype: str, expected: Any, trials: int, *,
+           model: str = "", arm: str = "", harness: str = "") -> tuple[int, int]:
     """Ask the same question `trials` times; return `(correct, unanswered)`.
 
     Repeating at temperature 0 is not redundant — it surfaces the provider-side
@@ -81,19 +83,35 @@ def _ask_n(answerer: Answerer, system: str, user: str,
     live cause is a token-budget stop that scales with prompt length, so the diff arm —
     whose prompt is strictly longer than its control's — is systematically the one that
     loses calls; this module makes no attempt to protect against that correlation. See
-    issue #280 for the open design question."""
+    issue #280 for the open design question.
+
+    `model`/`arm`/`harness` identify the call for `ledger.log_call` — this is the ONE choke
+    point every harness funnels through (module docstring, ledger.py's), so the ledger row
+    is written here rather than by each of the four `run_*_payload` callers separately.
+    They default to `""` because tests call `_ask_n` directly without them (the ledger then
+    still writes a row, just an uninformatively-labeled one — never a reason to skip it,
+    since that would let a caller's forgotten kwarg silently drop the row instead of merely
+    mislabeling it)."""
     ok = fails = 0
-    for _ in range(trials):
+    for trial in range(trials):
         reply = _safe_ask(answerer, system, user)
+        correct: bool | None
         if reply is None:
+            correct, unanswered = None, True
+        else:
+            correct, unanswered = score(qtype, expected, reply), False
+        log_call(harness=harness, model=model, arm=arm, qtype=qtype, expected=expected,
+                 reply=reply, correct=correct, unanswered=unanswered, trial=trial,
+                 system=system, user=user)
+        if unanswered:
             fails += 1
             continue
-        ok += score(qtype, expected, reply)
+        ok += bool(correct)
     return ok, fails
 
 
 def run_payload(obj: Any, raw_text: str, answerer: Answerer,
-                primer: str = PRIMER, trials: int = 1) -> list[dict]:
+                primer: str = PRIMER, trials: int = 1, model: str = "") -> list[dict]:
     """Ask one payload's questions over raw / terse / terse+primer / terse+inline-primer,
     `trials` times each.
 
@@ -113,6 +131,10 @@ def run_payload(obj: Any, raw_text: str, answerer: Answerer,
     delivered inline. This arm closes that gap: identical primer text, identical questions,
     the only difference being that it rides with the DATA rather than in the system slot —
     which is exactly what the proxy could do, since a stdio proxy cannot set a system prompt.
+
+    `model` identifies the caller's answerer for the ledger only (ledger.py) — it plays no
+    role in scoring. Callers that don't have a name for their answerer (most direct test
+    calls) can leave it as `""`; `run_fluency` passes the answerer's dict key.
     """
     terse_text = compress(obj)
     out: list[dict] = []
@@ -122,12 +144,16 @@ def run_payload(obj: Any, raw_text: str, answerer: Answerer,
         # The primer PREFIXES the result body, which is where a lazy primer would put it:
         # the proxy owns the result text and nothing else.
         inline_u = _user_prompt(q.prompt, q.instruction, f"{primer}\n\n{terse_text}")
-        raw_ok, raw_fail = _ask_n(answerer, "", raw_u, q.qtype, q.expected, trials)
-        terse_ok, terse_fail = _ask_n(answerer, "", terse_u, q.qtype, q.expected, trials)
-        primer_ok, primer_fail = _ask_n(answerer, primer, terse_u, q.qtype, q.expected, trials)
+        raw_ok, raw_fail = _ask_n(answerer, "", raw_u, q.qtype, q.expected, trials,
+                                  model=model, arm="raw", harness="run_payload")
+        terse_ok, terse_fail = _ask_n(answerer, "", terse_u, q.qtype, q.expected, trials,
+                                      model=model, arm="terse", harness="run_payload")
+        primer_ok, primer_fail = _ask_n(answerer, primer, terse_u, q.qtype, q.expected, trials,
+                                        model=model, arm="primer", harness="run_payload")
         # No system message: the whole point is that the model was never told anything
         # at initialize time.
-        inline_ok, inline_fail = _ask_n(answerer, "", inline_u, q.qtype, q.expected, trials)
+        inline_ok, inline_fail = _ask_n(answerer, "", inline_u, q.qtype, q.expected, trials,
+                                        model=model, arm="inline", harness="run_payload")
         out.append({
             "qid": q.qid, "qtype": q.qtype, "transform": q.transform, "trials": trials,
             "raw_ok": raw_ok, "terse_ok": terse_ok,
@@ -227,7 +253,7 @@ def run_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
             except (json.JSONDecodeError, TypeError):
                 obj = None
             if obj is not None:
-                for row in run_payload(obj, env["raw"], fn, primer, trials):
+                for row in run_payload(obj, env["raw"], fn, primer, trials, model=name):
                     rows.append({"tool": env["tool"], "sha": env.get("sha", "?"), **row})
             if progress is not None:
                 progress(progress_line("fluency", name, i, len(envelopes), rows, started,
@@ -244,7 +270,7 @@ def run_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
 # decision under production conditions.)
 # --------------------------------------------------------------------------- #
 def run_diff_payload(prev_obj: Any, curr_obj: Any, answerer: Answerer,
-                     tool: str = "", trials: int = 1) -> list[dict]:
+                     tool: str = "", trials: int = 1, model: str = "") -> list[dict]:
     """Does the model answer questions about the CURRENT result as well from
     (previous full result + diff) as from the full current result?
 
@@ -268,8 +294,10 @@ def run_diff_payload(prev_obj: Any, curr_obj: Any, answerer: Answerer,
     for q in questions:
         full_u = _user_prompt(q.prompt, q.instruction, curr_terse)
         diff_u = _user_prompt(q.prompt, q.instruction, diff_data)
-        _t_ok, _t_f = _ask_n(answerer, "", full_u, q.qtype, q.expected, trials)
-        _d_ok, _d_f = _ask_n(answerer, "", diff_u, q.qtype, q.expected, trials)
+        _t_ok, _t_f = _ask_n(answerer, "", full_u, q.qtype, q.expected, trials,
+                             model=model, arm="terse", harness="run_diff_payload")
+        _d_ok, _d_f = _ask_n(answerer, "", diff_u, q.qtype, q.expected, trials,
+                             model=model, arm="diff", harness="run_diff_payload")
         # Failed calls leave the denominator, exactly as in `run_payload`: the
         # defect #263 names applies to every harness, not only the primer one.
         _t_tr, _d_tr = trials - _t_f, trials - _d_f
@@ -309,7 +337,7 @@ def _aggregate_by_model(pairs: list[tuple], answerers: dict[str, Answerer], tria
         rows: list[dict] = []
         started = time.monotonic()
         for i, (tool, csha, a, b) in enumerate(pairs, 1):
-            for row in payload_fn(a, b, fn, tool, trials=trials):
+            for row in payload_fn(a, b, fn, tool, trials=trials, model=name):
                 rows.append({"tool": tool, "sha": csha, **row})
             if progress is not None:
                 progress(progress_line(label, name, i, len(pairs), rows, started,
@@ -412,7 +440,7 @@ def build_chain_windows(envelopes: list[dict], max_depth: int = 5,
 
 
 def run_chain_payload(objs: list, answerer: Answerer, tool: str = "",
-                      trials: int = 1) -> list[dict]:
+                      trials: int = 1, model: str = "") -> list[dict]:
     """run_diff_payload generalized to a depth-N chain: the same questions about the
     FINAL state, control = full-terse of the final result, form = the base full-terse
     plus every intermediate diff wire in order — exactly the context a model has
@@ -435,8 +463,10 @@ def run_chain_payload(objs: list, answerer: Answerer, tool: str = "",
     for q in questions:
         full_u = _user_prompt(q.prompt, q.instruction, curr_terse)
         chain_u = _user_prompt(q.prompt, q.instruction, chain_data)
-        _t_ok, _t_f = _ask_n(answerer, "", full_u, q.qtype, q.expected, trials)
-        _d_ok, _d_f = _ask_n(answerer, "", chain_u, q.qtype, q.expected, trials)
+        _t_ok, _t_f = _ask_n(answerer, "", full_u, q.qtype, q.expected, trials,
+                             model=model, arm="terse", harness="run_chain_payload")
+        _d_ok, _d_f = _ask_n(answerer, "", chain_u, q.qtype, q.expected, trials,
+                             model=model, arm="diff", harness="run_chain_payload")
         # Failed calls leave the denominator, exactly as in `run_payload`: the
         # defect #263 names applies to every harness, not only the primer one.
         _t_tr, _d_tr = trials - _t_f, trials - _d_f
@@ -466,7 +496,7 @@ def run_diff_soak(envelopes: list[dict], answerers: dict[str, Answerer],
         rows: list[dict] = []
         started = time.monotonic()
         for i, (tool, sha, _depth, objs) in enumerate(windows, 1):
-            for row in run_chain_payload(objs, fn, tool, trials=trials):
+            for row in run_chain_payload(objs, fn, tool, trials=trials, model=name):
                 rows.append({"tool": tool, "sha": sha, **row})
             if progress is not None:
                 progress(progress_line("fluency --diff-soak", name, i, len(windows), rows,
@@ -489,7 +519,7 @@ def run_diff_soak(envelopes: list[dict], answerers: dict[str, Answerer],
 # a genuinely different, stateful 2-turn tool-calling protocol; this isn't.)
 # --------------------------------------------------------------------------- #
 def run_text_diff_payload(prev: str, curr: str, answerer: Answerer,
-                          tool: str = "", trials: int = 1) -> list[dict]:
+                          tool: str = "", trials: int = 1, model: str = "") -> list[dict]:
     """Does the model answer questions about the CURRENT text as well from
     (previous text + text-diff) as from the full current text?
 
@@ -512,8 +542,10 @@ def run_text_diff_payload(prev: str, curr: str, answerer: Answerer,
     for q in questions:
         full_u = _user_prompt(q.prompt, q.instruction, curr)
         diff_u = _user_prompt(q.prompt, q.instruction, diff_data)
-        _t_ok, _t_f = _ask_n(answerer, "", full_u, q.qtype, q.expected, trials)
-        _d_ok, _d_f = _ask_n(answerer, "", diff_u, q.qtype, q.expected, trials)
+        _t_ok, _t_f = _ask_n(answerer, "", full_u, q.qtype, q.expected, trials,
+                             model=model, arm="terse", harness="run_text_diff_payload")
+        _d_ok, _d_f = _ask_n(answerer, "", diff_u, q.qtype, q.expected, trials,
+                             model=model, arm="diff", harness="run_text_diff_payload")
         # Failed calls leave the denominator, exactly as in `run_payload`: the
         # defect #263 names applies to every harness, not only the primer one.
         _t_tr, _d_tr = trials - _t_f, trials - _d_f
