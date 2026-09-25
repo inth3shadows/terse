@@ -15,6 +15,16 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- **`mcp-status` names a live duplicate in another scope (#447).** Its "runs TWICE" warning
+  fired only for a same-scope `folded-and-live` row, so a project router folding `kb` beside a
+  user-scope `kb` proxy printed `folded` and `wrapped` with no warning while `terse stats`
+  reported the label contested. It now asks the same predicate (`_contested_labels`) and
+  names the other writer under each row that actually runs.
+
+## [0.38.1] - 2026-09-24
+
+### Fixed
+
 - **An attach row recorded without tiktoken is proof of payment for every entry, not just a
   lazy router (#452).** A standalone proxy with such a row and no compressed block read
   `once/session (unpaid)` and was listed as costing nothing beside the row saying it paid.
