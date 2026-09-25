@@ -91,12 +91,14 @@ def log_call(*, harness: str, model: str, arm: str, qtype: str, expected: Any,
         "correct": correct,
         "unanswered": unanswered,
         "trial": trial,
-        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        # surrogatepass: a payload can legally carry a lone surrogate (json.loads
+        # accepts "\ud800"), and a strict encode here would abort the whole run.
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8", "surrogatepass")).hexdigest(),
         "prompt_chars": len(prompt),
     }
     try:
         mkdir_restricted(path.parent)
-        append_restricted(path, json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        append_restricted(path, json.dumps(row, default=str) + "\n")  # ASCII escapes: a lone surrogate must not fail the write
     except Exception as exc:  # noqa: BLE001 — a ledger write must never break a run
         global _warned
         if not _warned:

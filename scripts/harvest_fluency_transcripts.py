@@ -102,7 +102,7 @@ def harvest_file(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     file — a torn/partial JSONL line (same tolerance `stats.load_stats` gives its own
     ledger) is skipped, not fatal to the rest of the file or the run."""
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return None, f"unreadable ({exc.__class__.__name__})"
 
@@ -115,6 +115,8 @@ def harvest_file(path: Path) -> tuple[dict[str, Any] | None, str | None]:
         try:
             obj = json.loads(raw_line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
             continue
         line_type = obj.get("type")
         if line_type == "user" and user is None:

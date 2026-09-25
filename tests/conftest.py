@@ -61,6 +61,9 @@ def _isolate_xdg_state(monkeypatch, tmp_path_factory):
     ~/.local/state. Tests that care about the path set their own value on top."""
     monkeypatch.setenv("XDG_STATE_HOME",
                        str(tmp_path_factory.getbasetemp() / "xdg-state"))
+    # An exported TERSE_FLUENCY_LEDGER would otherwise route every test's rows into
+    # the developer's real ledger file.
+    monkeypatch.delenv("TERSE_FLUENCY_LEDGER", raising=False)
 
 
 # --------------------------------------------------------------------------- #

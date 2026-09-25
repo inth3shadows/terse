@@ -152,3 +152,16 @@ def test_write_failure_warns_only_once(monkeypatch, tmp_path, capsys):
     err = capsys.readouterr().err
     assert err.count("[terse fluency]") == 1, err
     ledger_mod._warned = False  # leave clean for the rest of the suite
+
+
+def test_lone_surrogate_in_prompt_never_aborts_the_run(monkeypatch, tmp_path):
+    """json.loads accepts "\\ud800" and compress() passes it through; a strict
+    utf-8 encode in the ledger used to raise UnicodeEncodeError out of _ask_n and
+    abort a whole multi-model run (PR #456 review)."""
+    log = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("TERSE_FLUENCY_LEDGER", str(log))
+    user = "q " + json.loads('"x\\ud800y"')
+    ok, fails = _ask_n(lambda s, u: "1", "", user, "count", 1, 1,
+                       model="m", arm="raw", harness="run_payload")
+    assert (ok, fails) == (1, 0)
+    assert len(_lines(log)) == 1
