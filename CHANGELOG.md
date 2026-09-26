@@ -13,7 +13,9 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **The CHANGELOG graduation check no longer depends on commit history (#436).** `test_unreleased_does_not_describe_work_that_already_shipped` decided whether an `[Unreleased]` entry had shipped by blaming the line and asking which tag contained that commit, so a pull request whose branch moved a released entry passed while its squash on `main` failed; that is how #422's release was skipped. An entry now counts as shipped when the same line appears in `CHANGELOG.md` at a release tag, and is attributed to the oldest such tag. A branch and its squash get the same answer, and a released entry moved back into `[Unreleased]` is now caught.
 
 ## [0.41.0] - 2026-09-26
 

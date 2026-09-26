@@ -16,6 +16,7 @@ well-written; they can check that no release is silently undocumented and that
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -39,13 +40,14 @@ def _ver(tag: str) -> tuple[int, ...]:
     return tuple(int(x) for x in tag.lstrip("v").split("."))
 
 
-def _git(*args: str) -> str:
-    return subprocess.run(["git", *args], cwd=REPO, capture_output=True,
+def _git(*args: str, repo: Path = REPO) -> str:
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True,
                           text=True, check=False).stdout
 
 
-def _tags() -> list[str]:
-    return [t for t in _git("tag", "--sort=creatordate").split() if re.fullmatch(r"v\d+\.\d+\.\d+", t)]
+def _tags(repo: Path = REPO) -> list[str]:
+    return [t for t in _git("tag", "--sort=creatordate", repo=repo).split()
+            if re.fullmatch(r"v\d+\.\d+\.\d+", t)]
 
 
 @pytest.fixture(scope="module")
@@ -83,6 +85,68 @@ def test_every_release_but_the_newest_has_a_changelog_section(text):
         "pushed, and a user on that version has no other way to find out what changed.")
 
 
+def _unreleased_body(text: str) -> list[str] | None:
+    """The lines strictly between `## [Unreleased]` and the next `## [` heading (or the end
+    of the file), or None when there is no `[Unreleased]` section."""
+    lines = text.splitlines()
+    start = next((i for i, ln in enumerate(lines) if ln.startswith("## [Unreleased]")), None)
+    if start is None:
+        return None
+    end = next((i for i, ln in enumerate(lines) if i > start and ln.startswith("## [")),
+               len(lines))
+    return lines[start + 1:end]
+
+
+def _entry_lines(lines: list[str]) -> set[str]:
+    """Only actual entry text can be "work that already shipped". Structure recurs across
+    releases and would match on every run: a blank separator, a `### Added` heading, the
+    `_Nothing yet._` placeholder, a multi-line italic note (either end), a bare code fence.
+    Measured on this CHANGELOG: once those are excluded, no entry line repeats."""
+    out = set()
+    for ln in lines:
+        t = ln.strip()
+        if (not t or t.startswith(("#", "_", "```")) or t.endswith("_")
+                or not any(c.isalpha() for c in t)):
+            continue
+        out.add(t)
+    return out
+
+
+def _shipped_unreleased_entries(text: str, repo: Path = REPO) -> dict[str, str]:
+    """Map each release tag to one `[Unreleased]` entry line (of `text`) it already shipped.
+
+    Decided by CONTENT, not history (#436): an entry has shipped iff its line appears in
+    `CHANGELOG.md` as of some release tag. At a tag, that snapshot's `[Unreleased]` holds
+    exactly what the tag shipped (graduation happens in the NEXT pull request) and its
+    versioned sections hold everything older, so any entry line in any tag's snapshot is
+    released work. Each line is attributed to the OLDEST tag containing it — the release
+    that actually shipped it, which is the one the graduation hint must name.
+
+    The previous check blamed each line and asked `git tag --contains`. Blame depends on
+    history, not content, so the same file could pass on a PR branch (a moved line blames
+    to the untagged branch commit) and fail on its squash (the line blames back to its
+    tagged original) — which is how #422's release was skipped. Content gives the same
+    answer on both, and a relocated entry is still caught.
+
+    No tags (a shallow clone or fresh fork) means nothing can be proven shipped: returns
+    {}. A tag whose tree has no CHANGELOG.md contributes nothing."""
+    body = _unreleased_body(text)
+    if not body:
+        return {}
+    pending = _entry_lines(body)
+    shipped: dict[str, str] = {}
+    for tag in sorted(_tags(repo), key=_ver):
+        if not pending:
+            break
+        snap = subprocess.run(["git", "show", f"{tag}:CHANGELOG.md"], cwd=repo,
+                              capture_output=True, text=True, check=False).stdout
+        hit = pending & {ln.strip() for ln in snap.splitlines()}
+        if hit:
+            shipped[tag] = sorted(hit)[0][:70]
+            pending -= hit
+    return shipped
+
+
 @pytest.mark.changelog_bookkeeping
 def test_unreleased_does_not_describe_work_that_already_shipped():
     """The failure this file was written for, encoded as the invariant rather than a size
@@ -94,48 +158,18 @@ def test_unreleased_does_not_describe_work_that_already_shipped():
     was rewritten.
 
     The real rule is the file's own: an entry moves out of `[Unreleased]` when its tag is
-    pushed. So blame each line still in `[Unreleased]` and ask git whether that commit is
-    already contained in a tag. If it is, the work shipped and the entry is in the wrong
-    place — which is exactly, and only, the drift that produced 1,133 stale lines. A
-    genuinely pending entry blames to an untagged commit and is fine, so this never
-    obstructs normal work.
+    pushed. So ask, for each entry still in `[Unreleased]`, whether that exact line is
+    already in `CHANGELOG.md` at some release tag (`_shipped_unreleased_entries`). If it
+    is, the work shipped and the entry is in the wrong place. A genuinely pending entry is
+    new text that no tag has seen, so this never obstructs normal work.
 
-    KNOWN LIMIT, measured rather than assumed: blame reports the last commit to touch a
-    line, so physically MOVING a released entry back into `[Unreleased]` re-blames it to the
-    (untagged) move commit and slips past. Verified — that mutation passes. This catches the
-    drift that actually happened (entries written under `[Unreleased]` and never moved out,
-    still blaming their original tagged commit) and not a deliberate relocation, which is
-    not a failure mode anyone has. `test_every_release_but_the_newest_has_a_changelog_section` is the
-    backstop there: the relocated entry's release still needs a section."""
-    lines = CHANGELOG.read_text(encoding="utf-8").splitlines()
-    try:
-        start = next(i for i, ln in enumerate(lines) if ln.startswith("## [Unreleased]"))
-        end = next(i for i, ln in enumerate(lines) if i > start and ln.startswith("## ["))
-    except StopIteration:
+    Reads the WORKING TREE file, so an uncommitted entry is checked too — correct, since
+    new text cannot be in a tag, and a released line pasted back in is caught before it is
+    committed. Content, not blame: a PR branch and its squash give the same answer (#436)."""
+    text = CHANGELOG.read_text(encoding="utf-8")
+    if _unreleased_body(text) is None:
         pytest.skip("no [Unreleased] section")
-    if end - start <= 1 or not _tags():
-        return
-    # Blame the WORKING TREE, not HEAD: the line numbers above come from the file on disk,
-    # and blaming HEAD pairs them with a different revision's line numbering the moment
-    # CHANGELOG.md has an uncommitted edit — which is every time someone is writing an
-    # entry. Uncommitted lines come back as an all-zero sha and are skipped below, which is
-    # correct: a line not yet committed cannot be in a tag.
-    blame = _git("blame", "-L", f"{start + 2},{end}", "--line-porcelain",
-                 "--", "CHANGELOG.md")
-    shipped: dict[str, str] = {}
-    for m in re.finditer(r"^([0-9a-f]{40}) \d+ (\d+)", blame, re.M):
-        sha, lineno = m.group(1), int(m.group(2))
-        if sha.startswith("0" * 20):        # uncommitted working-tree edit
-            continue
-        content = lines[lineno - 1]
-        # Structure, not content: a blank separator or a `### Added` heading has sat in this
-        # section since the file was created, so it blames to an ancient commit and would
-        # flag on every run. Only an actual entry line can be "work that already shipped".
-        if not content.strip() or content.startswith(("###", "_")):
-            continue
-        containing = _git("tag", "--contains", sha, "--sort=creatordate").split()
-        if containing:
-            shipped.setdefault(containing[0], lines[lineno - 1].strip()[:70])
+    shipped = _shipped_unreleased_entries(text)
     # The fix is one command, so print the command rather than a description of it. Whoever
     # trips this is usually not the person who cut the release — they opened the next PR and
     # inherited a red test about work that is not theirs — so making them go find the script
@@ -239,3 +273,90 @@ def test_the_hint_names_the_OLDEST_pending_release_not_the_lexicographic_first()
     # inside the failure path, replacing the message with a ValueError
     for tag in _tags():
         assert len(_ver(tag)) == 3, tag
+
+
+# --- #436: the shipped-entry check must depend on content, not on history ---------------
+
+_HEAD = "# Changelog\n\n## [Unreleased]\n\n### Added\n\n"
+_GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1", "PATH": os.environ.get("PATH", "")}
+
+
+class _Repo:
+    """A throwaway git repo with a CHANGELOG.md, for reproducing history shapes."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        path.mkdir()
+        self("init", "-q", "-b", "main")
+
+    def __call__(self, *args: str) -> str:
+        return subprocess.run(["git", *args], cwd=self.path, env=_GIT_ENV,
+                              capture_output=True, text=True, check=True).stdout
+
+    def commit(self, body: str, msg: str) -> None:
+        (self.path / "CHANGELOG.md").write_text(body, encoding="utf-8")
+        self("add", "CHANGELOG.md")
+        self("commit", "-q", "-m", msg)
+
+    def text(self) -> str:
+        return (self.path / "CHANGELOG.md").read_text(encoding="utf-8")
+
+    def blame_says_shipped(self, line: str) -> bool:
+        """The OLD check (blame + `tag --contains`), kept only to prove the fixture below
+        reproduces #436."""
+        n = self.text().splitlines().index(line) + 1
+        sha = self("blame", "-L", f"{n},{n}", "--porcelain", "--", "CHANGELOG.md").split()[0]
+        return bool(self("tag", "--contains", sha).split())
+
+
+def test_branch_head_and_its_squash_get_the_same_answer(tmp_path):
+    """#422, reduced: v0.1.0 ships entry A from [Unreleased]. A PR branch moves A (down,
+    then back) and adds B, never graduating A. Blame gives A to the branch's untagged
+    commit on the branch head (green) but to the tagged original on the squash (red). The
+    content check flags A on both, and never flags B."""
+    r = _Repo(tmp_path / "repo")
+    a, b = "- Entry A shipped in v0.1.0.", "- Entry B is still pending."
+    r.commit(_HEAD + f"{a}\n- Filler line one.\n", "a")
+    r("tag", "v0.1.0")
+    r("switch", "-q", "-c", "pr")
+    r.commit(_HEAD + f"- Filler line one.\n{a}\n", "move a down")
+    r.commit(_HEAD + f"{a}\n{b}\n- Filler line one.\n", "move a back, add b")
+    branch_text, branch_blame = r.text(), r.blame_says_shipped(a)
+    branch_verdict = _shipped_unreleased_entries(branch_text, r.path)
+
+    r("switch", "-q", "main")
+    r("merge", "-q", "--squash", "pr")
+    r("commit", "-q", "-m", "squash")
+    assert r.text() == branch_text
+    # the fixture really reproduces the bug: blame disagrees between the two
+    assert (branch_blame, r.blame_says_shipped(a)) == (False, True)
+    squash_verdict = _shipped_unreleased_entries(r.text(), r.path)
+    assert branch_verdict == squash_verdict == {"v0.1.0": a}
+
+
+def test_pending_entries_pass_and_untagged_history_proves_nothing(tmp_path):
+    r = _Repo(tmp_path / "repo")
+    r.commit(_HEAD + "- Old entry.\n", "a")
+    # no tags (shallow clone / fresh fork): nothing can be proven shipped
+    assert _shipped_unreleased_entries(_HEAD + "- Old entry.\n", r.path) == {}
+    r("tag", "v0.1.0")
+    graduated = _HEAD + "- Brand new entry.\n\n## [0.1.0] - 2026-01-01\n\n- Old entry.\n"
+    assert _shipped_unreleased_entries(graduated, r.path) == {}
+    # structure that recurs in every snapshot is never "shipped work"
+    assert _shipped_unreleased_entries(_HEAD + "_Nothing yet._\n\n```\n", r.path) == {}
+
+
+def test_each_entry_is_attributed_to_the_OLDEST_tag_that_shipped_it(tmp_path):
+    r = _Repo(tmp_path / "repo")
+    (r.path / "README").write_text("x")
+    r("add", "README")
+    r("commit", "-q", "-m", "pre-changelog")
+    r("tag", "v0.0.9")                      # no CHANGELOG.md in this tree: contributes nothing
+    r.commit(_HEAD + "- One.\n", "one")
+    r("tag", "v0.1.0")
+    r.commit(_HEAD + "- One.\n- Two.\n", "two")
+    r("tag", "v0.10.0")                     # numeric, not lexicographic, order
+    got = _shipped_unreleased_entries(_HEAD + "- Two.\n- One.\n- Three.\n", r.path)
+    assert got == {"v0.1.0": "- One.", "v0.10.0": "- Two."}
