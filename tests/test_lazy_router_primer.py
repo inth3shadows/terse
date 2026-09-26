@@ -85,11 +85,19 @@ def test_structured_content_is_held_raw_until_the_router_primer_has_attached():
     """#212 review: the primer cannot ride a result carrying `structuredContent` (the client
     discards the text block), and before #212 the eager `initialize` primer explained it.
     So while the shared primer is owed, the typed field goes out RAW — never an envelope the
-    model has no legend for — and no suppression is recorded, since none was owed."""
+    model has no legend for — and no suppression is recorded, since none was owed.
+
+    #463: under `"compress"` (claude-code's `auto`) the held result now carries the primer
+    in its typed field instead; the hold this pins remains for `"replace"`."""
     emitted: list = []
-    latch, (a, b) = _peers(emitted=emitted)
+    latch = PrimerLatch()
+    pol = Policy(rules=[Rule("gh.*", TIERS, structured="replace")])
+    a, b = (Interceptor(pol, server_name=f"p{i}", lazy_primer=False, shared_primer=latch,
+                        stats_primer=lambda c, t, a=True: emitted.append((c, len(t), a)))
+            for i in range(2))
+    latch.set_text(union_primer([(pol, "p0"), (pol, "p1")], structured_wrap=True))
     for p in (a, b):
-        p.client_name = "claude-code"          # `auto` compresses the typed field here
+        p.client_name = "claude-code"
     rows = {"rows": [{"id": i, "status": "active"} for i in range(12)]}
     _call(a, 1)
     held = json.loads(a.transform_response(_result(1, structured=rows)))["result"]
@@ -380,8 +388,9 @@ def test_a_held_result_passes_through_WHOLE_and_is_ledgered_as_passthrough():
     """Review round 2: holding only the typed field left a text-reading client (Cursor:
     `auto` resolves to `leave`) reading a terse text block no primer explained, and the
     ledger credited a context saving the model never received. The whole result is held,
-    and the row says so."""
-    for client in ("claude-code", "cursor"):
+    and the row says so. (#463: claude-code no longer holds -- it carries the primer in the
+    typed field; see the #463 tests below.)"""
+    for client in (None, "cursor"):
         rows: list = []
         latch = PrimerLatch()
         a = Interceptor(POL, server_name="p0", lazy_primer=False, shared_primer=latch,
@@ -792,3 +801,134 @@ def test_a_standalone_untokenized_attach_is_never_listed_free(tmp_path):
     liab = primer_liability([row], aggregate(recs))
     assert liab["servers"][0]["cadence"] == "once/session"
     assert "kb" not in liab["free"]
+
+
+# --- #463: a structured-only session must not hold forever -------------------------
+
+def _typed():
+    return {"rows": [{"id": i, "status": "active", "url": "https://x.example/api/items"}
+                     for i in range(12)]}
+
+
+def _typed_result(mid):
+    """A kb.*-shaped result: `structuredContent` plus its faithful text mirror."""
+    typed = _typed()
+    return _result(mid, text=json.dumps(typed), structured=typed)
+
+
+def _wrap_peers(n=1, client="claude-code", emitted=None, stats_rows=None, latch=None):
+    latch = latch if latch is not None else PrimerLatch()
+    peers = [Interceptor(POL, server_name=f"p{i}", lazy_primer=False, shared_primer=latch,
+                         stats=_stats_sink(stats_rows) if stats_rows is not None else None,
+                         stats_primer=(lambda c, t, a=True: emitted.append((c, len(t), a)))
+                         if emitted is not None else None)
+             for i in range(n)]
+    latch.set_text(union_primer([(POL, f"p{i}") for i in range(n)], structured_wrap=True))
+    for p in peers:
+        p.client_name = client
+    return latch, peers
+
+
+def _primer_blocks(res):
+    return sum(PRIMER_HEAD in b.get("text", "") for b in res["content"])
+
+
+def test_a_structured_only_session_compresses_with_the_primer_in_the_typed_field():
+    latch, (a,) = _wrap_peers()
+    _call(a, 1)
+    first = json.loads(a.transform_response(_typed_result(1)))["result"]
+    wrapper = first["structuredContent"]
+    assert set(wrapper) == {"__terse_primer__", "__terse_payload__"}
+    assert wrapper["__terse_primer__"] == latch.text
+    assert "__terse_" in json.dumps(wrapper["__terse_payload__"])      # compressed
+    assert wrapper["__terse_payload__"] != _typed()
+    assert _primer_blocks(first) == 1                                  # text block 0 too
+    assert first["content"][0]["text"] == latch.text
+    assert "__terse_" in first["content"][1]["text"]                   # text compressed
+    assert not latch.pending()
+    _call(a, 2)
+    second = json.loads(a.transform_response(_typed_result(2)))["result"]
+    assert "__terse_primer__" not in second["structuredContent"]       # spent
+    assert "__terse_" in json.dumps(second["structuredContent"])
+    assert _primer_blocks(second) == 0
+    assert "__terse_primer__" not in json.dumps(second)
+
+
+def test_the_union_primer_explains_the_wrapper_only_when_it_can_occur():
+    assert "__terse_primer__" in union_primer([(POL, "p0")], structured_wrap=True)
+    assert "__terse_primer__" not in union_primer([(POL, "p0")])
+    leave = Policy(rules=[Rule("*", TIERS, structured="leave")])
+    assert "__terse_primer__" not in union_primer([(leave, "p0")], structured_wrap=True)
+
+
+def test_an_unknown_client_keeps_the_hold():
+    for client in (None, "cursor"):
+        latch, (a,) = _wrap_peers(client=client)
+        raw = _typed_result(1)
+        _call(a, 1)
+        out = json.loads(a.transform_response(raw))["result"]
+        assert out == json.loads(raw)["result"], client
+        assert latch.pending(), client
+
+
+def test_replace_mode_keeps_the_hold():
+    latch = PrimerLatch()
+    pol = Policy(rules=[Rule("gh.*", TIERS, structured="replace")])
+    a = Interceptor(pol, server_name="p0", lazy_primer=False, shared_primer=latch)
+    latch.set_text(union_primer([(pol, "p0")], structured_wrap=True))
+    a.client_name = "claude-code"
+    raw = _typed_result(1)
+    _call(a, 1)
+    assert json.loads(a.transform_response(raw))["result"] == json.loads(raw)["result"]
+    assert latch.pending()
+
+
+def test_two_structured_peers_racing_wrap_exactly_one_primer():
+    emitted: list = []
+    latch, peers = _wrap_peers(n=2, emitted=emitted, latch=_RacingLatch(""))
+    for i, p in enumerate(peers):
+        _call(p, i + 1)
+    outs: dict[int, dict] = {}
+
+    def go(i):
+        outs[i] = json.loads(peers[i].transform_response(_typed_result(i + 1)))["result"]
+    threads = [threading.Thread(target=go, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    wrapped = [o for o in outs.values() if "__terse_primer__" in o["structuredContent"]]
+    assert len(wrapped) == 1
+    assert sum(_primer_blocks(o) for o in outs.values()) == 1
+    # The loser kept today's hold: its typed field went out raw, never unexplained.
+    loser = next(o for o in outs.values() if o is not wrapped[0])
+    assert loser["structuredContent"] == _typed()
+    assert emitted == [("once/session", len(latch.text), True)]
+
+
+def test_a_wrapped_result_books_one_primer_row_and_the_wrapper_on_the_emitted_side():
+    emitted: list = []
+    rows: list = []
+    latch, (a,) = _wrap_peers(emitted=emitted, stats_rows=rows)
+    _call(a, 1)
+    out = json.loads(a.transform_response(_typed_result(1)))["result"]
+    assert emitted == [("once/session", len(latch.text), True)]       # one primer row
+    assert len(rows) == 1
+    row = rows[0]
+    assert not row["passthrough"] and row["reason"] != "primer_hold"
+    payload = json.dumps(out["structuredContent"]["__terse_payload__"],
+                         separators=(",", ":"), ensure_ascii=False)
+    # Wrapper structure counted; the primer text is not billed a second time (its row is).
+    assert row["structured_out"] == ('{"__terse_primer__":"","__terse_payload__":'
+                                     + payload + "}")
+    assert len(row["structured_out"]) > len(payload)
+    assert row["structured"] == json.dumps(_typed(), separators=(",", ":"))
+
+
+def test_the_diff_base_after_a_wrapped_result_is_the_raw_value():
+    latch, (a,) = _wrap_peers()
+    a.diff = True
+    _call(a, 1)
+    out = json.loads(a.transform_response(_typed_result(1)))["result"]
+    assert "__terse_primer__" in out["structuredContent"]
+    assert a.last["gh.api.items"] == _typed()

@@ -407,7 +407,8 @@ class Router:
         # and the eager primer was 0.25% of all spend (program plan, 2.2).
         self.primer_latch = primer_latch
         if primer_latch is not None:
-            primer_latch.set_text(union_primer([(p.inter.policy, p.name) for p in peers]))
+            primer_latch.set_text(union_primer([(p.inter.policy, p.name) for p in peers],
+                                               structured_wrap=True))
         self.by_name = {p.name: i for i, p in enumerate(peers)}
         self.out = out
         self.out_lock = out_lock
