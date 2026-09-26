@@ -343,10 +343,14 @@ def _text_questions_and_staging(raw: str, rule: Any, tool: str) -> DropProbe:
     bare = [_GUTTER_RE.sub("", ln) for ln in lines]
     counts = Counter(bare)
     order = sorted(range(len(lines) - 1), key=lambda i: (abs(i - len(lines) // 2), i))
+    # And the anchor must not be VISIBLE in the emitted text: a block kept inline by
+    # `keep_first` (#252) can repeat the dropped block's lines, and an anchor found there
+    # makes a needs-retrieve question answerable from context without a retrieve.
     pair = next(((lines[i], lines[i + 1]) for i in order
-                 if counts[bare[i]] == 1 and lines[i + 1] != lines[i]), None)
+                 if counts[bare[i]] == 1 and lines[i + 1] != lines[i]
+                 and bare[i].strip() not in applied.text), None)
     if pair is None:
-        return _no_probe("no_anchor_line")  # no unambiguous anchor (every line identical)
+        return _no_probe("no_anchor_line")  # no unambiguous, non-visible anchor
     anchor, target = pair
     recall_q = _line_recall_question(handle, anchor, target)
     # Anchored on the SUM of the visible markers' `bytes` fields, not the marker count:
