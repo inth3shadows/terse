@@ -221,7 +221,7 @@ def test_the_primer_counts_toward_the_terse_arms_input_limit():
         pytest.skip("no tokenizer")
     primer = "primer " * 400
     terse_text = fluency.compress(PAYLOAD)
-    limit = max(codeceval.request_tokens(q, t) or 0
+    limit = max(codeceval.request_tokens(q, t, channel="text") or 0
                 for q in codeceval.gen_codec_questions(PAYLOAD)
                 for t in (RAW_TEXT, terse_text)) + 1
     env = {"tool": "kb.read.x", "server": "kb", "raw": RAW_TEXT, "sha": "a" * 40,
@@ -234,6 +234,63 @@ def test_the_primer_counts_toward_the_terse_arms_input_limit():
                                          limits={"m": limit}, primer=primer)
     assert [e.arm for e in primed.excluded] == ["terse"]
 
+
+
+def test_request_tokens_counts_a_text_channel_request_as_it_is_sent():
+    # #450: a text-channel (`cli:`) request carries the TEXT instruction and binds no tool, so
+    # counting the tool-channel instruction and the tool schema over-counted every one.
+    import pytest
+
+    from terse.tokenize import count_cl100k
+    if count_cl100k("x") is None:
+        pytest.skip("no tokenizer")
+    q = codeceval.gen_codec_questions(PAYLOAD)[0]
+    ans, seen = _text_answerer(_expected)
+    codeceval._codec_turn(q, RAW_TEXT, ans)
+    sent = seen[-1][-1]["content"]
+    assert codeceval.request_tokens(q, RAW_TEXT, channel="text") == count_cl100k(sent)
+    # Tool definitions are ignored on the text channel: that backend is sent none.
+    assert (codeceval.request_tokens(q, RAW_TEXT, [codeceval.RECORD_VALUE_TOOL_DEF],
+                                     channel="text") == count_cl100k(sent))
+    assert codeceval.request_tokens(q, RAW_TEXT) > count_cl100k(sent)
+
+
+def test_a_text_channel_payload_that_fits_as_sent_is_not_excluded():
+    # Through `run_codec_fluency`: the limit sits between the text request's real size and the
+    # tool-channel count of the same payload, so only a channel-blind count excludes it.
+    import pytest
+
+    from terse.tokenize import count_cl100k
+    if count_cl100k("x") is None:
+        pytest.skip("no tokenizer")
+    qs = codeceval.gen_codec_questions(PAYLOAD)
+    texts = (RAW_TEXT, fluency.compress(PAYLOAD))
+    text_max = max(codeceval.request_tokens(q, t, channel="text") or 0
+                   for q in qs for t in texts)
+    tool_max = max(codeceval.request_tokens(q, t, [codeceval.RECORD_VALUE_TOOL_DEF]) or 0
+                   for q in qs for t in texts)
+    assert tool_max > text_max
+    env = {"tool": "kb.read.x", "server": "kb", "raw": RAW_TEXT, "sha": "b" * 40,
+           "shape": "array-of-records", "manual": True}
+    ans, _ = _text_answerer(_expected)
+    run = codeceval.run_codec_fluency([env], {"m": ans}, trials=1, preflight=False,
+                                      limits={"m": text_max},
+                                      tool_defs=[codeceval.RECORD_VALUE_TOOL_DEF])
+    assert not run.excluded and run.rows["m"]
+
+
+def test_the_preflight_refusal_does_not_ask_a_text_model_for_a_tool_call():
+    # #450: a text-channel backend cannot call tools, so "answered without calling
+    # terse.record_answer" misdescribes its miss.
+    ans, _ = _text_answerer(lambda messages: "I think it is alice")
+    why = codeceval.preflight_encoding(ans, attempts=1)
+    assert why is not None
+    assert codeceval.RECORD_VALUE_TOOL not in why and "JSON value" in why
+
+    def tool_model(messages):
+        return Turn(text="alice")
+    why = codeceval.preflight_encoding(tool_model, attempts=1)
+    assert why is not None and codeceval.RECORD_VALUE_TOOL in why
 
 
 def test_the_preflight_asks_the_primed_request_when_there_is_a_primer():
@@ -335,8 +392,10 @@ def test_R3_savings_and_the_input_limit_use_the_policy_form():
     # differs from the default codec's (the raw arm is always larger, so no limit can sit
     # between the two forms — the reported size is what pins the call site).
     qs = codeceval.gen_codec_questions(payloads[0])
-    want = max(codeceval.request_tokens(q, policy_form[0]) or 0 for q in qs)
-    other = max(codeceval.request_tokens(q, default_form[0]) or 0 for q in qs)
+    # `channel="text"`: `ans` is a text-channel backend, sized as it is sent (#450).
+    want = max(codeceval.request_tokens(q, policy_form[0], channel="text") or 0 for q in qs)
+    other = max(codeceval.request_tokens(q, default_form[0], channel="text") or 0
+                for q in qs)
     assert want != other
     run2 = codeceval.run_codec_fluency(envs[:1], {"m": ans}, trials=1, preflight=False,
                                        policy=pol, limits={"m": 1})

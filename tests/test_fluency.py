@@ -576,11 +576,64 @@ def test_build_diff_report_unchanged_by_the_refactor():
 
 
 def test_build_diff_report_empty_hint_preserves_two_line_wrap():
-    # Pin build_diff_report's original two-physical-line empty-corpus hint — the
+    # Pin build_diff_report's two-physical-line no-pairs hint — the
     # _build_diff_style_report extraction must not collapse it into one long line.
     from terse.report import build_diff_report
-    report = build_diff_report({})
+    report = build_diff_report({"m": []}, pairs=0)
     assert "Capture a tool\n2+ times (an agent loop)" in report
+
+
+# --- #266 (a): an empty diff report names WHICH of three states it is in. One shared hint
+#     ("no model answers, or no same-tool pairs") sent an operator whose corpus HAD pairs
+#     off to capture more of them, when the pairs simply generated no questions. ---
+
+def test_empty_diff_report_with_no_models_says_no_model_answers():
+    from terse.report import build_diff_report, build_text_diff_report
+    for build in (build_diff_report, build_text_diff_report):
+        text = build({}, pairs=3)
+        assert "No model answers" in text
+        assert "PAIRS" not in text and "generated no question" not in text
+
+
+def test_empty_diff_report_with_no_pairs_says_no_pairs():
+    from terse.report import build_diff_report, build_text_diff_report
+    for build in (build_diff_report, build_text_diff_report):
+        text = build({"m": []}, pairs=0)
+        assert "No same-tool" in text and "PAIRS" in text
+        assert "No model answers" not in text and "generated no question" not in text
+
+
+def test_empty_diff_report_with_pairs_but_no_questions_says_so():
+    from terse.report import build_diff_report, build_text_diff_report
+    for build in (build_diff_report, build_text_diff_report):
+        text = build({"m": []}, pairs=4)
+        assert "4 same-tool pair(s)" in text and "generated no question" in text
+        # Not the capture-more advice: more pairs of the same shape would not help.
+        assert "Capture a" not in text and "No model answers" not in text
+
+
+def test_empty_diff_report_without_a_pair_count_names_both_corpus_causes():
+    from terse.report import build_diff_report
+    text = build_diff_report({"m": []})
+    assert "No same-tool" in text and "generated no question" in text
+
+
+def test_diff_pair_counters_match_what_the_harness_pairs():
+    import json
+    json_envs = [{"tool": "demo", "sha": "aaa", "raw": json.dumps(DIFF_PREV)},
+                 {"tool": "demo", "sha": "bbb", "raw": json.dumps(DIFF_CURR)},
+                 {"tool": "solo", "sha": "ccc", "raw": json.dumps(DIFF_PREV)}]
+    text_envs = [{"tool": "t", "sha": "aaa", "raw": TEXT_PREV},
+                 {"tool": "t", "sha": "bbb", "raw": TEXT_CURR}]
+    assert len(fluency.diff_pairs(json_envs)) == 1
+    assert len(fluency.text_diff_pairs(json_envs)) == 0
+    assert len(fluency.text_diff_pairs(text_envs)) == 1
+    assert len(fluency.diff_pairs(text_envs)) == 0
+    # A pair whose shape generates no question: counted as a pair, yields no rows.
+    flat = [{"tool": "rl", "sha": "a", "raw": json.dumps({"a": 1})},
+            {"tool": "rl", "sha": "b", "raw": json.dumps({"a": 2})}]
+    assert len(fluency.diff_pairs(flat)) == 1
+    assert fluency.run_diff_fluency(flat, {"m": lambda s, u: "x"}) == {"m": []}
 
 
 # --- openai_answerer TLS guard: never send an API key over cleartext http to a

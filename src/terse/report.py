@@ -1626,11 +1626,12 @@ def codec_verdict(rows: list[dict[str, Any]],
     # SAFE unreachable for this tier: a codec group is characteristically one question run
     # many times (`test_identical_partial_failure_on_both_arms_at_the_trial_floor_is_SAFE`
     # is a single row at 25 trials), so it would never reach 20 paired questions. This is
-    # not an exemption from sample-size gating — `_CODEC_MIN_TRIALS`, applied in
-    # `codec_unresolved_reasons`, is the same
-    # Clopper-Pearson floor in the unit this verdict actually counts in. Layering a second
-    # floor in a different unit would silently re-calibrate a tier that already decided
-    # this question, without saying so anywhere near `_CODEC_MIN_TRIALS`.
+    # not an exemption from sample-size gating — this tier's own floors live in
+    # `codec_unresolved_reasons`: `_CODEC_MIN_TRIALS` (the Clopper-Pearson floor, in trials)
+    # and `_CODEC_MIN_QUESTIONS` (complete questions, the fewest at which the sign test can
+    # reach significance). #334's 20-question floor is not one of them: it was calibrated
+    # for the comprehension gap, and applying it here would silently re-calibrate a tier
+    # whose floors are declared, with their reasons, beside those two constants.
     g = arm_gap(rows, "terse_ok", "raw_ok", min_paired=0)
     if g.excluded:
         return "UNRESOLVED", g
@@ -3606,17 +3607,44 @@ def build_trend_report(runs: list[dict[str, Any]]) -> str:
     return "\n".join(out)
 
 
+def _diff_empty_lines(results: dict, pairs: int | None, no_pairs_hint: list[str],
+                      rerun: str) -> list[str]:
+    """Why a diff-style report has no rows — ONE of three states, never a hint that lists
+    them all (#266). The shared hint ("no model answers, or no same-tool pairs") sent an
+    operator whose corpus HAD pairs off to capture more, when the pairs it had simply
+    generated no questions (a nested dict of scalars, or no lossless diff between them).
+
+    `pairs` is the number of same-tool pairs the harness asked over (`fluency.diff_pairs`
+    / `text_diff_pairs`); `None` when the caller did not count them, in which case both
+    corpus-side causes are named rather than a guessed one."""
+    if not results:
+        return [f"No model answers: no model was configured, so nothing was asked. "
+                f"Configure a backend, then re-run `{rerun}`."]
+    no_questions = ("generated no question — each pair either admits no lossless diff or "
+                    "has a shape the question generator cannot ask about (e.g. a nested "
+                    "dict of scalars, no record list). More captures of the same shape will "
+                    "not help; capture a tool whose result is a list of records.")
+    if pairs is None:
+        return [*no_pairs_hint,
+                f"Or the corpus has pairs that {no_questions}"]
+    if pairs == 0:
+        return no_pairs_hint
+    return [f"The corpus has {pairs} same-tool pair(s), but they {no_questions}"]
+
+
 def _build_diff_style_report(results: dict, title: str, intro: list[str],
-                             empty_hint: list[str], control_label: str = "full-terse") -> str:
+                             no_pairs_hint: list[str], rerun: str,
+                             control_label: str = "full-terse",
+                             pairs: int | None = None) -> str:
     """Shared body for build_diff_report and build_text_diff_report — the row shape
     ({qid, qtype, transform, trials, terse_ok, diff_ok}) and verdict math are identical
-    for both; only the title/intro/empty-hint copy and the control column's label
-    differ. `empty_hint` is pre-split into lines (not a single string) so each caller
+    for both; only the title/intro/no-pairs copy and the control column's label
+    differ. `no_pairs_hint` is pre-split into lines (not a single string) so each caller
     controls its own line-wrapping exactly, the same way `intro` already does."""
     out: list[str] = [title, ""]
     out += intro
     if not results or not any(results.values()):
-        out += [*empty_hint, ""]
+        out += [*_diff_empty_lines(results, pairs, no_pairs_hint, rerun), ""]
         return "\n".join(out)
 
     trials = max((r.get("trials", 1) for rows in results.values() for r in rows), default=1)
@@ -3711,7 +3739,7 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
     return "\n".join(out)
 
 
-def build_diff_report(results: dict) -> str:
+def build_diff_report(results: dict, pairs: int | None = None) -> str:
     """Render the cross-call diff fluency eval: does a model read a diff against the
     prior result as accurately as the full current result?
 
@@ -3719,6 +3747,8 @@ def build_diff_report(results: dict) -> str:
     full-terse (`terse_ok`) and diff-form (`diff_ok`) success counts over the same
     questions. The verdict gates on the worst model (principle #24): the proxy emits a
     diff only when smaller, so this bounds the comprehension cost of enabling it.
+    `pairs` (`len(fluency.diff_pairs(envelopes))`) lets an empty report say which of its
+    empty states it is in (#266).
     """
     return _build_diff_style_report(
         results,
@@ -3726,13 +3756,14 @@ def build_diff_report(results: dict) -> str:
         ["Does a model read a diff against the prior same-tool result as accurately as the",
          "full current result? Same questions, paired per question; ground truth is",
          "deterministic. Risk-item check for `proxy --diff` before turning it on.", ""],
-        ["No model answers, or no same-tool payload PAIRS in the corpus. Capture a tool",
-         "2+ times (an agent loop) and configure a backend, then re-run "
-         "`terse fluency --diff`."],
+        ["No same-tool payload PAIRS in the corpus. Capture a tool",
+         "2+ times (an agent loop), then re-run `terse fluency --diff`."],
+        "terse fluency --diff",
+        pairs=pairs,
     )
 
 
-def build_text_diff_report(results: dict) -> str:
+def build_text_diff_report(results: dict, pairs: int | None = None) -> str:
     """Render the text-diff fluency eval: does a model reconstruct the current TEXT as
     accurately from (previous text + text-diff) as from the full current text?
 
@@ -3747,10 +3778,12 @@ def build_text_diff_report(results: dict) -> str:
          "text-diff) as from the full current text? Tier 0 doesn't compress non-JSON text",
          "at all, so the control form here is the raw text, not a compressed one. Risk-item",
          "check before enabling `proxy --diff` for text-heavy tools.", ""],
-        ["No model answers, or no same-tool TEXT payload PAIRS in the corpus (JSON pairs "
+        ["No same-tool TEXT payload PAIRS in the corpus (JSON pairs "
          "are `--diff`'s domain, not this one's). Capture a text-producing tool 2+ times, "
          "then re-run `terse fluency --text-diff-eval`."],
+        "terse fluency --text-diff-eval",
         control_label="raw text",
+        pairs=pairs,
     )
 
 
