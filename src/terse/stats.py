@@ -969,11 +969,12 @@ def _is_launcher_basename(label: str) -> bool:
 # outrank a scope we do understand on the strength of not being recognised.
 _SCOPE_PRECEDENCE = {"local": 0, "project": 1, "user": 2}
 
-# Scan states whose entry is ABSENT from that scope's `mcpServers` (`_scan_target`): folded
-# behind a router (with or without its stash record), or a stash whose entry vanished. The
-# client cannot launch what is not there, so it resolves the name to the next scope that
-# DOES define it (#424). Every other state is a present entry.
-_ABSENT_FROM_SCOPE = ("folded", "folded-unstashed", "orphaned-stash")
+# Scan states the client does NOT launch from that scope (`_scan_target`): folded behind a
+# router (with or without its stash record), a stash whose entry vanished, or a project
+# `.mcp.json` entry the user never approved or rejected (#448 — in the file, never run).
+# The client resolves the name to the next scope that DOES launch it (#424). Every other
+# state is a launched entry.
+_ABSENT_FROM_SCOPE = ("folded", "folded-unstashed", "orphaned-stash", "unapproved")
 
 
 def _precedence_winner(scan_rows: list[dict[str, Any]]) -> dict[str, int]:

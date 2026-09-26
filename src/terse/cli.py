@@ -1974,6 +1974,9 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
             elif r["state"] == "router-ambiguous":
                 print(f"  {'':<20} another entry fronts the same peers file — delete the "
                       f"duplicate (they are interchangeable) before terse can manage it")
+            elif r["state"] == "unapproved":
+                print(f"  {'':<20} {r.get('approval')} in Claude Code: this .mcp.json "
+                      f"entry never launches until approved (#448)")
             # `folded-and-live` already said "runs TWICE" above, in its own words.
             if r["state"] != "folded-and-live":
                 for lbl, others in dup_of.get(row_index[id(r)], []):

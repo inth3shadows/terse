@@ -13,7 +13,9 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **An unapproved project `.mcp.json` entry no longer takes a server's slot in `terse stats` (#448).** Claude Code launches a project-scope server only after the user approves it, but the scan treated any entry in `.mcp.json` as running. A pending or rejected project entry therefore won the name over the user- or local-scope definition that actually runs, which dropped that definition from the report and hid any label contest it was part of. `mcp-status` now reports such an entry as `unapproved` (with `approval` of `pending` or `rejected` in `--json`), and it ranks below every launched definition, like a folded peer. Approval is read from `enabledMcpjsonServers`, `disabledMcpjsonServers` and `enableAllProjectMcpServers` in the project's `~/.claude.json` block, `~/.claude/settings.json`, and the project's `.claude/settings.json` and `.claude/settings.local.json`; a rejection wins over enable-all. Managed policy settings are not read.
 
 ## [0.41.0] - 2026-09-26
 

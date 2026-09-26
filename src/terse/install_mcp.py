@@ -1562,7 +1562,62 @@ def _peers_diff_label(peers_doc: dict | None) -> str | None:
     return labels.pop() if len(labels) == 1 else "peers (mixed)"
 
 
-def _scan_target(target: Target, scope: str) -> list[dict]:
+def _mcpjson_approval(mcp_json: Path, cfg: Path, project_keys: list[str]):
+    """`name -> "approved" | "rejected" | "pending"` for the servers of a project
+    `.mcp.json` (#448). Claude Code launches a project-scope server only once the user
+    has approved it; one that is pending or rejected sits in the file and never runs.
+
+    ASSUMED rule (Claude Code's own logic is not public API; this matches the keys it
+    writes, confirmed by key NAME only against a live install — current versions store
+    the approval dialog's answer in `<project>/.claude/settings.local.json`, and every
+    `~/.claude.json` `projects` block carries empty lists of the same keys):
+      - a name in any `disabledMcpjsonServers` -> "rejected" (a rejection beats
+        `enableAllProjectMcpServers`);
+      - else `enableAllProjectMcpServers: true` anywhere, or the name in any
+        `enabledMcpjsonServers` -> "approved";
+      - else "pending", which Claude Code does not launch.
+    Sources, unioned: the `~/.claude.json` `projects` block for each key in
+    `project_keys`, the user `settings.json` in the `.claude` dir beside `cfg` (where
+    `~/.claude/settings.json` sits beside `~/.claude.json`), and the project's own
+    `.claude/settings.json` / `.claude/settings.local.json`. Managed (enterprise) policy
+    settings and any non-interactive auto-approval are NOT modelled. Unreadable or
+    malformed sources are skipped, never raised — this feeds `scan_scopes`, which must
+    not raise. Only the three key names are read; no other value leaves the files."""
+    blocks: list[dict] = []
+    try:
+        projects = _load_json(cfg).get("projects")
+    except (OSError, ValueError, AttributeError):
+        projects = None
+    if isinstance(projects, dict):
+        blocks += [projects[k] for k in dict.fromkeys(project_keys) if k in projects]
+    for path in (cfg.parent / ".claude" / "settings.json",
+                 mcp_json.parent / ".claude" / "settings.json",
+                 mcp_json.parent / ".claude" / "settings.local.json"):
+        try:
+            blocks.append(_load_json(path))
+        except (OSError, ValueError):
+            continue
+    enabled: set[str] = set()
+    disabled: set[str] = set()
+    enable_all = False
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        for key, into in (("enabledMcpjsonServers", enabled),
+                          ("disabledMcpjsonServers", disabled)):
+            names = block.get(key)
+            if isinstance(names, list):
+                into.update(n for n in names if isinstance(n, str))
+        enable_all = enable_all or block.get("enableAllProjectMcpServers") is True
+
+    def status(name: str) -> str:
+        if name in disabled:
+            return "rejected"
+        return "approved" if enable_all or name in enabled else "pending"
+    return status
+
+
+def _scan_target(target: Target, scope: str, approval=None) -> list[dict]:
     if not target.cfg.exists():
         return []
     config = _load_json(target.cfg)
@@ -1765,7 +1820,13 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
             wraps = ", ".join(sorted(folded)) or NO_PEERS
             policy_missing = bool(policy and os.path.isabs(policy)
                                   and not os.path.exists(policy))
-        rows.append({"scope": scope, "server": name, "state": state, "policy": policy,
+        # A project entry Claude Code has not approved is in the file but never launched
+        # (#448), so it is reported as `unapproved` — an absent state to the precedence
+        # rule — rather than as the state its config alone implies. The launch fields
+        # above stay filled so status can still say what it WOULD run once approved.
+        approval_status = approval(name) if approval is not None and present else None
+        shown_state = state if approval_status in (None, "approved") else "unapproved"
+        rows.append({"scope": scope, "server": name, "state": shown_state, "policy": policy,
                     "policy_missing": policy_missing, "launcher": launcher,
                     "launcher_missing": launcher_gone, "wraps": wraps, "diff": diff,
                     "stats": stats_on, "stats_log": stats_log, "config": str(target.cfg),
@@ -1781,7 +1842,10 @@ def _scan_target(target: Target, scope: str) -> list[dict]:
                     "peers_file": (str(peers_p) if state in ("router", "router-ambiguous")
                                    else None),
                     "ledger_identity": ledger_identity,
-                    "ledger_identity_explicit": ledger_identity_explicit})
+                    "ledger_identity_explicit": ledger_identity_explicit,
+                    # Project scope only, present entries only: "approved", "pending" or
+                    # "rejected" (`_mcpjson_approval`). None everywhere else.
+                    "approval": approval_status})
     return rows
 
 
@@ -1802,7 +1866,9 @@ def scan_scopes(*, cfg: Path | None = None, file: str | None = None,
     peers file AND live, so the downstream runs twice), "router-ambiguous" (two entries
     front one peers file — a hand-edit terse refuses to guess through),
     "orphaned-stash" (stashed
-    but the entry vanished — see `_scan_target`), or "unwrapped" (present, not terse's). The wrapped-only
+    but the entry vanished — see `_scan_target`), "unapproved" (a project `.mcp.json`
+    entry Claude Code has not approved, so it never launches — `approval` says "pending"
+    or "rejected", #448), or "unwrapped" (present, not terse's). The wrapped-only
     fields (policy_missing, launcher, launcher_missing, wraps, diff, stats, stats_log) are
     None/False for non-wrapped rows — with one exception: a "folded-and-live" row whose
     LIVE entry launches via terse carries them too, because that entry runs its own proxy
@@ -1811,12 +1877,20 @@ def scan_scopes(*, cfg: Path | None = None, file: str | None = None,
     silently omitted, not an error, when it doesn't resolve (not in a git repo and
     no --repo-path given) — "no local scope here" is the common case, not a failure."""
     rows: list[dict] = []
-    rows += _scan_target(resolve_target("user", cfg=cfg), "user")
-    rows += _scan_target(resolve_target("project", file=file), "project")
+    user_target = resolve_target("user", cfg=cfg)
+    rows += _scan_target(user_target, "user")
     try:
         local_target = resolve_target("local", cfg=cfg, repo_path=repo_path)
     except ValueError:
         local_target = None
+    project_target = resolve_target("project", file=file)
+    # Claude Code keys a project's `~/.claude.json` block by its root; the `.mcp.json`'s
+    # directory is that root, and local scope's key is tried too for bare-worktree layouts.
+    keys = [str(project_target.cfg.parent)]
+    if local_target is not None:
+        keys.append(local_target.server_path[1])
+    rows += _scan_target(project_target, "project",
+                         approval=_mcpjson_approval(project_target.cfg, user_target.cfg, keys))
     if local_target is not None:
         rows += _scan_target(local_target, "local")
     return rows
