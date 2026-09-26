@@ -6,9 +6,32 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![terse MCP server](https://glama.ai/mcp/servers/inth3shadows/terse/badges/score.svg)](https://glama.ai/mcp/servers/inth3shadows/terse)
 
-The **lossless-first** MCP compression proxy: it makes tool output smaller without
-ever changing what your agent reads — **lossless by value** by default (what decodes back
-out is the same JSON, value for value), lossy only where you explicitly opt in.
+**Cut the tokens your AI agent spends reading tool output, without changing a single value it reads.**
+terse is a drop-in proxy for any MCP server. It strips structural overhead from each
+result (repeated keys, repeated values, repeated nested shapes) and hands the model the
+same data, value for value, in a denser form. No decode step, no model in the loop.
+
+Five GitHub-style issues cost 436 tokens (cl100k) as a server pretty-prints them, and 232
+minified. What the model gets instead costs 181:
+
+```json
+{"__terse_dict__":1,"legend":{"~0":[{"name":"bug","color":"d73a4a"}]},
+ "data":{"__terse_table__":1,"n":5,"cols":["number","state","title","user","labels","repo"],
+  "rows":[[101,"open","Crash on empty cart",["ana","User"],"~0","acme/widgets"],
+          [102,"open","Timeout on checkout",["ben","User"],"~0","acme/widgets"], ...],
+  "subcols":{"user":{"cols":["login","type"]}}}}
+```
+
+- **Lossless, and checked.** Every transform has an exact inverse, and a round-trip gate
+  asserts `decompress(compress(x)) == x`. Other tools in this space drop rows or old
+  results to save tokens; terse only removes repetition.
+- **Measured against the alternatives.** On real GitHub API payloads: **59.1%** fewer
+  tokens, against −6.5% for TOON and 4.5% for compressmcp on the same corpus
+  ([Benchmarks](#benchmarks-terse-vs-alternatives)).
+- **Selective, never worse.** It works per tool and passes through anything it can't
+  shrink, so it never inflates a result. `terse stats` shows what it actually saved.
+
+## Design: What Carries The Savings
 
 terse reduces tokens two ways: one that carries the day-to-day value, and one that is
 harder for a competitor to copy. Keeping those straight is the whole positioning.
@@ -212,7 +235,7 @@ Want to eyeball the codec first, no server involved?
 
 ```bash
 echo '[{"id":1,"state":"open","repo":"acme/widgets"},{"id":2,"state":"open","repo":"acme/widgets"},{"id":3,"state":"open","repo":"acme/widgets"},{"id":4,"state":"open","repo":"acme/widgets"},{"id":5,"state":"open","repo":"acme/widgets"},{"id":6,"state":"open","repo":"acme/widgets"}]' | terse gate -
-# → round-trip lossless: PASS ; ~36% fewer cl100k tokens
+# → round-trip lossless: PASS ; cl100k 87 -> 78 (10.3% saved)
 ```
 
 (Savings grow with record count and repetition; on a single tiny object terse correctly
