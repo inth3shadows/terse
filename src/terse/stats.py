@@ -1118,10 +1118,17 @@ def _ambiguous_labels(scan_rows: list[dict[str, Any]],
     return {lbl for lbl, n in counts.items() if n > 1}
 
 
-def _live_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
+def _live_labels(scan_rows: list[dict[str, Any]],
+                 ledger_path: str | None = None) -> set[str]:
     """Every ledger label some INSTALLED entry currently answers to — a router's peer names,
     and each wrapped entry's own identity or guess. The set `_superseded_labels` has to
-    subtract, so it cannot hand one server another server's live rows."""
+    subtract, so it cannot hand one server another server's live rows.
+
+    An entry that writes no rows into this ledger answers to nothing in it (#430):
+    `terse --help proxy -- kb-mcp` carries a `--`, so the scan fills `wraps` and an identity
+    for a process that runs no proxy, and counting it deleted a real entry's stranded
+    history. The gate covers only the identity half — a folded peer's name is its router's
+    label, and a folded row never carries `stats`."""
     live: set[str] = set()
     for row in scan_rows:
         state = row.get("state")
@@ -1137,10 +1144,11 @@ def _live_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
         # the thing `_superseded_labels` exists to name) and the basename itself for an
         # unbaked one. The `elif` is only the fallback for a row predating that field.
         ident = row.get("ledger_identity")
-        if ident:
-            live.add(str(ident))
-        elif wraps:
-            live.add(server_label(wraps.split()))
+        if _writes_ledger_rows(row, ledger_path):
+            if ident:
+                live.add(str(ident))
+            elif wraps:
+                live.add(server_label(wraps.split()))
         name = row.get("server")
         if name and state and state.startswith("folded"):
             live.add(str(name))
@@ -2030,7 +2038,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
     # separately-live duplicate of one of its peers (#396 review).
     contests = _contested_labels(scan_rows, ledger_path)
     contested = set(contests)
-    live = _live_labels(scan_rows)
+    live = _live_labels(scan_rows, ledger_path)
     for i, row in enumerate(scan_rows):
         name, state = row.get("server"), row.get("state")
         # The winner check subsumes the old `seen` dedup: one index per name, fleet-wide.
@@ -2102,8 +2110,17 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
             # A router ships ONE primer covering every form any peer can emit, and each
             # peer's policy is gated against its OWN name — gating the union on the router's
             # name would test rules like `kb.*` against "terse" and silently under-report.
+            #
+            # A standalone proxy gates on its BAKED `--server-name` — `run_proxy` hands the
+            # Interceptor that, None when absent — not on the `mcpServers` key and not on the
+            # guessed ledger identity (#428). Sizing against either tested a `kb.*` rule the
+            # running process never consults. A row predating `ledger_identity_explicit`
+            # cannot say, and keeps the entry key rather than sizing an unscoped primer.
+            explicit = row.get("ledger_identity_explicit")
+            gate = (name if explicit is None
+                    else row.get("ledger_identity") if explicit else None)
             tokens = count_cl100k(union_primer([(pol, p) for p in peers]) if is_router
-                                  else build_primer(pol, name))
+                                  else build_primer(pol, gate))
         except Exception:  # noqa: BLE001 — an unreadable policy is reported, never raised
             tokens = None
         # A primer this entry is KNOWN to have sent, because the attach site wrote it down
