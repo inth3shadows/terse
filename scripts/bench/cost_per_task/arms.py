@@ -188,7 +188,7 @@ def _router_peers_path(router_entry: dict) -> Path | None:
 
 
 def _snapshot_peers_with_pinned_policy(peers_doc: dict, peers_dir: Path, out_dir: Path,
-                                        arm: str) -> dict:
+                                        arm: str, policy_override: Path | None = None) -> dict:
     """Deep-copy `peers_doc` (a router `--config` peers file already loaded
     from disk) and, for every downstream that carries its own `policy`
     field, copy the policy file it points at into `out_dir` and repoint that
@@ -225,6 +225,10 @@ def _snapshot_peers_with_pinned_policy(peers_doc: dict, peers_dir: Path, out_dir
             src = peers_dir / src
         if not src.exists():
             continue
+        # A C-prime variant pins the OVERRIDE's content in place of every live policy
+        # the peers file names; the live files are only read, never written.
+        if policy_override is not None:
+            src = policy_override
         key = str(src.resolve())
         dst = copied.get(key)
         if dst is None:
@@ -262,12 +266,20 @@ def arm_c_config(cfg: Path | None = None, *, peers_copy_path: Path | None = None
     return {"mcpServers": {ROUTER_NAME: entry}}
 
 
-def write_arm_config(arm: str, out_dir: Path, cfg: Path | None = None) -> Path:
+def write_arm_config(arm: str, out_dir: Path, cfg: Path | None = None, *,
+                     c_policy: Path | None = None, c_terse: str | None = None) -> Path:
     """Build and write the MCP config for `arm` ('A'|'B'|'C') into `out_dir`.
     Returns the written path (mode 600). `out_dir` must be outside the repo
-    (the runner always passes the scratchpad)."""
+    (the runner always passes the scratchpad).
+
+    `c_policy` / `c_terse` make arm C a C-prime variant: the pinned policy copies hold
+    `c_policy`'s content and the router launches `c_terse` instead of the live binary,
+    everything else (peers, args, sanitising) identical -- so a policy option that only
+    an unreleased terse understands can be measured against today's C."""
     if arm not in VALID_ARMS:
         raise ValueError(f"unknown arm {arm!r}, must be one of {VALID_ARMS}")
+    if arm != "C" and (c_policy is not None or c_terse is not None):
+        raise ValueError(f"c_policy/c_terse apply only to arm C, not {arm!r}")
     if arm == "A":
         doc = arm_a_config()
     elif arm == "B":
@@ -281,8 +293,10 @@ def write_arm_config(arm: str, out_dir: Path, cfg: Path | None = None) -> Path:
         if peers_src is not None and peers_src.exists():
             peers_doc = json.loads(peers_src.read_text())
             snapshot = _snapshot_peers_with_pinned_policy(
-                peers_doc, peers_src.parent, out_dir, arm)
+                peers_doc, peers_src.parent, out_dir, arm, policy_override=c_policy)
             peers_dst = out_dir / f"peers-{arm}.json"
             _write_restricted(peers_dst, snapshot)
         doc = arm_c_config(resolved_cfg, peers_copy_path=peers_dst)
+        if c_terse is not None:
+            doc["mcpServers"][ROUTER_NAME]["command"] = c_terse
     return _write_restricted(out_dir / f"mcp-config-{arm}.json", doc)

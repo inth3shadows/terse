@@ -727,6 +727,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--tasks", type=Path, default=HERE / "tasks.json")
     ap.add_argument("--arms", default="A,B,C")
+    ap.add_argument("--c-policy", type=Path, default=None,
+                     help="arm C only: pin THIS policy file's content instead of the live "
+                          "policy (a C-prime variant; the live file is never written)")
+    ap.add_argument("--c-terse", default=None,
+                     help="arm C only: launch the router with this terse binary instead of "
+                          "the live one (e.g. a worktree's .venv/bin/terse)")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--model", default="claude-haiku-4-5-20251001",
                      help="a FULL model ID, not an alias -- so the resolved model actually "
@@ -771,7 +777,14 @@ def main(argv: list[str] | None = None) -> int:
     arm_list = args.arms.split(",")
 
     args.config_dir.mkdir(parents=True, exist_ok=True)
-    arm_paths = {arm: arms_mod.write_arm_config(arm, args.config_dir) for arm in arm_list}
+    c_overrides = {"c_policy": args.c_policy, "c_terse": args.c_terse}
+    arm_paths = {arm: arms_mod.write_arm_config(arm, args.config_dir,
+                                                **(c_overrides if arm == "C" else {}))
+                 for arm in arm_list}
+    if args.c_policy or args.c_terse:
+        # Rows carry arm "C" either way; keep a variant's --out/--config-dir separate.
+        print(f"arm C is a VARIANT: policy={args.c_policy or 'live'} "
+              f"terse={args.c_terse or 'live'}", file=sys.stderr)
     # Per-arm settings (Opus review 2026-09-26): B/C load the operator's real settings
     # (CLAUDE.md, rules, output style, skills, agents: "the user's setup"). Its blanket Read
     # allow rule is neutralised for EVERY arm by `blockReadsOutsideWorkingDirectories`, which

@@ -167,6 +167,39 @@ def test_write_arm_config_arm_c_pins_policy_via_peers_snapshot(tmp_path):
     assert len({d["policy"] for d in peers_doc["downstreams"]}) == 1
 
 
+def test_write_arm_config_arm_c_overrides_policy_and_terse_binary(tmp_path):
+    # A C-prime variant (e.g. a policy with keep_first, served by an unreleased terse)
+    # measured with everything else identical to arm C: the pinned policy copy holds the
+    # OVERRIDE's content, and the router launches the override binary. Arg list unchanged.
+    live_policy = tmp_path / "policy.json"
+    _write(live_policy, {"tag": "live"})
+    override = tmp_path / "variant.json"
+    _write(override, {"tag": "variant"})
+    downstreams = [{"name": name, "policy": "policy.json", "command": [f"/bin/{name}"]}
+                   for name in arms.SERVERS]
+    cfg, _ = _write_router_and_peers(tmp_path, downstreams)
+    base = json.loads(arms.write_arm_config("C", tmp_path / "base", cfg=cfg).read_text())
+    path = arms.write_arm_config("C", tmp_path / "out", cfg=cfg,
+                                 c_policy=override, c_terse="/opt/terse-dev/bin/terse")
+    entry = json.loads(path.read_text())["mcpServers"]["terse"]
+    assert entry["command"] == "/opt/terse-dev/bin/terse"
+    args = entry["args"]
+    base_args = base["mcpServers"]["terse"]["args"]
+    assert [a for a in args if "peers-" not in a] == [a for a in base_args if "peers-" not in a]
+    peers_doc = json.loads(Path(args[args.index("--config") + 1]).read_text())
+    for d in peers_doc["downstreams"]:
+        assert json.loads(Path(d["policy"]).read_text()) == {"tag": "variant"}
+    assert json.loads(live_policy.read_text()) == {"tag": "live"}  # live file untouched
+
+
+def test_c_overrides_are_rejected_for_other_arms(tmp_path):
+    import pytest
+    with pytest.raises(ValueError):
+        arms.write_arm_config("B", tmp_path, c_terse="/x")
+    with pytest.raises(ValueError):
+        arms.write_arm_config("A", tmp_path, c_policy=tmp_path / "p.json")
+
+
 def test_snapshot_peers_with_pinned_policy_leaves_policy_less_downstreams_alone(tmp_path):
     peers_doc = {"downstreams": [{"name": "kb", "command": ["/bin/kb"]}]}  # no 'policy' key
     out_dir = tmp_path / "out"
