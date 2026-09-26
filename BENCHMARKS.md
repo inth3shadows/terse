@@ -7,7 +7,7 @@
 |---|---|
 | §1 terse vs TOON | **re-run 2026-09-22** on TOON **4.1.1** (pin was 2.3.1). The 2.3.1 run was executed first and reproduced every published cell byte-identically, so the deltas are TOON's upgrade, not a terse regression. |
 | §2 width sweep | produced 2026-07-17, re-runs byte-identical; **not re-run** this pass |
-| §4 competitors | **new entrants measured 2026-09-22** (compressmcp, @sliday/tamp, token-smithers). headroom **not re-run** — its integration point needs provider credentials; its 2026-08-05 table is retained at that date. |
+| §4 competitors | **new entrants measured 2026-09-22** (compressmcp, @sliday/tamp, token-smithers), plus **distil and llmtrim on 2026-09-25**. headroom **not re-run** — its integration point needs provider credentials; its 2026-08-05 table is retained at that date. |
 | §5 live ledger | **re-derived 2026-09-22**: 4,461 blocks, 23.3% blended / 19.3% lossless-only. Supersedes the 2026-08-11 snapshot (2,357 blocks, 15.1%). |
 | §6 popular MCP servers | **re-run 2026-09-22** on v0.33.8, fresh cold round, plus a **third encoder column** (compressmcp). Two cells reproduce the 2026-08-04 round byte-identically. |
 | §7 topology | **new 2026-09-22.** Its A/B table is explicitly pre-#211 and is history, not guidance. |
@@ -178,6 +178,8 @@ dropped silently.
 | **compressmcp** 0.4.0 | **4.5%** | **yes, all 9** | Its "TerseJSON" tier abbreviates keys and prepends a `Keys:` legend. Real and genuinely lossless — but key abbreviation alone is a small win on nested records, and it **regresses on small objects** where the legend costs more than it saves: `gh_rate_limit` −23.2%, `gh_repo_single` −29.4%, `gh_labels` −3.0%. |
 | **@sliday/tamp** 0.8.21 | **not measurable here** | **no** | Declined **7 of 9** payloads at its own defaults. Cause executed, not guessed: `compress.js:499` returns `null` when `minified.length >= text.length`, and 7 of the 9 corpus files are already byte-minified. Of the two it did process, `gh_commits_flat` (1.7%) **emitted output that does not parse as JSON**. Its default stage list is `cmd-strip, minify, toon, strip-lines, whitespace, llmlingua, dedup, diff, read-diff, prune` — lossy by construction. |
 | **token-smithers** | **no codec measured** | n/a | Its `--pipe` CLI returned every payload **byte-identical (0.0%)**. That is not its compressor: `src/token_sieve/cli/main.py: create_pipeline()` registers `PassthroughStrategy()` for `ContentType.TEXT`, so pipe mode is a no-op by construction. Its real codec runs only in MCP-proxy mode, which this round did not stand up. |
+| **distil** (`distil-llm` 1.54.0, `dshakes/distil`) | **17.3%** | **no** (1 of 9 fails) | Measured 2026-09-25 through its in-process library call `distil.compress_messages(..., verbatim=True)` (Tier-0, its lossless tier; the default mode gave the same 17.3% because no digest tier fired on this corpus). It declined 5 of 9 payloads (non-uniform record arrays fall outside its fold path). Tier-0 promises decision-equivalence, not byte-exact JSON, and it is **not** lossless here: in `gh_labels` the hex colour string `"008672"` decodes as the integer `8672`. Tier-0 emits no recovery handle, so the loss cannot be undone. |
+| **llmtrim** 0.13.7 (`fkiene/llmtrim`, built from source at `1ae7a15a`) | **0.1%** | **yes, both it changed** | Measured 2026-09-25 at preset `safe` ("lossless input only") through its library call on an Anthropic `tool_result` body. Only 2 of 9 payloads folded (its TOON serialize stage); both decode exactly with the official `@toon-format/toon` decoder, including `"008672"`, which TOON quotes. The other 7 pass through unchanged. The PyPI `llmtrim` 0.13.7 binding reproduces the from-source numbers byte for byte. |
 
 **On `tamp` specifically:** it confirms #298's observation that terse's cross-call diff tier
 is *not* a unique axis — `diff` and `read-diff` are in tamp's default pipeline. What tamp
@@ -191,7 +193,7 @@ resolves to. Getting this wrong publishes a number attributed to the wrong proje
 | You might type | What actually installs | The real project |
 |---|---|---|
 | `npm i tamp` | `tamp@0.0.3` — oztu, "Encoder for the Tamper protocol" | **`@sliday/tamp`** (scoped), v0.8.21 |
-| `npm i llmtrim` | `llmtrim@1.4.0` — VincenzoManto, a token-trimming library | `fkiene/llmtrim` — GitHub only (Rust) |
+| `npm i llmtrim` | `llmtrim@1.4.0` — VincenzoManto, a token-trimming library (unpublished 2026-09-24; now 404) | `fkiene/llmtrim` (Rust); PyPI `llmtrim` is fkiene's own binding. GitHub mirrors such as `jinzaizhichi/llmtrim` are pull-bot copies |
 | `pip install headroom` | a different tool entirely | **`headroom-ai`** |
 | `pip install token-smithers` | 404 — on no registry | `shacharbard/token-smithers` — GitHub only |
 
