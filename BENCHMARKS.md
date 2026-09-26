@@ -7,7 +7,7 @@
 |---|---|
 | §1 terse vs TOON | **re-run 2026-09-22** on TOON **4.1.1** (pin was 2.3.1). The 2.3.1 run was executed first and reproduced every published cell byte-identically, so the deltas are TOON's upgrade, not a terse regression. |
 | §2 width sweep | produced 2026-07-17, re-runs byte-identical; **not re-run** this pass |
-| §4 competitors | **new entrants measured 2026-09-22** (compressmcp, @sliday/tamp, token-smithers). headroom **not re-run** — its integration point needs provider credentials; its 2026-08-05 table is retained at that date. |
+| §4 competitors | **new entrants measured 2026-09-22** (compressmcp, @sliday/tamp, token-smithers), plus **distil and llmtrim on 2026-09-25**. headroom **re-measured 2026-09-25 on 0.39.0** through a local mock upstream (no credentials needed): 47.3% lossy default, 0.0% `--lossless`. |
 | §5 live ledger | **re-derived 2026-09-22**: 4,461 blocks, 23.3% blended / 19.3% lossless-only. Supersedes the 2026-08-11 snapshot (2,357 blocks, 15.1%). |
 | §6 popular MCP servers | **re-run 2026-09-22** on v0.33.8, fresh cold round, plus a **third encoder column** (compressmcp). Two cells reproduce the 2026-08-04 round byte-identically. |
 | §7 topology | **new 2026-09-22.** Its A/B table is explicitly pre-#211 and is history, not guidance. |
@@ -178,6 +178,8 @@ dropped silently.
 | **compressmcp** 0.4.0 | **4.5%** | **yes, all 9** | Its "TerseJSON" tier abbreviates keys and prepends a `Keys:` legend. Real and genuinely lossless — but key abbreviation alone is a small win on nested records, and it **regresses on small objects** where the legend costs more than it saves: `gh_rate_limit` −23.2%, `gh_repo_single` −29.4%, `gh_labels` −3.0%. |
 | **@sliday/tamp** 0.8.21 | **not measurable here** | **no** | Declined **7 of 9** payloads at its own defaults. Cause executed, not guessed: `compress.js:499` returns `null` when `minified.length >= text.length`, and 7 of the 9 corpus files are already byte-minified. Of the two it did process, `gh_commits_flat` (1.7%) **emitted output that does not parse as JSON**. Its default stage list is `cmd-strip, minify, toon, strip-lines, whitespace, llmlingua, dedup, diff, read-diff, prune` — lossy by construction. |
 | **token-smithers** | **no codec measured** | n/a | Its `--pipe` CLI returned every payload **byte-identical (0.0%)**. That is not its compressor: `src/token_sieve/cli/main.py: create_pipeline()` registers `PassthroughStrategy()` for `ContentType.TEXT`, so pipe mode is a no-op by construction. Its real codec runs only in MCP-proxy mode, which this round did not stand up. |
+| **distil** (`distil-llm` 1.54.0, `dshakes/distil`) | **17.3%** | **no** (1 of 9 fails) | Measured 2026-09-25 through its in-process library call `distil.compress_messages(..., verbatim=True)` (Tier-0, its lossless tier; the default mode gave the same 17.3% because no digest tier fired on this corpus). It declined 5 of 9 payloads (non-uniform record arrays fall outside its fold path). Tier-0 promises decision-equivalence, not byte-exact JSON, and it is **not** lossless here: in `gh_labels` the hex colour string `"008672"` decodes as the integer `8672`. Tier-0 emits no recovery handle, so the loss cannot be undone. |
+| **llmtrim** 0.13.7 (`fkiene/llmtrim`, built from source at `1ae7a15a`) | **0.1%** | **yes, both it changed** | Measured 2026-09-25 at preset `safe` ("lossless input only") through its library call on an Anthropic `tool_result` body. Only 2 of 9 payloads folded (its TOON serialize stage); both decode exactly with the official `@toon-format/toon` decoder, including `"008672"`, which TOON quotes. The other 7 pass through unchanged. The PyPI `llmtrim` 0.13.7 binding reproduces the from-source numbers byte for byte. |
 
 **On `tamp` specifically:** it confirms #298's observation that terse's cross-call diff tier
 is *not* a unique axis — `diff` and `read-diff` are in tamp's default pipeline. What tamp
@@ -191,16 +193,28 @@ resolves to. Getting this wrong publishes a number attributed to the wrong proje
 | You might type | What actually installs | The real project |
 |---|---|---|
 | `npm i tamp` | `tamp@0.0.3` — oztu, "Encoder for the Tamper protocol" | **`@sliday/tamp`** (scoped), v0.8.21 |
-| `npm i llmtrim` | `llmtrim@1.4.0` — VincenzoManto, a token-trimming library | `fkiene/llmtrim` — GitHub only (Rust) |
+| `npm i llmtrim` | `llmtrim@1.4.0` — VincenzoManto, a token-trimming library (unpublished 2026-09-24; now 404) | `fkiene/llmtrim` (Rust); PyPI `llmtrim` is fkiene's own binding. GitHub mirrors such as `jinzaizhichi/llmtrim` are pull-bot copies |
 | `pip install headroom` | a different tool entirely | **`headroom-ai`** |
 | `pip install token-smithers` | 404 — on no registry | `shacharbard/token-smithers` — GitHub only |
 
 `npm i compressmcp` is the one that resolves correctly (TheDecipherist's).
 
-**Version drift note:** `headroom-ai` has moved 0.34.0 (tested 2026-08-05) → **0.38.0**
-(published, checked 2026-09-22). Its measurable integration point is a live LLM-API proxy
-against a real provider, which needs provider credentials, so it was **not re-measured this
-round**. The table below is retained at its 2026-08-05 date and should be read as such.
+**Re-measured 2026-09-25 on `headroom-ai` 0.39.0, without provider credentials.** headroom's proxy starts and serves with no API key set. It was pointed at a local mock Anthropic upstream (127.0.0.1) that records the forwarded request body, and each corpus payload was sent as a `tool_result`. Nothing left the machine. Result, same corpus, same run as terse's 59.1%:
+
+| payload | raw tok | headroom default (CCR on) | headroom `--lossless` |
+|---|--:|--:|--:|
+| gh_commits | 69,652 | 46.6% (lossy) | 0.0% |
+| gh_commits_flat | 10,886 | 83.3% (lossy) | 0.0% |
+| gh_dir_listing | 6,736 | 10.9% (lossy) | 0.0% |
+| gh_issues | 48,032 | 36.3% (lossy) | 0.0% |
+| gh_labels | 632 | 0.0% (untouched) | 0.0% |
+| gh_pulls | 151,165 | 42.5% (lossy) | 0.0% |
+| gh_rate_limit | 357 | 0.0% (untouched) | 0.0% |
+| gh_repo_single | 1,652 | 0.0% (untouched) | 0.0% |
+| gh_workflow_runs | 76,032 | 64.1% (lossy) | 0.0% |
+| **weighted** | **365,144** | **47.3%** (lossy on 6 of 9) | **0.0%** (byte-identical on all 9) |
+
+This reproduces the 2026-08-05 v0.34.0 finding on v0.39.0: headroom's savings come from CCR row and string drops, recoverable only through its retrieve cache, and its lossless mode forwards the content unchanged. The earlier reason for not re-running it ("needs provider credentials") no longer holds: a loopback mock is enough.
 
 **Headroom re-tested 2026-08-05, on its real integration point.** `headroom-ai` moved from
 v0.33.0 (2026-07-30) to v0.34.0 (this run) — same architecture, same numbers below,
