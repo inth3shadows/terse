@@ -15,7 +15,6 @@ import re
 import subprocess
 from pathlib import Path
 
-
 _EMPHASIS = re.compile(r"^(\*\*|__|\*|_)(.+?)\1$", re.DOTALL)
 
 
