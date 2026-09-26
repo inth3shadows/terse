@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.40.0] - 2026-09-26
+
 ### Added
 
 - **`keep_first` for text drop rules (#252).** A `$text.code_blocks` drop spec can now keep the first N fenced blocks of each text result inline (`{"lossy": "drop-to-retrieve", "min": 400, "keep_first": 1}`); later blocks still drop to a `terse.retrieve` handle. Only blocks at or above `min` count toward N. Over 151 past `codegraph_explore` results, 61% of retrieves fetched the first block, and keeping it inline cut the results that needed any retrieve from 80 to 34, at about 6.9 KB more per result. The default stays 0, so existing policies are unchanged. A value that is not a non-negative integer, or `keep_first` on a JSON field path, is ignored with a warning when the rule is applied. The drop eval no longer picks a recall anchor that is visible in the emitted text, so a kept block cannot answer a question meant to need a retrieve.
