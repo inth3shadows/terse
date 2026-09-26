@@ -421,6 +421,22 @@ def keep_first(spec: Any) -> int | None:
     return raw
 
 
+def retract_after(spec: Any) -> int | None:
+    """A drop spec's `retract_after` (#252): after this many retrieve HITS on the rule's
+    values in one session, that tool's later results keep the field inline until the
+    client reconnects. 0 when absent (never retract); None when present but not a
+    positive int, which the policy layer reports and the proxy treats as absent.
+
+    Measured 2026-09-26 over 151 live codegraph_explore results: after a session's first
+    retrieve, 72% of its later results needed one too (38% before)."""
+    if not isinstance(spec, dict) or "retract_after" not in spec:
+        return 0
+    raw = spec["retract_after"]
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        return None
+    return raw
+
+
 def apply_text_drops(text: str, rule: Any, tool: str,
                      sink: Callable[[str, Any], None],
                      origin: dict[str, tuple[str, str]] | None = None) -> str:
