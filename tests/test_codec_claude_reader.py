@@ -135,8 +135,8 @@ def test_a_cli_run_completes_and_primer_reaches_only_the_terse_arm(tmp_path, mon
     policy = tmp_path / "p.json"
     policy.write_text(json.dumps({"version": 1, "policies": [
         {"match": {"tool": "kb.*"}, "tiers": ["minify", "tabularize", "dictionary"]}]}))
-    expected_primer = union_primer([(load_policy(str(policy)), "kb")])
-    assert expected_primer
+    expected_primer = union_primer([(load_policy(str(policy)), "kb")], structured_wrap=True)
+    assert expected_primer and "__terse_primer__" in expected_primer
     seen: list[list[dict]] = []
 
     def fake_text(alias):

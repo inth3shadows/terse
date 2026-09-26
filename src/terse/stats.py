@@ -2174,6 +2174,14 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
                 for lbl in claimed)
             if lazy_router:
                 primer_labels = [rlbl]
+                # A LAZY router's primer also explains the #463 typed wrapper (an eager one
+                # never sent that sentence), so re-estimate with it for what was really sent.
+                try:
+                    pol = load_policy(pol_path) if pol_path else default_policy()
+                    tokens = count_cl100k(union_primer([(pol, p) for p in peers],
+                                                       structured_wrap=True))
+                except Exception:  # noqa: BLE001 — as above: reported, never raised
+                    tokens = None
                 # The router's own label is never contested (except by a `router-ambiguous` twin
                 # fronting the same peers file, which pools it -- over-billing), so a contested PEER says
                 # nothing about its primer (review round 3: a name-only contest sent

@@ -1495,7 +1495,9 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             from .proxy import union_primer
             pol = load_policy(args.policy)
             servers = sorted({e.get("server") for e in envelopes}, key=lambda x: x or "")
-            primer = union_primer([(pol, srv) for srv in servers])
+            # `structured_wrap`: production routers are lazy, and theirs carries the #463
+            # typed-wrapper sentence.
+            primer = union_primer([(pol, srv) for srv in servers], structured_wrap=True)
             if not primer:
                 print(f"terse fluency --codec-verdict --primer: {args.policy} emits no "
                       f"compressed form for these servers, so production sends no primer",
