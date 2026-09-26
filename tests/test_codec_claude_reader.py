@@ -248,16 +248,21 @@ def test_request_tokens_counts_a_text_channel_request_as_it_is_sent():
     ans, seen = _text_answerer(_expected)
     codeceval._codec_turn(q, RAW_TEXT, ans)
     sent = seen[-1][-1]["content"]
-    assert codeceval.request_tokens(q, RAW_TEXT, channel="text") == count_cl100k(sent)
+    # The message as sent, plus the `claude -p` preamble the backend adds on its side.
+    want = count_cl100k(sent) + codeceval._CLI_PREAMBLE_TOKENS
+    assert codeceval._CLI_PREAMBLE_TOKENS > 3000
+    assert codeceval.request_tokens(q, RAW_TEXT, channel="text") == want
     # Tool definitions are ignored on the text channel: that backend is sent none.
     assert (codeceval.request_tokens(q, RAW_TEXT, [codeceval.RECORD_VALUE_TOOL_DEF],
-                                     channel="text") == count_cl100k(sent))
-    assert codeceval.request_tokens(q, RAW_TEXT) > count_cl100k(sent)
+                                     channel="text") == want)
+    tool_side = codeceval.request_tokens(q, RAW_TEXT)
+    assert tool_side is not None and count_cl100k(sent) < tool_side < want
 
 
-def test_a_text_channel_payload_that_fits_as_sent_is_not_excluded():
-    # Through `run_codec_fluency`: the limit sits between the text request's real size and the
-    # tool-channel count of the same payload, so only a channel-blind count excludes it.
+def test_the_sweep_sizes_a_text_channel_request_by_its_channel():
+    # Through `run_codec_fluency`, so the call site must pass the answerer's channel: the
+    # text request (message + `claude -p` preamble) is larger than the tool-channel count of
+    # the same payload, so a limit between the two excludes only under channel-aware sizing.
     import pytest
 
     from terse.tokenize import count_cl100k
@@ -269,14 +274,18 @@ def test_a_text_channel_payload_that_fits_as_sent_is_not_excluded():
                    for q in qs for t in texts)
     tool_max = max(codeceval.request_tokens(q, t, [codeceval.RECORD_VALUE_TOOL_DEF]) or 0
                    for q in qs for t in texts)
-    assert tool_max > text_max
+    assert tool_max < text_max - 1
     env = {"tool": "kb.read.x", "server": "kb", "raw": RAW_TEXT, "sha": "b" * 40,
            "shape": "array-of-records", "manual": True}
     ans, _ = _text_answerer(_expected)
-    run = codeceval.run_codec_fluency([env], {"m": ans}, trials=1, preflight=False,
-                                      limits={"m": text_max},
-                                      tool_defs=[codeceval.RECORD_VALUE_TOOL_DEF])
-    assert not run.excluded and run.rows["m"]
+
+    def sweep(limit):
+        return codeceval.run_codec_fluency([env], {"m": ans}, trials=1, preflight=False,
+                                           limits={"m": limit},
+                                           tool_defs=[codeceval.RECORD_VALUE_TOOL_DEF])
+    ok = sweep(text_max)
+    assert not ok.excluded and ok.rows["m"]
+    assert sweep(text_max - 1).excluded
 
 
 def test_the_preflight_refusal_does_not_ask_a_text_model_for_a_tool_call():

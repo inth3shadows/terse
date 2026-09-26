@@ -604,12 +604,25 @@ def test_empty_diff_report_with_no_pairs_says_no_pairs():
 
 
 def test_empty_diff_report_with_pairs_but_no_questions_says_so():
-    from terse.report import build_diff_report, build_text_diff_report
-    for build in (build_diff_report, build_text_diff_report):
-        text = build({"m": []}, pairs=4)
-        assert "4 same-tool pair(s)" in text and "generated no question" in text
-        # Not the capture-more advice: more pairs of the same shape would not help.
-        assert "Capture a" not in text and "No model answers" not in text
+    from terse.report import build_diff_report
+    text = build_diff_report({"m": []}, pairs=4)
+    assert "4 same-tool pair(s)" in text and "generated no question" in text
+    # Not the capture-more advice: more pairs of the same shape would not help.
+    assert "Capture a tool" not in text and "No model answers" not in text
+
+
+def test_empty_text_diff_report_with_pairs_names_the_text_cause():
+    # Every text pair gets the line-count question, so the only zero-row cause is that no
+    # lossless text diff applies. The JSON advice (record lists) is wrong here.
+    from terse.report import build_text_diff_report
+    text = build_text_diff_report({"m": []}, pairs=2)
+    assert "2 same-tool pair(s)" in text and "no lossless text diff" in text
+    assert "record" not in text and "generated no question" not in text
+    assert "No model answers" not in text and "PAIRS in the corpus" not in text
+    # ...and that IS the cause: an empty previous text pairs but yields no rows.
+    envs = [{"tool": "t", "sha": "a", "raw": ""}, {"tool": "t", "sha": "b", "raw": TEXT_CURR}]
+    assert len(fluency.text_diff_pairs(envs)) == 1
+    assert fluency.run_text_diff_fluency(envs, {"m": lambda s, u: "1"}) == {"m": []}
 
 
 def test_empty_diff_report_without_a_pair_count_names_both_corpus_causes():

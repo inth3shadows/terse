@@ -690,6 +690,16 @@ class CodecRun(NamedTuple):
     merged_duplicates: Mapping[str, int] = MappingProxyType({})
 
 
+# The preamble `claude -p` sends ahead of every text-channel request (#450 review). NOT
+# re-measured here: a measurement spends real subscription quota. The figure is the one
+# recorded in `fluency.cli_answerer`'s docstring — 3,131 total input tokens for one call
+# with `--system-prompt ""` and `--setting-sources ""`, the flags that answerer passes. It
+# is in Claude's tokenizer, not cl100k, and includes that probe's own short user message,
+# so it is an approximation; added to a cl100k count it moves the limit check toward
+# excluding (the safe direction), where leaving it out passed requests ~3.1k over.
+_CLI_PREAMBLE_TOKENS = 3131
+
+
 def request_tokens(question: fluency.Question, payload_text: str,
                    tool_defs: list[dict] | None = None,
                    channel: str = "tool") -> int | None:
@@ -699,9 +709,9 @@ def request_tokens(question: fluency.Question, payload_text: str,
     tool definitions the answerer binds, because that is what the model is sent and what its
     limit is measured against. Per answer `channel` (`answer_channel`), as `_codec_turn`
     builds it: a `"text"` backend gets `_TEXT_INSTRUCTION` and binds no tool, so neither the
-    tool-channel instruction nor `tool_defs` is counted for it (#450). Still NOT counted:
-    the ~3.1k-token preamble `claude -p` adds on its side (`fluency.cli_answerer`), which
-    this process never sees.
+    tool-channel instruction nor `tool_defs` is counted for it (#450). It is charged
+    `_CLI_PREAMBLE_TOKENS` instead: the only text-channel backend is `claude -p`
+    (`cli_text_answerer`), which sends its own preamble ahead of this message.
 
     CORRECTED 2026-09-14. This docstring previously cited `b0e5f862` as the motivating case —
     "its terse arm is 32,510 tokens and fits by payload alone, then does not fit once the
@@ -725,7 +735,8 @@ def request_tokens(question: fluency.Question, payload_text: str,
     model's own tokenizer or a per-content bound; open on #403."""
     text = fluency._user_prompt(question.prompt, _channel_instruction(channel), payload_text)
     if channel == "text":
-        return count_cl100k(text)
+        n = count_cl100k(text)
+        return None if n is None else n + _CLI_PREAMBLE_TOKENS
     tools = json.dumps(tool_defs if tool_defs is not None else [RECORD_VALUE_TOOL_DEF])
     return count_cl100k(text + tools)
 

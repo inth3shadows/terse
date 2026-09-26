@@ -3608,7 +3608,7 @@ def build_trend_report(runs: list[dict[str, Any]]) -> str:
 
 
 def _diff_empty_lines(results: dict, pairs: int | None, no_pairs_hint: list[str],
-                      rerun: str) -> list[str]:
+                      no_questions: str, rerun: str) -> list[str]:
     """Why a diff-style report has no rows — ONE of three states, never a hint that lists
     them all (#266). The shared hint ("no model answers, or no same-tool pairs") sent an
     operator whose corpus HAD pairs off to capture more, when the pairs it had simply
@@ -3616,14 +3616,13 @@ def _diff_empty_lines(results: dict, pairs: int | None, no_pairs_hint: list[str]
 
     `pairs` is the number of same-tool pairs the harness asked over (`fluency.diff_pairs`
     / `text_diff_pairs`); `None` when the caller did not count them, in which case both
-    corpus-side causes are named rather than a guessed one."""
+    corpus-side causes are named rather than a guessed one. `no_questions` completes "the
+    pairs ..." with the cause that applies to the CALLER's harness: a JSON pair can fail to
+    generate questions, a text pair always gets the line-count one and yields no rows only
+    when no lossless text diff applies."""
     if not results:
         return [f"No model answers: no model was configured, so nothing was asked. "
                 f"Configure a backend, then re-run `{rerun}`."]
-    no_questions = ("generated no question — each pair either admits no lossless diff or "
-                    "has a shape the question generator cannot ask about (e.g. a nested "
-                    "dict of scalars, no record list). More captures of the same shape will "
-                    "not help; capture a tool whose result is a list of records.")
     if pairs is None:
         return [*no_pairs_hint,
                 f"Or the corpus has pairs that {no_questions}"]
@@ -3633,7 +3632,7 @@ def _diff_empty_lines(results: dict, pairs: int | None, no_pairs_hint: list[str]
 
 
 def _build_diff_style_report(results: dict, title: str, intro: list[str],
-                             no_pairs_hint: list[str], rerun: str,
+                             no_pairs_hint: list[str], no_questions: str, rerun: str,
                              control_label: str = "full-terse",
                              pairs: int | None = None) -> str:
     """Shared body for build_diff_report and build_text_diff_report — the row shape
@@ -3644,7 +3643,7 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
     out: list[str] = [title, ""]
     out += intro
     if not results or not any(results.values()):
-        out += [*_diff_empty_lines(results, pairs, no_pairs_hint, rerun), ""]
+        out += [*_diff_empty_lines(results, pairs, no_pairs_hint, no_questions, rerun), ""]
         return "\n".join(out)
 
     trials = max((r.get("trials", 1) for rows in results.values() for r in rows), default=1)
@@ -3758,6 +3757,10 @@ def build_diff_report(results: dict, pairs: int | None = None) -> str:
          "deterministic. Risk-item check for `proxy --diff` before turning it on.", ""],
         ["No same-tool payload PAIRS in the corpus. Capture a tool",
          "2+ times (an agent loop), then re-run `terse fluency --diff`."],
+        ("generated no question — each pair either admits no lossless diff or has a shape "
+         "the question generator cannot ask about (e.g. a nested dict of scalars, no record "
+         "list). More captures of the same shape will not help; capture a tool whose result "
+         "is a list of records."),
         "terse fluency --diff",
         pairs=pairs,
     )
@@ -3781,6 +3784,11 @@ def build_text_diff_report(results: dict, pairs: int | None = None) -> str:
         ["No same-tool TEXT payload PAIRS in the corpus (JSON pairs "
          "are `--diff`'s domain, not this one's). Capture a text-producing tool 2+ times, "
          "then re-run `terse fluency --text-diff-eval`."],
+        # Every text pair gets the line-count question, so the only way a pair yields no
+        # rows is `text_diff_wire` returning None (`run_text_diff_payload`).
+        ("admit no lossless text diff — the previous text is empty, or the chunked diff does "
+         "not rebuild the current text exactly. Capture a text tool whose consecutive "
+         "results share most of their content."),
         "terse fluency --text-diff-eval",
         control_label="raw text",
         pairs=pairs,
