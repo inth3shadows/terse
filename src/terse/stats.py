@@ -971,7 +971,8 @@ _SCOPE_PRECEDENCE = {"local": 0, "project": 1, "user": 2}
 
 # Scan states the client does NOT launch from that scope (`_scan_target`): folded behind a
 # router (with or without its stash record), a stash whose entry vanished, or a project
-# `.mcp.json` entry the user never approved or rejected (#448 — in the file, never run).
+# `.mcp.json` entry the user REJECTED (#448 — in the file, never run). A merely pending
+# project entry is NOT absent: `claude -p`, Agent SDK and cloud sessions load it unasked.
 # The client resolves the name to the next scope that DOES launch it (#424). Every other
 # state is a launched entry.
 _ABSENT_FROM_SCOPE = ("folded", "folded-unstashed", "orphaned-stash", "unapproved")

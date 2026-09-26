@@ -1564,25 +1564,42 @@ def _peers_diff_label(peers_doc: dict | None) -> str | None:
 
 def _mcpjson_approval(mcp_json: Path, cfg: Path, project_keys: list[str]):
     """`name -> "approved" | "rejected" | "pending"` for the servers of a project
-    `.mcp.json` (#448). Claude Code launches a project-scope server only once the user
-    has approved it; one that is pending or rejected sits in the file and never runs.
+    `.mcp.json` (#448).
 
-    ASSUMED rule (Claude Code's own logic is not public API; this matches the keys it
-    writes, confirmed by key NAME only against a live install — current versions store
-    the approval dialog's answer in `<project>/.claude/settings.local.json`, and every
+    Only "rejected" means "never launches". Claude Code's docs
+    (code.claude.com/docs/en/mcp): "In `claude -p` runs, Agent SDK sessions, and cloud
+    sessions, Claude Code can't show that prompt: it loads project-scoped servers without
+    asking" — and the prompt is also skipped under bypassPermissions with
+    skipDangerousModePermissionPrompt. So a PENDING entry really runs in exactly the
+    sessions a cost harness uses (`claude -p`), and treating it as absent would drop a live
+    writer from primer liability and `_contested_labels`. `disabledMcpjsonServers` is the one
+    key that blocks a server in every mode, which is why `scan_scopes` reports only a
+    rejected entry as `unapproved` (absent from its scope) and merely records "pending".
+
+    Rule (keys confirmed by NAME only against a live install — current versions store the
+    approval dialog's answer in `<project>/.claude/settings.local.json`, and every
     `~/.claude.json` `projects` block carries empty lists of the same keys):
       - a name in any `disabledMcpjsonServers` -> "rejected" (a rejection beats
         `enableAllProjectMcpServers`);
       - else `enableAllProjectMcpServers: true` anywhere, or the name in any
         `enabledMcpjsonServers` -> "approved";
-      - else "pending", which Claude Code does not launch.
+      - else "pending".
     Sources, unioned: the `~/.claude.json` `projects` block for each key in
-    `project_keys`, the user `settings.json` in the `.claude` dir beside `cfg` (where
-    `~/.claude/settings.json` sits beside `~/.claude.json`), and the project's own
-    `.claude/settings.json` / `.claude/settings.local.json`. Managed (enterprise) policy
-    settings and any non-interactive auto-approval are NOT modelled. Unreadable or
-    malformed sources are skipped, never raised — this feeds `scan_scopes`, which must
-    not raise. Only the three key names are read; no other value leaves the files."""
+    `project_keys`, the user `settings.json` (`$CLAUDE_CONFIG_DIR/settings.json` when that
+    is set, else the `.claude` dir beside `cfg`, as `~/.claude/settings.json` sits beside
+    `~/.claude.json`), and the project's own `.claude/settings.json` /
+    `.claude/settings.local.json`.
+
+    Known approximations, all erring toward "approved" or "pending" — never toward a false
+    "rejected", the only answer that changes a row's state:
+      - the OR-merge of `enableAllProjectMcpServers` ignores settings precedence (a
+        higher-precedence `false` does not override a lower `true`), and workspace trust
+        is not checked — both can yield a false "approved";
+      - managed (enterprise) policy settings are not read, so an approval that lives only
+        there reads as "pending".
+    Unreadable or malformed sources are skipped, never raised — this feeds `scan_scopes`,
+    which must not raise. Only the three key names are read; no other value leaves the
+    files."""
     blocks: list[dict] = []
     try:
         projects = _load_json(cfg).get("projects")
@@ -1590,7 +1607,10 @@ def _mcpjson_approval(mcp_json: Path, cfg: Path, project_keys: list[str]):
         projects = None
     if isinstance(projects, dict):
         blocks += [projects[k] for k in dict.fromkeys(project_keys) if k in projects]
-    for path in (cfg.parent / ".claude" / "settings.json",
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    user_settings = (Path(config_dir).expanduser() / "settings.json" if config_dir
+                     else cfg.parent / ".claude" / "settings.json")
+    for path in (user_settings,
                  mcp_json.parent / ".claude" / "settings.json",
                  mcp_json.parent / ".claude" / "settings.local.json"):
         try:
@@ -1820,12 +1840,15 @@ def _scan_target(target: Target, scope: str, approval=None) -> list[dict]:
             wraps = ", ".join(sorted(folded)) or NO_PEERS
             policy_missing = bool(policy and os.path.isabs(policy)
                                   and not os.path.exists(policy))
-        # A project entry Claude Code has not approved is in the file but never launched
-        # (#448), so it is reported as `unapproved` — an absent state to the precedence
-        # rule — rather than as the state its config alone implies. The launch fields
-        # above stay filled so status can still say what it WOULD run once approved.
+        # A project entry the user REJECTED is in the file but never launched, in any
+        # session mode (#448), so it is reported as `unapproved` — an absent state to the
+        # precedence rule — rather than as the state its config alone implies. A PENDING
+        # one keeps its real state: `claude -p`, Agent SDK and cloud sessions load it
+        # without asking (see `_mcpjson_approval`), so it is a live writer there and must
+        # stay in primer liability and the ledger-label contest. The launch fields above
+        # stay filled so status can still say what a rejected entry WOULD run.
         approval_status = approval(name) if approval is not None and present else None
-        shown_state = state if approval_status in (None, "approved") else "unapproved"
+        shown_state = "unapproved" if approval_status == "rejected" else state
         rows.append({"scope": scope, "server": name, "state": shown_state, "policy": policy,
                     "policy_missing": policy_missing, "launcher": launcher,
                     "launcher_missing": launcher_gone, "wraps": wraps, "diff": diff,
@@ -1867,8 +1890,9 @@ def scan_scopes(*, cfg: Path | None = None, file: str | None = None,
     front one peers file — a hand-edit terse refuses to guess through),
     "orphaned-stash" (stashed
     but the entry vanished — see `_scan_target`), "unapproved" (a project `.mcp.json`
-    entry Claude Code has not approved, so it never launches — `approval` says "pending"
-    or "rejected", #448), or "unwrapped" (present, not terse's). The wrapped-only
+    entry the user rejected in Claude Code, so it never launches in any mode — #448; a
+    merely PENDING entry keeps its real state, since non-interactive sessions load it, and
+    only its `approval` field says "pending"), or "unwrapped" (present, not terse's). The wrapped-only
     fields (policy_missing, launcher, launcher_missing, wraps, diff, stats, stats_log) are
     None/False for non-wrapped rows — with one exception: a "folded-and-live" row whose
     LIVE entry launches via terse carries them too, because that entry runs its own proxy

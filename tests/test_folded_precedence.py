@@ -91,9 +91,10 @@ def test_the_absent_states_are_exactly_the_scan_rows_the_client_does_not_launch(
     """The rule is only as good as the state list it keys on, and that list lives in
     `install_mcp`. Driven through the REAL scanner over a real multiproxy install, a stash
     entry whose live entry was hand-deleted, a folded peer whose stash record is gone, and a
-    project `.mcp.json` with one approved and one never-approved entry (#448): for every row,
-    "absent" by `_ABSENT_FROM_SCOPE` must equal "not launched" — not in that scope's
-    `mcpServers`, or a project entry Claude Code has not approved."""
+    project `.mcp.json` with an approved, a pending and a rejected entry (#448): for every
+    row, "absent" by `_ABSENT_FROM_SCOPE` must equal "not launched" — not in that scope's
+    `mcpServers`, or a project entry the user rejected. A PENDING entry is launched:
+    non-interactive, Agent SDK and cloud sessions load it without asking."""
     from terse import install_mcp as im
     from terse.stats import _ABSENT_FROM_SCOPE
 
@@ -117,9 +118,11 @@ def test_the_absent_states_are_exactly_the_scan_rows_the_client_does_not_launch(
     (proj / ".claude").mkdir(parents=True)
     mcp = proj / ".mcp.json"
     mcp.write_text(json.dumps({"mcpServers": {
-        "ok": {"command": "ok-mcp"}, "new": {"command": "new-mcp"}}}), encoding="utf-8")
-    (proj / ".claude" / "settings.local.json").write_text(
-        json.dumps({"enabledMcpjsonServers": ["ok"]}), encoding="utf-8")   # new -> unapproved
+        "ok": {"command": "ok-mcp"}, "new": {"command": "new-mcp"},
+        "no": {"command": "no-mcp"}}}), encoding="utf-8")
+    (proj / ".claude" / "settings.local.json").write_text(json.dumps(
+        {"enabledMcpjsonServers": ["ok"],                  # new -> pending, still launched
+         "disabledMcpjsonServers": ["no"]}), encoding="utf-8")   # no -> unapproved
 
     present = {"user": set(json.loads(cfg.read_text())["mcpServers"]),
                "project": set(json.loads(mcp.read_text())["mcpServers"])}
@@ -130,7 +133,7 @@ def test_the_absent_states_are_exactly_the_scan_rows_the_client_does_not_launch(
     assert set(_ABSENT_FROM_SCOPE) <= set(states.values()), states
     for r in rows:
         launched = (r["server"] in present[r["scope"]]
-                    and (r["scope"] != "project" or r["approval"] == "approved"))
+                    and (r["scope"] != "project" or r["approval"] != "rejected"))
         assert (r["state"] in _ABSENT_FROM_SCOPE) == (not launched), r
 
 

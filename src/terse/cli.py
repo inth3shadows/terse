@@ -1975,8 +1975,11 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
                 print(f"  {'':<20} another entry fronts the same peers file — delete the "
                       f"duplicate (they are interchangeable) before terse can manage it")
             elif r["state"] == "unapproved":
-                print(f"  {'':<20} {r.get('approval')} in Claude Code: this .mcp.json "
-                      f"entry never launches until approved (#448)")
+                print(f"  {'':<20} rejected in Claude Code: this .mcp.json entry never "
+                      f"launches (#448)")
+            elif r.get("approval") == "pending":
+                print(f"  {'':<20} pending: loads only in non-interactive sessions "
+                      f"(claude -p, Agent SDK, cloud) until approved")
             # `folded-and-live` already said "runs TWICE" above, in its own words.
             if r["state"] != "folded-and-live":
                 for lbl, others in dup_of.get(row_index[id(r)], []):
