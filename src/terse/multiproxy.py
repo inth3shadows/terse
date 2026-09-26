@@ -1492,6 +1492,7 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                  store: OrderedDict[str, Any], store_lock: Lock,
                  dropped_bytes: list[int],
                  origins: dict[str, tuple[str, str, str]] | None = None,
+                 retrieve_hits: dict[tuple[str, str], int] | None = None,
                  diff_override: bool | None = None,
                  diff_keyframe_override: int | None = None,
                  join_blocks_override: bool | None = None,
@@ -1549,7 +1550,8 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                                 stats_primer=stats_primer,
                                 server_name=spec.name, store=store,
                                 store_lock=store_lock, dropped_bytes=dropped_bytes,
-                                origins=origins, ledger_label=spec.name,
+                                origins=origins, retrieve_hits=retrieve_hits,
+                                ledger_label=spec.name,
                                 log_prefix="[terse-multiproxy]", lazy_primer=False,
                                 shared_primer=primer_latch)
             transport = build_transport(spec.target, headers=spec.headers or None,
@@ -1614,6 +1616,9 @@ def run_multi_proxy(
     # terse.retrieve for a handle another peer dropped, and a private map would lose the
     # attribution exactly on the fleet shape that has a lossy-by-default rule (#251).
     origins: dict[str, tuple[str, str, str]] = {}
+    # Shared like `origins`: a retrieve answered by peers[0] must retract the dropping
+    # peer's rule (#252).
+    retrieve_hits: dict[tuple[str, str], int] = {}
 
     # ONE lazy primer for the whole router (#212), recorded under `router_ledger_label` --
     # never a peer's name. The router is launched `proxy --config <peers>` and does not know
@@ -1625,6 +1630,7 @@ def run_multi_proxy(
         peers = _build_peers(specs, default_policy, debug=debug, capture=capture,
                              audit=audit, store=store, store_lock=store_lock,
                              dropped_bytes=dropped_bytes, origins=origins,
+                             retrieve_hits=retrieve_hits,
                              diff_override=diff_override,
                              diff_keyframe_override=diff_keyframe_override,
                              join_blocks_override=join_blocks_override,

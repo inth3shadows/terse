@@ -347,6 +347,7 @@ class Interceptor:
                  store_lock: Lock | None = None,
                  dropped_bytes: list[int] | None = None,
                  origins: dict[str, tuple[str, str, str]] | None = None,
+                 retrieve_hits: dict[tuple[str, str], int] | None = None,
                  stats_retrieve: Callable[[str, str, str, bool, str], None] | None = None,
                  stats_primer: Callable[[str, str, bool], None] | None = None,
                  ledger_label: str | None = None,
@@ -456,6 +457,13 @@ class Interceptor:
         # `_store_lock` alongside the dict it mirrors, and evicted in lockstep with it.
         self._drop_origin: dict[str, tuple[str, str, str]] = (origins if origins is not None
                                                               else {})
+        # `(tool, rule path) -> retrieve HITS this session` (#252), for a drop spec's
+        # `retract_after`. SHARED with the store for the same reason `_drop_origin` is: the
+        # router answers every retrieve through peers[0], so the peer whose rule should
+        # retract is usually not the one that counted the hit. Guarded by `_store_lock`,
+        # cleared with the store at `initialize`.
+        self._retrieve_hits: dict[tuple[str, str], int] = (retrieve_hits
+                                                           if retrieve_hits is not None else {})
         # The ledger `server` label THIS Interceptor's drops should be billed to. Stored
         # into `_drop_origin` at drop time rather than read at retrieve time, because under
         # multiproxy the router answers EVERY terse.retrieve through `peers[0]` (see
@@ -603,6 +611,7 @@ class Interceptor:
                     # handle the model still holds became unresolvable at the reconnect,
                     # so its attribution describes a drop that can no longer be retrieved.
                     self._drop_origin.clear()
+                    self._retrieve_hits.clear()
                 # The client's DECLARED identity, straight off the handshake. This is
                 # what lets `"structured": "auto"` compress the typed `structuredContent`
                 # field only for clients measured not to validate it (#128) — an observed
@@ -1196,7 +1205,8 @@ class Interceptor:
         try:
             applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put,
                                        server=self.server_name,
-                                       force_lossless=force_lossless)
+                                       force_lossless=force_lossless,
+                                       skip_drop_paths=self._retracted_paths(tool))
             self._note_drop_origins(applied)
         except Exception as exc:  # noqa: BLE001 — fail-open is the whole point
             if self.debug:
@@ -1325,7 +1335,8 @@ class Interceptor:
         try:
             applied, curr, refuse = policy_mod.apply_joined(
                 raws, tool, self.policy, drop_sink=self._drop_put,
-                server=self.server_name, force_lossless=force_lossless)
+                server=self.server_name, force_lossless=force_lossless,
+                skip_drop_paths=self._retracted_paths(tool))
             self._note_drop_origins(applied)
         except Exception as exc:  # noqa: BLE001 — fail-open is the whole point
             if self.debug:
@@ -1399,7 +1410,8 @@ class Interceptor:
                 try:
                     applied, curr, _refuse = policy_mod.apply_joined(
                         raws, tool, self.policy, drop_sink=self._drop_put,
-                        server=self.server_name, force_lossless=force_lossless)
+                        server=self.server_name, force_lossless=force_lossless,
+                        skip_drop_paths=self._retracted_paths(tool))
                     self._note_drop_origins(applied)
                 except Exception as exc:  # noqa: BLE001 — fail-open per run
                     if self.debug:
@@ -1553,7 +1565,8 @@ class Interceptor:
         try:
             applied = policy_mod.apply(text, tool, self.policy, drop_sink=self._drop_put,
                                        server=self.server_name,
-                                       force_lossless=force_lossless)
+                                       force_lossless=force_lossless,
+                                       skip_drop_paths=self._retracted_paths(tool))
             self._note_drop_origins(applied)
             if self.debug and not applied.skipped and applied.text != text:
                 sys.stderr.write(
@@ -1725,6 +1738,22 @@ class Interceptor:
                 # would grow without bound alongside a store that is explicitly capped.
                 self._drop_origin.pop(evicted_handle, None)
 
+    def _retracted_paths(self, tool: str) -> frozenset[str]:
+        """Drop paths this session has retracted for `tool` (#252): those whose spec sets
+        `retract_after` and whose values the model has already fetched back that many
+        times. Fail-open to "retract nothing" -- the caller's own fail-open covers the rest."""
+        try:
+            rule = self.policy.select(tool, self.server_name)
+        except Exception:  # noqa: BLE001 — never let the retract lookup break a call
+            return frozenset()
+        out = []
+        with self._store_lock:
+            for path, spec in rule.fields.items():
+                n = lossy_mod.retract_after(spec)
+                if n and self._retrieve_hits.get((tool, path), 0) >= n:
+                    out.append(path)
+        return frozenset(out)
+
     def _note_drop_origins(self, applied: Any) -> None:
         """Record `handle -> (server, tool, rule path)` for the drops an `apply`/`apply_joined`
         call actually COMMITTED (#251), so a later `terse.retrieve` is billed to the rule —
@@ -1804,6 +1833,9 @@ class Interceptor:
             # taken separately, an interleaved eviction between the two could drop the
             # origin and bill this retrieve to `unknown` even though it hit.
             origin = self._drop_origin.get(handle)
+            if hit and origin is not None:
+                key = (origin[1], origin[2])
+                self._retrieve_hits[key] = self._retrieve_hits.get(key, 0) + 1
         if hit:
             # Serialized ONCE and reused for the ledger's size measurement below: the drop
             # store is capped at 8 MiB, so a large field would otherwise pay a full second

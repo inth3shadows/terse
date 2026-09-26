@@ -13,7 +13,9 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Per-session retract for drop rules (#252).** A drop spec can set `retract_after: N`: once the model has fetched values that rule dropped from a tool back N times in a session, that tool's later results keep the field inline until the client reconnects. Counts are per tool and rule path; a retrieve that misses does not count, and under the multiproxy router a retrieve answered by any peer counts toward the peer that dropped the value. Off unless set. Over 151 past `codegraph_explore` results, 72% of the results after a session's first retrieve needed one too (38% before it); stopping the drop there cut the results needing any retrieve from 80 to 32. A value that is not a positive integer is ignored with a warning.
 
 ## [0.40.0] - 2026-09-26
 

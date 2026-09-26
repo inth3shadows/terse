@@ -23,7 +23,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -689,6 +689,9 @@ def _lossy_warnings(rule: Rule) -> list[str]:
             out.append(f"field '{path}': unknown lossy mode '{mode}' (ignored)")
         elif path in critical:
             out.append(f"field '{path}': marked '{mode}' AND critical — kept lossless")
+        if "retract_after" in spec and lossy_mod.retract_after(spec) is None:
+            out.append(f"field '{path}': 'retract_after' must be a positive integer, "
+                       f"got {spec['retract_after']!r} (ignored)")
         if "keep_first" in spec:
             if path not in lossy_mod.TEXT_SELECTORS:
                 out.append(f"field '{path}': 'keep_first' applies only to a text selector "
@@ -784,9 +787,20 @@ def _lossless_stage(data: Any, rule: Rule, warnings: list[str]) -> tuple[str, tu
     return text, rule.tiers
 
 
+def _without_paths(rule: Rule, paths: frozenset[str]) -> Rule:
+    """`rule` minus the field specs at `paths` -- the proxy's per-session retract (#252)
+    turns a drop rule off for one tool by leaving its path out, so every downstream stage
+    sees an ordinary rule without that field and needs no retract logic of its own."""
+    if not paths or not any(p in rule.fields for p in paths):
+        return rule
+    return replace(rule, fields={k: v for k, v in rule.fields.items()
+                                             if k not in paths})
+
+
 def apply(raw: str, tool: str, policy: Policy,
           drop_sink: Any = None, server: str | None = None,
-          force_lossless: bool = False) -> Applied:
+          force_lossless: bool = False,
+          skip_drop_paths: frozenset[str] = frozenset()) -> Applied:
     """Compress one raw payload per policy. Lossless by default; a field marked
     `truncate` (and not `critical`) is reduced, gated by the acceptable-loss invariant.
     Non-JSON passes through.
@@ -802,7 +816,7 @@ def apply(raw: str, tool: str, policy: Policy,
     Returns the (possibly unchanged) text plus what was applied — so a caller/proxy
     can log why a payload was or wasn't compressed, and whether anything was dropped.
     """
-    rule = policy.select(tool, server)
+    rule = _without_paths(policy.select(tool, server), skip_drop_paths)
     warnings = _lossy_warnings(rule)
 
     # Server-level lossy exclusion: on a never-lossy server (credential/personal store),
@@ -888,7 +902,9 @@ JOIN_REFUSED_DEPTH = "depth"                # joined array nests past the codec 
 
 def apply_joined(raws: list[str], tool: str, policy: Policy,
                  drop_sink: Any = None, server: str | None = None,
-                 force_lossless: bool = False) -> tuple[Applied | None, list | None, str]:
+                 force_lossless: bool = False,
+                 skip_drop_paths: frozenset[str] = frozenset()
+                 ) -> tuple[Applied | None, list | None, str]:
     """Compress a MULTI-block result as ONE record array (#116).
 
     Parse every block, run the lossy stage per-block (so a field path like
@@ -904,7 +920,7 @@ def apply_joined(raws: list[str], tool: str, policy: Policy,
 
     `raws` MUST have >=2 entries — the single-block shape is `apply`'s job.
     """
-    rule = policy.select(tool, server)
+    rule = _without_paths(policy.select(tool, server), skip_drop_paths)
     if not policy.join_blocks:
         return None, None, JOIN_REFUSED_OFF
     if not rule.tiers:
