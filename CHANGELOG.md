@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.39.1] - 2026-09-26
+
 ### Fixed
 
 - **A router session whose tools all return `structuredContent` now compresses (#463).** While the router's lazy primer was owed, every result carrying `structuredContent` passed through whole, and the hold released only when a text-only result carried the primer. A kb-only session therefore never compressed: live, `kb.read.list_nodes` and `kb.read.search` stayed raw until a `codegraph_explore` call attached the primer. Now, when the typed field would be compressed for the connected client (claude-code under `"structured": "auto"`, or an explicit `"compress"`), the first such result claims the primer, is compressed, and carries the primer both as text block 0 and inside the typed field as `{"__terse_primer__": ..., "__terse_payload__": ...}`; the primer gains one sentence explaining that wrapper. Unknown clients, `"leave"`, `"replace"` and a peer that loses the race keep the hold. The ledger books one primer row, and the result's emitted size counts the wrapper without billing the primer text twice.
