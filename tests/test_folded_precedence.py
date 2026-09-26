@@ -87,7 +87,8 @@ def test_absent_rank_beats_scope_rank_even_from_local():
     assert _precedence_winner(rows) == {"kb": 0}
 
 
-def test_the_absent_states_are_exactly_the_scan_rows_the_client_does_not_launch(tmp_path):
+def test_the_absent_states_are_exactly_the_scan_rows_the_client_does_not_launch(
+        tmp_path, monkeypatch):
     """The rule is only as good as the state list it keys on, and that list lives in
     `install_mcp`. Driven through the REAL scanner over a real multiproxy install, a stash
     entry whose live entry was hand-deleted, a folded peer whose stash record is gone, and a
@@ -98,6 +99,7 @@ def test_the_absent_states_are_exactly_the_scan_rows_the_client_does_not_launch(
     from terse import install_mcp as im
     from terse.stats import _ABSENT_FROM_SCOPE
 
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)   # never the real settings.json
     cfg = tmp_path / "claude.json"
     cfg.write_text(json.dumps({"mcpServers": {
         "kb": {"command": "kb-mcp"}, "gh": {"command": "gh-mcp"},

@@ -1596,7 +1596,10 @@ def _mcpjson_approval(mcp_json: Path, cfg: Path, project_keys: list[str]):
         higher-precedence `false` does not override a lower `true`), and workspace trust
         is not checked — both can yield a false "approved";
       - managed (enterprise) policy settings are not read, so an approval that lives only
-        there reads as "pending".
+        there reads as "pending";
+      - `claude -p --setting-sources user` ignores a project `settings.local.json`
+        `disabledMcpjsonServers`, so a server read as rejected can still run in that
+        mode (rare).
     Unreadable or malformed sources are skipped, never raised — this feeds `scan_scopes`,
     which must not raise. Only the three key names are read; no other value leaves the
     files."""
