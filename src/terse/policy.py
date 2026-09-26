@@ -459,6 +459,20 @@ class Policy:
         also be reachable."""
         return self.diff and bool(self.reachable_tiers(server))
 
+    def rewrites_structured(self, server: str | None = None) -> bool:
+        """True if some tool on `server` could have its `structuredContent` compressed: a
+        reachable rule with tiers whose `structured` is not "leave" (#463). Gates the
+        primer's typed-wrapper sentence. Same walk, and the same over-approximation, as
+        `reachable_tiers`: `"auto"` counts, because the client is not known until
+        `initialize`, after the primer is built."""
+        for r in self.rules:
+            if r.tiers and r.structured != "leave":
+                return True
+            if server and self._glob_covers_server(r.tool_glob, server):
+                return False
+        # The fallback rule `select` returns carries the Rule default, "auto".
+        return bool(self.default_tiers)
+
 
 def default_policy() -> Policy:
     """Lossless-everywhere default: full Tier-0/0.5 on every tool, no lossy."""
@@ -675,6 +689,13 @@ def _lossy_warnings(rule: Rule) -> list[str]:
             out.append(f"field '{path}': unknown lossy mode '{mode}' (ignored)")
         elif path in critical:
             out.append(f"field '{path}': marked '{mode}' AND critical — kept lossless")
+        if "keep_first" in spec:
+            if path not in lossy_mod.TEXT_SELECTORS:
+                out.append(f"field '{path}': 'keep_first' applies only to a text selector "
+                           f"{sorted(lossy_mod.TEXT_SELECTORS)} (ignored)")
+            elif lossy_mod.keep_first(spec) is None:
+                out.append(f"field '{path}': 'keep_first' must be a non-negative integer, "
+                           f"got {spec['keep_first']!r} (treated as 0)")
     for path in lossy_mod.unknown_text_selectors(rule):
         out.append(f"field '{path}': unknown text selector; known: "
                    f"{sorted(lossy_mod.TEXT_SELECTORS)} (ignored)")

@@ -407,6 +407,20 @@ def fenced_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
+def keep_first(spec: Any) -> int | None:
+    """A text drop spec's `keep_first` (#252): how many leading qualifying blocks stay
+    inline. 0 when absent; None when present but not a non-negative int, which the policy
+    layer reports and `apply_text_drops` treats as 0 (today's drop-everything behaviour).
+
+    Measured 2026-09-26 over 151 live codegraph_explore results: 61% of retrieves fetched
+    block 0 (codegraph orders blocks by relevance), and keeping it inline cut the results
+    that needed any retrieve from 80 to 34 at ~6.9 KB more resident per result."""
+    raw = spec.get("keep_first", 0) if isinstance(spec, dict) else 0
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return None
+    return raw
+
+
 def apply_text_drops(text: str, rule: Any, tool: str,
                      sink: Callable[[str, Any], None],
                      origin: dict[str, tuple[str, str]] | None = None) -> str:
@@ -420,6 +434,10 @@ def apply_text_drops(text: str, rule: Any, tool: str,
     out = text
     for path, spec in _text_drop_specs(rule):
         min_len = int(spec.get("min", DEFAULT_TEXT_DROP_MIN))
+        # Only blocks that would otherwise drop use up a kept slot: a block under the
+        # floor stays inline regardless, so letting it count would drop the block the
+        # operator meant to keep.
+        to_keep = keep_first(spec) or 0
         # One forward pass building segments, joined once at the end: splicing per span
         # recopied the whole payload each time (O(payload x spans)) on the proxy hot path.
         parts: list[str] = []
@@ -427,6 +445,9 @@ def apply_text_drops(text: str, rule: Any, tool: str,
         for start, end in fenced_spans(out):
             span = out[start:end]
             if len(span) < min_len:
+                continue
+            if to_keep:
+                to_keep -= 1
                 continue
             handle = _handle(tool, path, span)
             sink(handle, span)

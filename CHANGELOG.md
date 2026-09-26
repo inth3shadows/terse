@@ -13,7 +13,15 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **`keep_first` for text drop rules (#252).** A `$text.code_blocks` drop spec can now keep the first N fenced blocks of each text result inline (`{"lossy": "drop-to-retrieve", "min": 400, "keep_first": 1}`); later blocks still drop to a `terse.retrieve` handle. Only blocks at or above `min` count toward N. Over 151 past `codegraph_explore` results, 61% of retrieves fetched the first block, and keeping it inline cut the results that needed any retrieve from 80 to 34, at about 6.9 KB more per result. The default stays 0, so existing policies are unchanged. A value that is not a non-negative integer, or `keep_first` on a JSON field path, is ignored with a warning when the rule is applied. The drop eval no longer picks a recall anchor that is visible in the emitted text, so a kept block cannot answer a question meant to need a retrieve.
+
+## [0.39.1] - 2026-09-26
+
+### Fixed
+
+- **A router session whose tools all return `structuredContent` now compresses (#463).** While the router's lazy primer was owed, every result carrying `structuredContent` passed through whole, and the hold released only when a text-only result carried the primer. A kb-only session therefore never compressed: live, `kb.read.list_nodes` and `kb.read.search` stayed raw until a `codegraph_explore` call attached the primer. Now, when the typed field would be compressed for the connected client (claude-code under `"structured": "auto"`, or an explicit `"compress"`), the first such result claims the primer, is compressed, and carries the primer both as text block 0 and inside the typed field as `{"__terse_primer__": ..., "__terse_payload__": ...}`; the primer gains one sentence explaining that wrapper. Unknown clients, `"leave"`, `"replace"` and a peer that loses the race keep the hold. The ledger books one primer row, and the result's emitted size counts the wrapper without billing the primer text twice.
 
 ## [0.39.0] - 2026-09-25
 
