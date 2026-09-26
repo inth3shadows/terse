@@ -307,6 +307,31 @@ def test_a_retrieve_is_billed_to_the_peer_that_dropped_it_not_the_one_that_answe
     assert (tool, path, hit) == ("gh.api.list", "result[].body", True)
 
 
+def test_a_text_drops_block_index_survives_the_peer_hop():
+    """The same peer hop as above, on the TEXT path (#252): the block index is captured
+    by the dropping peer and must reach the ledger row written by the answering one."""
+    from collections import OrderedDict
+    from threading import Lock
+
+    store: OrderedDict = OrderedDict()
+    lock, boxed, origins = Lock(), [0], {}
+    rows: list[tuple] = []
+    peer_first = Interceptor(TEXT_DROP, store=store, store_lock=lock, dropped_bytes=boxed,
+                             origins=origins, ledger_label="gh",
+                             stats_retrieve=lambda s, t, p, h, v, index=None:
+                             rows.append((s, t, p, h, index)))
+    peer_kb = Interceptor(TEXT_DROP, store=store, store_lock=lock, dropped_bytes=boxed,
+                          origins=origins, ledger_label="kb")
+    block = "```python\n{}\n```\n"
+    text = block.format("a = 0\n" * 80) + "prose\n" + block.format("b = 1\n" * 80)
+    out = peer_kb._compress(text, "codegraph_explore")
+    handles = [json.loads(line)["__terse_dropped__"] for line in out.splitlines()
+               if "__terse_dropped__" in line]
+    assert len(handles) == 2
+    assert peer_first.answer_retrieve(_retrieve_call(9, handles[1])) is not None
+    assert rows == [("kb", "codegraph_explore", "$text.code_blocks", True, 1)]
+
+
 def test_an_unattributed_retrieve_falls_back_to_the_answering_proxys_own_label():
     """A handle with no provenance still has to be billed somewhere. There is no better
     answer available than the proxy that served it, and dropping the row entirely would

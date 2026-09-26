@@ -455,7 +455,9 @@ def apply_text_drops(text: str, rule: Any, tool: str,
     counting the ones `keep_first` kept inline -- the numbering `keep_first` itself counts
     in, so a retrieve of index i says "keep_first i+1 would have kept it". Handles are
     content-addressed, so an identical span at two positions is ONE handle; it records the
-    FIRST position, deterministically.
+    FIRST position, deterministically. The index counts within one content block's text
+    (it restarts for each block, the same as `keep_first`), and across results the most
+    recent drop of a handle sets its index.
     This is the path the fleet's only lossy-by-default rule takes (`$text.code_blocks`), so
     it is the one that actually needs the attribution."""
     out = text
