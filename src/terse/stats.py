@@ -1217,7 +1217,9 @@ def _contested_labels(scan_rows: list[dict[str, Any]],
     label are one logical server installed twice, which #285 ruled an honest label and
     `test_ambiguity_needs_a_LAUNCHER_not_merely_a_shared_label` pins; widening to any shared
     label would delete that measurement. A router's peer NAME is different in kind — the
-    router chose it, so a second entry answering to it duplicates that peer.
+    router chose it, so a second entry answering to it duplicates that peer. The same holds
+    for two entries that each bake the same explicit `--server-name` (#426): a declared name,
+    not a guess, so they contest it without any router.
 
     Gated on `_writes_ledger_rows`: an entry baked `--no-stats`, or pointed at another
     ledger, writes none of the rows under that label and cannot be one of the writers
@@ -1248,6 +1250,11 @@ def _contested_labels(scan_rows: list[dict[str, Any]],
     # name is different in kind: the router chose it, so a second entry answering to it is a
     # duplicate of that peer, which is the population #396 is about.
     router_labels: set[str] = set()
+    # ...except where two entries each DECLARE the label (#426). An explicit `--server-name`
+    # is chosen, not guessed, exactly like a router's peer name; two distinct entries baking
+    # the same one are two processes writing one label, and `_precedence_winner` has
+    # already collapsed the one-server-in-two-scopes case by name. Guesses keep #285's rule.
+    explicit_writers: dict[str, set[str]] = {}
     for i, row in enumerate(scan_rows):
         name = row.get("server")
         if not name or winners.get(str(name)) != i:
@@ -1266,6 +1273,8 @@ def _contested_labels(scan_rows: list[dict[str, Any]],
             ident = row.get("ledger_identity") or (server_label(wraps.split()) if wraps
                                                    else "")
             written = [str(ident)] if ident else []
+            if ident and row.get("ledger_identity_explicit"):
+                explicit_writers.setdefault(str(ident), set()).add(str(name))
         else:
             continue
         if state in ("router", "router-ambiguous"):
@@ -1276,7 +1285,9 @@ def _contested_labels(scan_rows: list[dict[str, Any]],
                 non_router_writers.setdefault(lbl, set()).add(str(name))
     return {lbl: _Contest(frozenset(writers[lbl]),
                           frozenset(non_router_writers.get(lbl, ())))
-            for lbl in router_labels if len(writers.get(lbl, ())) > 1}
+            for lbl in router_labels | {lbl for lbl, w in explicit_writers.items()
+                                        if len(w) > 1}
+            if len(writers.get(lbl, ())) > 1}
 
 
 def _superseded_labels(row: dict[str, Any], labels: list[str],
