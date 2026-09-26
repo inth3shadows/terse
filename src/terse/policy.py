@@ -689,6 +689,13 @@ def _lossy_warnings(rule: Rule) -> list[str]:
             out.append(f"field '{path}': unknown lossy mode '{mode}' (ignored)")
         elif path in critical:
             out.append(f"field '{path}': marked '{mode}' AND critical — kept lossless")
+        if "keep_first" in spec:
+            if path not in lossy_mod.TEXT_SELECTORS:
+                out.append(f"field '{path}': 'keep_first' applies only to a text selector "
+                           f"{sorted(lossy_mod.TEXT_SELECTORS)} (ignored)")
+            elif lossy_mod.keep_first(spec) is None:
+                out.append(f"field '{path}': 'keep_first' must be a non-negative integer, "
+                           f"got {spec['keep_first']!r} (treated as 0)")
     for path in lossy_mod.unknown_text_selectors(rule):
         out.append(f"field '{path}': unknown text selector; known: "
                    f"{sorted(lossy_mod.TEXT_SELECTORS)} (ignored)")
