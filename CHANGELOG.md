@@ -13,7 +13,8 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+- **The bundled demo server's tools advertise `annotations` and describe themselves more fully (#467).** `demo_orders` and `demo_logs` are synthetic, deterministic and do no I/O, so both now carry `{"readOnlyHint": true, "idempotentHint": true, "openWorldHint": false}`; their descriptions cross-reference each other and note what a larger `limit`/`lines` shows. Raises a registry inspector's (Glama's) score on the demo listing; the proxy's `tools/list` pass-through was verified unchanged for both the single proxy and multiproxy.
 
 ## [0.39.1] - 2026-09-26
 

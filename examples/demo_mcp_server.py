@@ -52,8 +52,16 @@ TOOLS = [
         "description": (
             "Return a synthetic order book as a JSON record array. Nothing is fetched "
             "and nothing is stored — the point is the shape, so you can see what terse "
-            "does to a record-shaped tool result."
+            "does to a record-shaped tool result. For the non-JSON counterpart, use "
+            "demo_logs. Output is deterministic: the same limit always returns the same "
+            "records, and a larger limit gives tabularize and the dictionary tier more "
+            "repetition to fold."
         ),
+        "annotations": {
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -72,8 +80,14 @@ TOOLS = [
         "name": "demo_logs",
         "description": (
             "Return a synthetic plain-text log tail. Non-JSON on purpose: it is what "
-            "terse's text tier sees, as opposed to the record array demo_orders returns."
+            "terse's text tier sees, as opposed to the record array demo_orders returns. "
+            "More lines gives the text tier more to work on."
         ),
+        "annotations": {
+            "readOnlyHint": True,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
         "inputSchema": {
             "type": "object",
             "properties": {
