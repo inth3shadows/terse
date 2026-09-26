@@ -16,8 +16,25 @@ import subprocess
 from pathlib import Path
 
 
+_EMPHASIS = re.compile(r"^(\*\*|__|\*|_)(.+?)\1$", re.DOTALL)
+
+
 def _norm(s: str) -> str:
-    return s.strip().strip("`\"' \t\n").lower()
+    """Strip surrounding whitespace, quotes and backticks, then one layer of WHOLE-answer
+    markdown emphasis (`**x**`, `__x__`, `*x*`, `_x_`), then repeat. Emphasis matters for
+    fairness: the operator's `minimal` output style (arms B/C only) bolds the first line of
+    every answer, so a correct `**2026-06-27**` failed in B/C where arm A's unstyled answer
+    passed (pilot 2026-09-26). Only a wrapper around the WHOLE answer is removed; "not
+    **kb-mcp**" still fails."""
+    prev = None
+    s = s.strip()
+    while s != prev:
+        prev = s
+        s = s.strip().strip("`\"' \t\n")
+        m = _EMPHASIS.match(s)
+        if m:
+            s = m.group(2)
+    return s.lower()
 
 
 def check_exact_match(answer: str, check: dict) -> tuple[bool, str]:

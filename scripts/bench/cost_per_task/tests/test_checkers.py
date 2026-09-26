@@ -157,3 +157,36 @@ def test_control_task_fixture_end_to_end(tmp_path):
     (tmp_path / "calc.py").write_text("def add(a, b):\n    return a + b\n")
     ok, detail = checkers.check_command("", check, tmp_path)
     assert ok, detail
+
+
+def test_whole_answer_markdown_emphasis_is_stripped_for_every_arm():
+    """The minimal output style (B/C) bolds the answer; A's unstyled answer does not.
+    Without this a correct B/C answer failed: a bias against the operator's setup."""
+    chk = {"expected": "2026-06-27"}
+    for got in ("**2026-06-27**", "__2026-06-27__", "*2026-06-27*", "`**2026-06-27**`",
+                " **2026-06-27** \n", "2026-06-27"):
+        assert checkers.check_exact_match(got, chk)[0], got
+
+
+def test_partial_emphasis_does_not_rescue_a_wrong_answer():
+    chk = {"expected": "kb-mcp"}
+    for got in ("not **kb-mcp**", "**kb-mcp** or caddy", "**not kb-mcp**"):
+        assert not checkers.check_exact_match(got, chk)[0], got
+
+
+def test_emphasis_plus_anything_else_still_fails():
+    chk = {"expected": "kb-mcp"}
+    for got in ("**kb-mcp**.", "**kb-mcp**\nverified", "*kb-mcp**"):
+        assert not checkers.check_exact_match(got, chk)[0], got
+
+
+def test_no_task_expects_a_value_that_emphasis_stripping_would_alter():
+    """`_norm` strips whole-value `_x_`/`*x*` from the EXPECTED value too, so a task whose
+    answer is `__init__` would accept `init`. Refuse such a task rather than score it wrongly."""
+    import json
+    from pathlib import Path
+    doc = json.loads((Path(checkers.__file__).parent / "tasks.json").read_text())
+    for task in doc["tasks"]:
+        exp = (task.get("check") or {}).get("expected")
+        if isinstance(exp, str):
+            assert checkers._norm(exp) == exp.strip().lower(), task["id"]
