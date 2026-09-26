@@ -1,0 +1,104 @@
+{
+  "_comment": "PILOT task suite for the cost-per-successful-task harness. See ~/.claude/plans/terse-cost-per-task-e2e.md. Each task has an AUTOMATIC success check and a `why` field recording how the expected answer was verified (and when). Mix: 2 kb read-only lookups (kb.read.* only, never kb.propose.*), 2 codegraph/runecho code questions about this repo, 1 non-MCP control (a file edit a test verifies). `tools` gives the exact --allowedTools list per arm (A/B/C) -- kb/codegraph/runecho tool names for arm C are DERIVED from src/terse/multiproxy.py's Router._expose_names rule (a bare name claimed by exactly one peer is exposed VERBATIM through the router; only a name two-or-more peers export gets qualified as '{peer}__{bare}') and cross-checked against this session's own live MCP tool list (which is itself routed through the 'terse' router), but per plan blocker #5 they are marked NEEDS-SMOKE-CONFIRM below and must be verified live in the 3-session smoke run before the full batch.",
+  "pinned_worktree_commit": "c9508a9c68f729322d1b9f45dd968754a1b4571f",
+  "pinned_worktree_commit_note": "origin/main HEAD as of 2026-09-25, before this harness existed (the harness's own files are untracked/uncommitted on this branch) -- 'repo' workdir tasks MUST create their git worktree from this fixed SHA, never from whatever HEAD happens to be at run time, so tasks.json (the answer key) can never end up inside a worktree a coding agent can Read even after this harness itself is eventually committed.",
+  "tasks": [
+    {
+      "id": "kb_lookup_hostname",
+      "category": "kb",
+      "workdir": "scratch",
+      "timeout": 300,
+      "prompt": "Use the kb read-only tools (kb.read.get, kb.read.search, or kb.read.list_nodes -- never any kb.propose.* tool) to find the homelab node whose IP address is exactly 192.168.9.60. Reply with ONLY that node's hostname and nothing else -- no punctuation, no explanation.",
+      "check": {
+        "type": "exact_match",
+        "expected": "kb-mcp"
+      },
+      "tools": {
+        "A": [],
+        "B": ["mcp__kb__kb_read_get", "mcp__kb__kb_read_search", "mcp__kb__kb_read_list_nodes"],
+        "C": ["mcp__terse__kb_read_get", "mcp__terse__kb_read_search", "mcp__terse__kb_read_list_nodes", "mcp__terse__terse_retrieve"]
+      },
+      "tools_note": "NEEDS-SMOKE-CONFIRM: arm C's names assume the router exposes kb's tools bare (no 'kb__' qualification) because no other configured peer (codegraph, runecho) also exports a tool literally named kb_read_get/kb_read_search/kb_read_list_nodes -- true today per multiproxy.py's Router._expose_names, and consistent with this very session's own mcp__terse__kb_read_* tool names, but must be confirmed live in the smoke run since a peers-file change could qualify them. terse_retrieve is added here too (plan F4) so C's kb tasks have the SAME logical tool surface as B's kb tools plus C's own re-hydration tool -- not a narrower 3-vs-8 mismatch against whatever the router actually exposes.",
+      "why": "kb.read.get(target_table='homelab_nodes', identifier='1') returned {\"hostname\": \"kb-mcp\", \"ip\": \"192.168.9.60\", ...}, verified live against the KB on 2026-09-25."
+    },
+    {
+      "id": "kb_lookup_decision_date",
+      "category": "kb",
+      "workdir": "scratch",
+      "timeout": 300,
+      "prompt": "Use the kb read-only tools (kb.read.get with target_table='decisions', identifier='107' -- never any kb.propose.* tool) to look up KB decision #107. Reply with ONLY its 'decided_on' date in YYYY-MM-DD format and nothing else.",
+      "check": {
+        "type": "exact_match",
+        "expected": "2026-06-27"
+      },
+      "tools": {
+        "A": [],
+        "B": ["mcp__kb__kb_read_get", "mcp__kb__kb_read_search", "mcp__kb__kb_read_list_nodes"],
+        "C": ["mcp__terse__kb_read_get", "mcp__terse__kb_read_search", "mcp__terse__kb_read_list_nodes", "mcp__terse__terse_retrieve"]
+      },
+      "tools_note": "NEEDS-SMOKE-CONFIRM: see kb_lookup_hostname's tools_note -- same derivation, same caveat (including the added terse_retrieve, plan F4).",
+      "why": "kb.read.get(target_table='decisions', identifier='107') returned {\"decided_on\": \"2026-06-27\", \"title\": \"terse: ship stateful/lossy compression levers opt-in + fluency-gated, not on-by-default\", ...}, verified live against the KB on 2026-09-25."
+    },
+    {
+      "id": "code_transforms_dropped_marker_name",
+      "category": "code",
+      "workdir": "repo",
+      "timeout": 300,
+      "prompt": "In this repository, src/terse/transforms.py defines a module-level constant that holds the literal string terse writes into a tool result to mark a field it dropped. Reply with ONLY that constant's NAME (as it appears in a `NAME = ...` assignment at module scope; NOT its string value) and nothing else.",
+      "check": {
+        "type": "exact_match",
+        "expected": "DROPPED_MARKER"
+      },
+      "tools": {
+        "A": ["Read(./**)", "Grep", "Glob"],
+        "B": ["Read(./**)", "Grep", "Glob", "mcp__codegraph__codegraph_explore", "mcp__runecho__locate", "mcp__runecho__structure"],
+        "C": ["Read(./**)", "Grep", "Glob", "mcp__terse__codegraph_explore", "mcp__terse__locate", "mcp__terse__structure", "mcp__terse__terse_retrieve"]
+      },
+      "tools_note": "NEEDS-SMOKE-CONFIRM: arm C's codegraph/runecho tool names, same derivation/caveat as the kb tasks. terse_retrieve is C-only (the router's own re-hydration tool; B has no equivalent since B never drops anything).",
+      "why": "src/terse/transforms.py:48 defines `DROPPED_MARKER = \"__terse_dropped__\"` (grepped directly from the file on 2026-09-26). Replaces a prior version of this task that asked for ab_session.py's cache-write multiplier (1.25) -- REJECTED after review because 1.25 is Anthropic's own PUBLISHED, publicly-documented cache-write pricing multiplier: a model could answer it correctly from training data alone, with zero repo access, which would let arm A (no tools, no repo) pass by general knowledge and silently understate the value of repo/codegraph access. DROPPED_MARKER is an arbitrary, repo-internal identifier with no public meaning outside this codebase, so a correct answer is only reachable by actually reading (or codegraph/grep-ing) this file."
+    },
+    {
+      "id": "code_install_mcp_resolve_target",
+      "category": "code",
+      "workdir": "repo",
+      "timeout": 300,
+      "prompt": "In this repository, src/terse/install_mcp.py defines a function that maps an MCP scope (user/project/local) plus its scope-specific override flag to a Target -- the physical config file to read/write plus the key path inside it that holds mcpServers. Reply with ONLY that function's name (as it appears in a `def` line) and nothing else.",
+      "check": {
+        "type": "exact_match",
+        "expected": "resolve_target"
+      },
+      "tools": {
+        "A": ["Read(./**)", "Grep", "Glob"],
+        "B": ["Read(./**)", "Grep", "Glob", "mcp__codegraph__codegraph_explore", "mcp__runecho__locate", "mcp__runecho__structure"],
+        "C": ["Read(./**)", "Grep", "Glob", "mcp__terse__codegraph_explore", "mcp__terse__locate", "mcp__terse__structure", "mcp__terse__terse_retrieve"]
+      },
+      "tools_note": "NEEDS-SMOKE-CONFIRM: see code_transforms_dropped_marker_name's tools_note -- same derivation, same caveat.",
+      "why": "src/terse/install_mcp.py defines `def resolve_target(scope, *, cfg=None, file=None, repo_path=None) -> Target:` (read directly from the file on 2026-09-25); its docstring is literally \"Map --scope (+ its scope-specific override) to a Target.\""
+    },
+    {
+      "id": "control_fix_add_bug",
+      "category": "control",
+      "workdir": "scratch",
+      "timeout": 300,
+      "fixture": {
+        "calc.py": "def add(a, b):\n    return a - b\n",
+        "test_calc.py": "from calc import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n"
+      },
+      "prompt": "There is a bug in calc.py in the current directory: the add function does not add its two arguments correctly. Fix calc.py so that running `pytest -q` in this directory passes. Do not modify test_calc.py.",
+      "check": {
+        "type": "command",
+        "command": "pytest -q",
+        "expect_exit": 0,
+        "timeout": 60,
+        "protect_file": "test_calc.py",
+        "protect_file_sha256": "390fd35dd01f299e7d29b184a434d956bf83b7b209bc2b03026567b9edce532e"
+      },
+      "tools": {
+        "A": ["Read(./**)", "Edit(./calc.py)", "Bash(pytest:*)"],
+        "B": ["Read(./**)", "Edit(./calc.py)", "Bash(pytest:*)"],
+        "C": ["Read(./**)", "Edit(./calc.py)", "Bash(pytest:*)"]
+      },
+      "why": "calc.py ships with `return a - b` (subtraction); test_calc.py asserts add(2, 3) == 5, which only a real fix to addition satisfies -- deterministic, no MCP tool involved (this is the non-MCP control, expected delta ~0). protect_file_sha256 is sha256('from calc import add\\n\\n\\ndef test_add():\\n    assert add(2, 3) == 5\\n'), computed 2026-09-26, so the checker refuses a run that 'fixes' the test instead of the bug even if the doctored test then happens to pass."
+    }
+  ]
+}
