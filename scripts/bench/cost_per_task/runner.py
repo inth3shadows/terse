@@ -688,19 +688,36 @@ def _refuse_out_inside_repo(out_path: Path, repo: Path) -> None:
         f"the repo (e.g. the scratchpad) so run results never land in a commit")
 
 
+def warmup_missed_mcp(row: dict, allowed_tools: list[str]) -> bool:
+    """True when a warm-up that was allowed MCP tools made zero MCP calls --
+    in the pilot that meant the MCP servers had not finished loading (the C
+    warm-up answered "I don't have access to kb.read.* tools"), so it cached a
+    prefix WITHOUT their tool definitions and the first measured run of that
+    combo still paid the full cold write. Arm C only, by luck of ordering.
+    Over-inclusive by design: a model that simply chose Grep also makes zero
+    MCP calls, and that costs one discarded rerun -- cheaper than a cold
+    measured rep. An infra-error row is never a miss (the retry would not fix
+    a rate limit or timeout)."""
+    return (any(t.startswith("mcp__") for t in allowed_tools)
+            and row.get("mcp_tool_calls") == 0
+            and not row.get("infra_error"))
+
+
 def plan_run_combos(tasks: list[dict], arm_list: list[str], reps: int, *,
                      seed: int | None = None
                      ) -> tuple[list[tuple[dict, str, int]], list[tuple[dict, str, int]]]:
     """(warmup_combos, real_combos) -- plan blocker #9 / Partial #9: ONE
-    discarded warm-up run per arm (per model -- `main` runs one model per
-    invocation) ALWAYS happens, not opt-in behind a flag a batch could be
-    run without by omission. A warm-up combo uses rep=0 and only the FIRST
-    task, once per arm, and is never merged into the shuffled real combos:
-    its only purpose is to run and be thrown away (to a separate output
-    file the caller never hands to analysis.py) before the measured reps
-    begin, e.g. to absorb a cold-start cache-write cost that would otherwise
-    land on task 1's rep 1."""
-    warmup_combos = [(tasks[0], arm, 0) for arm in arm_list] if tasks else []
+    discarded warm-up run per (task, arm) (per model -- `main` runs one model
+    per invocation) ALWAYS happens, not opt-in behind a flag a batch could be
+    run without by omission. Warm-up combos use rep=0 and are never merged
+    into the shuffled real combos: their only purpose is to run and be thrown
+    away (to a separate output file the caller never hands to analysis.py)
+    before the measured reps begin, to absorb the cold-start cache write.
+    Per (task, arm), not per arm: each combo has its own cached prompt prefix
+    (the per-task tool allowlist differs), so a warm-up on tasks[0] alone left
+    6 of 45 pilot runs cold -- whichever arm hit a combo first paid the full
+    first-turn write."""
+    warmup_combos = [(t, arm, 0) for t in tasks for arm in arm_list]
     real_combos = [(t, arm, rep) for t in tasks for arm in arm_list for rep in range(1, reps + 1)]
     random.Random(seed).shuffle(real_combos)
     return warmup_combos, real_combos
@@ -824,12 +841,22 @@ def main(argv: list[str] | None = None) -> int:
                 workdir = make_workdir(task, args.config_dir, repo, pinned_commit=pinned_commit)
                 owns_workdir = True
             try:
-                row = run_one(task=task, arm=arm, rep=rep, model=args.model,
-                               arm_config_path=arm_paths[arm], workdir=workdir,
-                               setting_sources=setting_sources[arm], out_fh=out_fh,
-                               allowed_tools=resolve_allowed_tools(task, arm),
-                               effort=args.effort, settings_path=settings_paths[arm],
-                               safe_mode=safe_mode[arm], builtin_tools=resolve_builtin_tools(task))
+                allowed = resolve_allowed_tools(task, arm)
+                # A warm-up whose MCP tools never loaded warmed the wrong prefix:
+                # retry it once (warm-up rows are discarded, so a retry costs
+                # only tokens, never a measured rep).
+                for _attempt in range(2 if is_warmup else 1):
+                    row = run_one(task=task, arm=arm, rep=rep, model=args.model,
+                                   arm_config_path=arm_paths[arm], workdir=workdir,
+                                   setting_sources=setting_sources[arm], out_fh=out_fh,
+                                   allowed_tools=allowed,
+                                   effort=args.effort, settings_path=settings_paths[arm],
+                                   safe_mode=safe_mode[arm], builtin_tools=resolve_builtin_tools(task))
+                    if not (is_warmup and warmup_missed_mcp(row, allowed)):
+                        break
+                    print(f"[{arm}] WARMUP {task['id']}: 0 MCP calls (tools may not have loaded)"
+                          f"{' -- retrying once' if _attempt == 0 else ' -- still 0 after retry'}",
+                          file=sys.stderr)
                 if row.get("infra_error"):
                     status = f"INFRA ({row['infra_error']}: {row.get('error')})"
                     failures.append((task["id"], arm, rep))

@@ -459,15 +459,31 @@ def test_refuse_out_inside_repo_allows_outside_path(tmp_path):
     r._refuse_out_inside_repo(outside, repo)  # must not raise
 
 
-def test_plan_run_combos_always_produces_warmup_now():
-    # Plan Partial #9: warm-up is no longer opt-in behind a flag -- it
-    # ALWAYS happens, one rep zero per arm, on the first task.
+def test_plan_run_combos_warms_up_every_task_arm_combo():
+    # Each (task, arm) has its own cached prompt prefix (the per-task tool
+    # allowlist differs), so a warm-up on tasks[0] alone left later combos
+    # cold: 6 of 45 pilot runs paid a full first-turn cache write. One
+    # rep-0 warm-up per (task, arm), never mixed into the measured reps.
     tasks = [{"id": "t1"}, {"id": "t2"}]
     warmup, real = r.plan_run_combos(tasks, ["A", "B"], reps=2, seed=1)
-    assert len(warmup) == 2  # one per arm
+    assert sorted((t["id"], arm) for t, arm, _ in warmup) == [
+        ("t1", "A"), ("t1", "B"), ("t2", "A"), ("t2", "B")]
     assert all(rep == 0 for _, _, rep in warmup)
-    assert all(t["id"] == "t1" for t, _, _ in warmup)  # first task only
     assert all(rep != 0 for _, _, rep in real)
+    assert len(real) == 8
+
+
+def test_warmup_missed_mcp_only_when_mcp_allowed_and_unused():
+    mcp = ["mcp__terse__kb_read_get", "Read"]
+    assert r.warmup_missed_mcp({"mcp_tool_calls": 0}, mcp)
+    assert not r.warmup_missed_mcp({"mcp_tool_calls": 1}, mcp)
+    # arm A / builtin-only tasks never call MCP -- zero calls is expected there
+    assert not r.warmup_missed_mcp({"mcp_tool_calls": 0}, ["Read"])
+    assert not r.warmup_missed_mcp({"mcp_tool_calls": 0}, [])
+    # no transcript -> unknown, not a miss (infra errors are reported separately)
+    assert not r.warmup_missed_mcp({"mcp_tool_calls": None}, mcp)
+    # a rate limit / timeout that left a transcript is an infra error, not a miss
+    assert not r.warmup_missed_mcp({"mcp_tool_calls": 0, "infra_error": "timeout"}, mcp)
 
 
 def test_plan_run_combos_no_tasks_has_no_warmup():

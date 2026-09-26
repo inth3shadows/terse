@@ -321,6 +321,27 @@ def test_first_turn_cache_stats_means_over_rows_with_data():
     assert stats["mean_first_turn_cache_write"] == 30
 
 
+def test_first_turn_cache_stats_counts_cold_runs():
+    # A measured run whose first turn read NOTHING from cache paid a full
+    # cold write (warm-up missed or expired) -- surfaced, not averaged away.
+    rows = [
+        {**_row("t1", "C", 1, True, 100), "first_turn_cache_read_tokens": 0,
+         "first_turn_cache_write_tokens": 14000},
+        {**_row("t1", "C", 2, True, 100), "first_turn_cache_read_tokens": 9000,
+         "first_turn_cache_write_tokens": 4000},
+    ]
+    assert an.first_turn_cache_stats(rows, "C")["cold"] == 1
+
+
+def test_format_report_shows_cold_count():
+    rows = [
+        {**_row("t1", "B", 1, True, 100), "first_turn_cache_read_tokens": 0,
+         "first_turn_cache_write_tokens": 20},
+    ]
+    text = an.format_report(an.analyze(rows))
+    assert "cold=1" in text
+
+
 def test_first_turn_cache_stats_none_when_no_data_for_arm():
     stats = an.first_turn_cache_stats([_row("t1", "A", 1, True, 100)], "C")
     assert stats["n"] == 0

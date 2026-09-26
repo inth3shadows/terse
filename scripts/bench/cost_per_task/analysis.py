@@ -104,13 +104,17 @@ def first_turn_cache_stats(rows: list[dict], arm: str) -> dict:
     the harness now always runs one discarded warm-up rep per arm before the
     measured reps specifically to absorb a cold-start cache-write spike --
     reporting the measured reps' own first-turn numbers lets a reader check
-    whether that warm-up actually worked, instead of just trusting it did."""
+    whether that warm-up actually worked, instead of just trusting it did.
+    `cold` counts measured runs whose first turn read nothing from cache (a
+    missed or expired warm-up): each one carries a full prefix write that is
+    not the arm's doing."""
     reads = [r["first_turn_cache_read_tokens"] for r in rows
              if r.get("arm") == arm and r.get("first_turn_cache_read_tokens") is not None]
     writes = [r["first_turn_cache_write_tokens"] for r in rows
               if r.get("arm") == arm and r.get("first_turn_cache_write_tokens") is not None]
     return {
         "n": len(reads),
+        "cold": sum(1 for x in reads if x == 0),
         "mean_first_turn_cache_read": statistics.mean(reads) if reads else None,
         "mean_first_turn_cache_write": statistics.mean(writes) if writes else None,
     }
@@ -368,7 +372,8 @@ def format_report(report: dict, infra: list[dict] | None = None) -> str:
                 if not ft or ft["n"] == 0:
                     continue
                 lines.append(f"  {arm}: read={ft['mean_first_turn_cache_read']:.0f} "
-                              f"write={ft['mean_first_turn_cache_write']:.0f} (n={ft['n']})")
+                              f"write={ft['mean_first_turn_cache_write']:.0f} (n={ft['n']}, "
+                              f"cold={ft['cold']})")
     return "\n".join(lines)
 
 
