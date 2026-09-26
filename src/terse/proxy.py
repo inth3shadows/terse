@@ -196,7 +196,7 @@ PRIMER_DROPPED = (
 # compress `structuredContent` at all; nothing else ever emits the wrapper.
 PRIMER_STRUCTURED = (
     '- Typed wrapper {"__terse_primer__":TEXT,"__terse_payload__":P}: TEXT is this '
-    "explanation; the tool's actual result is P.\n"
+    "explanation; the tool's actual result is P, itself read by the rules above.\n"
 )
 PRIMER_TAIL = "Always reason about the fully reconstructed result."
 
@@ -778,11 +778,15 @@ class Interceptor:
             # #463: the hold alone never releases for a session whose every tool returns
             # `structuredContent` (every kb.* tool), so such a session never compressed.
             # When this result's typed field WOULD be compressed for the connected client,
-            # claim the primer instead and carry it INSIDE the typed field (see the attach
-            # below). Claimed BEFORE compressing: a lost race keeps today's hold, so no
-            # result is ever compressed without the primer having gone out first or with it.
-            wrap_primer = hold_all and self._can_wrap_primer(tool) and self._claim_primer()
-            if wrap_primer:
+            # compress it TENTATIVELY with the hold lifted; the primer is claimed only once a
+            # wire form actually came out (see `wrap_tentative` below). No wire form, or a
+            # race lost to another peer, reverts to today's hold: the original line goes out
+            # untouched, so no result is ever compressed without the primer, and an
+            # incompressible result never spends it.
+            wrap_tentative = hold_all and self._can_wrap_primer(tool, result,
+                                                                error_result=error_result)
+            wrap_primer = False
+            if wrap_tentative:
                 hold_all = False
                 self._structured_hold = False   # resolve `structured` normally from here
             mirror = (None if hold_all else
@@ -901,6 +905,47 @@ class Interceptor:
                 emitted_pairs = ([(r, b["text"]) for r, b in zip(raw_texts, text_blocks, strict=True)]
                                  if raw_texts is not None else [])
 
+            # `structuredContent` rides alongside the text blocks and is what some clients
+            # actually give the model (#128). Compress it when the rule opts in; either
+            # way its EMITTED size is what the ledger must count, so the reported saving
+            # tracks the whole result rather than the text block alone. Before the sinks
+            # below, so a tentative #463 wrap can still revert to the hold they record.
+            # The audit record's `changed` is the TEXT decision, as it was before this call
+            # moved up.
+            text_changed = changed
+            structured_raw, structured_out, rewrote_structured = self._compress_structured(
+                result, tool, force_lossless=error_result)
+            changed = changed or rewrote_structured
+
+            if wrap_tentative:
+                # #463: claim the primer only if terse actually put a wire form on this
+                # result -- otherwise it would be spent explaining nothing.
+                wire_form = rewrote_structured or any(
+                    isinstance(b, dict) and b.get("type") == "text"
+                    and isinstance(b.get("text"), str) and '"__terse_' in b["text"]
+                    for b in content)
+                wrap_primer = wire_form and self._claim_primer()
+                if not wrap_primer:
+                    # Revert to exactly today's hold. `changed = False` sends the ORIGINAL
+                    # line (the in-place edits to `msg` are discarded with it); the ledger
+                    # row is passthrough/`primer_hold`, and every diff base the tentative
+                    # pass may have set is dropped, since the client received raw text.
+                    hold_all = True
+                    changed = text_changed = False
+                    diff_reason = "primer_hold"
+                    joined_block = None
+                    partial_done = False
+                    if self.diff:
+                        self.last.pop(tool, None)
+                        self.last_args.pop(tool, None)
+                        self.last_joined.pop(tool, None)
+                        self.since_keyframe.pop(tool, None)
+                        self.last_text.pop(tool, None)
+                        self.since_text_keyframe.pop(tool, None)
+                    emitted_pairs = ([(r, r) for r in raw_texts]
+                                     if raw_texts is not None else [])
+                    structured_out = structured_raw
+
             # Tee the RAW payload (#32), AFTER the path is known so a joined result is
             # captured ONCE as the array terse actually compresses — not N per-block
             # envelopes that would make the corpus misrepresent multi-block tools (the
@@ -939,16 +984,9 @@ class Interceptor:
             if self.audit is not None and persist:
                 deferred.append((
                     "audit", capture_tool,
-                    partial(self._emit_audit, tool, msg["id"], emitted_pairs, changed,
+                    partial(self._emit_audit, tool, msg["id"], emitted_pairs, text_changed,
                             display_tool=capture_tool),
                 ))
-            # `structuredContent` rides alongside the text blocks and is what some clients
-            # actually give the model (#128). Compress it when the rule opts in; either
-            # way its EMITTED size is what the ledger must count, so the reported saving
-            # tracks the whole result rather than the text block alone.
-            structured_raw, structured_out, rewrote_structured = self._compress_structured(
-                result, tool, force_lossless=error_result)
-            changed = changed or rewrote_structured
 
             # The mirror drop happens LAST, after the typed field is final and after both
             # sinks have seen the raw block: capture feeds the corpus and audit is the
@@ -1853,7 +1891,7 @@ class Interceptor:
             return self._shared_primer.pending()
         return not self._primer_sent
 
-    def _can_wrap_primer(self, tool: str) -> bool:
+    def _can_wrap_primer(self, tool: str, result: Any, *, error_result: bool) -> bool:
         """May a held structured result carry the router's primer in its typed field (#463)?
 
         Only when that field would be COMPRESSED for the connected client: the rule has
@@ -1861,8 +1899,16 @@ class Interceptor:
         `STRUCTURED_SAFE_CLIENTS`, measured not to validate the field against its schema).
         "leave" -- every unknown client -- keeps the hold, and so does "replace", whose
         mirror-dropping semantics stay exactly as they were. Resolved directly rather than
-        through `_structured_mode`, which reads "leave" while the hold is up."""
-        if self._shared_primer is None:
+        through `_structured_mode`, which reads "leave" while the hold is up.
+
+        Also held, unchanged: an `isError` result (a model recovering from a failure reads
+        the error as sent, and the error path's behaviour stays exactly as it was), and a
+        typed field that is not an object (null, a list), where a wrapper would change the
+        field's JSON type rather than merely extend it."""
+        if self._shared_primer is None or error_result:
+            return False
+        if not isinstance(result, dict) or not isinstance(result.get("structuredContent"),
+                                                          dict):
             return False
         rule = self.policy.select(tool, self.server_name)
         return bool(rule.tiers) and policy_mod.structured_mode_for_client(

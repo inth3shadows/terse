@@ -18,6 +18,7 @@ import pytest
 from terse.multiproxy import run_multi_proxy
 from terse.policy import Policy, Rule
 from terse.proxy import PRIMER_HEAD, Interceptor, PrimerLatch, union_primer
+from terse.transforms import decompress
 
 FAKE = pathlib.Path(__file__).parent / "fake_mcp_server.py"
 TIERS = ("minify", "tabularize", "dictionary")
@@ -842,6 +843,7 @@ def test_a_structured_only_session_compresses_with_the_primer_in_the_typed_field
     assert wrapper["__terse_primer__"] == latch.text
     assert "__terse_" in json.dumps(wrapper["__terse_payload__"])      # compressed
     assert wrapper["__terse_payload__"] != _typed()
+    assert decompress(json.dumps(wrapper["__terse_payload__"])) == _typed()   # lossless
     assert _primer_blocks(first) == 1                                  # text block 0 too
     assert first["content"][0]["text"] == latch.text
     assert "__terse_" in first["content"][1]["text"]                   # text compressed
@@ -918,6 +920,7 @@ def test_a_wrapped_result_books_one_primer_row_and_the_wrapper_on_the_emitted_si
     assert not row["passthrough"] and row["reason"] != "primer_hold"
     payload = json.dumps(out["structuredContent"]["__terse_payload__"],
                          separators=(",", ":"), ensure_ascii=False)
+    assert decompress(payload) == _typed()                             # lossless
     # Wrapper structure counted; the primer text is not billed a second time (its row is).
     assert row["structured_out"] == ('{"__terse_primer__":"","__terse_payload__":'
                                      + payload + "}")
@@ -932,3 +935,90 @@ def test_the_diff_base_after_a_wrapped_result_is_the_raw_value():
     out = json.loads(a.transform_response(_typed_result(1)))["result"]
     assert "__terse_primer__" in out["structuredContent"]
     assert a.last["gh.api.items"] == _typed()
+
+
+# --- #463 review fixes --------------------------------------------------------------
+
+_DIFF_MAPS = ("last", "last_args", "last_joined", "since_keyframe", "last_text",
+              "since_text_keyframe")
+
+
+def test_an_incompressible_structured_result_does_not_spend_the_primer():
+    """M1: the primer is claimed only once a wire form exists. `{"ok":1}` carries none, so
+    the line goes out byte-identical, held, and the next compressible result is wrapped."""
+    rows: list = []
+    latch, (a,) = _wrap_peers(stats_rows=rows)
+    a.diff = True
+    tool = "gh.api.items"
+    for m, seed in zip(_DIFF_MAPS, ({"old": 1}, "k", False, 0, "old", 0), strict=True):
+        getattr(a, m)[tool] = seed
+    raw = _result(1, text=json.dumps({"ok": 1}), structured={"ok": 1})
+    _call(a, 1)
+    assert a.transform_response(raw) == raw
+    assert latch.pending()
+    assert rows and all(r["passthrough"] and r["reason"] == "primer_hold"
+                        and r["raw"] == r["emitted"]
+                        and r["structured"] == r["structured_out"] for r in rows)
+    for m in _DIFF_MAPS:
+        assert tool not in getattr(a, m), m
+    _call(a, 2)
+    out = json.loads(a.transform_response(_typed_result(2)))["result"]
+    assert "__terse_primer__" in out["structuredContent"]
+
+
+def test_an_error_result_with_structured_content_is_held_not_wrapped():
+    """L1: the error path is unchanged -- held whole, primer still owed."""
+    latch, (a,) = _wrap_peers()
+    typed = _typed()
+    raw = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
+        "content": [{"type": "text", "text": json.dumps(typed)}],
+        "structuredContent": typed, "isError": True}})
+    _call(a, 1)
+    assert a.transform_response(raw) == raw
+    assert latch.pending()
+
+
+def test_a_non_object_typed_field_is_held_not_wrapped():
+    """L2: wrapping null or a list would change the field's JSON type."""
+    rows = [{"id": i, "status": "active"} for i in range(12)]
+    for typed in (None, rows):
+        latch, (a,) = _wrap_peers()
+        raw = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
+            "content": [{"type": "text", "text": json.dumps(rows)}],
+            "structuredContent": typed}})
+        _call(a, 1)
+        assert a.transform_response(raw) == raw, typed
+        assert latch.pending(), typed
+
+
+def test_a_reinitialize_rearms_the_wrap():
+    latch, (a, b) = _wrap_peers(n=2)
+    _call(a, 1)
+    assert "__terse_primer__" in json.loads(
+        a.transform_response(_typed_result(1)))["result"]["structuredContent"]
+    for p in (a, b):
+        p.note_request(json.dumps({"jsonrpc": "2.0", "id": 9, "method": "initialize",
+                                   "params": {"clientInfo": {"name": "claude-code"}}}))
+    assert latch.pending()
+    _call(b, 2)
+    again = json.loads(b.transform_response(_typed_result(2)))["result"]
+    assert again["structuredContent"]["__terse_primer__"] == latch.text
+
+
+def test_the_wrapper_sentence_says_the_payload_is_itself_encoded():
+    """L4: P is not literal JSON; it is read by the same rules as any other result."""
+    assert "itself read by the rules above" in union_primer([(POL, "p0")],
+                                                            structured_wrap=True)
+
+
+def test_a_lazy_routers_estimate_is_the_primer_it_actually_sends(tmp_path):
+    """L3: the lazy router's primer carries the wrapper sentence, so its estimate must."""
+    from terse.policy import load_policy
+    from terse.stats import primer_liability
+    from terse.tokenize import count_cl100k
+    pf = _pfile(tmp_path)
+    row = _router_row(tmp_path, pf)
+    liab = primer_liability([row], _agg(tools=[("gh", 6, True)], sessions=(pf, 1, 100)))
+    pol = load_policy(row["policy"])
+    sent = count_cl100k(union_primer([(pol, p) for p in ("gh", "kb")], structured_wrap=True))
+    assert sent and liab["servers"][0]["primer_tokens"] == sent
