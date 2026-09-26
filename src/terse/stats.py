@@ -1213,13 +1213,14 @@ def _contested_labels(scan_rows: list[dict[str, Any]],
     regression against the commit it was remediating). An ambiguous entry still WRITES under
     that label — it merely may not bank it — and writing is the whole question here.
 
-    One side must be a ROUTER. Two plain wrapped entries resolving to one non-launcher
-    label are one logical server installed twice, which #285 ruled an honest label and
-    `test_ambiguity_needs_a_LAUNCHER_not_merely_a_shared_label` pins; widening to any shared
-    label would delete that measurement. A router's peer NAME is different in kind — the
-    router chose it, so a second entry answering to it duplicates that peer. The same holds
-    for two entries that each bake the same explicit `--server-name` (#426): a declared name,
-    not a guess, so they contest it without any router.
+    **The rule:** a label is contested when more than one entry writes it AND at least one
+    writer CHOSE it — a router (its peer names) or an entry baking an explicit
+    `--server-name` (#426). Only when every writer merely GUESSED it (the downstream
+    command's basename) is a shared label left alone: two such entries resolving to one
+    non-launcher label must run the same binary, one logical server installed twice, which
+    #285 ruled an honest label and `test_ambiguity_needs_a_LAUNCHER_not_merely_a_shared_label`
+    pins. Once any side declares the name the collision is a choice, not a coincidence of
+    binaries, and the two processes' rows are indistinguishable — a router is not required.
 
     Gated on `_writes_ledger_rows`: an entry baked `--no-stats`, or pointed at another
     ledger, writes none of the rows under that label and cannot be one of the writers
@@ -1243,18 +1244,10 @@ def _contested_labels(scan_rows: list[dict[str, Any]],
     # write a primer record under it, which is what makes the single-standalone case
     # attributable.
     non_router_writers: dict[str, set[str]] = {}
-    # A contest needs a ROUTER on one side, and that is a deliberate limit rather than an
-    # oversight. Two plain wrapped entries that resolve to one non-launcher label are ONE
-    # logical server installed twice — #285 decided that is an honest label, and
-    # `test_ambiguity_needs_a_LAUNCHER_not_merely_a_shared_label` pins it. A router's peer
-    # name is different in kind: the router chose it, so a second entry answering to it is a
-    # duplicate of that peer, which is the population #396 is about.
-    router_labels: set[str] = set()
-    # ...except where two entries each DECLARE the label (#426). An explicit `--server-name`
-    # is chosen, not guessed, exactly like a router's peer name; two distinct entries baking
-    # the same one are two processes writing one label, and `_precedence_winner` has
-    # already collapsed the one-server-in-two-scopes case by name. Guesses keep #285's rule.
-    explicit_writers: dict[str, set[str]] = {}
+    # Labels some writer CHOSE — a router's peer names, or an explicit `--server-name`
+    # (#426). Only these can be contested; an all-guessed shared label is #285's honest
+    # one-server-installed-twice case (see the docstring for the full rule).
+    chosen_labels: set[str] = set()
     for i, row in enumerate(scan_rows):
         name = row.get("server")
         if not name or winners.get(str(name)) != i:
@@ -1274,20 +1267,18 @@ def _contested_labels(scan_rows: list[dict[str, Any]],
                                                    else "")
             written = [str(ident)] if ident else []
             if ident and row.get("ledger_identity_explicit"):
-                explicit_writers.setdefault(str(ident), set()).add(str(name))
+                chosen_labels.add(str(ident))
         else:
             continue
         if state in ("router", "router-ambiguous"):
-            router_labels.update(written)
+            chosen_labels.update(written)
         for lbl in written:
             writers.setdefault(lbl, set()).add(str(name))
             if state not in ("router", "router-ambiguous"):
                 non_router_writers.setdefault(lbl, set()).add(str(name))
     return {lbl: _Contest(frozenset(writers[lbl]),
                           frozenset(non_router_writers.get(lbl, ())))
-            for lbl in router_labels | {lbl for lbl, w in explicit_writers.items()
-                                        if len(w) > 1}
-            if len(writers.get(lbl, ())) > 1}
+            for lbl in chosen_labels if len(writers.get(lbl, ())) > 1}
 
 
 def _superseded_labels(row: dict[str, Any], labels: list[str],

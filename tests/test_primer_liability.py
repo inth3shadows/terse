@@ -881,16 +881,21 @@ def test_two_entries_baking_the_same_explicit_server_name_are_contested(tmp_path
     assert "`kb`: remove one of them, or give one of kb-proj, kb-user a DISTINCT" in text
 
 
-def test_one_explicit_name_beside_a_guess_of_the_same_label_is_not_contested(tmp_path):
-    """The boundary of #426: only DECLARED names contest. A guessed basename that happens
-    to equal another entry's explicit `--server-name` keeps today's behaviour."""
+def test_one_explicit_name_beside_a_guess_of_the_same_label_is_contested(tmp_path):
+    """#426 review. One entry DECLARES `kb`, another merely guesses `kb` from its binary.
+    #285's shared-label exemption rests on two GUESSES only matching when both run the same
+    binary; once either side declares the name, the collision is a choice, and counting the
+    label into both rows banks one saving twice. Contested, like the all-explicit case."""
     pol = _policy(tmp_path)
     rows = [_scan("kb-a", "wrapped", "kb-server --stdio", pol,
                   identity="kb", explicit=True),
             _scan("kb-b", "wrapped", "/opt/bin/kb --stdio", pol,
                   identity="kb", explicit=False)]
     liab = primer_liability(rows, _agg(("kb", 10, 10_000, 4_000)))
-    assert all(s["contested_labels"] == [] for s in liab["servers"])
+    for s in liab["servers"]:
+        assert s["contested_labels"] == ["kb"]
+        assert s["blocks"] is None
+        assert s["verdict"] != "KEEP"
 
 
 def test_one_server_in_two_scopes_is_not_a_collision_with_itself(tmp_path):
