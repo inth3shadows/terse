@@ -263,13 +263,19 @@ def _handle(tool: str, path: str, serialized: str) -> str:
     return digest[:HANDLE_LEN]
 
 
+# `handle -> (tool, rule path, block index)` provenance for a committed drop (#251, #252).
+# `index` is a text drop's block position (see `apply_text_drops`); None for a JSON field.
+Origin = tuple[str, str, int | None]
+
+
 def _drop(value: Any, tool: str, path: str, min_len: int,
           sink: Callable[[str, Any], None],
-          origin: dict[str, tuple[str, str]] | None = None) -> Any:
+          origin: dict[str, Origin] | None = None) -> Any:
     """Persist `value` via `sink` and return the inline handle marker — unless its
     serialized form is under `min_len`, in which case it stays put (not worth a round-trip).
 
-    `origin`, when given, records `handle -> (tool, path)`. The handle is a one-way digest
+    `origin`, when given, records `handle -> (tool, path, index)` (see `Origin`; a JSON
+    field has no block position, so `index` is None here). The handle is a one-way digest
     OF that pair, so provenance cannot be recovered from it later — capturing it here is the
     only chance. It exists so a retrieve can be billed back to the rule that caused the drop
     (#251): without it the ledger can only say a retrieve happened, not which rule to retune.
@@ -281,7 +287,7 @@ def _drop(value: Any, tool: str, path: str, min_len: int,
     handle = _handle(tool, path, serialized)
     sink(handle, value)
     if origin is not None:
-        origin[handle] = (tool, path)
+        origin[handle] = (tool, path, None)
     return drop_marker(handle, len(serialized))
 
 
@@ -310,12 +316,12 @@ def _drop_specs(rule: Any) -> list[tuple[str, dict]]:
 
 
 def apply_drops(obj: Any, rule: Any, tool: str, sink: Callable[[str, Any], None],
-                origin: dict[str, tuple[str, str]] | None = None) -> Any:
+                origin: dict[str, Origin] | None = None) -> Any:
     """Replace every drop-marked, non-critical field of `obj` with a handle marker,
     persisting each original via `sink(handle, value)`. Returns a new structure; critical
     fields are never touched. Raises PathError if a path doesn't resolve (caller falls back).
 
-    `origin` is the optional `handle -> (tool, path)` provenance map described on `_drop`."""
+    `origin` is the optional provenance map described on `_drop`."""
     out = obj
     for path, spec in _drop_specs(rule):
         min_len = int(spec.get("min", DEFAULT_DROP_MIN))
@@ -439,12 +445,17 @@ def retract_after(spec: Any) -> int | None:
 
 def apply_text_drops(text: str, rule: Any, tool: str,
                      sink: Callable[[str, Any], None],
-                     origin: dict[str, tuple[str, str]] | None = None) -> str:
+                     origin: dict[str, Origin] | None = None) -> str:
     """Replace every drop-marked text span of `text` with a one-line handle marker,
     persisting each original span verbatim via `sink(handle, span)`. Returns the new text
     (unchanged when nothing qualifies). Spans under the size floor are left in place.
 
-    `origin` is the optional `handle -> (tool, path)` provenance map described on `_drop`.
+    `origin` is the optional provenance map described on `_drop`, here with the block's
+    `index` (#252): its position among the result's QUALIFYING blocks (at or above `min`),
+    counting the ones `keep_first` kept inline -- the numbering `keep_first` itself counts
+    in, so a retrieve of index i says "keep_first i+1 would have kept it". Handles are
+    content-addressed, so an identical span at two positions is ONE handle; it records the
+    FIRST position, deterministically.
     This is the path the fleet's only lossy-by-default rule takes (`$text.code_blocks`), so
     it is the one that actually needs the attribution."""
     out = text
@@ -454,6 +465,7 @@ def apply_text_drops(text: str, rule: Any, tool: str,
         # floor stays inline regardless, so letting it count would drop the block the
         # operator meant to keep.
         to_keep = keep_first(spec) or 0
+        index = -1
         # One forward pass building segments, joined once at the end: splicing per span
         # recopied the whole payload each time (O(payload x spans)) on the proxy hot path.
         parts: list[str] = []
@@ -462,13 +474,14 @@ def apply_text_drops(text: str, rule: Any, tool: str,
             span = out[start:end]
             if len(span) < min_len:
                 continue
+            index += 1
             if to_keep:
                 to_keep -= 1
                 continue
             handle = _handle(tool, path, span)
             sink(handle, span)
             if origin is not None:
-                origin[handle] = (tool, path)
+                origin.setdefault(handle, (tool, path, index))
             marker = json.dumps(drop_marker(handle, len(span)),
                                 separators=(",", ":"), ensure_ascii=False)
             # Keep the span's own trailing newline so the surrounding prose's line

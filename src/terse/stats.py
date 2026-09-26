@@ -374,7 +374,8 @@ def build_primer_record(server: str, *, cadence: str, primer: str,
 
 
 def build_retrieve_record(server: str, tool: str, path: str, *,
-                          hit: bool, payload: str = "") -> dict[str, Any]:
+                          hit: bool, payload: str = "",
+                          index: int | None = None) -> dict[str, Any]:
     """One ledger line for a `terse.retrieve` round-trip — a drop rule's COST (#251).
 
     Until this existed the ledger measured only the saving side of `drop-to-retrieve`: the
@@ -401,8 +402,13 @@ def build_retrieve_record(server: str, tool: str, path: str, *,
     both (`"not a ledger record"`), so a retrieve can never be counted as a compressed
     block or fold its bytes into the published savings percentage. That skip is load-
     bearing, not incidental — see `test_a_retrieve_record_never_enters_the_savings_total`.
+
+    `index` (#252) is the retrieved block's position among its text result's qualifying
+    blocks, so `terse tune` can later suggest `keep_first`/`retract_after` from live data.
+    Written only when known: a JSON-field drop has no position, and rows written before
+    this field simply lack it, so every reader must treat the key as optional.
     """
-    return {
+    rec: dict[str, Any] = {
         "ts": int(time.time()),
         "version": _ledger_version(),
         "server": server,
@@ -418,6 +424,9 @@ def build_retrieve_record(server: str, tool: str, path: str, *,
         # None (not 0) without tiktoken, matching `build_record`: unknown is not zero.
         "tokens": count_cl100k(payload),
     }
+    if index is not None:
+        rec["index"] = index
+    return rec
 
 
 def _sum_tokens(a: int | None, b: int | None) -> int | None:
@@ -3104,9 +3113,10 @@ def build_retrieve_writer(stats_log: str | Path, server: str):
     because under multiproxy the router answers every retrieve through `peers[0]`
     (`_route_call`) — so this closure's own label names the answering peer, which is
     almost never the peer whose rule dropped the value."""
-    def retrieve(origin_server: str, tool: str, path: str, hit: bool, payload: str) -> None:
+    def retrieve(origin_server: str, tool: str, path: str, hit: bool, payload: str,
+                 index: int | None = None) -> None:
         append_stats(build_retrieve_record(origin_server or server, tool, path,
-                                           hit=hit, payload=payload),
+                                           hit=hit, payload=payload, index=index),
                      stats_log)
 
     return retrieve

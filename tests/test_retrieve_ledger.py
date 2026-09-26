@@ -31,7 +31,7 @@ def _recorder():
     """Capture what the retrieve writer would have appended, without touching disk."""
     rows: list[tuple] = []
 
-    def rec(server, tool, path, hit, payload):
+    def rec(server, tool, path, hit, payload, index=None):
         rows.append((server, tool, path, hit, payload))
 
     return rows, rec
@@ -231,7 +231,7 @@ def test_a_failed_recoverability_gate_leaves_no_attribution_behind(monkeypatch):
     monkeypatch.undo()
     ok = policy_mod.apply(payload, "gh.api.list", pol,
                           drop_sink=committed.__setitem__, server="gh")
-    assert list(ok.drop_origins.values()) == [("gh.api.list", "result[].body")]
+    assert list(ok.drop_origins.values()) == [("gh.api.list", "result[].body", None)]
     assert len(committed) == 1
 
 
@@ -252,7 +252,7 @@ def test_attribution_is_evicted_in_lockstep_with_the_value():
     """The store is explicitly capped; the origins map mirrors it and must be capped by
     the same eviction, or it grows without bound beside a bounded dict."""
     inter = Interceptor(DROP)
-    inter._drop_origin["h0"] = ("gh.api.list", "result[].body")
+    inter._drop_origin["h0"] = ("gh", "gh.api.list", "result[].body", None)
     inter._drop_put("h0", "v0")
     assert "h0" in inter._drop_origin
     original_max = Interceptor.DROPPED_MAX

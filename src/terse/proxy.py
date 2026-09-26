@@ -346,9 +346,9 @@ class Interceptor:
                  store: OrderedDict[str, Any] | None = None,
                  store_lock: Lock | None = None,
                  dropped_bytes: list[int] | None = None,
-                 origins: dict[str, tuple[str, str, str]] | None = None,
+                 origins: dict[str, tuple[str, str, str, int | None]] | None = None,
                  retrieve_hits: dict[tuple[str, str], int] | None = None,
-                 stats_retrieve: Callable[[str, str, str, bool, str], None] | None = None,
+                 stats_retrieve: Callable[..., None] | None = None,
                  stats_primer: Callable[[str, str, bool], None] | None = None,
                  ledger_label: str | None = None,
                  log_prefix: str = "[terse-proxy]",
@@ -449,14 +449,15 @@ class Interceptor:
         # the dict it's tracking. Default (None) is behavior-preserving: a fresh private
         # box, exactly equivalent to a private int.
         self._dropped_bytes_box: list[int] = dropped_bytes if dropped_bytes is not None else [0]
-        # `handle -> (tool, rule path)` for everything in `self.dropped` (#251). SHARED
+        # `handle -> (server, tool, rule path, block index)` for everything in
+        # `self.dropped` (#251; the index, #252, is None for a JSON-field drop). SHARED
         # whenever `store` is, and for the same reason: under multiproxy any peer's
         # Interceptor may be the one that answers a `terse.retrieve` for a handle a
         # DIFFERENT peer dropped, so a private origins map would lose the attribution on
         # exactly the fleet shape that has a lossy-by-default rule. Guarded by
         # `_store_lock` alongside the dict it mirrors, and evicted in lockstep with it.
-        self._drop_origin: dict[str, tuple[str, str, str]] = (origins if origins is not None
-                                                              else {})
+        self._drop_origin: dict[str, tuple[str, str, str, int | None]] = (
+            origins if origins is not None else {})
         # `(tool, rule path) -> retrieve HITS this session` (#252), for a drop spec's
         # `retract_after`. SHARED with the store for the same reason `_drop_origin` is: the
         # router answers every retrieve through peers[0], so the peer whose rule should
@@ -1755,7 +1756,7 @@ class Interceptor:
         return frozenset(out)
 
     def _note_drop_origins(self, applied: Any) -> None:
-        """Record `handle -> (server, tool, rule path)` for the drops an `apply`/`apply_joined`
+        """Record `handle -> (server, tool, rule path, block index)` for the drops an `apply`/`apply_joined`
         call actually COMMITTED (#251), so a later `terse.retrieve` is billed to the rule —
         and to the peer — that caused it.
 
@@ -1771,12 +1772,16 @@ class Interceptor:
         if not origins:
             return
         with self._store_lock:
-            for handle, (otool, opath) in origins.items():
+            for handle, (otool, opath, *rest) in origins.items():
                 # Only attribute what actually reached the store. A drop whose value was
                 # evicted between commit and here has nothing to retrieve, and recording it
                 # would inflate the rule's drop count against retrieves that cannot happen.
+                # A (tool, path) pair from an older `Applied`-shaped caller has no index.
+                # Across results the LATEST drop of a handle wins, as it always has: the
+                # result the model most recently saw is the one it retrieves from.
                 if handle in self.dropped:
-                    self._drop_origin[handle] = (self._ledger_label, otool, opath)
+                    self._drop_origin[handle] = (self._ledger_label, otool, opath,
+                                                 rest[0] if rest else None)
 
     def _inject_retrieve_tool(self, msg: dict) -> str | None:
         """If `msg` is a tools/list result, append the synthetic terse.retrieve tool so the
@@ -1862,10 +1867,15 @@ class Interceptor:
             # `hit` false has already discarded the origin. Billed to this proxy's own
             # label rather than dropped — the call was spent either way, and hiding it
             # would under-count the cost side.
-            oserver, otool, opath = origin if origin is not None else (
-                self._ledger_label, lossy_mod.RETRIEVE_TOOL, "")
+            oserver, otool, opath, oindex = origin if origin is not None else (
+                self._ledger_label, lossy_mod.RETRIEVE_TOOL, "", None)
             try:
-                self.stats_retrieve(oserver, otool, opath, hit, served)
+                # The block index (#252) is passed only when there is one, so a 5-argument
+                # writer from before it keeps working on every JSON-field and miss path.
+                if oindex is None:
+                    self.stats_retrieve(oserver, otool, opath, hit, served)
+                else:
+                    self.stats_retrieve(oserver, otool, opath, hit, served, index=oindex)
             except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
                 self._warn_sink("stats", otool, exc)
         return json.dumps({"jsonrpc": "2.0", "id": mid, "result": result},
