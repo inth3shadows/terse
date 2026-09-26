@@ -1,6 +1,14 @@
 """Offline tests for checkers.py -- no network, no claude -p, no MCP."""
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# The flat cost_per_task scripts are importable by bare module name (`arms`, `runner`,
+# ...). Done here, not in a conftest.py: a second `conftest` module shadowed
+# tests/conftest.py in a whole-repo run (`from conftest import ...` there then failed).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import checkers
 
 
