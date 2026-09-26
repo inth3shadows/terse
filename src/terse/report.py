@@ -3787,8 +3787,8 @@ def build_text_diff_report(results: dict, pairs: int | None = None) -> str:
         # Every text pair gets the line-count question, so the only way a pair yields no
         # rows is `text_diff_wire` returning None (`run_text_diff_payload`).
         ("admit no lossless text diff — the previous text is empty, or the chunked diff does "
-         "not rebuild the current text exactly. Capture a text tool whose consecutive "
-         "results share most of their content."),
+         "not rebuild the current text exactly. Capture a text tool whose previous result "
+         "is non-empty."),
         "terse fluency --text-diff-eval",
         control_label="raw text",
         pairs=pairs,
