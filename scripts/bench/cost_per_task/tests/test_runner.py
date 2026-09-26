@@ -67,11 +67,10 @@ def _run_one(monkeypatch, tmp_path, *, run_side_effect, transcript_records=None,
     monkeypatch.setattr(r, "_run_claude_process", run_side_effect)
     out_path = tmp_path / "out.jsonl"
     with out_path.open("a") as out_fh:
-        row = r.run_one(task=task or _base_task(), arm="B", rep=1, model="claude-haiku-4-5",
-                         arm_config_path=Path("/tmp/cfg.json"), workdir=tmp_path,
-                         setting_sources=None, out_fh=out_fh,
-                         transcript_search_root=search_root, **run_one_kwargs)
-    return row
+        return r.run_one(task=task or _base_task(), arm="B", rep=1, model="claude-haiku-4-5",
+                          arm_config_path=Path("/tmp/cfg.json"), workdir=tmp_path,
+                          setting_sources=None, out_fh=out_fh,
+                          transcript_search_root=search_root, **run_one_kwargs)
 
 
 def test_build_claude_command_basic_shape():
@@ -437,7 +436,7 @@ def test_resolve_allowed_tools_defaults_to_empty_when_absent():
 
 def test_build_settings_file_disables_all_hooks_mode_600(tmp_path):
     path = r.build_settings_file(tmp_path)
-    assert json.loads(path.read_text()) == {"disableAllHooks": True}
+    assert json.loads(path.read_text())["disableAllHooks"] is True
     assert (path.stat().st_mode & 0o777) == 0o600
 
 
@@ -558,7 +557,7 @@ def test_run_claude_process_kills_whole_process_group_on_timeout(tmp_path):
 # --------------------------------------------------------------- F2: --tools
 
 def test_resolve_builtin_tools_matches_category():
-    assert r.resolve_builtin_tools({"category": "kb"}) == ""
+    assert r.resolve_builtin_tools({"category": "kb"}) == "Read,Grep"
     assert r.resolve_builtin_tools({"category": "code"}) == "Read,Grep,Glob"
     assert r.resolve_builtin_tools({"category": "control"}) == "Read,Edit,Bash"
 
@@ -758,3 +757,49 @@ def test_cleanup_runecho_enrollment_never_raises_when_binary_missing(monkeypatch
 
     monkeypatch.setattr(r.subprocess, "run", _raise)
     r.cleanup_runecho_enrollment(wt)  # must not raise
+
+
+# ------------------------------------------- offloaded tool results (2026-09-26 smoke bias)
+
+def test_offload_read_rule_is_scoped_to_this_session_only(tmp_path):
+    """A large MCP result is written to <projects>/<slug>/<session>/tool-results/. The rule
+    must reach THAT session's file and nothing else: an earlier run's offloaded kb result
+    holds the answer."""
+    rule = r.offload_read_rule("abc-123", projects_dir=tmp_path)
+    assert rule == f"Read(/{tmp_path}/*/abc-123/tool-results/**)"
+    assert "abc-123" in rule and rule.count("*") == 3        # slug glob + recursive tail only
+
+
+def test_every_run_gets_the_offload_rule_on_top_of_its_task_tools(monkeypatch, tmp_path):
+    seen = {}
+    def fake_build(**kw):
+        seen.update(kw)
+        raise RuntimeError("stop after argv")
+    monkeypatch.setattr(r, "build_claude_command", fake_build)
+    try:
+        r.run_one(task={"id": "t", "prompt": "p", "category": "kb"}, arm="B", rep=1,
+                  model="m", arm_config_path=tmp_path / "c.json", workdir=tmp_path,
+                  setting_sources="", out_fh=None, allowed_tools=["mcp__kb__x"],
+                  effort="high", settings_path=None, safe_mode=False, builtin_tools="Read,Grep")
+    except RuntimeError:
+        pass
+    tools = seen["allowed_tools"]
+    assert tools[0] == "mcp__kb__x"
+    assert tools[-1].startswith("Read(/") and f"/{seen['session_id']}/tool-results/**)" in tools[-1]
+
+
+def test_setup_arms_load_the_operator_settings_and_A_does_not():
+    """B/C are "the user's setup": `--setting-sources ""` would also drop CLAUDE.md, rules,
+    output style, skills and agents (Opus review 2026-09-26), so only A drops them."""
+    import inspect
+    src = inspect.getsource(r.main)
+    assert 'setting_sources = {"A": "", "B": None, "C": None}' in src
+
+
+def test_every_arm_disables_hooks_and_fences_reads_to_the_working_dir(tmp_path):
+    """B/C's settings.json grants a blanket Read (a ~/.claude leak arm A lacks); the
+    generated settings neutralise it for every arm."""
+    for name in ("settings-no-hooks.json", "settings-setup.json"):
+        doc = json.loads(r.build_settings_file(tmp_path, name=name).read_text())
+        assert doc == {"disableAllHooks": True,
+                       "permissions": {"blockReadsOutsideWorkingDirectories": True}}

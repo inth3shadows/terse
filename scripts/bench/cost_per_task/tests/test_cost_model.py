@@ -10,7 +10,7 @@ import cost_model as cm
 
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE.parent))  # scripts/bench, for ab_session
-import importlib.util
+import importlib.util  # noqa: E402 -- after the sys.path setup it depends on
 
 _spec = importlib.util.spec_from_file_location("ab_session", HERE.parent / "ab_session.py")
 ab_session = importlib.util.module_from_spec(_spec)

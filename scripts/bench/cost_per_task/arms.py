@@ -214,7 +214,7 @@ def _snapshot_peers_with_pinned_policy(peers_doc: dict, peers_dir: Path, out_dir
     the live router to pin)."""
     doc = copy.deepcopy(peers_doc)
     copied: dict[str, Path] = {}  # resolved source path -> copy already written
-    for i, d in enumerate(doc.get("downstreams") or []):
+    for d in doc.get("downstreams") or []:
         if not isinstance(d, dict):
             continue
         raw = d.get("policy")

@@ -32,9 +32,9 @@ HERE = Path(__file__).resolve().parent
 AB_SESSION_PATH = HERE.parent / "ab_session.py"
 
 sys.path.insert(0, str(HERE))
-import arms as arms_mod          # noqa: E402
-import checkers                  # noqa: E402
-import cost_model                # noqa: E402
+import arms as arms_mod  # noqa: E402
+import checkers  # noqa: E402
+import cost_model  # noqa: E402
 import mcp_share as mcp_share_mod  # noqa: E402
 
 # Infra-error categories (plan blocker #2). A row tagged with one of these is
@@ -62,13 +62,36 @@ INFRA_API_ERROR = "api_error"
 # built-in allowances (Bash cat/rg/curl/ssh, bare Read) that --allowedTools
 # alone does not override -- --allowedTools only ADDS permission rules, it
 # never shrinks the built-in tool SET a settings file already granted.
-# --tools does shrink it: "" removes every built-in tool regardless of what
-# settings.json allows, closing that loophole identically for A/B/C.
+# --tools does shrink it, identically for A/B/C. Reads by the tools it does grant are
+# further fenced by `blockReadsOutsideWorkingDirectories` (build_settings_file).
 CATEGORY_BUILTIN_TOOLS = {
-    "kb": "",                    # kb tasks are answerable ONLY via the kb MCP tools
+    # kb tasks are answerable ONLY via the kb MCP tools. `Read` is present so the
+    # session can open its OWN offloaded tool-result file (see offload_read_rule): Claude
+    # Code writes a large MCP result to <projects>/<slug>/<session>/tool-results/ instead
+    # of the context, and without Read an arm whose result was large (B, uncompressed)
+    # fails where its compressed twin (C) does not -- the 2026-09-26 smoke-run bias.
+    # Other reads are fenced by `blockReadsOutsideWorkingDirectories` (build_settings_file),
+    # which still admits ~/.claude/CLAUDE.md and the skills/plugins/rules/agents/commands
+    # folders; neither kb answer is in them (checked 2026-09-26). Grep too: an offloaded result can exceed Read's 25k-token cap (41,257 tokens for
+    # list_nodes in the 2026-09-26 smoke), and the operator's real sessions would grep it
+    # rather than page through it. Identical for every arm.
+    "kb": "Read,Grep",
     "code": "Read,Grep,Glob",    # read-only repo exploration, no execution
     "control": "Read,Edit,Bash", # the one task that must actually edit + run pytest
 }
+
+
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+
+def offload_read_rule(session_id: str, projects_dir: Path = CLAUDE_PROJECTS_DIR) -> str:
+    """The one Read permission rule every arm gets on every task: this session's OWN
+    offloaded tool results, and nothing else. Scoped by the session id (a fresh uuid per
+    run), so a run can never read an EARLIER run's offloaded result -- which, for a kb
+    task, would contain the answer. The project slug is globbed (`*`) rather than
+    recomputed: the session id alone is unique, and Claude Code's slug rule is not ours
+    to re-derive. `//` marks an absolute path in a permission rule."""
+    return f"Read(/{projects_dir}/*/{session_id}/tool-results/**)"
 
 
 def resolve_builtin_tools(task: dict) -> str:
@@ -484,6 +507,7 @@ def run_one(*, task: dict, arm: str, rep: int, model: str, arm_config_path: Path
     through to `build_claude_command` (plan blockers #5, #6, #7)."""
     session_id = str(uuid.uuid4())
     run_id = str(uuid.uuid4())
+    allowed_tools = [*(allowed_tools or []), offload_read_rule(session_id)]
     cmd = build_claude_command(prompt=task["prompt"], model=model,
                                 mcp_config_path=arm_config_path, session_id=session_id,
                                 setting_sources=setting_sources, allowed_tools=allowed_tools,
@@ -633,9 +657,11 @@ def resolve_allowed_tools(task: dict, arm: str) -> list[str]:
     return list((task.get("tools") or {}).get(arm, []))
 
 
-def build_settings_file(out_dir: Path) -> Path:
+def build_settings_file(out_dir: Path, name: str = "settings-no-hooks.json") -> Path:
     """The harness-wide `--settings` file, applied to EVERY arm uniformly:
-    `{"disableAllHooks": true}` (plan blocker #6). Verified against the
+    `{"disableAllHooks": true, "permissions": {"blockReadsOutsideWorkingDirectories": true}}`
+    (plan blocker #6; the read fence per the Opus review of 2026-09-26, which neutralises the
+    operator settings' blanket Read allow rule for B/C). Verified against the
     installed claude CLI's own settings schema strings (v2.1.283,
     2026-09-26): `disableAllHooks` is a real top-level settings key, honored
     from a user settings file OR a `--settings` file, and also gates
@@ -644,8 +670,9 @@ def build_settings_file(out_dir: Path) -> Path:
     handoff consumption, project-index-init, and budget/context injection
     hooks for every arm. It does NOT disable CLAUDE.md, output style, or MCP
     server loading -- B/C still get "the user's setup" the plan calls for."""
-    return arms_mod._write_restricted(out_dir / "settings-no-hooks.json",
-                                       {"disableAllHooks": True})
+    doc: dict = {"disableAllHooks": True,
+                 "permissions": {"blockReadsOutsideWorkingDirectories": True}}
+    return arms_mod._write_restricted(out_dir / name, doc)
 
 
 def _refuse_out_inside_repo(out_path: Path, repo: Path) -> None:
@@ -728,7 +755,14 @@ def main(argv: list[str] | None = None) -> int:
 
     args.config_dir.mkdir(parents=True, exist_ok=True)
     arm_paths = {arm: arms_mod.write_arm_config(arm, args.config_dir) for arm in arm_list}
-    settings_path = build_settings_file(args.config_dir)
+    # Per-arm settings (Opus review 2026-09-26): B/C load the operator's real settings
+    # (CLAUDE.md, rules, output style, skills, agents: "the user's setup"). Its blanket Read
+    # allow rule is neutralised for EVERY arm by `blockReadsOutsideWorkingDirectories`, which
+    # the CLI checks before allow rules and which "true in any settings source wins". The CLI
+    # still lets a session read its own offloaded tool results under that setting.
+    settings_paths = {"A": build_settings_file(args.config_dir),
+                      "B": build_settings_file(args.config_dir, name="settings-setup.json"),
+                      "C": build_settings_file(args.config_dir, name="settings-setup.json")}
     # Arm A loads no user/project/local settings (and therefore no CLAUDE.md)
     # and gets --safe-mode on top -- making "no custom setup" explicit and
     # checkable rather than inferred from an empty MCP config (plan blocker
@@ -746,12 +780,13 @@ def main(argv: list[str] | None = None) -> int:
                     mcp_config_path=arm_paths[arm], session_id="<SESSION-ID>",
                     setting_sources=setting_sources[arm],
                     allowed_tools=resolve_allowed_tools(task, arm),
-                    effort=args.effort, settings_path=settings_path,
+                    effort=args.effort, settings_path=settings_paths[arm],
                     safe_mode=safe_mode[arm], tools=resolve_builtin_tools(task))
                 print(f"[{arm}] {task['id']}:")
                 print("  " + " ".join(cmd))
-        print(f"\nsettings file ({settings_path}):")
-        print("  " + settings_path.read_text().strip())
+        for a in sorted(set(arm_list)):
+            print(f"\nsettings file [{a}] ({settings_paths[a]}):")
+            print("  " + settings_paths[a].read_text().strip())
         return 0
 
     # Plan F1: ONE shared, pinned worktree for every 'repo' task rep across
@@ -793,7 +828,7 @@ def main(argv: list[str] | None = None) -> int:
                                arm_config_path=arm_paths[arm], workdir=workdir,
                                setting_sources=setting_sources[arm], out_fh=out_fh,
                                allowed_tools=resolve_allowed_tools(task, arm),
-                               effort=args.effort, settings_path=settings_path,
+                               effort=args.effort, settings_path=settings_paths[arm],
                                safe_mode=safe_mode[arm], builtin_tools=resolve_builtin_tools(task))
                 if row.get("infra_error"):
                     status = f"INFRA ({row['infra_error']}: {row.get('error')})"
