@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.41.2] - 2026-09-26
+
 ### Fixed
 
 - **A rejected project `.mcp.json` entry no longer takes a server's slot in `terse stats` (#448).** Claude Code never launches a project-scope server the user rejected, but the scan treated any entry in `.mcp.json` as running. A rejected entry therefore won the name over the user- or local-scope definition that actually runs, which dropped that definition from the report and hid any label contest it was part of. `mcp-status` now reports such an entry as `unapproved`, and it ranks below every launched definition, like a folded peer. An entry that is only pending approval keeps its normal state, because `claude -p`, Agent SDK and cloud sessions load it without asking; `mcp-status` notes that it is pending. `--json` rows gain an `approval` field (`approved`, `pending` or `rejected`) for present project entries. Approval is read from `enabledMcpjsonServers`, `disabledMcpjsonServers` and `enableAllProjectMcpServers` in the project's `~/.claude.json` block, the user `settings.json` (under `$CLAUDE_CONFIG_DIR` when set), and the project's `.claude/settings.json` and `.claude/settings.local.json`; a rejection wins over enable-all. Managed policy settings are not read.
