@@ -66,6 +66,11 @@ def test_demo_server_answers_the_handshake_a_registry_inspector_performs():
     tools = {t["name"]: t for t in listed["result"]["tools"]}
     assert set(tools) == {"demo_orders", "demo_logs"}
     assert all(t.get("description") and t.get("inputSchema") for t in tools.values())
+    # Both tools are synthetic, deterministic and do no I/O (#467) — an inspector like
+    # Glama's scores `annotations` directly, and a demo server is the worst place to
+    # leave them off.
+    assert all(t.get("annotations", {}).get("readOnlyHint") is True
+               for t in tools.values())
 
 
 def test_demo_orders_reaches_the_model_compressed_not_as_raw_json():
