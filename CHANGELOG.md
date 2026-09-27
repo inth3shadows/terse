@@ -25,6 +25,25 @@ fails that pull request until the section has moved.
   its existing behaviour. The `router/live duplicate label` verdict reason (unchanged in
   `--json`) now also covers these declared-name collisions with no router.
 
+## [0.41.2] - 2026-09-26
+
+### Fixed
+
+- **A rejected project `.mcp.json` entry no longer takes a server's slot in `terse stats` (#448).** Claude Code never launches a project-scope server the user rejected, but the scan treated any entry in `.mcp.json` as running. A rejected entry therefore won the name over the user- or local-scope definition that actually runs, which dropped that definition from the report and hid any label contest it was part of. `mcp-status` now reports such an entry as `unapproved`, and it ranks below every launched definition, like a folded peer. An entry that is only pending approval keeps its normal state, because `claude -p`, Agent SDK and cloud sessions load it without asking; `mcp-status` notes that it is pending. `--json` rows gain an `approval` field (`approved`, `pending` or `rejected`) for present project entries. Approval is read from `enabledMcpjsonServers`, `disabledMcpjsonServers` and `enableAllProjectMcpServers` in the project's `~/.claude.json` block, the user `settings.json` (under `$CLAUDE_CONFIG_DIR` when set), and the project's `.claude/settings.json` and `.claude/settings.local.json`; a rejection wins over enable-all. Managed policy settings are not read.
+
+## [0.41.1] - 2026-09-26
+
+### Changed
+
+- **The bundled demo server's tools advertise `annotations` and describe themselves more fully (#467).** `demo_orders` and `demo_logs` are synthetic, deterministic and do no I/O, so both now carry `{"readOnlyHint": true, "idempotentHint": true, "openWorldHint": false}`; their descriptions cross-reference each other and note what a larger `limit`/`lines` shows. Raises a registry inspector's (Glama's) score on the demo listing; the proxy's `tools/list` pass-through was verified unchanged for both the single proxy and multiproxy.
+
+### Fixed
+
+- **The CHANGELOG graduation check no longer depends on commit history (#436).** `test_unreleased_does_not_describe_work_that_already_shipped` decided whether an `[Unreleased]` entry had shipped by blaming the line and asking which tag contained that commit, so a pull request whose branch moved a released entry passed while its squash on `main` failed; that is how #422's release was skipped. An entry now counts as shipped when the same line appears in `CHANGELOG.md` at a release tag, and is attributed to the oldest such tag. A branch and its squash get the same answer, and a released entry moved back into `[Unreleased]` is now caught.
+
+- **`terse stats` sizes a standalone primer against the name the proxy gates on (#428).** The estimate tested policy rules against the `mcpServers` key, but a running `terse proxy` gates its primer on its baked `--server-name`, and on no name at all when none is baked. For an unbaked entry such as a `folded-and-live` duplicate, a `kb.*` passthrough rule sized a 0-token primer for a process that sends the full 248. Routers still size their union primer against peer names. Only the `estimated` path changes; a recorded primer row still wins.
+- **An entry that runs no proxy no longer hides another entry's stranded history (#430).** `terse --help proxy -- kb-mcp` has no `proxy` subcommand and writes no ledger rows, but its `kb-mcp` identity still counted as live, which removed the real entry's `superseded_labels` line for `kb-mcp`. Only entries that write to the ledger being read now count as live.
+
 ## [0.41.0] - 2026-09-26
 
 ### Added
