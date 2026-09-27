@@ -854,6 +854,16 @@ def test_R7_legacy_rows_fall_back_to_trials_minus_fails():
     assert _codec_answered(legacy, "raw") == 3 and _codec_answered(legacy, "terse") == 3
 
 
+def test_codec_complete_on_legacy_rows_reads_trials_minus_fails():
+    # #450: `_codec_complete`'s fallback (no `*_answered`/`*_parsed` counters) was never
+    # exercised. A legacy row with no lost calls is complete; one lost call is not.
+    from terse.report import _codec_complete
+    base = {"qid": "q", "trials": 5, "raw_ok": 5, "terse_ok": 5}
+    assert _codec_complete(dict(base, fails=0))
+    assert _codec_complete(base)   # no `fails` key: nothing recorded as lost
+    assert not _codec_complete(dict(base, fails=1))
+
+
 def test_R7_parsed_is_capped_by_answered():
     from terse.report import _codec_answered
     r = _answered_row("q", 5, 5, 5, terse_ans=3, raw_parsed=5, terse_parsed=5)

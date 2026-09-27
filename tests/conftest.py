@@ -66,6 +66,14 @@ def _isolate_xdg_state(monkeypatch, tmp_path_factory):
     monkeypatch.delenv("TERSE_FLUENCY_LEDGER", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_claude_config_dir(monkeypatch):
+    """An exported $CLAUDE_CONFIG_DIR would make `scan_scopes` read the developer's real
+    user settings.json for project-server approval (#448), in every test that runs the
+    real scanner. Tests that care about it set their own value on top."""
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+
 # --------------------------------------------------------------------------- #
 # Shared drop-eval CLI fixtures (#386 review): ONE copy of the payload, the drop-field
 # spec, the policy doc and the `_cmd_fluency` Namespace, so a new required `args.<field>`

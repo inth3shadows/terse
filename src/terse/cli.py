@@ -1528,7 +1528,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             return 1
         results = fluency.run_diff_fluency(envelopes, answerers, trials=args.trials,
                                            progress=_stderr_progress)
-        _write_report(build_diff_report(results), args.out)
+        _write_report(build_diff_report(results, pairs=len(fluency.diff_pairs(envelopes))),
+                      args.out)
         _maybe_write_diff_html(args, results)
         if args.bars:
             print("\n" + build_terminal_diff_report(results))
@@ -1564,7 +1565,8 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
             return 1
         results = fluency.run_text_diff_fluency(envelopes, answerers, trials=args.trials,
                                                 progress=_stderr_progress)
-        _write_report(build_text_diff_report(results), args.out)
+        _write_report(build_text_diff_report(
+            results, pairs=len(fluency.text_diff_pairs(envelopes))), args.out)
         _maybe_write_diff_html(args, results, control_label="raw text")
         if args.bars:
             print("\n" + build_terminal_diff_report(results, control_label="raw text"))
@@ -1974,6 +1976,12 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
             elif r["state"] == "router-ambiguous":
                 print(f"  {'':<20} another entry fronts the same peers file — delete the "
                       f"duplicate (they are interchangeable) before terse can manage it")
+            elif r["state"] == "unapproved":
+                print(f"  {'':<20} rejected in Claude Code: this .mcp.json entry never "
+                      f"launches (#448)")
+            elif r.get("approval") == "pending":
+                print(f"  {'':<20} pending: loads only in non-interactive sessions "
+                      f"(claude -p, Agent SDK, cloud) until approved")
             # `folded-and-live` already said "runs TWICE" above, in its own words.
             if r["state"] != "folded-and-live":
                 for lbl, others in dup_of.get(row_index[id(r)], []):
