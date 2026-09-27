@@ -459,10 +459,9 @@ def test_primer_ci_excludes_vacuous_tasks():
     assert rep["exercising_tasks"] == ["kb"]
     assert rep["vacuous_tasks"] == ["noisy"]
     c = rep["contrasts"]["C[never]-C[always]"]
-    # Only kb is in the CI: a single task resamples to itself, so the CI is its own delta
-    # (-30 tokens/success), not the ~-30k gap the vacuous task would contribute.
-    assert c["ci"] is not None and abs(c["observed"]) < 100
-    assert c["ci"][0] > -100 and c["ci"][1] < 100
+    # Only kb counts: its own ~-30 tokens/success delta, not the ~-30k gap the vacuous
+    # task would contribute. One task is below MIN_CI_TASKS: descriptive, no CI.
+    assert c["ci"] is None and abs(c["observed"]) < 100
     # Without the fix, the noisy vacuous task drives a large "significant" saving.
     by_task = rep["tasks"]
     unrestricted = an.paired_bootstrap_ci(by_task, "C[never]", "C[always]")
@@ -481,6 +480,38 @@ def test_primer_ci_excludes_vacuous_tasks():
     assert any("VACUOUS task" in ln and "C[always]" in ln for ln in noisy_lines)
     # C[never] never shows the primer by design: its rows are never flagged.
     assert not any("VACUOUS" in ln for ln in kb_lines + noisy_lines if "C[never]" in ln)
+
+
+def test_primer_two_exercising_tasks_is_descriptive_only():
+    # The real #325 shape: 2 exercising tasks (kb + one where always saw it 1/5) with a
+    # consistent large gap that the degenerate 2-task bootstrap called SIGNIFICANT.
+    rows = _issue_325_rows()
+    for rep_ in range(1, 6):
+        rows += [_prow("xf", "always", rep_, True, 33000 + rep_, rep_ == 1),
+                 _prow("xf", "never", rep_, True, 17000 + rep_, False)]
+    rep = an.primer_comparison(rows)
+    m = rep["haiku"]
+    assert m["exercising_tasks"] == ["kb", "xf"]
+    c = m["contrasts"]["C[never]-C[always]"]
+    assert c["ci"] is None and c["observed"] < 0
+    text = an.format_primer_report(rep)
+    assert "SIGNIFICANT" not in text and "95% CI [" not in text
+    assert (f"too few primer-exercising tasks (2 < {an.MIN_CI_TASKS}) for a CI; "
+            f"descriptive only") in text
+    assert "observed -" in text and "success not lower than baseline" in text
+
+
+def test_primer_ci_computed_at_min_ci_tasks_and_ignores_vacuous():
+    rows = [r for r in _issue_325_rows() if r["task_id"] == "noisy"]
+    for i in range(an.MIN_CI_TASKS):
+        for rep_ in range(1, 4):
+            rows += [_prow(f"t{i}", "always", rep_, True, 1000 + 10 * i + rep_, True),
+                     _prow(f"t{i}", "never", rep_, True, 900 + 10 * i + rep_, False)]
+    m = an.primer_comparison(rows)["haiku"]
+    c = m["contrasts"]["C[never]-C[always]"]
+    assert c["ci"] is not None and c["observed"] == -100
+    # The vacuous task's ~-25k gap is not in the CI.
+    assert c["ci"][0] > -200 and c["ci"][1] < 0
 
 
 def test_primer_success_drop_on_vacuous_task_is_still_reported():

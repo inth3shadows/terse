@@ -319,6 +319,17 @@ def primer_label(row: dict) -> str:
 # `always` run is present.
 PRIMER_BASELINES = ("C[always]", "C[unset]")
 
+# Fewest primer-exercising tasks the --by-primer bootstrap may size a CI from (#491).
+# The bootstrap resamples k tasks with replacement, so it can only produce
+# C(2k-1, k) distinct task multisets: k=2 -> 3, k=3 -> 10, k=4 -> 35, k=5 -> 126.
+# Each all-one-task draw has probability k**-k (k=2: 25%, k=3: 3.7%), which is above
+# the 2.5% tail at k<=3, so the CI endpoints are then just single-task deltas and the
+# CI is degenerate (in the #325 run, auto's upper bound equalled its observed value).
+# At k=4 the tails rest on only a handful of the 35 multisets. k=5 is the first size
+# where the tails span many distinct resamples (126, extremes 0.03% each). Below it
+# the report is descriptive only: observed delta and success, no CI, no verdict.
+MIN_CI_TASKS = 5
+
 
 def _attachment(runs: list[dict]) -> dict:
     """How many of `runs` actually showed the model the primer (`primer_attached`).
@@ -374,9 +385,19 @@ def primer_comparison(rows: list[dict]) -> dict:
                 if lab == baseline:
                     continue
                 key = f"{lab}-{baseline}"
-                if exercising:
+                pair_tasks = [t for t in exercising if lab in by_task[t]]
+                if len(pair_tasks) >= MIN_CI_TASKS:
                     contrasts[key] = paired_bootstrap_ci(by_task, lab, baseline,
                                                          task_subset=exercising)
+                elif exercising:
+                    hi = _aggregate_for_picks(pair_tasks, by_task, lab)
+                    lo = _aggregate_for_picks(pair_tasks, by_task, baseline)
+                    contrasts[key] = {
+                        "ci": None, "n_boot": 0, "n_used": 0, "descriptive_only": True,
+                        "observed": (hi - lo) if (hi is not None and lo is not None)
+                        else None,
+                        "reason": f"too few primer-exercising tasks ({len(pair_tasks)} < "
+                                  f"{MIN_CI_TASKS}) for a CI; descriptive only"}
                 else:
                     contrasts[key] = {"ci": None, "observed": None, "n_boot": 0, "n_used": 0,
                                       "reason": f"vacuous: {baseline} never saw the primer "
@@ -481,7 +502,8 @@ def format_primer_report(report: dict) -> str:
                                              if ok_vac else "success LOWER than baseline")
                              + " on vacuous tasks")
             continue
-        lines.append(f"\npaired bootstrap 95% CI vs {m['baseline']} over the "
+        lines.append(f"\ncontrasts (paired bootstrap 95% CI from {MIN_CI_TASKS} tasks) "
+                      f"vs {m['baseline']} over the "
                       f"{len(m['exercising_tasks'])} primer-exercising task(s) "
                       f"(mode - baseline, weighted tokens/success):")
         for key, c in m["contrasts"].items():
@@ -491,7 +513,9 @@ def format_primer_report(report: dict) -> str:
                 ok += ("; on vacuous tasks: " +
                        ("not lower" if m["success_not_lower_vacuous"][key] else "LOWER"))
             if c["ci"] is None:
-                lines.append(f"  {key}: {c['reason']} ({ok})")
+                obs = (f"observed {c['observed']:+.0f}, "
+                       if c.get("descriptive_only") and c["observed"] is not None else "")
+                lines.append(f"  {key}: {obs}{c['reason']} ({ok})")
             else:
                 verdict = "SIGNIFICANT" if c["excludes_zero"] else "inconclusive"
                 lines.append(f"  {key}: observed {c['observed']:+.0f}, 95% CI "
