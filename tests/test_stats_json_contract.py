@@ -79,7 +79,10 @@ RETRIEVE_ROW = {"server", "tool", "path", "calls", "hits", "misses", "bytes", "t
 # tidying `aggregate`: `primer_liability` divides `tokens` by it to recover the PER-SESSION
 # primer, so losing it silently restores the window-sum over-bill this row exists to fix.
 PRIMER_ROW = {"server", "cadence", "attached", "emissions", "bytes", "tokens",
-              "untokenized"}
+              "untokenized",
+              # #325: WHICH decline an `attached: false` row is (structured / never / auto);
+              # null on an attach.
+              "reason"}
 
 LIABILITY = {"servers", "per_turn_tokens", "session_once_tokens", "unresolved",
              "idle", "free", "uncertain", "saved_tokens", "turns_covered",
@@ -122,7 +125,11 @@ LIABILITY_SERVER = {"server", "scope", "state", "primer_tokens", "ledger_labels"
                     "primer_source",
                     # #443: the retrieve cost netted out of THIS entry's rate (#438), so a
                     # consumer can tell a retrieve-driven negative rate from expansion.
-                    "retrieve_tokens"}
+                    "retrieve_tokens",
+                    # #325: the entry's baked `--primer` mode (always / never / auto).
+                    "primer_mode",
+                    # #325: the decline reasons behind a measured zero; empty otherwise.
+                    "primer_decline_reasons"}
 
 # Deliberately verdict-INCAPABLE (#238): no `primer_tokens`, no `blocks_to_break_even`, no
 # `break_even_verdict`, no `verdict`. A peer has no primer to divide by -- the router pays one
@@ -147,9 +154,12 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "superseded_labels": (list,), "contested_labels": (list,),
     "contests": (dict,),
     "cadence": (str,), "saved_per_block": (float, int, type(None)),
-    # #311: always one of exactly two strings, never null -- there is always an answer to
-    # "where did this number come from", even when the answer is "we inferred it".
+    # #311: always one of a fixed set of strings, never null -- there is always an answer
+    # to "where did this number come from", even when the answer is "we inferred it".
+    # #325 added "configured" (`--primer never`, no attach recorded) beside the two.
     "primer_source": (str,),
+    "primer_mode": (str,), "primer_decline_reasons": (list,),
+    "reason": (str, type(None)),
     # #311 primer rows: emissions/bytes/tokens are counts, `untokenized` is the
     # None-is-not-zero escape hatch every other record already has.
     "emissions": (int,),

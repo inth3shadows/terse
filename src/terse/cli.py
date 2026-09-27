@@ -236,7 +236,7 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
                                    diff_override=diff_override,
                                    diff_keyframe_override=args.diff_keyframe_interval,
                                    join_blocks_override=join_blocks_override,
-                                   stats_log=stats_log)
+                                   stats_log=stats_log, primer_mode=args.primer)
         except (OSError, ValueError) as e:
             print(f"proxy --config: {e}", file=sys.stderr)
             return 2
@@ -250,7 +250,7 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         return 2
     return run_proxy(cmd, pol, debug=args.debug, capture_dir=args.capture_dir,
                      debug_log=args.debug_log, headers=headers, stats_log=stats_log,
-                     server_name=args.server_name)
+                     server_name=args.server_name, primer_mode=args.primer)
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
@@ -2254,6 +2254,13 @@ def main(argv: list[str] | None = None) -> int:
     px.add_argument("--no-stats", action="store_true",
                     help="disable the savings ledger (it is ON by default — safe because "
                          "it stores no payload content)")
+    px.add_argument("--primer", choices=("always", "never", "auto"), default="always",
+                    help="when to attach the format primer (#325). always (default): once "
+                         "per session, on the first compressed result. never: not at all. "
+                         "auto: only on a result carrying a form the primer is measured to "
+                         "rescue (nested subcols, absent columns, object aliases, diffs, "
+                         "dropped fields); flat tables and scalar aliases go out unexplained. "
+                         "With --config, one mode for every peer.")
     px.add_argument("--header", action="append", metavar="NAME=VALUE",
                     help="HTTP header to send to an HTTP/SSE downstream (repeatable), e.g. "
                          "--header 'Authorization=Bearer xyz'. Ignored for a stdio downstream. "

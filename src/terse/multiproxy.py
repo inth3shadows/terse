@@ -78,6 +78,7 @@ from . import lossy as lossy_mod
 from . import policy as policy_mod
 from ._secure_io import mkdir_restricted, write_restricted
 from .proxy import (
+    PRIMER_ALWAYS,
     PRIMER_HEAD,
     RETRIEVE_TOOL_DEF,
     SWALLOW,
@@ -2024,6 +2025,7 @@ def run_multi_proxy(
     diff_keyframe_override: int | None = None,
     join_blocks_override: bool | None = None,
     stats_log: str | None = None,
+    primer_mode: str = PRIMER_ALWAYS,
 ) -> int:
     """Load `config_path`, build one `Peer` per downstream (own `Transport` + own
     `Interceptor`, all sharing one drop store), spawn one `pump()` reader thread per
@@ -2069,7 +2071,13 @@ def run_multi_proxy(
     # ONE lazy primer for the whole router (#212), recorded under `router_ledger_label` --
     # never a peer's name. The router is launched `proxy --config <peers>` and does not know
     # its own config name; the peers file's resolved path is the identity the scan shares.
-    primer_latch = PrimerLatch()
+    # `--primer` (#325) is ONE mode for the whole router: it lives on the shared latch, so
+    # every peer reads the same answer to "does this session owe a primer".
+    try:
+        primer_latch = PrimerLatch(mode=primer_mode)
+    except ValueError as exc:
+        sys.stderr.write(f"[terse-multiproxy] {exc}\n")
+        return 2
     primer_label = router_ledger_label(config_path)
 
     try:

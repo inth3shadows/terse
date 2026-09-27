@@ -1086,6 +1086,14 @@ uv run terse proxy --no-join-blocks -- uvx some-mcp-server
 # or per policy file: {"join_blocks": false, ...}; bake into a wrapped server with
 # install-mcp --no-join-blocks
 
+# the format primer (#325): `always` (default) attaches it once per session, on the first
+# compressed result. `never` sends none. `auto` attaches it only on a result carrying a
+# form the primer is measured to rescue (nested subcols, absent columns, object aliases,
+# diffs, dropped fields); flat tables and scalar aliases go out without it. With
+# --config, one mode for the whole router. install-mcp does not bake it yet: add it to the
+# entry's args by hand (before the `--`), and re-add it after re-running install-mcp.
+uv run terse proxy --primer auto -- uvx some-mcp-server
+
 # re-run the fluency gate against your own consumer/model anytime.
 # needs same-tool PAIRS in the corpus (capture a tool 2+ times) + a configured model:
 TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \

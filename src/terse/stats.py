@@ -309,9 +309,18 @@ PRIMER_EVENT = "primer"
 PRIMER_CADENCE_PER_TURN = "per-turn"
 PRIMER_CADENCE_ONCE = "once/session"
 
+# Why a primer was DECLINED (`attached: false`), public for the same reason the cadences are:
+# the write sites name one, the read side buckets on it (#325). `structured` is #286's
+# suppression and the only reason a row written before the field can have had, so it is also
+# the default for such a row. `never`/`auto` are `terse proxy --primer`'s two declines. All
+# three cost exactly zero; they are kept apart so a report can say WHICH zero it measured.
+PRIMER_DECLINE_STRUCTURED = "structured"
+PRIMER_DECLINE_NEVER = "never"
+PRIMER_DECLINE_AUTO = "auto"
+
 
 def build_primer_record(server: str, *, cadence: str, primer: str,
-                        attached: bool = True) -> dict[str, Any]:
+                        attached: bool = True, reason: str | None = None) -> dict[str, Any]:
     """One ledger line for a primer that was ACTUALLY emitted (#311, #286).
 
     `primer_liability` sizes the primer from the INSTALLED policy and then uses the ledger
@@ -345,6 +354,10 @@ def build_primer_record(server: str, *, cadence: str, primer: str,
     window cannot say", permanently and unfixably. Presence means something. So the proxy
     writes down both answers and the reader never has to guess.
 
+    `reason` (#325) says which decline an `attached=False` row is: `structured` (the #286
+    case above, and the default), `never` or `auto` (`terse proxy --primer`). Written only on
+    a decline -- an attach has no reason to give.
+
     Payload-free like every other record: the primer is measured and discarded. It is
     policy-derived text the operator's own configuration produced, never tool output.
 
@@ -353,7 +366,7 @@ def build_primer_record(server: str, *, cadence: str, primer: str,
     its bytes into the published savings percentage. That skip is load-bearing, not
     incidental -- see `test_a_primer_record_never_enters_the_savings_total`.
     """
-    return {
+    rec: dict[str, Any] = {
         "ts": int(time.time()),
         "version": _ledger_version(),
         "server": server,
@@ -371,6 +384,9 @@ def build_primer_record(server: str, *, cadence: str, primer: str,
         # None (not 0) without tiktoken, matching `build_record`: unknown is not zero.
         "tokens": count_cl100k(primer) if attached else 0,
     }
+    if not attached:
+        rec["reason"] = reason or PRIMER_DECLINE_STRUCTURED
+    return rec
 
 
 def build_retrieve_record(server: str, tool: str, path: str, *,
@@ -541,7 +557,10 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     # Keyed by (server, cadence, attached): an attach and a suppression are opposite facts
     # about the same server and must never merge into one row. That third key is what makes
     # "this server provably pays nothing" expressible at all (#286).
-    primers: dict[tuple[str, str, bool], dict[str, int]] = {}
+    # And by `reason` (#325), None on an attach: `never`, `auto` and a `structuredContent`
+    # suppression are all measured zeros, but a report that cannot say WHICH zero would
+    # explain a configured `--primer never` as #286's structuredContent gap.
+    primers: dict[tuple[str, str, bool, str | None], dict[str, int]] = {}
     # Lazy-router sessions by router label (#212): the proof a lazy router ran at all, even
     # in a window where no result reached it.
     router_sessions: dict[str, dict[str, Any]] = {}
@@ -562,8 +581,11 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             # bucketed as a suppression and the entry published a measured zero. Same
             # hand-edited/foreign-writer threat class the `rec_tok > 0` guard defends
             # against. Only an explicit `false` means the primer was declined.
-            pkey = (psrv, str(rec.get("cadence", "unknown")),
-                    rec.get("attached", True) is not False)
+            pattached = rec.get("attached", True) is not False
+            # A decline row predating `reason` can only be the `structuredContent` one.
+            preason = (None if pattached
+                       else str(rec.get("reason") or PRIMER_DECLINE_STRUCTURED))
+            pkey = (psrv, str(rec.get("cadence", "unknown")), pattached, preason)
             prow = primers.setdefault(pkey, {"emissions": 0, "tokens": 0,
                                              "bytes": 0, "untokenized": 0})
             # Counts recorded DECISIONS, not emissions, on an `attached: false` row -- the
@@ -699,8 +721,9 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             # Primers actually emitted this window, by label and cadence (#311). Empty on
             # every ledger written before this shipped -- readers MUST treat empty as "this
             # ledger cannot say", not as "no primer was sent".
-            "primers": [{"server": s, "cadence": c, "attached": a, **row}
-                        for (s, c, a), row in sorted(primers.items())],
+            "primers": [{"server": s, "cadence": c, "attached": a, "reason": r, **row}
+                        for (s, c, a, r), row in sorted(
+                            primers.items(), key=lambda kv: (kv[0][:3], kv[0][3] or ""))],
             # Lazy-router sessions (#212). Empty on any ledger with no lazy router -- read
             # as "this ledger cannot say the router was lazy", never as "zero sessions".
             "router_sessions": [{"server": s, **row}
@@ -1882,7 +1905,13 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
     # in the policy/primer machinery only when a report is actually being rendered.
     from .install_mcp import NO_PEERS
     from .policy import default_policy, load_policy
-    from .proxy import build_primer, union_primer
+    from .proxy import (
+        PRIMER_ALWAYS,
+        PRIMER_MODES,
+        PRIMER_NEVER,
+        build_primer,
+        union_primer,
+    )
 
     # Primers ACTUALLY emitted this window, by ledger label (#311). Only the once/session
     # cadence: the eager sites emit unconditionally and are already exact by inference, so
@@ -1911,6 +1940,10 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
     # `structuredContent` result and attach on a later text-only one, and having paid once
     # is what matters.
     suppressed_label: set[str] = set()
+    # WHICH declines each label recorded (#325): `structured`, `never`, `auto`. Read from the
+    # row, never inferred from the entry's `--primer` mode -- an `auto` entry can decline on
+    # `structuredContent` alone, and the report must say so.
+    decline_reasons: dict[str, set[str]] = {}
     # Labels with ANY attach row, recorded before the tokenization skip below. Kept separate
     # from `recorded_emissions` because those two answer different questions: "did it pay?"
     # and "can we size what it paid?". An attach written without tiktoken carries
@@ -1938,6 +1971,8 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
             # safe direction; believing it publishes a fabricated zero.
             if not (prow.get("tokens") or 0) and not (prow.get("bytes") or 0):
                 suppressed_label.add(plbl)
+                decline_reasons.setdefault(plbl, set()).add(
+                    str(prow.get("reason") or PRIMER_DECLINE_STRUCTURED))
             continue
         # BEFORE the tokenization skip: an attach is proof of payment whether or not we can
         # size it.
@@ -2256,6 +2291,23 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
             tokens = 0
         if measured:
             tokens = round(rec_tok / rec_em)
+        # `--primer` baked into the entry (#325). Read from the INSTALL, like the size is: an
+        # unrecognised value keeps `always`, which bills -- the safe direction. `never` is a
+        # configured zero whenever the window recorded no attach; a recorded attach still
+        # wins, because it is a fact about what went out (the window can predate the flag).
+        # `auto` changes nothing here by design: its attach and decline rows feed the same
+        # recorded/measured-zero machinery as `always`, and with neither the estimate stands
+        # as an UPPER bound -- `auto` pays it only on sessions whose results needed it.
+        primer_mode = str(row.get("primer") or PRIMER_ALWAYS)
+        if primer_mode not in PRIMER_MODES:
+            primer_mode = PRIMER_ALWAYS
+        # NOT `not measured` alone: `measured` needs a token count, and an UNTOKENIZED
+        # attach is still proof of payment -- publishing a configured zero over it is #320's
+        # fabricated measurement, re-entered through the mode.
+        configured_zero = (primer_mode == PRIMER_NEVER and not measured
+                           and not any(lbl in attached_label for lbl in primer_labels))
+        if configured_zero:
+            tokens = 0
         # None, not 0, when no label could be recovered: "unknown" and "never called" are
         # different claims, and only the second one accuses an install of being pure cost.
         blocks = (sum(by_label.get(lbl, 0) for lbl in labels) if labels
@@ -2337,7 +2389,16 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
             # guess which of its numbers is a measurement (#311). "recorded" = the proxy
             # wrote down an emission this window; "estimated" = sized from the installed
             # policy and inferred to have been paid, the pre-#311 behaviour.
-            "primer_source": "recorded" if (measured or measured_zero) else "estimated",
+            # "configured" (#325): `--primer never` is baked in and no attach was recorded,
+            # so the zero comes from the install, not from a ledger row.
+            "primer_source": ("recorded" if (measured or measured_zero)
+                              else "configured" if configured_zero else "estimated"),
+            # The entry's `--primer` mode (#325): always / never / auto.
+            "primer_mode": primer_mode,
+            # The decline reasons behind a measured zero (#325), sorted; empty otherwise.
+            "primer_decline_reasons": (sorted(set().union(
+                *(decline_reasons.get(lbl, set()) for lbl in primer_labels)))
+                if measured_zero else []),
             "tokenized_blocks": tokenized,
             # `unpaid=measured_zero` forces the UNPAID bucket. `_cadence` alone returns
             # `_ONCE` ("pays once per session") whenever `encoded > 0`, and #286's shape
@@ -2359,7 +2420,10 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
                                 # `encoded == 0` was listed free beside it.
                                 recorded=measured or any(
                                     lbl in attached_label for lbl in primer_labels),
-                                unpaid=measured_zero, lazy_router=lazy_router),
+                                # A configured `never` zero is as unpaid as a measured
+                                # one (#325): `1x` beside 0 tokens would contradict itself.
+                                unpaid=measured_zero or configured_zero,
+                                lazy_router=lazy_router),
             **_break_even(tokens, blocks, tokenized,
                           sum(net_saved_by_label.get(lbl, 0) for lbl in labels),
                           # Same shape as `no ledger label` — nothing measurable — but a
@@ -2442,9 +2506,11 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         # primer` verdict in the table. `or primer_source == "recorded"` re-admits the
         # second case, whose primer_tokens is a MEASURED 0 rather than an absent one -- and
         # that is a real distinction, not a loophole: only a recorded suppression sets it.
+        # "configured" (#325) is a baked `--primer never`, zero by construction.
         "free": [s["server"] for s in servers
                  if s["cadence"] == _ONCE_FREE
-                 and (s["primer_tokens"] or s.get("primer_source") == "recorded")],
+                 and (s["primer_tokens"]
+                      or s.get("primer_source") in ("recorded", "configured"))],
         # Lazy, but no ledger label was recoverable, so we cannot say whether the attach
         # ever fired. Neither total counts it — same discipline as `unresolved`.
         "uncertain": [s["server"] for s in servers if s["cadence"] == _ONCE_UNKNOWN],
@@ -2539,13 +2605,26 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
     # the whole point of #286. Split by the token count -- a measured zero is the suppression.
     paid = [s_["server"] for s_ in servers
             if s_.get("primer_source") == "recorded" and s_.get("primer_tokens")]
-    never = [s_["server"] for s_ in servers
+    zeros = [s_ for s_ in servers
              if s_.get("primer_source") == "recorded" and not s_.get("primer_tokens")]
-    if paid or never:
-        lines.append(f"  {len(paid) + len(never)} of {len(servers)} server(s) are MEASURED, "
+    # A measured zero under `--primer never`/`auto` (#325) is that mode's decline, not #286's
+    # `structuredContent` gap, and the sentence below must not claim otherwise.
+    # By the recorded REASON, not the entry's mode: an `auto` entry whose only decline was
+    # `structuredContent` is #286's case. A row from an older terse has no reasons: #286's.
+    mode_reasons = {PRIMER_DECLINE_NEVER, PRIMER_DECLINE_AUTO}
+    by_mode = [s_["server"] for s_ in zeros
+               if mode_reasons & set(s_.get("primer_decline_reasons") or ())]
+    never = [s_["server"] for s_ in zeros if s_["server"] not in by_mode]
+    configured = [s_["server"] for s_ in servers if s_.get("primer_source") == "configured"]
+    if paid or zeros:
+        lines.append(f"  {len(paid) + len(zeros)} of {len(servers)} server(s) are MEASURED, "
                      f"not inferred:")
         if paid:
             lines.append(f"             {len(paid)} recorded an emission.")
+        if by_mode:
+            lines.append(f"             {len(by_mode)} recorded that `--primer never`/`auto` "
+                         f"declined it, and none")
+            lines.append("             attached later, so they pay nothing at all (#325).")
         if never:
             # NOT "every result carried `structuredContent`": the row proves only that the
             # result which WOULD have carried the primer did, and that none attached later.
@@ -2556,7 +2635,7 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
             lines.append("             result that would have carried it, and none attached "
                          "later, so they pay")
             lines.append("             nothing at all (#286).")
-        if len(paid) + len(never) < len(servers):
+        if len(paid) + len(zeros) + len(configured) < len(servers):
             # "except any listed as free below": an estimated entry that was never triggered
             # appears in BOTH this sentence and the free list below, which reads as a
             # contradiction. The estimate is about the primer's SIZE, not about whether it
@@ -2564,6 +2643,17 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
             lines.append("             The rest are sized from policy and assumed paid — "
                          "except any listed as")
             lines.append("             free below, where the ledger settles it.")
+    if configured:
+        lines.append(f"  {len(configured)} server(s) run `--primer never` and pay no primer: "
+                     f"{', '.join(configured)}")
+    # `auto` (#325) pays only on sessions whose results carried a form the primer rescues, so
+    # an ESTIMATE for it is an upper bound, not a per-session tax -- said, not footnoted.
+    auto_est = [s_["server"] for s_ in servers
+                if s_.get("primer_mode") == "auto" and s_.get("primer_source") == "estimated"
+                and s_.get("primer_tokens")]
+    if auto_est:
+        lines.append(f"  `--primer auto`, sized as if every called session attached — an "
+                     f"UPPER bound: {', '.join(auto_est)}")
     if liab["unresolved"]:
         lines.append(f"  {liab['unresolved']} server(s) have an unreadable policy and are "
                      f"NOT counted — treat both figures as lower bounds.")
@@ -3104,9 +3194,10 @@ def build_primer_writer(stats_log: str | Path, server: str):
     ONE union primer the client receives is one row. (Before #212 the router primed eagerly
     at `initialize` and recorded nothing; billing N peer labels for one primer is the
     over-count that sank #312's design.)"""
-    def primer(cadence: str, text: str, attached: bool = True) -> None:
+    def primer(cadence: str, text: str, attached: bool = True,
+               reason: str | None = None) -> None:
         append_stats(build_primer_record(server, cadence=cadence, primer=text,
-                                         attached=attached), stats_log)
+                                         attached=attached, reason=reason), stats_log)
 
     return primer
 

@@ -1017,7 +1017,7 @@ def proxy_arg_segment(entry: dict) -> list[str] | None:
 
 def parse_proxy_opts(entry: dict) -> dict[str, str] | None:
     """The terse proxy options baked into a wrapped MCP server `entry`'s args —
-    `{'policy','capture_dir','server_name','stats_log'}` for whichever keys are present —
+    `{'policy','capture_dir','server_name','stats_log','primer'}` for whichever keys are present —
     or None when `entry` is not a terse-wrapped entry.
 
     Only the segment BETWEEN the `proxy` subcommand and the first `--` (the downstream
@@ -1039,7 +1039,11 @@ def parse_proxy_opts(entry: dict) -> dict[str, str] | None:
                 # else" (#397). An entry with `--stats-log /elsewhere.jsonl` writes real
                 # records that `terse stats` never reads, which looks exactly like an entry
                 # that wrote nothing — except that nothing in the row could say so.
-                "--stats-log": "stats_log"}
+                "--stats-log": "stats_log",
+                # `--primer never|auto` (#325): `terse stats` reads it to price the entry's
+                # primer, so it has to be found on THIS side of the `--` like every other
+                # terse flag -- a downstream's own `--primer` is never terse's.
+                "--primer": "primer"}
     opts: dict[str, str] = {}
     i = 0
     while i < len(seg):
@@ -1718,6 +1722,7 @@ def _scan_target(target: Target, scope: str, approval=None) -> list[dict]:
         diff = None
         stats_on = None
         stats_log = None
+        primer_mode = None
         # A `folded-and-live` entry is live under its own name AND named in the peers
         # file, so when that live entry launches via terse it runs its own proxy and
         # writes its own ledger rows under its own guessed identity — which is exactly
@@ -1766,6 +1771,8 @@ def _scan_target(target: Target, scope: str, approval=None) -> list[dict]:
             # file. Same defect family as #285's `--server-name=`.
             opts = parse_proxy_opts(servers[name]) or {}
             policy = opts.get("policy") or policy
+            # None = no `--primer` baked, which runs the proxy's default (`always`).
+            primer_mode = opts.get("primer")
             # Only an absolute policy path is unambiguously checkable: a relative one
             # resolves against the MCP launcher's cwd, which a status scan can't know, so we
             # never false-flag it (see #58's drift lineage — the point is to surface real
@@ -1856,6 +1863,8 @@ def _scan_target(target: Target, scope: str, approval=None) -> list[dict]:
                     "policy_missing": policy_missing, "launcher": launcher,
                     "launcher_missing": launcher_gone, "wraps": wraps, "diff": diff,
                     "stats": stats_on, "stats_log": stats_log, "config": str(target.cfg),
+                    # The baked `--primer` mode (#325), None when absent (= `always`).
+                    "primer": primer_mode,
                     # Which router a peer sits behind — the one fact a folded row can't
                     # otherwise state, and the first thing you need to un-fold it.
                     "router": (router_name if state in ("folded", "folded-unstashed",
@@ -1880,7 +1889,7 @@ def scan_scopes(*, cfg: Path | None = None, file: str | None = None,
     """Enumerate every terse-relevant mcpServers entry across all three scopes,
     read-only — no writes, no directory creation, never raises. One row per
     (scope, server): {scope, server, state, policy, policy_missing, launcher,
-    launcher_missing, wraps, diff, stats, stats_log, config, router, peers_error,
+    launcher_missing, wraps, diff, stats, stats_log, primer, config, router, peers_error,
     ledger_identity, ledger_identity_explicit}, state one of
     "wrapped"
     (stashed and present), "wrapped-unstashed" (the entry launches via terse but has no
