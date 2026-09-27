@@ -346,10 +346,10 @@ def _aggregate_by_model(pairs: list[tuple], answerers: dict[str, Answerer], tria
     return results
 
 
-def run_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
-                     trials: int = 1, progress: Progress | None = None) -> dict:
-    """Run the diff-fluency eval over consecutive same-tool payload PAIRS (sorted by sha
-    for determinism — the order the proxy would see them). Returns {model: [rows]}."""
+def diff_pairs(envelopes: list[dict]) -> list[tuple]:
+    """The consecutive same-tool JSON pairs `run_diff_fluency` asks over, as
+    `(tool, sha, prev_obj, curr_obj)`. Public so a caller can tell the report how many
+    pairs existed: an empty result with pairs is a different fix than one without (#266)."""
     pairs: list[tuple] = []
     for tool, csha, prev_raw, curr_raw in _iter_consecutive_pairs(envelopes):
         try:
@@ -358,7 +358,14 @@ def run_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
         except (json.JSONDecodeError, TypeError):
             continue
         pairs.append((tool, csha, prev_obj, curr_obj))
-    return _aggregate_by_model(pairs, answerers, trials, run_diff_payload,
+    return pairs
+
+
+def run_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
+                     trials: int = 1, progress: Progress | None = None) -> dict:
+    """Run the diff-fluency eval over consecutive same-tool payload PAIRS (sorted by sha
+    for determinism — the order the proxy would see them). Returns {model: [rows]}."""
+    return _aggregate_by_model(diff_pairs(envelopes), answerers, trials, run_diff_payload,
                                progress=progress)
 
 
@@ -560,13 +567,9 @@ def run_text_diff_payload(prev: str, curr: str, answerer: Answerer,
     return out
 
 
-def run_text_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
-                          trials: int = 1, progress: Progress | None = None) -> dict:
-    """Same tool-pairing loop as run_diff_fluency, inverted: only pairs envelopes whose
-    raw text is NOT valid JSON on EITHER side (text-diff's domain; JSON payloads are
-    run_diff_fluency's domain instead) — classify_shape (already used by measure.py)
-    catches the Python-3.11 RecursionError on deeply-nested JSON that a bare
-    json.loads/except wouldn't."""
+def text_diff_pairs(envelopes: list[dict]) -> list[tuple]:
+    """The consecutive same-tool TEXT pairs `run_text_diff_fluency` asks over, as
+    `(tool, sha, prev_raw, curr_raw)` — the `diff_pairs` counterpart (#266)."""
     pairs: list[tuple] = []
     for tool, csha, prev_raw, curr_raw in _iter_consecutive_pairs(envelopes):
         if classify_shape(curr_raw) not in (LONG_TEXT, OTHER):
@@ -574,5 +577,16 @@ def run_text_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
         if classify_shape(prev_raw) not in (LONG_TEXT, OTHER):
             continue  # prev is JSON-shaped -> not a text-to-text transition
         pairs.append((tool, csha, prev_raw, curr_raw))
-    return _aggregate_by_model(pairs, answerers, trials, run_text_diff_payload,
+    return pairs
+
+
+def run_text_diff_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
+                          trials: int = 1, progress: Progress | None = None) -> dict:
+    """Same tool-pairing loop as run_diff_fluency, inverted: only pairs envelopes whose
+    raw text is NOT valid JSON on EITHER side (text-diff's domain; JSON payloads are
+    run_diff_fluency's domain instead) — classify_shape (already used by measure.py)
+    catches the Python-3.11 RecursionError on deeply-nested JSON that a bare
+    json.loads/except wouldn't."""
+    return _aggregate_by_model(text_diff_pairs(envelopes), answerers, trials,
+                               run_text_diff_payload,
                                label="fluency --text-diff", progress=progress)

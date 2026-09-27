@@ -13,7 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **An empty diff report says why it is empty (#266).** `terse fluency --diff` and `--text-diff-eval` printed one hint ("no model answers, or no same-tool pairs") for three different states, so a corpus whose pairs simply generated no questions was sent off to capture more pairs. The report now names one state: no model configured, no same-tool pairs, or N pairs that yielded no question, with the cause for that report (JSON: no lossless diff or a shape the question generator cannot ask about; text: no lossless text diff). `fluency.diff_pairs` and `fluency.text_diff_pairs` expose the pairs the harnesses ask over.
+- **The codec verdict sizes a `cli:` model's request as it is sent (#450).** `--max-input-tokens` counted the tool-channel instruction and the tool definitions for text-channel models, which are sent neither, and left out the `claude -p` preamble those models are sent. The count now follows the answer channel and adds the preamble's recorded size (3,131 tokens, from an earlier `claude -p` measurement; not re-measured, and in Claude's tokenizer rather than cl100k). The pre-flight refusal no longer tells a text-channel model it "answered without calling terse.record_answer".
 
 ## [0.41.3] - 2026-09-26
 
