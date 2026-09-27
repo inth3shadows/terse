@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Changed
+
+- **The bundled demo server's tools advertise `annotations` and describe themselves more fully (#467).** `demo_orders` and `demo_logs` are synthetic, deterministic and do no I/O, so both now carry `{"readOnlyHint": true, "idempotentHint": true, "openWorldHint": false}`; their descriptions cross-reference each other and note what a larger `limit`/`lines` shows. Raises a registry inspector's (Glama's) score on the demo listing; the proxy's `tools/list` pass-through was verified unchanged for both the single proxy and multiproxy.
+
 ### Fixed
 
 - **The CHANGELOG graduation check no longer depends on commit history (#436).** `test_unreleased_does_not_describe_work_that_already_shipped` decided whether an `[Unreleased]` entry had shipped by blaming the line and asking which tag contained that commit, so a pull request whose branch moved a released entry passed while its squash on `main` failed; that is how #422's release was skipped. An entry now counts as shipped when the same line appears in `CHANGELOG.md` at a release tag, and is attributed to the oldest such tag. A branch and its squash get the same answer, and a released entry moved back into `[Unreleased]` is now caught.
