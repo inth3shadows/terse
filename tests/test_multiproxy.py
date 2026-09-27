@@ -635,6 +635,23 @@ def test_build_peers_never_attaches_a_lazy_primer(monkeypatch):
     assert transforms.TABLE_MARKER in blocks[0]["text"]
 
 
+def test_build_peers_shares_one_retrieve_hit_counter(monkeypatch):
+    # #252: the router answers every terse.retrieve through peers[0], so the hit that
+    # should retract a rule is counted there. Each peer must see that SAME dict, or a
+    # dropped kwarg silently turns `retract_after` off behind the router.
+    from terse import multiproxy as mp
+
+    monkeypatch.setattr(mp, "build_transport",
+                        lambda target, headers=None, env=None, cwd=None: _FakePeerTransport())
+    specs = [DownstreamSpec(name=n, target=[n], headers={}, policy_path=None)
+             for n in ("a", "b")]
+    hits: dict = {}
+    peers = _build_peers(specs, PLAIN_POLICY, debug=False, capture=None, audit=None,
+                         store=OrderedDict(), store_lock=Lock(), dropped_bytes=[0],
+                         retrieve_hits=hits)
+    assert all(p.inter._retrieve_hits is hits for p in peers)
+
+
 def test_load_multi_config_rejects_name_containing_prefix_sep(tmp_path):
     # Regression: a name like "gh__api" wasn't rejected, so it could shadow a shorter
     # peer name ("gh") under _route_call's first-occurrence "__" split.

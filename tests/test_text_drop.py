@@ -431,3 +431,77 @@ def test_the_quoted_locator_is_unique_on_what_the_model_actually_sees():
     bare = [re.sub(r"^\s*\d+\t", "", ln)
             for ln in store[recall.expected_handle].splitlines() if ln.strip()]
     assert bare.count(quoted) == 1
+
+
+# --------------------------------------------------------------------------- #
+# keep_first: the first N qualifying blocks stay inline (#252)
+# --------------------------------------------------------------------------- #
+TWO_BLOCKS = DOC + "\n#### src/b.py\n\n```go\n" + CODE.replace("line", "row") + "\n```\n"
+
+
+def test_keep_first_leaves_the_leading_block_inline_and_drops_the_rest():
+    applied, store = _apply(TWO_BLOCKS, _drop_rule(keep_first=1))
+    assert "line 10 of source" in applied.text      # block 0 resident
+    assert "row 10 of source" not in applied.text   # block 1 dropped
+    assert len(store) == 1
+    assert lossy.restore_text_drops(applied.text, store.__getitem__) == TWO_BLOCKS
+
+
+def test_keep_first_counts_only_blocks_above_the_floor():
+    # A tiny leading block is never dropped anyway, so it must not use up the kept slot.
+    text = "intro\n\n```\ntiny\n```\n" + TWO_BLOCKS
+    applied, store = _apply(text, _drop_rule(keep_first=1))
+    assert "line 10 of source" in applied.text
+    assert "row 10 of source" not in applied.text
+    assert len(store) == 1
+
+
+def test_keep_first_covering_every_block_drops_nothing():
+    applied, store = _apply(TWO_BLOCKS, _drop_rule(keep_first=5))
+    assert applied.text == TWO_BLOCKS
+    assert store == {}
+    assert not any(w.startswith("lossy:") for w in applied.warnings)
+
+
+def test_keep_first_zero_is_todays_behaviour():
+    assert len(_apply(TWO_BLOCKS, _drop_rule(keep_first=0))[1]) == 2
+
+
+def test_invalid_keep_first_warns_and_falls_back_to_zero():
+    for bad in (-1, True, "1", 1.5):
+        rule = _drop_rule(keep_first=bad)
+        assert any("keep_first" in w for w in _lossy_warnings(rule)), bad
+        assert len(_apply(TWO_BLOCKS, rule)[1]) == 2, bad
+
+
+def test_keep_first_on_a_json_field_warns_it_is_ignored():
+    rule = _rule({"$.body": {"lossy": "drop-to-retrieve", "keep_first": 1}})
+    assert any("keep_first" in w for w in _lossy_warnings(rule))
+
+
+def _recall_anchor(q) -> str:
+    import re
+    # Both prompt forms quote the anchor as a JSON string right before ". What".
+    return json.loads(re.search(r'is (".*?")\. What', q.prompt).group(1))
+
+
+def test_drop_eval_skips_when_every_dropped_line_is_visible_in_a_kept_block():
+    # keep_first leaves block 0 resident; a dropped block that only repeats it offers no
+    # anchor a model could not read off the kept copy, so no recall question is asked.
+    dup = DOC + "\n#### src/b.py\n\n```python\n" + CODE + "\n```\n"
+    probe = dropeval._text_questions_and_staging(dup, _drop_rule(keep_first=1),
+                                                 "codegraph_explore")
+    assert probe.questions == []
+    assert probe.reason == "no_anchor_line"
+
+
+def test_drop_eval_anchors_on_a_line_only_the_dropped_block_has():
+    unique = "\n".join(f"unique tail {i} only in the dropped block, long enough" for i in range(8))
+    text = DOC + "\n#### src/b.py\n\n```python\n" + CODE + "\n" + unique + "\n```\n"
+    rule = _drop_rule(keep_first=1)
+    probe = dropeval._text_questions_and_staging(text, rule, "codegraph_explore")
+    recall = [q for q in probe.questions if q.needs_retrieve]
+    assert len(recall) == 1
+    anchor = _recall_anchor(recall[0])
+    assert anchor.startswith("unique tail")
+    assert anchor not in probe.applied.text
