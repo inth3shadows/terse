@@ -694,6 +694,25 @@ def test_significant_harm_survives_a_trimmed_corpus():
 # --------------------------------------------------------------------------- #
 # Fix plan D1-D3: the dual review's reproductions, verbatim
 # --------------------------------------------------------------------------- #
+def test_a_text_channel_model_does_not_withhold_the_gateway_models_rate():
+    """#450: a `cli:` model answers in text and never carries `*_calls`, because compliance
+    does not apply to it. Treating it like an uncounted tool model withheld the gateway
+    model's rate from a SAFE cell that it had fully measured."""
+    tool = [_row(f"q{i}", 1, 1, raw_calls=1, terse_calls=int(i >= 4)) for i in range(20)]
+    text = [_answered_row(f"q{i}", 1, 1, 1, channel="text", raw_parsed=1, terse_parsed=1)
+            for i in range(20)]
+    for cli in ("cli:haiku", "zz-cli"):              # sorts before AND after `gw`
+        cell = _safe_cell({cli: _tagged_t(text), "gw": _tagged_t(
+            [{**r, "channel": "tool"} for r in tool])})
+        # Only `gw` was measured, so the rate is named as its own: the Model column shows
+        # the tie-break model, which is the text model when it sorts first, and an unnamed
+        # rate there would read as the text model's (review of #480).
+        assert "compliance raw 100% (`gw`), terse 80% (`gw`) in this run" in cell, cell
+    first = _safe_cell({"cli:haiku": _tagged_t(text), "gw": _tagged_t(
+        [{**r, "channel": "tool"} for r in tool])})
+    assert "| `cli:haiku` |" in first and "terse 80% (`gw`)" in first, first
+
+
 def _answered_row(qid, raw_ok, terse_ok, trials, raw_ans=None, terse_ans=None, **extra):
     raw_ans = trials if raw_ans is None else raw_ans
     terse_ans = trials if terse_ans is None else terse_ans
