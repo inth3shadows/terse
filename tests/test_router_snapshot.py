@@ -461,3 +461,40 @@ def test_list_changed_is_sent_only_for_a_capability_that_advertised_it(tmp_path)
     notes = [m["method"] for m in (json.loads(ln) for ln in out.getvalue().splitlines())
              if "method" in m]
     assert notes == ["notifications/prompts/list_changed"]
+
+
+def test_peers_swapping_initialize_arrival_order_is_not_reported_as_a_change(tmp_path, capsys):
+    # Instructions are joined in ARRIVAL order by the real merge. Two instruction-bearing
+    # peers answering in the opposite order to the snapshot's is not a change.
+    def init(text):
+        return {"result": {"protocolVersion": "2025-06-18",
+                           "capabilities": {"tools": {}}, "instructions": text}}
+    parts = {"initialize": {"a": init("A NOTES."), "b": init("B NOTES.")},   # a first
+             "tools/list": {"a": {"result": {"tools": [{"name": "ta"}]}},
+                            "b": {"result": {"tools": [{"name": "tb"}]}}}}
+    path = tmp_path / "snap.json"
+    RouterSnapshot(path, "fp").save(parts, "2025-06-18")
+    before = path.read_bytes()
+    ts, out = [_FakeTransport(), _FakeTransport()], io.StringIO()
+    router = Router([Peer("a", ts[0], Interceptor(POLICY)),
+                     Peer("b", ts[1], Interceptor(POLICY))],
+                    out, Lock(), broadcast_timeout=1000, snapshot=RouterSnapshot(path, "fp"))
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18"}}))
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        for i in (1, 0):                                                       # b first
+            sent = _await_sent(ts[i], "initialize")
+            router.from_peer(i)(json.dumps({"jsonrpc": "2.0", "id": sent["id"],
+                                            **parts["initialize"]["ab"[i]]}))
+        for i in (0, 1):
+            sent = _await_sent(ts[i], "tools/list")
+            router.from_peer(i)(json.dumps({"jsonrpc": "2.0", "id": sent["id"],
+                                            **parts["tools/list"]["ab"[i]]}))
+    finally:
+        router.close_senders()
+    assert "live initialize differs" not in capsys.readouterr().err
+    assert not [ln for ln in out.getvalue().splitlines() if "list_changed" in ln]
+    assert path.read_bytes() == before

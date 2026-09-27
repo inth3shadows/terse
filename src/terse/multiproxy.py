@@ -359,7 +359,12 @@ def snapshot_cwd(specs: list[DownstreamSpec]) -> str | None:
     served in the wrong one — a list_changed, the very cache bust #270 removes, and an
     `initialize.instructions` naming tools that do not exist there, which nothing in MCP
     can correct mid-session. So such a snapshot is per directory: in its path and in its
-    fingerprint."""
+    fingerprint.
+
+    KNOWN LIMITATION: the first session in a NEW directory still takes the blocking path,
+    and with per-session git worktrees (`claudew`) that is most new worktrees. Snapshot
+    files are also never pruned. Follow-up options, not done here: key by the git common
+    dir where codegraph's index location allows it, and an age-based prune."""
     return os.getcwd() if any(s.cwd is None for s in specs) else None
 
 
@@ -380,7 +385,10 @@ def peers_fingerprint(specs: list[DownstreamSpec], cwd: str | None = None) -> st
 
 def _init_view(result: dict) -> dict:
     """The part of a merged `initialize` result a client acts on, for comparing a served
-    snapshot with the live one. `serverInfo` is left out: it names this process."""
+    snapshot with the live one. `serverInfo` is left out: it names this process. Callers
+    merge from CONFIG-ordered parts (`Router._stable_init_view`), because the real merge
+    joins instructions in arrival order and two peers swapping arrival would otherwise
+    read as a change."""
     return {"instructions": result.get("instructions"),
             "capabilities": result.get("capabilities")}
 
@@ -1331,6 +1339,14 @@ class Router:
         return {self.peers[i].name: {k: part[k] for k in ("result", "error") if k in part}
                 for i, part in pb.parts.items()}
 
+    def _stable_init_view(self, pb: _PendingBroadcast) -> dict:
+        """`_init_view` of `pb` merged with its parts in CONFIG order instead of arrival
+        order, so the served-vs-live comparison sees content changes only."""
+        ordered = _PendingBroadcast(kind=pb.kind, client_id=None, seq=pb.seq,
+                                    remaining=set(), done=True,
+                                    parts={i: pb.parts[i] for i in sorted(pb.parts)})
+        return _init_view(self._merge_initialize(ordered))
+
     def _fast_initialize(self, msg: dict) -> bool:
         """Answer the client's `initialize` from the snapshot and start the peers' own
         handshake in the background. False (the caller broadcasts as before) when there is
@@ -1360,9 +1376,10 @@ class Router:
         warm = _Warm(seq=seq, parts=snap)
         with self._snap_lock:
             self._warm = warm             # a re-initialize supersedes any earlier session
-        result = self._merge_initialize(self._stored_pb("initialize", snap["initialize"], seq))
+        stored = self._stored_pb("initialize", snap["initialize"], seq)
+        result = self._merge_initialize(stored)
         caps = result["capabilities"]
-        warm.served_init = _init_view(result)
+        warm.served_init = self._stable_init_view(stored)
         advertised = dict(caps)
         for surface in ("tools", "prompts", "resources"):
             cap = caps.get(surface)
@@ -1463,7 +1480,7 @@ class Router:
             self._record(pb)
         live_init = warm.live_init
         if live_init is not None and not live_init.remaining \
-                and _init_view(self._merge_initialize(live_init)) != warm.served_init:
+                and self._stable_init_view(live_init) != warm.served_init:
             sys.stderr.write("[terse-multiproxy] the live initialize differs from the "
                              "snapshot this session was answered from (instructions or "
                              "capabilities); it cannot be re-sent mid-session, so the "
