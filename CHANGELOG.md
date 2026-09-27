@@ -21,6 +21,9 @@ fails that pull request until the section has moved.
 
 - **The CHANGELOG graduation check no longer depends on commit history (#436).** `test_unreleased_does_not_describe_work_that_already_shipped` decided whether an `[Unreleased]` entry had shipped by blaming the line and asking which tag contained that commit, so a pull request whose branch moved a released entry passed while its squash on `main` failed; that is how #422's release was skipped. An entry now counts as shipped when the same line appears in `CHANGELOG.md` at a release tag, and is attributed to the oldest such tag. A branch and its squash get the same answer, and a released entry moved back into `[Unreleased]` is now caught.
 
+- **`terse stats` sizes a standalone primer against the name the proxy gates on (#428).** The estimate tested policy rules against the `mcpServers` key, but a running `terse proxy` gates its primer on its baked `--server-name`, and on no name at all when none is baked. For an unbaked entry such as a `folded-and-live` duplicate, a `kb.*` passthrough rule sized a 0-token primer for a process that sends the full 248. Routers still size their union primer against peer names. Only the `estimated` path changes; a recorded primer row still wins.
+- **An entry that runs no proxy no longer hides another entry's stranded history (#430).** `terse --help proxy -- kb-mcp` has no `proxy` subcommand and writes no ledger rows, but its `kb-mcp` identity still counted as live, which removed the real entry's `superseded_labels` line for `kb-mcp`. Only entries that write to the ledger being read now count as live.
+
 ## [0.41.0] - 2026-09-26
 
 ### Added
