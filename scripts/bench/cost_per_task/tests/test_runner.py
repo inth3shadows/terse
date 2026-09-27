@@ -733,7 +733,7 @@ def test_make_shared_code_worktree_creates_a_real_worktree_at_pinned_commit(tmp_
     base_dir.mkdir()
     wt = r.make_shared_code_worktree(base_dir, repo, head)
     try:
-        assert wt == base_dir / "shared-code-worktree"
+        assert wt.parent == base_dir and wt.name.startswith("shared-code-worktree-")
         assert (wt / ".git").exists()
         wt_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt, capture_output=True,
                                   text=True, check=True).stdout.strip()
@@ -881,3 +881,24 @@ def test_c_primer_flag_rejects_unknown_mode():
     import pytest
     with pytest.raises(SystemExit):
         r.main(["--c-primer", "sometimes", "--out", "/x", "--config-dir", "/y"])
+
+
+def test_shared_code_worktree_basename_differs_per_config_dir(monkeypatch, tmp_path):
+    # runecho enrolls/un-enrolls by BASENAME: two batches must never share one.
+    monkeypatch.setattr(r.subprocess, "run", lambda *a, **kw: None)
+    one = r.make_shared_code_worktree(tmp_path / "primer-always", tmp_path, "HEAD")
+    two = r.make_shared_code_worktree(tmp_path / "primer-never", tmp_path, "HEAD")
+    again = r.make_shared_code_worktree(tmp_path / "primer-always", tmp_path, "HEAD")
+    assert one.name != two.name
+    assert one.name == again.name
+
+
+def test_run_one_row_records_primer_attached(monkeypatch, tmp_path):
+    from terse.proxy import PRIMER_HEAD
+    records = [_usage_record(), {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "x", "content": PRIMER_HEAD + "{}"}]}}]
+    row = _run_one(monkeypatch, tmp_path,
+                    run_side_effect=_fake_process(returncode=0,
+                                                   stdout=json.dumps({"result": "ok"})),
+                    transcript_records=records, c_primer="always")
+    assert row["primer_attached"] is True

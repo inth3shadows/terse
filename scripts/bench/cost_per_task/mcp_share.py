@@ -69,3 +69,57 @@ def mcp_share(transcript_path: Path) -> float:
                     if tid in mcp_use_ids:
                         mcp_chars += _content_len(block.get("content"))
     return (mcp_chars / total_chars) if total_chars else 0.0
+
+
+def primer_needle() -> str:
+    """The opening clause of terse's PRIMER_HEAD ("Some tool results are
+    'terse'-compressed") -- present in every non-empty primer assembly, whether
+    attached as a text block or inside a typed result's `__terse_primer__` wrapper, and
+    free of any character JSON re-encoding would escape. Imported, never copied, so a
+    reworded primer can't silently turn every run into 'not attached'."""
+    from terse.proxy import PRIMER_HEAD
+    return PRIMER_HEAD.split(" (", 1)[0]
+
+
+def primer_attached(transcript_path: Path | None) -> bool | None:
+    """Did the model see terse's format primer in this session (#325)?
+
+    Scans every `tool_result` block in the transcript, and every file in the session's
+    offloaded `<session>/tool-results/` directory (a large result is written there
+    instead of inline), for `primer_needle()`. None when there is no transcript to judge
+    by. Blind spot: MCP `initialize` instructions are not recorded in a Claude Code
+    transcript, so a primer delivered ONLY there would read as False -- terse attaches
+    it lazily to the first compressed tool result (#212), which this does see."""
+    if transcript_path is None:
+        return None
+    transcript_path = Path(transcript_path)
+    if not transcript_path.exists():
+        return None
+    needle = primer_needle()
+    with transcript_path.open() as fh:
+        for line in fh:
+            if needle not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = rec.get("message") if isinstance(rec, dict) else None
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if (isinstance(block, dict) and block.get("type") == "tool_result"
+                        and needle in json.dumps(block.get("content"))):
+                    return True
+    offload_dir = transcript_path.parent / transcript_path.stem / "tool-results"
+    if offload_dir.is_dir():
+        for f in sorted(offload_dir.rglob("*")):
+            if not f.is_file():
+                continue
+            try:
+                if needle in f.read_text(errors="replace"):
+                    return True
+            except OSError:
+                continue
+    return False

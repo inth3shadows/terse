@@ -16,18 +16,24 @@ C's router argv (omitted = today's argv, unchanged) and records it on every row 
 `c_primer`. To compare the three modes with everything else identical, run one
 arm-C-only batch per mode with the SAME --c-terse (a terse that has `--primer`; the
 runner refuses to start otherwise), --model, --effort, --reps and --seed, and a
-SEPARATE --config-dir and --out each (concurrently is fine):
+SEPARATE --config-dir and --out each, one after another:
 
   T=<worktree>/.venv/bin/terse
   for m in always never auto; do
     uv run python scripts/bench/cost_per_task/runner.py --arms C --c-terse "$T" \\
       --c-primer $m --seed 1 --config-dir "$SCRATCH/primer-$m" \\
-      --out "$SCRATCH/primer-$m.jsonl" &
-  done; wait
+      --out "$SCRATCH/primer-$m.jsonl"
+  done
   uv run python scripts/bench/cost_per_task/analysis.py --by-primer "$SCRATCH"/primer-*.jsonl
 
-Each batch runs its own discarded warm-up rep first (to that --config-dir's
-warmup.jsonl, never --out), so the cold-cache handling is the same per mode.
+SEQUENTIALLY, not in parallel: concurrent batches share one rate limit (a
+rate-limited row is excluded as infra, so the modes would end up with different
+n) and share the operator's live kb/runecho/codegraph backends, so one mode's
+load would perturb another's latency and timeouts. Each batch runs its own discarded warm-up rep first (to that
+--config-dir's warmup.jsonl, never --out), so the cold-cache handling is the same
+per mode. Every row records `primer_attached` (did the model actually see the
+primer); `--by-primer` stratifies on it and flags a mode that never attached on a
+task as vacuous there.
 """
 from __future__ import annotations
 
@@ -397,8 +403,14 @@ def remove_workdir(task: dict, workdir: Path, repo: Path) -> None:
 def make_shared_code_worktree(base_dir: Path, repo: Path, pinned_commit: str) -> Path:
     """ONE git worktree, pinned to `pinned_commit`, at a fixed path under
     `base_dir` -- created once per harness invocation and reused by every
-    'repo' task rep, never removed/recreated per rep like `make_workdir`."""
-    wt = base_dir / "shared-code-worktree"
+    'repo' task rep, never removed/recreated per rep like `make_workdir`.
+
+    The basename carries a short hash of `base_dir`: runecho enrolls a repo by its cwd
+    BASENAME and `cleanup_runecho_enrollment` removes by that name, so two batches with
+    different --config-dirs must never share one."""
+    import hashlib
+    tag = hashlib.sha256(str(Path(base_dir).resolve()).encode()).hexdigest()[:8]
+    wt = base_dir / f"shared-code-worktree-{tag}"
     subprocess.run(["git", "worktree", "add", "--detach", str(wt), pinned_commit],
                     cwd=repo, check=True, capture_output=True, text=True)
     return wt
@@ -637,6 +649,9 @@ def run_one(*, task: dict, arm: str, rep: int, model: str, arm_config_path: Path
         computed_cost_usd=computed_usd,
         cost_gap=cost_model.cost_gap_flag(computed_usd, cli_cost_usd),
         mcp_share_approx=share,
+        # Whether the model actually saw the format primer (#325) -- arm C runs with
+        # --no-stats, so the transcript is the only record. None = no transcript.
+        primer_attached=mcp_share_mod.primer_attached(transcript),
         **stderr_digest(stderr),
     )
 
