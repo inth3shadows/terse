@@ -471,7 +471,7 @@ def test_proxy_cmd_parses_and_forwards_headers(monkeypatch):
 
     def fake_run_proxy(cmd, pol, debug=False, stdin=None, stdout=None,
                        capture_dir=None, debug_log=None, headers=None, stats_log=None,
-                       server_name=None):
+                       server_name=None, primer_mode="always"):
         captured["cmd"] = cmd
         captured["headers"] = headers
         captured["stats_log"] = stats_log

@@ -43,7 +43,7 @@ from . import text_diff, transforms
 # `tokenize` this module already imports), and there is no cycle -- `stats` never imports
 # `proxy`. The WRITER is still imported lazily in `run_proxy` as before. Naming the site's
 # cadence from the one definition beats re-spelling the literal at each call site.
-from .stats import PRIMER_CADENCE_ONCE
+from .stats import PRIMER_CADENCE_ONCE, PRIMER_DECLINE_AUTO, PRIMER_DECLINE_NEVER
 from .tokenize import count_cl100k
 from .transport import HttpTransport, build_transport
 
@@ -205,6 +205,81 @@ PRIMER_TAIL = "Always reason about the fully reconstructed result."
 TERSE_PRIMER = (PRIMER_HEAD + PRIMER_TABLE + PRIMER_DICT + PRIMER_EMBEDDED + PRIMER_DIFF
                 + PRIMER_DROPPED + PRIMER_TAIL)
 
+# `terse proxy --primer MODE` (#325). `always` is the behaviour before the flag existed (the
+# lazy attach of #211/#212) and stays the default, so no installed entry changes on upgrade.
+# `never` attaches nothing, ever. `auto` attaches lazily like `always`, but only on the first
+# result whose COMPRESSED form carries a wire form the primer is measured to rescue (see
+# `wire_needs_primer`); once attached the session is primed and the latch is unchanged.
+PRIMER_ALWAYS = "always"
+PRIMER_NEVER = "never"
+PRIMER_AUTO = "auto"
+PRIMER_MODES = (PRIMER_ALWAYS, PRIMER_NEVER, PRIMER_AUTO)
+
+# PROVISIONAL (#325), from #249's per-question evidence -- revisit with Phase 2's
+# cost-per-task data, not by intuition. An ALLOWLIST of what `auto` may send unexplained,
+# because the evidence says where the primer is load-bearing more precisely than a density
+# or width threshold can:
+#
+#   * The whole stress-corpus gap was `deref` on two shapes: a hoisted `subcols` column
+#     (the model returned the positional subrow instead of re-keying it) and an object-valued
+#     alias whose record had `absent_cols` (the model wrote nulls for missing keys). Separately,
+#     24 absent-vs-null questions scored near chance without the table paragraph. Those forms
+#     plus the ones #249 never measured (diff, text diff, embedded JSON, dropped) attach.
+#   * Flat tables and scalar-only dictionary aliases -- wide_table (12 cols), long_table,
+#     heavy_alias (density 0.33), mixed_realistic -- were read at raw parity by every model
+#     WITHOUT the primer. Those are the only forms `auto` sends unexplained.
+#
+# Alias density and table width were measured as the signal first and REJECTED: over the
+# #249 corpora the real payloads are denser and wider than the stress ones (gh_pulls: 36 cols,
+# alias density 0.42; stress.heavy_alias: 4 cols, 0.33), so no threshold separates the two.
+# Consequence, stated so nobody reads `auto` as a big saver: on the real GitHub corpus it
+# attaches on 6 of 9 payloads -- it declines on flat, scalar-aliased results only.
+_AUTO_TABLE_KEYS = ("subcols", "absent_cols", "sentinel_cols")
+_AUTO_FORMS = (transforms.DIFF_MARKER, text_diff.DIFF_MARKER, transforms.JSON_STR_MARKER,
+               transforms.DROPPED_MARKER)
+
+
+def _node_needs_primer(node: Any) -> bool:
+    """`wire_needs_primer` over an already-parsed wire form. Iterative: a wire form is
+    depth-capped by the codec, but this also sees a downstream's own structure."""
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if any(k in cur for k in _AUTO_FORMS):
+                return True
+            if transforms.TABLE_MARKER in cur and any(k in cur for k in _AUTO_TABLE_KEYS):
+                return True
+            if transforms.DICT_MARKER in cur:
+                legend = cur.get("legend")
+                if not isinstance(legend, dict) or any(
+                        isinstance(v, (dict, list)) for v in legend.values()):
+                    return True
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return False
+
+
+def wire_needs_primer(text: str) -> bool:
+    """Does this compressed text carry a wire form `--primer auto` must explain (#325)?
+
+    Errs toward True -- attaching when unsure is what `always` does, and it is the direction
+    #249 measured as safe. Substring checks first, because the allowlist needs a parse only
+    for a dictionary legend: a quoted key or marker anywhere answers True without one, and a
+    payload QUOTING such a key (a code-search tool returning terse's own source) merely
+    over-attaches. Anything that fails to parse also answers True."""
+    if '"__terse_' not in text:
+        return False
+    if any(f'"{k}"' in text for k in _AUTO_TABLE_KEYS + _AUTO_FORMS):
+        return True
+    if f'"{transforms.DICT_MARKER}"' not in text:
+        return False           # flat tables only: the measured-safe form
+    try:
+        return _node_needs_primer(json.loads(text))
+    except (ValueError, RecursionError):
+        return True
+
 
 def build_primer(pol: policy_mod.Policy, server: str | None = None) -> str:
     """The primer for a server governed by `pol` — only the wire forms it can emit (#168).
@@ -284,12 +359,24 @@ class PrimerLatch:
     both attach.
 
     `text` is assigned after the peers are built (`Router.__init__`), because the union is
-    over their loaded policies; nothing reads it before the first `tools/call` result."""
+    over their loaded policies; nothing reads it before the first `tools/call` result.
 
-    def __init__(self, text: str = "") -> None:
+    `mode` is the router's ONE `--primer` mode (#325): every peer reads it from here, so two
+    peers can never disagree about whether the session owes a primer. Under `never` nothing
+    is ever pending, which also lifts the `structuredContent` hold (no primer will come to
+    explain the typed field, so holding it raw would only forfeit the saving)."""
+
+    def __init__(self, text: str = "", mode: str = PRIMER_ALWAYS) -> None:
+        if mode not in PRIMER_MODES:
+            raise ValueError(f"unknown primer mode {mode!r} (expected one of "
+                             f"{', '.join(PRIMER_MODES)})")
         self._lock = Lock()
         self.text = text
+        self.mode = mode
         self.sent = not text
+        # One DECLINE row per session (#325), shared for the same reason `sent` is: N peers,
+        # one session, one decision to record.
+        self.declined = False
 
     def set_text(self, text: str) -> None:
         with self._lock:
@@ -300,15 +387,24 @@ class PrimerLatch:
         """A re-handshake: the client's context -- and the primer it read -- is gone."""
         with self._lock:
             self.sent = not self.text
+            self.declined = False
 
     def pending(self) -> bool:
-        return not self.sent
+        return self.mode != PRIMER_NEVER and not self.sent
 
     def claim(self) -> bool:
         with self._lock:
-            if self.sent:
+            if self.sent or self.mode == PRIMER_NEVER:
                 return False
             self.sent = True
+            return True
+
+    def claim_decline(self) -> bool:
+        """Test-and-set the once-per-session decline record (#325)."""
+        with self._lock:
+            if self.declined:
+                return False
+            self.declined = True
             return True
 
 
@@ -349,11 +445,12 @@ class Interceptor:
                  origins: dict[str, tuple[str, str, str, int | None]] | None = None,
                  retrieve_hits: dict[tuple[str, str], int] | None = None,
                  stats_retrieve: Callable[..., None] | None = None,
-                 stats_primer: Callable[[str, str, bool], None] | None = None,
+                 stats_primer: Callable[..., None] | None = None,
                  ledger_label: str | None = None,
                  log_prefix: str = "[terse-proxy]",
                  lazy_primer: bool = True,
-                 shared_primer: PrimerLatch | None = None):
+                 shared_primer: PrimerLatch | None = None,
+                 primer_mode: str = PRIMER_ALWAYS):
         self.policy = pol
         # The downstream server's name, when the caller knows it (`proxy --server-name`,
         # or a multiproxy peer's config name). Passed to every `policy.select`/`apply` so
@@ -511,6 +608,18 @@ class Interceptor:
         # authoritative. Bounded to one per process so a server that returns
         # `structuredContent` on every call writes one row, not one per result.
         self._primer_suppressed_logged = False
+        # `--primer` (#325). A router peer takes the SHARED latch's mode, never its own, so
+        # the whole fleet decides once; `primer_mode` is only read standalone.
+        if primer_mode not in PRIMER_MODES:
+            raise ValueError(f"unknown primer mode {primer_mode!r} (expected one of "
+                             f"{', '.join(PRIMER_MODES)})")
+        self._primer_mode = (shared_primer.mode if shared_primer is not None
+                             else primer_mode)
+        # Whether this session has recorded its `never`/`auto` DECLINE (#325) -- standalone
+        # only; a router peer uses the latch's. Its own flag, not `_primer_suppressed_logged`:
+        # a `structuredContent` suppression and a mode decline are different facts, and one
+        # must not silence the other's row.
+        self._primer_declined_logged = False
         # Per-result: see the tools/call branch of `transform_response` (#212).
         self._structured_hold = False
         # The two proxy pump threads call note_request (client->server) and
@@ -590,6 +699,7 @@ class Interceptor:
                 # the wire forms to the NEW context.
                 self._primer_sent = not (self._lazy_primer and self._primer_text)
                 self._primer_suppressed_logged = False
+                self._primer_declined_logged = False
                 if self._shared_primer is not None:
                     # Every peer sees the router's broadcast initialize and resets the ONE
                     # shared latch -- idempotent, and done before any tools/call can land.
@@ -694,9 +804,10 @@ class Interceptor:
         with self._local_lock:
             if msg["id"] == self.init_id:
                 self.init_id = None  # one-time
-                if self._lazy_primer:
+                if self._lazy_primer or self._primer_mode == PRIMER_NEVER:
                     # #168 phase 2: no eager priming — the primer attaches to the first
                     # qualifying tools/call result instead (see the end of this method).
+                    # `--primer never` (#325) forbids the eager path too.
                     return line
                 primed = self._augment_initialize(msg)
                 return primed if primed is not None else line
@@ -934,8 +1045,23 @@ class Interceptor:
                     isinstance(b, dict) and b.get("type") == "text"
                     and isinstance(b.get("text"), str) and '"__terse_' in b["text"]
                     for b in content)
-                wrap_primer = wire_form and self._claim_primer()
-                if not wrap_primer:
+                # `--primer auto` (#325): a wire form `auto` sends unexplained goes out
+                # COMPRESSED and unwrapped -- no primer is owed for it, so reverting to the
+                # raw hold would forfeit the saving for nothing. The latch stays armed for a
+                # later result that does need it.
+                auto_declined = (wire_form and self._primer_mode == PRIMER_AUTO
+                                 and not self._result_needs_primer(content, result,
+                                                                   rewrote_structured))
+                wrap_primer = wire_form and not auto_declined and self._claim_primer()
+                if auto_declined:
+                    # `hold_all` is already False (lifted for the tentative pass above).
+                    if self._claim_decline():
+                        deferred.append((
+                            "primer ledger", "(primer)",
+                            partial(self._emit_primer, PRIMER_CADENCE_ONCE,
+                                    self._primer_body(), False, PRIMER_DECLINE_AUTO),
+                        ))
+                elif not wrap_primer:
                     # Revert to exactly today's hold. `changed = False` sends the ORIGINAL
                     # line (the in-place edits to `msg` are discarded with it); the ledger
                     # row is passthrough/`primer_hold`, and every diff base the tentative
@@ -1111,8 +1237,40 @@ class Interceptor:
                     partial(self._emit_primer, PRIMER_CADENCE_ONCE,
                             self._primer_body(), False),
                 ))
+            # `--primer auto` (#325): the attach below additionally needs a wire form the
+            # primer is measured to rescue. Evaluated only while the primer is still owed on
+            # a result that would otherwise attach it, so a primed (or `always`) session
+            # never pays for the scan; the latch stays armed, so a later result that needs
+            # the primer still gets it. The decline is recorded once per session.
+            auto_skip = (primer_pending and not structured_present and marker_in_text
+                         and self._primer_mode == PRIMER_AUTO
+                         and not self._result_needs_primer(content, result, False))
+            if auto_skip and self._claim_decline():
+                deferred.append((
+                    "primer ledger", "(primer)",
+                    partial(self._emit_primer, PRIMER_CADENCE_ONCE,
+                            self._primer_body(), False, PRIMER_DECLINE_AUTO),
+                ))
+            # `--primer never` (#325): nothing is ever pending, so neither branch above nor
+            # the attach below can fire. The decline is still written down, once per session
+            # at the first result carrying a wire form, so `primer_liability` reads a
+            # measured zero rather than billing an estimate on "the server was called". The
+            # scan is gated on the row still being owed, so it runs until the first wire
+            # form and never again.
+            if (self._primer_mode == PRIMER_NEVER and self._lazy_primer
+                    and self.stats_primer is not None and self._decline_unlogged()
+                    and (rewrote_structured or any(
+                        isinstance(b, dict) and b.get("type") == "text"
+                        and isinstance(b.get("text"), str) and '"__terse_' in b["text"]
+                        for b in content))
+                    and self._claim_decline()):
+                deferred.append((
+                    "primer ledger", "(primer)",
+                    partial(self._emit_primer, PRIMER_CADENCE_ONCE,
+                            self._primer_body(), False, PRIMER_DECLINE_NEVER),
+                ))
             if (primer_pending and not structured_present and marker_in_text
-                    and self._claim_primer()):
+                    and not auto_skip and self._claim_primer()):
                 content.insert(0, {"type": "text", "text": self._primer_body()})
                 changed = True
                 # DEFERRED, not called here (review of #311). The decision to bill is
@@ -1927,7 +2085,7 @@ class Interceptor:
             else self._primer_text
 
     def _primer_pending(self) -> bool:
-        if not self._lazy_primer:
+        if not self._lazy_primer or self._primer_mode == PRIMER_NEVER:
             return False
         if self._shared_primer is not None:
             return self._shared_primer.pending()
@@ -1964,6 +2122,33 @@ class Interceptor:
         self._primer_sent = True
         return True
 
+    def _claim_decline(self) -> bool:
+        """Test-and-set this session's one `never`/`auto` decline record (#325). Shared
+        under a router, like the attach latch, so N peers write one row per session."""
+        if self._shared_primer is not None:
+            return self._shared_primer.claim_decline()
+        if self._primer_declined_logged:
+            return False
+        self._primer_declined_logged = True
+        return True
+
+    def _decline_unlogged(self) -> bool:
+        """Cheap precondition for the decline scan: is a decline row still owed?"""
+        if self._shared_primer is not None:
+            return not self._shared_primer.declined
+        return not self._primer_declined_logged
+
+    @staticmethod
+    def _result_needs_primer(content: list, result: Any, rewrote_structured: bool) -> bool:
+        """`--primer auto`'s shape test over the FINAL result (#325): any text block, or a
+        typed field terse rewrote, carrying a wire form `wire_needs_primer` says to explain."""
+        if rewrote_structured and isinstance(result, dict) \
+                and _node_needs_primer(result.get("structuredContent")):
+            return True
+        return any(isinstance(b, dict) and b.get("type") == "text"
+                   and isinstance(b.get("text"), str) and wire_needs_primer(b["text"])
+                   for b in content)
+
     def _claim_suppression(self) -> bool:
         if self._shared_primer is not None:
             # Never under a router (#212): while its primer is owed, a result carrying
@@ -1975,7 +2160,8 @@ class Interceptor:
         self._primer_suppressed_logged = True
         return True
 
-    def _emit_primer(self, cadence: str, text: str, attached: bool = True) -> None:
+    def _emit_primer(self, cadence: str, text: str, attached: bool = True,
+                     reason: str | None = None) -> None:
         """Record a primer that actually went out, with the cadence of the site that sent
         it (#311, #286).
 
@@ -1984,6 +2170,10 @@ class Interceptor:
         to, because the result carried `structuredContent` and the client would have discarded
         it unread (`attached=False`, zero). A session that simply never produces a
         compressible result writes nothing at all, which is correct -- it made no decision.
+
+        `--primer` (#325) adds two more declines, told apart by `reason`: `never` (the mode
+        forbids it) and `auto` (this result's wire forms are ones `auto` sends unexplained).
+        Both are recorded once per session, at the first result carrying a wire form.
 
         Recording the refusal rather than staying silent about it is the whole of #286.
         Silence cannot be read: a window with no primer row is indistinguishable from one
@@ -2005,7 +2195,12 @@ class Interceptor:
         # and a dead ledger going silent is what #131 exists to prevent. It also avoids the
         # substring "stats skipped", which is what a reader (and a test) greps for to count
         # RESULT-ledger failures.
-        emit(cadence, text, attached)
+        # `reason` (#325) only when there is one: the `structuredContent` suppression keeps
+        # its three-argument call, and the record builder defaults its reason.
+        if reason is None:
+            emit(cadence, text, attached)
+        else:
+            emit(cadence, text, attached, reason)
 
     def _emit_stats(self, tool: str, pairs: list[tuple[str, str]], *,
                     display_tool: str | None = None, diff_reason: str | None = None,
@@ -2211,6 +2406,7 @@ def run_proxy(
     stats_log: str | None = None,
     server_name: str | None = None,
     lazy_primer: bool = True,
+    primer_mode: str = PRIMER_ALWAYS,
 ) -> int:
     """Launch the downstream MCP peer `cmd` and proxy JSON-RPC through `Interceptor`.
     `cmd` is either a stdio launch command, or a single-element list holding a URL — in
@@ -2247,6 +2443,9 @@ def run_proxy(
     as a flag — passed through from here only so a test that isn't about primer behavior
     can pin the old always-eager `Interceptor` shape (`lazy_primer=False`) instead of
     threading a leading primer block through every first-compressed-result assertion.
+
+    `primer_mode` is `--primer` (#325): `always` (default, the lazy attach above), `never`, or
+    `auto` -- see `PRIMER_MODES`.
 
     Return code: for a stdio downstream, the child's real exit code (or 127 if it could
     never be launched — #19), exactly as before this function grew a second transport.
@@ -2313,7 +2512,8 @@ def run_proxy(
     inter = Interceptor(pol, debug=debug, capture=capture, audit=audit, stats=stats,
                         stats_retrieve=stats_retrieve, stats_primer=stats_primer,
                         ledger_label=ledger_label,
-                        server_name=server_name, lazy_primer=lazy_primer)
+                        server_name=server_name, lazy_primer=lazy_primer,
+                        primer_mode=primer_mode)
 
     try:
         transport = build_transport(cmd, headers=headers)

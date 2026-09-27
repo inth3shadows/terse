@@ -13,7 +13,9 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **`terse proxy --primer always|never|auto` (#325).** The format primer can now be turned off or made conditional. `always` is the default and is exactly the previous behaviour: the primer attaches once per session, to the first compressed result. `never` attaches none. `auto` attaches it only on a result whose compressed form carries a nested `subcols` column, absent columns, an object-valued alias, a diff, an embedded-JSON or a dropped field. Flat tables and plain string aliases go out without it. Once attached, the session stays primed as before. The rule comes from #249, where every no-primer regression was a nested row or an object alias with absent keys, and flat or heavily aliased tables were read correctly without the primer. Alias density and table width were measured as the signal and rejected, because the real GitHub payloads are denser and wider than the stress ones. On that real corpus `auto` still attaches on 6 of 9 payloads, so it is not a large saving there. With `--config`, one mode applies to the whole router, and under `never` a `structuredContent` result is no longer held raw waiting for a primer. The ledger records a `never` or `auto` decline once per session as an `attached: false` primer row with a new `reason` field (`never`, `auto`, or `structured` for the existing #286 suppression, which older rows default to). `terse stats --json` publishes `reason` on each `primers` row and `primer_mode` on each primer-liability server. An entry baked `--primer never` is priced at zero with `primer_source: "configured"` unless the window recorded an attach. An `auto` entry with no primer rows keeps the estimate, and the report labels it an upper bound. `terse stats` reads a baked `--primer` from the entry's args, on terse's side of the `--` only. `install-mcp` does not bake the flag yet.
 
 ## [0.42.1] - 2026-09-26
 
