@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.41.4] - 2026-09-26
+
 ### Fixed
 
 - **An empty diff report says why it is empty (#266).** `terse fluency --diff` and `--text-diff-eval` printed one hint ("no model answers, or no same-tool pairs") for three different states, so a corpus whose pairs simply generated no questions was sent off to capture more pairs. The report now names one state: no model configured, no same-tool pairs, or N pairs that yielded no question, with the cause for that report (JSON: no lossless diff or a shape the question generator cannot ask about; text: no lossless text diff). `fluency.diff_pairs` and `fluency.text_diff_pairs` expose the pairs the harnesses ask over.
