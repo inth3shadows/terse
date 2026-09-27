@@ -436,7 +436,73 @@ def test_primer_comparison_attachment_flags_vacuous_modes():
     assert st["attached"]["total_cost"] == 90 and st["not_attached"]["total_cost"] == 45
     assert rep["stratified"]["C[never]"]["attached"] is None
     text = an.format_primer_report(an.primer_comparison(_primer_rows()))
-    assert "VACUOUS for this task" in text and "not seen" in text
+    # always saw the primer on both tasks: C[never]'s 0/1 must NOT flag either task.
+    assert "VACUOUS task (control only)" not in text and "not seen" in text
+
+
+# ---------------------------------------------- #491: CI only over primer-exercising tasks
+
+def _issue_325_rows(reps=5):
+    """The #325 shape: `kb` is the only task where always saw the primer; `noisy` is a
+    vacuous task (no mode ever saw it) where always costs ~2x never plus one failure."""
+    rows = []
+    for rep in range(1, reps + 1):
+        rows += [_prow("kb", "always", rep, True, 1000 + rep, True),
+                 _prow("kb", "never", rep, True, 1000 - rep, False),
+                 _prow("noisy", "always", rep, rep != 1, 48000 + 500 * rep, False),
+                 _prow("noisy", "never", rep, True, 23000 + 100 * rep, False)]
+    return rows
+
+
+def test_primer_ci_excludes_vacuous_tasks():
+    rep = an.primer_comparison(_issue_325_rows())["haiku"]
+    assert rep["exercising_tasks"] == ["kb"]
+    assert rep["vacuous_tasks"] == ["noisy"]
+    c = rep["contrasts"]["C[never]-C[always]"]
+    # Only kb is in the CI: a single task resamples to itself, so the CI is its own delta
+    # (-30 tokens/success), not the ~-30k gap the vacuous task would contribute.
+    assert c["ci"] is not None and abs(c["observed"]) < 100
+    assert c["ci"][0] > -100 and c["ci"][1] < 100
+    # Without the fix, the noisy vacuous task drives a large "significant" saving.
+    by_task = rep["tasks"]
+    unrestricted = an.paired_bootstrap_ci(by_task, "C[never]", "C[always]")
+    assert unrestricted["observed"] < -10000
+    # The vacuous task is reported as a pooled control, not dropped.
+    assert rep["arms_vacuous"]["C[always]"]["successes"] == 4
+    assert rep["arms_exercising"]["C[always]"]["n"] == 5
+    # success guard on the exercising set; vacuous success still visible.
+    assert rep["success_not_lower"]["C[never]-C[always]"] is True
+    assert rep["success_not_lower_vacuous"]["C[never]-C[always]"] is True
+    text = an.format_primer_report(an.primer_comparison(_issue_325_rows()))
+    assert "over the 1 primer-exercising task(s)" in text
+    assert "no-effect control" in text
+    noisy_lines = [ln for ln in text.splitlines() if ln.startswith("noisy")]
+    kb_lines = [ln for ln in text.splitlines() if ln.startswith("kb ")]
+    assert any("VACUOUS task" in ln and "C[always]" in ln for ln in noisy_lines)
+    # C[never] never shows the primer by design: its rows are never flagged.
+    assert not any("VACUOUS" in ln for ln in kb_lines + noisy_lines if "C[never]" in ln)
+
+
+def test_primer_success_drop_on_vacuous_task_is_still_reported():
+    rows = [_prow("kb", "always", 1, True, 100, True), _prow("kb", "never", 1, True, 90, False),
+            _prow("noisy", "always", 1, True, 100, False),
+            _prow("noisy", "never", 1, False, 90, False)]
+    rep = an.primer_comparison(rows)["haiku"]
+    assert rep["success_not_lower"]["C[never]-C[always]"] is True
+    assert rep["success_not_lower_vacuous"]["C[never]-C[always]"] is False
+    assert "on vacuous tasks: LOWER" in an.format_primer_report(an.primer_comparison(rows))
+
+
+def test_primer_all_vacuous_emits_no_ci():
+    rows = [r for r in _issue_325_rows() if r["task_id"] == "noisy"]
+    rep = an.primer_comparison(rows)
+    m = rep["haiku"]
+    assert m["exercising_tasks"] == [] and m["vacuous_tasks"] == ["noisy"]
+    assert m["contrasts"]["C[never]-C[always]"]["ci"] is None
+    text = an.format_primer_report(rep)
+    assert "primer comparison is VACUOUS" in text
+    assert "SIGNIFICANT" not in text and "95% CI" not in text
+    assert "success LOWER than baseline on vacuous tasks" not in text
 
 
 def test_primer_label_marks_rows_without_the_flag_unset():
