@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.41.3] - 2026-09-26
+
 ### Fixed
 
 - **A `--server-name` shared with another entry no longer double-counts it (#426).**
