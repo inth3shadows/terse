@@ -854,6 +854,50 @@ def test_ambiguity_needs_a_LAUNCHER_not_merely_a_shared_label(tmp_path):
     assert all(r["ledger_labels"] == ["kb-server"] for r in liab["servers"])
 
 
+def test_two_entries_baking_the_same_explicit_server_name_are_contested(tmp_path):
+    """#426. Two distinct entries, no router anywhere, each baked `--server-name kb`. The
+    launcher test above is about GUESSED basenames; an explicit name is a declaration, and
+    two entries declaring one identity are two processes writing one label that the ledger
+    cannot tell apart. Before the fix each row banked the same 6,000-token saving and
+    reported its own KEEP — #285's double count with the router removed.
+
+    Owner decision (2026-09-26): contested, same as a router-owned label. Both go dark and
+    the report carries the existing duplicate-label explanation and per-label remedy."""
+    pol = _policy(tmp_path)
+    rows = [_scan("kb-user", "wrapped", "kb-server --stdio", pol,
+                  identity="kb", explicit=True),
+            _scan("kb-proj", "wrapped", "kb-server --stdio", pol, scope="project",
+                  identity="kb", explicit=True)]
+    liab = primer_liability(rows, _agg(("kb", 10, 10_000, 4_000)))
+    by_name = {s["server"]: s for s in liab["servers"]}
+
+    for name in ("kb-user", "kb-proj"):
+        assert by_name[name]["contested_labels"] == ["kb"]
+        assert by_name[name]["ledger_labels"] == []
+        assert by_name[name]["blocks"] is None
+        assert by_name[name]["verdict"] != "KEEP"
+    text = "\n".join(build_primer_section(liab))
+    assert "duplicate label" in text
+    assert "`kb`: remove one of them, or give one of kb-proj, kb-user a DISTINCT" in text
+
+
+def test_one_explicit_name_beside_a_guess_of_the_same_label_is_contested(tmp_path):
+    """#426 review. One entry DECLARES `kb`, another merely guesses `kb` from its binary.
+    #285's shared-label exemption rests on two GUESSES only matching when both run the same
+    binary; once either side declares the name, the collision is a choice, and counting the
+    label into both rows banks one saving twice. Contested, like the all-explicit case."""
+    pol = _policy(tmp_path)
+    rows = [_scan("kb-a", "wrapped", "kb-server --stdio", pol,
+                  identity="kb", explicit=True),
+            _scan("kb-b", "wrapped", "/opt/bin/kb --stdio", pol,
+                  identity="kb", explicit=False)]
+    liab = primer_liability(rows, _agg(("kb", 10, 10_000, 4_000)))
+    for s in liab["servers"]:
+        assert s["contested_labels"] == ["kb"]
+        assert s["blocks"] is None
+        assert s["verdict"] != "KEEP"
+
+
 def test_one_server_in_two_scopes_is_not_a_collision_with_itself(tmp_path):
     """`primer_liability` de-duplicates by server NAME — the same entry in project and user
     scope is one server to the client, not two primers. The ambiguity count has to

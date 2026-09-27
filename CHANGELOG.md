@@ -13,7 +13,17 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A `--server-name` shared with another entry no longer double-counts it (#426).**
+  With no router in the fleet, `terse stats` gave each entry the label's full blocks and
+  savings, so one 6,000-token saving was banked twice and both rows reported `KEEP`. A label
+  written by more than one entry is now contested whenever at least one of them DECLARES it
+  with an explicit `--server-name` (whether the other side declares or guesses it), exactly
+  like a router-owned label: neither gets credit, and the report prints the duplicate-label
+  line with a per-label remedy. A label every writer merely guesses from the same binary keeps
+  its existing behaviour. The `router/live duplicate label` verdict reason (unchanged in
+  `--json`) now also covers these declared-name collisions with no router.
 
 ## [0.41.2] - 2026-09-26
 
