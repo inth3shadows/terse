@@ -31,7 +31,7 @@ def _recorder():
     """Capture what the retrieve writer would have appended, without touching disk."""
     rows: list[tuple] = []
 
-    def rec(server, tool, path, hit, payload):
+    def rec(server, tool, path, hit, payload, index=None):
         rows.append((server, tool, path, hit, payload))
 
     return rows, rec
@@ -231,7 +231,7 @@ def test_a_failed_recoverability_gate_leaves_no_attribution_behind(monkeypatch):
     monkeypatch.undo()
     ok = policy_mod.apply(payload, "gh.api.list", pol,
                           drop_sink=committed.__setitem__, server="gh")
-    assert list(ok.drop_origins.values()) == [("gh.api.list", "result[].body")]
+    assert list(ok.drop_origins.values()) == [("gh.api.list", "result[].body", None)]
     assert len(committed) == 1
 
 
@@ -252,7 +252,7 @@ def test_attribution_is_evicted_in_lockstep_with_the_value():
     """The store is explicitly capped; the origins map mirrors it and must be capped by
     the same eviction, or it grows without bound beside a bounded dict."""
     inter = Interceptor(DROP)
-    inter._drop_origin["h0"] = ("gh.api.list", "result[].body")
+    inter._drop_origin["h0"] = ("gh", "gh.api.list", "result[].body", None)
     inter._drop_put("h0", "v0")
     assert "h0" in inter._drop_origin
     original_max = Interceptor.DROPPED_MAX
@@ -305,6 +305,31 @@ def test_a_retrieve_is_billed_to_the_peer_that_dropped_it_not_the_one_that_answe
     server, tool, path, hit, _payload = rows_first[0]
     assert server == "kb", "billed to the answering peer instead of the dropping one"
     assert (tool, path, hit) == ("gh.api.list", "result[].body", True)
+
+
+def test_a_text_drops_block_index_survives_the_peer_hop():
+    """The same peer hop as above, on the TEXT path (#252): the block index is captured
+    by the dropping peer and must reach the ledger row written by the answering one."""
+    from collections import OrderedDict
+    from threading import Lock
+
+    store: OrderedDict = OrderedDict()
+    lock, boxed, origins = Lock(), [0], {}
+    rows: list[tuple] = []
+    peer_first = Interceptor(TEXT_DROP, store=store, store_lock=lock, dropped_bytes=boxed,
+                             origins=origins, ledger_label="gh",
+                             stats_retrieve=lambda s, t, p, h, v, index=None:
+                             rows.append((s, t, p, h, index)))
+    peer_kb = Interceptor(TEXT_DROP, store=store, store_lock=lock, dropped_bytes=boxed,
+                          origins=origins, ledger_label="kb")
+    block = "```python\n{}\n```\n"
+    text = block.format("a = 0\n" * 80) + "prose\n" + block.format("b = 1\n" * 80)
+    out = peer_kb._compress(text, "codegraph_explore")
+    handles = [json.loads(line)["__terse_dropped__"] for line in out.splitlines()
+               if "__terse_dropped__" in line]
+    assert len(handles) == 2
+    assert peer_first.answer_retrieve(_retrieve_call(9, handles[1])) is not None
+    assert rows == [("kb", "codegraph_explore", "$text.code_blocks", True, 1)]
 
 
 def test_an_unattributed_retrieve_falls_back_to_the_answering_proxys_own_label():

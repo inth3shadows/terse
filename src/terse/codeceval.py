@@ -269,7 +269,7 @@ def preflight_questions() -> list[tuple[fluency.Question, str]]:
     return out
 
 
-def _preflight_miss(turn: Turn, expected: Any) -> str | None:
+def _preflight_miss(turn: Turn, expected: Any, channel: str = "tool") -> str | None:
     """`None` if a scorable pre-flight turn matched, else why not — named by failure mode,
     since each needs a different remedy (a prompt, a different model, a harder look).
 
@@ -293,8 +293,13 @@ def _preflight_miss(turn: Turn, expected: Any) -> str | None:
         parsed, prose = _prose_value(turn)
         if parsed and _value_matches(prose, expected):
             return None
+        text = (turn.text or "")[:60]
+        if channel == "text":
+            # A text-channel backend cannot call a tool (#450): naming the tool it skipped
+            # misdescribes the miss. Its only way to answer is a whole-reply JSON value.
+            return f"its reply was not the expected whole-reply JSON value (text: {text!r})"
         return (f"answered without calling {RECORD_VALUE_TOOL}, and its reply was not the "
-                f"value either (text: {(turn.text or '')[:60]!r})")
+                f"value either (text: {text!r})")
     if _value_matches(got, expected):
         return None
     if encodes_as_json_string(got, expected):
@@ -347,7 +352,7 @@ def preflight_encoding(answerer: ToolAnswerer, attempts: int = PREFLIGHT_ATTEMPT
             if turn.error:
                 continue
             answered += 1
-            reason = _preflight_miss(turn, question.expected)
+            reason = _preflight_miss(turn, question.expected, answer_channel(answerer))
             if reason is not None:
                 bad += 1
                 if first_reason is None:
@@ -390,6 +395,12 @@ def _codec_instruction() -> str:
     eval's whole premise is a downstream TOOL CALL, so the instruction has to ask for one."""
     return ("Call the tool with that value as its argument. Do not reply in prose, and do "
            "not call any other tool.")
+
+
+def _channel_instruction(channel: str) -> str:
+    """The instruction a trial on `channel` is sent — one place, so `_codec_turn` and
+    `request_tokens` cannot disagree about what a request contains."""
+    return _TEXT_INSTRUCTION if channel == "text" else _codec_instruction()
 
 
 _FENCE = re.compile(r"\A```(?:[A-Za-z0-9_+-]*)\n(.*?)\n?```\Z", re.DOTALL)
@@ -498,15 +509,16 @@ def with_primer(primer: str, payload_text: str) -> str:
 
 
 def _codec_turn(question: fluency.Question, payload_text: str, answerer: ToolAnswerer) -> Turn:
-    """The one request a codec-eval question is sent as — a single user message, no system
-    message — shared by the sweep (`_ask_codec_question`) and `preflight_encoding`, so a
-    model that passes the pre-flight passed on the request it is scored on. A `--primer`
-    run's primer is part of `payload_text` (`with_primer`), not a system message. The
-    instruction follows the backend's channel, identically on both arms."""
-    instruction = (_TEXT_INSTRUCTION if answer_channel(answerer) == "text"
-                   else _codec_instruction())
+    """The one request a codec-eval question is sent as — a single user message; terse adds
+    no system message of its own — shared by the sweep (`_ask_codec_question`) and
+    `preflight_encoding`, so a model that passes the pre-flight passed on the request it is
+    scored on. A `--primer` run's primer is part of `payload_text` (`with_primer`), not a
+    system message. A `cli:` backend still reaches the model with `claude -p`'s own
+    ~3.1k-token preamble and an explicit empty system prompt (`fluency.cli_answerer`),
+    identical on both arms. The instruction follows the backend's channel
+    (`_channel_instruction`), identically on both arms."""
     messages: list[dict] = [{"role": "user", "content": fluency._user_prompt(
-        question.prompt, instruction, payload_text)}]
+        question.prompt, _channel_instruction(answer_channel(answerer)), payload_text)}]
     return _safe_call(answerer, messages)
 
 
@@ -678,13 +690,28 @@ class CodecRun(NamedTuple):
     merged_duplicates: Mapping[str, int] = MappingProxyType({})
 
 
+# The preamble `claude -p` sends ahead of every text-channel request (#450 review). NOT
+# re-measured here: a measurement spends real subscription quota. The figure is the one
+# recorded in `fluency.cli_answerer`'s docstring — 3,131 total input tokens for one call
+# with `--system-prompt ""` and `--setting-sources ""`, the flags that answerer passes. It
+# is in Claude's tokenizer, not cl100k, and includes that probe's own short user message,
+# so it is an approximation; added to a cl100k count it moves the limit check toward
+# excluding (the safe direction), where leaving it out passed requests ~3.1k over.
+_CLI_PREAMBLE_TOKENS = 3131
+
+
 def request_tokens(question: fluency.Question, payload_text: str,
-                   tool_defs: list[dict] | None = None) -> int | None:
+                   tool_defs: list[dict] | None = None,
+                   channel: str = "tool") -> int | None:
     """cl100k count of the REAL request one trial sends, or `None` without a tokenizer.
 
     The whole request, not the payload: `_codec_turn`'s user message plus the serialized
     tool definitions the answerer binds, because that is what the model is sent and what its
-    limit is measured against.
+    limit is measured against. Per answer `channel` (`answer_channel`), as `_codec_turn`
+    builds it: a `"text"` backend gets `_TEXT_INSTRUCTION` and binds no tool, so neither the
+    tool-channel instruction nor `tool_defs` is counted for it (#450). It is charged
+    `_CLI_PREAMBLE_TOKENS` instead: the only text-channel backend is `claude -p`
+    (`cli_text_answerer`), which sends its own preamble ahead of this message.
 
     CORRECTED 2026-09-14. This docstring previously cited `b0e5f862` as the motivating case —
     "its terse arm is 32,510 tokens and fits by payload alone, then does not fit once the
@@ -706,14 +733,18 @@ def request_tokens(question: fluency.Question, payload_text: str,
     measurement: the drift is CONTENT-dependent, so any single factor small enough not to
     exclude ordinary payloads still misses numeric-dense ones. Tightening this needs the
     model's own tokenizer or a per-content bound; open on #403."""
-    text = fluency._user_prompt(question.prompt, _codec_instruction(), payload_text)
+    text = fluency._user_prompt(question.prompt, _channel_instruction(channel), payload_text)
+    if channel == "text":
+        n = count_cl100k(text)
+        return None if n is None else n + _CLI_PREAMBLE_TOKENS
     tools = json.dumps(tool_defs if tool_defs is not None else [RECORD_VALUE_TOOL_DEF])
     return count_cl100k(text + tools)
 
 
 def oversized_arms(obj: Any, raw_text: str, limit: int,
                    tool_defs: list[dict] | None = None,
-                   primer: str = "", terse: str | None = None) -> list[tuple[str, int]]:
+                   primer: str = "", terse: str | None = None,
+                   channel: str = "tool") -> list[tuple[str, int]]:
     """`[(arm, tokens), ...]` for every arm whose LARGEST request exceeds `limit`. Empty
     when the payload fits, or when no tokenizer is available to say.
 
@@ -738,7 +769,7 @@ def oversized_arms(obj: Any, raw_text: str, limit: int,
     terse_text = fluency.compress(obj) if terse is None else terse
     for arm, text in (("raw", raw_text), ("terse", with_primer(primer, terse_text))):
         sizes = [n for q in questions
-                 if (n := request_tokens(q, text, tool_defs)) is not None]
+                 if (n := request_tokens(q, text, tool_defs, channel)) is not None]
         if sizes and max(sizes) > limit:
             out.append((arm, max(sizes)))
     return out
@@ -953,7 +984,8 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
             # `is not None`, not truthiness: a declared limit of 0 means NOTHING fits, and
             # reading it as "no limit known" would silently disable the check for the one
             # value that most obviously asks for it.
-            over = (oversized_arms(obj, env["raw"], limit, tool_defs, primer, terse)
+            over = (oversized_arms(obj, env["raw"], limit, tool_defs, primer, terse,
+                                   answer_channel(answerer))
                     if limit is not None else [])
             if over and limit is not None:
                 # One line per (model, payload), like the skip lines above: the run says

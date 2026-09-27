@@ -1937,7 +1937,7 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
                  audit: Callable[[dict], None] | None,
                  store: OrderedDict[str, Any], store_lock: Lock,
                  dropped_bytes: list[int],
-                 origins: dict[str, tuple[str, str, str]] | None = None,
+                 origins: dict[str, tuple[str, str, str, int | None]] | None = None,
                  retrieve_hits: dict[tuple[str, str], int] | None = None,
                  diff_override: bool | None = None,
                  diff_keyframe_override: int | None = None,
@@ -2061,7 +2061,7 @@ def run_multi_proxy(
     # Shared for the same reason `store` is: any peer's Interceptor may answer a
     # terse.retrieve for a handle another peer dropped, and a private map would lose the
     # attribution exactly on the fleet shape that has a lossy-by-default rule (#251).
-    origins: dict[str, tuple[str, str, str]] = {}
+    origins: dict[str, tuple[str, str, str, int | None]] = {}
     # Shared like `origins`: a retrieve answered by peers[0] must retract the dropping
     # peer's rule (#252).
     retrieve_hits: dict[tuple[str, str], int] = {}

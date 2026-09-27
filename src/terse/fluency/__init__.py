@@ -61,6 +61,7 @@ from .harnesses import (  # noqa: F401
     _safe_ask,
     _user_prompt,
     build_chain_windows,
+    diff_pairs,
     guarded,
     progress_line,
     run_chain_payload,
@@ -71,6 +72,7 @@ from .harnesses import (  # noqa: F401
     run_payload,
     run_text_diff_fluency,
     run_text_diff_payload,
+    text_diff_pairs,
 )
 from .ledger import (  # noqa: F401
     default_ledger_path,
