@@ -42,6 +42,11 @@ proportionate. Documented limitations are fine; silent gaps are not:
   - A broadcast (`initialize`/`tools/list`) blocks on every peer up to
     `BROADCAST_TIMEOUT` seconds; a peer that never answers can't wedge it — the reply
     goes out with whatever DID arrive, and the missing peer(s) are logged to stderr.
+    EXCEPT once a snapshot exists for this exact peers config (#270, `RouterSnapshot`):
+    `initialize` and the list methods are then answered from it at once, the peers start
+    in the background, and a live list that differs from the snapshot is announced with
+    one `notifications/*/list_changed`. Without a usable snapshot (first run, edited
+    config, corrupt file) the blocking path above runs unchanged and writes one.
 
 Reused, unchanged: `Interceptor` (per peer, sharing one drop store via its optional
 `store`/`store_lock` kwargs — see proxy.py), `pump()` (one reader thread PER PEER for
@@ -54,20 +59,24 @@ broadcast id-remapping/merge.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import queue
 import sys
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from functools import partial
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any, TextIO
 
 from . import lossy as lossy_mod
 from . import policy as policy_mod
+from ._secure_io import mkdir_restricted, write_restricted
 from .proxy import (
     PRIMER_HEAD,
     RETRIEVE_TOOL_DEF,
@@ -87,6 +96,7 @@ from .stats import (
     build_retrieve_writer,
     build_router_session_writer,
     build_stats_writer,
+    default_stats_log,
     router_ledger_label,
 )
 from .transport import Transport, build_transport
@@ -115,6 +125,21 @@ _SCATTER_METHODS = ("resources/read", "resources/subscribe", "resources/unsubscr
 # else that still carries an id (not tools/call, not prompts/get, not one of these)
 # falls through to the documented "forward to peer 0 only" path.
 _BROADCAST_METHODS = _AGGREGATE_METHODS + _SCATTER_METHODS
+
+# The aggregate list methods a persisted snapshot can answer before the peers are up
+# (#270), each mapped to the notification that tells the client its answer changed. The
+# two resources lists share one notification: MCP has no separate one for templates.
+_SNAPSHOT_LISTS = {
+    "tools/list": "notifications/tools/list_changed",
+    "prompts/list": "notifications/prompts/list_changed",
+    "resources/list": "notifications/resources/list_changed",
+    "resources/templates/list": "notifications/resources/list_changed",
+}
+# Everything a snapshot holds. `initialize` and `tools/list` are required (a snapshot
+# without them answers nothing a client waits on); the other lists are kept when a client
+# asked for them in the session that wrote it.
+_SNAPSHOT_KINDS = ("initialize", *_SNAPSHOT_LISTS)
+_SNAPSHOT_VERSION = 2   # 2: + the client protocolVersion the replies were negotiated for
 
 # Bound on `Router._local_id_map` (broadcast-local id -> broadcast seq). Entries are
 # deliberately NOT popped as soon as a broadcast finishes (a late, post-finish reply
@@ -306,6 +331,164 @@ class _PendingBroadcast:
     parts: dict[int, dict] = field(default_factory=dict)
     timer: threading.Timer | None = None
     done: bool = False
+    # A BACKGROUND broadcast (#270): the router's own, owed to no client. When set,
+    # `_finish_broadcast` hands the finished broadcast here instead of writing a reply, and
+    # `_broadcast` keeps it out of `_active_seq` (it has no client id to supersede).
+    on_done: Callable[[_PendingBroadcast], None] | None = None
+
+
+def router_snapshot_path(config_path: str, cwd: str | None = None) -> Path:
+    """Where the router persists its snapshot (#270): beside the savings ledger, under
+    `$XDG_STATE_HOME/terse/router-snapshots/`, one file per peers config — and per launch
+    directory, when `cwd` is given (see `snapshot_cwd`).
+
+    Keyed by the config's RESOLVED path, not by its fingerprint: an edited config then
+    overwrites its own stale file instead of orphaning one per edit. Whether the file may
+    be served is decided by the fingerprint stored INSIDE it (`peers_fingerprint`)."""
+    ident = str(Path(config_path).resolve()) + ("" if cwd is None else "\0" + cwd)
+    key = hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16]
+    return default_stats_log().parent / "router-snapshots" / f"{key}.json"
+
+
+def snapshot_cwd(specs: list[DownstreamSpec]) -> str | None:
+    """The router's own cwd when any peer INHERITS it (no `cwd` in its entry), else None.
+
+    A peer's replies can depend on where it runs. On the live fleet the codegraph peer
+    serves its tools only inside a repo with a `.codegraph/` index and is a zero-tool null
+    server everywhere else (25 of 62 repos). A snapshot shared across directories would be
+    served in the wrong one — a list_changed, the very cache bust #270 removes, and an
+    `initialize.instructions` naming tools that do not exist there, which nothing in MCP
+    can correct mid-session. So such a snapshot is per directory: in its path and in its
+    fingerprint.
+
+    KNOWN LIMITATION: the first session in a NEW directory still takes the blocking path,
+    and with per-session git worktrees (`claudew`) that is most new worktrees. Snapshot
+    files are also never pruned. Follow-up options, not done here: key by the git common
+    dir where codegraph's index location allows it, and an age-based prune."""
+    return os.getcwd() if any(s.cwd is None for s in specs) else None
+
+
+def peers_fingerprint(specs: list[DownstreamSpec], cwd: str | None = None) -> str:
+    """sha256 over every parsed `downstreams[]` entry — name, target, headers, env, cwd,
+    resolved policy path — plus the inherited launch directory (`snapshot_cwd`). Any edit
+    to the peers config changes it, and a snapshot written under a different fingerprint
+    is never served.
+
+    Policy CONTENTS and the terse version are deliberately not in it: the snapshot stores
+    each peer's RAW replies and the router re-merges them live (`_stored_pb`), so the
+    retrieve tool, the primer mode and `serverInfo.version` always come from the running
+    process. Only the digest is written — `headers` and `env` can carry credentials."""
+    doc = json.dumps({"peers": [asdict(s) for s in specs], "cwd": cwd},
+                     sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(doc.encode("utf-8")).hexdigest()
+
+
+def _init_view(result: dict) -> dict:
+    """The part of a merged `initialize` result a client acts on, for comparing a served
+    snapshot with the live one. `serverInfo` is left out: it names this process. Callers
+    merge from CONFIG-ordered parts (`Router._stable_init_view`), because the real merge
+    joins instructions in arrival order and two peers swapping arrival would otherwise
+    read as a change."""
+    return {"instructions": result.get("instructions"),
+            "capabilities": result.get("capabilities")}
+
+
+class RouterSnapshot:
+    """The persisted replies of the last complete session (#270): for each kind in
+    `_SNAPSHOT_KINDS`, peer name -> that peer's `{"result": ...}` or `{"error": ...}`,
+    in arrival order (`_merge_initialize` takes the first-arriving protocolVersion) — plus
+    the `protocolVersion` the CLIENT requested in that session. The peers' `initialize`
+    replies were negotiated against that request, so they may only answer a client asking
+    for the same one (`Router._fast_initialize`).
+
+    Every failure is a fallback, never a crash: a missing, unreadable, corrupt, foreign or
+    wrongly-shaped file loads as None, and the router blocks on its peers exactly as it did
+    before snapshots existed. A write that fails is reported once and otherwise ignored."""
+
+    def __init__(self, path: Path, fingerprint: str):
+        self.path = Path(path)
+        self.fingerprint = fingerprint
+        self._warned = False
+
+    def load(self) -> tuple[dict[str, dict[str, dict]], str] | None:
+        """(parts, client protocolVersion), or None for anything that cannot be served."""
+        try:
+            doc = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:  # UnicodeDecodeError is a ValueError too
+            sys.stderr.write(f"[terse-multiproxy] snapshot {self.path} unreadable ({exc}); "
+                             "initialize will wait on every peer\n")
+            return None
+        if not isinstance(doc, dict) or doc.get("version") != _SNAPSHOT_VERSION \
+                or doc.get("fingerprint") != self.fingerprint:
+            return None   # an edited peers config is routine, not worth a warning
+        parts, protocol = doc.get("parts"), doc.get("protocol")
+        if not isinstance(parts, dict) or not isinstance(protocol, str):
+            return None
+        out: dict[str, dict[str, dict]] = {}
+        for kind in _SNAPSHOT_KINDS:
+            per_peer = parts.get(kind)
+            if per_peer is None:
+                continue
+            if not isinstance(per_peer, dict) or not all(
+                    isinstance(v, dict) for v in per_peer.values()):
+                return None
+            out[kind] = per_peer
+        if "initialize" not in out or "tools/list" not in out:
+            return None
+        # Every kind must cover the same peers. The fingerprint already pins the peer set,
+        # so a mismatch here means a hand-edited or truncated file; one peer's missing
+        # tools would otherwise be served as though that peer exported nothing.
+        names = set(out["initialize"])
+        if any(set(per_peer) != names for per_peer in out.values()):
+            return None
+        return out, protocol
+
+    def save(self, parts: dict[str, dict[str, dict]], protocol: str) -> None:
+        try:
+            mkdir_restricted(self.path.parent)
+            # Atomic (temp + os.replace): a router killed mid-write leaves the previous
+            # snapshot or the new one, never half of one.
+            write_restricted(self.path, json.dumps(
+                {"version": _SNAPSHOT_VERSION, "fingerprint": self.fingerprint,
+                 "protocol": protocol, "parts": parts}, separators=(",", ":"), ensure_ascii=False))
+        except OSError as exc:
+            if not self._warned:
+                self._warned = True
+                sys.stderr.write(f"[terse-multiproxy] could not write snapshot "
+                                 f"{self.path} ({exc}); the next session's initialize "
+                                 "will wait on every peer\n")
+
+
+@dataclass
+class _Warm:
+    """One session answered from the snapshot (#270), from its `initialize` until the live
+    reconcile replaces it.
+
+    `seq` is a broadcast seq RESERVED at initialize, before any of the peers' own
+    broadcasts are issued: every snapshot-served listing installs its routing table at it,
+    so the live listings — always issued later, so always a higher seq — win the
+    `_merge_tools_list` seq guard, and a snapshot listing answered after them is refused
+    as stale and answered with the live table instead.
+
+    The live refresh needs BOTH `init_done` (every peer answered its `initialize`) and
+    `client_ready` (the client's `notifications/initialized` has been forwarded): a peer
+    is entitled to refuse requests before that notification, and the per-peer sender queue
+    only orders what is already in it."""
+    seq: int
+    parts: dict[str, dict[str, dict]]
+    init_done: bool = False
+    client_ready: bool = False
+    refreshing: bool = False
+    outstanding: set[str] = field(default_factory=set)
+    fresh: dict[str, _PendingBroadcast] = field(default_factory=dict)
+    # What the client was told at initialize: the merged `instructions`/`capabilities`
+    # (before the listChanged flags were added) and the list_changed notifications those
+    # capabilities declared — the only ones `_reconcile` may send.
+    served_init: dict = field(default_factory=dict)
+    advertised: frozenset[str] = frozenset()
+    live_init: _PendingBroadcast | None = None
 
 
 class _PeerSender:
@@ -393,7 +576,8 @@ class Router:
     def __init__(self, peers: list[Peer], out: TextIO, out_lock: Lock, *,
                  debug: bool = False, broadcast_timeout: float = BROADCAST_TIMEOUT,
                  primer_latch: PrimerLatch | None = None,
-                 on_session: Callable[[], None] | None = None):
+                 on_session: Callable[[], None] | None = None,
+                 snapshot: RouterSnapshot | None = None):
         self.peers = peers
         # Writes one `router_session` ledger row per client `initialize` (#212) -- the
         # proof, for `primer_liability`, that a LAZY router ran this session even when no
@@ -565,6 +749,33 @@ class Router:
         self._routed_timed_out: OrderedDict[Any, float] = OrderedDict()
         self._routed_timed_out_ttl = broadcast_timeout * 4
 
+        # The fast initialize (#270). A broadcast `initialize` waits on the slowest peer
+        # (4.2s on the live fleet, 2026-09-26), and a headless client sends its first
+        # inference request before that: terse's tools then arrive on turn 2 and the whole
+        # prompt prefix is re-written (`cache_miss_reason: tools_changed`). With a snapshot
+        # for this exact peers config, `initialize` and the list methods are answered from
+        # it at once while the peers start in the background; a routed call to a peer that
+        # is not up yet simply waits in that peer's FIFO sender queue behind its own
+        # `initialize`, bounded by the same routed-call timeout as ever.
+        #
+        # `_persisted` is the snapshot as last loaded or written (None: no usable one, so
+        # this session blocks exactly as before). `_live_parts` collects this process's own
+        # COMPLETE replies per kind — a broadcast a peer timed out on is never recorded, so
+        # a degraded listing cannot overwrite a good snapshot. `_warm` is the session being
+        # served from the snapshot, if any. `_persisted_protocol` / `_client_protocol` are
+        # the client protocolVersion the persisted / live replies answer (see
+        # `RouterSnapshot`). All of these are guarded by `_snap_lock`.
+        self.snapshot = snapshot
+        loaded = snapshot.load() if snapshot is not None else None
+        if loaded is not None and set(loaded[0]["initialize"]) != set(self.by_name):
+            loaded = None
+        self._persisted: dict[str, dict[str, dict]] | None = loaded[0] if loaded else None
+        self._persisted_protocol: str | None = loaded[1] if loaded else None
+        self._client_protocol: str | None = None
+        self._live_parts: dict[str, dict[str, dict]] = {}
+        self._warm: _Warm | None = None
+        self._snap_lock = Lock()
+
     # ---------- client -> server ----------
 
     def route_client_line(self, line: str) -> None:
@@ -591,6 +802,11 @@ class Router:
             self._route_prompt_get(msg)
             return
 
+        if method == "initialize" and self._fast_initialize(msg):
+            return
+        if method in _SNAPSHOT_LISTS and self._serve_warm(msg, method):
+            return
+
         if method in _BROADCAST_METHODS:
             self._broadcast(msg, method)
             return
@@ -599,6 +815,8 @@ class Router:
             # A notification (no id at all): fan out fire-and-forget, no reply to track.
             if method is not None:
                 self._broadcast_notification(line)
+                if method == "notifications/initialized":
+                    self._client_initialized()
             return
 
         if method is None:
@@ -812,7 +1030,11 @@ class Router:
             timer.start()
         self._write_peer(idx, line)
 
-    def _broadcast(self, msg: dict, kind: str) -> None:
+    def _broadcast(self, msg: dict, kind: str,
+                   on_done: Callable[[_PendingBroadcast], None] | None = None) -> None:
+        """Fan `msg` out to every peer under broadcast-local ids and collect the replies.
+        With `on_done` the broadcast is the router's own (#270): nothing is written to the
+        client, and the finished broadcast is handed to `on_done` instead."""
         if not self.peers:
             return
         client_id = msg.get("id")
@@ -829,15 +1051,16 @@ class Router:
             # misbehavior — a late reply for the abandoned one resolves via
             # `_local_id_map` to a seq no longer in `_pending` and is safely swallowed
             # (see `_maybe_collect`), never misattributed to the new broadcast.
-            prior_seq = self._active_seq.get(client_id)
+            prior_seq = self._active_seq.get(client_id) if on_done is None else None
             if prior_seq is not None:
                 prior = self._pending.pop(prior_seq, None)
                 if prior is not None and prior.timer is not None:
                     prior.timer.cancel()
             pb = _PendingBroadcast(kind=kind, client_id=client_id, seq=seq,
-                                   remaining=set(range(len(self.peers))))
+                                   remaining=set(range(len(self.peers))), on_done=on_done)
             self._pending[seq] = pb
-            self._active_seq[client_id] = seq
+            if on_done is None:
+                self._active_seq[client_id] = seq
             for i in range(len(self.peers)):
                 self._local_id_map[f"terse-b{seq}-{i}"] = seq
             while len(self._local_id_map) > _LOCAL_ID_MAP_MAX:
@@ -1078,10 +1301,233 @@ class Router:
             # so a reply that arrives after this point still resolves to "seq not in
             # _pending" and is safely swallowed instead of leaking to the client.
 
+        if pb.on_done is not None:
+            # Fail-open: this runs on a peer's reader thread (or a Timer), and the snapshot
+            # is an optimization — a bug in it must not kill that peer's output stream.
+            try:
+                pb.on_done(pb)
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(f"[terse-multiproxy] snapshot bookkeeping failed: {exc}\n")
+            return
         body = self._merge_broadcast(pb)
         self._write_client(json.dumps(
             {"jsonrpc": "2.0", "id": pb.client_id, **body},
             separators=(",", ":"), ensure_ascii=False))
+        # After the reply, so the client never waits on a snapshot write.
+        if pb.kind in _SNAPSHOT_KINDS and self.snapshot is not None:
+            try:
+                self._record(pb)
+                self._maybe_persist()
+            except Exception as exc:  # noqa: BLE001 — same fail-open reasoning as above
+                sys.stderr.write(f"[terse-multiproxy] snapshot bookkeeping failed: {exc}\n")
+
+    # ---------- the snapshot (#270) ----------
+
+    def _stored_pb(self, kind: str, per_peer: dict[str, dict],
+                   seq: int) -> _PendingBroadcast:
+        """A finished broadcast rebuilt from stored replies, so a snapshot is answered by
+        the SAME merge code as a live listing — naming, the retrieve tool, the primer mode
+        and the routing-table install all come from this process, never from the file."""
+        return _PendingBroadcast(kind=kind, client_id=None, seq=seq, remaining=set(),
+                                 parts={self.by_name[n]: p for n, p in per_peer.items()
+                                        if n in self.by_name},
+                                 done=True)
+
+    def _by_peer(self, pb: _PendingBroadcast) -> dict[str, dict]:
+        """A broadcast's replies as stored: peer name -> its result-or-error, in arrival
+        order. The JSON-RPC id is dropped (it is a broadcast-local one)."""
+        return {self.peers[i].name: {k: part[k] for k in ("result", "error") if k in part}
+                for i, part in pb.parts.items()}
+
+    def _stable_init_view(self, pb: _PendingBroadcast) -> dict:
+        """`_init_view` of `pb` merged with its parts in CONFIG order instead of arrival
+        order, so the served-vs-live comparison sees content changes only."""
+        ordered = _PendingBroadcast(kind=pb.kind, client_id=None, seq=pb.seq,
+                                    remaining=set(), done=True,
+                                    parts={i: pb.parts[i] for i in sorted(pb.parts)})
+        return _init_view(self._merge_initialize(ordered))
+
+    def _fast_initialize(self, msg: dict) -> bool:
+        """Answer the client's `initialize` from the snapshot and start the peers' own
+        handshake in the background. False (the caller broadcasts as before) when there is
+        no usable snapshot.
+
+        Also False when the client asks for a different `protocolVersion` than the one the
+        snapshot's replies were negotiated for: the stored peer replies (and the
+        protocolVersion `_merge_initialize` takes from them) answer THAT request, not this
+        one. The blocking path then negotiates afresh and persists the new pairing.
+
+        `listChanged` is advertised ONLY on this path, since it is the only one on which
+        the router emits list_changed itself: always for tools, and for prompts/resources
+        when the merged capabilities declare that surface at all. A client is entitled to
+        ignore a notification the server never declared, so `_reconcile` sends only these."""
+        params = msg.get("params")
+        requested = params.get("protocolVersion") if isinstance(params, dict) else None
+        with self._snap_lock:
+            self._client_protocol = requested if isinstance(requested, str) else None
+            snap = self._persisted
+            same_protocol = (self._client_protocol is not None
+                             and self._client_protocol == self._persisted_protocol)
+        if snap is None or not same_protocol or not self.peers:
+            return False
+        with self._pending_lock:
+            seq = self._broadcast_seq     # reserved — see _Warm
+            self._broadcast_seq += 1
+        warm = _Warm(seq=seq, parts=snap)
+        with self._snap_lock:
+            self._warm = warm             # a re-initialize supersedes any earlier session
+        stored = self._stored_pb("initialize", snap["initialize"], seq)
+        result = self._merge_initialize(stored)
+        caps = result["capabilities"]
+        warm.served_init = self._stable_init_view(stored)
+        advertised = dict(caps)
+        for surface in ("tools", "prompts", "resources"):
+            cap = caps.get(surface)
+            if surface == "tools" or isinstance(cap, dict):
+                advertised[surface] = {**(cap if isinstance(cap, dict) else {}),
+                                       "listChanged": True}
+        result["capabilities"] = advertised
+        warm.advertised = frozenset(
+            note for kind, note in _SNAPSHOT_LISTS.items()
+            if kind.split("/")[0] in advertised)
+        # Reply BEFORE the peers are even written to. The client's next line (normally
+        # `notifications/initialized`) is read by this same thread after we return, so it
+        # still reaches every peer's queue behind the `initialize` below.
+        self._write_client(json.dumps({"jsonrpc": "2.0", "id": msg.get("id"),
+                                       "result": result},
+                                      separators=(",", ":"), ensure_ascii=False))
+        self._broadcast(msg, "initialize", on_done=partial(self._warm_initialized, warm))
+        return True
+
+    def _serve_warm(self, msg: dict, kind: str) -> bool:
+        """Answer a list method from the snapshot while its session is warm. False (the
+        caller broadcasts) once the live lists have replaced it, or when the snapshot has
+        no entry for `kind` — that one then waits on the peers, as it always did."""
+        with self._snap_lock:
+            warm = self._warm
+        if warm is None or kind not in warm.parts:
+            return False
+        body = self._merge_broadcast(self._stored_pb(kind, warm.parts[kind], warm.seq))
+        self._write_client(json.dumps({"jsonrpc": "2.0", "id": msg.get("id"), **body},
+                                      separators=(",", ":"), ensure_ascii=False))
+        return True
+
+    def _client_initialized(self) -> None:
+        with self._snap_lock:
+            warm = self._warm
+            if warm is None:
+                return
+            warm.client_ready = True
+        self._maybe_refresh(warm)
+
+    def _warm_initialized(self, warm: _Warm, pb: _PendingBroadcast) -> None:
+        """Every peer answered (or timed out on) the background `initialize`. Recorded but
+        not persisted: a snapshot is only written from a whole live set, in `_reconcile`."""
+        self._record(pb)
+        with self._snap_lock:
+            warm.init_done = True
+            warm.live_init = pb
+        self._maybe_refresh(warm)
+
+    def _maybe_refresh(self, warm: _Warm) -> None:
+        """Once the peers are initialized and the client has said so, ask every peer for
+        each list the snapshot answered, as the router's own background broadcasts."""
+        with self._snap_lock:
+            if (self._warm is not warm or warm.refreshing
+                    or not (warm.init_done and warm.client_ready)):
+                return
+            warm.refreshing = True
+            kinds = [k for k in _SNAPSHOT_LISTS if k in warm.parts]
+            warm.outstanding = set(kinds)   # filled BEFORE the first broadcast can finish
+        for kind in kinds:
+            self._broadcast({"jsonrpc": "2.0", "id": "terse-refresh", "method": kind,
+                             "params": {}}, kind,
+                            on_done=partial(self._warm_refreshed, warm, kind))
+
+    def _warm_refreshed(self, warm: _Warm, kind: str, pb: _PendingBroadcast) -> None:
+        with self._snap_lock:
+            warm.fresh[kind] = pb
+            warm.outstanding.discard(kind)
+            if warm.outstanding or self._warm is not warm:
+                return
+            self._warm = None   # from here on, list methods are broadcast as usual
+        self._reconcile(warm)
+
+    def _reconcile(self, warm: _Warm) -> None:
+        """Install the live lists, persist them if complete and new, and tell the client
+        about any list that differs from what the snapshot served — once per notification,
+        and not at all when nothing changed (the common case: a stable fleet).
+
+        Compared on the stored per-peer replies rather than on the merged lists: the merge
+        is a function of those replies, so equal replies can only produce an equal list,
+        and the comparison stays free of the merge's side effects. A peer that timed out
+        makes its list differ, which is right: its tools are no longer routable.
+
+        `initialize` is compared too, on what the client actually reads (`instructions`,
+        `capabilities`), but it can only be REPORTED: MCP has no notification that
+        re-sends `initialize`, so this session keeps the stale instructions (e.g. naming a
+        peer's tools that the live peer no longer serves). The live replies were recorded
+        by `_warm_initialized`, so `_maybe_persist` below corrects the NEXT session."""
+        notes: list[str] = []
+        for kind, note in _SNAPSHOT_LISTS.items():
+            pb = warm.fresh.get(kind)
+            if pb is None:
+                continue
+            self._merge_broadcast(pb)    # installs the live table: its seq > warm.seq
+            if (self._by_peer(pb) != warm.parts.get(kind) and note in warm.advertised
+                    and note not in notes):
+                notes.append(note)
+            self._record(pb)
+        live_init = warm.live_init
+        if live_init is not None and not live_init.remaining \
+                and self._stable_init_view(live_init) != warm.served_init:
+            sys.stderr.write("[terse-multiproxy] the live initialize differs from the "
+                             "snapshot this session was answered from (instructions or "
+                             "capabilities); it cannot be re-sent mid-session, so the "
+                             "snapshot is updated for the next one\n")
+        self._maybe_persist()
+        for note in notes:
+            self._write_client(json.dumps({"jsonrpc": "2.0", "method": note},
+                                          separators=(",", ":")))
+
+    def _record(self, pb: _PendingBroadcast) -> None:
+        """Keep a COMPLETE broadcast's replies as this process's live view of `pb.kind`.
+        A broadcast that finished on its timeout (some peer still in `remaining`) is not
+        recorded: persisting it would serve that peer as tool-less next session."""
+        if self.snapshot is None or pb.kind not in _SNAPSHOT_KINDS or pb.remaining:
+            return
+        live = self._by_peer(pb)
+        with self._snap_lock:
+            self._live_parts[pb.kind] = live
+
+    def _maybe_persist(self) -> None:
+        """Write the snapshot when this process has a live `initialize` and `tools/list`
+        and they (or any other recorded list) differ from what is on disk. Kinds this
+        session never asked for are carried over from the previous snapshot — same
+        fingerprint, same peers. Never while a session is still warm: its live view is
+        only complete at `_reconcile`."""
+        if self.snapshot is None:
+            return
+        with self._snap_lock:
+            live, protocol = self._live_parts, self._client_protocol
+            if (self._warm is not None or protocol is None
+                    or "initialize" not in live or "tools/list" not in live):
+                return
+            # Kinds are carried over only from a snapshot for the SAME client protocol.
+            same = protocol == self._persisted_protocol
+            merged = {**((self._persisted or {}) if same else {}), **live}
+            if same and merged == self._persisted:
+                return
+            self._persisted, self._persisted_protocol = merged, protocol
+            # Under the lock so two finishing broadcasts cannot write out of order.
+            self.snapshot.save(merged, protocol)
+
+    def end_warm(self) -> None:
+        """Drop the warm session at client EOF, BEFORE the shutdown drains: nothing is owed
+        to a departed client, so the background initialize must not go on to start a live
+        refresh against peers that are about to be closed."""
+        with self._snap_lock:
+            self._warm = None
 
     # ---------- broadcast merges ----------
 
@@ -1644,10 +2090,13 @@ def run_multi_proxy(
         return 2
 
     out_lock = Lock()
+    launch_dir = snapshot_cwd(specs)
     router = Router(peers, cout, out_lock, debug=debug, broadcast_timeout=broadcast_timeout,
                     primer_latch=primer_latch,
                     on_session=(build_router_session_writer(stats_log, primer_label)
-                                if stats_log is not None else None))
+                                if stats_log is not None else None),
+                    snapshot=RouterSnapshot(router_snapshot_path(config_path, launch_dir),
+                                            peers_fingerprint(specs, launch_dir)))
 
     sigterm_token = _install_sigterm_to_exit()
 
@@ -1673,6 +2122,7 @@ def run_multi_proxy(
         # peer answered — must still get its merged reply; wait out any broadcast still
         # in flight (bounded by its own timeout) before tearing peers down. Same
         # reasoning for a still-in-flight routed tools/call.
+        router.end_warm()
         router.drain_pending_broadcasts()
         router.drain_routed_calls()
 
