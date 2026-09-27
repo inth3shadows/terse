@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.42.0] - 2026-09-26
+
 ### Added
 
 - **Retrieve ledger rows record which block was fetched (#252).** A `terse.retrieve` row for a text drop (`$text.code_blocks`) now carries `index`: the block's position among the result's blocks at or above `min`, counting blocks `keep_first` kept inline. A retrieve at index `i` means `keep_first` of `i + 1` would have kept that block. This gives a later `terse tune` live data for suggesting `keep_first` and `retract_after`. Identical blocks share one handle and record the first position. JSON-field drops have no position and write no `index`. Older rows without it still read the same, and the row still holds no payload.
