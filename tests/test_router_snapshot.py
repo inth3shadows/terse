@@ -12,23 +12,29 @@ peer is `fake_mcp_server.py` with `FAKE_INIT_DELAY`.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import pathlib
 import sys
 import threading
 import time
+from threading import Lock
 
 import pytest
 
 from terse.multiproxy import (
+    Peer,
+    Router,
     RouterSnapshot,
     load_multi_config,
     peers_fingerprint,
     router_snapshot_path,
     run_multi_proxy,
+    snapshot_cwd,
 )
 from terse.policy import Policy, Rule
+from terse.proxy import SWALLOW, Interceptor
 
 FAKE = pathlib.Path(__file__).parent / "fake_mcp_server.py"
 POLICY = Policy(rules=[Rule("*", ("minify",))])
@@ -103,9 +109,9 @@ class _Client:
         t, m = self.out.wait(lambda m: m.get("id") == mid, timeout)
         return t - t0, m
 
-    def handshake(self) -> tuple[float, dict, float, dict]:
+    def handshake(self, protocol: str = "2025-06-18") -> tuple[float, dict, float, dict]:
         init_s, init = self.request(1, "initialize",
-                                    {"protocolVersion": "2025-06-18", "capabilities": {},
+                                    {"protocolVersion": protocol, "capabilities": {},
                                      "clientInfo": {"name": "t", "version": "0"}})
         self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         list_s, listed = self.request(2, "tools/list")
@@ -129,6 +135,16 @@ def _config(tmp_path, *, slow_env=None, fast_env=None) -> pathlib.Path:
     return cfg
 
 
+def _path(cfg) -> pathlib.Path:
+    specs = load_multi_config(str(cfg))
+    return router_snapshot_path(str(cfg), snapshot_cwd(specs))
+
+
+def _fp(cfg) -> str:
+    specs = load_multi_config(str(cfg))
+    return peers_fingerprint(specs, snapshot_cwd(specs))
+
+
 def _names(listed: dict) -> list[str]:
     return [t["name"] for t in listed["result"]["tools"]]
 
@@ -138,7 +154,7 @@ def _seed(cfg) -> dict:
     c = _Client(cfg)
     c.handshake()
     assert c.close() == 0
-    return json.loads(router_snapshot_path(str(cfg)).read_text(encoding="utf-8"))
+    return json.loads(_path(cfg).read_text(encoding="utf-8"))
 
 
 # --- 1 ---
@@ -180,7 +196,7 @@ def test_a_snapshot_that_differs_from_live_emits_one_list_changed_and_is_updated
     cfg = _config(tmp_path)
     snap = _seed(cfg)
     snap["parts"]["tools/list"]["slow"]["result"]["tools"] = [{"name": "stale.tool"}]
-    path = router_snapshot_path(str(cfg))
+    path = _path(cfg)
     path.write_text(json.dumps(snap), encoding="utf-8")
 
     c = _Client(cfg)
@@ -205,7 +221,7 @@ def test_a_snapshot_that_differs_from_live_emits_one_list_changed_and_is_updated
 def test_a_snapshot_identical_to_live_emits_nothing_and_is_not_rewritten(tmp_path):
     cfg = _config(tmp_path)
     _seed(cfg)
-    path = router_snapshot_path(str(cfg))
+    path = _path(cfg)
     before = (path.read_bytes(), path.stat().st_mtime_ns)
     c = _Client(cfg)
     try:
@@ -222,7 +238,7 @@ def test_a_snapshot_identical_to_live_emits_nothing_and_is_not_rewritten(tmp_pat
 
 def test_without_a_snapshot_initialize_blocks_as_today_and_one_is_written(tmp_path):
     cfg = _config(tmp_path)
-    path = router_snapshot_path(str(cfg))
+    path = _path(cfg)
     assert not path.exists()
     c = _Client(cfg)
     try:
@@ -233,7 +249,7 @@ def test_without_a_snapshot_initialize_blocks_as_today_and_one_is_written(tmp_pa
     assert "tools" not in init["result"]["capabilities"]  # no listChanged claim on this path
     assert _names(listed) == ["fast.tool", "slow.tool"]
     snap = json.loads(path.read_text(encoding="utf-8"))
-    assert snap["fingerprint"] == peers_fingerprint(load_multi_config(str(cfg)))
+    assert snap["fingerprint"] == _fp(cfg)
     assert set(snap["parts"]["initialize"]) == set(snap["parts"]["tools/list"]) \
         == {"fast", "slow"}
 
@@ -250,9 +266,9 @@ def test_an_edited_peers_config_ignores_the_old_snapshot(tmp_path):
     finally:
         assert c.close() == 0
     assert init_s > DELAY - FAST
-    new = json.loads(router_snapshot_path(str(cfg)).read_text(encoding="utf-8"))
+    new = json.loads(_path(cfg).read_text(encoding="utf-8"))
     assert new["fingerprint"] != old["fingerprint"]
-    assert new["fingerprint"] == peers_fingerprint(load_multi_config(str(cfg)))
+    assert new["fingerprint"] == _fp(cfg)
 
 
 # --- 6 ---
@@ -261,12 +277,11 @@ def test_an_edited_peers_config_ignores_the_old_snapshot(tmp_path):
 def test_a_corrupt_or_unreadable_snapshot_falls_back_to_blocking(tmp_path, damage):
     cfg = _config(tmp_path)
     _seed(cfg)
-    path = router_snapshot_path(str(cfg))
+    path = _path(cfg)
     if damage == "garbage":
         path.write_text("{not json", encoding="utf-8")
     elif damage == "wrong-shape":
-        path.write_text(json.dumps({"version": 1, "fingerprint": peers_fingerprint(
-            load_multi_config(str(cfg))), "parts": {"initialize": []}}), encoding="utf-8")
+        path.write_text(json.dumps({"version": 2, "protocol": "2025-06-18", "fingerprint": _fp(cfg), "parts": {"initialize": []}}), encoding="utf-8")
     else:
         path.unlink()
         path.mkdir()
@@ -284,13 +299,14 @@ def test_a_corrupt_or_unreadable_snapshot_falls_back_to_blocking(tmp_path, damag
 def test_snapshot_load_rejects_every_shape_it_cannot_serve(tmp_path):
     path = tmp_path / "s.json"
     snap = RouterSnapshot(path, "fp")
-    good = {"version": 1, "fingerprint": "fp",
+    good = {"version": 2, "fingerprint": "fp", "protocol": "2025-06-18",
             "parts": {"initialize": {"a": {"result": {}}},
                       "tools/list": {"a": {"result": {"tools": []}}}}}
     assert snap.load() is None                           # missing
     path.write_text(json.dumps(good), encoding="utf-8")
-    assert snap.load() == good["parts"]
-    for bad in ([], {**good, "version": 2}, {**good, "fingerprint": "other"},
+    assert snap.load() == (good["parts"], "2025-06-18")
+    no_protocol = {k: v for k, v in good.items() if k != "protocol"}
+    for bad in ([], {**good, "version": 1}, {**good, "fingerprint": "other"}, no_protocol,
                 {**good, "parts": {"initialize": good["parts"]["initialize"]}},
                 {**good, "parts": {**good["parts"], "tools/list": {"a": "x"}}},
                 {**good, "parts": {**good["parts"], "tools/list": {"b": {"result": {}}}}}):
@@ -320,5 +336,128 @@ def test_a_peer_that_fails_to_start_still_errors_its_calls(tmp_path):
     assert dead["error"]["code"] == -32001 and "timed out" in dead["error"]["message"]
     assert "result" in live
     # A degraded live listing is never persisted over a complete snapshot.
-    path = router_snapshot_path(str(cfg))
+    path = _path(cfg)
     assert json.loads(path.read_text(encoding="utf-8")) == seeded
+
+
+# --- review fixes: cwd, initialize drift, protocolVersion, advertised list_changed ---
+
+def test_two_launch_directories_keep_separate_snapshots(tmp_path, monkeypatch):
+    # A peer with no `cwd` inherits the router's, and its replies can depend on it (the
+    # live codegraph peer has zero tools outside an indexed repo). One directory's snapshot
+    # must never answer another's.
+    cfg = _config(tmp_path)
+    (tmp_path / "repo_a").mkdir()
+    (tmp_path / "repo_b").mkdir()
+    monkeypatch.chdir(tmp_path / "repo_a")
+    _seed(cfg)
+    path_a, fp_a = _path(cfg), _fp(cfg)
+    monkeypatch.chdir(tmp_path / "repo_b")
+    assert _path(cfg) != path_a and _fp(cfg) != fp_a
+    c = _Client(cfg)
+    try:
+        init_s, _, _, _ = c.handshake()
+    finally:
+        assert c.close() == 0
+    assert init_s > DELAY - FAST          # repo_a's snapshot was not served here
+    assert path_a.exists() and _path(cfg).exists()
+
+
+def test_an_initialize_only_difference_is_reported_and_persisted(tmp_path, capsys):
+    cfg = _config(tmp_path)
+    snap = _seed(cfg)
+    snap["parts"]["initialize"]["fast"]["result"]["instructions"] = "STALE NOTES."
+    path = _path(cfg)
+    path.write_text(json.dumps(snap), encoding="utf-8")
+    c = _Client(cfg)
+    try:
+        _, init, _, _ = c.handshake()
+        assert "STALE NOTES." in init["result"]["instructions"]   # served; cannot be undone
+        c.request(3, "tools/call", {"name": "slow.tool"})          # the slow peer is up
+        time.sleep(1.0)
+        # The tools did not change, so the client is not told anything.
+        assert c.out.notes("notifications/tools/list_changed") == []
+    finally:
+        assert c.close() == 0
+    assert "live initialize differs" in capsys.readouterr().err
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert "instructions" not in after["parts"]["initialize"]["fast"]["result"]
+
+
+def test_a_different_client_protocol_version_takes_the_blocking_path(tmp_path):
+    cfg = _config(tmp_path)
+    assert _seed(cfg)["protocol"] == "2025-06-18"
+    c = _Client(cfg)
+    try:
+        init_s, init, _, _ = c.handshake(protocol="2024-11-05")
+    finally:
+        assert c.close() == 0
+    assert init_s > DELAY - FAST
+    assert "tools" not in init["result"]["capabilities"]
+    assert json.loads(_path(cfg).read_text(encoding="utf-8"))["protocol"] == "2024-11-05"
+
+
+class _FakeTransport:
+    def __init__(self):
+        self.out = io.StringIO()
+
+    def inbound(self):
+        return iter([])
+
+    def outbound(self):
+        return self.out
+
+    def close(self):
+        pass
+
+
+def _await_sent(t: _FakeTransport, method: str) -> dict:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        for ln in t.out.getvalue().splitlines():
+            m = json.loads(ln)
+            if m.get("method") == method:
+                return m
+        time.sleep(0.01)
+    raise AssertionError(f"{method} never reached the peer")
+
+
+def test_list_changed_is_sent_only_for_a_capability_that_advertised_it(tmp_path):
+    # The merged capabilities declare tools and prompts but not resources: both get
+    # listChanged, and a changed resources list is NOT announced (it was never declared).
+    init = {"result": {"protocolVersion": "2025-06-18",
+                       "capabilities": {"tools": {}, "prompts": {}}}}
+    parts = {"initialize": {"a": init},
+             "tools/list": {"a": {"result": {"tools": [{"name": "t1"}]}}},
+             "prompts/list": {"a": {"result": {"prompts": [{"name": "p1"}]}}},
+             "resources/list": {"a": {"result": {"resources": []}}}}
+    path = tmp_path / "snap.json"
+    RouterSnapshot(path, "fp").save(parts, "2025-06-18")
+    t, out = _FakeTransport(), io.StringIO()
+    router = Router([Peer("a", t, Interceptor(POLICY))], out, Lock(), broadcast_timeout=1000,
+                    snapshot=RouterSnapshot(path, "fp"))
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18"}}))
+        caps = json.loads(out.getvalue())["result"]["capabilities"]
+        assert caps["tools"]["listChanged"] is True
+        assert caps["prompts"]["listChanged"] is True
+        assert "resources" not in caps
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        feed = router.from_peer(0)
+        sent = _await_sent(t, "initialize")
+        assert feed(json.dumps({"jsonrpc": "2.0", "id": sent["id"], **init})) is SWALLOW
+        replies = {"tools/list": {"tools": [{"name": "t1"}]},             # unchanged
+                   "prompts/list": {"prompts": [{"name": "p2"}]},         # changed
+                   "resources/list": {"resources": [{"uri": "a://x"}]}}   # changed
+        for method, result in replies.items():
+            sent = _await_sent(t, method)
+            assert feed(json.dumps({"jsonrpc": "2.0", "id": sent["id"],
+                                    "result": result})) is SWALLOW
+    finally:
+        router.close_senders()
+    notes = [m["method"] for m in (json.loads(ln) for ln in out.getvalue().splitlines())
+             if "method" in m]
+    assert notes == ["notifications/prompts/list_changed"]

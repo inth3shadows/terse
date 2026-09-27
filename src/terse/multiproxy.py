@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import queue
 import sys
 import threading
@@ -138,7 +139,7 @@ _SNAPSHOT_LISTS = {
 # without them answers nothing a client waits on); the other lists are kept when a client
 # asked for them in the session that wrote it.
 _SNAPSHOT_KINDS = ("initialize", *_SNAPSHOT_LISTS)
-_SNAPSHOT_VERSION = 1
+_SNAPSHOT_VERSION = 2   # 2: + the client protocolVersion the replies were negotiated for
 
 # Bound on `Router._local_id_map` (broadcast-local id -> broadcast seq). Entries are
 # deliberately NOT popped as soon as a broadcast finishes (a late, post-finish reply
@@ -336,34 +337,61 @@ class _PendingBroadcast:
     on_done: Callable[[_PendingBroadcast], None] | None = None
 
 
-def router_snapshot_path(config_path: str) -> Path:
+def router_snapshot_path(config_path: str, cwd: str | None = None) -> Path:
     """Where the router persists its snapshot (#270): beside the savings ledger, under
-    `$XDG_STATE_HOME/terse/router-snapshots/`, one file per peers config.
+    `$XDG_STATE_HOME/terse/router-snapshots/`, one file per peers config — and per launch
+    directory, when `cwd` is given (see `snapshot_cwd`).
 
     Keyed by the config's RESOLVED path, not by its fingerprint: an edited config then
     overwrites its own stale file instead of orphaning one per edit. Whether the file may
     be served is decided by the fingerprint stored INSIDE it (`peers_fingerprint`)."""
-    key = hashlib.sha256(str(Path(config_path).resolve()).encode("utf-8")).hexdigest()[:16]
+    ident = str(Path(config_path).resolve()) + ("" if cwd is None else "\0" + cwd)
+    key = hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16]
     return default_stats_log().parent / "router-snapshots" / f"{key}.json"
 
 
-def peers_fingerprint(specs: list[DownstreamSpec]) -> str:
+def snapshot_cwd(specs: list[DownstreamSpec]) -> str | None:
+    """The router's own cwd when any peer INHERITS it (no `cwd` in its entry), else None.
+
+    A peer's replies can depend on where it runs. On the live fleet the codegraph peer
+    serves its tools only inside a repo with a `.codegraph/` index and is a zero-tool null
+    server everywhere else (25 of 62 repos). A snapshot shared across directories would be
+    served in the wrong one — a list_changed, the very cache bust #270 removes, and an
+    `initialize.instructions` naming tools that do not exist there, which nothing in MCP
+    can correct mid-session. So such a snapshot is per directory: in its path and in its
+    fingerprint."""
+    return os.getcwd() if any(s.cwd is None for s in specs) else None
+
+
+def peers_fingerprint(specs: list[DownstreamSpec], cwd: str | None = None) -> str:
     """sha256 over every parsed `downstreams[]` entry — name, target, headers, env, cwd,
-    resolved policy path. Any edit to the peers config changes it, and a snapshot written
-    under a different fingerprint is never served.
+    resolved policy path — plus the inherited launch directory (`snapshot_cwd`). Any edit
+    to the peers config changes it, and a snapshot written under a different fingerprint
+    is never served.
 
     Policy CONTENTS and the terse version are deliberately not in it: the snapshot stores
     each peer's RAW replies and the router re-merges them live (`_stored_pb`), so the
     retrieve tool, the primer mode and `serverInfo.version` always come from the running
     process. Only the digest is written — `headers` and `env` can carry credentials."""
-    doc = json.dumps([asdict(s) for s in specs], sort_keys=True, separators=(",", ":"))
+    doc = json.dumps({"peers": [asdict(s) for s in specs], "cwd": cwd},
+                     sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(doc.encode("utf-8")).hexdigest()
+
+
+def _init_view(result: dict) -> dict:
+    """The part of a merged `initialize` result a client acts on, for comparing a served
+    snapshot with the live one. `serverInfo` is left out: it names this process."""
+    return {"instructions": result.get("instructions"),
+            "capabilities": result.get("capabilities")}
 
 
 class RouterSnapshot:
     """The persisted replies of the last complete session (#270): for each kind in
     `_SNAPSHOT_KINDS`, peer name -> that peer's `{"result": ...}` or `{"error": ...}`,
-    in arrival order (`_merge_initialize` takes the first-arriving protocolVersion).
+    in arrival order (`_merge_initialize` takes the first-arriving protocolVersion) — plus
+    the `protocolVersion` the CLIENT requested in that session. The peers' `initialize`
+    replies were negotiated against that request, so they may only answer a client asking
+    for the same one (`Router._fast_initialize`).
 
     Every failure is a fallback, never a crash: a missing, unreadable, corrupt, foreign or
     wrongly-shaped file loads as None, and the router blocks on its peers exactly as it did
@@ -374,7 +402,8 @@ class RouterSnapshot:
         self.fingerprint = fingerprint
         self._warned = False
 
-    def load(self) -> dict[str, dict[str, dict]] | None:
+    def load(self) -> tuple[dict[str, dict[str, dict]], str] | None:
+        """(parts, client protocolVersion), or None for anything that cannot be served."""
         try:
             doc = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -386,8 +415,8 @@ class RouterSnapshot:
         if not isinstance(doc, dict) or doc.get("version") != _SNAPSHOT_VERSION \
                 or doc.get("fingerprint") != self.fingerprint:
             return None   # an edited peers config is routine, not worth a warning
-        parts = doc.get("parts")
-        if not isinstance(parts, dict):
+        parts, protocol = doc.get("parts"), doc.get("protocol")
+        if not isinstance(parts, dict) or not isinstance(protocol, str):
             return None
         out: dict[str, dict[str, dict]] = {}
         for kind in _SNAPSHOT_KINDS:
@@ -406,16 +435,16 @@ class RouterSnapshot:
         names = set(out["initialize"])
         if any(set(per_peer) != names for per_peer in out.values()):
             return None
-        return out
+        return out, protocol
 
-    def save(self, parts: dict[str, dict[str, dict]]) -> None:
+    def save(self, parts: dict[str, dict[str, dict]], protocol: str) -> None:
         try:
             mkdir_restricted(self.path.parent)
             # Atomic (temp + os.replace): a router killed mid-write leaves the previous
             # snapshot or the new one, never half of one.
             write_restricted(self.path, json.dumps(
                 {"version": _SNAPSHOT_VERSION, "fingerprint": self.fingerprint,
-                 "parts": parts}, separators=(",", ":"), ensure_ascii=False))
+                 "protocol": protocol, "parts": parts}, separators=(",", ":"), ensure_ascii=False))
         except OSError as exc:
             if not self._warned:
                 self._warned = True
@@ -446,6 +475,12 @@ class _Warm:
     refreshing: bool = False
     outstanding: set[str] = field(default_factory=set)
     fresh: dict[str, _PendingBroadcast] = field(default_factory=dict)
+    # What the client was told at initialize: the merged `instructions`/`capabilities`
+    # (before the listChanged flags were added) and the list_changed notifications those
+    # capabilities declared — the only ones `_reconcile` may send.
+    served_init: dict = field(default_factory=dict)
+    advertised: frozenset[str] = frozenset()
+    live_init: _PendingBroadcast | None = None
 
 
 class _PeerSender:
@@ -719,11 +754,16 @@ class Router:
         # this session blocks exactly as before). `_live_parts` collects this process's own
         # COMPLETE replies per kind — a broadcast a peer timed out on is never recorded, so
         # a degraded listing cannot overwrite a good snapshot. `_warm` is the session being
-        # served from the snapshot, if any. All three are guarded by `_snap_lock`.
+        # served from the snapshot, if any. `_persisted_protocol` / `_client_protocol` are
+        # the client protocolVersion the persisted / live replies answer (see
+        # `RouterSnapshot`). All of these are guarded by `_snap_lock`.
         self.snapshot = snapshot
-        self._persisted = snapshot.load() if snapshot is not None else None
-        if self._persisted is not None and set(self._persisted["initialize"]) != set(self.by_name):
-            self._persisted = None
+        loaded = snapshot.load() if snapshot is not None else None
+        if loaded is not None and set(loaded[0]["initialize"]) != set(self.by_name):
+            loaded = None
+        self._persisted: dict[str, dict[str, dict]] | None = loaded[0] if loaded else None
+        self._persisted_protocol: str | None = loaded[1] if loaded else None
+        self._client_protocol: str | None = None
         self._live_parts: dict[str, dict[str, dict]] = {}
         self._warm: _Warm | None = None
         self._snap_lock = Lock()
@@ -1296,12 +1336,23 @@ class Router:
         handshake in the background. False (the caller broadcasts as before) when there is
         no usable snapshot.
 
-        `tools.listChanged` is advertised ONLY on this path: it is the only one on which
-        the router may later emit `notifications/tools/list_changed` itself, and a client
-        is entitled to ignore a notification the server never declared."""
+        Also False when the client asks for a different `protocolVersion` than the one the
+        snapshot's replies were negotiated for: the stored peer replies (and the
+        protocolVersion `_merge_initialize` takes from them) answer THAT request, not this
+        one. The blocking path then negotiates afresh and persists the new pairing.
+
+        `listChanged` is advertised ONLY on this path, since it is the only one on which
+        the router emits list_changed itself: always for tools, and for prompts/resources
+        when the merged capabilities declare that surface at all. A client is entitled to
+        ignore a notification the server never declared, so `_reconcile` sends only these."""
+        params = msg.get("params")
+        requested = params.get("protocolVersion") if isinstance(params, dict) else None
         with self._snap_lock:
+            self._client_protocol = requested if isinstance(requested, str) else None
             snap = self._persisted
-        if snap is None or not self.peers:
+            same_protocol = (self._client_protocol is not None
+                             and self._client_protocol == self._persisted_protocol)
+        if snap is None or not same_protocol or not self.peers:
             return False
         with self._pending_lock:
             seq = self._broadcast_seq     # reserved — see _Warm
@@ -1311,9 +1362,17 @@ class Router:
             self._warm = warm             # a re-initialize supersedes any earlier session
         result = self._merge_initialize(self._stored_pb("initialize", snap["initialize"], seq))
         caps = result["capabilities"]
-        tools_cap = caps.get("tools")
-        result["capabilities"] = {**caps, "tools": {
-            **(tools_cap if isinstance(tools_cap, dict) else {}), "listChanged": True}}
+        warm.served_init = _init_view(result)
+        advertised = dict(caps)
+        for surface in ("tools", "prompts", "resources"):
+            cap = caps.get(surface)
+            if surface == "tools" or isinstance(cap, dict):
+                advertised[surface] = {**(cap if isinstance(cap, dict) else {}),
+                                       "listChanged": True}
+        result["capabilities"] = advertised
+        warm.advertised = frozenset(
+            note for kind, note in _SNAPSHOT_LISTS.items()
+            if kind.split("/")[0] in advertised)
         # Reply BEFORE the peers are even written to. The client's next line (normally
         # `notifications/initialized`) is read by this same thread after we return, so it
         # still reaches every peer's queue behind the `initialize` below.
@@ -1350,6 +1409,7 @@ class Router:
         self._record(pb)
         with self._snap_lock:
             warm.init_done = True
+            warm.live_init = pb
         self._maybe_refresh(warm)
 
     def _maybe_refresh(self, warm: _Warm) -> None:
@@ -1384,16 +1444,30 @@ class Router:
         Compared on the stored per-peer replies rather than on the merged lists: the merge
         is a function of those replies, so equal replies can only produce an equal list,
         and the comparison stays free of the merge's side effects. A peer that timed out
-        makes its list differ, which is right: its tools are no longer routable."""
+        makes its list differ, which is right: its tools are no longer routable.
+
+        `initialize` is compared too, on what the client actually reads (`instructions`,
+        `capabilities`), but it can only be REPORTED: MCP has no notification that
+        re-sends `initialize`, so this session keeps the stale instructions (e.g. naming a
+        peer's tools that the live peer no longer serves). The live replies were recorded
+        by `_warm_initialized`, so `_maybe_persist` below corrects the NEXT session."""
         notes: list[str] = []
         for kind, note in _SNAPSHOT_LISTS.items():
             pb = warm.fresh.get(kind)
             if pb is None:
                 continue
             self._merge_broadcast(pb)    # installs the live table: its seq > warm.seq
-            if self._by_peer(pb) != warm.parts.get(kind) and note not in notes:
+            if (self._by_peer(pb) != warm.parts.get(kind) and note in warm.advertised
+                    and note not in notes):
                 notes.append(note)
             self._record(pb)
+        live_init = warm.live_init
+        if live_init is not None and not live_init.remaining \
+                and _init_view(self._merge_initialize(live_init)) != warm.served_init:
+            sys.stderr.write("[terse-multiproxy] the live initialize differs from the "
+                             "snapshot this session was answered from (instructions or "
+                             "capabilities); it cannot be re-sent mid-session, so the "
+                             "snapshot is updated for the next one\n")
         self._maybe_persist()
         for note in notes:
             self._write_client(json.dumps({"jsonrpc": "2.0", "method": note},
@@ -1418,15 +1492,18 @@ class Router:
         if self.snapshot is None:
             return
         with self._snap_lock:
-            live = self._live_parts
-            if self._warm is not None or "initialize" not in live or "tools/list" not in live:
+            live, protocol = self._live_parts, self._client_protocol
+            if (self._warm is not None or protocol is None
+                    or "initialize" not in live or "tools/list" not in live):
                 return
-            merged = {**(self._persisted or {}), **live}
-            if merged == self._persisted:
+            # Kinds are carried over only from a snapshot for the SAME client protocol.
+            same = protocol == self._persisted_protocol
+            merged = {**((self._persisted or {}) if same else {}), **live}
+            if same and merged == self._persisted:
                 return
-            self._persisted = merged
+            self._persisted, self._persisted_protocol = merged, protocol
             # Under the lock so two finishing broadcasts cannot write out of order.
-            self.snapshot.save(merged)
+            self.snapshot.save(merged, protocol)
 
     def end_warm(self) -> None:
         """Drop the warm session at client EOF, BEFORE the shutdown drains: nothing is owed
@@ -1996,12 +2073,13 @@ def run_multi_proxy(
         return 2
 
     out_lock = Lock()
+    launch_dir = snapshot_cwd(specs)
     router = Router(peers, cout, out_lock, debug=debug, broadcast_timeout=broadcast_timeout,
                     primer_latch=primer_latch,
                     on_session=(build_router_session_writer(stats_log, primer_label)
                                 if stats_log is not None else None),
-                    snapshot=RouterSnapshot(router_snapshot_path(config_path),
-                                            peers_fingerprint(specs)))
+                    snapshot=RouterSnapshot(router_snapshot_path(config_path, launch_dir),
+                                            peers_fingerprint(specs, launch_dir)))
 
     sigterm_token = _install_sigterm_to_exit()
 
