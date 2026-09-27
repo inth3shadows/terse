@@ -1940,6 +1940,10 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
     # `structuredContent` result and attach on a later text-only one, and having paid once
     # is what matters.
     suppressed_label: set[str] = set()
+    # WHICH declines each label recorded (#325): `structured`, `never`, `auto`. Read from the
+    # row, never inferred from the entry's `--primer` mode -- an `auto` entry can decline on
+    # `structuredContent` alone, and the report must say so.
+    decline_reasons: dict[str, set[str]] = {}
     # Labels with ANY attach row, recorded before the tokenization skip below. Kept separate
     # from `recorded_emissions` because those two answer different questions: "did it pay?"
     # and "can we size what it paid?". An attach written without tiktoken carries
@@ -1967,6 +1971,8 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
             # safe direction; believing it publishes a fabricated zero.
             if not (prow.get("tokens") or 0) and not (prow.get("bytes") or 0):
                 suppressed_label.add(plbl)
+                decline_reasons.setdefault(plbl, set()).add(
+                    str(prow.get("reason") or PRIMER_DECLINE_STRUCTURED))
             continue
         # BEFORE the tokenization skip: an attach is proof of payment whether or not we can
         # size it.
@@ -2295,7 +2301,11 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         primer_mode = str(row.get("primer") or PRIMER_ALWAYS)
         if primer_mode not in PRIMER_MODES:
             primer_mode = PRIMER_ALWAYS
-        configured_zero = primer_mode == PRIMER_NEVER and not measured
+        # NOT `not measured` alone: `measured` needs a token count, and an UNTOKENIZED
+        # attach is still proof of payment -- publishing a configured zero over it is #320's
+        # fabricated measurement, re-entered through the mode.
+        configured_zero = (primer_mode == PRIMER_NEVER and not measured
+                           and not any(lbl in attached_label for lbl in primer_labels))
         if configured_zero:
             tokens = 0
         # None, not 0, when no label could be recovered: "unknown" and "never called" are
@@ -2385,6 +2395,10 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
                               else "configured" if configured_zero else "estimated"),
             # The entry's `--primer` mode (#325): always / never / auto.
             "primer_mode": primer_mode,
+            # The decline reasons behind a measured zero (#325), sorted; empty otherwise.
+            "primer_decline_reasons": (sorted(set().union(
+                *(decline_reasons.get(lbl, set()) for lbl in primer_labels)))
+                if measured_zero else []),
             "tokenized_blocks": tokenized,
             # `unpaid=measured_zero` forces the UNPAID bucket. `_cadence` alone returns
             # `_ONCE` ("pays once per session") whenever `encoded > 0`, and #286's shape
@@ -2406,7 +2420,10 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
                                 # `encoded == 0` was listed free beside it.
                                 recorded=measured or any(
                                     lbl in attached_label for lbl in primer_labels),
-                                unpaid=measured_zero, lazy_router=lazy_router),
+                                # A configured `never` zero is as unpaid as a measured
+                                # one (#325): `1x` beside 0 tokens would contradict itself.
+                                unpaid=measured_zero or configured_zero,
+                                lazy_router=lazy_router),
             **_break_even(tokens, blocks, tokenized,
                           sum(net_saved_by_label.get(lbl, 0) for lbl in labels),
                           # Same shape as `no ledger label` — nothing measurable — but a
@@ -2489,9 +2506,11 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         # primer` verdict in the table. `or primer_source == "recorded"` re-admits the
         # second case, whose primer_tokens is a MEASURED 0 rather than an absent one -- and
         # that is a real distinction, not a loophole: only a recorded suppression sets it.
+        # "configured" (#325) is a baked `--primer never`, zero by construction.
         "free": [s["server"] for s in servers
                  if s["cadence"] == _ONCE_FREE
-                 and (s["primer_tokens"] or s.get("primer_source") == "recorded")],
+                 and (s["primer_tokens"]
+                      or s.get("primer_source") in ("recorded", "configured"))],
         # Lazy, but no ledger label was recoverable, so we cannot say whether the attach
         # ever fired. Neither total counts it — same discipline as `unresolved`.
         "uncertain": [s["server"] for s in servers if s["cadence"] == _ONCE_UNKNOWN],
@@ -2590,8 +2609,12 @@ def build_primer_section(liab: dict[str, Any]) -> list[str]:
              if s_.get("primer_source") == "recorded" and not s_.get("primer_tokens")]
     # A measured zero under `--primer never`/`auto` (#325) is that mode's decline, not #286's
     # `structuredContent` gap, and the sentence below must not claim otherwise.
-    never = [s_["server"] for s_ in zeros if s_.get("primer_mode", "always") == "always"]
-    by_mode = [s_["server"] for s_ in zeros if s_.get("primer_mode", "always") != "always"]
+    # By the recorded REASON, not the entry's mode: an `auto` entry whose only decline was
+    # `structuredContent` is #286's case. A row from an older terse has no reasons: #286's.
+    mode_reasons = {PRIMER_DECLINE_NEVER, PRIMER_DECLINE_AUTO}
+    by_mode = [s_["server"] for s_ in zeros
+               if mode_reasons & set(s_.get("primer_decline_reasons") or ())]
+    never = [s_["server"] for s_ in zeros if s_["server"] not in by_mode]
     configured = [s_["server"] for s_ in servers if s_.get("primer_source") == "configured"]
     if paid or zeros:
         lines.append(f"  {len(paid) + len(zeros)} of {len(servers)} server(s) are MEASURED, "

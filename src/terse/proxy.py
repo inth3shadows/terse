@@ -906,8 +906,18 @@ class Interceptor:
             # incompressible result never spends it.
             wrap_tentative = hold_all and self._can_wrap_primer(tool, result,
                                                                 error_result=error_result)
+            # `--primer auto` (#325): the hold exists because a primer is owed, and under
+            # `auto` one is owed only for a result that NEEDS it. So every held result is
+            # compressed tentatively, wrappable client or not: one `auto` declines is
+            # released compressed (its typed field resolved exactly as after an `always`
+            # attach), one that needs the primer reverts to the hold below. Without this a
+            # non-"compress" client kept every typed result raw until some result happened
+            # to need the primer -- a compression loss Phase 2 would bill to the primer.
+            auto_tentative = (hold_all and not wrap_tentative
+                              and self._primer_mode == PRIMER_AUTO)
+            tentative = wrap_tentative or auto_tentative
             wrap_primer = False
-            if wrap_tentative:
+            if tentative:
                 hold_all = False
                 self._structured_hold = False   # resolve `structured` normally from here
             mirror = (None if hold_all else
@@ -1038,7 +1048,7 @@ class Interceptor:
                 result, tool, force_lossless=error_result)
             changed = changed or rewrote_structured
 
-            if wrap_tentative:
+            if tentative:
                 # #463: claim the primer only if terse actually put a wire form on this
                 # result -- otherwise it would be spent explaining nothing.
                 wire_form = rewrote_structured or any(
@@ -1052,7 +1062,10 @@ class Interceptor:
                 auto_declined = (wire_form and self._primer_mode == PRIMER_AUTO
                                  and not self._result_needs_primer(content, result,
                                                                    rewrote_structured))
-                wrap_primer = wire_form and not auto_declined and self._claim_primer()
+                # Only a wrappable result may CARRY the primer; an `auto_tentative` one that
+                # needs it reverts to the hold, as `always` would have held it.
+                wrap_primer = (wire_form and not auto_declined and wrap_tentative
+                               and self._claim_primer())
                 if auto_declined:
                     # `hold_all` is already False (lifted for the tentative pass above).
                     if self._claim_decline():
@@ -1071,6 +1084,9 @@ class Interceptor:
                     diff_reason = "primer_hold"
                     joined_block = None
                     partial_done = False
+                    # A `replace` mirror an `auto_tentative` pass resolved is not dropped
+                    # either: the original line goes out whole.
+                    mirror = None
                     if self.diff:
                         self.last.pop(tool, None)
                         self.last_args.pop(tool, None)

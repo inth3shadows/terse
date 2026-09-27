@@ -390,3 +390,62 @@ def test_a_downstream_primer_flag_is_not_terses():
     entry = {"command": "/usr/bin/python",
              "args": ["-m", "terse", "proxy", "--", "kb-server", "--primer", "never"]}
     assert "primer" not in (im.parse_proxy_opts(entry) or {})
+
+
+# --- review of #488 ---
+
+def _probe(mode):
+    """Router, structured="auto", NO client name (so the typed field resolves to "leave"
+    and #463's wrap never applies): flat text, then flat text + structuredContent, x3.
+    Returns (typed field compressed?, text compressed?) per structured result."""
+    pol = Policy(rules=[Rule("gh.*", TIERS, structured="auto")])
+    _latch, (a, _b) = _router(mode, [], pol)
+    sc = {"rows": [{"id": i, "status": "awaiting-triage-from-maintainer"}
+                   for i in range(12)]}
+    seen = []
+    for k in range(3):
+        _drive(a, 2 * k + 1, _flat_text())
+        res = json.loads(_drive(a, 2 * k + 2, _flat_text(), structured=sc))["result"]
+        seen.append((res["structuredContent"] != sc,
+                     any('"__terse_' in b.get("text", "") for b in res["content"])))
+    return seen
+
+
+def test_router_auto_releases_a_declined_typed_result_like_always_does():
+    """Under `auto` a held result stayed a raw `primer_hold` passthrough for the whole
+    session whenever the client could not take the #463 wrap -- a compression loss that
+    Phase 2 would have billed to the primer."""
+    assert _probe("always") == [(False, True)] * 3
+    assert _probe("auto") == _probe("always")
+
+
+def test_router_auto_still_holds_a_typed_result_that_needs_the_primer():
+    pol = Policy(rules=[Rule("gh.*", TIERS, structured="auto")])
+    latch, (a, _b) = _router("auto", [], pol)
+    line = _result(1, _nested_text(), structured={"x": 1})
+    _call(a, 1)
+    assert a.transform_response(line) == line          # held whole, primer still owed
+    assert latch.pending()
+
+
+def test_liability_never_does_not_zero_an_untokenized_attach():
+    att = {**build_primer_record("gh-server", cadence=PRIMER_CADENCE_ONCE, primer="P" * 40),
+           "tokens": None}
+    row = primer_liability([_scan_row("never")], _agg([att]))["servers"][0]
+    assert row["primer_source"] == "estimated" and row["primer_tokens"] > 0
+
+
+def test_liability_never_is_unpaid_and_listed_free():
+    liab = primer_liability([_scan_row("never")], _agg())
+    assert liab["servers"][0]["cadence"] == "once/session (unpaid)"
+    assert liab["free"] == ["gh"]
+
+
+def test_liability_names_the_recorded_reason_not_the_mode():
+    """A standalone `auto` entry whose only decline was `structuredContent` is #286's case."""
+    liab = primer_liability([_scan_row("auto")], _agg([_decline(PRIMER_DECLINE_STRUCTURED)]))
+    assert liab["servers"][0]["primer_decline_reasons"] == ["structured"]
+    text = "\n".join(build_primer_section(liab))
+    assert "structuredContent" in text and "#325" not in text
+    liab = primer_liability([_scan_row("auto")], _agg([_decline(PRIMER_DECLINE_AUTO)]))
+    assert liab["servers"][0]["primer_decline_reasons"] == ["auto"]

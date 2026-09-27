@@ -127,7 +127,9 @@ LIABILITY_SERVER = {"server", "scope", "state", "primer_tokens", "ledger_labels"
                     # consumer can tell a retrieve-driven negative rate from expansion.
                     "retrieve_tokens",
                     # #325: the entry's baked `--primer` mode (always / never / auto).
-                    "primer_mode"}
+                    "primer_mode",
+                    # #325: the decline reasons behind a measured zero; empty otherwise.
+                    "primer_decline_reasons"}
 
 # Deliberately verdict-INCAPABLE (#238): no `primer_tokens`, no `blocks_to_break_even`, no
 # `break_even_verdict`, no `verdict`. A peer has no primer to divide by -- the router pays one
@@ -156,7 +158,7 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     # to "where did this number come from", even when the answer is "we inferred it".
     # #325 added "configured" (`--primer never`, no attach recorded) beside the two.
     "primer_source": (str,),
-    "primer_mode": (str,),
+    "primer_mode": (str,), "primer_decline_reasons": (list,),
     "reason": (str, type(None)),
     # #311 primer rows: emissions/bytes/tokens are counts, `untokenized` is the
     # None-is-not-zero escape hatch every other record already has.
