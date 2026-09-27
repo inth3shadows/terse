@@ -278,3 +278,77 @@ def test_write_arm_config_rejects_unknown_arm(tmp_path):
         assert "unknown arm" in str(e)
     else:
         raise AssertionError("expected ValueError")
+
+
+# ----------------------------------------------------------- #325: --c-primer arms
+
+def test_write_arm_config_arm_c_argv_unchanged_without_c_primer(tmp_path):
+    downstreams = [{"name": name, "command": [f"/bin/{name}"]} for name in arms.SERVERS]
+    cfg, _ = _write_router_and_peers(tmp_path, downstreams)
+    entry = json.loads(arms.write_arm_config("C", tmp_path / "out", cfg=cfg)
+                       .read_text())["mcpServers"]["terse"]
+    peers_copy = str(tmp_path / "out" / "peers-C.json")
+    assert entry["args"] == ["proxy", "--config", peers_copy, "--no-stats"]
+    assert "--primer" not in entry["args"]
+
+
+def test_write_arm_config_arm_c_inserts_primer_after_proxy_subcommand(tmp_path):
+    downstreams = [{"name": name, "command": [f"/bin/{name}"]} for name in arms.SERVERS]
+    cfg, _ = _write_router_and_peers(tmp_path, downstreams)
+    base = json.loads(arms.write_arm_config("C", tmp_path / "base", cfg=cfg)
+                      .read_text())["mcpServers"]["terse"]["args"]
+    for mode in arms.PRIMER_MODES:
+        out = tmp_path / mode
+        entry = json.loads(arms.write_arm_config("C", out, cfg=cfg, c_primer=mode)
+                           .read_text())["mcpServers"]["terse"]
+        assert entry["args"] == ["proxy", "--primer", mode, "--config",
+                                 str(out / "peers-C.json"), "--no-stats"]
+        # Only the two primer tokens differ from the flag-less argv.
+        rest = [a for a in entry["args"] if a not in ("--primer", mode)]
+        assert [a for a in rest if "peers-" not in a] == [a for a in base if "peers-" not in a]
+
+
+def test_c_primer_combines_with_c_terse(tmp_path):
+    downstreams = [{"name": name, "command": [f"/bin/{name}"]} for name in arms.SERVERS]
+    cfg, _ = _write_router_and_peers(tmp_path, downstreams)
+    entry = json.loads(arms.write_arm_config(
+        "C", tmp_path / "out", cfg=cfg, c_primer="never",
+        c_terse="/opt/terse-dev/bin/terse").read_text())["mcpServers"]["terse"]
+    assert entry["command"] == "/opt/terse-dev/bin/terse"
+    assert entry["args"][:3] == ["proxy", "--primer", "never"]
+
+
+def test_with_primer_stays_on_terses_side_of_the_double_dash():
+    entry = {"command": "uvx", "args": ["terse", "proxy", "--policy", "/p.json", "--",
+                                        "kb-mcp", "--primer", "downstream-own"]}
+    out = arms.with_primer(entry, "auto")
+    assert out["args"] == ["terse", "proxy", "--primer", "auto", "--policy", "/p.json", "--",
+                           "kb-mcp", "--primer", "downstream-own"]
+    assert entry["args"][2] == "--policy"  # input not mutated
+
+
+def test_with_primer_replaces_an_existing_primer_flag():
+    entry = {"command": "/bin/terse", "args": ["proxy", "--primer", "always",
+                                               "--config", "/peers.json"]}
+    assert arms.with_primer(entry, "never")["args"] == [
+        "proxy", "--primer", "never", "--config", "/peers.json"]
+
+
+def test_with_primer_rejects_bad_mode_and_non_proxy_entry():
+    import pytest
+    with pytest.raises(ValueError):
+        arms.with_primer({"command": "/bin/terse", "args": ["proxy"]}, "sometimes")
+    with pytest.raises(ValueError):
+        arms.with_primer({"command": "/bin/terse", "args": ["stats"]}, "never")
+
+
+def test_c_primer_rejected_for_other_arms(tmp_path):
+    import pytest
+    with pytest.raises(ValueError):
+        arms.write_arm_config("B", tmp_path, c_primer="never")
+
+
+def test_proxy_help_argv_stops_at_the_proxy_subcommand():
+    entry = {"command": "uvx", "args": ["terse", "proxy", "--primer", "auto",
+                                        "--config", "/peers.json"]}
+    assert arms.proxy_help_argv(entry) == ["uvx", "terse", "proxy", "--help"]

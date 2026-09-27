@@ -373,3 +373,41 @@ def test_load_rows_reads_jsonl(tmp_path):
     path.write_text("\n".join(json.dumps(r) for r in rows) + "\n\n")  # trailing blank line
     loaded = an.load_rows([path])
     assert len(loaded) == 2
+
+
+# ----------------------------------------------------------- #325: --by-primer
+
+def _prow(task, mode, rep, success, cost):
+    return {**_row(task, "C", rep, success, cost), "c_primer": mode}
+
+
+def test_primer_comparison_groups_arm_c_rows_by_mode():
+    rows = [_prow("t1", "always", 1, True, 100), _prow("t1", "never", 1, True, 80),
+            _prow("t1", "auto", 1, True, 90), _prow("t2", "always", 1, True, 50),
+            _prow("t2", "never", 1, False, 40), _prow("t2", "auto", 1, True, 45),
+            _row("t1", "B", 1, True, 999),  # non-C rows are ignored
+            {**_prow("t1", "never", 2, False, None), "infra_error": "timeout"}]
+    rep = an.primer_comparison(rows)["haiku"]
+    assert rep["labels"] == ["C[always]", "C[auto]", "C[never]"]
+    assert rep["arms"]["C[never]"]["total_cost"] == 120
+    assert rep["arms"]["C[never]"]["successes"] == 1
+    assert set(rep["contrasts"]) == {"C[always]-C[auto]", "C[always]-C[never]",
+                                     "C[auto]-C[never]"}
+    assert rep["success_not_lower"]["C[always]-C[never]"] is True
+    assert rep["success_not_lower"]["C[auto]-C[never]"] is True
+    text = an.format_primer_report(an.primer_comparison(rows))
+    assert "C[never]" in text and "paired bootstrap" in text
+
+
+def test_primer_label_marks_rows_without_the_flag_unset():
+    assert an.primer_label(_row("t1", "C", 1, True, 1)) == "C[unset]"
+    assert an.primer_label(_prow("t1", "auto", 1, True, 1)) == "C[auto]"
+
+
+def test_main_by_primer_prints_primer_report(tmp_path, capsys):
+    import json
+    p = tmp_path / "rows.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in [
+        _prow("t1", "always", 1, True, 100), _prow("t1", "never", 1, True, 80)]))
+    assert an.main(["--by-primer", str(p)]) == 0
+    assert "arm C by --primer mode" in capsys.readouterr().out

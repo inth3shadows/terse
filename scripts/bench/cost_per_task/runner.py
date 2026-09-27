@@ -10,6 +10,24 @@ reinvented.
 
 See ~/.claude/plans/terse-cost-per-task-e2e.md for the protocol this
 implements.
+
+Primer-mode arms (#325): `--c-primer always|never|auto` adds `--primer MODE` to arm
+C's router argv (omitted = today's argv, unchanged) and records it on every row as
+`c_primer`. To compare the three modes with everything else identical, run one
+arm-C-only batch per mode with the SAME --c-terse (a terse that has `--primer`; the
+runner refuses to start otherwise), --model, --effort, --reps and --seed, and a
+SEPARATE --config-dir and --out each (concurrently is fine):
+
+  T=<worktree>/.venv/bin/terse
+  for m in always never auto; do
+    uv run python scripts/bench/cost_per_task/runner.py --arms C --c-terse "$T" \\
+      --c-primer $m --seed 1 --config-dir "$SCRATCH/primer-$m" \\
+      --out "$SCRATCH/primer-$m.jsonl" &
+  done; wait
+  uv run python scripts/bench/cost_per_task/analysis.py --by-primer "$SCRATCH"/primer-*.jsonl
+
+Each batch runs its own discarded warm-up rep first (to that --config-dir's
+warmup.jsonl, never --out), so the cold-cache handling is the same per mode.
 """
 from __future__ import annotations
 
@@ -487,7 +505,8 @@ def run_one(*, task: dict, arm: str, rep: int, model: str, arm_config_path: Path
             effort: str | None = None,
             settings_path: Path | None = None,
             safe_mode: bool = False,
-            builtin_tools: str | None = None) -> dict:
+            builtin_tools: str | None = None,
+            c_primer: str | None = None) -> dict:
     """Run ONE `claude -p` session for (task, arm, rep), score it against the
     task's success check, and append its JSONL row to `out_fh` immediately.
     Returns the row dict too.
@@ -504,7 +523,11 @@ def run_one(*, task: dict, arm: str, rep: int, model: str, arm_config_path: Path
 
     `allowed_tools` is this (task, arm)'s permission allowlist (tasks.json's
     `tools.<ARM>`); `effort`/`settings_path`/`safe_mode` are passed straight
-    through to `build_claude_command` (plan blockers #5, #6, #7)."""
+    through to `build_claude_command` (plan blockers #5, #6, #7).
+
+    `c_primer` is recorded on the row as-is (the `--primer` mode arm C's router was
+    launched with, None when the flag was not passed) so analysis.py can group C runs
+    that differ only by primer mode (#325)."""
     session_id = str(uuid.uuid4())
     run_id = str(uuid.uuid4())
     allowed_tools = [*(allowed_tools or []), offload_read_rule(session_id)]
@@ -520,6 +543,7 @@ def run_one(*, task: dict, arm: str, rep: int, model: str, arm_config_path: Path
         "session_id": session_id, "workdir": str(workdir),
         "arm_config_path": str(arm_config_path),
         "effort": effort, "allowed_tools": allowed_tools,
+        "c_primer": c_primer,
     }
 
     # CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 on every arm, uniformly, so a
@@ -723,6 +747,24 @@ def plan_run_combos(tasks: list[dict], arm_list: list[str], reps: int, *,
     return warmup_combos, real_combos
 
 
+def preflight_primer_supported(arm_c_config_path: Path) -> None:
+    """Exit before any session if arm C's router binary does not accept `--primer`.
+
+    A terse older than #325 rejects the unknown flag and exits, so every arm C session
+    would run with no MCP tools -- scored as task failures, not infra. Runs only
+    `<terse> proxy --help` (no model, no downstream)."""
+    doc = json.loads(arm_c_config_path.read_text())
+    entry = doc["mcpServers"][arms_mod.ROUTER_NAME]
+    argv = arms_mod.proxy_help_argv(entry)
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        sys.exit(f"preflight FAILED: could not run `{' '.join(argv)}` ({e})")
+    if out.returncode != 0 or "--primer" not in out.stdout:
+        sys.exit(f"preflight FAILED: `{' '.join(argv)}` does not list --primer -- arm C's "
+                 f"terse predates #325; pass --c-terse <a terse with it>")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--tasks", type=Path, default=HERE / "tasks.json")
@@ -733,6 +775,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--c-terse", default=None,
                      help="arm C only: launch the router with this terse binary instead of "
                           "the live one (e.g. a worktree's .venv/bin/terse)")
+    ap.add_argument("--c-primer", choices=arms_mod.PRIMER_MODES, default=None,
+                     help="arm C only: launch the router with `--primer MODE` (#325); "
+                          "omitted = no flag at all (today's exact argv). Needs a terse "
+                          "that knows the flag (see --c-terse); checked before any run")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--model", default="claude-haiku-4-5-20251001",
                      help="a FULL model ID, not an alias -- so the resolved model actually "
@@ -777,14 +823,18 @@ def main(argv: list[str] | None = None) -> int:
     arm_list = args.arms.split(",")
 
     args.config_dir.mkdir(parents=True, exist_ok=True)
-    c_overrides = {"c_policy": args.c_policy, "c_terse": args.c_terse}
+    c_overrides = {"c_policy": args.c_policy, "c_terse": args.c_terse,
+                   "c_primer": args.c_primer}
     arm_paths = {arm: arms_mod.write_arm_config(arm, args.config_dir,
                                                 **(c_overrides if arm == "C" else {}))
                  for arm in arm_list}
-    if args.c_policy or args.c_terse:
+    if args.c_policy or args.c_terse or args.c_primer:
         # Rows carry arm "C" either way; keep a variant's --out/--config-dir separate.
         print(f"arm C is a VARIANT: policy={args.c_policy or 'live'} "
-              f"terse={args.c_terse or 'live'}", file=sys.stderr)
+              f"terse={args.c_terse or 'live'} primer={args.c_primer or 'unset'}",
+              file=sys.stderr)
+    if args.c_primer and "C" in arm_paths:
+        preflight_primer_supported(arm_paths["C"])
     # Per-arm settings (Opus review 2026-09-26): B/C load the operator's real settings
     # (CLAUDE.md, rules, output style, skills, agents: "the user's setup"). Its blanket Read
     # allow rule is neutralised for EVERY arm by `blockReadsOutsideWorkingDirectories`, which
@@ -864,7 +914,8 @@ def main(argv: list[str] | None = None) -> int:
                                    setting_sources=setting_sources[arm], out_fh=out_fh,
                                    allowed_tools=allowed,
                                    effort=args.effort, settings_path=settings_paths[arm],
-                                   safe_mode=safe_mode[arm], builtin_tools=resolve_builtin_tools(task))
+                                   safe_mode=safe_mode[arm], builtin_tools=resolve_builtin_tools(task),
+                                   c_primer=args.c_primer if arm == "C" else None)
                     if not (is_warmup and warmup_missed_mcp(row, allowed)):
                         break
                     print(f"[{arm}] WARMUP {task['id']}: 0 MCP calls (tools may not have loaded)"
