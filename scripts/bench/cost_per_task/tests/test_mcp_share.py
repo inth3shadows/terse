@@ -101,3 +101,58 @@ def test_mcp_share_unmatched_tool_result_id_not_counted(tmp_path):
     path = tmp_path / "t.jsonl"
     _write_transcript(path, records)
     assert ms.mcp_share(path) == 0.0
+
+
+# ----------------------------------------------------------- #325: primer_attached
+
+def _primer_text():
+    from terse.proxy import PRIMER_HEAD
+    return PRIMER_HEAD + "- Table {...}\n"
+
+
+def _result_record(content):
+    return {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": content}]}}
+
+
+def test_primer_attached_true_for_a_text_block_primer(tmp_path):
+    path = tmp_path / "s.jsonl"
+    _write_transcript(path, [_result_record([
+        {"type": "text", "text": _primer_text()}, {"type": "text", "text": "{\"a\":1}"}])])
+    assert ms.primer_attached(path) is True
+
+
+def test_primer_attached_true_for_a_typed_wrapper_primer(tmp_path):
+    wrapped = json.dumps({"__terse_primer__": _primer_text(), "__terse_payload__": {"a": 1}})
+    path = tmp_path / "s.jsonl"
+    _write_transcript(path, [_result_record(wrapped)])
+    assert ms.primer_attached(path) is True
+
+
+def test_primer_attached_false_without_primer_or_for_empty_wrapper(tmp_path):
+    empty = json.dumps({"__terse_primer__": "", "__terse_payload__": {"a": 1}})
+    path = tmp_path / "s.jsonl"
+    _write_transcript(path, [_result_record(empty), _result_record("plain result")])
+    assert ms.primer_attached(path) is False
+
+
+def test_primer_attached_ignores_the_head_outside_tool_results(tmp_path):
+    # e.g. the model quoting the primer back, or a doc in the prompt -- not an attach.
+    path = tmp_path / "s.jsonl"
+    _write_transcript(path, [{"type": "assistant", "message": {"content": [
+        {"type": "text", "text": _primer_text()}]}}])
+    assert ms.primer_attached(path) is False
+
+
+def test_primer_attached_true_when_only_in_an_offloaded_result(tmp_path):
+    path = tmp_path / "sess-1.jsonl"
+    _write_transcript(path, [_result_record("Output too large, saved to file")])
+    off = tmp_path / "sess-1" / "tool-results"
+    off.mkdir(parents=True)
+    (off / "r1.txt").write_text(_primer_text())
+    assert ms.primer_attached(path) is True
+
+
+def test_primer_attached_none_without_a_transcript(tmp_path):
+    assert ms.primer_attached(None) is None
+    assert ms.primer_attached(tmp_path / "missing.jsonl") is None

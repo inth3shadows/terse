@@ -307,6 +307,141 @@ def analyze(rows: list[dict]) -> dict:
     return report
 
 
+def primer_label(row: dict) -> str:
+    """Arm C's row relabelled by the `--primer` mode its router ran with (#325):
+    `C[always]`, `C[never]`, `C[auto]`, or `C[unset]` for a row from a run that did not
+    pass `--c-primer` (the proxy default, i.e. `always` behaviour, but not asserted)."""
+    return f"C[{row.get('c_primer') or 'unset'}]"
+
+
+# The mode a primer variant must not be worse than: `always` is today's behaviour. A
+# `C[unset]` run (no --c-primer) is the same behaviour and stands in when no explicit
+# `always` run is present.
+PRIMER_BASELINES = ("C[always]", "C[unset]")
+
+
+def _attachment(runs: list[dict]) -> dict:
+    """How many of `runs` actually showed the model the primer (`primer_attached`).
+    `vacuous` is True when every determinable run went without it -- the mode's
+    treatment never reached the model on this task, so its cost says nothing about the
+    primer -- and None when no run was determinable."""
+    known = [r["primer_attached"] for r in runs if r.get("primer_attached") is not None]
+    attached = sum(1 for v in known if v)
+    return {"n": len(runs), "known": len(known), "attached": attached,
+            "vacuous": (attached == 0) if known else None}
+
+
+def primer_comparison(rows: list[dict]) -> dict:
+    """Compare arm C runs that differ only by primer mode (`runner.py --c-primer`).
+
+    Only arm C rows are used; each is relabelled by `primer_label` and the SAME
+    machinery as the A/B/C report runs over those labels. Every non-baseline label is
+    contrasted against the baseline (`PRIMER_BASELINES`): `<label>-<baseline>` paired
+    task-level bootstrap CI, and whether `<label>`'s success rate is not lower than the
+    baseline's. Pooled cost per success is reported twice -- over the tasks EVERY label
+    ran (`arms_shared`, the universe the CIs describe when all labels cover the same
+    tasks) and over each label's own tasks (`arms_all`). `attachment` and `stratified`
+    split by `primer_attached`. Infra rows are excluded exactly as in `analyze`."""
+    analyzable, _infra = partition_infra_rows(rows)
+    c_rows = [{**r, "arm": primer_label(r)} for r in analyzable if r.get("arm") == "C"]
+    grouped = _group_by_model_task_arm(c_rows)
+    report: dict = {}
+    for model, by_task_raw in grouped.items():
+        by_task = {t: {lab: task_arm_stats(runs) for lab, runs in lab_runs.items()}
+                   for t, lab_runs in by_task_raw.items()}
+        labels = sorted({lab for s in by_task.values() for lab in s})
+        baseline = next((b for b in PRIMER_BASELINES if b in labels), None)
+        contrasts, not_lower = {}, {}
+        if baseline is not None:
+            for lab in labels:
+                if lab == baseline:
+                    continue
+                key = f"{lab}-{baseline}"
+                contrasts[key] = paired_bootstrap_ci(by_task, lab, baseline)
+                not_lower[key] = success_not_lower(by_task, lab, baseline)
+        shared = {t for t, s in by_task.items() if all(lab in s for lab in labels)}
+        shared_by_task = {t: by_task[t] for t in shared}
+        attachment = {t: {lab: _attachment(runs) for lab, runs in lab_runs.items()}
+                      for t, lab_runs in by_task_raw.items()}
+        stratified: dict = {}
+        for lab in labels:
+            runs = [r for lab_runs in by_task_raw.values() for r in lab_runs.get(lab, [])]
+            yes = [r for r in runs if r.get("primer_attached") is True]
+            no = [r for r in runs if r.get("primer_attached") is False]
+            stratified[lab] = {"attached": task_arm_stats(yes) if yes else None,
+                               "not_attached": task_arm_stats(no) if no else None}
+        report[model] = {"labels": labels, "baseline": baseline, "tasks": by_task,
+                          "shared_tasks": sorted(shared),
+                          "arms_shared": {lab: arm_aggregate(shared_by_task, lab)
+                                          for lab in labels},
+                          "arms_all": {lab: arm_aggregate(by_task, lab) for lab in labels},
+                          "contrasts": contrasts, "success_not_lower": not_lower,
+                          "attachment": attachment, "stratified": stratified}
+    return report
+
+
+def _cps(stats: dict | None) -> str:
+    if stats is None or stats["cost_per_success"] is None:
+        return "n/a"
+    return f"{stats['cost_per_success']:.0f}"
+
+
+def format_primer_report(report: dict) -> str:
+    lines: list[str] = []
+    for model, m in report.items():
+        lines.append(f"\n=== model: {model} -- arm C by --primer mode ===")
+        lines.append(f"{'task':<32} {'mode':<10} {'n':>3} {'succ':>4} {'rate':>6} "
+                      f"{'cost/succ':>12} {'primer seen':>12}")
+        for task_id in sorted(m["tasks"]):
+            for lab in m["labels"]:
+                s = m["tasks"][task_id].get(lab)
+                if s is None:
+                    continue
+                att = m["attachment"][task_id][lab]
+                seen = f"{att['attached']}/{att['known']}" if att["known"] else "unknown"
+                flag = "  VACUOUS for this task" if att["vacuous"] else ""
+                lines.append(f"{task_id:<32} {lab:<10} {s['n']:>3} {s['successes']:>4} "
+                              f"{s['success_rate']:>6.0%} {_cps(s):>12} {seen:>12}{flag}")
+        lines.append("(VACUOUS = the model never saw the primer in any run of that mode on "
+                      "that task: its cost there says nothing about the primer)")
+        lines.append(f"\npooled cost per successful task over the {len(m['shared_tasks'])} "
+                      f"task(s) every mode ran:")
+        for lab in m["labels"]:
+            a = m["arms_shared"][lab]
+            lines.append(f"  {lab}: {_cps(a)} ({a['successes']}/{a['n']} succeeded, "
+                          f"{a['success_rate']:.0%})")
+        lines.append("pooled over each mode's OWN tasks (not what the CIs compare):")
+        for lab in m["labels"]:
+            a = m["arms_all"][lab]
+            lines.append(f"  {lab}: {_cps(a)} ({a['successes']}/{a['n']} succeeded, "
+                          f"{a['success_rate']:.0%})")
+        lines.append("\nstratified by whether the primer reached the model:")
+        for lab in m["labels"]:
+            st = m["stratified"][lab]
+            parts = []
+            for key, name in (("attached", "seen"), ("not_attached", "not seen")):
+                s = st[key]
+                parts.append(f"{name}: {_cps(s)} ({s['successes']}/{s['n']})" if s
+                             else f"{name}: no runs")
+            lines.append(f"  {lab}: " + "; ".join(parts))
+        if m["baseline"] is None:
+            lines.append("\nno C[always] (or C[unset]) run to compare against -- "
+                          "no contrasts")
+            continue
+        lines.append(f"\npaired bootstrap 95% CI vs {m['baseline']} "
+                      f"(mode - baseline, weighted tokens/success):")
+        for key, c in m["contrasts"].items():
+            ok = ("success not lower than baseline" if m["success_not_lower"][key]
+                  else "success LOWER than baseline")
+            if c["ci"] is None:
+                lines.append(f"  {key}: {c['reason']} ({ok})")
+            else:
+                verdict = "SIGNIFICANT" if c["excludes_zero"] else "inconclusive"
+                lines.append(f"  {key}: observed {c['observed']:+.0f}, 95% CI "
+                              f"[{c['ci'][0]:+.0f}, {c['ci'][1]:+.0f}] {verdict} ({ok})")
+    return "\n".join(lines)
+
+
 def format_report(report: dict, infra: list[dict] | None = None) -> str:
     lines: list[str] = []
     if infra:
@@ -381,12 +516,22 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("jsonl", nargs="+", type=Path)
     ap.add_argument("--json", action="store_true", help="emit the report as JSON")
+    ap.add_argument("--by-primer", action="store_true",
+                     help="compare arm C runs by their --primer mode (runner --c-primer, "
+                          "#325) instead of the A/B/C report; pass every mode's --out file")
     args = ap.parse_args(argv)
     rows = load_rows(args.jsonl)
     if not rows:
         print("no rows to analyze", file=sys.stderr)
         return 2
     _analyzable, infra = partition_infra_rows(rows)
+    if args.by_primer:
+        preport = primer_comparison(rows)
+        if args.json:
+            print(json.dumps({"primer_report": preport, "infra_excluded": infra}, indent=2))
+        else:
+            print(format_primer_report(preport))
+        return 0
     report = analyze(rows)
     if args.json:
         print(json.dumps({"report": report, "infra_excluded": infra}, indent=2))

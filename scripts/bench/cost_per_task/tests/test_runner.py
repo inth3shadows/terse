@@ -733,7 +733,7 @@ def test_make_shared_code_worktree_creates_a_real_worktree_at_pinned_commit(tmp_
     base_dir.mkdir()
     wt = r.make_shared_code_worktree(base_dir, repo, head)
     try:
-        assert wt == base_dir / "shared-code-worktree"
+        assert wt.parent == base_dir and wt.name.startswith("shared-code-worktree-")
         assert (wt / ".git").exists()
         wt_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt, capture_output=True,
                                   text=True, check=True).stdout.strip()
@@ -827,3 +827,78 @@ def test_every_arm_disables_hooks_and_fences_reads_to_the_working_dir(tmp_path):
         doc = json.loads(r.build_settings_file(tmp_path, name=name).read_text())
         assert doc == {"disableAllHooks": True,
                        "permissions": {"blockReadsOutsideWorkingDirectories": True}}
+
+
+# ----------------------------------------------------------- #325: --c-primer rows
+
+def test_run_one_row_carries_c_primer(monkeypatch, tmp_path):
+    row = _run_one(monkeypatch, tmp_path,
+                    run_side_effect=_fake_process(returncode=0,
+                                                   stdout=json.dumps({"result": "ok"})),
+                    transcript_records=[_usage_record()], c_primer="auto")
+    assert row["c_primer"] == "auto"
+    written = json.loads((tmp_path / "out.jsonl").read_text().splitlines()[-1])
+    assert written["c_primer"] == "auto"
+
+
+def test_run_one_row_c_primer_is_none_by_default(monkeypatch, tmp_path):
+    row = _run_one(monkeypatch, tmp_path,
+                    run_side_effect=_fake_process(returncode=0,
+                                                   stdout=json.dumps({"result": "ok"})),
+                    transcript_records=[_usage_record()])
+    assert row["c_primer"] is None
+
+
+def _arm_c_cfg(tmp_path):
+    p = tmp_path / "mcp-config-C.json"
+    p.write_text(json.dumps({"mcpServers": {"terse": {
+        "command": "/opt/t/bin/terse",
+        "args": ["proxy", "--primer", "never", "--config", "/peers.json"]}}}))
+    return p
+
+
+def test_preflight_primer_supported_passes_when_help_lists_flag(monkeypatch, tmp_path):
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout="  --primer {always,never,auto}\n",
+                                           stderr="")
+    monkeypatch.setattr(r.subprocess, "run", fake_run)
+    r.preflight_primer_supported(_arm_c_cfg(tmp_path))
+    assert seen["argv"] == ["/opt/t/bin/terse", "proxy", "--help"]
+
+
+def test_preflight_primer_supported_exits_on_old_terse(monkeypatch, tmp_path):
+    import pytest
+    monkeypatch.setattr(r.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 0, stdout="  --policy POLICY\n", stderr=""))
+    with pytest.raises(SystemExit):
+        r.preflight_primer_supported(_arm_c_cfg(tmp_path))
+
+
+def test_c_primer_flag_rejects_unknown_mode():
+    import pytest
+    with pytest.raises(SystemExit):
+        r.main(["--c-primer", "sometimes", "--out", "/x", "--config-dir", "/y"])
+
+
+def test_shared_code_worktree_basename_differs_per_config_dir(monkeypatch, tmp_path):
+    # runecho enrolls/un-enrolls by BASENAME: two batches must never share one.
+    monkeypatch.setattr(r.subprocess, "run", lambda *a, **kw: None)
+    one = r.make_shared_code_worktree(tmp_path / "primer-always", tmp_path, "HEAD")
+    two = r.make_shared_code_worktree(tmp_path / "primer-never", tmp_path, "HEAD")
+    again = r.make_shared_code_worktree(tmp_path / "primer-always", tmp_path, "HEAD")
+    assert one.name != two.name
+    assert one.name == again.name
+
+
+def test_run_one_row_records_primer_attached(monkeypatch, tmp_path):
+    from terse.proxy import PRIMER_HEAD
+    records = [_usage_record(), {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "x", "content": PRIMER_HEAD + "{}"}]}}]
+    row = _run_one(monkeypatch, tmp_path,
+                    run_side_effect=_fake_process(returncode=0,
+                                                   stdout=json.dumps({"result": "ok"})),
+                    transcript_records=records, c_primer="always")
+    assert row["primer_attached"] is True

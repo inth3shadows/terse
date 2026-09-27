@@ -373,3 +373,81 @@ def test_load_rows_reads_jsonl(tmp_path):
     path.write_text("\n".join(json.dumps(r) for r in rows) + "\n\n")  # trailing blank line
     loaded = an.load_rows([path])
     assert len(loaded) == 2
+
+
+# ----------------------------------------------------------- #325: --by-primer
+
+def _prow(task, mode, rep, success, cost, attached=None):
+    return {**_row(task, "C", rep, success, cost), "c_primer": mode,
+            "primer_attached": attached}
+
+
+def _primer_rows():
+    return [_prow("t1", "always", 1, True, 100, True), _prow("t1", "never", 1, True, 80, False),
+            _prow("t1", "auto", 1, True, 90, True), _prow("t2", "always", 1, True, 50, True),
+            _prow("t2", "never", 1, False, 40, False), _prow("t2", "auto", 1, True, 45, False),
+            _row("t1", "B", 1, True, 999),  # non-C rows are ignored
+            {**_prow("t1", "never", 2, False, None), "infra_error": "timeout"}]
+
+
+def test_primer_comparison_contrasts_every_mode_against_always():
+    rep = an.primer_comparison(_primer_rows())["haiku"]
+    assert rep["labels"] == ["C[always]", "C[auto]", "C[never]"]
+    assert rep["baseline"] == "C[always]"
+    assert rep["arms_all"]["C[never]"]["total_cost"] == 120
+    assert rep["arms_all"]["C[never]"]["successes"] == 1
+    assert set(rep["contrasts"]) == {"C[auto]-C[always]", "C[never]-C[always]"}
+    # never failed t2 where always passed: never's success IS lower than the baseline.
+    assert rep["success_not_lower"]["C[never]-C[always]"] is False
+    assert rep["success_not_lower"]["C[auto]-C[always]"] is True
+    text = an.format_primer_report(an.primer_comparison(_primer_rows()))
+    assert "C[never]-C[always]" in text and "success LOWER than baseline" in text
+
+
+def test_primer_comparison_falls_back_to_unset_baseline_and_none():
+    rows = [_prow("t1", None, 1, True, 100), _prow("t1", "never", 1, True, 80)]
+    rep = an.primer_comparison(rows)["haiku"]
+    assert rep["baseline"] == "C[unset]"
+    assert set(rep["contrasts"]) == {"C[never]-C[unset]"}
+    rows = [_prow("t1", "auto", 1, True, 100), _prow("t1", "never", 1, True, 80)]
+    rep = an.primer_comparison(rows)
+    assert rep["haiku"]["baseline"] is None and rep["haiku"]["contrasts"] == {}
+    assert "no contrasts" in an.format_primer_report(rep)
+
+
+def test_primer_comparison_pools_over_shared_tasks_and_own_tasks():
+    rows = [_prow("t1", "always", 1, True, 100), _prow("t1", "never", 1, True, 80),
+            _prow("t2", "always", 1, True, 1000)]  # t2 only ran under always
+    rep = an.primer_comparison(rows)["haiku"]
+    assert rep["shared_tasks"] == ["t1"]
+    assert rep["arms_shared"]["C[always]"]["total_cost"] == 100
+    assert rep["arms_all"]["C[always]"]["total_cost"] == 1100
+
+
+def test_primer_comparison_attachment_flags_vacuous_modes():
+    rep = an.primer_comparison(_primer_rows())["haiku"]
+    att = rep["attachment"]
+    assert att["t1"]["C[never]"] == {"n": 1, "known": 1, "attached": 0, "vacuous": True}
+    assert att["t1"]["C[auto]"]["vacuous"] is False
+    assert att["t2"]["C[auto]"]["vacuous"] is True  # auto declined on t2
+    undeterminable = an.primer_comparison([_prow("t1", "auto", 1, True, 1)])["haiku"]
+    assert undeterminable["attachment"]["t1"]["C[auto]"]["vacuous"] is None
+    st = rep["stratified"]["C[auto]"]
+    assert st["attached"]["total_cost"] == 90 and st["not_attached"]["total_cost"] == 45
+    assert rep["stratified"]["C[never]"]["attached"] is None
+    text = an.format_primer_report(an.primer_comparison(_primer_rows()))
+    assert "VACUOUS for this task" in text and "not seen" in text
+
+
+def test_primer_label_marks_rows_without_the_flag_unset():
+    assert an.primer_label(_row("t1", "C", 1, True, 1)) == "C[unset]"
+    assert an.primer_label(_prow("t1", "auto", 1, True, 1)) == "C[auto]"
+
+
+def test_main_by_primer_prints_primer_report(tmp_path, capsys):
+    import json
+    p = tmp_path / "rows.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in [
+        _prow("t1", "always", 1, True, 100), _prow("t1", "never", 1, True, 80)]))
+    assert an.main(["--by-primer", str(p)]) == 0
+    assert "arm C by --primer mode" in capsys.readouterr().out

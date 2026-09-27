@@ -266,8 +266,49 @@ def arm_c_config(cfg: Path | None = None, *, peers_copy_path: Path | None = None
     return {"mcpServers": {ROUTER_NAME: entry}}
 
 
+PRIMER_MODES = ("always", "never", "auto")  # `terse proxy --primer` (#325)
+
+
+def with_primer(entry: dict, mode: str) -> dict:
+    """A copy of router `entry` whose terse argv carries `--primer MODE` (#325).
+
+    Inserted immediately after the `proxy` subcommand token -- terse's own side of any
+    `--`, and for a `--config` router (no `--` at all) among the router's own options --
+    so it can never be read as a downstream's flag. The `proxy` position comes from
+    terse's own `install_mcp._proxy_subcommand_index`, not re-derived here. An existing
+    `--primer` on terse's side is replaced rather than duplicated."""
+    if mode not in PRIMER_MODES:
+        raise ValueError(f"unknown primer mode {mode!r}, must be one of {PRIMER_MODES}")
+    out = copy.deepcopy(entry)
+    args = list(out.get("args") or [])
+    i = install_mcp._proxy_subcommand_index(out, args)
+    if i is None:
+        raise ValueError("router entry runs no `terse proxy` -- cannot set --primer on it")
+    end = args.index("--") if "--" in args[i:] else len(args)
+    if "--primer" in args[i:end]:
+        j = args.index("--primer", i)
+        args[j + 1:j + 2] = [mode]
+    else:
+        args[i + 1:i + 1] = ["--primer", mode]
+    out["args"] = args
+    return out
+
+
+def proxy_help_argv(entry: dict) -> list[str]:
+    """`<router command> ... proxy --help` for `entry` -- what the runner's preflight
+    runs to confirm the binary arm C will launch actually accepts `--primer` (a terse
+    that predates #325 exits 2 on the unknown flag, and arm C would then silently run
+    with no MCP tools at all)."""
+    args = list(entry.get("args") or [])
+    i = install_mcp._proxy_subcommand_index(entry, args)
+    if i is None:
+        raise ValueError("router entry runs no `terse proxy`")
+    return [entry["command"], *args[:i + 1], "--help"]
+
+
 def write_arm_config(arm: str, out_dir: Path, cfg: Path | None = None, *,
-                     c_policy: Path | None = None, c_terse: str | None = None) -> Path:
+                     c_policy: Path | None = None, c_terse: str | None = None,
+                     c_primer: str | None = None) -> Path:
     """Build and write the MCP config for `arm` ('A'|'B'|'C') into `out_dir`.
     Returns the written path (mode 600). `out_dir` must be outside the repo
     (the runner always passes the scratchpad).
@@ -275,11 +316,14 @@ def write_arm_config(arm: str, out_dir: Path, cfg: Path | None = None, *,
     `c_policy` / `c_terse` make arm C a C-prime variant: the pinned policy copies hold
     `c_policy`'s content and the router launches `c_terse` instead of the live binary,
     everything else (peers, args, sanitising) identical -- so a policy option that only
-    an unreleased terse understands can be measured against today's C."""
+    an unreleased terse understands can be measured against today's C.
+
+    `c_primer` (#325) adds `--primer MODE` to arm C's router argv (see `with_primer`);
+    None leaves the argv byte-identical to a run without it."""
     if arm not in VALID_ARMS:
         raise ValueError(f"unknown arm {arm!r}, must be one of {VALID_ARMS}")
-    if arm != "C" and (c_policy is not None or c_terse is not None):
-        raise ValueError(f"c_policy/c_terse apply only to arm C, not {arm!r}")
+    if arm != "C" and (c_policy is not None or c_terse is not None or c_primer is not None):
+        raise ValueError(f"c_policy/c_terse/c_primer apply only to arm C, not {arm!r}")
     if arm == "A":
         doc = arm_a_config()
     elif arm == "B":
@@ -297,6 +341,9 @@ def write_arm_config(arm: str, out_dir: Path, cfg: Path | None = None, *,
             peers_dst = out_dir / f"peers-{arm}.json"
             _write_restricted(peers_dst, snapshot)
         doc = arm_c_config(resolved_cfg, peers_copy_path=peers_dst)
+        if c_primer is not None:
+            doc["mcpServers"][ROUTER_NAME] = with_primer(doc["mcpServers"][ROUTER_NAME],
+                                                         c_primer)
         if c_terse is not None:
             doc["mcpServers"][ROUTER_NAME]["command"] = c_terse
     return _write_restricted(out_dir / f"mcp-config-{arm}.json", doc)
