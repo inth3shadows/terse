@@ -536,6 +536,57 @@ def test_primer_all_vacuous_emits_no_ci():
     assert "success LOWER than baseline on vacuous tasks" not in text
 
 
+def test_abc_contrast_below_min_ci_tasks_is_descriptive_only():
+    rows = []
+    for i in range(2):
+        for rep in range(1, 4):
+            rows += [_row(f"t{i}", "C", rep, True, 50), _row(f"t{i}", "B", rep, True, 150)]
+    text = an.format_report(an.analyze(rows))
+    assert "SIGNIFICANT" not in text and "C is cheaper" not in text
+    assert (f"C-B: observed -100, too few tasks (2 < {an.MIN_CI_TASKS}) for a CI; "
+            f"descriptive only") in text
+
+
+def test_abc_contrast_at_min_ci_tasks_is_unchanged():
+    rows = []
+    for i in range(an.MIN_CI_TASKS):
+        for rep in range(1, 4):
+            rows += [_row(f"t{i}", "C", rep, True, 50 + i), _row(f"t{i}", "B", rep, True, 150)]
+    report = an.analyze(rows)
+    by_task = report["haiku"]["tasks"]
+    assert report["haiku"]["contrasts"]["C-B"] == an.paired_bootstrap_ci(by_task, "C", "B")
+
+
+def test_primer_undeterminable_tasks_are_a_separate_group():
+    rows = _issue_325_rows()  # kb exercising, noisy vacuous
+    for rep_ in range(1, 4):
+        rows += [_prow("legacy", "always", rep_, True, 500, None),
+                 _prow("legacy", "never", rep_, True, 100, None)]
+    m = an.primer_comparison(rows)["haiku"]
+    assert m["undeterminable_tasks"] == ["legacy"]
+    assert m["vacuous_tasks"] == ["noisy"] and m["exercising_tasks"] == ["kb"]
+    assert m["arms_vacuous"]["C[always]"]["n"] == 5  # control = noisy only
+    text = an.format_primer_report(an.primer_comparison(rows))
+    assert "UNDETERMINABLE -- 1 task(s)" in text and "legacy" in text
+
+
+def test_primer_all_undeterminable_does_not_claim_never_saw():
+    rows = [_prow("t1", None, 1, True, 100), _prow("t1", "never", 1, True, 80)]
+    m = an.primer_comparison(rows)["haiku"]
+    assert m["undeterminable_tasks"] == ["t1"] and m["vacuous_tasks"] == []
+    text = an.format_primer_report(an.primer_comparison(rows))
+    assert "primer comparison is UNDETERMINABLE" in text
+    assert "primer comparison is VACUOUS" not in text
+
+
+def test_primer_mode_that_saw_primer_on_vacuous_task_is_flagged():
+    rows = [_prow("kb", "always", 1, True, 100, True), _prow("kb", "auto", 1, True, 90, True),
+            _prow("v", "always", 1, True, 100, False), _prow("v", "auto", 1, True, 90, True)]
+    text = an.format_primer_report(an.primer_comparison(rows))
+    v_auto = [ln for ln in text.splitlines() if ln.startswith("v ") and "C[auto]" in ln]
+    assert v_auto and "saw primer; baseline did not" in v_auto[0]
+
+
 def test_primer_label_marks_rows_without_the_flag_unset():
     assert an.primer_label(_row("t1", "C", 1, True, 1)) == "C[unset]"
     assert an.primer_label(_prow("t1", "auto", 1, True, 1)) == "C[auto]"
