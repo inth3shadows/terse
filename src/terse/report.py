@@ -2267,17 +2267,22 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
             # An arm is quoted only when EVERY model has a full reading for it: a model with
             # uncounted rows passed the gate on a partial rate (or none), and dropping just
             # that model would quote a better-measured one's 100% for the cell (review 2).
-            rates_by_model = {m: dict(_codec_call_rates(g.rows)) for m, (_, g) in verdicts.items()}
+            # A text-channel model (`cli:`) never carries the counters because compliance
+            # does not apply to it — not a partial reading — so it leaves the quote rather
+            # than withholding a gateway model's fully measured rate (#450).
+            rates_by_model = {m: dict(_codec_call_rates(g.rows)) for m, (_, g) in verdicts.items()
+                              if not (g.rows and all(r.get("channel") == "text"
+                                                     for r in g.rows))}
             # Every model AT the lowest rate is named, so a tie does not single one out by
             # sort order; a rate every model shares names nobody (review 2 of #432).
             lowest: dict[str, tuple[float, list[str]]] = {}
             for arm in ("raw", "terse"):
-                if all(arm in rates for rates in rates_by_model.values()):
+                if rates_by_model and all(arm in rates for rates in rates_by_model.values()):
                     low = min(rates[arm] for rates in rates_by_model.values())
                     lowest[arm] = (low, [m for m, rates in rates_by_model.items()
                                          if rates[arm] == low])
             if lowest:
-                n_models = len(verdicts)
+                n_models = len(rates_by_model)
                 shown = ", ".join(
                     f"{arm} {_codec_rate_text(rate)}"
                     + ("" if len(ms) == n_models else
