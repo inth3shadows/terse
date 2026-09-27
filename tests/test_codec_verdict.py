@@ -704,8 +704,13 @@ def test_a_text_channel_model_does_not_withhold_the_gateway_models_rate():
     for cli in ("cli:haiku", "zz-cli"):              # sorts before AND after `gw`
         cell = _safe_cell({cli: _tagged_t(text), "gw": _tagged_t(
             [{**r, "channel": "tool"} for r in tool])})
-        # Only `gw` was measured, so the rate is its alone and names nobody.
-        assert "compliance raw 100%, terse 80% in this run" in cell, cell
+        # Only `gw` was measured, so the rate is named as its own: the Model column shows
+        # the tie-break model, which is the text model when it sorts first, and an unnamed
+        # rate there would read as the text model's (review of #480).
+        assert "compliance raw 100% (`gw`), terse 80% (`gw`) in this run" in cell, cell
+    first = _safe_cell({"cli:haiku": _tagged_t(text), "gw": _tagged_t(
+        [{**r, "channel": "tool"} for r in tool])})
+    assert "| `cli:haiku` |" in first and "terse 80% (`gw`)" in first, first
 
 
 def _answered_row(qid, raw_ok, terse_ok, trials, raw_ans=None, terse_ans=None, **extra):

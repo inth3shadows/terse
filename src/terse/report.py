@@ -2282,7 +2282,7 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
                     lowest[arm] = (low, [m for m, rates in rates_by_model.items()
                                          if rates[arm] == low])
             if lowest:
-                n_models = len(rates_by_model)
+                n_models = len(verdicts)
                 shown = ", ".join(
                     f"{arm} {_codec_rate_text(rate)}"
                     + ("" if len(ms) == n_models else
