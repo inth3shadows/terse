@@ -7,9 +7,17 @@ array so minify + tabularize + dictionary all have something to fold, EXCEPT for
 `fs.read` tool, which returns plain (non-JSON) log text -- so a real proxy run can
 exercise the Tier 0.7 text diff (#25) against a live subprocess, not just the pure
 Interceptor unit tests.
+
+Three optional env knobs, for the router's snapshot tests (#270): FAKE_INIT_DELAY (seconds
+to sleep before answering `initialize` -- a slow-starting peer), FAKE_TOOLS (comma-separated
+names `tools/list` reports instead of the default two), and FAKE_DIE_IF (a path: if it exists
+at launch, exit at once -- a peer that fails to start on THIS run only, while its config
+entry, and so the snapshot fingerprint, stays the same across runs).
 """
 import json
+import os
 import sys
+import time
 
 RECORDS = [{"id": i, "status": "active", "url": "https://x.example/api/items"} for i in range(20)]
 
@@ -25,6 +33,12 @@ def _log_text(n, changed_line=None):
 
 def main() -> None:
     global _fs_read_calls
+    die_if = os.environ.get("FAKE_DIE_IF")
+    if die_if and os.path.exists(die_if):
+        sys.exit(1)
+    init_delay = float(os.environ.get("FAKE_INIT_DELAY") or 0)
+    tools = [{"name": n} for n in
+             (os.environ.get("FAKE_TOOLS") or "gh.api.items,fs.read").split(",")]
     for raw in sys.stdin:
         line = raw.strip()
         if not line:
@@ -36,6 +50,8 @@ def main() -> None:
         mid = msg.get("id")
         method = msg.get("method")
         if method == "initialize":
+            if init_delay:
+                time.sleep(init_delay)
             # "stdio_peer" is a harmless marker key (no test asserts capabilities is
             # empty) that lets a multiproxy test prove THIS fake was actually reached
             # by a broadcast, by checking for it in the merged capabilities union.
@@ -56,7 +72,7 @@ def main() -> None:
                     "result": {"content": [{"type": "text", "text": text}], "isError": False}}
         elif method == "tools/list":
             resp = {"jsonrpc": "2.0", "id": mid,
-                    "result": {"tools": [{"name": "gh.api.items"}, {"name": "fs.read"}]}}
+                    "result": {"tools": tools}}
         elif method and method.startswith("notifications/"):
             continue  # notifications get no response
         elif mid is not None:

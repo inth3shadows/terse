@@ -13,7 +13,9 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **The router answers `initialize` without waiting for its slowest peer (#270).** `initialize` was broadcast to every peer and answered only when the slowest one replied (4.2s on the live fleet, measured 2026-09-26). A headless client such as `claude --print` sends its first request before that, so terse's tools arrived on turn 2 and the API re-wrote the whole prompt prefix (`cache_miss_reason: tools_changed`; 43% of one session's cache writes). The router now saves each peer's `initialize` and list replies after a complete session, to `$XDG_STATE_HOME/terse/router-snapshots/`, keyed by the peers config path and tagged with a fingerprint of its `downstreams`. When the fingerprint matches, `initialize`, `tools/list` and the other list methods are answered from that file at once while the peers start in the background, and a `tools/call` sent to a peer that is still starting waits for it, under the same timeout as before. Once every peer is up the router lists them again; if anything differs from the saved replies it sends one `notifications/tools/list_changed` (the fast `initialize` advertises `tools.listChanged`) and updates the file. A listing in which some peer timed out is never saved. With no file, an edited config, or a corrupt or unreadable file, `initialize` waits on every peer as before and the file is written afterwards.
 
 ## [0.41.0] - 2026-09-26
 
