@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.41.5] - 2026-09-26
+
 ### Fixed
 
 - **Codec eval: a `cli:` model no longer hides a gateway model's compliance rate (#450).** In a run mixing a text-channel (`cli:`) model with a tool-calling one, a SAFE row dropped the tool-call compliance line entirely, because the text model carries no call counters. Text-channel models are now left out of that line, so it quotes the tool-calling models' rate.
