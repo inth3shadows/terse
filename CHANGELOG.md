@@ -17,6 +17,52 @@ fails that pull request until the section has moved.
 
 - **Retrieve ledger rows record which block was fetched (#252).** A `terse.retrieve` row for a text drop (`$text.code_blocks`) now carries `index`: the block's position among the result's blocks at or above `min`, counting blocks `keep_first` kept inline. A retrieve at index `i` means `keep_first` of `i + 1` would have kept that block. This gives a later `terse tune` live data for suggesting `keep_first` and `retract_after`. Identical blocks share one handle and record the first position. JSON-field drops have no position and write no `index`. Older rows without it still read the same, and the row still holds no payload.
 
+## [0.41.5] - 2026-09-26
+
+### Fixed
+
+- **Codec eval: a `cli:` model no longer hides a gateway model's compliance rate (#450).** In a run mixing a text-channel (`cli:`) model with a tool-calling one, a SAFE row dropped the tool-call compliance line entirely, because the text model carries no call counters. Text-channel models are now left out of that line, so it quotes the tool-calling models' rate.
+
+## [0.41.4] - 2026-09-26
+
+### Fixed
+
+- **An empty diff report says why it is empty (#266).** `terse fluency --diff` and `--text-diff-eval` printed one hint ("no model answers, or no same-tool pairs") for three different states, so a corpus whose pairs simply generated no questions was sent off to capture more pairs. The report now names one state: no model configured, no same-tool pairs, or N pairs that yielded no question, with the cause for that report (JSON: no lossless diff or a shape the question generator cannot ask about; text: no lossless text diff). `fluency.diff_pairs` and `fluency.text_diff_pairs` expose the pairs the harnesses ask over.
+- **The codec verdict sizes a `cli:` model's request as it is sent (#450).** `--max-input-tokens` counted the tool-channel instruction and the tool definitions for text-channel models, which are sent neither, and left out the `claude -p` preamble those models are sent. The count now follows the answer channel and adds the preamble's recorded size (3,131 tokens, from an earlier `claude -p` measurement; not re-measured, and in Claude's tokenizer rather than cl100k). The pre-flight refusal no longer tells a text-channel model it "answered without calling terse.record_answer".
+
+## [0.41.3] - 2026-09-26
+
+### Fixed
+
+- **A `--server-name` shared with another entry no longer double-counts it (#426).**
+  With no router in the fleet, `terse stats` gave each entry the label's full blocks and
+  savings, so one 6,000-token saving was banked twice and both rows reported `KEEP`. A label
+  written by more than one entry is now contested whenever at least one of them DECLARES it
+  with an explicit `--server-name` (whether the other side declares or guesses it), exactly
+  like a router-owned label: neither gets credit, and the report prints the duplicate-label
+  line with a per-label remedy. A label every writer merely guesses from the same binary keeps
+  its existing behaviour. The `router/live duplicate label` verdict reason (unchanged in
+  `--json`) now also covers these declared-name collisions with no router.
+
+## [0.41.2] - 2026-09-26
+
+### Fixed
+
+- **A rejected project `.mcp.json` entry no longer takes a server's slot in `terse stats` (#448).** Claude Code never launches a project-scope server the user rejected, but the scan treated any entry in `.mcp.json` as running. A rejected entry therefore won the name over the user- or local-scope definition that actually runs, which dropped that definition from the report and hid any label contest it was part of. `mcp-status` now reports such an entry as `unapproved`, and it ranks below every launched definition, like a folded peer. An entry that is only pending approval keeps its normal state, because `claude -p`, Agent SDK and cloud sessions load it without asking; `mcp-status` notes that it is pending. `--json` rows gain an `approval` field (`approved`, `pending` or `rejected`) for present project entries. Approval is read from `enabledMcpjsonServers`, `disabledMcpjsonServers` and `enableAllProjectMcpServers` in the project's `~/.claude.json` block, the user `settings.json` (under `$CLAUDE_CONFIG_DIR` when set), and the project's `.claude/settings.json` and `.claude/settings.local.json`; a rejection wins over enable-all. Managed policy settings are not read.
+
+## [0.41.1] - 2026-09-26
+
+### Changed
+
+- **The bundled demo server's tools advertise `annotations` and describe themselves more fully (#467).** `demo_orders` and `demo_logs` are synthetic, deterministic and do no I/O, so both now carry `{"readOnlyHint": true, "idempotentHint": true, "openWorldHint": false}`; their descriptions cross-reference each other and note what a larger `limit`/`lines` shows. Raises a registry inspector's (Glama's) score on the demo listing; the proxy's `tools/list` pass-through was verified unchanged for both the single proxy and multiproxy.
+
+### Fixed
+
+- **The CHANGELOG graduation check no longer depends on commit history (#436).** `test_unreleased_does_not_describe_work_that_already_shipped` decided whether an `[Unreleased]` entry had shipped by blaming the line and asking which tag contained that commit, so a pull request whose branch moved a released entry passed while its squash on `main` failed; that is how #422's release was skipped. An entry now counts as shipped when the same line appears in `CHANGELOG.md` at a release tag, and is attributed to the oldest such tag. A branch and its squash get the same answer, and a released entry moved back into `[Unreleased]` is now caught.
+
+- **`terse stats` sizes a standalone primer against the name the proxy gates on (#428).** The estimate tested policy rules against the `mcpServers` key, but a running `terse proxy` gates its primer on its baked `--server-name`, and on no name at all when none is baked. For an unbaked entry such as a `folded-and-live` duplicate, a `kb.*` passthrough rule sized a 0-token primer for a process that sends the full 248. Routers still size their union primer against peer names. Only the `estimated` path changes; a recorded primer row still wins.
+- **An entry that runs no proxy no longer hides another entry's stranded history (#430).** `terse --help proxy -- kb-mcp` has no `proxy` subcommand and writes no ledger rows, but its `kb-mcp` identity still counted as live, which removed the real entry's `superseded_labels` line for `kb-mcp`. Only entries that write to the ledger being read now count as live.
+
 ## [0.41.0] - 2026-09-26
 
 ### Added

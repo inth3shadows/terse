@@ -689,6 +689,10 @@ def test_scan_scopes_includes_project_and_local_when_present(tmp_path, monkeypat
                                                           "--", "proj-mcp"]}}}))
     im.stash_path(mcp_json).write_text(json.dumps(
         {"project": {"proj-demo": {"command": "proj-mcp", "args": []}}}))
+    # Approved, as Claude Code records it, so the row reports its wrapped state (#448).
+    (proj_dir / ".claude").mkdir()
+    (proj_dir / ".claude" / "settings.local.json").write_text(
+        json.dumps({"enabledMcpjsonServers": ["proj-demo"]}))
     monkeypatch.chdir(proj_dir)
 
     rows = im.scan_scopes(repo_path="/repo/root")

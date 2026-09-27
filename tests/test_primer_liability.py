@@ -854,6 +854,50 @@ def test_ambiguity_needs_a_LAUNCHER_not_merely_a_shared_label(tmp_path):
     assert all(r["ledger_labels"] == ["kb-server"] for r in liab["servers"])
 
 
+def test_two_entries_baking_the_same_explicit_server_name_are_contested(tmp_path):
+    """#426. Two distinct entries, no router anywhere, each baked `--server-name kb`. The
+    launcher test above is about GUESSED basenames; an explicit name is a declaration, and
+    two entries declaring one identity are two processes writing one label that the ledger
+    cannot tell apart. Before the fix each row banked the same 6,000-token saving and
+    reported its own KEEP — #285's double count with the router removed.
+
+    Owner decision (2026-09-26): contested, same as a router-owned label. Both go dark and
+    the report carries the existing duplicate-label explanation and per-label remedy."""
+    pol = _policy(tmp_path)
+    rows = [_scan("kb-user", "wrapped", "kb-server --stdio", pol,
+                  identity="kb", explicit=True),
+            _scan("kb-proj", "wrapped", "kb-server --stdio", pol, scope="project",
+                  identity="kb", explicit=True)]
+    liab = primer_liability(rows, _agg(("kb", 10, 10_000, 4_000)))
+    by_name = {s["server"]: s for s in liab["servers"]}
+
+    for name in ("kb-user", "kb-proj"):
+        assert by_name[name]["contested_labels"] == ["kb"]
+        assert by_name[name]["ledger_labels"] == []
+        assert by_name[name]["blocks"] is None
+        assert by_name[name]["verdict"] != "KEEP"
+    text = "\n".join(build_primer_section(liab))
+    assert "duplicate label" in text
+    assert "`kb`: remove one of them, or give one of kb-proj, kb-user a DISTINCT" in text
+
+
+def test_one_explicit_name_beside_a_guess_of_the_same_label_is_contested(tmp_path):
+    """#426 review. One entry DECLARES `kb`, another merely guesses `kb` from its binary.
+    #285's shared-label exemption rests on two GUESSES only matching when both run the same
+    binary; once either side declares the name, the collision is a choice, and counting the
+    label into both rows banks one saving twice. Contested, like the all-explicit case."""
+    pol = _policy(tmp_path)
+    rows = [_scan("kb-a", "wrapped", "kb-server --stdio", pol,
+                  identity="kb", explicit=True),
+            _scan("kb-b", "wrapped", "/opt/bin/kb --stdio", pol,
+                  identity="kb", explicit=False)]
+    liab = primer_liability(rows, _agg(("kb", 10, 10_000, 4_000)))
+    for s in liab["servers"]:
+        assert s["contested_labels"] == ["kb"]
+        assert s["blocks"] is None
+        assert s["verdict"] != "KEEP"
+
+
 def test_one_server_in_two_scopes_is_not_a_collision_with_itself(tmp_path):
     """`primer_liability` de-duplicates by server NAME — the same entry in project and user
     scope is one server to the client, not two primers. The ambiguity count has to
@@ -986,6 +1030,60 @@ def test_stranded_history_never_names_a_label_the_fleet_still_answers_to(tmp_pat
          _scan("terse", "router", "kb, runecho", pol)],
         _agg(("kb", 50, 90000, 20000), ("x", 4, 900, 300)))
     assert {r["server"]: r["superseded_labels"] for r in peer["servers"]}["x"] == []
+
+
+def test_an_entry_that_runs_no_proxy_does_not_hide_stranded_history(tmp_path):
+    """#430, the issue's own reproduction. `terse --help proxy -- kb-mcp` carries a `--`, so
+    `scan_scopes` fills `wraps` and a ledger identity of `kb-mcp` for it, but it has no
+    `proxy` subcommand and so `stats` stays None: it writes no ledger rows. Reading that
+    phantom identity as live deleted the real entry's `superseded_labels` line."""
+    pol = _policy(tmp_path)
+    real = {**_scan("kb", "wrapped", "kb-mcp", pol, identity="kb", explicit=True),
+            "stats": True, "stats_log": None}
+    phantom = {**_scan("kb-help", "wrapped-unstashed", "kb-mcp", pol,
+                       identity="kb-mcp", explicit=False),
+               "stats": None, "stats_log": None}
+    agg = _agg(("kb", 10, 5000, 2000), ("kb-mcp", 7, 3000, 1500))
+
+    alone = primer_liability([real], agg)
+    assert alone["servers"][0]["superseded_labels"] == ["kb-mcp"]
+    both = {r["server"]: r for r in primer_liability([real, phantom], agg)["servers"]}
+    assert both["kb"]["superseded_labels"] == ["kb-mcp"]
+
+
+def test_a_standalone_primer_is_sized_against_the_name_the_proxy_actually_gates_on(tmp_path):
+    """#428. `run_proxy` builds its primer from the BAKED `--server-name` (None when absent),
+    not from the `mcpServers` key and not from the guessed ledger identity. Each rule below
+    totally covers one candidate name with `tiers: []`, so every wrong gate sizes 0 for a
+    process that really emits the full primer (or the reverse)."""
+    from terse.policy import load_policy
+    from terse.proxy import build_primer
+    from terse.tokenize import count_cl100k
+
+    def sized(tool, row):
+        pol = _policy(tmp_path, name=f"{tool}.json", tool=tool, tiers=())
+        want = count_cl100k(build_primer(load_policy(pol), row.pop("_gate")))
+        got = primer_liability([{**row, "policy": pol}], _agg())["servers"][0]
+        return got["primer_tokens"], want
+
+    # Unbaked: the proxy gates on None, so a `kb.*` passthrough keyed on the entry name
+    # does not reach it — the issue's `folded-and-live` shape.
+    unbaked = {**_scan("kb", "folded-and-live", "kb-server", None,
+                       identity="kb-server", explicit=False), "_gate": None}
+    got, want = sized("kb.*", dict(unbaked))
+    assert got == want > 0
+    # ...and neither does a rule on the GUESSED identity, which the proxy never gates on.
+    got, want = sized("kb-server.*", dict(unbaked))
+    assert got == want > 0
+    # Baked: the explicit name wins over the entry key.
+    baked = {**_scan("kb-live", "wrapped", "kb-server", None, identity="kb",
+                     explicit=True), "_gate": "kb"}
+    got, want = sized("kb.*", dict(baked))
+    assert got == want == 0
+    # A row predating `ledger_identity` keeps the entry-key fallback.
+    legacy = {**_scan("kb", "wrapped", "kb-server", None), "_gate": "kb"}
+    got, want = sized("kb.*", dict(legacy))
+    assert got == want == 0
 
 
 def test_two_unbaked_entries_collide_even_when_one_wrote_an_empty_server_name(tmp_path):
