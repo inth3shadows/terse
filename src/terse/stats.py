@@ -969,11 +969,13 @@ def _is_launcher_basename(label: str) -> bool:
 # outrank a scope we do understand on the strength of not being recognised.
 _SCOPE_PRECEDENCE = {"local": 0, "project": 1, "user": 2}
 
-# Scan states whose entry is ABSENT from that scope's `mcpServers` (`_scan_target`): folded
-# behind a router (with or without its stash record), or a stash whose entry vanished. The
-# client cannot launch what is not there, so it resolves the name to the next scope that
-# DOES define it (#424). Every other state is a present entry.
-_ABSENT_FROM_SCOPE = ("folded", "folded-unstashed", "orphaned-stash")
+# Scan states the client does NOT launch from that scope (`_scan_target`): folded behind a
+# router (with or without its stash record), a stash whose entry vanished, or a project
+# `.mcp.json` entry the user REJECTED (#448 — in the file, never run). A merely pending
+# project entry is NOT absent: `claude -p`, Agent SDK and cloud sessions load it unasked.
+# The client resolves the name to the next scope that DOES launch it (#424). Every other
+# state is a launched entry.
+_ABSENT_FROM_SCOPE = ("folded", "folded-unstashed", "orphaned-stash", "unapproved")
 
 
 def _precedence_winner(scan_rows: list[dict[str, Any]]) -> dict[str, int]:
@@ -1118,10 +1120,17 @@ def _ambiguous_labels(scan_rows: list[dict[str, Any]],
     return {lbl for lbl, n in counts.items() if n > 1}
 
 
-def _live_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
+def _live_labels(scan_rows: list[dict[str, Any]],
+                 ledger_path: str | None = None) -> set[str]:
     """Every ledger label some INSTALLED entry currently answers to — a router's peer names,
     and each wrapped entry's own identity or guess. The set `_superseded_labels` has to
-    subtract, so it cannot hand one server another server's live rows."""
+    subtract, so it cannot hand one server another server's live rows.
+
+    An entry that writes no rows into this ledger answers to nothing in it (#430):
+    `terse --help proxy -- kb-mcp` carries a `--`, so the scan fills `wraps` and an identity
+    for a process that runs no proxy, and counting it deleted a real entry's stranded
+    history. The gate covers only the identity half — a folded peer's name is its router's
+    label, and a folded row never carries `stats`."""
     live: set[str] = set()
     for row in scan_rows:
         state = row.get("state")
@@ -1137,10 +1146,11 @@ def _live_labels(scan_rows: list[dict[str, Any]]) -> set[str]:
         # the thing `_superseded_labels` exists to name) and the basename itself for an
         # unbaked one. The `elif` is only the fallback for a row predating that field.
         ident = row.get("ledger_identity")
-        if ident:
-            live.add(str(ident))
-        elif wraps:
-            live.add(server_label(wraps.split()))
+        if _writes_ledger_rows(row, ledger_path):
+            if ident:
+                live.add(str(ident))
+            elif wraps:
+                live.add(server_label(wraps.split()))
         name = row.get("server")
         if name and state and state.startswith("folded"):
             live.add(str(name))
@@ -1213,11 +1223,14 @@ def _contested_labels(scan_rows: list[dict[str, Any]],
     regression against the commit it was remediating). An ambiguous entry still WRITES under
     that label — it merely may not bank it — and writing is the whole question here.
 
-    One side must be a ROUTER. Two plain wrapped entries resolving to one non-launcher
-    label are one logical server installed twice, which #285 ruled an honest label and
-    `test_ambiguity_needs_a_LAUNCHER_not_merely_a_shared_label` pins; widening to any shared
-    label would delete that measurement. A router's peer NAME is different in kind — the
-    router chose it, so a second entry answering to it duplicates that peer.
+    **The rule:** a label is contested when more than one entry writes it AND at least one
+    writer CHOSE it — a router (its peer names) or an entry baking an explicit
+    `--server-name` (#426). Only when every writer merely GUESSED it (the downstream
+    command's basename) is a shared label left alone: two such entries resolving to one
+    non-launcher label must run the same binary, one logical server installed twice, which
+    #285 ruled an honest label and `test_ambiguity_needs_a_LAUNCHER_not_merely_a_shared_label`
+    pins. Once any side declares the name the collision is a choice, not a coincidence of
+    binaries, and the two processes' rows are indistinguishable — a router is not required.
 
     Gated on `_writes_ledger_rows`: an entry baked `--no-stats`, or pointed at another
     ledger, writes none of the rows under that label and cannot be one of the writers
@@ -1241,13 +1254,10 @@ def _contested_labels(scan_rows: list[dict[str, Any]],
     # write a primer record under it, which is what makes the single-standalone case
     # attributable.
     non_router_writers: dict[str, set[str]] = {}
-    # A contest needs a ROUTER on one side, and that is a deliberate limit rather than an
-    # oversight. Two plain wrapped entries that resolve to one non-launcher label are ONE
-    # logical server installed twice — #285 decided that is an honest label, and
-    # `test_ambiguity_needs_a_LAUNCHER_not_merely_a_shared_label` pins it. A router's peer
-    # name is different in kind: the router chose it, so a second entry answering to it is a
-    # duplicate of that peer, which is the population #396 is about.
-    router_labels: set[str] = set()
+    # Labels some writer CHOSE — a router's peer names, or an explicit `--server-name`
+    # (#426). Only these can be contested; an all-guessed shared label is #285's honest
+    # one-server-installed-twice case (see the docstring for the full rule).
+    chosen_labels: set[str] = set()
     for i, row in enumerate(scan_rows):
         name = row.get("server")
         if not name or winners.get(str(name)) != i:
@@ -1266,17 +1276,19 @@ def _contested_labels(scan_rows: list[dict[str, Any]],
             ident = row.get("ledger_identity") or (server_label(wraps.split()) if wraps
                                                    else "")
             written = [str(ident)] if ident else []
+            if ident and row.get("ledger_identity_explicit"):
+                chosen_labels.add(str(ident))
         else:
             continue
         if state in ("router", "router-ambiguous"):
-            router_labels.update(written)
+            chosen_labels.update(written)
         for lbl in written:
             writers.setdefault(lbl, set()).add(str(name))
             if state not in ("router", "router-ambiguous"):
                 non_router_writers.setdefault(lbl, set()).add(str(name))
     return {lbl: _Contest(frozenset(writers[lbl]),
                           frozenset(non_router_writers.get(lbl, ())))
-            for lbl in router_labels if len(writers.get(lbl, ())) > 1}
+            for lbl in chosen_labels if len(writers.get(lbl, ())) > 1}
 
 
 def _superseded_labels(row: dict[str, Any], labels: list[str],
@@ -2030,7 +2042,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
     # separately-live duplicate of one of its peers (#396 review).
     contests = _contested_labels(scan_rows, ledger_path)
     contested = set(contests)
-    live = _live_labels(scan_rows)
+    live = _live_labels(scan_rows, ledger_path)
     for i, row in enumerate(scan_rows):
         name, state = row.get("server"), row.get("state")
         # The winner check subsumes the old `seen` dedup: one index per name, fleet-wide.
@@ -2102,8 +2114,17 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
             # A router ships ONE primer covering every form any peer can emit, and each
             # peer's policy is gated against its OWN name — gating the union on the router's
             # name would test rules like `kb.*` against "terse" and silently under-report.
+            #
+            # A standalone proxy gates on its BAKED `--server-name` — `run_proxy` hands the
+            # Interceptor that, None when absent — not on the `mcpServers` key and not on the
+            # guessed ledger identity (#428). Sizing against either tested a `kb.*` rule the
+            # running process never consults. A row predating `ledger_identity_explicit`
+            # cannot say, and keeps the entry key rather than sizing an unscoped primer.
+            explicit = row.get("ledger_identity_explicit")
+            gate = (name if explicit is None
+                    else row.get("ledger_identity") if explicit else None)
             tokens = count_cl100k(union_primer([(pol, p) for p in peers]) if is_router
-                                  else build_primer(pol, name))
+                                  else build_primer(pol, gate))
         except Exception:  # noqa: BLE001 — an unreadable policy is reported, never raised
             tokens = None
         # A primer this entry is KNOWN to have sent, because the attach site wrote it down

@@ -87,14 +87,19 @@ def test_absent_rank_beats_scope_rank_even_from_local():
     assert _precedence_winner(rows) == {"kb": 0}
 
 
-def test_the_absent_states_are_exactly_the_scan_rows_missing_from_mcpServers(tmp_path):
+def test_the_absent_states_are_exactly_the_scan_rows_the_client_does_not_launch(
+        tmp_path, monkeypatch):
     """The rule is only as good as the state list it keys on, and that list lives in
     `install_mcp`. Driven through the REAL scanner over a real multiproxy install, a stash
-    entry whose live entry was hand-deleted, and a folded peer whose stash record is gone:
-    for every row, "absent" by `_ABSENT_FROM_SCOPE` must equal "not in mcpServers"."""
+    entry whose live entry was hand-deleted, a folded peer whose stash record is gone, and a
+    project `.mcp.json` with an approved, a pending and a rejected entry (#448): for every
+    row, "absent" by `_ABSENT_FROM_SCOPE` must equal "not launched" — not in that scope's
+    `mcpServers`, or a project entry the user rejected. A PENDING entry is launched:
+    non-interactive, Agent SDK and cloud sessions load it without asking."""
     from terse import install_mcp as im
     from terse.stats import _ABSENT_FROM_SCOPE
 
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)   # never the real settings.json
     cfg = tmp_path / "claude.json"
     cfg.write_text(json.dumps({"mcpServers": {
         "kb": {"command": "kb-mcp"}, "gh": {"command": "gh-mcp"},
@@ -111,14 +116,27 @@ def test_the_absent_states_are_exactly_the_scan_rows_missing_from_mcpServers(tmp
     stash = json.loads(im.stash_path(cfg).read_text())
     del stash["user"]["gh"]                               # -> folded-unstashed
     im.stash_path(cfg).write_text(json.dumps(stash), encoding="utf-8")
+    proj = tmp_path / "proj"
+    (proj / ".claude").mkdir(parents=True)
+    mcp = proj / ".mcp.json"
+    mcp.write_text(json.dumps({"mcpServers": {
+        "ok": {"command": "ok-mcp"}, "new": {"command": "new-mcp"},
+        "no": {"command": "no-mcp"}}}), encoding="utf-8")
+    (proj / ".claude" / "settings.local.json").write_text(json.dumps(
+        {"enabledMcpjsonServers": ["ok"],                  # new -> pending, still launched
+         "disabledMcpjsonServers": ["no"]}), encoding="utf-8")   # no -> unapproved
 
-    present = set(json.loads(cfg.read_text())["mcpServers"])
-    rows = [r for r in im.scan_scopes(cfg=cfg) if r["scope"] == "user"]
-    states = {r["server"]: r["state"] for r in rows}
+    present = {"user": set(json.loads(cfg.read_text())["mcpServers"]),
+               "project": set(json.loads(mcp.read_text())["mcpServers"])}
+    rows = [r for r in im.scan_scopes(cfg=cfg, file=str(mcp), repo_path=str(proj))
+            if r["scope"] in present]
+    states = {(r["scope"], r["server"]): r["state"] for r in rows}
     # Every absent state is exercised, so a renamed state cannot pass by omission.
     assert set(_ABSENT_FROM_SCOPE) <= set(states.values()), states
     for r in rows:
-        assert (r["state"] in _ABSENT_FROM_SCOPE) == (r["server"] not in present), r
+        launched = (r["server"] in present[r["scope"]]
+                    and (r["scope"] != "project" or r["approval"] != "rejected"))
+        assert (r["state"] in _ABSENT_FROM_SCOPE) == (not launched), r
 
 
 def test_ambiguity_sees_the_running_entry_not_the_absent_row_above_it(tmp_path):
