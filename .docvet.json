@@ -8,6 +8,7 @@
     "_marker",
     "_off",
     "_passthrough",
+    "directory_tree",
     "drop-policy.json",
     "edit_file",
     "gh-policy.json",
@@ -26,6 +27,7 @@
     "reports/verify-report.md",
     "some-output.json",
     "terse-peers-project-<hash>.json",
-    "terse-policy.json"
+    "terse-policy.json",
+    "tests/test_changelog_covers_every_release.py::test_unreleased_does_not_describe_work_that_already_shipped"
   ]
 }

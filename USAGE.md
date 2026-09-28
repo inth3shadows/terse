@@ -545,6 +545,30 @@ handle; the exploration summary, blast radius, and file headings stay resident, 
 keeps the *intelligence* and fetches the *source* only if it actually needs it. On 60 real
 captured `codegraph_explore` payloads this took a 0.0%-saved tool to **87.0%**.
 
+Two knobs tune how much stays inline, both from live retrieve data (#252):
+
+- **`keep_first: N`** keeps the first `N` qualifying blocks (at or above `min`) inline per
+  result; later blocks still drop to a handle. Default `0` (unchanged behavior). Over 151
+  past `codegraph_explore` results, 61% of retrieves fetched the first block, and
+  `keep_first: 1` cut the results needing any retrieve from 80 to 34, at about 6.9 KB more
+  per result. A non-negative-integer value, or `keep_first` on a JSON field path, is ignored
+  with a warning.
+- **`retract_after: N`** stops dropping a rule's field for a tool once the model has fetched
+  it back `N` times in the same session — later results from that tool keep it inline until
+  the client reconnects. Off unless set. Over 151 past `codegraph_explore` results, 72% of
+  results after a session's first retrieve needed one too; retracting there cut the results
+  needing any retrieve from 80 to 32. A non-positive-integer value is ignored with a warning.
+
+```json
+{
+  "$text.code_blocks": { "lossy": "drop-to-retrieve", "min": 400, "keep_first": 1, "retract_after": 2 }
+}
+```
+
+`terse.retrieve` rows in the ledger now record which block a fetch pulled (`index`,
+counting `keep_first`-kept blocks), so a later `terse tune` can suggest values for both
+knobs from what a session actually fetched back.
+
 This is **lossy and opt-in** — the same bar as any drop:
 
 - Everything is recoverable, and the gate proves it: terse restores the entire payload from
@@ -1246,7 +1270,9 @@ it at (broker pool or a loopback gateway). You never need it for normal use.
 
 <!-- docvet:anchors
 drop-to-retrieve -> src/terse/transforms.py
+keep_first -> src/terse/lossy.py
 proxy --config -> src/terse/cli.py
+retract_after -> src/terse/lossy.py
 truncate -> src/terse/transforms.py
 -->
 
