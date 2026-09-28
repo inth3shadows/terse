@@ -276,6 +276,36 @@ def paired_bootstrap_ci(by_task: dict, arm_hi: str, arm_lo: str, *,
             "excludes_zero": ci[0] > 0 or ci[1] < 0}
 
 
+# Fewest tasks a paired task-level bootstrap may size a CI from (#491); applies to
+# both the A/B/C contrasts and --by-primer.
+# The bootstrap resamples k tasks with replacement, so it can only produce
+# C(2k-1, k) distinct task multisets: k=2 -> 3, k=3 -> 10, k=4 -> 35, k=5 -> 126.
+# Each all-one-task draw has probability k**-k (k=2: 25%, k=3: 3.7%), which is above
+# the 2.5% tail at k<=3, so the CI endpoints are then just single-task deltas and the
+# CI is degenerate (in the #325 run, auto's upper bound equalled its observed value).
+# At k=4 the tails rest on only a handful of the 35 multisets. k=5 is the first size
+# where the tails span many distinct resamples (126, extremes 0.03% each). Below it
+# a contrast is descriptive only: observed delta and success, no CI, no verdict.
+MIN_CI_TASKS = 5
+
+
+def guarded_ci(by_task: dict, arm_hi: str, arm_lo: str, *,
+               task_subset: set[str] | None = None, what: str = "tasks") -> dict:
+    """`paired_bootstrap_ci` when >= MIN_CI_TASKS tasks carry both arms (within
+    `task_subset`); otherwise a descriptive-only result: the observed delta over those
+    tasks, `ci` None, `descriptive_only` True -- never a significance verdict."""
+    task_ids = [t for t, arms in by_task.items() if arm_hi in arms and arm_lo in arms
+                and (task_subset is None or t in task_subset)]
+    if len(task_ids) >= MIN_CI_TASKS or not task_ids:
+        return paired_bootstrap_ci(by_task, arm_hi, arm_lo, task_subset=task_subset)
+    hi = _aggregate_for_picks(task_ids, by_task, arm_hi)
+    lo = _aggregate_for_picks(task_ids, by_task, arm_lo)
+    return {"ci": None, "n_boot": 0, "n_used": 0, "descriptive_only": True,
+            "observed": (hi - lo) if (hi is not None and lo is not None) else None,
+            "reason": f"too few {what} ({len(task_ids)} < {MIN_CI_TASKS}) for a CI; "
+                      f"descriptive only"}
+
+
 def analyze(rows: list[dict]) -> dict:
     analyzable, _infra = partition_infra_rows(rows)
     grouped = _group_by_model_task_arm(analyzable)
@@ -293,7 +323,7 @@ def analyze(rows: list[dict]) -> dict:
         contrasts = {}
         for hi, lo in CONTRASTS:
             subset = common_tasks if (hi, lo) == ("B", "A") else None
-            contrasts[f"{hi}-{lo}"] = paired_bootstrap_ci(by_task, hi, lo, task_subset=subset)
+            contrasts[f"{hi}-{lo}"] = guarded_ci(by_task, hi, lo, task_subset=subset)
         c_success_not_lower = success_not_lower(by_task, "C", "B")
         unaddressable = {t: task_unaddressable_from_b(s) for t, s in by_task.items()}
         model_rows = [r for arm_runs in by_task_raw.values() for runs in arm_runs.values()
@@ -320,6 +350,7 @@ def primer_label(row: dict) -> str:
 PRIMER_BASELINES = ("C[always]", "C[unset]")
 
 
+
 def _attachment(runs: list[dict]) -> dict:
     """How many of `runs` actually showed the model the primer (`primer_attached`).
     `vacuous` is True when every determinable run went without it -- the mode's
@@ -341,7 +372,15 @@ def primer_comparison(rows: list[dict]) -> dict:
     baseline's. Pooled cost per success is reported twice -- over the tasks EVERY label
     ran (`arms_shared`, the universe the CIs describe when all labels cover the same
     tasks) and over each label's own tasks (`arms_all`). `attachment` and `stratified`
-    split by `primer_attached`. Infra rows are excluded exactly as in `analyze`."""
+    split by `primer_attached`. Infra rows are excluded exactly as in `analyze`.
+
+    The CIs, success guards and headline pool are restricted to PRIMER-EXERCISING tasks
+    (#491): tasks where the baseline showed the model the primer on >=1 run. A task where
+    the baseline never did cannot carry a primer effect, so bootstrapping over it only
+    lets run-to-run noise read as significant. Those vacuous tasks are pooled separately
+    (`arms_vacuous`, `success_not_lower_vacuous`) as a no-effect control with no CI.
+    Vacuity is judged from the baseline row alone, so a mode designed never to show the
+    primer (`C[never]`) does not make a task vacuous."""
     analyzable, _infra = partition_infra_rows(rows)
     c_rows = [{**r, "arm": primer_label(r)} for r in analyzable if r.get("arm") == "C"]
     grouped = _group_by_model_task_arm(c_rows)
@@ -351,18 +390,39 @@ def primer_comparison(rows: list[dict]) -> dict:
                    for t, lab_runs in by_task_raw.items()}
         labels = sorted({lab for s in by_task.values() for lab in s})
         baseline = next((b for b in PRIMER_BASELINES if b in labels), None)
-        contrasts, not_lower = {}, {}
+        attachment = {t: {lab: _attachment(runs) for lab, runs in lab_runs.items()}
+                      for t, lab_runs in by_task_raw.items()}
+        # Primer-exercising = the baseline saw the primer on >=1 run of the task (#491).
+        exercising = {t for t, att in attachment.items()
+                      if baseline in att and att[baseline]["attached"] >= 1}
+        # Undeterminable = no baseline run recorded `primer_attached` (all None, e.g.
+        # legacy C[unset] rows): not evidence of "never saw", so neither in the CI nor
+        # in the no-effect control.
+        undeterminable = {t for t, att in attachment.items()
+                          if baseline in att and att[baseline]["known"] == 0}
+        vacuous = {t for t, att in attachment.items()
+                   if baseline in att and t not in exercising and t not in undeterminable}
+        exercising_by_task = {t: by_task[t] for t in exercising}
+        vacuous_by_task = {t: by_task[t] for t in vacuous}
+        contrasts, not_lower, not_lower_vacuous = {}, {}, {}
         if baseline is not None:
             for lab in labels:
                 if lab == baseline:
                     continue
                 key = f"{lab}-{baseline}"
-                contrasts[key] = paired_bootstrap_ci(by_task, lab, baseline)
-                not_lower[key] = success_not_lower(by_task, lab, baseline)
+                if exercising:
+                    contrasts[key] = guarded_ci(by_task, lab, baseline,
+                                                task_subset=exercising,
+                                                what="primer-exercising tasks")
+                else:
+                    contrasts[key] = {"ci": None, "observed": None, "n_boot": 0, "n_used": 0,
+                                      "reason": f"no primer-exercising task: {baseline} "
+                                                f"never saw the primer on any task where it "
+                                                f"was determinable -- no primer effect to size"}
+                not_lower[key] = success_not_lower(exercising_by_task, lab, baseline)
+                not_lower_vacuous[key] = success_not_lower(vacuous_by_task, lab, baseline)
         shared = {t for t, s in by_task.items() if all(lab in s for lab in labels)}
         shared_by_task = {t: by_task[t] for t in shared}
-        attachment = {t: {lab: _attachment(runs) for lab, runs in lab_runs.items()}
-                      for t, lab_runs in by_task_raw.items()}
         stratified: dict = {}
         for lab in labels:
             runs = [r for lab_runs in by_task_raw.values() for r in lab_runs.get(lab, [])]
@@ -375,7 +435,17 @@ def primer_comparison(rows: list[dict]) -> dict:
                           "arms_shared": {lab: arm_aggregate(shared_by_task, lab)
                                           for lab in labels},
                           "arms_all": {lab: arm_aggregate(by_task, lab) for lab in labels},
+                          "exercising_tasks": sorted(exercising),
+                          "vacuous_tasks": sorted(vacuous),
+                          "undeterminable_tasks": sorted(undeterminable),
+                          "arms_exercising": {lab: arm_aggregate(
+                              {t: shared_by_task[t] for t in shared & exercising}, lab)
+                              for lab in labels},
+                          "arms_vacuous": {lab: arm_aggregate(
+                              {t: shared_by_task[t] for t in shared & vacuous}, lab)
+                              for lab in labels},
                           "contrasts": contrasts, "success_not_lower": not_lower,
+                          "success_not_lower_vacuous": not_lower_vacuous,
                           "attachment": attachment, "stratified": stratified}
     return report
 
@@ -399,17 +469,42 @@ def format_primer_report(report: dict) -> str:
                     continue
                 att = m["attachment"][task_id][lab]
                 seen = f"{att['attached']}/{att['known']}" if att["known"] else "unknown"
-                flag = "  VACUOUS for this task" if att["vacuous"] else ""
+                flag = ""
+                if lab == m["baseline"] and task_id in m["vacuous_tasks"]:
+                    flag = "  VACUOUS task (control only)"
+                elif lab == m["baseline"] and task_id in m["undeterminable_tasks"]:
+                    flag = "  UNDETERMINABLE (primer_attached unrecorded)"
+                elif task_id in m["vacuous_tasks"] and att["attached"]:
+                    flag = "  saw primer; baseline did not"
                 lines.append(f"{task_id:<32} {lab:<10} {s['n']:>3} {s['successes']:>4} "
                               f"{s['success_rate']:>6.0%} {_cps(s):>12} {seen:>12}{flag}")
-        lines.append("(VACUOUS = the model never saw the primer in any run of that mode on "
-                      "that task: its cost there says nothing about the primer)")
-        lines.append(f"\npooled cost per successful task over the {len(m['shared_tasks'])} "
-                      f"task(s) every mode ran:")
+        if m["baseline"] is not None:
+            lines.append(f"(VACUOUS task = {m['baseline']} never saw the primer on it, so a "
+                          f"cost gap there cannot be a primer effect relative to the baseline "
+                          f"(a mode that did see it there is marked 'saw primer; baseline did "
+                          f"not'): excluded from the CIs, pooled below as a no-effect control. "
+                          f"A mode that never shows the primer by design, e.g. C[never], does "
+                          f"not make a task vacuous.)")
+        shared = set(m["shared_tasks"])
+        ex = sorted(shared & set(m["exercising_tasks"]))
+        vac = sorted(shared & set(m["vacuous_tasks"]))
+        lines.append(f"\npooled cost per successful task over the {len(ex)} "
+                      f"primer-exercising task(s) every mode ran (what the CIs compare):")
         for lab in m["labels"]:
-            a = m["arms_shared"][lab]
+            a = m["arms_exercising"][lab]
             lines.append(f"  {lab}: {_cps(a)} ({a['successes']}/{a['n']} succeeded, "
                           f"{a['success_rate']:.0%})")
+        lines.append(f"no-effect control -- pooled over the {len(vac)} VACUOUS task(s) "
+                      f"every mode ran (any gap here is noise, not a primer effect; no CI):")
+        for lab in m["labels"]:
+            a = m["arms_vacuous"][lab]
+            lines.append(f"  {lab}: {_cps(a)} ({a['successes']}/{a['n']} succeeded, "
+                          f"{a['success_rate']:.0%})")
+        if m["undeterminable_tasks"]:
+            lines.append(f"UNDETERMINABLE -- {len(m['undeterminable_tasks'])} task(s) where no "
+                          f"{m['baseline']} run recorded primer_attached, so whether the "
+                          f"baseline saw the primer is unknown; excluded from the CIs AND the "
+                          f"control: " + ", ".join(m["undeterminable_tasks"]))
         lines.append("pooled over each mode's OWN tasks (not what the CIs compare):")
         for lab in m["labels"]:
             a = m["arms_all"][lab]
@@ -428,13 +523,33 @@ def format_primer_report(report: dict) -> str:
             lines.append("\nno C[always] (or C[unset]) run to compare against -- "
                           "no contrasts")
             continue
-        lines.append(f"\npaired bootstrap 95% CI vs {m['baseline']} "
-                      f"(mode - baseline, weighted tokens/success):")
+        if not m["exercising_tasks"] and not m["vacuous_tasks"]:
+            lines.append(f"\nprimer comparison is UNDETERMINABLE: no {m['baseline']} run "
+                          f"recorded primer_attached, so primer exposure is unknown -- no CI")
+            continue
+        if not m["exercising_tasks"]:
+            lines.append(f"\nprimer comparison is VACUOUS: {m['baseline']} never saw the "
+                          f"primer on any task where it was determinable, so there is no "
+                          f"primer effect to measure -- no CI")
+            for key, ok_vac in m["success_not_lower_vacuous"].items():
+                lines.append(f"  {key}: " + ("success not lower than baseline"
+                                             if ok_vac else "success LOWER than baseline")
+                             + " on vacuous tasks")
+            continue
+        lines.append(f"\ncontrasts vs {m['baseline']} over the "
+                      f"{len(m['exercising_tasks'])} primer-exercising task(s) "
+                      f"(mode - baseline, weighted tokens/success; paired bootstrap 95% CI "
+                      f"needs >={MIN_CI_TASKS} tasks):")
         for key, c in m["contrasts"].items():
             ok = ("success not lower than baseline" if m["success_not_lower"][key]
                   else "success LOWER than baseline")
+            if m["vacuous_tasks"]:
+                ok += ("; on vacuous tasks: " +
+                       ("not lower" if m["success_not_lower_vacuous"][key] else "LOWER"))
             if c["ci"] is None:
-                lines.append(f"  {key}: {c['reason']} ({ok})")
+                obs = (f"observed {c['observed']:+.0f}, "
+                       if c.get("descriptive_only") and c["observed"] is not None else "")
+                lines.append(f"  {key}: {obs}{c['reason']} ({ok})")
             else:
                 verdict = "SIGNIFICANT" if c["excludes_zero"] else "inconclusive"
                 lines.append(f"  {key}: observed {c['observed']:+.0f}, 95% CI "
@@ -489,7 +604,9 @@ def format_report(report: dict, infra: list[dict] | None = None) -> str:
             label = CONTRAST_LABELS.get(key)
             key_display = f"{key} [{label}]" if label else key
             if c["ci"] is None:
-                lines.append(f"  {key_display}: {c['reason']}")
+                obs = (f"observed {c['observed']:+.0f}, "
+                       if c.get("descriptive_only") and c["observed"] is not None else "")
+                lines.append(f"  {key_display}: {obs}{c['reason']}")
             elif c["excludes_zero"]:
                 cheaper = lo if c["observed"] > 0 else hi
                 lines.append(f"  {key_display}: observed {c['observed']:+.0f}, "
