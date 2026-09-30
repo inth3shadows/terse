@@ -63,6 +63,7 @@ import hashlib
 import json
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -341,7 +342,7 @@ class _PendingBroadcast:
 def router_snapshot_path(config_path: str, cwd: str | None = None) -> Path:
     """Where the router persists its snapshot (#270): beside the savings ledger, under
     `$XDG_STATE_HOME/terse/router-snapshots/`, one file per peers config — and per launch
-    directory, when `cwd` is given (see `snapshot_cwd`).
+    repo (or directory, outside a repo), when `cwd` is given (see `snapshot_cwd`).
 
     Keyed by the config's RESOLVED path, not by its fingerprint: an edited config then
     overwrites its own stale file instead of orphaning one per edit. Whether the file may
@@ -352,21 +353,46 @@ def router_snapshot_path(config_path: str, cwd: str | None = None) -> Path:
 
 
 def snapshot_cwd(specs: list[DownstreamSpec]) -> str | None:
-    """The router's own cwd when any peer INHERITS it (no `cwd` in its entry), else None.
+    """Where the router was launched, when any peer INHERITS its cwd (no `cwd` in its
+    entry), else None: the launch directory's git common dir inside a git repo, the cwd
+    itself anywhere else (`_git_common_dir`).
 
     A peer's replies can depend on where it runs. On the live fleet the codegraph peer
     serves its tools only inside a repo with a `.codegraph/` index and is a zero-tool null
-    server everywhere else (25 of 62 repos). A snapshot shared across directories would be
+    server everywhere else (25 of 62 repos). A snapshot shared across repos would be
     served in the wrong one — a list_changed, the very cache bust #270 removes, and an
     `initialize.instructions` naming tools that do not exist there, which nothing in MCP
-    can correct mid-session. So such a snapshot is per directory: in its path and in its
+    can correct mid-session. So such a snapshot is per repo: in its path and in its
     fingerprint.
 
-    KNOWN LIMITATION: the first session in a NEW directory still takes the blocking path,
-    and with per-session git worktrees (`claudew`) that is most new worktrees. Snapshot
-    files are also never pruned. Follow-up options, not done here: key by the git common
-    dir where codegraph's index location allows it, and an age-based prune."""
-    return os.getcwd() if any(s.cwd is None for s in specs) else None
+    Per repo, not per directory: every worktree of a repo shares one snapshot, so a new
+    per-session worktree (`claudew`) starts warm instead of blocking on its first
+    initialize (#479's known limit). Measured 2026-09-29: 49 per-directory snapshots held
+    only two distinct reply sets (codegraph indexed or not) plus peer-version drift, and
+    `claudew` links each worktree's `.codegraph` to the base checkout's. A worktree whose
+    peers DO answer differently (one made by hand, with no index) is served its repo's
+    snapshot once; `_reconcile` then sends list_changed and persists the live replies.
+
+    KNOWN LIMITATION: snapshot files are never pruned."""
+    if all(s.cwd is not None for s in specs):
+        return None
+    cwd = os.getcwd()
+    return _git_common_dir(cwd) or cwd
+
+
+def _git_common_dir(cwd: str) -> str | None:
+    """`cwd`'s resolved git common dir (shared by all of a repo's worktrees), or None when
+    it is not in a git repo or git cannot say (not installed, error, timeout). Asked of
+    git rather than read from `.git` by hand: gitdir files, `commondir`, submodules and
+    `GIT_DIR` are git's to resolve. Once per router launch, so the subprocess is cheap."""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=cwd,
+                             capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    path = out.stdout.strip()
+    # Relative (".git") in a main checkout, absolute in a linked worktree.
+    return str((Path(cwd) / path).resolve()) if out.returncode == 0 and path else None
 
 
 def peers_fingerprint(specs: list[DownstreamSpec], cwd: str | None = None) -> str:

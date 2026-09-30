@@ -16,6 +16,8 @@ import io
 import json
 import os
 import pathlib
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -361,6 +363,70 @@ def test_two_launch_directories_keep_separate_snapshots(tmp_path, monkeypatch):
         assert c.close() == 0
     assert init_s > DELAY - FAST          # repo_a's snapshot was not served here
     assert path_a.exists() and _path(cfg).exists()
+
+
+def _git(*args, cwd):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+
+def _repo_with_worktree(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+    main, wt = root / "main", root / "wt"
+    main.mkdir()
+    _git("init", "-q", cwd=main)
+    _git("commit", "-q", "--allow-empty", "-m", "init", cwd=main)
+    _git("worktree", "add", "-q", str(wt), cwd=main)
+    return main, wt
+
+
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+
+
+@needs_git
+def test_worktrees_of_one_repo_share_a_snapshot_and_start_warm(tmp_path, monkeypatch):
+    # #479's known limit: every new per-session worktree used to block on its first
+    # initialize. Keyed by the git common dir, a fresh worktree is served the repo's
+    # snapshot -- and so is a subdirectory of the main checkout.
+    cfg = _config(tmp_path)
+    main, wt = _repo_with_worktree(tmp_path)
+    (main / "sub").mkdir()
+    monkeypatch.chdir(main)
+    _seed(cfg)
+    path, fp = _path(cfg), _fp(cfg)
+    for d in (wt, main / "sub"):
+        monkeypatch.chdir(d)
+        assert (_path(cfg), _fp(cfg)) == (path, fp), d
+    c = _Client(cfg)
+    try:
+        init_s, _, list_s, _ = c.handshake()
+    finally:
+        assert c.close() == 0
+    assert init_s < FAST and list_s < FAST, (init_s, list_s)
+
+
+@needs_git
+def test_two_repos_keep_separate_snapshots(tmp_path, monkeypatch):
+    cfg = _config(tmp_path)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    main_a, _ = _repo_with_worktree(tmp_path / "a")
+    main_b, _ = _repo_with_worktree(tmp_path / "b")
+    monkeypatch.chdir(main_a)
+    path_a = _path(cfg)
+    monkeypatch.chdir(main_b)
+    assert _path(cfg) != path_a
+
+
+def test_without_git_the_snapshot_is_keyed_by_the_directory(tmp_path, monkeypatch):
+    # git missing (or failing) must never stop the router: it falls back to the cwd.
+    cfg = _config(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def no_git(*a, **k):
+        raise FileNotFoundError("git")
+    monkeypatch.setattr(subprocess, "run", no_git)
+    assert snapshot_cwd(load_multi_config(str(cfg))) == os.getcwd()
 
 
 def test_an_initialize_only_difference_is_reported_and_persisted(tmp_path, capsys):
