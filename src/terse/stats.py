@@ -231,7 +231,23 @@ def context_tokens(rec: dict[str, Any], raw_t: int, out_t: int) -> tuple[int, in
     Known residual: the proxy attaches the typed field's size to block 0 only, so blocks
     1..N of a multi-block result that carried one still count their text here. That
     overstates the context saving by those blocks — the direction this fix narrows, not
-    the one it introduces."""
+    the one it introduces.
+
+    OFFLOAD (item 3, 2026-09-30): a row tagged `offload` belongs to a result the client
+    saved to a file instead of putting in context (Claude Code, over its 25k-token limit).
+    It saves nothing on this basis. "out": terse's output was offloaded too, so neither
+    side entered context -- (0, 0). "raw": terse kept inline what the raw result would have
+    offloaded, so its output IS paid and the raw path's short file pointer is not claimed
+    as the baseline; counting the pointer would score terse negative on the unknowable
+    assumption that the model never reads the file -- (out, out). Measured on the live
+    ledger before this existed: ~20% of the reported saving sat in these two cases."""
+    offload = rec.get("offload")
+    if offload == "out":
+        return 0, 0
+    if offload == "raw":
+        _, ctx_out = context_tokens({k: v for k, v in rec.items() if k != "offload"},
+                                    raw_t, out_t)
+        return ctx_out, ctx_out
     s_raw = rec.get("structured_tokens")
     if not isinstance(s_raw, int) or isinstance(s_raw, bool) or s_raw <= 0:
         return raw_t, out_t
@@ -814,7 +830,8 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
             lines.append(f"  context:        {ctx_raw:,} -> {ctx_out:,}   "
                          f"saved {ctx_raw - ctx_out:,} "
                          f"({_pct_saved(ctx_raw, ctx_out).strip()})   [context: a rewritten "
-                         "typed field counts alone, #420]")
+                         "typed field counts alone, #420; a result the client offloaded "
+                         "to a file saves nothing]")
         if total["untokenized"]:
             lines.append(f"  ({total['untokenized']} result(s) uncounted — tiktoken "
                          f"unavailable when they were recorded; chars below cover them)")
@@ -3167,9 +3184,14 @@ def build_stats_writer(stats_log: str | Path, server: str, router: str | None = 
     first-failure warning dead code, so a dead ledger stayed silent (#131)."""
     def stats(tool: str, raw: str, emitted: str, passthrough: bool,
               diff_reason: str | None = None, structured: str | None = None,
-              structured_out: str | None = None) -> None:
+              structured_out: str | None = None, offload: str | None = None) -> None:
         rec = build_record(server, tool, raw, emitted, passthrough, diff_reason,
                            structured, structured_out)
+        if offload is not None:
+            # "out" | "raw": the client offloaded this result to a file, or would have
+            # offloaded the raw one (`proxy.Interceptor._emit_stats`). Read by
+            # `context_tokens`; absent on every row the question did not arise for.
+            rec["offload"] = offload
         if router is not None:
             # The stamp (#212): this row was written by a peer of the LAZY router `router`.
             # `primer_liability` reads a router as lazy only if no row it claims is unstamped

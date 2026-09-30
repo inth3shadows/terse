@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -204,6 +205,55 @@ PRIMER_TAIL = "Always reason about the fully reconstructed result."
 # policy. `build_primer(default_policy())` reproduces this exactly.
 TERSE_PRIMER = (PRIMER_HEAD + PRIMER_TABLE + PRIMER_DICT + PRIMER_EMBEDDED + PRIMER_DIFF
                 + PRIMER_DROPPED + PRIMER_TAIL)
+
+# Clients that SAVE an over-limit tool result to a file and hand the model only its path
+# (code.claude.com/docs/en/mcp, "MCP output limits and warnings"). Keyed on
+# `clientInfo.name` like `STRUCTURED_SAFE_CLIENTS`; any other client is assumed to inline.
+OFFLOAD_CLIENTS = frozenset({"claude-code"})
+OFFLOAD_DEFAULT_TOKENS = 25_000
+
+
+def offload_limit(client_name: str | None, environ: Any = None) -> int | None:
+    """The token size above which the connected client offloads a result, or None when it
+    never does. Claude Code's default is 25,000 tokens, overridden by the
+    `MAX_MCP_OUTPUT_TOKENS` it and this proxy (its child) both inherit. A tool's own
+    `_meta["anthropic/maxResultSizeChars"]` is not honoured here: no live server sets it.
+
+    Measured 2026-09-30 against the operator's transcripts: the smallest MCP result Claude
+    Code offloaded was 104,414 chars, the largest it kept inline 39,269 -- consistent with
+    25k tokens, though counted here in cl100k, not Claude Code's own tokenizer."""
+    if client_name not in OFFLOAD_CLIENTS:
+        return None
+    env = os.environ if environ is None else environ
+    try:
+        n = int(env.get("MAX_MCP_OUTPUT_TOKENS", ""))
+    except ValueError:
+        return OFFLOAD_DEFAULT_TOKENS
+    return n if n > 0 else OFFLOAD_DEFAULT_TOKENS
+
+
+def over_limit(text: str, limit: int | None) -> bool:
+    """Would `text` exceed `limit` tokens? Bounded and fail-open, because it runs inside
+    `transform_response` (under `_local_lock` while a primer is owed) as well as in the
+    deferred ledger sink.
+
+    - A cl100k token always covers at least one byte, so a text no longer than `limit`
+      bytes cannot be over: the common, small result pays no tokenizer pass.
+    - Only the first `limit * 8` characters are tokenized. A prefix that is already over
+      decides it; a text that is still under after that averages more than 8 bytes per
+      token, far above cl100k's ~4 on JSON and prose, and is read as inline. Tokenizing
+      a 2.4 MB payload whole measured 558 ms; this caps the work near 200 KB at 25k.
+    - A tokenizer that raises (tiktoken refuses `<|endoftext|>` in input) or is missing
+      answers False: inline, exactly the behaviour before this check existed. An
+      exception here would otherwise kill the proxy's reader thread."""
+    if limit is None or len(text.encode("utf-8")) <= limit:
+        return False
+    try:
+        n = count_cl100k(text[: limit * 8])
+    except Exception:  # noqa: BLE001 — a size estimate must never take down forwarding
+        return False
+    return n is not None and n > limit
+
 
 # `terse proxy --primer MODE` (#325). `always` is the behaviour before the flag existed (the
 # lazy attach of #211/#212) and stays the default, so no installed entry changes on upgrade.
@@ -436,8 +486,10 @@ class Interceptor:
     def __init__(self, pol: policy_mod.Policy, debug: bool = False,
                  capture: CaptureFn | None = None,
                  audit: Callable[[dict], None] | None = None,
-                 stats: Callable[[str, str, str, bool, str | None, str | None,
-                                  str | None], None] | None = None,
+                 # `...`: positional (tool, raw, emitted, passthrough, diff_reason,
+                 # structured, structured_out), plus `offload=` only when set -- the same
+                 # optional-keyword shape `stats_retrieve` takes for `index`.
+                 stats: Callable[..., None] | None = None,
                  server_name: str | None = None,
                  store: OrderedDict[str, Any] | None = None,
                  store_lock: Lock | None = None,
@@ -1064,7 +1116,16 @@ class Interceptor:
                                                                    rewrote_structured))
                 # Only a wrappable result may CARRY the primer; an `auto_tentative` one that
                 # needs it reverts to the hold, as `always` would have held it.
+                # Not onto a result the client will offload (see the text attach below):
+                # it reverts to the hold, and a later result carries the primer.
                 wrap_primer = (wire_form and not auto_declined and wrap_tentative
+                               and isinstance(result, dict)
+                               and ((limit := offload_limit(self.client_name)) is None
+                                    or not over_limit(
+                                        self._primer_body() + json.dumps(
+                                            result.get("structuredContent"),
+                                            separators=(",", ":"), ensure_ascii=False),
+                                        limit))
                                and self._claim_primer())
                 if auto_declined:
                     # `hold_all` is already False (lifted for the tentative pass above).
@@ -1285,8 +1346,17 @@ class Interceptor:
                     partial(self._emit_primer, PRIMER_CADENCE_ONCE,
                             self._primer_body(), False, PRIMER_DECLINE_NEVER),
                 ))
+            # A result the client will offload to a file must not carry the primer: the
+            # model may never read that file, and the latch would be spent unseen. It stays
+            # armed for the next result instead. Checked before the claim, so a router's
+            # shared latch is never taken for a result that cannot deliver it.
             if (primer_pending and not structured_present and marker_in_text
-                    and not auto_skip and self._claim_primer()):
+                    and not auto_skip
+                    and not over_limit(self._primer_body() + "\n" + "\n".join(
+                        b["text"] for b in content if isinstance(b, dict)
+                        and b.get("type") == "text" and isinstance(b.get("text"), str)),
+                        offload_limit(self.client_name))
+                    and self._claim_primer()):
                 content.insert(0, {"type": "text", "text": self._primer_body()})
                 changed = True
                 # DEFERRED, not called here (review of #311). The decision to bill is
@@ -1337,7 +1407,8 @@ class Interceptor:
                     partial(self._emit_stats, tool, emitted_pairs,
                             display_tool=capture_tool, diff_reason=diff_reason,
                             structured=structured_raw, structured_out=structured_out,
-                            force_passthrough=hold_all),
+                            force_passthrough=hold_all,
+                            offload_at=offload_limit(self.client_name)),
                 ))
 
             if not changed:
@@ -2222,7 +2293,8 @@ class Interceptor:
                     display_tool: str | None = None, diff_reason: str | None = None,
                     structured: str | None = None,
                     structured_out: str | None = None,
-                    force_passthrough: bool = False) -> None:
+                    force_passthrough: bool = False,
+                    offload_at: int | None = None) -> None:
         """Hand the stats callback one
         (tool, raw, emitted, passthrough, diff_reason, structured, structured_out) per
         emitted block, for the payload-free savings ledger (stats.py). Same fail-open
@@ -2235,19 +2307,39 @@ class Interceptor:
         carried, if any, on the raw and emitted sides (they differ only when the typed field
         was itself compressed, #141). Per-RESULT, not per-block, so both are attributed to
         the first pair only — counting them once per block would inflate the very number
-        this is meant to make honest (#128)."""
+        this is meant to make honest (#128).
+
+        `offload_at` is the connected client's offload limit (`offload_limit`), or None.
+        Classified here, after the lock is released, over what the client READS -- the
+        typed field when there is one (#420), else the text blocks joined -- because the
+        limit applies to the whole result while rows are per block. Every row of an
+        affected result is tagged `offload`: "out" when the client offloaded what terse
+        emitted, "raw" when only the raw result would have been. Passed to the writer only
+        when set, so a writer from before the field keeps working."""
         stats = self.stats
         if stats is None:
             return
+        offload = None
+        if offload_at is not None:
+            seen_raw = structured if structured is not None else "\n".join(r for r, _ in pairs)
+            seen_out = (structured_out if structured_out is not None
+                        else structured if structured is not None
+                        else "\n".join(e for _, e in pairs))
+            offload = ("out" if over_limit(seen_out, offload_at)
+                       else "raw" if over_limit(seen_raw, offload_at) else None)
         shown_tool = display_tool if display_tool is not None else tool
         # `force_passthrough`: a result held whole for the router's primer (#212) ran no
         # codec, whatever its rule's tiers say.
         passthrough = force_passthrough or not self.policy.select(tool, self.server_name).tiers
         for index, (raw, emitted) in enumerate(pairs):
             try:
-                stats(shown_tool, raw, emitted, passthrough, diff_reason,
-                      structured if index == 0 else None,
-                      structured_out if index == 0 else None)
+                args = (shown_tool, raw, emitted, passthrough, diff_reason,
+                        structured if index == 0 else None,
+                        structured_out if index == 0 else None)
+                if offload is None:
+                    stats(*args)
+                else:
+                    stats(*args, offload=offload)
             except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
                 self._warn_sink("stats", shown_tool, exc)
 

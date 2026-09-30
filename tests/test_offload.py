@@ -1,0 +1,210 @@
+"""Results the client offloads to a file instead of putting in context (item 3).
+
+Claude Code saves an MCP result over its limit (25,000 tokens by default,
+`MAX_MCP_OUTPUT_TOKENS` to change it) to a file and hands the model only the path. Two
+consequences for terse: a lazy primer attached to such a result may never be read, and the
+ledger's saving for it never reached context. Measured on the live ledger before this: ~20%
+of the reported saving sat in offloaded results.
+"""
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from terse.policy import Policy, Rule
+from terse.proxy import (
+    OFFLOAD_DEFAULT_TOKENS,
+    PRIMER_HEAD,
+    Interceptor,
+    PrimerLatch,
+    offload_limit,
+    over_limit,
+    union_primer,
+)
+from terse.stats import build_stats_writer, context_tokens, load_stats
+
+POL = Policy(rules=[Rule("gh.*", ("minify", "tabularize", "dictionary"))])
+LIMIT = 1500   # tokens; the fixtures below are sized against it
+
+
+def _rows(n: int) -> str:
+    # cl100k, raw -> compressed: 12 rows 376 -> 196, 60 rows 1,864 -> 779,
+    # 200 rows 6,204 -> 2,459. The primer is ~555.
+    return json.dumps({"result": [{"id": i, "owner": {"name": f"user-{i:02d}",
+                                                      "team": "platform-infrastructure"},
+                                   "count": i * 3} for i in range(n)]})
+
+
+def _drive(inter: Interceptor, mid: int, text: str) -> dict:
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+                                   "params": {"name": "gh.api.items"}}))
+    line = inter.transform_response(json.dumps(
+        {"jsonrpc": "2.0", "id": mid,
+         "result": {"content": [{"type": "text", "text": text}]}}))
+    return json.loads(line)["result"]
+
+
+def _has_primer(result: dict) -> bool:
+    return any(PRIMER_HEAD in b.get("text", "") for b in result["content"])
+
+
+@pytest.fixture
+def small_limit(monkeypatch):
+    monkeypatch.setenv("MAX_MCP_OUTPUT_TOKENS", str(LIMIT))
+
+
+# --- the limit ---
+
+def test_only_an_offloading_client_has_a_limit():
+    assert offload_limit(None, {}) is None
+    assert offload_limit("some-other-client", {}) is None
+    assert offload_limit("claude-code", {}) == OFFLOAD_DEFAULT_TOKENS == 25_000
+
+
+@pytest.mark.parametrize("env, want", [("50000", 50_000), ("", 25_000), ("lots", 25_000),
+                                       ("0", 25_000), ("-5", 25_000)])
+def test_the_limit_follows_max_mcp_output_tokens(env, want):
+    assert offload_limit("claude-code", {"MAX_MCP_OUTPUT_TOKENS": env}) == want
+
+
+def test_over_limit_counts_tokens_not_bytes():
+    assert not over_limit("x" * 10_000, None)
+    assert not over_limit("short", 3)                  # 5 bytes, but 1 token
+    assert over_limit(_rows(200), 1000)
+    assert not over_limit(_rows(200), 100_000)
+
+
+# --- the primer ---
+
+def test_the_primer_skips_an_offloaded_result_and_attaches_to_the_next(small_limit):
+    inter = Interceptor(POL)
+    inter.client_name = "claude-code"
+    first = _drive(inter, 1, _rows(200))               # 2,459 compressed > 1,500
+    assert '"__terse_' in first["content"][0]["text"]  # still compressed, just unprimed
+    assert not _has_primer(first)
+    assert _has_primer(_drive(inter, 2, _rows(12)))    # the latch stayed armed
+
+
+def test_the_primer_skips_a_result_that_only_the_primer_pushes_over(monkeypatch):
+    # 779 compressed fits under 1,000; with the ~555-token primer it would not.
+    monkeypatch.setenv("MAX_MCP_OUTPUT_TOKENS", "1000")
+    inter = Interceptor(POL)
+    inter.client_name = "claude-code"
+    assert not _has_primer(_drive(inter, 1, _rows(60)))
+    assert _has_primer(_drive(inter, 2, _rows(12)))
+
+
+def test_a_client_that_never_offloads_gets_the_primer_on_any_result(small_limit):
+    inter = Interceptor(POL)
+    inter.client_name = "some-other-client"
+    assert _has_primer(_drive(inter, 1, _rows(200)))
+
+
+def test_a_router_does_not_spend_its_shared_latch_on_an_offloaded_result(small_limit):
+    latch = PrimerLatch()
+    a, b = (Interceptor(POL, server_name=n, lazy_primer=False, shared_primer=latch)
+            for n in ("a", "b"))
+    latch.set_text(union_primer([(POL, "a"), (POL, "b")], structured_wrap=True))
+    a.client_name = b.client_name = "claude-code"
+    assert not _has_primer(_drive(a, 1, _rows(200)))
+    assert latch.pending()
+    assert _has_primer(_drive(b, 2, _rows(12)))
+    assert not latch.pending()
+
+
+# --- the ledger ---
+
+def _ledger(tmp_path, client: str | None, text: str) -> list[dict]:
+    log = tmp_path / "stats.jsonl"
+    inter = Interceptor(POL, stats=build_stats_writer(log, "gh"))
+    inter.client_name = client
+    _drive(inter, 1, text)
+    return [r for r in load_stats(log) if not r.get("event")]
+
+
+def test_a_result_offloaded_after_terse_is_tagged_out(tmp_path, small_limit):
+    (row,) = _ledger(tmp_path, "claude-code", _rows(200))
+    assert row["offload"] == "out"
+
+
+def test_a_result_terse_kept_under_the_limit_is_tagged_raw(tmp_path, small_limit):
+    (row,) = _ledger(tmp_path, "claude-code", _rows(60))      # 1,864 raw -> 779
+    assert row["offload"] == "raw"
+
+
+def test_an_inline_result_and_a_non_offloading_client_carry_no_tag(tmp_path, small_limit):
+    (inline,) = _ledger(tmp_path, "claude-code", _rows(12))
+    (other,) = _ledger(tmp_path / "x", "some-other-client", _rows(200))
+    assert "offload" not in inline and "offload" not in other
+
+
+def test_a_writer_from_before_the_field_still_works(small_limit):
+    # A stats callback with the old seven-argument signature must not be handed `offload=`
+    # for an ordinary result.
+    seen: list = []
+    inter = Interceptor(POL, stats=lambda *a: seen.append(a))
+    inter.client_name = "claude-code"
+    _drive(inter, 1, _rows(12))
+    assert len(seen) == 1 and len(seen[0]) == 7
+
+
+# --- the context basis ---
+
+def test_an_offloaded_row_saves_nothing_in_context():
+    assert context_tokens({"offload": "out"}, 30_000, 27_000) == (0, 0)
+    assert context_tokens({"offload": "raw"}, 30_000, 9_000) == (9_000, 9_000)
+    assert context_tokens({}, 3_000, 900) == (3_000, 900)
+
+
+def test_a_kept_inline_row_with_a_rewritten_typed_field_pays_its_typed_size():
+    rec = {"offload": "raw", "structured_tokens": 28_000, "structured_out_tokens": 8_000}
+    assert context_tokens(rec, 40_000, 12_000) == (8_000, 8_000)
+
+
+def _drive_typed(inter: Interceptor, mid: int, rows: int) -> dict:
+    typed = json.loads(_rows(rows))
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+                                   "params": {"name": "gh.api.items"}}))
+    line = inter.transform_response(json.dumps(
+        {"jsonrpc": "2.0", "id": mid,
+         "result": {"content": [{"type": "text", "text": json.dumps(typed)}],
+                    "structuredContent": typed}}))
+    return json.loads(line)["result"]
+
+
+def test_the_typed_wrapper_skips_an_offloaded_result_and_wraps_the_next(small_limit):
+    # #463's second attach site: a structured-reading client gets the primer inside the
+    # typed field. An over-limit one reverts to the raw hold and keeps the latch armed.
+    latch = PrimerLatch()
+    peer = Interceptor(POL, server_name="p0", lazy_primer=False, shared_primer=latch)
+    latch.set_text(union_primer([(POL, "p0")], structured_wrap=True))
+    peer.client_name = "claude-code"
+    big = _drive_typed(peer, 1, 200)
+    assert "__terse_primer__" not in json.dumps(big["structuredContent"])
+    assert latch.pending()
+    small = _drive_typed(peer, 2, 12)
+    assert "__terse_primer__" in small["structuredContent"]
+    assert not latch.pending()
+
+
+def test_text_the_tokenizer_refuses_never_breaks_forwarding(small_limit):
+    # tiktoken raises on `<|endoftext|>` in input; under the primer guard that exception
+    # would kill the proxy's reader thread. It must read as inline instead.
+    assert not over_limit("log tail: <|endoftext|> " + "x" * 30_000, LIMIT)
+    inter = Interceptor(POL)
+    inter.client_name = "claude-code"
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "gh.api.items"}}))
+    line = inter.transform_response(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
+        "content": [{"type": "text", "text": _rows(12)},
+                    {"type": "text", "text": "log tail: <|endoftext|> " + "x" * 30_000}]}}))
+    assert json.loads(line)["result"]["content"]
+
+
+def test_the_tokenizer_pass_is_bounded(monkeypatch):
+    seen: list[int] = []
+    import terse.proxy as proxy_mod
+    monkeypatch.setattr(proxy_mod, "count_cl100k", lambda t: seen.append(len(t)) or 0)
+    over_limit("y" * 2_000_000, 1000)
+    assert seen == [8000]
