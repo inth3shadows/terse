@@ -26,6 +26,7 @@ from threading import Lock
 import pytest
 
 from terse.multiproxy import (
+    _SNAPSHOT_MAX_AGE,
     Peer,
     Router,
     RouterSnapshot,
@@ -37,6 +38,7 @@ from terse.multiproxy import (
 )
 from terse.policy import Policy, Rule
 from terse.proxy import SWALLOW, Interceptor
+from terse.stats import load_stats
 
 FAKE = pathlib.Path(__file__).parent / "fake_mcp_server.py"
 POLICY = Policy(rules=[Rule("*", ("minify",))])
@@ -85,7 +87,9 @@ class _Out:
 class _Client:
     """`run_multi_proxy` on a thread, fed over a real pipe."""
 
-    def __init__(self, cfg: pathlib.Path, broadcast_timeout: float = 10.0):
+    def __init__(self, cfg: pathlib.Path, broadcast_timeout: float = 10.0,
+                 stats_log: pathlib.Path | None = None):
+        self._stats_log = stats_log
         r, w = os.pipe()
         self._cin = os.fdopen(r, "r", encoding="utf-8")
         self._w = os.fdopen(w, "w", encoding="utf-8")
@@ -97,7 +101,9 @@ class _Client:
 
     def _run(self, cfg, broadcast_timeout):
         self.rc = run_multi_proxy(str(cfg), POLICY, stdin=self._cin, stdout=self.out,
-                                  broadcast_timeout=broadcast_timeout)
+                                  broadcast_timeout=broadcast_timeout,
+                                  stats_log=(str(self._stats_log) if self._stats_log
+                                             else None))
 
     def send(self, msg: dict) -> float:
         self._w.write(json.dumps(msg) + "\n")
@@ -427,6 +433,32 @@ def test_without_git_the_snapshot_is_keyed_by_the_directory(tmp_path, monkeypatc
         raise FileNotFoundError("git")
     monkeypatch.setattr(subprocess, "run", no_git)
     assert snapshot_cwd(load_multi_config(str(cfg))) == os.getcwd()
+
+
+def test_each_session_row_records_whether_it_started_warm(tmp_path):
+    # The ledger is how the live fleet shows a new worktree actually starting warm (#479).
+    cfg, log = _config(tmp_path), tmp_path / "stats.jsonl"
+    for _ in range(2):
+        c = _Client(cfg, stats_log=log)
+        c.handshake()
+        assert c.close() == 0
+    rows = [r for r in load_stats(log) if r.get("event") == "router_session"]
+    assert [r["snapshot"] for r in rows] == ["cold", "warm"]
+
+
+def test_save_prunes_only_snapshots_older_than_the_max_age(tmp_path):
+    snap = RouterSnapshot(tmp_path / "snaps" / "live.json", "fp")
+    snap.path.parent.mkdir()
+    old, young = snap.path.parent / "old.json", snap.path.parent / "young.json"
+    other = snap.path.parent / "old.txt"      # not a snapshot: never touched
+    for f in (old, young, other, snap.path):
+        f.write_text("{}", encoding="utf-8")
+    stale = time.time() - _SNAPSHOT_MAX_AGE - 60
+    for f in (old, other, snap.path):
+        os.utime(f, (stale, stale))
+    snap.save({"initialize": {}, "tools/list": {}}, "2025-06-18")
+    assert not old.exists()
+    assert young.exists() and other.exists() and snap.path.exists()
 
 
 def test_an_initialize_only_difference_is_reported_and_persisted(tmp_path, capsys):

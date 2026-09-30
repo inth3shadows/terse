@@ -142,6 +142,10 @@ _SNAPSHOT_LISTS = {
 # asked for them in the session that wrote it.
 _SNAPSHOT_KINDS = ("initialize", *_SNAPSHOT_LISTS)
 _SNAPSHOT_VERSION = 2   # 2: + the client protocolVersion the replies were negotiated for
+# A snapshot no session has rewritten in this long belongs to a repo, config or keying that
+# is gone; `RouterSnapshot.save` deletes it. A live one is rewritten whenever its replies
+# change and otherwise costs nothing to re-create (one blocking initialize).
+_SNAPSHOT_MAX_AGE = 30 * 86400
 
 # Bound on `Router._local_id_map` (broadcast-local id -> broadcast seq). Entries are
 # deliberately NOT popped as soon as a broadcast finishes (a late, post-finish reply
@@ -373,7 +377,8 @@ def snapshot_cwd(specs: list[DownstreamSpec]) -> str | None:
     peers DO answer differently (one made by hand, with no index) is served its repo's
     snapshot once; `_reconcile` then sends list_changed and persists the live replies.
 
-    KNOWN LIMITATION: snapshot files are never pruned."""
+    Files no session has written for `_SNAPSHOT_MAX_AGE` are pruned on save — including
+    the per-directory ones written before this keying (`RouterSnapshot.save`)."""
     if all(s.cwd is not None for s in specs):
         return None
     cwd = os.getcwd()
@@ -486,6 +491,24 @@ class RouterSnapshot:
                 sys.stderr.write(f"[terse-multiproxy] could not write snapshot "
                                  f"{self.path} ({exc}); the next session's initialize "
                                  "will wait on every peer\n")
+            return
+        self._prune()
+
+    def _prune(self) -> None:
+        """Delete sibling snapshots older than `_SNAPSHOT_MAX_AGE`. Best-effort and silent:
+        a file another router is replacing right now is young, and a failed unlink only
+        leaves a stale file that no fingerprint will ever serve."""
+        cutoff = time.time() - _SNAPSHOT_MAX_AGE
+        try:
+            siblings = list(self.path.parent.glob("*.json"))
+        except OSError:
+            return
+        for f in siblings:
+            try:
+                if f != self.path and f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                continue
 
 
 @dataclass
@@ -603,7 +626,7 @@ class Router:
     def __init__(self, peers: list[Peer], out: TextIO, out_lock: Lock, *,
                  debug: bool = False, broadcast_timeout: float = BROADCAST_TIMEOUT,
                  primer_latch: PrimerLatch | None = None,
-                 on_session: Callable[[], None] | None = None,
+                 on_session: Callable[[str], None] | None = None,
                  snapshot: RouterSnapshot | None = None):
         self.peers = peers
         # Writes one `router_session` ledger row per client `initialize` (#212) -- the
@@ -1119,7 +1142,9 @@ class Router:
             self._write_peer(i, line)
         if kind == "initialize" and self.on_session is not None:
             try:
-                self.on_session()
+                # `on_done` is set only by `_fast_initialize`: the client was already
+                # answered from the snapshot, so this session started warm.
+                self.on_session("warm" if on_done is not None else "cold")
             except Exception as exc:  # noqa: BLE001 — a ledger sink is never load-bearing
                 if self.debug:
                     sys.stderr.write(f"[terse-multiproxy] session ledger: {exc}\n")

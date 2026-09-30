@@ -13,7 +13,9 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A new git worktree starts warm (#479).** The router's saved `initialize` and list replies (#270) were keyed by the launch directory, so the first session in every new worktree, which is most sessions under per-session worktrees, still waited on the slowest peer. The key is now the launch directory's git common dir, which every worktree and subdirectory of a repo shares. Outside a git repo, or when `git` is missing or fails, the key is the directory as before. On 2026-09-29 the 49 per-directory files on the live fleet held only two distinct reply sets (codegraph indexed or not) plus peer version drift. A worktree whose peers do answer differently gets its repo's saved replies once, and the existing check then sends `list_changed` and saves the live replies for the next session. Saved files that no session has rewritten in 30 days are now deleted when a snapshot is saved, including the per-directory files this change leaves behind. Each `router_session` ledger row now carries `snapshot: "warm"` or `"cold"`, which says whether that session was answered from the saved replies. Older rows have no such field. `terse stats --json` is unchanged.
 
 ## [0.43.0] - 2026-09-27
 
