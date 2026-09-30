@@ -203,6 +203,25 @@ baked onto the router entry, which applies it to all peers. A peer's `env` and `
 carried into the peers file and re-applied when the router launches it, so a server that
 needed a pinned `PATH` or an API key in `env` keeps getting one.
 
+The router answers `initialize` from the replies it saved last session, so it doesn't wait
+on its slowest peer. By default those saved replies are kept per launch directory, because
+a peer that inherits the router's directory may answer differently in each one. To share
+them across directories, declare what each such peer's replies actually depend on, by
+editing the peers file by hand:
+
+```json
+{"name": "codegraph", "command": ["codegraph", "serve", "--mcp"], "snapshot_markers": [".codegraph"]},
+{"name": "runecho", "command": ["runecho-mcp"], "snapshot_markers": []}
+```
+
+`[".codegraph"]` means "only through the nearest `.codegraph` at or above the directory".
+Worktrees whose `.codegraph` links to the same index then share one set of saved replies,
+and so do all directories with no index. `[]` means the peer does not depend on the
+directory at all. The saved replies are shared only when every peer without its own `cwd`
+declares markers; otherwise they stay per directory. Re-running `install-mcp` keeps a
+peer's markers. Saved replies that have been neither used nor updated for 30 days are
+deleted.
+
 `terse mcp-status` reports a folded fleet as one `router` row (with `wraps=` listing its
 peers) plus a `folded` row per peer naming the router it sits behind — not as drift. Four
 more states exist for when something has gone wrong, each with a line saying what to do:

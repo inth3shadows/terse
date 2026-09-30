@@ -12,12 +12,12 @@ peer is `fake_mcp_server.py` with `FAKE_INIT_DELAY`.
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import io
 import json
 import os
 import pathlib
-import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -34,7 +34,7 @@ from terse.multiproxy import (
     peers_fingerprint,
     router_snapshot_path,
     run_multi_proxy,
-    snapshot_cwd,
+    snapshot_scope,
 )
 from terse.policy import Policy, Rule
 from terse.proxy import SWALLOW, Interceptor
@@ -145,12 +145,12 @@ def _config(tmp_path, *, slow_env=None, fast_env=None) -> pathlib.Path:
 
 def _path(cfg) -> pathlib.Path:
     specs = load_multi_config(str(cfg))
-    return router_snapshot_path(str(cfg), snapshot_cwd(specs))
+    return router_snapshot_path(str(cfg), snapshot_scope(specs))
 
 
 def _fp(cfg) -> str:
     specs = load_multi_config(str(cfg))
-    return peers_fingerprint(specs, snapshot_cwd(specs))
+    return peers_fingerprint(specs, snapshot_scope(specs))
 
 
 def _names(listed: dict) -> list[str]:
@@ -230,7 +230,9 @@ def test_a_snapshot_identical_to_live_emits_nothing_and_is_not_rewritten(tmp_pat
     cfg = _config(tmp_path)
     _seed(cfg)
     path = _path(cfg)
-    before = (path.read_bytes(), path.stat().st_mtime_ns)
+    # By inode, not mtime: `load` touches the file it serves (so `_prune` sees it in use),
+    # while a rewrite is an atomic replace, which always lands a new inode.
+    before = (path.read_bytes(), path.stat().st_ino)
     c = _Client(cfg)
     try:
         c.handshake()
@@ -239,7 +241,7 @@ def test_a_snapshot_identical_to_live_emits_nothing_and_is_not_rewritten(tmp_pat
         assert c.out.notes("notifications/tools/list_changed") == []
     finally:
         assert c.close() == 0
-    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+    assert (path.read_bytes(), path.stat().st_ino) == before
 
 
 # --- 4 ---
@@ -371,36 +373,29 @@ def test_two_launch_directories_keep_separate_snapshots(tmp_path, monkeypatch):
     assert path_a.exists() and _path(cfg).exists()
 
 
-def _git(*args, cwd):
-    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
-                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
-                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
-
-
-def _repo_with_worktree(root: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
-    main, wt = root / "main", root / "wt"
-    main.mkdir()
-    _git("init", "-q", cwd=main)
-    _git("commit", "-q", "--allow-empty", "-m", "init", cwd=main)
-    _git("worktree", "add", "-q", str(wt), cwd=main)
-    return main, wt
-
-
-needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
-
-
-@needs_git
-def test_worktrees_of_one_repo_share_a_snapshot_and_start_warm(tmp_path, monkeypatch):
-    # #479's known limit: every new per-session worktree used to block on its first
-    # initialize. Keyed by the git common dir, a fresh worktree is served the repo's
-    # snapshot -- and so is a subdirectory of the main checkout.
+def _marked_config(tmp_path, markers) -> pathlib.Path:
+    """`_config` with `snapshot_markers` declared on both (cwd-inheriting) peers."""
     cfg = _config(tmp_path)
-    main, wt = _repo_with_worktree(tmp_path)
-    (main / "sub").mkdir()
-    monkeypatch.chdir(main)
+    doc = json.loads(cfg.read_text(encoding="utf-8"))
+    for d in doc["downstreams"]:
+        d["snapshot_markers"] = markers
+    cfg.write_text(json.dumps(doc), encoding="utf-8")
+    return cfg
+
+
+def test_directories_sharing_a_declared_marker_share_a_snapshot_and_start_warm(
+        tmp_path, monkeypatch):
+    # #479: with the marker declared, a new worktree whose `.codegraph` links to the same
+    # index is served the snapshot another worktree saved -- and so is a subdirectory.
+    cfg = _marked_config(tmp_path, [".idx"])
+    (tmp_path / "main" / ".idx").mkdir(parents=True)
+    (tmp_path / "main" / "sub").mkdir()
+    (tmp_path / "wt").mkdir()
+    (tmp_path / "wt" / ".idx").symlink_to("../main/.idx")
+    monkeypatch.chdir(tmp_path / "main")
     _seed(cfg)
     path, fp = _path(cfg), _fp(cfg)
-    for d in (wt, main / "sub"):
+    for d in (tmp_path / "wt", tmp_path / "main" / "sub"):
         monkeypatch.chdir(d)
         assert (_path(cfg), _fp(cfg)) == (path, fp), d
     c = _Client(cfg)
@@ -411,28 +406,71 @@ def test_worktrees_of_one_repo_share_a_snapshot_and_start_warm(tmp_path, monkeyp
     assert init_s < FAST and list_s < FAST, (init_s, list_s)
 
 
-@needs_git
-def test_two_repos_keep_separate_snapshots(tmp_path, monkeypatch):
-    cfg = _config(tmp_path)
+def test_a_different_or_missing_marker_keeps_a_separate_snapshot(tmp_path, monkeypatch):
+    # The reviewed failure of keying by git repo: an unindexed worktree of an indexed repo
+    # must not be served the indexed one's snapshot, nor it theirs.
+    cfg = _marked_config(tmp_path, [".idx"])
+    for d in ("indexed/.idx", "other/.idx", "bare"):
+        (tmp_path / "repo" / d).mkdir(parents=True)
+    paths = []
+    for d in ("indexed", "other", "bare"):
+        monkeypatch.chdir(tmp_path / "repo" / d)
+        paths.append(_path(cfg))
+    assert len(set(paths)) == 3
+
+
+def test_directories_with_no_marker_anywhere_share_one_snapshot(tmp_path, monkeypatch):
+    cfg = _marked_config(tmp_path, [".no-such-marker-479"])
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
-    main_a, _ = _repo_with_worktree(tmp_path / "a")
-    main_b, _ = _repo_with_worktree(tmp_path / "b")
-    monkeypatch.chdir(main_a)
+    monkeypatch.chdir(tmp_path / "a")
     path_a = _path(cfg)
-    monkeypatch.chdir(main_b)
+    monkeypatch.chdir(tmp_path / "b")
+    assert _path(cfg) == path_a
+
+
+def test_one_undeclared_inheriting_peer_keeps_the_snapshot_per_directory(tmp_path, monkeypatch):
+    cfg = _marked_config(tmp_path, [])
+    doc = json.loads(cfg.read_text(encoding="utf-8"))
+    del doc["downstreams"][1]["snapshot_markers"]
+    cfg.write_text(json.dumps(doc), encoding="utf-8")
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    monkeypatch.chdir(tmp_path / "a")
+    assert snapshot_scope(load_multi_config(str(cfg))) == str(tmp_path / "a")
+    path_a = _path(cfg)
+    monkeypatch.chdir(tmp_path / "b")
     assert _path(cfg) != path_a
 
 
-def test_without_git_the_snapshot_is_keyed_by_the_directory(tmp_path, monkeypatch):
-    # git missing (or failing) must never stop the router: it falls back to the cwd.
+def test_an_undeclared_config_keys_exactly_as_before_the_field_existed(tmp_path, monkeypatch):
+    # Adding the field must not invalidate every saved snapshot on upgrade: with no peer
+    # declaring markers, the scope is the cwd and the fingerprint hashes the same entries.
     cfg = _config(tmp_path)
     monkeypatch.chdir(tmp_path)
+    specs = load_multi_config(str(cfg))
+    assert snapshot_scope(specs) == os.getcwd()
+    legacy = [{k: v for k, v in dataclasses.asdict(s).items() if k != "snapshot_markers"}
+              for s in specs]
+    doc = json.dumps({"peers": legacy, "cwd": os.getcwd()}, sort_keys=True,
+                     separators=(",", ":"))
+    assert _fp(cfg) == hashlib.sha256(doc.encode("utf-8")).hexdigest()
 
-    def no_git(*a, **k):
-        raise FileNotFoundError("git")
-    monkeypatch.setattr(subprocess, "run", no_git)
-    assert snapshot_cwd(load_multi_config(str(cfg))) == os.getcwd()
+
+@pytest.mark.parametrize("bad", ["x", [""], ["/abs"], ["../up"], [1]])
+def test_malformed_snapshot_markers_are_a_config_error(tmp_path, bad):
+    cfg = _marked_config(tmp_path, bad)
+    with pytest.raises(ValueError, match="snapshot_markers"):
+        load_multi_config(str(cfg))
+
+
+def test_snapshot_markers_on_a_peer_with_its_own_cwd_is_a_config_error(tmp_path):
+    cfg = _marked_config(tmp_path, [".idx"])
+    doc = json.loads(cfg.read_text(encoding="utf-8"))
+    doc["downstreams"][0]["cwd"] = str(tmp_path)
+    cfg.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ValueError, match="inherits the router's"):
+        load_multi_config(str(cfg))
 
 
 def test_each_session_row_records_whether_it_started_warm(tmp_path):
@@ -446,19 +484,42 @@ def test_each_session_row_records_whether_it_started_warm(tmp_path):
     assert [r["snapshot"] for r in rows] == ["cold", "warm"]
 
 
-def test_save_prunes_only_snapshots_older_than_the_max_age(tmp_path):
-    snap = RouterSnapshot(tmp_path / "snaps" / "live.json", "fp")
-    snap.path.parent.mkdir()
-    old, young = snap.path.parent / "old.json", snap.path.parent / "young.json"
-    other = snap.path.parent / "old.txt"      # not a snapshot: never touched
+def _stale(*files: pathlib.Path) -> None:
+    t = time.time() - _SNAPSHOT_MAX_AGE - 60
+    for f in files:
+        os.utime(f, (t, t))
+
+
+def test_prune_removes_only_stale_snapshots_and_never_its_own(tmp_path):
+    snap = RouterSnapshot(tmp_path / "live.json", "fp")
+    old, young, other = tmp_path / "old.json", tmp_path / "young.json", tmp_path / "old.txt"
     for f in (old, young, other, snap.path):
         f.write_text("{}", encoding="utf-8")
-    stale = time.time() - _SNAPSHOT_MAX_AGE - 60
-    for f in (old, other, snap.path):
-        os.utime(f, (stale, stale))
-    snap.save({"initialize": {}, "tools/list": {}}, "2025-06-18")
+    _stale(old, other, snap.path)          # its own file stale too: the guard must hold
+    snap._prune()
     assert not old.exists()
     assert young.exists() and other.exists() and snap.path.exists()
+
+
+def test_save_prunes_its_stale_siblings(tmp_path):
+    snap = RouterSnapshot(tmp_path / "live.json", "fp")
+    old = tmp_path / "old.json"
+    old.write_text("{}", encoding="utf-8")
+    _stale(old)
+    snap.save({"initialize": {}, "tools/list": {}}, "2025-06-18")
+    assert not old.exists() and snap.path.exists()
+
+
+def test_a_served_snapshot_is_not_pruned_as_abandoned(tmp_path):
+    # Replies that never change are never rewritten; being served must still count as use,
+    # or a stable repo's snapshot would be deleted by another repo's save after 30 days.
+    live = RouterSnapshot(tmp_path / "live.json", "fp")
+    live.save({"initialize": {"p": {}}, "tools/list": {"p": {}}}, "2025-06-18")
+    _stale(live.path)
+    assert live.load() is not None
+    RouterSnapshot(tmp_path / "other.json", "fp").save(
+        {"initialize": {}, "tools/list": {}}, "2025-06-18")
+    assert live.path.exists()
 
 
 def test_an_initialize_only_difference_is_reported_and_persisted(tmp_path, capsys):

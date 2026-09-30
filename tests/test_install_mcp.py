@@ -2393,6 +2393,23 @@ def test_multiproxy_refuses_to_fold_a_router_belonging_to_a_DIFFERENT_peers_file
     assert "othermux" in json.loads(cfg.read_text())["mcpServers"]
 
 
+def test_multiproxy_refold_keeps_a_peers_snapshot_markers():
+    """`snapshot_markers` (#479) is the operator's declaration, found nowhere in the client
+    entry a re-fold rebuilds from, so a re-install must carry it over — except onto a peer
+    that now has its own `cwd`, where the router would reject it."""
+    from terse.install_mcp import wrap_multi
+    cfg = {"mcpServers": {"kb": {"command": "kb-mcp"},
+                          "gh": {"command": "gh-mcp", "cwd": "/x"}}}
+    prior = {"downstreams": [
+        {"name": "kb", "command": ["kb-mcp"], "snapshot_markers": [".idx"]},
+        {"name": "gh", "command": ["gh-mcp"], "snapshot_markers": []}]}
+    _, _, peers = wrap_multi(cfg, {}, ["kb", "gh"], "/p.json", ["terse"],
+                             peers_file="/unused/peers.json", existing_peers=prior)
+    by_name = {d["name"]: d for d in peers["downstreams"]}
+    assert by_name["kb"]["snapshot_markers"] == [".idx"]
+    assert "snapshot_markers" not in by_name["gh"]
+
+
 def test_prune_peer_normalizes_away_malformed_entries(tmp_path):
     """Pinned directly, not through a caller: every caller re-normalizes via
     `peers_downstreams`, so reverting `_prune_peer` alone regressed silently with the
