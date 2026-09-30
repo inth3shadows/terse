@@ -747,9 +747,11 @@ def wrap_multi(config: dict, stash: dict, servers: list[str], policy: str,
         spec = _peer_spec(name, original, policy)
         # `snapshot_markers` (#479) is the operator's own declaration about the peer, found
         # nowhere in the client entry `_peer_spec` rebuilds from. Re-folding a peer must not
-        # silently drop it (the router would fall back to per-directory snapshots).
+        # silently drop it (the router would fall back to per-directory snapshots). Only
+        # onto a `command` peer with no `cwd` of its own: the router rejects markers on
+        # anything else, and a peers file it cannot load takes down the whole fleet.
         markers = prior_markers.get(name)
-        if markers is not None and "cwd" not in spec:
+        if markers is not None and "command" in spec and "cwd" not in spec:
             spec["snapshot_markers"] = markers
         downstreams.append(spec)
         live_servers.pop(name, None)

@@ -2393,21 +2393,29 @@ def test_multiproxy_refuses_to_fold_a_router_belonging_to_a_DIFFERENT_peers_file
     assert "othermux" in json.loads(cfg.read_text())["mcpServers"]
 
 
-def test_multiproxy_refold_keeps_a_peers_snapshot_markers():
+def test_multiproxy_refold_keeps_a_peers_snapshot_markers(tmp_path):
     """`snapshot_markers` (#479) is the operator's declaration, found nowhere in the client
     entry a re-fold rebuilds from, so a re-install must carry it over — except onto a peer
-    that now has its own `cwd`, where the router would reject it."""
+    that now has its own `cwd` or became a `url` server, where the router would reject it
+    and refuse to launch the whole fleet."""
     from terse.install_mcp import wrap_multi
+    from terse.multiproxy import load_multi_config
     cfg = {"mcpServers": {"kb": {"command": "kb-mcp"},
-                          "gh": {"command": "gh-mcp", "cwd": "/x"}}}
+                          "gh": {"command": "gh-mcp", "cwd": "/x"},
+                          "web": {"type": "http", "url": "https://example.invalid/mcp"}}}
     prior = {"downstreams": [
         {"name": "kb", "command": ["kb-mcp"], "snapshot_markers": [".idx"]},
-        {"name": "gh", "command": ["gh-mcp"], "snapshot_markers": []}]}
-    _, _, peers = wrap_multi(cfg, {}, ["kb", "gh"], "/p.json", ["terse"],
+        {"name": "gh", "command": ["gh-mcp"], "snapshot_markers": []},
+        {"name": "web", "command": ["web-mcp"], "snapshot_markers": []}]}
+    _, _, peers = wrap_multi(cfg, {}, ["kb", "gh", "web"], "/p.json", ["terse"],
                              peers_file="/unused/peers.json", existing_peers=prior)
     by_name = {d["name"]: d for d in peers["downstreams"]}
     assert by_name["kb"]["snapshot_markers"] == [".idx"]
     assert "snapshot_markers" not in by_name["gh"]
+    assert "snapshot_markers" not in by_name["web"]
+    out = tmp_path / "peers.json"
+    out.write_text(json.dumps(peers), encoding="utf-8")
+    load_multi_config(str(out))            # the router can launch what was written
 
 
 def test_prune_peer_normalizes_away_malformed_entries(tmp_path):
