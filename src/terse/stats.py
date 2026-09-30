@@ -3205,9 +3205,12 @@ def build_primer_writer(stats_log: str | Path, server: str):
 def build_router_session_writer(stats_log: str | Path, server: str):
     """One `router_session` row per lazy-router `initialize` (#212). `server` is the
     router's own `router_ledger_label`. Fail-open like every writer: the caller swallows."""
-    def session() -> None:
-        append_stats({"ts": int(time.time()), "version": _ledger_version(),
-                      "server": server, "event": ROUTER_SESSION_EVENT}, stats_log)
+    def session(snapshot: str | None = None) -> None:
+        rec: dict[str, Any] = {"ts": int(time.time()), "version": _ledger_version(),
+                               "server": server, "event": ROUTER_SESSION_EVENT}
+        if snapshot is not None:
+            rec["snapshot"] = snapshot   # "warm" | "cold" (#479): answered from the snapshot?
+        append_stats(rec, stats_log)
 
     return session
 

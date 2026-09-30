@@ -698,6 +698,10 @@ def wrap_multi(config: dict, stash: dict, servers: list[str], policy: str,
         if isinstance(d, dict) and isinstance(d.get("name"), str)
         and d["name"] not in requested and d["name"] not in live_servers
     ]
+    prior_markers = {d["name"]: d["snapshot_markers"]
+                     for d in ((existing_peers or {}).get("downstreams") or [])
+                     if isinstance(d, dict) and isinstance(d.get("name"), str)
+                     and "snapshot_markers" in d}
     seen_peers: set[str] = set()
     for name in servers:
         if name in seen_peers:
@@ -740,7 +744,16 @@ def wrap_multi(config: dict, stash: dict, servers: list[str], policy: str,
             stash[name] = original
         else:
             raise KeyError(name)
-        downstreams.append(_peer_spec(name, original, policy))
+        spec = _peer_spec(name, original, policy)
+        # `snapshot_markers` (#479) is the operator's own declaration about the peer, found
+        # nowhere in the client entry `_peer_spec` rebuilds from. Re-folding a peer must not
+        # silently drop it (the router would fall back to per-directory snapshots). Only
+        # onto a `command` peer with no `cwd` of its own: the router rejects markers on
+        # anything else, and a peers file it cannot load takes down the whole fleet.
+        markers = prior_markers.get(name)
+        if markers is not None and "command" in spec and "cwd" not in spec:
+            spec["snapshot_markers"] = markers
+        downstreams.append(spec)
         live_servers.pop(name, None)
 
     # A rename (`--router-name` differing from the router already fronting THIS peers

@@ -141,6 +141,10 @@ _SNAPSHOT_LISTS = {
 # asked for them in the session that wrote it.
 _SNAPSHOT_KINDS = ("initialize", *_SNAPSHOT_LISTS)
 _SNAPSHOT_VERSION = 2   # 2: + the client protocolVersion the replies were negotiated for
+# A snapshot no session has saved or been served in this long belongs to a directory,
+# config or keying that is gone; `RouterSnapshot.save` deletes it. A live one is rewritten whenever its replies
+# change and otherwise costs nothing to re-create (one blocking initialize).
+_SNAPSHOT_MAX_AGE = 30 * 86400
 
 # Bound on `Router._local_id_map` (broadcast-local id -> broadcast seq). Entries are
 # deliberately NOT popped as soon as a broadcast finishes (a late, post-finish reply
@@ -199,6 +203,9 @@ class DownstreamSpec:
     policy_path: str | None     # resolved relative to the config file; None = use the default
     env: dict[str, str] | None = None   # stdio only: merged over the router's own environ
     cwd: str | None = None              # stdio only: the peer's working directory
+    # What the peer's replies depend on in the router's cwd (`snapshot_scope`); None =
+    # undeclared, so a snapshot is per directory. Only for a peer that inherits the cwd.
+    snapshot_markers: tuple[str, ...] | None = None
 
 
 def load_multi_config(path: str) -> list[DownstreamSpec]:
@@ -290,6 +297,20 @@ def load_multi_config(path: str) -> list[DownstreamSpec]:
                              "'command' downstream only — a 'url' peer launches no "
                              "process, so they would be silently ignored")
 
+        markers = d.get("snapshot_markers")
+        if markers is not None:
+            if not isinstance(markers, list) or not all(
+                    isinstance(m, str) and m and not Path(m).is_absolute()
+                    and ".." not in Path(m).parts for m in markers):
+                raise ValueError(f"{path}: downstream {name!r}: 'snapshot_markers' must be "
+                                 "a list of relative paths (e.g. [\".codegraph\"]), "
+                                 "without '..'")
+            if url or cwd is not None:
+                raise ValueError(f"{path}: downstream {name!r}: 'snapshot_markers' applies "
+                                 "only to a 'command' downstream that inherits the router's "
+                                 "cwd (no 'cwd' of its own)")
+            markers = tuple(markers)
+
         policy_path = d.get("policy")
         if policy_path is not None:
             if not isinstance(policy_path, str):
@@ -299,7 +320,8 @@ def load_multi_config(path: str) -> list[DownstreamSpec]:
 
         specs.append(DownstreamSpec(name=name, target=target,
                                     headers={str(k): str(v) for k, v in headers.items()},
-                                    policy_path=policy_path, env=env, cwd=cwd))
+                                    policy_path=policy_path, env=env, cwd=cwd,
+                                    snapshot_markers=markers))
     return specs
 
 
@@ -340,8 +362,8 @@ class _PendingBroadcast:
 
 def router_snapshot_path(config_path: str, cwd: str | None = None) -> Path:
     """Where the router persists its snapshot (#270): beside the savings ledger, under
-    `$XDG_STATE_HOME/terse/router-snapshots/`, one file per peers config — and per launch
-    directory, when `cwd` is given (see `snapshot_cwd`).
+    `$XDG_STATE_HOME/terse/router-snapshots/`, one file per peers config — and per
+    snapshot scope, when `cwd` is given (see `snapshot_scope`).
 
     Keyed by the config's RESOLVED path, not by its fingerprint: an edited config then
     overwrites its own stale file instead of orphaning one per edit. Whether the file may
@@ -351,35 +373,68 @@ def router_snapshot_path(config_path: str, cwd: str | None = None) -> Path:
     return default_stats_log().parent / "router-snapshots" / f"{key}.json"
 
 
-def snapshot_cwd(specs: list[DownstreamSpec]) -> str | None:
-    """The router's own cwd when any peer INHERITS it (no `cwd` in its entry), else None.
+def snapshot_scope(specs: list[DownstreamSpec]) -> str | None:
+    """What a snapshot's replies depend on beyond the peers config: None when no peer
+    inherits the router's cwd (no `cwd` in its entry); otherwise the cwd itself, unless
+    EVERY inheriting peer declares `snapshot_markers`, in which case a scope built from
+    those markers alone (`_marker_scope`).
 
     A peer's replies can depend on where it runs. On the live fleet the codegraph peer
-    serves its tools only inside a repo with a `.codegraph/` index and is a zero-tool null
-    server everywhere else (25 of 62 repos). A snapshot shared across directories would be
-    served in the wrong one — a list_changed, the very cache bust #270 removes, and an
-    `initialize.instructions` naming tools that do not exist there, which nothing in MCP
-    can correct mid-session. So such a snapshot is per directory: in its path and in its
-    fingerprint.
+    serves its tools only under a `.codegraph/` index and is a zero-tool null server
+    everywhere else. A snapshot served where the peers would answer differently is a
+    list_changed, the very cache bust #270 removes, and an `initialize.instructions`
+    naming tools that do not exist there, which nothing in MCP can correct mid-session.
+    So the scope is in both the snapshot's path and its fingerprint.
 
-    KNOWN LIMITATION: the first session in a NEW directory still takes the blocking path,
-    and with per-session git worktrees (`claudew`) that is most new worktrees. Snapshot
-    files are also never pruned. Follow-up options, not done here: key by the git common
-    dir where codegraph's index location allows it, and an age-based prune."""
-    return os.getcwd() if any(s.cwd is None for s in specs) else None
+    Per directory by default, so every new directory (most per-session worktrees) blocks
+    on its first initialize (#479). Declared markers lift that exactly as far as they are
+    true: every worktree whose `.codegraph` links to the same index shares one snapshot,
+    and every directory with no index shares another. Keying by git repo instead was
+    built and rejected (2026-09-30): 9 of the operator's repos mix indexed and unindexed
+    worktrees (Claude Code's own agent worktrees have no index), so one key per repo
+    served the wrong replies on every switch between them."""
+    if all(s.cwd is not None for s in specs):
+        return None
+    cwd = os.getcwd()
+    inheriting = [s for s in specs if s.cwd is None]
+    if any(s.snapshot_markers is None for s in inheriting):
+        return cwd
+    return _marker_scope(inheriting, Path(cwd))
+
+
+def _marker_scope(specs: list[DownstreamSpec], cwd: Path) -> str:
+    """`{peer: {marker: resolved nearest match, or None}}` as canonical JSON. The nearest
+    match is the first `<dir>/<marker>` that exists walking up from `cwd` to the root,
+    resolved through symlinks, so worktrees linking one index resolve alike. Prefixed so
+    it can never collide with a directory path in `router_snapshot_path`."""
+    def nearest(marker: str) -> str | None:
+        for d in (cwd, *cwd.parents):
+            candidate = d / marker
+            try:
+                if candidate.exists():
+                    return str(candidate.resolve())
+            except OSError:
+                continue
+        return None
+    doc = {s.name: {m: nearest(m) for m in s.snapshot_markers or ()} for s in specs}
+    return "markers:" + json.dumps(doc, sort_keys=True, separators=(",", ":"))
 
 
 def peers_fingerprint(specs: list[DownstreamSpec], cwd: str | None = None) -> str:
     """sha256 over every parsed `downstreams[]` entry — name, target, headers, env, cwd,
-    resolved policy path — plus the inherited launch directory (`snapshot_cwd`). Any edit
-    to the peers config changes it, and a snapshot written under a different fingerprint
-    is never served.
+    resolved policy path, snapshot markers — plus the snapshot scope (`snapshot_scope`,
+    passed as `cwd`). Any edit to the peers config changes it, and a snapshot written
+    under a different fingerprint is never served. An entry with no `snapshot_markers`
+    hashes exactly as it did before the field existed, so adding the field to the code
+    did not invalidate every saved snapshot.
 
     Policy CONTENTS and the terse version are deliberately not in it: the snapshot stores
     each peer's RAW replies and the router re-merges them live (`_stored_pb`), so the
     retrieve tool, the primer mode and `serverInfo.version` always come from the running
     process. Only the digest is written — `headers` and `env` can carry credentials."""
-    doc = json.dumps({"peers": [asdict(s) for s in specs], "cwd": cwd},
+    peers = [{k: v for k, v in asdict(s).items()
+              if not (k == "snapshot_markers" and v is None)} for s in specs]
+    doc = json.dumps({"peers": peers, "cwd": cwd},
                      sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(doc.encode("utf-8")).hexdigest()
 
@@ -444,6 +499,12 @@ class RouterSnapshot:
         names = set(out["initialize"])
         if any(set(per_peer) != names for per_peer in out.values()):
             return None
+        # A snapshot is rewritten only when its replies change, so an in-use one on a
+        # stable fleet would look abandoned to `_prune`. Being served counts as use.
+        try:
+            os.utime(self.path)
+        except OSError:
+            pass
         return out, protocol
 
     def save(self, parts: dict[str, dict[str, dict]], protocol: str) -> None:
@@ -460,6 +521,25 @@ class RouterSnapshot:
                 sys.stderr.write(f"[terse-multiproxy] could not write snapshot "
                                  f"{self.path} ({exc}); the next session's initialize "
                                  "will wait on every peer\n")
+            return
+        self._prune()
+
+    def _prune(self) -> None:
+        """Delete sibling snapshots neither saved nor served for `_SNAPSHOT_MAX_AGE`
+        (`load` touches the file it serves). Best-effort and silent:
+        a file another router is replacing right now is young, and a failed unlink only
+        leaves a stale file that no fingerprint will ever serve."""
+        cutoff = time.time() - _SNAPSHOT_MAX_AGE
+        try:
+            siblings = list(self.path.parent.glob("*.json"))
+        except OSError:
+            return
+        for f in siblings:
+            try:
+                if f != self.path and f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                continue
 
 
 @dataclass
@@ -577,7 +657,7 @@ class Router:
     def __init__(self, peers: list[Peer], out: TextIO, out_lock: Lock, *,
                  debug: bool = False, broadcast_timeout: float = BROADCAST_TIMEOUT,
                  primer_latch: PrimerLatch | None = None,
-                 on_session: Callable[[], None] | None = None,
+                 on_session: Callable[[str], None] | None = None,
                  snapshot: RouterSnapshot | None = None):
         self.peers = peers
         # Writes one `router_session` ledger row per client `initialize` (#212) -- the
@@ -1093,7 +1173,9 @@ class Router:
             self._write_peer(i, line)
         if kind == "initialize" and self.on_session is not None:
             try:
-                self.on_session()
+                # `on_done` is set only by `_fast_initialize`: the client was already
+                # answered from the snapshot, so this session started warm.
+                self.on_session("warm" if on_done is not None else "cold")
             except Exception as exc:  # noqa: BLE001 — a ledger sink is never load-bearing
                 if self.debug:
                     sys.stderr.write(f"[terse-multiproxy] session ledger: {exc}\n")
@@ -2098,7 +2180,7 @@ def run_multi_proxy(
         return 2
 
     out_lock = Lock()
-    launch_dir = snapshot_cwd(specs)
+    launch_dir = snapshot_scope(specs)
     router = Router(peers, cout, out_lock, debug=debug, broadcast_timeout=broadcast_timeout,
                     primer_latch=primer_latch,
                     on_session=(build_router_session_writer(stats_log, primer_label)

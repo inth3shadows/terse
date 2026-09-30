@@ -13,7 +13,9 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Peers can declare what their replies depend on, so new worktrees can start warm (#479).** The router answers `initialize` from the replies it saved last session (#270). Those saved replies were kept per launch directory whenever a peer inherits the router's directory, so the first session in every new directory, which is most sessions under per-session worktrees, still waited on the slowest peer. A peer entry in the peers file can now carry `snapshot_markers`, a list of relative paths. `[".codegraph"]` says the peer's replies depend on the directory only through the nearest `.codegraph` at or above it, resolved through symlinks. `[]` says they don't depend on the directory at all. When every peer without its own `cwd` declares markers, saved replies are shared by every directory that resolves the same markers. For example, all worktrees whose `.codegraph` links to one index share them, and all directories with no index share another set. Otherwise nothing changes, and a config without the field keeps using the files it already saved. Keying by git repository was tried first and rejected: 9 of the maintainer's repos mix worktrees with and without an index (Claude Code's own agent worktrees have none), so one key per repo served the wrong replies on every switch. A malformed `snapshot_markers`, or one on a `url` peer or a peer with its own `cwd`, is a config error. `install-mcp` keeps a peer's markers when it re-folds that peer. Saved files that have been neither served nor saved for 30 days are now deleted when a snapshot is saved. Each `router_session` ledger row now carries `snapshot: "warm"` or `"cold"`, which says whether that session was answered from saved replies. Older rows have no such field. `terse stats --json` is unchanged.
 
 ## [0.43.0] - 2026-09-27
 
