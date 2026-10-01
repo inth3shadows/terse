@@ -273,12 +273,15 @@ def test_make_workdir_repo_requires_pinned_commit():
 def test_load_tasks_reads_shipped_tasks_json():
     tasks = r.load_tasks(r.HERE / "tasks.json")
     ids = [t["id"] for t in tasks]
-    assert len(tasks) == 5
-    assert len(set(ids)) == 5  # unique ids
+    # The PRE-REGISTERED suite (2026-10-01, ~/.claude/plans/terse-cost-per-task-preregistered.md):
+    # 10 MCP tasks weighted to the live call mix + 1 non-MCP control. Changing it after the
+    # first scored run is a new pre-registration, so the mix is pinned here.
+    assert len(tasks) == 11
+    assert len(set(ids)) == 11  # unique ids
     categories = {t["category"] for t in tasks}
     assert categories == {"kb", "code", "control"}
-    assert sum(1 for t in tasks if t["category"] == "kb") == 2
-    assert sum(1 for t in tasks if t["category"] == "code") == 2
+    assert sum(1 for t in tasks if t["category"] == "kb") == 7
+    assert sum(1 for t in tasks if t["category"] == "code") == 3
     assert sum(1 for t in tasks if t["category"] == "control") == 1
     for t in tasks:
         assert t.get("why"), f"{t['id']} is missing its 'why' justification"
