@@ -206,5 +206,50 @@ def test_the_tokenizer_pass_is_bounded(monkeypatch):
     seen: list[int] = []
     import terse.proxy as proxy_mod
     monkeypatch.setattr(proxy_mod, "count_cl100k", lambda t: seen.append(len(t)) or 0)
-    over_limit("y" * 2_000_000, 1000)
+    assert over_limit("y" * 2_000_000, 1000)   # past the char cutoff: no tokenizer pass at all
+    assert seen == []
+    over_limit("y" * 40_000, 1000)             # under it: only a limit*8 prefix is tokenized
     assert seen == [8000]
+
+
+# --- #496: the cutoff is ~50,000 characters, not only 25k tokens ---
+
+_WORDS = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango", "uniform", "victor", "whiskey", "xray", "yankee", "zulu"]
+
+
+def _prose(n: int) -> str:
+    # cl100k, raw -> compressed: 200 rows 46,770 chars / 13,679 tok -> 43,628 / 12,299;
+    # 260 rows 60,852 / 17,784 -> 56,750 / 15,984. Prose tokenizes long (~3.5 chars per
+    # token), so these cross 50,000 chars while staying far under 25,000 tokens -- the shape
+    # of the Opus run's 57 KB `list_principles` result that Claude Code offloaded (#496).
+    return json.dumps({"result": [{"id": i, "note": " ".join(
+        _WORDS[(i * 7 + k) % 26] for k in range(i % 5 + 30)) + f" item {i}"}
+        for i in range(n)]})
+
+
+def test_a_result_over_fifty_thousand_chars_is_offloaded_under_the_token_limit():
+    # Measured on the operator's transcripts: largest MCP result shown inline 49,034 chars,
+    # smallest offloaded 51,246 ("Output too large (50KB)"), Claude Code 2.1.284-2.1.287.
+    assert over_limit(_prose(260), OFFLOAD_DEFAULT_TOKENS)        # 60,852 chars, ~17.8k tok
+    assert not over_limit(_prose(200), OFFLOAD_DEFAULT_TOKENS)    # 46,770 chars, ~13.7k tok
+
+
+@pytest.fixture
+def default_limits(monkeypatch):
+    # These tests run inside Claude Code sessions too, which may export its own limit.
+    monkeypatch.delenv("MAX_MCP_OUTPUT_TOKENS", raising=False)
+
+
+def test_the_primer_skips_a_result_over_fifty_thousand_chars_at_the_default_limits(
+        default_limits):
+    inter = Interceptor(POL)
+    inter.client_name = "claude-code"
+    big = _drive(inter, 1, _prose(260))                # 56,750 chars compressed
+    assert not _has_primer(big)
+    assert _has_primer(_drive(inter, 2, _prose(200)))  # 43,628 + the primer still fits
+
+
+def test_a_result_over_fifty_thousand_chars_is_tagged_out_at_the_default_limits(
+        tmp_path, default_limits):
+    (row,) = _ledger(tmp_path, "claude-code", _prose(260))
+    assert row["offload"] == "out"
