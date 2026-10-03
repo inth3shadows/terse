@@ -1,5 +1,5 @@
 {
-  "_comment": "PILOT task suite for the cost-per-successful-task harness. See ~/.claude/plans/terse-cost-per-task-e2e.md. Each task has an AUTOMATIC success check and a `why` field recording how the expected answer was verified (and when). Mix: 2 kb read-only lookups (kb.read.* only, never kb.propose.*), 2 codegraph/runecho code questions about this repo, 1 non-MCP control (a file edit a test verifies). `tools` gives the exact --allowedTools list per arm (A/B/C) -- kb/codegraph/runecho tool names for arm C are DERIVED from src/terse/multiproxy.py's Router._expose_names rule (a bare name claimed by exactly one peer is exposed VERBATIM through the router; only a name two-or-more peers export gets qualified as '{peer}__{bare}') and cross-checked against this session's own live MCP tool list (which is itself routed through the 'terse' router), but per plan blocker #5 they are marked NEEDS-SMOKE-CONFIRM below and must be verified live in the 3-session smoke run before the full batch.",
+  "_comment": "PRE-REGISTERED task suite (2026-10-01) for the cost-per-successful-task harness; supersedes the 2026-09-26 pilot suite, whose 5 tasks are kept byte-identical as the first five entries. See ~/.claude/plans/terse-cost-per-task-preregistered.md and terse-cost-per-task-e2e.md. Each task has an AUTOMATIC success check and a `why` recording how the expected answer was verified (and when). Mix: 7 kb read-only lookups (kb.read.* only, never kb.propose.*), 3 codegraph/runecho code questions about this repo at the pinned commit, 1 non-MCP control. `tools` gives the exact --allowedTools list per arm (A/B/C); arm C's names follow src/terse/multiproxy.py's Router._expose_names rule and are marked NEEDS-SMOKE-CONFIRM until the smoke run confirms them live.",
   "pinned_worktree_commit": "c9508a9c68f729322d1b9f45dd968754a1b4571f",
   "pinned_worktree_commit_note": "origin/main HEAD as of 2026-09-25, before this harness existed (the harness's own files are untracked/uncommitted on this branch) -- 'repo' workdir tasks MUST create their git worktree from this fixed SHA, never from whatever HEAD happens to be at run time, so tasks.json (the answer key) can never end up inside a worktree a coding agent can Read even after this harness itself is eventually committed.",
   "tasks": [
@@ -99,6 +99,119 @@
         "C": ["Read(./**)", "Edit(./calc.py)", "Bash(pytest:*)"]
       },
       "why": "calc.py ships with `return a - b` (subtraction); test_calc.py asserts add(2, 3) == 5, which only a real fix to addition satisfies -- deterministic, no MCP tool involved (this is the non-MCP control, expected delta ~0). protect_file_sha256 is sha256('from calc import add\\n\\n\\ndef test_add():\\n    assert add(2, 3) == 5\\n'), computed 2026-09-26, so the checker refuses a run that 'fixes' the test instead of the bug even if the doctored test then happens to pass."
+    },
+    {
+      "id": "kb_search_decision_id",
+      "category": "kb",
+      "workdir": "scratch",
+      "timeout": 300,
+      "prompt": "Use the kb read-only tools (kb.read.search or kb.read.get -- never any kb.propose.* tool) to find the KB decision that says to run `codegraph init` with a pre-created index directory for repos on a bare-worktree layout. Reply with ONLY that decision's numeric id and nothing else -- no punctuation, no '#', no parentheses, no explanation.",
+      "check": {
+        "type": "exact_match",
+        "expected": "368"
+      },
+      "tools": {
+        "A": [],
+        "B": ["mcp__kb__kb_read_search", "mcp__kb__kb_read_get"],
+        "C": ["mcp__terse__kb_read_search", "mcp__terse__kb_read_get", "mcp__terse__terse_retrieve"]
+      },
+      "tools_note": "NEEDS-SMOKE-CONFIRM: arm C tool names follow the pilot kb tasks' derivation (router exposes kb's tools bare); confirm in the smoke run.",
+      "why": "kb.read.get(decisions, 368) returned title 'Use `codegraph init` with a pre-created index dir for bare-worktree repos', decided_on 2026-08-06; kb.read.search('terse router snapshot keying worktree') ranked it in the top 5. Verified live 2026-10-01."
+    },
+    {
+      "id": "kb_search_service_ip",
+      "category": "kb",
+      "workdir": "scratch",
+      "timeout": 300,
+      "prompt": "Use the kb read-only tools (kb.read.search or kb.read.get -- never any kb.propose.* tool) to find the homelab node that runs the Navidrome music server. Reply with ONLY that node's IP address and nothing else -- no punctuation, no '#', no parentheses, no explanation.",
+      "check": {
+        "type": "exact_match",
+        "expected": "192.168.9.48"
+      },
+      "tools": {
+        "A": [],
+        "B": ["mcp__kb__kb_read_search", "mcp__kb__kb_read_get"],
+        "C": ["mcp__terse__kb_read_search", "mcp__terse__kb_read_get", "mcp__terse__terse_retrieve"]
+      },
+      "tools_note": "NEEDS-SMOKE-CONFIRM: arm C tool names follow the pilot kb tasks' derivation (router exposes kb's tools bare); confirm in the smoke run.",
+      "why": "kb.read.list_nodes: node 41 'navidrome', ip 192.168.9.48, services ['Navidrome'], LXC 103 on nuc3. Verified live 2026-10-01."
+    },
+    {
+      "id": "kb_get_principle_evidence",
+      "category": "kb",
+      "workdir": "scratch",
+      "timeout": 300,
+      "prompt": "Use the kb read-only tool kb.read.get with target_table='principles' and identifier='203' (never any kb.propose.* tool). Its evidence names one Python test file that was created. Reply with ONLY that file's basename (for example name.py) and nothing else -- no punctuation, no '#', no parentheses, no explanation.",
+      "check": {
+        "type": "exact_match",
+        "expected": "test_ship_policy_constants.py"
+      },
+      "tools": {
+        "A": [],
+        "B": ["mcp__kb__kb_read_get"],
+        "C": ["mcp__terse__kb_read_get", "mcp__terse__terse_retrieve"]
+      },
+      "tools_note": "NEEDS-SMOKE-CONFIRM: arm C tool names follow the pilot kb tasks' derivation (router exposes kb's tools bare); confirm in the smoke run.",
+      "why": "kb.read.list_principles(category='testing-verification'): principle 203 'Pin critical constants in separate test files with boundary cases', evidence 'Created tests/test_ship_policy_constants.py ...'. Verified live 2026-10-01."
+    },
+    {
+      "id": "kb_list_nodes_role_ip",
+      "category": "kb",
+      "workdir": "scratch",
+      "timeout": 300,
+      "prompt": "Use the kb read-only tool kb.read.list_nodes (never any kb.propose.* tool) to find the homelab node whose role is the Uptime Kuma status / uptime monitor. Reply with ONLY that node's IP address and nothing else -- no punctuation, no '#', no parentheses, no explanation.",
+      "check": {
+        "type": "exact_match",
+        "expected": "192.168.9.55"
+      },
+      "tools": {
+        "A": [],
+        "B": ["mcp__kb__kb_read_list_nodes"],
+        "C": ["mcp__terse__kb_read_list_nodes", "mcp__terse__terse_retrieve"]
+      },
+      "tools_note": "NEEDS-SMOKE-CONFIRM: arm C tool names follow the pilot kb tasks' derivation (router exposes kb's tools bare); confirm in the smoke run.",
+      "why": "kb.read.list_nodes (default, active): node 32 'uptime-kuma', ip 192.168.9.55, role 'Uptime Kuma status / uptime monitor'. 47 nodes returned -- a large result, deliberately. Verified live 2026-10-01."
+    },
+    {
+      "id": "kb_list_principles_negative_test_id",
+      "category": "kb",
+      "workdir": "scratch",
+      "timeout": 300,
+      "prompt": "Use the kb read-only tool kb.read.list_principles (never any kb.propose.* tool; its categories include testing-verification) to find the principle saying a gate that guards behavior must be negative-tested -- asserting it goes FALSE when the guarded capability is absent. Reply with ONLY that principle's numeric id and nothing else -- no punctuation, no '#', no parentheses, no explanation.",
+      "check": {
+        "type": "exact_match",
+        "expected": "184"
+      },
+      "tools": {
+        "A": [],
+        "B": ["mcp__kb__kb_read_list_principles"],
+        "C": ["mcp__terse__kb_read_list_principles", "mcp__terse__terse_retrieve"]
+      },
+      "tools_note": "NEEDS-SMOKE-CONFIRM: arm C tool names follow the pilot kb tasks' derivation (router exposes kb's tools bare); confirm in the smoke run.",
+      "why": "kb.read.get(principles, 184): category testing-verification, principle 'A gate that guards behavior must be negative-tested: assert it goes FALSE when the guarded capability is absent ...'. Chosen over principle 123 after the pre-run review: list_principles clips at limit 40 sorted by (category, principle), testing-verification has more than 40 rows, and 184's text ('A gate ...') sorts near the top of its category, so additions during the run cannot push it past the default page. Verified live 2026-10-01."
+    },
+    {
+      "id": "code_multiproxy_config_loader",
+      "category": "code",
+      "workdir": "repo",
+      "timeout": 300,
+      "prompt": "In this repository, src/terse/multiproxy.py defines a module-level function that parses and validates the router's `--config` JSON file (the one listing its `downstreams`). Reply with ONLY that function's NAME and nothing else -- no punctuation, no '#', no parentheses, no explanation.",
+      "check": {
+        "type": "exact_match",
+        "expected": "load_multi_config"
+      },
+      "tools": {
+        "A": ["Read(./**)", "Grep", "Glob"],
+        "B": ["Read(./**)", "Grep", "Glob", "mcp__codegraph__codegraph_explore", "mcp__runecho__locate", "mcp__runecho__structure"],
+        "C": ["Read(./**)", "Grep", "Glob", "mcp__terse__codegraph_explore", "mcp__terse__locate", "mcp__terse__structure", "mcp__terse__terse_retrieve"]
+      },
+      "tools_note": "NEEDS-SMOKE-CONFIRM: same derivation as the pilot code tasks.",
+      "why": "`git show c9508a9:src/terse/multiproxy.py` line 178: `def load_multi_config(path: str) -> list[DownstreamSpec]:` with docstring 'Parse + validate a `--config` JSON file'. Repo-internal name, not guessable from training data. Verified 2026-10-01."
     }
-  ]
+  ],
+  "preregistration": {
+    "date": "2026-10-01",
+    "plan": "~/.claude/plans/terse-cost-per-task-preregistered.md",
+    "note": "The 11 tasks in `tasks` are the PRE-REGISTERED suite for the terse (C) vs plain (B) run: 10 MCP tasks + 1 control. Changing any task, answer or check after the first scored run makes it a new pre-registration."
+  }
 }
