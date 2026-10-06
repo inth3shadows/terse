@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.44.1] - 2026-09-30
+
 ### Fixed
 
 - **A result Claude Code offloads to a file no longer carries the primer or counts as a context saving.** Claude Code saves an MCP result over its limit (25,000 tokens by default, `MAX_MCP_OUTPUT_TOKENS` to change it) to a file and gives the model only the path. The lazy primer attaches to the first compressed result of a session, so when that result was over the limit the primer went into the file and the model might never see it, while every later result went out compressed and unexplained. The primer now skips a result that would be offloaded, with the primer counted in, and attaches to the next one that fits. This applies to both the text block and the #463 typed wrapper, and a router's shared latch is not spent. The ledger tags each row of an affected result: `offload: "out"` when the client offloaded terse's output, `"raw"` when terse kept inline a result whose raw form would have been offloaded. On the context basis (#420) both save nothing: `"out"` counts as zero on both sides, and `"raw"` counts terse's inline copy as paid on both sides. Scoring `"raw"` against the raw path's short file pointer would claim that the model never reads the file, which nobody can know. Only a client whose `clientInfo.name` is `claude-code` is treated as offloading, and a result's size is counted in cl100k over what the client reads (the typed field when there is one, otherwise the text blocks). Older rows have no tag and read as before. On the live ledger, about 20% of the reported saving was in these results: 48 results over the limit even after terse (382,799 tokens) and 17 that terse brought under it (298,248 tokens). `terse stats --json` keeps its shape.
