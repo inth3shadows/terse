@@ -211,6 +211,12 @@ TERSE_PRIMER = (PRIMER_HEAD + PRIMER_TABLE + PRIMER_DICT + PRIMER_EMBEDDED + PRI
 # `clientInfo.name` like `STRUCTURED_SAFE_CLIENTS`; any other client is assumed to inline.
 OFFLOAD_CLIENTS = frozenset({"claude-code"})
 OFFLOAD_DEFAULT_TOKENS = 25_000
+# ...and, independently of the token limit, a result whose text is over this many
+# characters (#496). Measured on the operator's transcripts, Claude Code 2.1.282-2.1.287:
+# largest MCP result shown inline 49,034 chars, smallest offloaded 51,246 ("Output too
+# large (50KB)"). A 57 KB result of ~15k cl100k tokens was offloaded, so the token limit
+# alone let the primer ride into the file and fill the model's preview of it.
+OFFLOAD_DEFAULT_CHARS = 50_000
 
 
 def offload_limit(client_name: str | None, environ: Any = None) -> int | None:
@@ -233,7 +239,11 @@ def offload_limit(client_name: str | None, environ: Any = None) -> int | None:
 
 
 def over_limit(text: str, limit: int | None) -> bool:
-    """Would `text` exceed `limit` tokens? Bounded and fail-open, because it runs inside
+    """Would the connected client offload `text`? `limit` is its token limit
+    (`offload_limit`); None means a client that never offloads. Over
+    `OFFLOAD_DEFAULT_CHARS` characters is offloaded whatever its token count (#496), decided
+    before any tokenizer pass. Otherwise: would `text` exceed `limit` tokens? Bounded and
+    fail-open, because it runs inside
     `transform_response` (under `_local_lock` while a primer is owed) as well as in the
     deferred ledger sink.
 
@@ -242,11 +252,16 @@ def over_limit(text: str, limit: int | None) -> bool:
     - Only the first `limit * 8` characters are tokenized. A prefix that is already over
       decides it; a text that is still under after that averages more than 8 bytes per
       token, far above cl100k's ~4 on JSON and prose, and is read as inline. Tokenizing
-      a 2.4 MB payload whole measured 558 ms; this caps the work near 200 KB at 25k.
+      a 2.4 MB payload whole measured 558 ms; with the char cutoff first, no pass ever
+      sees more than `OFFLOAD_DEFAULT_CHARS` characters.
     - A tokenizer that raises (tiktoken refuses `<|endoftext|>` in input) or is missing
       answers False: inline, exactly the behaviour before this check existed. An
       exception here would otherwise kill the proxy's reader thread."""
-    if limit is None or len(text.encode("utf-8")) <= limit:
+    if limit is None:
+        return False
+    if len(text) > OFFLOAD_DEFAULT_CHARS:
+        return True
+    if len(text.encode("utf-8")) <= limit:
         return False
     try:
         n = count_cl100k(text[: limit * 8])
