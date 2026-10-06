@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.44.2] - 2026-10-06
+
 ### Fixed
 
 - **A result over 50,000 characters is treated as offloaded, whatever its token count (#496).** 0.44.1 withheld the primer from a result Claude Code saves to a file only when the result was over 25,000 tokens. Claude Code also offloads by length. On the maintainer's transcripts (Claude Code 2.1.282 to 2.1.287) the largest MCP result shown inline was 49,034 characters and the smallest offloaded one was 51,246 ("Output too large (50KB)"). So a result of about 13,000 to 25,000 tokens was offloaded with the primer still attached. The model sees an offloaded result as a short preview of its start, and the primer filled that preview. In the pre-registered Opus 5.5 run, the answer was pushed out of view on a 57 KB list result: Opus searched the file two or three more times and that task cost 88% more through terse. Now a result whose text is over 50,000 characters counts as offloaded for both the primer and the ledger's `offload` tag. This check runs before any tokenizing, so long results are also cheaper to check. The token limit still applies as before.
