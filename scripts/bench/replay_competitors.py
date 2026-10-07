@@ -230,13 +230,13 @@ def encoder_tokens(raw_tokens: int, obj, ledger_raw: int, shown_tokens: int,
         codec = raw_tokens
     sizes = {"terse_shipped": raw_tokens - (ledger_raw - shown_tokens), "terse_codec": codec}
     if toon and toon.get("lossless") and "toon" in toon:
-        sizes["toon"] = count_cl100k(toon["toon"])
+        sizes["toon"] = rs.shown_tokens(toon["toon"])
     else:
         sizes["toon"] = raw_tokens
         flags["toon_passthrough"] = True
     if hr and "error" not in hr:
         for mode in ("default", "agent", "verified"):
-            sizes[f"headroom_{mode}"] = count_cl100k(hr[mode])
+            sizes[f"headroom_{mode}"] = rs.shown_tokens(hr[mode])
         flags["headroom_dropped"] = bool(hr["dropped"])
     else:
         for mode in ("default", "agent", "verified"):
@@ -379,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
         if raw_text is None:
             leave_out("not_rebuilt", it)
             continue
-        raw_tokens = count_cl100k(raw_text)
+        raw_tokens = rs.shown_tokens(raw_text)
         if not verified(raw_tokens, it["ledger_raw"]):
             leave_out("size_differs", it)
             continue

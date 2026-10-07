@@ -76,7 +76,8 @@ def _load(name: str, path: Path):
 ab_session = _load("ab_session", HERE / "ab_session.py")
 cost_model = _load("cost_model", HERE / "cost_per_task" / "cost_model.py")
 
-from terse.tokenize import count_cl100k  # noqa: E402 -- after the sys.path setup
+from terse import tokenize  # noqa: E402 -- after the sys.path setup
+from terse.tokenize import count_cl100k  # noqa: E402
 
 # Claude Code saves an MCP result to a file past either limit (code.claude.com/docs/en/mcp;
 # the 50,000-char one measured in #496). The model then sees only a short preview.
@@ -289,6 +290,8 @@ class Result:
     tokens: int | None
     offloaded: bool
     args: str
+    # The shown text itself, only when the scan was asked to keep it.
+    text: str | None = None
 
 
 def _usage_call(usage: dict, model: str | None) -> Call:
@@ -303,6 +306,16 @@ def _usage_call(usage: dict, model: str | None) -> Call:
     return Call(model, usage.get("input_tokens", 0) or 0,
                 usage.get("cache_read_input_tokens", 0) or 0, w5, w1,
                 usage.get("output_tokens", 0) or 0)
+
+
+def shown_tokens(text: str) -> int | None:
+    """cl100k size of a shown result. tiktoken refuses text that spells one of its special
+    tokens (`<|endoftext|>` in a log or a diff); a tool result is plain text, so count it
+    as such."""
+    try:
+        return count_cl100k(text)
+    except ValueError:
+        return len(tokenize._enc(tokenize.CL100K).encode(text, disallowed_special=()))
 
 
 def is_offload_notice(text: str) -> bool:
@@ -320,14 +333,21 @@ def _result_text(content) -> str:
     return ""
 
 
-def scan_transcript(path: Path, billed_elsewhere: set[tuple] | None = None) -> list[tuple]:
+def scan_transcript(path: Path, billed_elsewhere: set[tuple] | None = None,
+                    want=None, keep_text: bool = False) -> list[tuple]:
     """The transcript as an ordered event list: ("call", Call), ("result", Result),
     ("compact",). A response split over several records is one call (the dedup key is
     cost_model's); a synthetic all-zero usage record is not a call.
 
     `billed_elsewhere` is the set of responses earlier transcripts already recorded, and
     is added to. A response found there keeps its place in the order, so later calls
-    still compare against the right prompt size, but is marked unbilled."""
+    still compare against the right prompt size, but is marked unbilled.
+
+    `want` picks the tools whose results are recorded, by name (default: MCP tools);
+    `keep_text` keeps each recorded result's text on its `Result`."""
+    if want is None:
+        def want(name: str) -> bool:
+            return name.startswith("mcp__")
     events: list[tuple] = []
     seen: set[tuple] = set()
     if billed_elsewhere is None:
@@ -353,7 +373,7 @@ def scan_transcript(path: Path, billed_elsewhere: set[tuple] | None = None) -> l
                 if isinstance(content, list):
                     for block in content:
                         if (isinstance(block, dict) and block.get("type") == "tool_use"
-                                and str(block.get("name", "")).startswith("mcp__")):
+                                and want(str(block.get("name", "")))):
                             uses[block.get("id")] = (
                                 block["name"],
                                 json.dumps(block.get("input"), sort_keys=True))
@@ -377,8 +397,8 @@ def scan_transcript(path: Path, billed_elsewhere: set[tuple] | None = None) -> l
                     text = _result_text(block.get("content"))
                     events.append(("result", Result(
                         block["tool_use_id"], use[0], parse_ts(rec["timestamp"]),
-                        len(text), count_cl100k(text),
-                        is_offload_notice(text), use[1])))
+                        len(text), shown_tokens(text),
+                        is_offload_notice(text), use[1], text if keep_text else None)))
     return events
 
 
