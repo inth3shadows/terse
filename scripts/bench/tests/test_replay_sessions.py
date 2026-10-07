@@ -213,6 +213,18 @@ def test_classify_reads_the_typed_field_when_that_is_what_was_shown(tmp_path):
     assert rs.classify(result(chars=2000, tokens=500), led) == ("priced", 500, 0)
 
 
+def test_classify_reads_the_typed_field_when_both_forms_were_emitted_the_same_size(tmp_path):
+    # The shown size fits either form. The client shows the typed field, so raw is the
+    # typed field's 2,000 tokens, not the text blocks' 2,500.
+    led = rs.load_ledger(ledger_file(tmp_path, [row(
+        100, raw=4500, out=1600, raw_chars=18000, out_chars=6000,
+        structured_chars=8000, structured_out_chars=3000,
+        structured_tokens=2000, structured_out_tokens=800)]))[0]
+    assert rs.classify(result(chars=3010, tokens=800), led) == ("priced", 1200, 0)
+    # A primer on top leaves it a tie.
+    assert rs.classify(result(chars=3400, tokens=900), led) == ("priced", 1100, 0)
+
+
 def test_classify_claims_nothing_for_offloaded_results(tmp_path):
     big = rs.load_ledger(ledger_file(tmp_path, [row(100, raw=30000, out=26000)]))[0]
     assert rs.classify(result(offloaded=True, tokens=500), big) == ("offloaded", 0, 0)
@@ -283,6 +295,20 @@ def test_replay_prices_a_result_until_the_compaction_boundary(tmp_path):
     assert item["weighted"] == pytest.approx(400 * (2.0 + 0.05))
     assert out["net_weighted"] == pytest.approx(item["weighted"])
     assert out["calls"] == 4 and out["model"] == OPUS
+    # With terse off the same two calls would have carried all 1,000 raw tokens.
+    assert item["raw_weighted"] == pytest.approx(1000 * (2.0 + 0.05))
+
+
+def test_replay_gives_no_raw_path_cost_to_a_result_either_path_kept_out_of_context(tmp_path):
+    big, tipped = rs.load_ledger(ledger_file(tmp_path, [
+        row(100, raw=30000, out=9000), row(200, raw=12000, out=11900)]))
+    events = [("call", call(w1=100)), ("result", result("a", tokens=9000)),
+              ("result", result("b", tokens=500, offloaded=True)),
+              ("result", result("c", tokens=500, offloaded=True)),
+              ("call", call(read=100, w1=9100))]
+    items = rs.replay(events, {"a": big, "b": big, "c": tipped})["items"]
+    assert [it["status"] for it in items] == ["kept_inline", "offloaded", "offload_only_out"]
+    assert [it["raw_weighted"] for it in items] == [0.0, 0.0, 0.0]
 
 
 def test_replay_prices_nothing_when_compaction_follows_the_result_at_once(tmp_path):
@@ -303,6 +329,8 @@ def test_replay_scales_the_delta_by_the_models_tokenizer_ratio(tmp_path):
     assert scaled["weighted"] == pytest.approx(600 * 2.0)
     assert other["weighted"] == pytest.approx(800 * 2.0)
     assert plain["delta_tokens"] == scaled["delta_tokens"] == 400   # cl100k kept as is
+    assert plain["raw_weighted"] == pytest.approx(1000 * 2.0)
+    assert scaled["raw_weighted"] == pytest.approx(1500 * 2.0)
 
 
 def test_replay_leaves_copied_history_out_of_the_session_total():
@@ -320,6 +348,7 @@ def test_a_copied_result_keeps_its_weight_but_is_counted_once(tmp_path):
     rows = [rs.replay(ev, {"a": led}) for ev in (original, resumed)]
     assert [r["items"][0]["copy"] for r in rows] == [False, True]
     assert rows[1]["items"][0]["weighted"] == pytest.approx(400 * 0.05)
+    assert rows[1]["items"][0]["raw_weighted"] == pytest.approx(1000 * 0.05)
     counts = {"ledger_results": 1, "joined": 1, "size_mismatch": 0, "no_transcript": 0,
               "groups_split": 0, "changed_results": 1, "changed_joined": 1,
               "saved_tokens_joined_pct": 100.0, "mismatch_offsets": {}}
@@ -340,8 +369,9 @@ def test_summarize_reports_unpriced_weight_and_the_untouched_check():
     item = {"tool": "t", "status": "priced", "delta_tokens": 400, "kept_inline_tokens": 0,
             "carried_calls": 2, "weighted": 800.0, "usd": None, "model": "claude-x",
             "changed": True, "recall_3": False, "shown_tokens": 600, "kept_inline_weighted": 0,
-            "copy": False}
-    same = dict(item, delta_tokens=3, weighted=6.0, usd=0.00002, changed=False, model=OPUS)
+            "copy": False, "raw_weighted": 2000.0}
+    same = dict(item, delta_tokens=3, weighted=6.0, usd=0.00002, changed=False, model=OPUS,
+                raw_weighted=1206.0)
     session = {"calls": 3, "model": OPUS, "session_weighted": 10000.0, "net_weighted": 806.0,
                "items": [item, same]}
     counts = {"ledger_results": 2, "joined": 2, "size_mismatch": 0, "no_transcript": 0,
@@ -351,8 +381,14 @@ def test_summarize_reports_unpriced_weight_and_the_untouched_check():
     assert got["weighted_without_usd_price"] == 800.0 and got["items_without_usd_price"] == 1
     assert got["untouched_check"] == {"results": 1, "delta_tokens": 3, "shown_tokens": 600}
     assert got["join"]["rate_pct"] == 100.0
+    # 806 saved of the 3,206 the two results would have cost, and of the 10,000 billed.
+    assert got["mcp_raw_weighted"] == 3206.0
+    assert got["net_share_of_mcp_results_pct"] == 25.14
+    assert got["net_share_of_all_sessions_pct"] == 8.06
+    assert got["by_tool"]["t"]["raw_weighted"] == 3206.0
     text = rs.render(got)
     assert "NOT in the usd figure" in text and "expect ~0" in text
+    assert "would have cost: 25.14% of 3,206" in text
 
 
 def test_scan_transcript_marks_a_response_seen_in_an_earlier_file_unbilled(tmp_path):
