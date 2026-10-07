@@ -27,6 +27,9 @@ Method
    and model.
 4. Charge a `terse_retrieve` round trip its result tokens (same carry) plus the cached
    prefix its extra API call re-read.
+5. Report the net twice: against what the results terse handled would have cost with
+   terse off (what an MCP proxy can reach), and against the whole bill of every session
+   scanned (mostly shell output, file reads and model output, which it cannot).
 
 What it cannot show: whether the model would have made the same calls with terse off. The
 replay assumes it would. `recall_3` (an identical-argument call of the same tool within
@@ -558,8 +561,13 @@ def classify(res: Result, led: LedgerResult) -> tuple[str, int, int]:
     """
     if not led.has_tokens or res.tokens is None:
         return "no_tokens", 0, 0
+    # <=: terse often emits the text blocks and the typed field at the same size, and the
+    # shown size then cannot tell them apart. The client shows the typed field when a
+    # result has one (untouched `secret.list_credentials` results in the transcripts are
+    # `structured_chars` long to the character), and the raw text blocks are the larger
+    # side, so a tie read as text overstated the saving.
     typed = (led.typed_out_chars > 0
-             and abs(res.chars - led.typed_out_chars) < abs(res.chars - led.text_out_chars))
+             and abs(res.chars - led.typed_out_chars) <= abs(res.chars - led.text_out_chars))
     raw_tokens, raw_chars = led.raw_side(typed)
     raw_offloads = raw_tokens > OFFLOAD_TOKENS or raw_chars > OFFLOAD_CHARS
     if res.offloaded:
@@ -638,6 +646,10 @@ def replay(events: list[tuple], joined: dict[str, LedgerResult],
         scale = ratio.get(model, ratio.get(None, 1.0))
         weighted = delta * scale * per_w
         usd = None if per_usd is None else delta * scale * per_usd
+        # What this result would have cost in context with terse off: the denominator
+        # for "share of what an MCP result costs". Nothing for a result the raw path
+        # would have saved to a file, and nothing for a retrieve, which it never makes.
+        raw_weighted = (delta + res.tokens) * scale * per_w if status == "priced" else 0.0
         if is_retrieve and start < len(calls) and calls[start].billed:
             # The round trip is an API call the raw path never makes: it re-read the
             # whole cached prefix once.
@@ -660,6 +672,7 @@ def replay(events: list[tuple], joined: dict[str, LedgerResult],
             # carrying it; the result itself is counted where it was first billed.
             "copy": start < len(calls) and not calls[start].billed,
             "kept_inline_weighted": round(inline * scale * per_w, 2),
+            "raw_weighted": round(raw_weighted, 2),
         })
         net_weighted += weighted
         net_usd = None if (net_usd is None or usd is None) else net_usd + usd
@@ -729,17 +742,19 @@ def summarize(sessions: list[dict], join_counts: dict,
         for row in rows:
             slot = acc.setdefault(key(row), {
                 "results": 0, "delta_tokens": 0, "weighted": 0.0, "usd": 0.0,
-                "usd_missing": 0})
+                "usd_missing": 0, "raw_weighted": 0.0})
             if not row["copy"]:
                 slot["results"] += 1
                 slot["delta_tokens"] += row["delta_tokens"]
             slot["weighted"] += row["weighted"]
+            slot["raw_weighted"] += row["raw_weighted"]
             if row["usd"] is None:
                 slot["usd_missing"] += 1
             else:
                 slot["usd"] += row["usd"]
         for slot in acc.values():
             slot["weighted"] = round(slot["weighted"], 1)
+            slot["raw_weighted"] = round(slot["raw_weighted"], 1)
             slot["usd"] = round(slot["usd"], 4)
         return acc
 
@@ -767,6 +782,7 @@ def summarize(sessions: list[dict], join_counts: dict,
     plain = [it for it in items if it["status"] != "retrieve" and not it["copy"]]
     all_weighted = sum(s["session_weighted"] for s in sessions)
     net = sum(s["net_weighted"] for s in sessions)
+    mcp_raw = sum(it["raw_weighted"] for it in items)
     unpriced = sum(it["weighted"] for it in items if it["usd"] is None)
     # terse left these alone, so raw and shown should be the same size. A sum far from
     # zero means the two sides are not being measured alike.
@@ -791,6 +807,12 @@ def summarize(sessions: list[dict], join_counts: dict,
         "ratios_applied": {str(k): round(v, 3) for k, v in tokenizer_ratios(calib).items()},
         "all_sessions_weighted": round(all_weighted, 1),
         "net_share_of_all_sessions_pct": round(100 * net / all_weighted, 4) if all_weighted else None,
+        # The same net against what terse could reach: the cost the joined, priced
+        # results (changed or not) would have had with terse off. Retrieves are in the
+        # net. A result that did not join is in neither side; an untouched one would
+        # only have added to the denominator, so read this beside the join rate.
+        "mcp_raw_weighted": round(mcp_raw, 1),
+        "net_share_of_mcp_results_pct": round(100 * net / mcp_raw, 2) if mcp_raw else None,
         "touched_sessions_weighted": round(sum(s["session_weighted"] for s in touched), 1),
         "kept_inline_pessimistic_weighted": round(sum(it["kept_inline_weighted"] for it in items), 1),
         "by_status": fold(items, lambda r: r["status"]),
@@ -827,6 +849,11 @@ def render(summary: dict) -> str:
     u = summary["untouched_check"]
     lines.append(f"check: {u['results']} results terse left alone sum to a delta of "
                  f"{u['delta_tokens']:,} tokens against {u['shown_tokens']:,} shown (expect ~0)")
+    if summary["mcp_raw_weighted"]:
+        lines.append(f"share of what the joined, priced MCP results would have cost: "
+                     f"{summary['net_share_of_mcp_results_pct']}% of "
+                     f"{summary['mcp_raw_weighted']:,.0f} (results that did not join, or "
+                     f"that either path saved to a file, are in neither side)")
     lines.append(f"share of all scanned sessions' billed cost: "
                  f"{summary['net_share_of_all_sessions_pct']}%")
     lines.append(f"pessimistic bound for results kept inline: "
@@ -834,15 +861,19 @@ def render(summary: dict) -> str:
 
     def table(title, rows, order=None):
         lines.append("")
-        lines.append(f"{title:<34}{'results':>9}{'delta tok':>13}{'weighted':>15}{'usd':>11}")
+        lines.append(f"{title:<34}{'results':>9}{'delta tok':>13}{'weighted':>15}{'usd':>11}"
+                     f"{'raw path':>15}{'saved':>8}")
         keys = order or sorted(rows, key=lambda k: -rows[k]["weighted"])
         for key in keys:
             if key not in rows:
                 continue
             r = rows[key]
             usd = f"{r['usd']:,.2f}" + ("*" if r["usd_missing"] else "")
+            share = (f"{100 * r['weighted'] / r['raw_weighted']:.1f}%"
+                     if r["raw_weighted"] else "-")
             lines.append(f"{str(key)[:33]:<34}{r['results']:>9}{r['delta_tokens']:>13,}"
-                         f"{r['weighted']:>15,.0f}{usd:>11}")
+                         f"{r['weighted']:>15,.0f}{usd:>11}{r['raw_weighted']:>15,.0f}"
+                         f"{share:>8}")
 
     table("by status", summary["by_status"])
     table("by model", summary["by_model"])
