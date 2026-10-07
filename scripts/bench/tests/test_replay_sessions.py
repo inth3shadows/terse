@@ -463,6 +463,16 @@ def test_scan_transcript_dedups_split_responses_and_reads_mcp_results(tmp_path):
     assert (call0.read, call0.w1, call0.w5, call0.inp) == (900, 100, 0, 2)
     assert (res.tool_use_id, res.chars, res.offloaded) == ("tu1", 5, False)
     assert res.args == '{"a": 1}' and res.ts == rs.parse_ts("2026-10-01T00:00:01.500Z")
+    assert res.text is None
+    # Asked for another tool, with the text kept.
+    shell = [e[1] for e in rs.scan_transcript(path, want=lambda n: n == "Bash", keep_text=True)
+             if e[0] == "result"]
+    assert [(r.tool_use_id, r.name, r.text) for r in shell] == [("tu2", "Bash", "not an mcp tool")]
+
+
+def test_shown_tokens_counts_text_that_spells_a_special_token():
+    assert rs.shown_tokens("plain words") == rs.count_cl100k("plain words")
+    assert rs.shown_tokens("log tail: <|endoftext|> done") > 5
 
 
 def test_scan_transcript_marks_a_persisted_preview_as_offloaded(tmp_path):
