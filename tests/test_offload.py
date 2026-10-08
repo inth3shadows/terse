@@ -14,6 +14,7 @@ import pytest
 
 from terse.policy import Policy, Rule
 from terse.proxy import (
+    OFFLOAD_DEFAULT_CHARS,
     OFFLOAD_DEFAULT_TOKENS,
     PRIMER_HEAD,
     Interceptor,
@@ -205,6 +206,14 @@ def test_a_tokenizer_that_raises_never_breaks_forwarding(small_limit, monkeypatc
         "content": [{"type": "text", "text": _rows(12)},
                     {"type": "text", "text": "log tail: <|endoftext|> " + "x" * 30_000}]}}))
     assert json.loads(line)["result"]["content"]
+
+
+def test_an_over_limit_text_spelling_a_special_token_is_seen_as_over_limit():
+    # The tokenizer used to raise on this text, which the guard reads as inline: the
+    # primer was then attached to a result the client was about to save to a file.
+    text = "<|endoftext|> " + "word " * 4000
+    assert len(text) <= OFFLOAD_DEFAULT_CHARS      # decided by the token count, not the size
+    assert over_limit(text, LIMIT)
 
 
 def test_a_result_spelling_a_special_token_is_still_compressed():
