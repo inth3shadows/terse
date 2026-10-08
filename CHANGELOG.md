@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.44.3] - 2026-10-08
+
 ### Fixed
 
 - A result containing text that spells a tokenizer special token (`<|endoftext|>` in a log,
