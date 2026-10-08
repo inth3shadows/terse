@@ -185,7 +185,37 @@ def test_measure_skips_and_never_runs_what_is_not_plain_and_read_only(tmp_path, 
     calls = []
     monkeypatch.setattr(rk, "run_isolated", fake_rtk(calls))
     cwd = str(tmp_path)
-    assert rk.measure("git status | head", cwd, base) == {"status": "skip_compound"}
+    assert rk.measure("git status & ls", cwd, base) == {"status": "skip_compound"}
+    assert rk.measure("(git status)", cwd, base) == {"status": "skip_compound"}
+    assert rk.measure("FOO=1 git status && ls", cwd, base) == {"status": "skip_compound"}
+    assert rk.measure("git status |& head", cwd, base) == {"status": "skip_compound"}
+    assert rk.measure("git status;; ls", cwd, base) == {"status": "skip_compound"}
+    assert rk.measure("git status &&", cwd, base) == {"status": "skip_compound"}
+    assert rk.measure("ls *.py | head", cwd, base) == {"status": "skip_expansion"}
+    assert rk.measure('git status && echo "$HOME"', cwd, base) == \
+        {"status": "skip_expansion"}
+    assert rk.measure("cat $(ls) | head", cwd, base) == {"status": "skip_expansion"}
+    assert rk.measure("git log -3 > out.txt", cwd, base) == {"status": "skip_redirect"}
+    assert rk.measure("git status && sort < f", cwd, base) == {"status": "skip_redirect"}
+    assert rk.measure("git status 2>err.txt | head", cwd, base) == \
+        {"status": "skip_redirect"}
+    # A redirect in the middle of a command is not one of the two forms taken.
+    assert rk.measure("git status 2>&1 -s | head", cwd, base) == \
+        {"status": "skip_compound"}
+    for chain in ("git status && rm -rf x", "git status; git push", "ls | tee out",
+                  "git status && cd sub && ls", "git status && cd /tmp && ls",
+                  "git log | sort -o out",
+                  "git log | sort out", "git log | uniq a b", "git log | sort --output=o",
+                  "ls | xargs rm", "git status && rtk git diff", "echo hi && python3 x.py",
+                  "git status | find . -delete", "git log | sort -T /tmp"):
+        assert rk.measure(chain, cwd, base) == {"status": "skip_not_listed"}, chain
+    # One command stays on the single-command list, with or without a new line after it.
+    assert rk.measure("echo hi", cwd, base) == {"status": "skip_not_listed"}
+    assert rk.measure("echo hi\n", cwd, base) == {"status": "skip_not_listed"}
+    # bash splits words on space and tab only: these ran some other program.
+    assert rk.measure("ls | cat\x0b", cwd, base) == {"status": "skip_compound"}
+    assert rk.measure("\xa0ls | cat", cwd, base) == {"status": "skip_not_listed"}
+    assert rk.measure("ls | cat\x1f", cwd, base) == {"status": "skip_not_listed"}
     assert rk.measure("rm -rf x", cwd, base) == {"status": "skip_not_listed"}
     assert rk.measure("git push", cwd, base) == {"status": "skip_not_listed"}
     assert rk.measure("tree -ao out", cwd, base) == {"status": "skip_not_listed"}
@@ -387,3 +417,177 @@ def test_main_rejects_bad_arguments(capsys):
 @pytest.mark.parametrize("cmd", ["git log -3", "cd /repo && git log -3 2>&1"])
 def test_peel_then_simple_words_round_trip(cmd):
     assert rk.simple_words(rk.peel(cmd)[0]) == ["git", "log", "-3"]
+
+
+def test_parse_chain_splits_on_operators_outside_quotes_and_keeps_stderr_redirects():
+    assert rk.parse_chain("git status && git diff") == \
+        [("", ["git", "status"], ""), ("&&", ["git", "diff"], "")]
+    assert rk.parse_chain("grep -n 'a|b; c && d' f 2>/dev/null || echo none") == \
+        [("", ["grep", "-n", "a|b; c && d", "f"], " 2>/dev/null"),
+         ("||", ["echo", "none"], "")]
+    assert rk.parse_chain('git status 2>&1 | tail -5;echo "x 2>&1 y"\nls') == \
+        [("", ["git", "status"], " 2>&1"), ("|", ["tail", "-5"], ""),
+         (";", ["echo", "x 2>&1 y"], ""), ("\n", ["ls"], "")]
+    # `2>&1` is a redirect only where a word starts.
+    assert rk.parse_chain("grep x2>&1 | head") == "skip_redirect"
+    assert rk.parse_chain("ls 2>&1x | head") == "skip_redirect"
+    assert rk.parse_chain("grep 'open | head") == "skip_compound"
+    assert rk.parse_chain("ls 2>&1&& ls 2>&1|cat") == \
+        [("", ["ls"], " 2>&1"), ("&&", ["ls"], " 2>&1"), ("|", ["cat"], "")]
+    assert rk.parse_chain("ls \x1f 2>&1 | cat")[0] == ("", ["ls", "\x1f"], " 2>&1")
+
+
+def test_rerunnable_takes_filters_without_file_operands_and_no_cd():
+    for words in (["echo", "-n", "a b"], ["pwd"], ["true"], ["wc", "-l"],
+                  ["sort"], ["sort", "-rn"], ["sort", "-k2,2nr", "-t,"], ["uniq", "-c"],
+                  ["git", "log", "-3"], ["head", "-5"]):
+        assert rk.rerunnable(words), words
+    for words in (["cd", "sub"], ["cd", "/tmp"], ["sort", "f"],
+                  ["sort", "-o", "f"], ["sort", "-ro"], ["sort", "-k", "2"],
+                  ["sort", "--compress-program=x"], ["uniq", "a", "b"], ["uniq", "-f1"],
+                  ["tee", "f"], ["sed", "-n", "1p"], ["git", "push"]):
+        assert not rk.rerunnable(words), words
+
+
+def test_chain_script_is_built_from_checked_words_and_only_for_the_same_chain():
+    head = ("exec 3>'/h/my exits'\n"
+            'r() { "$@"; local s=$?; echo "$s" >&3; return "$s"; }\n')
+    chain = rk.parse_chain("pwd && git status 2>&1 | head -3; echo 'a b'")
+    assert rk.chain_script(chain, "pwd && rtk git status 2>&1 | head -3; echo 'a b'\n",
+                           "/b/rtk", "/h/my exits") == \
+        head + "pwd && r /b/rtk git status 2>&1 | head -3 ; echo 'a b'"
+    two = rk.parse_chain("head -5 a.py && ls")
+    assert rk.chain_script(two, "rtk read a.py --head-lines 5 && rtk ls", "/b/rtk",
+                           "/h/my exits") == \
+        head + "r /b/rtk read a.py --head-lines 5 && r /b/rtk ls"
+    for rewritten in ("head -5 a.py && ls",                      # nothing in RTK form
+                      "rtk read a.py && rtk ls && rm -rf x",      # one command more
+                      "rtk read a.py; rtk ls",                    # another operator
+                      "rtk read a.py 2>&1 && rtk ls",             # another redirect
+                      "rtk read a.py && rm -rf x",                # a command swapped
+                      "rtk read a.py && rtk",                     # RTK with nothing to run
+                      "rtk read a.py && rtk ls > out",            # a redirect to a file
+                      "rtk read $(id) && rtk ls",                 # an expansion
+                      "rtk read a.py && FOO=1 rtk ls", ""):
+        assert rk.chain_script(two, rewritten, "/b/rtk", "/h/e") is None, rewritten
+
+
+def test_measure_runs_a_chain_once_under_bash_with_its_redirects(tmp_path, base, monkeypatch):
+    calls = []
+    monkeypatch.setattr(rk, "run_isolated", fake_rtk(
+        calls, rewrite="rtk git status 2>/dev/null | head -3", out="M a.py", err="warn"))
+    row = rk.measure(f"cd {tmp_path} && git status 2>/dev/null | head -3", "/nonexistent",
+                     base)
+    assert set(row) == {"status", "rtk_exit", "rtk_chars", "rtk_tokens", "rtk_ms", "segs",
+                        "seg_exits"}
+    # The stand-in ran no script, so no RTK command left an exit code.
+    assert row["status"] == "ran" and row["segs"] == 2 and row["seg_exits"] == []
+    # stderr is whatever the script let through: the chain's own redirect did the dropping.
+    assert row["rtk_chars"] == len("M a.py\nwarn")
+    rtk = str(base / "rtk")
+    assert calls[0][0] == [rtk, "rewrite", "git status 2>/dev/null | head -3"]
+    assert calls[1][0][:4] == ["/bin/bash", "--noprofile", "--norc", "-c"]
+    script = calls[1][0][4].splitlines()
+    assert script[0] == f"exec 3>{calls[1][2]['HOME']}/rtk-shadow-exits"
+    assert script[2] == f"r {rtk} git status 2>/dev/null | head -3"
+    assert calls[1][1] == str(tmp_path) and len(calls) == 2
+    assert calls[1][2]["TMPDIR"] == calls[1][2]["HOME"]
+
+
+def test_measure_takes_one_listed_command_with_a_new_line_after_it(tmp_path, base,
+                                                                   monkeypatch):
+    calls = []
+    monkeypatch.setattr(rk, "run_isolated", fake_rtk(calls, rewrite="rtk git status"))
+    row = rk.measure("git status\n", str(tmp_path), base)
+    assert row["status"] == "ran" and row["segs"] == 1
+
+
+def test_measure_never_runs_a_chain_rtk_rewrote_into_something_else(tmp_path, base,
+                                                                    monkeypatch):
+    for rewrite in (None, "git status && ls", "rtk git status && rm -rf x",
+                    "rtk git status; rtk ls", "rtk git status && rtk ls && id"):
+        calls = []
+        monkeypatch.setattr(rk, "run_isolated", fake_rtk(calls, rewrite=rewrite))
+        assert rk.measure("git status && ls", str(tmp_path), base) == \
+            {"status": "skip_no_rtk_form"}, rewrite
+        assert len(calls) == 1
+
+
+def test_a_chain_runs_for_real_under_the_isolation(tmp_path):
+    (tmp_path / "f").write_text("b\na\nb\n")
+    chain = rk.parse_chain("echo 'x; y' && cat f | sort | uniq -c 2>&1; cat nope 2>/dev/null")
+    assert all(rk.rerunnable(w) for _, w, _ in chain)
+    # `rtk` stands in as /bin/cat here: only the first `cat` is given an RTK form.
+    exits = str(tmp_path / "my exits")
+    script = rk.chain_script(
+        chain, "echo 'x; y' && rtk f | sort | uniq -c 2>&1; rtk nope 2>/dev/null",
+        "/bin/cat", exits)
+    rc, out, err = rk.run_isolated(["/bin/bash", "--noprofile", "--norc", "-c", script],
+                                   str(tmp_path), {"PATH": "/usr/bin:/bin"})
+    assert (rc, err) == (1, "")
+    assert out.split() == ["x;", "y", "1", "a", "2", "b"]
+    # The first RTK command is in front of a pipe, the second is the chain's last.
+    assert rk.read_exits(exits) == [0, 1]
+    assert rk.read_exits(str(tmp_path / "none")) == []
+
+
+def test_a_chain_counts_as_saved_only_when_every_rtk_command_exited_zero():
+    def row(**kw):
+        return {"ts": 0, "word": "echo", "status": "ran", "raw_tokens": 2000,
+                "rtk_tokens": 10, "rtk_exit": 0, "segs": 2, **kw}
+    good = row(seg_exits=[0, rk.PIPE_CLOSED])
+    # `rtk git log | head`: RTK failed with a one-line message, `head` exited 0.
+    hidden = row(seg_exits=[128])
+    never = row(seg_exits=[])
+    killed = row(seg_exits=[0, 137])
+    assert [rk.failed(r) for r in (good, hidden, never, killed)] == [False, True, True, True]
+    assert [rk.crashed(r) for r in (good, hidden, never, killed)] == \
+        [False, True, False, True]
+    s = rk.summarize([good, hidden, never, killed])
+    assert (s["saved"], s["nonzero"], s["crashed"]) == (1990, 3, 2)
+    # Face value for a non-zero exit; a crash counts as no saving in both columns.
+    assert s["saved_any"] == 2 * 1990
+    single = {"ts": 0, "word": "echo", "status": "ran", "raw_tokens": 2000,
+              "rtk_tokens": 10, "rtk_exit": rk.PIPE_CLOSED}
+    assert rk.failed(single) and rk.crashed(single)
+
+
+def test_render_files_a_chain_under_its_own_label_not_its_first_command():
+    rows = [{"ts": 0, "word": "echo", "status": "ran", "raw_tokens": 100, "rtk_tokens": 40,
+             "rtk_exit": 0, "segs": 3, "seg_exits": [0]},
+            {"ts": 0, "word": "git log", "status": "ran", "raw_tokens": 50,
+             "rtk_tokens": 50, "rtk_exit": 0}]
+    text = rk.render(rows)
+    assert "(chain)      n=    1" in text and "git log      n=    1" in text
+    assert "  echo " not in text
+
+
+def test_a_rebuilt_chain_does_what_the_original_line_did(tmp_path):
+    """Random chains: the script built from checked words against the line as typed."""
+    import random
+    rng = random.Random(7)
+    (tmp_path / "f").write_text("b\na\nb\n")
+    cmds = ["echo a", "echo 'b  c'", 'echo "d;e"', "true", "cat f", "cat nope", "wc -l",
+            "sort -r", "uniq -c", "echo x 2>&1", "cat nope 2>/dev/null", "cat nope 2>&1"]
+    seps = [" && ", " || ", "; ", " | ", "\n", "&&", "|", " ;"]
+    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+    taken = 0
+    for _ in range(150):
+        parts = [rng.choice(cmds) for _ in range(rng.randint(2, 5))]
+        line = parts[0] + "".join(rng.choice(seps) + c for c in parts[1:])
+        chain = rk.parse_chain(line)
+        assert not isinstance(chain, str), line
+        # `rtk` stands in as /bin/echo for every `echo`, so the output must not change.
+        rewritten = "".join(
+            f"{op} {'rtk' if w[0] == 'echo' else w[0]} "
+            f"{' '.join(map(rk.shlex.quote, w[1:]))}{redirect}" for op, w, redirect in chain)
+        script = rk.chain_script(chain, rewritten, "/bin/echo", str(tmp_path / "exits"))
+        if script is None:
+            continue
+        taken += 1
+        want, got = (subprocess.run(["/bin/bash", "-c", text], cwd=tmp_path, env=env,
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True)
+                     for text in (line, script))
+        assert (got.returncode, got.stdout, got.stderr) == \
+            (want.returncode, want.stdout, want.stderr), line
+    assert taken > 100

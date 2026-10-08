@@ -11,13 +11,18 @@ detaches at once, so the Bash call is not held up, and appends one row per Bash 
 <dir>/shadow.jsonl. A row holds sizes and a label from a fixed list of program names,
 never a command line, a path or any output.
 
-For a command that is a single simple command (no pipes, lists, redirects, expansions
-or globs; a leading `cd <absolute dir> &&` is the one exception), on the read-only list
-below, and for which `rtk rewrite` gives an RTK form, the RTK form is run once in the
-same working directory and its output is sized against what the session was shown.
-Every other command gets a row saying why it was skipped, so the share of Bash output
-the trial covers is reported, not hidden. That share is what this harness dares to
-re-run, which is less than what RTK itself would take.
+For a command that is a single simple command (no redirects, expansions or globs; a
+leading `cd <absolute dir> &&` and a trailing `2>&1` or `2>/dev/null` are the
+exceptions), on the read-only list below, and for which `rtk rewrite` gives an RTK
+form, the RTK form is run once in the same working directory and its output is sized
+against what the session was shown. A chain of such commands (`&&`, `||`, `;`, a new
+line, `|`) is taken the same way when every command in it is safe to run a second
+time: the line `rtk rewrite` gives is checked to be the same chain with some commands
+in RTK form, rebuilt from the checked words and run once under bash, which notes each
+RTK command's exit code in a file beside the temporary home. Every other
+command gets a row saying why it was skipped, so the share of Bash output the trial
+covers is reported, not hidden. That share is what this harness dares to re-run, which
+is less than what RTK itself would take.
 
 The RTK run gets no network, its own process-id namespace (so nothing it starts
 outlives it), a memory limit, and a home directory on tmpfs that is deleted when it
@@ -61,8 +66,11 @@ SHOWN_CAP = 30_000
 PERSIST_PREVIEW = 2_000
 # Bash output's share of the whole bill, from replay_shell.py's 2026-10-07 run.
 BASH_SHARE_OF_BILL = 0.161
+# What bash reports for a command killed by SIGPIPE: in a chain, `rtk ... | head` ends
+# RTK this way once `head` has read enough, as it ended the original command.
+PIPE_CLOSED = 141
 
-READ_ONLY = {"grep", "rg", "cat", "head", "tail", "ls", "find"}
+READ_ONLY = {"grep", "rg", "cat", "head", "tail", "ls", "find", "wc"}
 GIT_READ_ONLY = {"log", "diff", "status", "show"}
 # Options that make a read-only command write a file, run another program or open a
 # viewer. Matched whole or as `--opt=value`; none of these has a short form, and
@@ -73,6 +81,16 @@ FORBIDDEN = {
              "-fprintf", "-fls"),
     "rg": ("--pre", "--pre-glob", "--hostname-bin"),
     "git": ("--output", "--ext-diff", "--textconv", "-h"),
+}
+# Taken inside a chain only: RTK has no form for these, but a chain often holds them.
+# `cd` is not one: the hook is told one directory, and after a `cd` in the middle of a
+# chain that may be where the chain ended, not where its first command ran.
+CHAIN_ONLY = {"echo", "pwd", "true"}
+# `sort` and `uniq` inside a chain, as filters: every argument must be an option of
+# these shapes, so there is no file operand (`sort -o FILE` and `uniq IN OUT` write one).
+FILTER_ARGS = {
+    "sort": re.compile(r"-[bdfghnrRuV]+|-k\d[\d.,bdfghnrRV]*|-t[^\s]"),
+    "uniq": re.compile(r"-[cdiu]+"),
 }
 # The only labels a row may carry. Anything else is "(other)", so a script's name or a
 # mistyped secret at the start of a command line never reaches the log.
@@ -95,21 +113,31 @@ UNQUOTED_SPECIAL = set("|&;<>(){}*?[]~$`\\\n\r\v\f#!")
 DQUOTED_SPECIAL = set("$`\\!")
 # `cd <absolute dir> && <rest>`: the one compound form taken, since the directory is known.
 LEAD_CD = re.compile(
-    r"""\s*cd\s+(?:'([^']*)'|"([^"$`\\!]*)"|([^\s'"|&;<>(){}*?\[\]~$`\\#!]+))\s*&&\s*(.*)""",
+    r"""[ \t]*cd[ \t]+(?:'([^']*)'|"([^"$`\\!]*)"|([^\s'"|&;<>(){}*?\[\]~$`\\#!]+))[ \t]*&&[ \t]*(.*)""",
     re.S)
-TAIL_ERR = re.compile(r"(.*?)\s+2>(&1|/dev/null)\s*", re.S)
+TAIL_ERR = re.compile(r"(.*?)[ \t]+2>(&1|/dev/null)[ \t]*", re.S)
+# The two stderr redirects a chain's command may end with, where a word would start.
+CHAIN_ERR = re.compile(r"2>(?:&1|/dev/null)(?=[ \t\n|;&]|$)")
+CHAIN_OPS = ("&&", "||", ";", "|", "\n")
+EXPANSION = set("*?[]~$`\\!")
 
 
-def peel(cmd: str) -> tuple[str, str | None, bool]:
-    """(`cmd` without a leading `cd <absolute dir> &&` and a trailing stderr redirect,
-    that directory or None, whether stderr was sent to /dev/null). A relative `cd` is
-    left on, so the command is skipped: the hook cannot tell where it started from."""
-    cwd = None
+def peel_cd(cmd: str) -> tuple[str, str | None]:
+    """(`cmd` without a leading `cd <absolute dir> &&`, that directory or None). A
+    relative `cd` is left on, so the command is skipped: the hook cannot tell where it
+    started from."""
     m = LEAD_CD.fullmatch(cmd)
     if m:
         target = next(g for g in m.group(1, 2, 3) if g is not None)
         if os.path.isabs(target):
-            cwd, cmd = target, m.group(4)
+            return m.group(4), target
+    return cmd, None
+
+
+def peel(cmd: str) -> tuple[str, str | None, bool]:
+    """(`cmd` without a leading `cd <absolute dir> &&` and a trailing stderr redirect,
+    that directory or None, whether stderr was sent to /dev/null)."""
+    cmd, cwd = peel_cd(cmd)
     m = TAIL_ERR.fullmatch(cmd)
     if m:
         return m.group(1), cwd, m.group(2) == "/dev/null"
@@ -172,6 +200,103 @@ def read_only(words: list[str]) -> bool:
     return not any(w == b or w.startswith(b + "=") for w in words[1:] for b in banned)
 
 
+Chain = list[tuple[str, list[str], str]]
+
+
+def parse_chain(cmd: str) -> Chain | str:
+    """`cmd` as [(operator before it, words, stderr redirect after it)] when it is
+    simple commands joined by `&&`, `||`, `;`, a new line or `|`, else the skip status
+    that says why not. The first operator is ""; a redirect is "", " 2>&1" or
+    " 2>/dev/null"."""
+    cmd = cmd.strip(" \t\n")
+    texts, op, start, quote, i = [], "", 0, None, 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            elif quote == '"' and ch in DQUOTED_SPECIAL:
+                return "skip_expansion"
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "2" and (i == 0 or cmd[i - 1] in " \t") and CHAIN_ERR.match(cmd, i):
+            i = CHAIN_ERR.match(cmd, i).end()
+            continue
+        else:
+            sep = next((s for s in CHAIN_OPS if cmd.startswith(s, i)), None)
+            if sep:
+                texts.append((op, cmd[start:i]))
+                op, start, i = sep, i + len(sep), i + len(sep)
+                continue
+            if ch in EXPANSION:
+                return "skip_expansion"
+            if ch in "<>":
+                return "skip_redirect"
+            if ch in UNQUOTED_SPECIAL:
+                return "skip_compound"
+        i += 1
+    if quote:
+        return "skip_compound"
+    texts.append((op, cmd[start:]))
+    chain: Chain = []
+    for op, text in texts:
+        redirect = ""
+        m = TAIL_ERR.fullmatch(text)
+        if m:
+            text, redirect = m.group(1), f" 2>{m.group(2)}"
+        words = simple_words(text)
+        if words is None:
+            return "skip_compound"
+        chain.append((op, words, redirect))
+    return chain
+
+
+def rerunnable(words: list[str]) -> bool:
+    """True when a chain's command is safe to run a second time."""
+    prog = words[0]
+    if prog in CHAIN_ONLY:
+        return True
+    if prog in FILTER_ARGS:
+        return all(FILTER_ARGS[prog].fullmatch(w) for w in words[1:])
+    return read_only(words)
+
+
+def chain_script(chain: Chain, rewritten: str, rtk: str, exits: str) -> str | None:
+    """A bash script for the line `rtk rewrite` gave for `chain`, built from checked
+    words and never from RTK's text. None unless that line is the same chain, operator
+    for operator, with each command either word for word the original or an `rtk ...`
+    form, and at least one of them the latter. Each RTK command is run through a
+    function that passes on its exit code and also appends it to the file `exits`: a
+    chain's own exit code is its last command's, which says nothing of an RTK command
+    in front of a pipe or a `;`."""
+    form = parse_chain(rewritten)
+    if isinstance(form, str) or len(form) != len(chain):
+        return None
+    parts, changed = [], False
+    for (op, words, redirect), (form_op, form_words, form_redirect) in zip(chain, form,
+                                                                           strict=True):
+        if form_op != op or form_redirect != redirect:
+            return None
+        if form_words != words:
+            if form_words[0] != "rtk" or len(form_words) < 2:
+                return None
+            words, changed = ["r", rtk, *form_words[1:]], True
+        parts.append(f"{op} {shlex.join(words)}{redirect}")
+    if not changed:
+        return None
+    return (f"exec 3>{shlex.quote(exits)}\n"
+            'r() { "$@"; local s=$?; echo "$s" >&3; return "$s"; }\n'
+            + " ".join(parts).strip())
+
+
+def read_exits(path: str) -> list[int]:
+    """The exit codes a chain's RTK commands left in `path`, in the order they ended."""
+    try:
+        return [int(line) for line in Path(path).read_text().split()]
+    except (OSError, ValueError):
+        return []
+
+
 def shown(stdout: str, stderr: str) -> str:
     """A Bash result as the session is shown it: stdout, then stderr."""
     stdout, stderr = stdout.strip("\n"), stderr.strip("\n")
@@ -196,7 +321,9 @@ def rtk_env(home: str) -> dict[str, str]:
            "XDG_CACHE_HOME": os.path.join(home, ".cache"),
            "RTK_TELEMETRY_DISABLED": "1", "DO_NOT_TRACK": "1",
            # A second `git status` must not take the index lock from the live session.
-           "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C.UTF-8"}
+           "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C.UTF-8",
+           # `sort` spills a large input to files here; they go when the home does.
+           "TMPDIR": home}
     gitconfig = Path.home() / ".gitconfig"
     if gitconfig.is_file():
         env["GIT_CONFIG_GLOBAL"] = str(gitconfig)
@@ -270,12 +397,20 @@ def take_slot(base: Path) -> int | None:
 
 def measure(cmd: str, cwd: str, base: Path) -> dict:
     """The row fields for one Bash command: a skip reason, or RTK's output size."""
+    chain_text = peel_cd(cmd)[0]
     cmd, cd_dir, drop_stderr = peel(cmd)
     cwd = cd_dir or cwd
-    words = simple_words(cmd)
+    words, chain = simple_words(cmd), None
     if words is None:
-        return {"status": "skip_compound"}
-    if not read_only(words):
+        # Not one command: a chain keeps its redirects in the script it is run from.
+        chain, cmd, drop_stderr = parse_chain(chain_text), chain_text, False
+        if isinstance(chain, str):
+            return {"status": chain}
+        # One command with a new line after it is still one command: the same list.
+        allowed = read_only if len(chain) == 1 else rerunnable
+        if not all(allowed(w) for _, w, _ in chain):
+            return {"status": "skip_not_listed"}
+    elif not read_only(words):
         return {"status": "skip_not_listed"}
     if not os.path.isdir(cwd):
         return {"status": "skip_no_cwd"}
@@ -297,19 +432,31 @@ def measure(cmd: str, cwd: str, base: Path) -> dict:
                 rc, out, _ = run_isolated([rtk, "rewrite", cmd], home, env)
                 if rc not in (0, 1, 3):
                     return {"status": "rtk_error", "error": f"rewrite exit {rc}"}
-                form = simple_words(out.strip()) if rc != 1 else None
-                if not form or form[0] != "rtk" or len(form) < 2:
-                    return {"status": "skip_no_rtk_form"}
+                if chain is None:
+                    form = simple_words(out.strip()) if rc != 1 else None
+                    if not form or form[0] != "rtk" or len(form) < 2:
+                        return {"status": "skip_no_rtk_form"}
+                    argv = [rtk, *form[1:]]
+                else:
+                    exits = os.path.join(home, "rtk-shadow-exits")
+                    script = chain_script(chain, out, rtk, exits) if rc != 1 else None
+                    if script is None:
+                        return {"status": "skip_no_rtk_form"}
+                    argv = ["/bin/bash", "--noprofile", "--norc", "-c", script]
                 started = time.monotonic()
-                rc, out, err = run_isolated([rtk, *form[1:]], cwd, env)
+                rc, out, err = run_isolated(argv, cwd, env)
             except subprocess.TimeoutExpired:
                 return {"status": "rtk_timeout"}
             except OSError as exc:
                 return {"status": "rtk_error", "error": type(exc).__name__}
             text = shown(out, "" if drop_stderr else err)
-            return {"status": "ran", "rtk_exit": rc, "rtk_chars": len(text),
-                    "rtk_tokens": tokens(text[:SHOWN_CAP]),
-                    "rtk_ms": round((time.monotonic() - started) * 1000)}
+            row = {"status": "ran", "rtk_exit": rc, "rtk_chars": len(text),
+                   "rtk_tokens": tokens(text[:SHOWN_CAP]),
+                   "rtk_ms": round((time.monotonic() - started) * 1000)}
+            if chain is not None:
+                row["segs"] = len(chain)
+                row["seg_exits"] = read_exits(exits)[:len(chain)]
+            return row
     finally:
         os.close(slot)
 
@@ -402,17 +549,31 @@ def suspect(row: dict) -> bool:
     return row["rtk_tokens"] == 0 and row["raw_tokens"] > 20
 
 
+def rtk_exits(row: dict) -> list[int]:
+    """The exit codes of the RTK commands a row ran: one for a single command; for a
+    chain one per RTK command that started, with a reader closing the pipe read as 0."""
+    if "segs" not in row:
+        return [row["rtk_exit"]]
+    return [0 if e == PIPE_CLOSED else e for e in row.get("seg_exits", [])]
+
+
+def failed(row: dict) -> bool:
+    """An RTK command exited non-zero, or (a chain) none of them got to start."""
+    exits = rtk_exits(row)
+    return not exits or any(e != 0 for e in exits)
+
+
 def crashed(row: dict) -> bool:
     """An exit code no wrapped command passes on: killed by a signal, or not run."""
-    return row["rtk_exit"] < 0 or row["rtk_exit"] >= 126
+    return any(e < 0 or e >= 126 for e in rtk_exits(row))
 
 
 def summarize(rows: list[dict]) -> dict:
     """Totals for a set of rows, with the saving counted two ways. RTK passes on the
     wrapped command's exit code (`grep` with no match exits 1), so a non-zero exit is
     not by itself a failure; but a run that failed with a one-line message would then
-    read as a large saving. `saved` counts only exit-0 runs; `saved_any` also counts
-    non-zero ones. A suspect or crashed row is covered with nothing saved in both."""
+    read as a large saving. `saved` counts only exit-0 runs (for a chain: every RTK
+    command in it started and exited 0); `saved_any` also counts the others. A suspect or crashed row is covered with nothing saved in both."""
     out = {"calls": 0, "bash_tokens": 0, "ran": 0, "ran_raw": 0, "ran_rtk": 0,
            "ran_rtk_any": 0, "suspect": 0, "nonzero": 0, "crashed": 0, "worker_errors": 0,
            "by_status": defaultdict(int)}
@@ -426,7 +587,7 @@ def summarize(rows: list[dict]) -> dict:
         if r["status"] == "ran":
             out["ran"] += 1
             out["ran_raw"] += r["raw_tokens"]
-            out["nonzero"] += r["rtk_exit"] != 0
+            out["nonzero"] += failed(r)
             if suspect(r) or crashed(r):
                 out["suspect"] += suspect(r)
                 out["crashed"] += crashed(r)
@@ -434,7 +595,7 @@ def summarize(rows: list[dict]) -> dict:
                 out["ran_rtk_any"] += r["raw_tokens"]
             else:
                 out["ran_rtk_any"] += r["rtk_tokens"]
-                out["ran_rtk"] += r["rtk_tokens"] if r["rtk_exit"] == 0 else r["raw_tokens"]
+                out["ran_rtk"] += r["raw_tokens"] if failed(r) else r["rtk_tokens"]
     out["saved"] = out["ran_raw"] - out["ran_rtk"]
     out["saved_any"] = out["ran_raw"] - out["ran_rtk_any"]
     return out
@@ -466,8 +627,9 @@ def render(rows: list[dict]) -> str:
         f"{k} {pct(v, s['bash_tokens'])}" for k, v in sorted(s["by_status"].items())))
     words: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
     for r in rows:
-        if r.get("status") == "ran" and r["rtk_exit"] == 0 and not suspect(r):
-            w = words[r["word"]]
+        if r.get("status") == "ran" and not failed(r) and not suspect(r):
+            # A chain is not its first command: `echo x && git log` is no `echo` row.
+            w = words["(chain)" if "segs" in r else r["word"]]
             w[0] += 1
             w[1] += r["raw_tokens"]
             w[2] += r["rtk_tokens"]
@@ -477,12 +639,18 @@ def render(rows: list[dict]) -> str:
     lines.append(
         f"Of {s['ran']} RTK runs, {s['suspect']} printed nothing for a non-empty result "
         f"and {s['crashed']} ended on a signal or could not start: no saving in either "
-        f"column. {s['nonzero']} exited non-zero in all; the rest of those count as no "
+        f"column. {s['nonzero']} had an RTK command exit non-zero or not start; the rest "
+        "of those count as no "
         "saving, except in '(any exit)', which takes their output at face value. "
         f"{s['worker_errors']} calls were lost to a worker error and are in no column.\n"
-        "'covered' is what this harness re-runs (single read-only commands), which is "
-        "less than what RTK would take, so the last two columns understate RTK on that "
-        "side. On the other side, Claude Code sends no hook event for a Bash call that "
+        "'covered' is what this harness re-runs (read-only commands and chains of "
+        "them, with no expansion, glob or file redirect), which is less than what RTK "
+        "would take, so the last two columns understate RTK on that side. A chain is "
+        "run whole again, the commands RTK leaves alone included, and counts as saved "
+        "only when every RTK command in it started and exited 0 (or was cut off by the "
+        "command reading its output); a chain whose RTK command printed nothing is not "
+        "caught when its other commands printed something. A skip reason names the first "
+        "thing in a command the harness does not take, not the only one. On the other side, Claude Code sends no hook event for a Bash call that "
         "failed, so failed commands (a failing test run, a build error) are in no row "
         "and not in 'logged Bash': the last two columns are NOT a strict floor, and "
         "'est. of bill' applies a share of the bill that includes failed calls. A "
