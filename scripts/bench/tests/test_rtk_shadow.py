@@ -513,6 +513,7 @@ def test_measure_never_runs_a_chain_rtk_rewrote_into_something_else(tmp_path, ba
         assert len(calls) == 1
 
 
+@needs_unshare
 def test_a_chain_runs_for_real_under_the_isolation(tmp_path):
     (tmp_path / "f").write_text("b\na\nb\n")
     chain = rk.parse_chain("echo 'x; y' && cat f | sort | uniq -c 2>&1; cat nope 2>/dev/null")
