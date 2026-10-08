@@ -254,8 +254,7 @@ def over_limit(text: str, limit: int | None) -> bool:
       token, far above cl100k's ~4 on JSON and prose, and is read as inline. Tokenizing
       a 2.4 MB payload whole measured 558 ms; with the char cutoff first, no pass ever
       sees more than `OFFLOAD_DEFAULT_CHARS` characters.
-    - A tokenizer that raises (tiktoken refuses `<|endoftext|>` in input) or is missing
-      answers False: inline, exactly the behaviour before this check existed. An
+    - A tokenizer that raises or is missing answers False: inline, exactly the behaviour before this check existed. An
       exception here would otherwise kill the proxy's reader thread."""
     if limit is None:
         return False

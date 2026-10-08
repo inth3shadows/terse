@@ -14,6 +14,7 @@ import pytest
 
 from terse.policy import Policy, Rule
 from terse.proxy import (
+    OFFLOAD_DEFAULT_CHARS,
     OFFLOAD_DEFAULT_TOKENS,
     PRIMER_HEAD,
     Interceptor,
@@ -188,9 +189,14 @@ def test_the_typed_wrapper_skips_an_offloaded_result_and_wraps_the_next(small_li
     assert not latch.pending()
 
 
-def test_text_the_tokenizer_refuses_never_breaks_forwarding(small_limit):
-    # tiktoken raises on `<|endoftext|>` in input; under the primer guard that exception
-    # would kill the proxy's reader thread. It must read as inline instead.
+def test_a_tokenizer_that_raises_never_breaks_forwarding(small_limit, monkeypatch):
+    # Under the primer guard an exception from the tokenizer would kill the proxy's
+    # reader thread. It must read as inline instead.
+    import terse.proxy as proxy_mod
+
+    def refuse(text):
+        raise ValueError("tokenizer refused the text")
+    monkeypatch.setattr(proxy_mod, "count_cl100k", refuse)
     assert not over_limit("log tail: <|endoftext|> " + "x" * 30_000, LIMIT)
     inter = Interceptor(POL)
     inter.client_name = "claude-code"
@@ -200,6 +206,25 @@ def test_text_the_tokenizer_refuses_never_breaks_forwarding(small_limit):
         "content": [{"type": "text", "text": _rows(12)},
                     {"type": "text", "text": "log tail: <|endoftext|> " + "x" * 30_000}]}}))
     assert json.loads(line)["result"]["content"]
+
+
+def test_an_over_limit_text_spelling_a_special_token_is_seen_as_over_limit():
+    # The tokenizer used to raise on this text, which the guard reads as inline: the
+    # primer was then attached to a result the client was about to save to a file.
+    text = "<|endoftext|> " + "word " * 4000
+    assert len(text) <= OFFLOAD_DEFAULT_CHARS      # decided by the token count, not the size
+    assert over_limit(text, LIMIT)
+
+
+def test_a_result_spelling_a_special_token_is_still_compressed():
+    # The codec's size comparisons used to raise on this text; the proxy then failed open
+    # and forwarded the result whole.
+    rows = json.dumps({"result": [{"id": i, "owner": {"name": f"user-{i:02d}",
+                                                      "team": "platform-infrastructure"},
+                                   "note": "tail <|endoftext|> marker"} for i in range(60)]})
+    inter = Interceptor(POL, lazy_primer=False)
+    out = _drive(inter, 1, rows)["content"][-1]["text"]
+    assert "__terse_table__" in out and len(out) < len(rows) // 2
 
 
 def test_the_tokenizer_pass_is_bounded(monkeypatch):

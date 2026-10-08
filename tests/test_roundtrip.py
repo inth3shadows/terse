@@ -431,3 +431,22 @@ def test_the_gate_no_longer_leans_on_jsons_shared_NaN_object():
     assert built != parsed                                     # plain `==` still says no
     assert transforms.values_equal(built, parsed)              # the gate no longer does
     assert transforms.roundtrip_ok(built)
+
+
+def test_text_spelling_a_tokenizer_special_token_is_counted_and_compressed():
+    """tiktoken refuses `<|endoftext|>` unless told it is plain text. One such string in a
+    result used to raise out of every size comparison in the codec."""
+    from terse.tokenize import count_cl100k, encode_cl100k
+
+    marked = "log tail <|endoftext|> end"
+    n = count_cl100k(marked)
+    if n is None:
+        pytest.skip("tiktoken not installed")
+    # Read as text it costs several tokens; as the special token it would be one.
+    assert n > count_cl100k("log tail  end") + 1
+    assert len(encode_cl100k(marked)) == n
+    rows = [{"id": i, "name": f"user{i}", "note": marked, "status": "active"}
+            for i in range(40)]
+    out = transforms.compress(rows)
+    assert transforms.decompress(out) == rows
+    assert len(out) < len(transforms.minify(rows)) // 2

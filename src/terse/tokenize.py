@@ -43,7 +43,10 @@ def _enc(name: str):
 def count(text: str, encoding: str = CL100K) -> int | None:
     """Token count under a named tiktoken encoding, or None if unavailable."""
     enc = _enc(encoding)
-    return len(enc.encode(text)) if enc is not None else None
+    # A tool result is plain text. tiktoken refuses text that spells one of its special
+    # tokens (`<|endoftext|>` in a log or a diff) unless told to read it as text; left to
+    # raise, one such string anywhere in a result made the whole codec give up on it.
+    return len(enc.encode(text, disallowed_special=())) if enc is not None else None
 
 
 def count_cl100k(text: str) -> int | None:
@@ -56,4 +59,4 @@ def encode_cl100k(text: str) -> list[int] | None:
     """cl100k_base token ids, or None if unavailable. Used by the probes to reason
     about token-level overlap/redundancy, not just counts."""
     enc = _enc(CL100K)
-    return enc.encode(text) if enc is not None else None
+    return enc.encode(text, disallowed_special=()) if enc is not None else None
