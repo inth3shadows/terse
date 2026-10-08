@@ -589,6 +589,8 @@ def test_a_rebuilt_chain_does_what_the_original_line_did(tmp_path):
         want, got = (subprocess.run(["/bin/bash", "-c", text], cwd=tmp_path, env=env,
                                     stdin=subprocess.DEVNULL, capture_output=True, text=True)
                      for text in (line, script))
-        assert (got.returncode, got.stdout, got.stderr) == \
-            (want.returncode, want.stdout, want.stderr), line
+        # Two commands of one pipeline write stderr at the same time, so its bytes
+        # can interleave differently from run to run: compare what was written.
+        assert (got.returncode, got.stdout, sorted(got.stderr)) == \
+            (want.returncode, want.stdout, sorted(want.stderr)), line
     assert taken > 100
