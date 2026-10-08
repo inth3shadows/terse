@@ -13,7 +13,12 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- A result containing text that spells a tokenizer special token (`<|endoftext|>` in a log,
+  a diff or a model transcript) is compressed like any other. The token counter raised on
+  such text, so the codec gave up and the proxy forwarded the whole result uncompressed;
+  `terse` on the command line failed outright on the same input.
 
 ## [0.44.2] - 2026-10-06
 
