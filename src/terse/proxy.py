@@ -44,7 +44,12 @@ from . import text_diff, transforms
 # `tokenize` this module already imports), and there is no cycle -- `stats` never imports
 # `proxy`. The WRITER is still imported lazily in `run_proxy` as before. Naming the site's
 # cadence from the one definition beats re-spelling the literal at each call site.
-from .stats import PRIMER_CADENCE_ONCE, PRIMER_DECLINE_AUTO, PRIMER_DECLINE_NEVER
+from .stats import (
+    PRIMER_CADENCE_ONCE,
+    PRIMER_DECLINE_AUTO,
+    PRIMER_DECLINE_NEVER,
+    resolve_ledger_identity,
+)
 from .tokenize import count_cl100k
 from .transport import HttpTransport, build_transport
 
@@ -2365,13 +2370,20 @@ SWALLOW: Any = object()
 
 
 def pump(src: Iterable[str], dst: Any, transform: Callable[[str], Any],
-         lock: Lock | None = None) -> None:
+         lock: Lock | None = None, on_read: Callable[[str], None] | None = None,
+         on_write: Callable[[str], None] | None = None) -> None:
     """Read lines from src, apply transform, write to dst with a single trailing newline.
     transform returns: a string to write, None to forward the line unchanged, or SWALLOW to
     write nothing (the transform handled it out-of-band). Stops at EOF. With `lock`, each
     write+flush is serialized — needed on the shared client-facing stream, which both this
-    pump and the retrieve answerer write to (#10)."""
+    pump and the retrieve answerer write to (#10).
+
+    `on_read`/`on_write` are the wire log's taps: every raw line read (including the
+    empty ones skipped below) and every line about to be written — the latter inside
+    `lock`, so the log's order is the stream's order."""
     for raw in src:
+        if on_read is not None:
+            on_read(raw)
         line = raw.rstrip("\n")
         if not line:
             continue
@@ -2382,9 +2394,13 @@ def pump(src: Iterable[str], dst: Any, transform: Callable[[str], Any],
             out = line
         if lock is not None:
             with lock:
+                if on_write is not None:
+                    on_write(out)
                 dst.write(out + "\n")
                 dst.flush()
         else:
+            if on_write is not None:
+                on_write(out)
             dst.write(out + "\n")
             dst.flush()
 
@@ -2516,6 +2532,44 @@ def _build_capture_and_audit(
     return capture, audit
 
 
+def _single_wire_tap(wire_log: str | None, conn: str, pol: policy_mod.Policy,
+                     server_name: str | None, inter: Interceptor, cmd: list[str],
+                     policy_path: str | None, transport: Any,
+                     ) -> tuple[Any, Callable[[str], Any]]:
+    """The single proxy's wire tap and its request-time gate (see wirelog.py), or
+    (None, None) without `--wire-log` or when the log cannot be opened."""
+    if wire_log is None:
+        return None, lambda _line: None
+    from . import __version__
+    from .wirelog import call_gate, open_wire_tap, retrieve_handle, server_excluded
+
+    wire = open_wire_tap(wire_log, conn, exclude_all=server_excluded(pol, server_name))
+    if wire is None:
+        return None, lambda _line: None
+
+    def resolve(method: str, params: dict) -> tuple[str | None, bool] | None:
+        name = params.get("name")
+        if method != "tools/call" or not isinstance(name, str):
+            return None
+        if name == lossy_mod.RETRIEVE_TOOL:
+            # Excluded iff the result the handle was dropped from was excluded.
+            origin = inter._drop_origin.get(retrieve_handle(params) or "")
+            if origin is None:
+                return None
+            name = origin[1]
+        rule = pol.select(name, server_name)
+        return rule.tool_glob, not rule.capture
+
+    pid = getattr(getattr(transport, "proc", None), "pid", None)
+    label = resolve_ledger_identity(server_name, cmd)
+    wire.event("start", version=__version__, mode="single", policy=policy_path,
+               peers=[label], argv={"cmd0": os.path.basename(cmd[0]) if pid else None,
+                                    "argc": len(cmd), "transport":
+                                    "stdio" if pid else "http"})
+    wire.event("peer_start", peer=label, pid=pid)
+    return wire, lambda line: call_gate(line, resolve)
+
+
 def run_proxy(
     cmd: list[str],
     pol: policy_mod.Policy,
@@ -2529,6 +2583,8 @@ def run_proxy(
     server_name: str | None = None,
     lazy_primer: bool = True,
     primer_mode: str = PRIMER_ALWAYS,
+    wire_log: str | None = None,
+    policy_path: str | None = None,
 ) -> int:
     """Launch the downstream MCP peer `cmd` and proxy JSON-RPC through `Interceptor`.
     `cmd` is either a stdio launch command, or a single-element list holding a URL — in
@@ -2569,6 +2625,10 @@ def run_proxy(
     `primer_mode` is `--primer` (#325): `always` (default, the lazy attach above), `never`, or
     `auto` -- see `PRIMER_MODES`.
 
+    With `wire_log` (a directory), every line at all four hops is appended to the wire log
+    (see wirelog.py); `policy_path` only labels its `start` event. Opt-in, side-effect-only,
+    fail-open like the sinks above.
+
     Return code: for a stdio downstream, the child's real exit code (or 127 if it could
     never be launched — #19), exactly as before this function grew a second transport.
     For an HTTP downstream there is no child process to exit; 0 means the client
@@ -2607,7 +2667,8 @@ def run_proxy(
                 "--server-name <name>.\n")
             return 2
 
-    capture, audit = _build_capture_and_audit(capture_dir, debug_log, _new_session_id())
+    conn = _new_session_id()
+    capture, audit = _build_capture_and_audit(capture_dir, debug_log, conn)
 
     stats = None
     stats_retrieve = None
@@ -2618,7 +2679,6 @@ def run_proxy(
             build_primer_writer,
             build_retrieve_writer,
             build_stats_writer,
-            resolve_ledger_identity,
         )
 
         label = ledger_label = resolve_ledger_identity(server_name, cmd)
@@ -2661,6 +2721,10 @@ def run_proxy(
     # not just in which method to call (see the join/rc branch below).
     is_http = isinstance(transport, HttpTransport)
 
+    wire, wire_gate = _single_wire_tap(wire_log, conn, pol, server_name, inter, cmd,
+                                       policy_path, transport)
+    peer_label = resolve_ledger_identity(server_name, cmd) if wire is not None else None
+
     sigterm_token = _install_sigterm_to_exit()
 
     # The client-facing stream (cout) now has TWO writers: the server->client pump and the
@@ -2688,13 +2752,22 @@ def run_proxy(
                 reply = inter.answer_retrieve(line)
                 if reply is not None:
                     with out_lock:
+                        if wire is not None:
+                            wire.tap("client_out", reply, status="local_answer",
+                                     origin="retrieve")
                         cout.write(reply + "\n")
                         cout.flush()
                     return SWALLOW
                 inter.note_request(line)
                 return line  # forward request unchanged; only observe
             try:
-                pump(cin, transport.outbound(), fwd)
+                if wire is None:
+                    pump(cin, transport.outbound(), fwd)
+                else:
+                    tap = wire.tap
+                    pump(cin, transport.outbound(), fwd,
+                         on_read=lambda raw: tap("client_in", raw, gate=wire_gate(raw)),
+                         on_write=lambda out: tap("server_out", out, peer=peer_label))
             finally:
                 # transport.half_close() is what lets server_to_client's
                 # pump(transport.inbound(), ...) below ever terminate: for HTTP
@@ -2707,7 +2780,13 @@ def run_proxy(
                 transport.half_close()
 
         def server_to_client() -> None:
-            pump(transport.inbound(), cout, inter.transform_response, lock=out_lock)
+            if wire is None:
+                pump(transport.inbound(), cout, inter.transform_response, lock=out_lock)
+            else:
+                tap = wire.tap
+                pump(transport.inbound(), cout, inter.transform_response, lock=out_lock,
+                     on_read=lambda raw: tap("server_in", raw, peer=peer_label),
+                     on_write=lambda out: tap("client_out", out))
 
         t_up = Thread(target=client_to_server, daemon=True)
         t_down = Thread(target=server_to_client, daemon=True)
@@ -2720,8 +2799,14 @@ def run_proxy(
             # queue iterator. No fixed timeout — inbound EOF IS the completion signal.
             t_down.join()
             rc = 0
+            if wire is not None:
+                wire.event("peer_exit", peer=peer_label, pid=None, exit_code=None)
         else:
             rc = transport.wait()
+            if wire is not None:
+                wire.event("peer_exit", peer=peer_label,
+                           pid=getattr(getattr(transport, "proc", None), "pid", None),
+                           exit_code=rc)
             # The child has exited, so its stdout reaches EOF and the inbound pump WILL
             # terminate once it drains the last buffered reply — give it a generous window
             # to do so. The old 2s cap could kill the daemon thread mid-drain on a large
@@ -2730,6 +2815,9 @@ def run_proxy(
             # it rather than truncating in silence.
             t_down.join(timeout=_STDIO_DRAIN_TIMEOUT)
             if t_down.is_alive():
+                if wire is not None:
+                    wire.event("drain_timeout", peer=peer_label,
+                               timeout_s=_STDIO_DRAIN_TIMEOUT)
                 sys.stderr.write(
                     "[terse] downstream exited but its final reply did not finish "
                     f"draining within {_STDIO_DRAIN_TIMEOUT:.0f}s; last message(s) may "
@@ -2738,4 +2826,6 @@ def run_proxy(
     finally:
         _ignore_sigterm(sigterm_token)
         transport.close()
+        if wire is not None:
+            wire.close()
         _restore_sigterm(sigterm_token)
