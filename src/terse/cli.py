@@ -236,7 +236,8 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
                                    diff_override=diff_override,
                                    diff_keyframe_override=args.diff_keyframe_interval,
                                    join_blocks_override=join_blocks_override,
-                                   stats_log=stats_log, primer_mode=args.primer)
+                                   stats_log=stats_log, primer_mode=args.primer,
+                                   **_wire_kwargs(args))
         except (OSError, ValueError) as e:
             print(f"proxy --config: {e}", file=sys.stderr)
             return 2
@@ -250,7 +251,16 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         return 2
     return run_proxy(cmd, pol, debug=args.debug, capture_dir=args.capture_dir,
                      debug_log=args.debug_log, headers=headers, stats_log=stats_log,
-                     server_name=args.server_name, primer_mode=args.primer)
+                     server_name=args.server_name, primer_mode=args.primer,
+                     **_wire_kwargs(args))
+
+
+def _wire_kwargs(args: argparse.Namespace) -> dict:
+    """`--wire-log` for either proxy mode; passed only when given, so a run without it
+    makes exactly the call it made before the flag existed."""
+    if args.wire_log is None:
+        return {}
+    return {"wire_log": args.wire_log, "policy_path": args.policy}
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
@@ -2241,6 +2251,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="append a structured raw->decision->emitted record per result to "
                          "this JSONL file for after-the-fact diagnosis/replay (opt-in; never "
                          "affects forwarding)")
+    px.add_argument("--wire-log", metavar="DIR",
+                    help="append every JSON-RPC line crossing the proxy, at all four hops, "
+                         "to DIR/<CLAUDE_CODE_SESSION_ID>/<conn>.jsonl (0600) — the raw "
+                         "originals AND what the client was given; capture:false traffic is "
+                         "logged as metadata only (opt-in; never affects forwarding)")
     px.add_argument("--server-name", metavar="NAME",
                     help="this downstream's name in your MCP config (e.g. runecho). Makes "
                          "a server-scoped policy rule (\"runecho.*\") match a server whose "
