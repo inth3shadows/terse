@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.44.4] - 2026-10-20
+
 ### Fixed
 
 - A `tools/call` or `prompts/get` whose `params` is not an object (a list, string or number) no longer ends a multiproxy session. The router raised on it and the client loop died; it now answers a request with a -32602 error and drops a notification.
