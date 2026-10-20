@@ -301,6 +301,12 @@ class StdioTransport:
 _SENTINEL: Any = object()
 
 
+class _SynthesizedReply(str):
+    """A reply this transport made up rather than received (the -32000 error for a failed
+    POST). Still a plain `str` to every consumer; only the wire log reads the label."""
+    wire_origin = "http_synth"
+
+
 class _HttpSendWriter:
     """The `.write(str)`/`.flush()` adapter `pump()` writes client->server
     lines through, for an `HttpTransport`. `pump()` always calls
@@ -556,7 +562,7 @@ class HttpTransport:
         has_id, mid = _parse_request_id(line)
         if not has_id:
             return
-        self._q.put(self._error_reply(mid, message))
+        self._q.put(_SynthesizedReply(self._error_reply(mid, message)))
 
     @staticmethod
     def _error_reply(mid: Any, message: str) -> str:

@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+from typing import TextIO
 
 # Refuse to open a symlink as the final path component, so a pre-planted symlink in a
 # terse-managed dir can't redirect a secret-bearing write (config, backup, captured
@@ -93,12 +94,18 @@ def _silent_unlink(path: str | Path) -> None:
         pass
 
 
-def append_restricted(path: str | Path, text: str, *, mode: int = 0o600) -> None:
+def open_append_restricted(path: str | Path, *, mode: int = 0o600) -> TextIO:
+    """`append_restricted`'s open half, for a writer that keeps the file open across many
+    appends (the wire log): same O_APPEND/O_NOFOLLOW flags, mode pinned before content."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | _NOFOLLOW, mode)
     try:
         os.fchmod(fd, mode)
     except OSError:
         os.close(fd)
         raise
-    with os.fdopen(fd, "a", encoding="utf-8") as fh:
+    return os.fdopen(fd, "a", encoding="utf-8")
+
+
+def append_restricted(path: str | Path, text: str, *, mode: int = 0o600) -> None:
+    with open_append_restricted(path, mode=mode) as fh:
         fh.write(text)
