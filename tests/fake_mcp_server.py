@@ -13,6 +13,11 @@ to sleep before answering `initialize` -- a slow-starting peer), FAKE_TOOLS (com
 names `tools/list` reports instead of the default two), and FAKE_DIE_IF (a path: if it exists
 at launch, exit at once -- a peer that fails to start on THIS run only, while its config
 entry, and so the snapshot fingerprint, stays the same across runs).
+
+Wire-log tools (tests/test_wire_log.py), selected by tools/call name: `fake.big` (a text
+result of `arguments.n` chars), `fake.error` (a JSON-RPC error reply), `fake.echo` (echoes
+`arguments` back in the result), `fake.noise` (writes a blank line, a whitespace line and a
+non-JSON line before its reply), `fake.crash` (exits 3 without replying).
 """
 import json
 import os
@@ -60,8 +65,25 @@ def main() -> None:
                                "capabilities": {"stdio_peer": True},
                                "serverInfo": {"name": "fake", "version": "0"}}}
         elif method == "tools/call":
-            name = (msg.get("params") or {}).get("name")
-            if name == "fs.read":
+            params = msg.get("params") or {}
+            name = params.get("name")
+            args = params.get("arguments") or {}
+            if name == "fake.crash":
+                sys.exit(3)
+            if name == "fake.noise":
+                sys.stdout.write("\n   \nnot json {\n")
+                sys.stdout.flush()
+            if name == "fake.error":
+                resp = {"jsonrpc": "2.0", "id": mid,
+                        "error": {"code": -32050, "message": "fake failure"}}
+                sys.stdout.write(json.dumps(resp) + "\n")
+                sys.stdout.flush()
+                continue
+            if name == "fake.big":
+                text = "x" * int(args.get("n", 0))
+            elif name == "fake.echo":
+                text = json.dumps(args)
+            elif name == "fs.read":
                 _fs_read_calls += 1
                 # 2nd+ read of the "same file" has one line changed -- the realistic
                 # debug-loop shape the CDC text diff targets.
