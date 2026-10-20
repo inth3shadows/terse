@@ -16,6 +16,7 @@ fails that pull request until the section has moved.
 ### Fixed
 
 - A `tools/call` or `prompts/get` whose `params` is not an object (a list, string or number) no longer ends a multiproxy session. The router raised on it and the client loop died; it now answers a request with a -32602 error and drops a notification.
+- A multiproxy client line with an id or method of the wrong JSON type (an `id` that is a list, object or boolean, a `method` that is not a string) no longer ends the session; it gets a -32600 error, with a null id when the id itself is the problem. Any other unexpected failure while routing one line is now logged to stderr and answered with -32603 instead of taking the router down for every peer. A non-object `params` that is empty or false (`[]`, `0`, `""`, `false`) is now a -32602 like any other, where it used to be read as no params.
 
 ## [0.44.3] - 2026-10-08
 

@@ -860,16 +860,53 @@ class Router:
     # ---------- client -> server ----------
 
     def route_client_line(self, line: str) -> None:
-        """Route one raw JSON-RPC line from the real client. Never raises: a malformed
-        line (shouldn't happen — it came straight from the client's stdin) is silently
-        ignored rather than crashing the whole session over one bad line."""
+        """Route one raw JSON-RPC line from the real client. Never raises: the client
+        loop has no handler of its own, so one exception here would end the session for
+        every peer. Unparseable JSON is ignored; a malformed id or method is answered
+        with -32600 before any state is touched; anything else that raises is logged and
+        answered with -32603."""
         try:
             msg = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             return
         if not isinstance(msg, dict):
             return
+        if self._reject_invalid_request(msg):
+            return
+        try:
+            self._dispatch_client(msg, line)
+        except Exception as exc:  # noqa: BLE001 — the backstop "never raises" promises
+            mid, method = msg.get("id"), msg.get("method")
+            sys.stderr.write(f"[terse-multiproxy] internal error routing {method!r} "
+                             f"(id {mid!r}): {type(exc).__name__}: {exc}\n")
+            if mid is not None and method is not None:  # a request; never a notification
+                self._write_client(json.dumps(
+                    {"jsonrpc": "2.0", "id": mid, "error": {
+                        "code": -32603, "message": "terse-multiproxy: internal error"}},
+                    separators=(",", ":"), ensure_ascii=False))
 
+    def _reject_invalid_request(self, msg: dict) -> bool:
+        """True after answering (or dropping) a message whose id or method is not a
+        JSON-RPC type. Checked up front so an unhashable id never reaches a pending-map
+        lookup and leaves half-registered state behind."""
+        mid, method = msg.get("id"), msg.get("method")
+        bad_id = mid is not None and (isinstance(mid, bool)
+                                      or not isinstance(mid, (str, int, float)))
+        bad_method = method is not None and not isinstance(method, str)
+        if not (bad_id or bad_method):
+            return False
+        sys.stderr.write(f"[terse-multiproxy] invalid request (id {mid!r}, method "
+                         f"{method!r}); rejected\n")
+        # A response (no method) is never answered; a notification likewise. JSON-RPC 2.0
+        # §5: when the id itself is invalid it cannot be echoed, so the reply carries null.
+        if method is not None and mid is not None:
+            self._write_client(json.dumps(
+                {"jsonrpc": "2.0", "id": None if bad_id else mid, "error": {
+                    "code": -32600, "message": "terse-multiproxy: invalid request"}},
+                separators=(",", ":"), ensure_ascii=False))
+        return True
+
+    def _dispatch_client(self, msg: dict, line: str) -> None:
         method, mid = msg.get("method"), msg.get("id")
 
         if method == "tools/call":
@@ -950,6 +987,9 @@ class Router:
                     "code": -32602,
                     "message": "terse-multiproxy: params must be an object"}},
                 separators=(",", ":"), ensure_ascii=False))
+        elif self.debug:
+            sys.stderr.write(f"[terse-multiproxy] notification {msg.get('method')!r} "
+                             "with non-object params; dropped\n")
         return None
 
     def _route_call(self, msg: dict) -> None:
