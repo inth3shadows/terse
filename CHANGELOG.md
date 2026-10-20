@@ -13,7 +13,9 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- `terse proxy --wire-log DIR` (single server and `--config`) appends every JSON-RPC line crossing the proxy, at all four hops, to `DIR/<CLAUDE_CODE_SESSION_ID>/<conn>.jsonl` (0600): what the client sent, what the server returned, and what the client was given. That includes blank and malformed lines, notifications, errors, locally answered `terse.retrieve`, snapshot-served `initialize`/`tools/list`, broadcast copies and merged replies, router-made errors and timeouts, and peer lines dropped by a full send queue, plus start, peer start/exit, drain-timeout and stop events. Records are numbered with no gaps, and records lost to a full log queue are counted in a `sink_drop` event. A call whose policy rule has `"capture": false`, and every line for a server whose default rule has it, is logged as metadata only, with no body and no hash. Off by default. It never changes what the client or server receives: a write failure warns once and turns the log off.
 
 ## [0.44.4] - 2026-10-20
 
