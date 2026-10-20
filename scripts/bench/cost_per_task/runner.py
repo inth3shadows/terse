@@ -1,3 +1,8 @@
+# HOST-BY-DESIGN (modelbench bench/review/SANDBOX.md, tier D): arms B and C run the
+# operator's real ~/.claude setup and live kb/runecho/codegraph backends on purpose,
+# because the question is cost per successful task in the user's own environment.
+# Sandboxing them would measure a different setup. Do not reuse this runner for
+# answer-graded runs where the model must not reach the answer key (tier A/B).
 """Task runner for the end-to-end cost-per-successful-task harness.
 
 Runs task x arm x rep in randomized order, ONE `claude -p` session per

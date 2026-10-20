@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# HOST-BY-DESIGN (modelbench bench/review/SANDBOX.md, tier D): needs a mitmproxy CA
+# and a real Claude Code login on the host; the delta between the arms is unaffected
+# by host config, and sandboxing would cut off the proxy and auth. Do not reuse this
+# for answer-graded runs (tier A/B).
 # Measures which MCP result field reaches the model's context (issue #128).
 #
 # Launches a SEPARATE headless Claude Code through a read-only mitmproxy, wired via
