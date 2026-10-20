@@ -208,6 +208,22 @@ class DownstreamSpec:
     snapshot_markers: tuple[str, ...] | None = None
 
 
+_LOG_REPR_MAX = 200
+
+
+def _clip(text: str) -> str:
+    """`text` cut to `_LOG_REPR_MAX` chars for a stderr line: ids, methods and exception
+    messages carry client input, so an unbounded one makes a 1 MB id a 1 MB log line."""
+    if len(text) <= _LOG_REPR_MAX:
+        return text
+    return f"{text[:_LOG_REPR_MAX]}...(+{len(text) - _LOG_REPR_MAX} chars)"
+
+
+def _short(value: object) -> str:
+    """`repr(value)`, clipped (see `_clip`)."""
+    return _clip(repr(value))
+
+
 def load_multi_config(path: str) -> list[DownstreamSpec]:
     """Parse + validate a `--config` JSON file:
     `{"downstreams": [{"name": "gh", "policy": "gh.json", "command": [...]},
@@ -677,6 +693,9 @@ class Router:
         self.by_name = {p.name: i for i, p in enumerate(peers)}
         self.out = out
         self.out_lock = out_lock
+        # Set by `_write_client` when a write to the client fails with OSError (broken
+        # pipe, closed fd): nothing can be answered again, so the client loop stops.
+        self.client_gone = False
         self.debug = debug
         self.broadcast_timeout = broadcast_timeout
         # True if ANY peer's policy enables drop-to-retrieve — gates whether the merged
@@ -860,16 +879,49 @@ class Router:
     # ---------- client -> server ----------
 
     def route_client_line(self, line: str) -> None:
-        """Route one raw JSON-RPC line from the real client. Never raises: a malformed
-        line (shouldn't happen — it came straight from the client's stdin) is silently
-        ignored rather than crashing the whole session over one bad line."""
+        """Route one raw JSON-RPC line from the real client. Unparseable JSON (including
+        nesting deep enough to raise RecursionError) is ignored; a malformed id or method
+        is answered with -32600 before any state is touched; anything dispatch raises is
+        logged and answered with -32603, so the client hears about it. The client loop in
+        `run_multi_proxy` additionally contains anything that still escapes."""
         try:
             msg = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
+        except (ValueError, RecursionError):   # JSONDecodeError is a ValueError
             return
         if not isinstance(msg, dict):
             return
+        if self._reject_invalid_request(msg):
+            return
+        try:
+            self._dispatch_client(msg, line)
+        except Exception as exc:  # noqa: BLE001 — answer the client rather than go silent
+            mid, method = msg.get("id"), msg.get("method")
+            sys.stderr.write(f"[terse-multiproxy] internal error routing {_short(method)} "
+                             f"(id {_short(mid)}): {type(exc).__name__}: "
+                             f"{_clip(str(exc))}\n")
+            if mid is not None and method is not None:  # a request; never a notification
+                self._write_error(mid, -32603, "terse-multiproxy: internal error")
 
+    def _reject_invalid_request(self, msg: dict) -> bool:
+        """True after answering (or dropping) a message whose id or method is not a
+        JSON-RPC type. Checked up front so an unhashable id never reaches a pending-map
+        lookup and leaves half-registered state behind."""
+        mid, method = msg.get("id"), msg.get("method")
+        bad_id = mid is not None and (isinstance(mid, bool)
+                                      or not isinstance(mid, (str, int, float)))
+        bad_method = method is not None and not isinstance(method, str)
+        if not (bad_id or bad_method):
+            return False
+        sys.stderr.write(f"[terse-multiproxy] invalid request (id {_short(mid)}, method "
+                         f"{_short(method)}); rejected\n")
+        # A response (no method) is never answered; a notification likewise. JSON-RPC 2.0
+        # §5: when the id itself is invalid it cannot be echoed, so the reply carries null.
+        if method is not None and mid is not None:
+            self._write_error(None if bad_id else mid, -32600,
+                              "terse-multiproxy: invalid request")
+        return True
+
+    def _dispatch_client(self, msg: dict, line: str) -> None:
         method, mid = msg.get("method"), msg.get("id")
 
         if method == "tools/call":
@@ -934,8 +986,28 @@ class Router:
                 "(scope — see multiproxy.py's module docstring)\n")
             self._write_peer(0, line)
 
+    def _params_or_reject(self, msg: dict) -> dict | None:
+        """`msg`'s params as a dict (absent/null is `{}`), or None after answering a
+        non-object value with -32602 (a notification, having no id, is dropped
+        silently). `or {}` alone passes a truthy list/string/number, whose `.get` would
+        raise out of the client loop and end the session."""
+        params = msg.get("params")
+        if params is None:
+            return {}
+        if isinstance(params, dict):
+            return params
+        if msg.get("id") is not None:
+            self._write_error(msg["id"], -32602,
+                              "terse-multiproxy: params must be an object")
+        elif self.debug:
+            sys.stderr.write(f"[terse-multiproxy] notification {_short(msg.get('method'))} "
+                             "with non-object params; dropped\n")
+        return None
+
     def _route_call(self, msg: dict) -> None:
-        params = msg.get("params") or {}
+        params = self._params_or_reject(msg)
+        if params is None:
+            return
         name = params.get("name")
         mid = msg.get("id")
 
@@ -1064,7 +1136,9 @@ class Router:
         Unlike `_route_call` this does NOT `note_request`: note_request only tracks
         tools/call (a prompts/get reply is a plain passthrough through the peer's
         Interceptor), so registering it would be a no-op anyway."""
-        params = msg.get("params") or {}
+        params = self._params_or_reject(msg)
+        if params is None:
+            return
         name = params.get("name")
         mid = msg.get("id")
         seq, route, _ = self._prompt_state     # ONE load — see __init__
@@ -1192,8 +1266,28 @@ class Router:
 
     def _write_client(self, line: str) -> None:
         with self.out_lock:
-            self.out.write(line + "\n")
-            self.out.flush()
+            try:
+                self.out.write(line + "\n")
+                self.out.flush()
+            except OSError:
+                self.client_gone = True
+                raise
+
+    def _write_error(self, mid: Any, code: int, message: str) -> None:
+        """Write one JSON-RPC error envelope to the client. Never raises: it is what the
+        error paths fall back on, so it must not be the next thing that fails.
+        `ensure_ascii=True` escapes a lone surrogate in a client id (`"\\ud800"`), which
+        strict UTF-8 stdout cannot encode; a failed write is noted once and dropped."""
+        line = json.dumps({"jsonrpc": "2.0", "id": mid,
+                           "error": {"code": code, "message": message}},
+                          separators=(",", ":"), ensure_ascii=True)
+        try:
+            self._write_client(line)
+        except (OSError, ValueError) as exc:
+            gone = " (client stdout is gone)" if self.client_gone else ""
+            sys.stderr.write(f"[terse-multiproxy] could not write {code} reply (id "
+                             f"{_short(mid)}){gone}: {type(exc).__name__}: "
+                             f"{_clip(str(exc))}\n")
 
     def close_senders(self) -> None:
         """Stop every peer's background sender thread (#5). Called once, after the
@@ -2206,7 +2300,17 @@ def run_multi_proxy(
             line = raw.rstrip("\n")
             if not line:
                 continue
-            router.route_client_line(line)
+            try:
+                router.route_client_line(line)
+            except Exception as exc:  # noqa: BLE001 — one line must never end the session
+                sys.stderr.write(f"[terse-multiproxy] client line dropped: "
+                                 f"{type(exc).__name__}: {_clip(str(exc))}\n")
+            # A dead client stdout ends the session like EOF: nothing can be answered
+            # again, and carrying on would only log one failure per remaining line.
+            if router.client_gone:
+                sys.stderr.write("[terse-multiproxy] client stdout is gone; ending the "
+                                 "session\n")
+                break
 
         # A client that disconnects the instant after e.g. `initialize` — before any
         # peer answered — must still get its merged reply; wait out any broadcast still

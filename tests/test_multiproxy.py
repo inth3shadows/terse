@@ -20,6 +20,8 @@ import time
 from collections import OrderedDict
 from threading import Lock
 
+import pytest
+
 from terse import __version__, transforms
 from terse.lossy import _handle, _serialize
 from terse.multiproxy import (
@@ -1953,7 +1955,6 @@ def test_peer_cwd_reaches_the_launched_child(tmp_path):
 
 
 def test_load_multi_config_rejects_env_or_cwd_on_a_url_peer(tmp_path):
-    import pytest
     for bad in ({"env": {"K": "v"}}, {"cwd": "/tmp"}):
         cfg = _write_config(tmp_path, [{"name": "h", "url": "https://x.example/mcp", **bad}])
         with pytest.raises(ValueError, match="launches no process"):
@@ -1965,7 +1966,6 @@ def test_load_multi_config_coerces_scalar_env_values_and_rejects_containers(tmp_
     `{"PORT": 3000}` is a working entry in the config the peers file is generated from,
     and rejecting it takes down every peer in the fleet — not just this one — at router
     launch. A container or null is a mistake, not a convention, so it stays an error."""
-    import pytest
     cfg = _write_config(tmp_path, [{"name": "p", "command": ["true"],
                                     "env": {"PORT": 3000, "DEBUG": True, "S": "x"}}])
     assert load_multi_config(str(cfg))[0].env == {"PORT": "3000", "DEBUG": "True",
@@ -1981,7 +1981,6 @@ def test_load_multi_config_coerces_scalar_env_values_and_rejects_containers(tmp_
 
 def test_load_multi_config_rejects_an_empty_cwd(tmp_path):
     """`Popen(cwd="")` fails with a bare `[Errno 2] ... : ''` that names nothing."""
-    import pytest
     cfg = _write_config(tmp_path, [{"name": "p", "command": ["true"], "cwd": ""}])
     with pytest.raises(ValueError, match="must not be empty"):
         load_multi_config(str(cfg))
@@ -2168,3 +2167,324 @@ def test_an_empty_peer_does_not_mask_a_real_one_in_the_same_listing():
     msg = [m for m in _lines(out) if m.get("id") == 9][0]["error"]["message"]
     assert "b (error)" in msg and "a (empty)" not in msg
     assert "re-read tools/list" in msg
+
+
+@pytest.mark.parametrize("method", ["tools/call", "prompts/get"])
+@pytest.mark.parametrize("params", [["x"], "oops", 7])
+def test_non_object_params_get_invalid_params_not_a_crash(method, params):
+    # A truthy non-object `params` slipped past `msg.get("params") or {}` and raised
+    # AttributeError out of route_client_line, ending the whole session. A request gets
+    # -32602; a notification (no id) is dropped silently. Nothing reaches a peer.
+    _, t1, _, out, router = _two_peer_router()
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 5, "method": method, "params": params}))
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "method": method, "params": params}))
+        assert _peer_calls(t1) == []
+    finally:
+        router.close_senders()
+    msgs = _lines(out)
+    assert len(msgs) == 1
+    assert msgs[0]["id"] == 5 and msgs[0]["error"]["code"] == -32602
+
+
+@pytest.mark.parametrize("params", [[], 0, "", False])
+def test_falsy_non_object_params_get_invalid_params_too(params):
+    # F5: `or {}` used to turn a falsy non-object into `{}` (then -32601, unknown tool);
+    # it is just as malformed as a truthy one, so it gets the same -32602.
+    _, t1, _, out, router = _two_peer_router()
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": params}))
+        assert _peer_calls(t1) == []
+    finally:
+        router.close_senders()
+    msgs = _lines(out)
+    assert len(msgs) == 1
+    assert msgs[0]["id"] == 5 and msgs[0]["error"]["code"] == -32602
+
+
+def _assert_router_still_routes(router, t1, out, mid=42):
+    """A valid call after a malformed line reaches peer b and its reply comes back."""
+    router.route_client_line(json.dumps(
+        {"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+         "params": {"name": "b__search", "arguments": {}}}))
+    sent = _await_peer_call(t1)
+    assert sent["id"] == mid and sent["params"]["name"] == "search"
+    reply = router.from_peer(1)(json.dumps(
+        {"jsonrpc": "2.0", "id": mid,
+         "result": {"content": [{"type": "text", "text": "ok"}]}}))
+    assert reply is not None and reply is not SWALLOW
+    assert json.loads(reply)["id"] == mid and "result" in json.loads(reply)
+    assert mid not in router._routed_timers
+
+
+@pytest.mark.parametrize("bad, reply", [
+    # F1: an unhashable id on a routed call reached `_routed_timers.pop(mid)`.
+    ({"jsonrpc": "2.0", "id": [1], "method": "tools/call", "params": {"name": "a__x"}},
+     {"id": None, "code": -32600}),
+    # F2: an unhashable id on a client response reached `_server_requests.pop(mid)`. A
+    # response is never answered.
+    ({"jsonrpc": "2.0", "id": [1], "result": {}}, None),
+    # F3: a non-string method reached `method in _SNAPSHOT_LISTS`.
+    ({"jsonrpc": "2.0", "id": 1, "method": ["tools/list"]}, {"id": 1, "code": -32600}),
+    ({"jsonrpc": "2.0", "method": ["tools/list"]}, None),            # notification
+    ({"jsonrpc": "2.0", "id": {"k": 1}, "method": "ping"}, {"id": None, "code": -32600}),
+    ({"jsonrpc": "2.0", "id": True, "method": "ping"}, {"id": None, "code": -32600}),
+])
+def test_malformed_id_or_method_is_rejected_and_the_router_keeps_working(bad, reply,
+                                                                         capsys):
+    _, t1, _, out, router = _two_peer_router()
+    try:
+        router.route_client_line(json.dumps(bad))     # must not raise
+        msgs = _lines(out)
+        if reply is None:
+            assert msgs == []
+        else:
+            assert len(msgs) == 1
+            assert msgs[0]["id"] == reply["id"]
+            assert msgs[0]["error"]["code"] == reply["code"]
+        assert _peer_calls(t1) == []
+        assert not router._routed_timers
+        assert "[terse-multiproxy]" in capsys.readouterr().err
+        out.truncate(0)
+        out.seek(0)
+        _assert_router_still_routes(router, t1, out)
+    finally:
+        router.close_senders()
+
+
+def test_an_unexpected_exception_in_dispatch_is_contained(monkeypatch, capsys):
+    # F4: the backstop. Whatever raises inside dispatch must not escape the client loop:
+    # a request gets -32603, a notification gets nothing, and stderr says so.
+    _, t1, _, out, router = _two_peer_router()
+    original = router._route_call
+    fail = [2]
+
+    def _flaky(msg):
+        if fail[0]:
+            fail[0] -= 1
+            raise RuntimeError("boom")
+        return original(msg)
+
+    monkeypatch.setattr(router, "_route_call", _flaky)
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "x"}}))
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "x"}}))
+        msgs = _lines(out)
+        assert len(msgs) == 1
+        assert msgs[0]["id"] == 7 and msgs[0]["error"]["code"] == -32603
+        err = capsys.readouterr().err
+        assert err.count("[terse-multiproxy]") == 2 and "boom" in err
+        out.truncate(0)
+        out.seek(0)
+        _assert_router_still_routes(router, t1, out)
+    finally:
+        router.close_senders()
+
+
+def test_client_loop_survives_malformed_lines_between_valid_calls(tmp_path):
+    # End to end through run_multi_proxy's real `for raw in cin` loop: the malformed
+    # lines must not end the session before the valid calls behind them are answered.
+    cfg = _write_config(tmp_path, [{"name": "gh", "command": [sys.executable, str(FAKE)]}])
+    lines = [
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+         "params": {"name": "gh__gh.api.items"}},
+        {"jsonrpc": "2.0", "id": [1], "method": "tools/call",
+         "params": {"name": "gh__gh.api.items"}},
+        {"jsonrpc": "2.0", "id": [1], "result": {}},
+        {"jsonrpc": "2.0", "id": 9, "method": ["tools/list"]},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": "gh__gh.api.items"}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": []},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+         "params": {"name": "gh__gh.api.items"}},
+    ]
+    cin = io.StringIO("".join(json.dumps(m) + "\n" for m in lines))
+    cout = io.StringIO()
+    assert run_multi_proxy(str(cfg), PLAIN_POLICY, stdin=cin, stdout=cout) == 0
+    by_id = {}
+    for m in _lines(cout):
+        by_id.setdefault(json.dumps(m.get("id")), []).append(m)
+    for ok in (1, 2, 4):
+        assert len(by_id[str(ok)]) == 1 and "result" in by_id[str(ok)][0], by_id
+    assert by_id["9"][0]["error"]["code"] == -32600
+    assert by_id["3"][0]["error"]["code"] == -32602
+    assert by_id["null"][0]["error"]["code"] == -32600
+
+
+def _strict_utf8_out():
+    """A client stdout like the real one: strict UTF-8, so a lone surrogate in a reply
+    raises UnicodeEncodeError on write instead of passing through as io.StringIO does."""
+    return io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict")
+
+
+def _strict_lines(out) -> list[dict]:
+    out.flush()
+    raw = out.buffer.getvalue().decode("utf-8")
+    return [json.loads(ln) for ln in raw.splitlines() if ln.strip()]
+
+
+@pytest.mark.parametrize("msg, code", [
+    # Unknown tool: the -32601 write raises; the backstop's -32603 must still go out.
+    ({"jsonrpc": "2.0", "id": "\ud800", "method": "tools/call",
+      "params": {"name": "nope"}}, -32603),
+    # Bad method: the -32600 rejection itself must be writable.
+    ({"jsonrpc": "2.0", "id": "\ud800", "method": 5}, -32600),
+])
+def test_an_unencodable_id_gets_a_valid_escaped_reply(msg, code, capsys):
+    # R2-1: id "\ud800" made every error write raise UnicodeEncodeError on a strict
+    # UTF-8 stdout, out of route_client_line and so out of the client loop.
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    out = _strict_utf8_out()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        router.route_client_line(json.dumps(msg))     # must not raise
+        out.flush()
+        assert b'"id":"\\ud800"' in out.buffer.getvalue()
+        msgs = _strict_lines(out)
+        assert len(msgs) == 1
+        assert msgs[0]["id"] == "\ud800" and msgs[0]["error"]["code"] == code
+        assert not router.client_gone
+        _assert_router_still_routes(router, t1, out)
+    finally:
+        router.close_senders()
+
+
+class _BrokenPipeOut:
+    """A client stdout whose reader has gone away."""
+
+    def __init__(self):
+        self.writes = 0
+
+    def write(self, s):
+        self.writes += 1
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self):
+        pass
+
+
+@pytest.mark.parametrize("msg", [
+    {"jsonrpc": "2.0", "id": 1, "method": 5},                                 # -32600
+    {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": [1]},        # -32602
+    {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "nope"}},
+])
+def test_a_failing_client_write_does_not_escape_and_marks_the_client_gone(msg, capsys):
+    # R2-1/R2-8: BrokenPipe on the client stdout escaped route_client_line.
+    _, _, peers, _, _ = _two_peer_router()
+    router = Router(peers, _BrokenPipeOut(), Lock(), broadcast_timeout=1000)
+    try:
+        router.route_client_line(json.dumps(msg))     # must not raise
+    finally:
+        router.close_senders()
+    assert router.client_gone
+    err = capsys.readouterr().err
+    assert "Traceback" not in err and "client stdout" in err
+
+
+def test_a_deeply_nested_line_is_a_parse_failure_not_a_crash(capsys):
+    # R2-2: json.loads raises RecursionError (not ValueError) on deep nesting.
+    _, t1, _, out, router = _two_peer_router()
+    try:
+        router.route_client_line("[" * 100000)          # must not raise
+        assert _lines(out) == []
+        _assert_router_still_routes(router, t1, out)
+    finally:
+        router.close_senders()
+
+
+def test_a_bad_params_notification_is_traced_under_debug(capsys):
+    # F7 / R2-8: the dropped notification leaves a --debug stderr line, none without.
+    _, t1, _, out, router = _two_peer_router()
+    try:
+        note = json.dumps({"jsonrpc": "2.0", "method": "tools/call", "params": [1]})
+        router.route_client_line(note)
+        assert capsys.readouterr().err == ""
+        router.debug = True
+        router.route_client_line(note)
+        assert _lines(out) == [] and _peer_calls(t1) == []
+    finally:
+        router.close_senders()
+    err = capsys.readouterr().err
+    assert "notification 'tools/call' with non-object params; dropped" in err
+
+
+def test_stderr_lines_for_a_huge_id_are_bounded(capsys):
+    # R2-6: the rejection log used to repr the whole id (1 MB id -> 1 MB stderr line).
+    _, _, _, out, router = _two_peer_router()
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": ["a" * 1_000_000], "method": "ping"}))
+    finally:
+        router.close_senders()
+    assert _lines(out)[0]["error"]["code"] == -32600
+    err = capsys.readouterr().err
+    assert err and max(len(ln) for ln in err.splitlines()) < 1000
+
+
+def test_client_loop_survives_unwritable_deep_and_raising_lines(tmp_path, monkeypatch,
+                                                                 capsys):
+    # End to end through `for raw in cin` on a strict UTF-8 stdout: a surrogate id, a
+    # deeply nested line, a raise inside dispatch and a raise outside the inner backstop
+    # are each contained, and every valid call behind them is answered.
+    original_dispatch = Router._dispatch_client
+    original_reject = Router._reject_invalid_request
+
+    def _dispatch(self, msg, line):
+        if msg.get("id") == 50:
+            raise RuntimeError("dispatch boom")
+        return original_dispatch(self, msg, line)
+
+    def _reject(self, msg):
+        if msg.get("id") == 60:
+            raise RuntimeError("outer boom")
+        return original_reject(self, msg)
+
+    monkeypatch.setattr(Router, "_dispatch_client", _dispatch)
+    monkeypatch.setattr(Router, "_reject_invalid_request", _reject)
+    cfg = _write_config(tmp_path, [{"name": "gh", "command": [sys.executable, str(FAKE)]}])
+    call = {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "gh__gh.api.items"}}
+    text = "".join([
+        json.dumps({**call, "id": 1}) + "\n",
+        json.dumps({"jsonrpc": "2.0", "id": "\ud800", "method": "tools/call",
+                    "params": {"name": "nope"}}) + "\n",
+        json.dumps({**call, "id": 2}) + "\n",
+        "[" * 100000 + "\n",
+        json.dumps({**call, "id": 3}) + "\n",
+        json.dumps({**call, "id": 50}) + "\n",
+        json.dumps({**call, "id": 4}) + "\n",
+        json.dumps({**call, "id": 60}) + "\n",
+        json.dumps({**call, "id": 5}) + "\n",
+    ])
+    cout = _strict_utf8_out()
+    assert run_multi_proxy(str(cfg), PLAIN_POLICY, stdin=io.StringIO(text),
+                           stdout=cout) == 0
+    by_id: dict = {}
+    for m in _strict_lines(cout):
+        by_id.setdefault(m.get("id"), []).append(m)
+    for ok in (1, 2, 3, 4, 5):
+        assert len(by_id[ok]) == 1 and "result" in by_id[ok][0], by_id
+    assert by_id["\ud800"][0]["error"]["code"] == -32603
+    assert by_id[50][0]["error"]["code"] == -32603
+    assert 60 not in by_id                    # raised before any reply could be built
+    err = capsys.readouterr().err
+    assert "outer boom" in err and "Traceback" not in err
+
+
+def test_client_loop_ends_cleanly_when_client_stdout_is_gone(tmp_path, capsys):
+    # A dead client pipe ends the session like EOF: one note, no traceback, no
+    # per-line logging for the rest of the input.
+    cfg = _write_config(tmp_path, [{"name": "gh", "command": [sys.executable, str(FAKE)]}])
+    bad = json.dumps({"jsonrpc": "2.0", "id": 1, "method": 5}) + "\n"
+    cout = _BrokenPipeOut()
+    assert run_multi_proxy(str(cfg), PLAIN_POLICY, stdin=io.StringIO(bad * 50),
+                           stdout=cout) == 0
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert err.count("ending the session") == 1
+    assert err.count("invalid request") == 1

@@ -13,7 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- A `tools/call` or `prompts/get` whose `params` is not an object (a list, string or number) no longer ends a multiproxy session. The router raised on it and the client loop died; it now answers a request with a -32602 error and drops a notification.
+- A multiproxy client line with an id or method of the wrong JSON type (an `id` that is a list, object or boolean, a `method` that is not a string) no longer ends the session; it gets a -32600 error, with a null id when the id itself is the problem. An exception while routing a client request is logged to stderr and answered with -32603, and the client loop now drops any line that still raises (logged) and reads the next one, so a bad line that decodes as UTF-8 no longer ends the session for every peer (invalid UTF-8 on stdin still does). The router's -32600, -32602 and -32603 replies escape non-ASCII in the id, so a lone-surrogate id (`"\ud800"`) on a reply written by the client loop gets a valid reply instead of crashing the write (a loop-written reply that still cannot be encoded, such as an unknown-tool -32601, falls back to -32603); replies written from a peer or timer thread (broadcast merges, routed results, -32001 timeouts) are not covered and still fail on such an id. A line nested deep enough to overflow the JSON parser is ignored like any other unparseable line, and when the router's own write to the client's stdout fails, the client loop stops reading and shuts the peers down as at end of input, instead of raising. Stderr notes about a rejected line clip the id and method to 200 characters. Failures on the peer side of the router are not covered by this change. A non-object `params` that is empty or false (`[]`, `0`, `""`, `false`) is now a -32602 like any other, where it used to be read as no params.
 
 ## [0.44.3] - 2026-10-08
 
