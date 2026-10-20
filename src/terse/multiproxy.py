@@ -934,8 +934,28 @@ class Router:
                 "(scope — see multiproxy.py's module docstring)\n")
             self._write_peer(0, line)
 
+    def _params_or_reject(self, msg: dict) -> dict | None:
+        """`msg`'s params as a dict (absent/null is `{}`), or None after answering a
+        non-object value with -32602 (a notification, having no id, is dropped
+        silently). `or {}` alone passes a truthy list/string/number, whose `.get` would
+        raise out of the client loop and end the session."""
+        params = msg.get("params")
+        if params is None:
+            return {}
+        if isinstance(params, dict):
+            return params
+        if msg.get("id") is not None:
+            self._write_client(json.dumps(
+                {"jsonrpc": "2.0", "id": msg["id"], "error": {
+                    "code": -32602,
+                    "message": "terse-multiproxy: params must be an object"}},
+                separators=(",", ":"), ensure_ascii=False))
+        return None
+
     def _route_call(self, msg: dict) -> None:
-        params = msg.get("params") or {}
+        params = self._params_or_reject(msg)
+        if params is None:
+            return
         name = params.get("name")
         mid = msg.get("id")
 
@@ -1064,7 +1084,9 @@ class Router:
         Unlike `_route_call` this does NOT `note_request`: note_request only tracks
         tools/call (a prompts/get reply is a plain passthrough through the peer's
         Interceptor), so registering it would be a no-op anyway."""
-        params = msg.get("params") or {}
+        params = self._params_or_reject(msg)
+        if params is None:
+            return
         name = params.get("name")
         mid = msg.get("id")
         seq, route, _ = self._prompt_state     # ONE load — see __init__

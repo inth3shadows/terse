@@ -20,6 +20,8 @@ import time
 from collections import OrderedDict
 from threading import Lock
 
+import pytest
+
 from terse import __version__, transforms
 from terse.lossy import _handle, _serialize
 from terse.multiproxy import (
@@ -2168,3 +2170,23 @@ def test_an_empty_peer_does_not_mask_a_real_one_in_the_same_listing():
     msg = [m for m in _lines(out) if m.get("id") == 9][0]["error"]["message"]
     assert "b (error)" in msg and "a (empty)" not in msg
     assert "re-read tools/list" in msg
+
+
+@pytest.mark.parametrize("method", ["tools/call", "prompts/get"])
+@pytest.mark.parametrize("params", [["x"], "oops", 7])
+def test_non_object_params_get_invalid_params_not_a_crash(method, params):
+    # A truthy non-object `params` slipped past `msg.get("params") or {}` and raised
+    # AttributeError out of route_client_line, ending the whole session. A request gets
+    # -32602; a notification (no id) is dropped silently. Nothing reaches a peer.
+    _, t1, _, out, router = _two_peer_router()
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 5, "method": method, "params": params}))
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "method": method, "params": params}))
+        assert _peer_calls(t1) == []
+    finally:
+        router.close_senders()
+    msgs = _lines(out)
+    assert len(msgs) == 1
+    assert msgs[0]["id"] == 5 and msgs[0]["error"]["code"] == -32602
