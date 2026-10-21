@@ -63,6 +63,7 @@ import hashlib
 import json
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -101,6 +102,12 @@ from .stats import (
     router_ledger_label,
 )
 from .transport import Transport, build_transport
+from .wirelog import (
+    WireTap,
+    open_wire_tap,
+    retrieve_handle,
+    server_excluded,
+)
 
 # Tool-name prefix separator — defined in policy.py (not here) so Policy.select can
 # recognize and strip it when matching a captured, peer-qualified corpus tool name
@@ -605,9 +612,14 @@ class _PeerSender:
 
     _STOP: Any = object()
 
-    def __init__(self, transport: Transport, debug: bool = False):
+    def __init__(self, transport: Transport, debug: bool = False,
+                 wire: WireTap | None = None, peer: str | None = None):
         self._transport = transport
         self._debug = debug
+        # The wire log's server_out tap: a line is recorded once — at its real write, or
+        # as `dropped` where it is discarded instead (queue full, evicted at close).
+        self._wire = wire
+        self._peer = peer
         # BOUNDED: an unbounded queue let a client hammering one stalled HTTP peer grow
         # memory without limit (its single worker drains slower than sends arrive). The
         # bound turns that runaway into a dropped line for the already-broken peer instead
@@ -617,10 +629,16 @@ class _PeerSender:
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def send(self, line: str) -> None:
+    def send(self, line: str, origin: str | None = None) -> None:
+        # The exclusion decision of the client (or peer) line this send derives from is
+        # taken HERE, on the producing thread, and carried to the worker's tap.
+        ctx = self._wire.context() if self._wire is not None else None
         try:
-            self._q.put_nowait(line)
+            self._q.put_nowait((line, origin, ctx))
         except queue.Full:
+            if self._wire is not None:
+                self._wire.tap("server_out", line, peer=self._peer, status="dropped",
+                               origin="queue_full", inherit=ctx)
             # Peer worker can't keep up (stalled/hung peer). Drop rather than block the
             # shared routing thread or grow memory. Announce the first drop so a silently
             # falling-behind peer is visible; stay quiet after to avoid a stderr flood.
@@ -632,15 +650,22 @@ class _PeerSender:
 
     def _run(self) -> None:
         while True:
-            line = self._q.get()
-            if line is self._STOP:
+            item = self._q.get()
+            if item is self._STOP:
                 return
+            line, origin, ctx = item
+            if self._wire is not None:
+                self._wire.tap("server_out", line, peer=self._peer, origin=origin,
+                               inherit=ctx)
             try:
                 w = self._transport.outbound()
                 w.write(line + "\n")
                 w.flush()
             except Exception as exc:  # noqa: BLE001 — one peer's send failure must
                                        # never crash its worker thread or any other peer
+                if self._wire is not None:
+                    self._wire.event("write_error", peer=self._peer,
+                                     error=f"{type(exc).__name__}: {_clip(str(exc))}")
                 if self._debug:
                     sys.stderr.write(f"[terse-multiproxy] send failed: {exc}\n")
 
@@ -654,9 +679,12 @@ class _PeerSender:
                 break
             except queue.Full:
                 try:
-                    self._q.get_nowait()
+                    evicted = self._q.get_nowait()
                 except queue.Empty:
-                    pass
+                    continue
+                if self._wire is not None and evicted is not self._STOP:
+                    self._wire.tap("server_out", evicted[0], peer=self._peer,
+                                   status="dropped", origin="evicted", inherit=evicted[2])
         self._thread.join(timeout=2.0)
 
 
@@ -674,8 +702,15 @@ class Router:
                  debug: bool = False, broadcast_timeout: float = BROADCAST_TIMEOUT,
                  primer_latch: PrimerLatch | None = None,
                  on_session: Callable[[str], None] | None = None,
-                 snapshot: RouterSnapshot | None = None):
+                 snapshot: RouterSnapshot | None = None,
+                 wire: WireTap | None = None):
         self.peers = peers
+        # The wire log (wirelog.py), or None. Every client-facing write goes through
+        # `_write_client`, which records it; peer writes are recorded by `_PeerSender`.
+        # Its exclusion gate asks `_wire_resolve` where a client request goes.
+        self.wire = wire
+        if wire is not None:
+            wire.resolve = self._wire_resolve
         # Writes one `router_session` ledger row per client `initialize` (#212) -- the
         # proof, for `primer_liability`, that a LAZY router ran this session even when no
         # result ever attached its primer. Fail-open: see `_broadcast`.
@@ -711,7 +746,8 @@ class Router:
         self.has_drop = any(p.inter.policy.has_drop(p.inter.server_name) for p in peers)
         # One background sender per peer (index-aligned with `peers`) so a slow HTTP
         # peer's blocking send can't stall routing to any other peer — see _PeerSender.
-        self._senders = [_PeerSender(p.transport, debug=debug) for p in peers]
+        self._senders = [_PeerSender(p.transport, debug=debug, wire=wire, peer=p.name)
+                         for p in peers]
 
         # Routing tables built by `_merge_tools_list` / `_merge_prompts_list` (#168):
         # exposed name -> (peer index, the bare name that peer actually expects). Names
@@ -878,6 +914,52 @@ class Router:
 
     # ---------- client -> server ----------
 
+    def _wire_resolve(self, msg: dict) -> tuple[str | None, bool] | None:
+        """The wire log's decision for one parsed client message: where it goes, mirroring
+        `_dispatch_client`. A tools/call / prompts/get name resolves to (peer, bare name)
+        through the same table and `_resolve` `_route_call` uses, then THAT peer's policy
+        decides, exactly as its Interceptor will (peer-qualified name, peer as server).
+        Anything else is broadcast to every peer (a notification, or one of
+        `_BROADCAST_METHODS`) or sent to peer 0, and is excluded when any peer it reaches
+        is excluded as a whole. A response (no method) is matched by id in the tap."""
+        assert self.wire is not None
+        method, params = msg.get("method"), msg.get("params")
+        if not isinstance(method, str):
+            return None
+        whole = self.wire.excluded_peers
+        if method not in ("tools/call", "prompts/get"):
+            targets = (self.peers if msg.get("id") is None or method in _BROADCAST_METHODS
+                       else self.peers[:1])
+            for p in targets:
+                if p.name in whole:
+                    return whole[p.name], True
+            return None
+        if not isinstance(params, dict):
+            return None                 # answered -32602 by the router, sent nowhere
+        name = params.get("name")
+        if method == "tools/call" and name == lossy_mod.RETRIEVE_TOOL:
+            # The origin map is shared by every peer; it names the DROPPING peer and the
+            # qualified tool, so the reply is excluded iff that result was.
+            origin = (self.peers[0].inter._drop_origin.get(retrieve_handle(params) or "")
+                      if self.peers else None)
+            idx = self.by_name.get(origin[0]) if origin is not None else None
+            if origin is None or idx is None:
+                return None
+            peer, tool = self.peers[idx], origin[1]
+        else:
+            seq, route, _ = self._tool_state if method == "tools/call" else self._prompt_state
+            target = self._resolve(name, route, seq >= 0)
+            if target is None:
+                return None
+            peer = self.peers[target[0]]
+            tool = f"{peer.name}{PREFIX_SEP}{target[1]}"
+        if peer.name in whole:
+            return whole[peer.name], True
+        if method != "tools/call":
+            return None
+        rule = peer.inter.policy.select(tool, peer.name)
+        return rule.tool_glob, not rule.capture
+
     def route_client_line(self, line: str) -> None:
         """Route one raw JSON-RPC line from the real client. Unparseable JSON (including
         nesting deep enough to raise RecursionError) is ignored; a malformed id or method
@@ -1018,7 +1100,7 @@ class Router:
             reply = self.peers[0].inter.answer_retrieve(
                 json.dumps(msg, separators=(",", ":"), ensure_ascii=False))
             if reply is not None:
-                self._write_client(reply)
+                self._write_client(reply, status="local_answer", origin="retrieve")
             return
 
         seq, route, silent = self._tool_state  # ONE load — see __init__
@@ -1244,7 +1326,8 @@ class Router:
                 # fires. Clear it immediately: multiproxy builds its own merged
                 # initialize reply, so this peer's init_id has no other purpose.
                 peer.inter.clear_init_id()
-            self._write_peer(i, line)
+            self._write_peer(i, line, "router_broadcast" if on_done is None
+                             else "router_internal")
         if kind == "initialize" and self.on_session is not None:
             try:
                 # `on_done` is set only by `_fast_initialize`: the client was already
@@ -1258,14 +1341,28 @@ class Router:
         for sender in self._senders:
             sender.send(line)
 
-    def _write_peer(self, idx: int, line: str) -> None:
+    def _write_peer(self, idx: int, line: str, origin: str | None = None) -> None:
         # Enqueued to the peer's own background sender (#5): never blocks this thread
         # on a peer's network round-trip, so one slow HTTP peer can't stall routing to
         # any OTHER peer — see _PeerSender's docstring.
-        self._senders[idx].send(line)
+        if origin is None:
+            self._senders[idx].send(line)
+        else:
+            self._senders[idx].send(line, origin)
 
-    def _write_client(self, line: str) -> None:
+    def _write_client(self, line: str, *, status: str = "synthesized",
+                      origin: str = "router") -> None:
+        """Every router-originated client line (peer passthroughs go through `pump`).
+        `status`/`origin` label it in the wire log. A merged or snapshot-served reply holds
+        every peer's share, so with any peer excluded as a whole it is excluded outright
+        (over-excluding a list is the safe direction) — whatever its id says."""
         with self.out_lock:
+            if self.wire is not None:
+                force = None
+                if origin in ("router_broadcast", "snapshot") and self.wire.excluded_peers:
+                    force = next(iter(self.wire.excluded_peers.values()))
+                self.wire.tap("client_out", line, status=status, origin=origin,
+                              force=force)
             try:
                 self.out.write(line + "\n")
                 self.out.flush()
@@ -1282,7 +1379,7 @@ class Router:
                            "error": {"code": code, "message": message}},
                           separators=(",", ":"), ensure_ascii=True)
         try:
-            self._write_client(line)
+            self._write_client(line, origin="error_writer")
         except (OSError, ValueError) as exc:
             gone = " (client stdout is gone)" if self.client_gone else ""
             sys.stderr.write(f"[terse-multiproxy] could not write {code} reply (id "
@@ -1461,7 +1558,7 @@ class Router:
             {"jsonrpc": "2.0", "id": mid, "error": {
                 "code": -32001,
                 "message": f"terse-multiproxy: peer {peer_name!r} timed out"}},
-            separators=(",", ":"), ensure_ascii=False))
+            separators=(",", ":"), ensure_ascii=False), origin="timeout")
 
     def _finish_broadcast(self, seq: int) -> None:
         with self._pending_lock:
@@ -1489,7 +1586,7 @@ class Router:
         body = self._merge_broadcast(pb)
         self._write_client(json.dumps(
             {"jsonrpc": "2.0", "id": pb.client_id, **body},
-            separators=(",", ":"), ensure_ascii=False))
+            separators=(",", ":"), ensure_ascii=False), origin="router_broadcast")
         # After the reply, so the client never waits on a snapshot write.
         if pb.kind in _SNAPSHOT_KINDS and self.snapshot is not None:
             try:
@@ -1572,7 +1669,8 @@ class Router:
         # still reaches every peer's queue behind the `initialize` below.
         self._write_client(json.dumps({"jsonrpc": "2.0", "id": msg.get("id"),
                                        "result": result},
-                                      separators=(",", ":"), ensure_ascii=False))
+                                      separators=(",", ":"), ensure_ascii=False),
+                           origin="snapshot")
         self._broadcast(msg, "initialize", on_done=partial(self._warm_initialized, warm))
         return True
 
@@ -1586,7 +1684,8 @@ class Router:
             return False
         body = self._merge_broadcast(self._stored_pb(kind, warm.parts[kind], warm.seq))
         self._write_client(json.dumps({"jsonrpc": "2.0", "id": msg.get("id"), **body},
-                                      separators=(",", ":"), ensure_ascii=False))
+                                      separators=(",", ":"), ensure_ascii=False),
+                           origin="snapshot")
         return True
 
     def _client_initialized(self) -> None:
@@ -1665,7 +1764,7 @@ class Router:
         self._maybe_persist()
         for note in notes:
             self._write_client(json.dumps({"jsonrpc": "2.0", "method": note},
-                                          separators=(",", ":")))
+                                          separators=(",", ":")), origin="reconcile")
 
     def _record(self, pb: _PendingBroadcast) -> None:
         """Keep a COMPLETE broadcast's replies as this process's live view of `pb.kind`.
@@ -2187,6 +2286,35 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
     return peers
 
 
+def _peer_pid(peer: Peer) -> int | None:
+    proc = getattr(peer.transport, "proc", None)
+    return getattr(proc, "pid", None)
+
+
+def _peer_reader(peer: Peer, cout: TextIO, transform: Callable[[str], Any], out_lock: Lock,
+                 wire: WireTap | None) -> None:
+    """One peer's server->client pump thread; with the wire log, taps both sides and
+    records the peer's exit once its stdout reaches EOF (a crash mid-session included)."""
+    if wire is None:
+        pump(peer.transport.inbound(), cout, transform, lock=out_lock)
+        return
+    tap, name = wire.tap, peer.name
+    try:
+        # client_out inherits the server_in decision this thread just made (wirelog.py).
+        pump(peer.transport.inbound(), cout, transform, lock=out_lock,
+             on_read=lambda raw: tap("server_in", raw, peer=name),
+             on_write=lambda out: tap("client_out", out))
+    finally:
+        proc = getattr(peer.transport, "proc", None)
+        code = None
+        if proc is not None:
+            try:
+                code = proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+        wire.event("peer_exit", peer=name, pid=_peer_pid(peer), exit_code=code)
+
+
 def run_multi_proxy(
     config_path: str,
     default_policy: policy_mod.Policy,
@@ -2202,6 +2330,8 @@ def run_multi_proxy(
     join_blocks_override: bool | None = None,
     stats_log: str | None = None,
     primer_mode: str = PRIMER_ALWAYS,
+    wire_log: str | None = None,
+    policy_path: str | None = None,
 ) -> int:
     """Load `config_path`, build one `Peer` per downstream (own `Transport` + own
     `Interceptor`, all sharing one drop store), spawn one `pump()` reader thread per
@@ -2231,7 +2361,8 @@ def run_multi_proxy(
     # ONE session id across every peer: the peers share a corpus dir, and each peer's
     # `server` already disambiguates them — a per-peer id would only make the same run look
     # like N runs to a tune-time reader.
-    capture, audit = _build_capture_and_audit(capture_dir, debug_log, _new_session_id())
+    conn = _new_session_id()
+    capture, audit = _build_capture_and_audit(capture_dir, debug_log, conn)
 
     store: OrderedDict[str, Any] = OrderedDict()
     store_lock = Lock()
@@ -2273,6 +2404,19 @@ def run_multi_proxy(
         sys.stderr.write(f"[terse-multiproxy] bad downstream policy: {exc}\n")
         return 2
 
+    wire = None
+    if wire_log is not None:
+        excluded = {p.name: glob for p in peers
+                    if (glob := server_excluded(p.inter.policy, p.name)) is not None}
+        wire = open_wire_tap(wire_log, conn, excluded_peers=excluded)
+    if wire is not None:
+        from . import __version__
+        wire.event("start", version=__version__, mode="multi", policy=policy_path,
+                   config=config_path, peers=[p.name for p in peers],
+                   argv={"argc": len(peers)})
+        for p in peers:
+            wire.event("peer_start", peer=p.name, pid=_peer_pid(p))
+
     out_lock = Lock()
     launch_dir = snapshot_scope(specs)
     router = Router(peers, cout, out_lock, debug=debug, broadcast_timeout=broadcast_timeout,
@@ -2280,14 +2424,15 @@ def run_multi_proxy(
                     on_session=(build_router_session_writer(stats_log, primer_label)
                                 if stats_log is not None else None),
                     snapshot=RouterSnapshot(router_snapshot_path(config_path, launch_dir),
-                                            peers_fingerprint(specs, launch_dir)))
+                                            peers_fingerprint(specs, launch_dir)),
+                    wire=wire)
 
     sigterm_token = _install_sigterm_to_exit()
 
     try:
-        threads = [Thread(target=pump,
-                          args=(peer.transport.inbound(), cout, router.from_peer(i)),
-                          kwargs={"lock": out_lock}, daemon=True)
+        threads = [Thread(target=_peer_reader,
+                          args=(peer, cout, router.from_peer(i), out_lock, wire),
+                          daemon=True)
                   for i, peer in enumerate(peers)]
         for t in threads:
             t.start()
@@ -2297,6 +2442,8 @@ def run_multi_proxy(
         # line-out (see module docstring). Running it inline on THIS thread means
         # "block until client stdin EOF" falls out of the for-loop ending, for free.
         for raw in cin:
+            if wire is not None:
+                wire.tap("client_in", raw)
             line = raw.rstrip("\n")
             if not line:
                 continue
@@ -2348,4 +2495,6 @@ def run_multi_proxy(
         # stdio child that didn't exit on its own; a harmless repeat close for HTTP).
         for peer in peers:
             peer.transport.close()
+        if wire is not None:
+            wire.close()
         _restore_sigterm(sigterm_token)

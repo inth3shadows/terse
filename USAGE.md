@@ -892,6 +892,50 @@ actually affected, and the flood guard still holds within each peer.
 Because those records embed the raw payload, a tool with `"capture": false` in the policy
 (above) is skipped here too — one declaration covers both disk sinks.
 
+### Recording everything that crossed the proxy (`--wire-log`)
+
+`--debug-log` records one entry per *result*. `--wire-log DIR` records every JSON-RPC
+**line**, in both directions, at all four hops: what the client sent, what terse forwarded
+to the server, what the server answered, and what the client was finally given. That makes
+an agent's MCP session reconstructible afterwards: both the original a server sent and the
+compressed text the model actually read. It works the same for a single server and for
+`--config`:
+
+```bash
+uv run terse proxy --wire-log ~/.local/state/terse/wire -- uvx some-mcp-server
+```
+
+Each proxy process writes one file, `DIR/<session>/<conn>.jsonl`, where `<session>` is
+`$CLAUDE_CODE_SESSION_ID` (Claude Code sets it for every MCP server it launches; otherwise
+`no-session`) and `<conn>` is the process's own id. The directories are created `0700` and
+the file `0600`. Every record carries `seq`, which counts up from 0. A missing number is a
+record the log dropped because it fell behind, and every one is counted in a `sink_drop`
+event (see below), so the holes always add up to the `sink_drop` counts.
+
+`capture: false` applies here too. A call whose rule says `"capture": false` is logged
+without its body: its request, its result, its progress notifications, any request the
+server sends while it runs and the client's answer, and any `terse.retrieve` reply drawn
+from that result. The same goes for every line to or from a server whose default rule says
+it (the `secret-broker.*` default-deny). Those records keep the method, id, length and
+timing, but `line` and `sha256` are `null`. There is no hash, because the sha256 of a short
+secret can be brute-forced.
+
+When in doubt the log hides a line rather than risk one. With `--config`, anything that
+also reaches an excluded server is hidden: `initialize`, the tool and resource lists,
+`ping` and notifications all go to every server, so with `secret-broker` in the fleet they
+are logged as metadata only. The exact rules are in TECHNICAL.md ("Wire log").
+
+Like the other sinks, the wire log never affects forwarding. It is written off the
+forwarding threads. If the writer falls behind, records are dropped and counted, and a
+`sink_drop` event later records how many. If the directory can't be opened, a write
+fails or the log itself hits a bug, terse warns once on stderr and turns the wire log off
+for that process. Proxying
+carries on as before.
+
+It holds raw tool payloads, the same kind of content as Claude Code's own transcripts.
+Treat the directory that way: keep it local and don't sync it. The full record schema is
+in TECHNICAL.md ("Wire log").
+
 ### How much is terse actually saving me? (`terse stats`)
 
 Every proxy keeps a **live savings ledger** by default — one small JSON line per tool

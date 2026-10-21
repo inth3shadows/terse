@@ -163,6 +163,13 @@ off by default because it failed rung 4 at the measured hit rate.
   default in `cli.py` (`--no-stats` / `--stats-log FILE`);
   the `run_proxy`/`run_multi_proxy` API default stays None (disabled) so library
   callers opt in explicitly.
+- **`wirelog.py`** — the `--wire-log` sink (see "Wire log" below). `WireTap.tap()` runs on
+  the forwarding threads: it stamps clocks, makes the `capture: false` decision (`_Scope`,
+  with the mode's `resolve` for client requests and `server_excluded` for whole servers),
+  takes `seq` and enqueues; one writer thread hashes, serializes and appends. It is wired in
+  through `pump`'s
+  `on_read`/`on_write` hooks, `run_proxy`'s retrieve answer, `Router._write_client`,
+  `_PeerSender` and the multiproxy client loop.
 - **`capture.py`** — `classify_shape` (pretty/compact JSON, array-of-records,
   long-text), `capture_payload` (writes a sha-idempotent envelope to `corpus/`),
   `load_corpus`, `coverage`, `extract_records`, `bare_and_server` / `qualify` /
@@ -349,6 +356,90 @@ off by default because it failed rung 4 at the measured hit rate.
 `policy.example.json` ships a policy that encodes the measured insight (gh/runecho
 full tiers, kb drops dictionary, `*.rate_limit` skipped).
 
+### Wire log (`--wire-log DIR`)
+
+Off by default. One file per proxy process: `DIR/<CLAUDE_CODE_SESSION_ID or
+no-session>/<conn>.jsonl`, where `conn` is the per-process id that also scopes capture
+result ids. Directories are created 0700 and the file 0600 (`O_APPEND|O_NOFOLLOW`). A
+connection never shares a file, so v1 needs no rotation. No fsync: each batch is flushed,
+and the file is flushed and closed when the proxy exits.
+
+One JSON object per line (`ensure_ascii`, so any string round-trips):
+
+| field | meaning |
+|---|---|
+| `v` | schema version, `1` |
+| `conn`, `seq` | process id; record number, from 0, +1 per record, kept or dropped (a missing number is a record lost to a full queue, counted by the next `sink_drop`) |
+| `ts_ns`, `mono_ns` | wall clock and monotonic clock, nanoseconds |
+| `claude_session` | `$CLAUDE_CODE_SESSION_ID`, or `no-session` |
+| `peer` | the server's name on `server_out`/`server_in` (single proxy: `--server-name`, else the ledger label); `null` on client hops |
+| `hop` | `client_in`, `server_out`, `server_in`, `client_out`, or `event` |
+| `jsonrpc_id`, `method` | taken from the line when it parses as a JSON object |
+| `len` | the line's length in characters, newline excluded |
+| `sha256` | of the line's UTF-8 encoding; `null` when excluded |
+| `line` | the exact line, newline excluded; `null` when excluded |
+| `capture_status` | `full`, `excluded_by_policy`, `parse_error` (blank, whitespace-only or not JSON), `dropped` (a peer line discarded instead of written), `synthesized` (terse wrote it, not a server), `local_answer` (a `terse.retrieve` reply) |
+| `origin` | for terse-made or discarded lines: `retrieve`, `snapshot`, `router_broadcast` (a fan-out copy or the merged reply), `router_internal` (the router's own background broadcasts), `timeout` (-32001), `router` (-32601 unknown tool/prompt), `error_writer` (-32600/-32602/-32603), `reconcile` (list_changed), `http_synth` (HTTP transport's -32000), `queue_full` / `evicted` (peer send queue) |
+| `rule` | the policy rule glob behind an exclusion or a tools/call decision; for an exclusion no rule names, `<undecidable>` (a line the gate could not classify), `<gate-error>` (the gate raised) or `<exclusion-overflow>` |
+| `event`, `detail` | on `hop: event` only: `start` (version, mode, policy path, config, peers, an argv summary with no arguments), `peer_start` (pid), `peer_exit` (pid, exit code), `drain_timeout`, `write_error` (a peer write that raised), `sink_drop` (count of records lost to a full queue), `exclusion_overflow` (the in-flight exclusion table is full; every later line is excluded), `stop` (records) |
+
+A record is taken once per physical line per hop. Reads are taken as the line arrives,
+including the blank lines the pumps skip. Writes are taken immediately before the write,
+inside the client-stdout lock, so `client_out` order is stdout order. A peer line is taken
+when its sender thread writes it, or as `dropped` where it is discarded instead.
+
+**Exclusion.** Decided in `tap()`, on the thread that produced the line and under the lock
+that assigns `seq`, by a small state machine (`wirelog._Scope`); the writer only renders the
+decision. Every client line is parsed, with no substring prefilter, so `tools\/call` and
+any other JSON escape decide exactly like the plain form. Other lines are parsed only while
+something on their side (the client, or that peer) is excluded.
+
+- A client request is excluded when it is a `tools/call` whose rule has `capture: false`
+  (under `--config` the name is first resolved to (peer, bare name) through the routing
+  table `_route_call` uses, then matched against that peer's policy as `<peer>__<bare>`), a
+  `terse.retrieve` of a handle dropped from an excluded result, or, under `--config`, any
+  message that reaches a peer whose default rule has `capture: false`: a routed call or
+  prompt, every broadcast method (`initialize`, the lists, `ping`, `resources/*`), every
+  client notification, and a method forwarded to peer 0.
+- A JSON-RPC batch array is decided per element. One excluded element, or one the gate
+  cannot classify, excludes the whole line. A client line with duplicate keys (parsers
+  disagree on which one wins) or nested too deep to parse is unclassifiable, and excluded
+  with `rule: "<undecidable>"`.
+- An excluded request's id is excluded on every hop it travels, including the router's
+  rewritten forms (`terse-b*` broadcast copies, `terse-s*` server requests), and so is any
+  `notifications/progress` carrying its `params._meta.progressToken` and any
+  `notifications/cancelled` naming it.
+- While a request excluded for a peer is in flight, everything that peer sends except
+  responses to non-excluded ids is excluded: server requests (`sampling/createMessage`,
+  `elicitation/create`, `roots/list`, `ping`), notifications and unparseable lines. The
+  client's reply to such a request is excluded on both hops. A server whose default rule
+  has `capture: false` is excluded the same way all the time: every line to or from it.
+  In single-proxy mode that is the whole connection.
+- A merged or snapshot-served reply is excluded whenever any peer is excluded as a whole.
+- Ids awaiting a reply are never evicted; answered ones are remembered (the last 4096), so
+  a late duplicate or a reused id stays excluded. Past 65536 ids in flight the connection
+  fails closed: an `exclusion_overflow` event, then every line is excluded
+  (`<exclusion-overflow>`). If the gate itself raises, that line is excluded
+  (`<gate-error>`) and stderr warns once.
+
+The errors all lean towards hiding a line. With a whole-server-excluded peer in a
+`--config` fleet (the usual `secret-broker.*` default-deny), `initialize`, every list,
+`ping`, `resources/*` and client notifications are logged as metadata only, on the client
+hops and on every peer's copy of them, because each one reaches that peer. A peer's
+notifications and server requests are also hidden while an excluded call to it is in
+flight, and an excluded call that is never answered keeps that peer in that state until
+it exits.
+
+**Text-mode caveat.** terse reads and writes decoded `str` lines, so `line` and `sha256`
+describe the decoded text, re-encoded as UTF-8 (`surrogateescape`, so undecodable input
+bytes hash back to the original bytes). A trailing `\r` is kept as part of the line.
+
+**Not captured.** Child-process stderr (inherited, never seen by terse). Bytes before
+decoding. Whether a write succeeded: writes are recorded just before they are made, and only
+the multiproxy peer sender reports a write that raised (`write_error`). Records still
+queued when the drain times out at shutdown. A client line Python's JSON parser rejects is
+logged in full as `parse_error`, even if a more lenient server would accept it.
+
 ### Environment
 
 - `TERSE_FLUENCY_BASE_URL` / `TERSE_FLUENCY_API_KEY` / `TERSE_FLUENCY_MODELS` — the
@@ -361,6 +452,8 @@ full tiers, kb drops dictionary, `*.rate_limit` skipped).
   `terse` binary). Must be an absolute path — spawned via `execve`, no shell to expand `~`.
   Unset, `install-mcp` prefers the `terse` console script on `PATH` from outside its own
   virtualenv and falls back to `<interpreter> -m terse` (`terse_invocation`, #275).
+- `CLAUDE_CODE_SESSION_ID` — names the `--wire-log` session directory (set by Claude
+  Code in each MCP server's environment).
 - `XDG_STATE_HOME` — overrides where `terse stats` persists its ledger
   (`$XDG_STATE_HOME/terse/stats.jsonl`, fallback `~/.local/state`).
 - `NO_COLOR` — when set, disables ANSI color in terminal reports (`terminal_report.py`).
