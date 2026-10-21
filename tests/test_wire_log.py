@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import pathlib
+import signal
 import sys
 import threading
 import time
@@ -348,6 +350,48 @@ def test_server_crash_mid_session_records_peer_exit_and_stop(mode, tmp_path):
         (timeout,) = [r for r in recs if r["hop"] == "client_out" and r["jsonrpc_id"] == 2]
         assert timeout["origin"] == "timeout" and timeout["capture_status"] == "synthesized"
         assert json.loads(timeout["line"])["error"]["code"] == -32001
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_stop_is_written_before_reaping_a_peer_that_ignores_sigterm(mode, tmp_path):
+    """#528: the client ends the session with SIGTERM while a peer ignores it, as kb's
+    sb-run wrapper does. The reaper then waits ~2 s before SIGKILL; `stop` must not wait
+    behind it, or a client that kills the proxy inside that window loses it."""
+    cmd = [sys.executable, "-c",
+           "import runpy, signal, sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+           f"sys.argv = [{str(FAKE)!r}]; runpy.run_path(sys.argv[0], run_name='__main__')"]
+    cout = io.StringIO()
+    raised, done = [], threading.Event()
+
+    def cin():
+        yield INIT + "\n"
+        deadline = time.monotonic() + 20
+        while not any(json.loads(ln).get("id") == 1 for ln in cout.getvalue().splitlines()):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        raised.append(time.time_ns())
+        os.kill(os.getpid(), signal.SIGTERM)    # the proxy's handler: SystemExit(143)
+        done.wait(30)       # single mode reads stdin on a worker thread; hold it open
+
+    wdir = tmp_path / "wire"
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(SystemExit):
+            if mode == "single":
+                run_proxy(cmd, FULL, stdin=cin(), stdout=cout, wire_log=str(wdir))
+            else:
+                run_multi_proxy(str(_peers_cfg(tmp_path, [{"name": "gh", "command": cmd}])),
+                                FULL, stdin=cin(), stdout=cout, wire_log=str(wdir))
+    finally:
+        done.set()
+    assert time.monotonic() - t0 >= 2.0          # the reaper did wait for SIGKILL
+    recs = _records(wdir)
+    _check(recs, cout.getvalue(), [INIT])
+    (teardown,) = _events(recs, "teardown")
+    assert teardown["detail"]["reason"] == "SystemExit"
+    assert len(teardown["detail"]["live_peers"]) == 1
+    assert recs[-2] is teardown
+    assert (recs[-1]["ts_ns"] - raised[0]) / 1e9 < 1.0       # stop did not wait
 
 
 def test_session_id_names_the_directory_and_field(tmp_path, monkeypatch):

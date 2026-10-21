@@ -2537,6 +2537,18 @@ def _build_capture_and_audit(
     return capture, audit
 
 
+def _wire_teardown(wire: Any, live: list[str]) -> None:
+    """Close the wire log from a proxy's `finally`, BEFORE its last-resort reaper (#528):
+    a downstream that ignores SIGTERM holds `_terminate_child` ~2 s, and a client ending
+    the session kills this process inside that window, losing `stop`. Downstreams still
+    running go into a `teardown` event, since their peer_exit would come after `stop`."""
+    if live:
+        exc = sys.exc_info()[1]
+        wire.event("teardown", live_peers=live,
+                   reason=type(exc).__name__ if exc is not None else None)
+    wire.close()
+
+
 def _single_wire_tap(wire_log: str | None, conn: str, pol: policy_mod.Policy,
                      server_name: str | None, inter: Interceptor, cmd: list[str],
                      policy_path: str | None, transport: Any) -> Any:
@@ -2833,7 +2845,9 @@ def run_proxy(
         return rc
     finally:
         _ignore_sigterm(sigterm_token)
-        transport.close()
         if wire is not None:
-            wire.close()
+            proc = getattr(transport, "proc", None)
+            alive = proc is not None and proc.poll() is None
+            _wire_teardown(wire, [peer_label or "downstream"] if alive else [])
+        transport.close()
         _restore_sigterm(sigterm_token)
