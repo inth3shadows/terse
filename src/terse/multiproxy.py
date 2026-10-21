@@ -90,6 +90,7 @@ from .proxy import (
     _install_sigterm_to_exit,
     _new_session_id,
     _restore_sigterm,
+    _wire_teardown,
     pump,
     union_primer,
 )
@@ -2291,6 +2292,11 @@ def _peer_pid(peer: Peer) -> int | None:
     return getattr(proc, "pid", None)
 
 
+def _peer_alive(peer: Peer) -> bool:
+    proc = getattr(peer.transport, "proc", None)
+    return proc is not None and proc.poll() is None
+
+
 def _peer_reader(peer: Peer, cout: TextIO, transform: Callable[[str], Any], out_lock: Lock,
                  wire: WireTap | None) -> None:
     """One peer's server->client pump thread; with the wire log, taps both sides and
@@ -2491,10 +2497,10 @@ def run_multi_proxy(
         # sender thread already exited on the first STOP, so this just re-queues one
         # nobody will read and joins an already-finished thread.
         router.close_senders()
+        if wire is not None:    # before the reaper, so `stop` survives a quick kill (#528)
+            _wire_teardown(wire, [p.name for p in peers if _peer_alive(p)])
         # Idempotent last-resort reaper for every peer (SIGTERM/SIGKILL escalation for a
         # stdio child that didn't exit on its own; a harmless repeat close for HTTP).
         for peer in peers:
             peer.transport.close()
-        if wire is not None:
-            wire.close()
         _restore_sigterm(sigterm_token)

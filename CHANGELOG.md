@@ -17,6 +17,10 @@ fails that pull request until the section has moved.
 
 - `terse proxy --wire-log DIR` (single server and `--config`) appends every JSON-RPC line crossing the proxy, at all four hops, to `DIR/<CLAUDE_CODE_SESSION_ID>/<conn>.jsonl` (0600): what the client sent, what the server returned, and what the client was given. That includes blank and malformed lines, notifications, errors, locally answered `terse.retrieve`, snapshot-served `initialize`/`tools/list`, broadcast copies and merged replies, router-made errors and timeouts, and peer lines dropped by a full send queue, plus start, peer start/exit, drain-timeout and stop events. Records are numbered in order; a missing number is a record lost to a full log queue, and every one is counted in a `sink_drop` event. A call whose policy rule has `"capture": false` is logged as metadata only, with no body and no hash, on every hop: its request (however its JSON is escaped, or inside a batch), its result, its progress notifications, requests the server sends while it runs and the client's replies to them, and `terse.retrieve` replies drawn from it. So is every line for a server whose default rule has it, and under `--config` anything that also reaches such a server (broadcasts, lists, notifications). Off by default. It never changes what the client or server receives: a write failure or a bug in the log warns once and turns the log off.
 
+### Fixed
+
+- The wire log's `stop` event is no longer lost when the client ends the session with a signal (#528). The proxy reaped its servers before closing the log, and a server that ignores SIGTERM held that reap for 2 s before SIGKILL, long enough for Claude Code to kill the proxy first. The log now closes before the reap; servers still running at that point are named in a `teardown` event (with the exception that ended the session) just before `stop`, in place of the `peer_exit` records they no longer get.
+
 ## [0.44.4] - 2026-10-20
 
 ### Fixed
