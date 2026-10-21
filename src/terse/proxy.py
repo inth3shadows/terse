@@ -2380,7 +2380,9 @@ def pump(src: Iterable[str], dst: Any, transform: Callable[[str], Any],
 
     `on_read`/`on_write` are the wire log's taps: every raw line read (including the
     empty ones skipped below) and every line about to be written — the latter inside
-    `lock`, so the log's order is the stream's order."""
+    `lock`, so the log's order is the stream's order. A line the transport synthesized
+    (`transport._SynthesizedReply`) keeps that type on the way to `on_write`, so the log
+    labels the client's copy too."""
     for raw in src:
         if on_read is not None:
             on_read(raw)
@@ -2392,6 +2394,9 @@ def pump(src: Iterable[str], dst: Any, transform: Callable[[str], Any],
             continue
         if out is None:
             out = line
+        if on_write is not None and hasattr(raw, "wire_origin") \
+                and not hasattr(out, "wire_origin"):
+            out = type(raw)(out)
         if lock is not None:
             with lock:
                 if on_write is not None:
@@ -2534,22 +2539,24 @@ def _build_capture_and_audit(
 
 def _single_wire_tap(wire_log: str | None, conn: str, pol: policy_mod.Policy,
                      server_name: str | None, inter: Interceptor, cmd: list[str],
-                     policy_path: str | None, transport: Any,
-                     ) -> tuple[Any, Callable[[str], Any]]:
-    """The single proxy's wire tap and its request-time gate (see wirelog.py), or
-    (None, None) without `--wire-log` or when the log cannot be opened."""
+                     policy_path: str | None, transport: Any) -> Any:
+    """The single proxy's wire tap with its tools/call policy installed (see wirelog.py),
+    or None without `--wire-log` or when the log cannot be opened."""
     if wire_log is None:
-        return None, lambda _line: None
+        return None
     from . import __version__
-    from .wirelog import call_gate, open_wire_tap, retrieve_handle, server_excluded
+    from .wirelog import open_wire_tap, retrieve_handle, server_excluded
 
     wire = open_wire_tap(wire_log, conn, exclude_all=server_excluded(pol, server_name))
     if wire is None:
-        return None, lambda _line: None
+        return None
 
-    def resolve(method: str, params: dict) -> tuple[str | None, bool] | None:
+    def resolve(msg: dict) -> tuple[str | None, bool] | None:
+        params = msg.get("params")
+        if msg.get("method") != "tools/call" or not isinstance(params, dict):
+            return None
         name = params.get("name")
-        if method != "tools/call" or not isinstance(name, str):
+        if not isinstance(name, str):
             return None
         if name == lossy_mod.RETRIEVE_TOOL:
             # Excluded iff the result the handle was dropped from was excluded.
@@ -2567,7 +2574,8 @@ def _single_wire_tap(wire_log: str | None, conn: str, pol: policy_mod.Policy,
                                     "argc": len(cmd), "transport":
                                     "stdio" if pid else "http"})
     wire.event("peer_start", peer=label, pid=pid)
-    return wire, lambda line: call_gate(line, resolve)
+    wire.resolve = resolve
+    return wire
 
 
 def run_proxy(
@@ -2721,8 +2729,8 @@ def run_proxy(
     # not just in which method to call (see the join/rc branch below).
     is_http = isinstance(transport, HttpTransport)
 
-    wire, wire_gate = _single_wire_tap(wire_log, conn, pol, server_name, inter, cmd,
-                                       policy_path, transport)
+    wire = _single_wire_tap(wire_log, conn, pol, server_name, inter, cmd, policy_path,
+                            transport)
     peer_label = resolve_ledger_identity(server_name, cmd) if wire is not None else None
 
     sigterm_token = _install_sigterm_to_exit()
@@ -2766,7 +2774,7 @@ def run_proxy(
                 else:
                     tap = wire.tap
                     pump(cin, transport.outbound(), fwd,
-                         on_read=lambda raw: tap("client_in", raw, gate=wire_gate(raw)),
+                         on_read=lambda raw: tap("client_in", raw),
                          on_write=lambda out: tap("server_out", out, peer=peer_label))
             finally:
                 # transport.half_close() is what lets server_to_client's

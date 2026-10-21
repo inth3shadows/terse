@@ -103,9 +103,7 @@ from .stats import (
 )
 from .transport import Transport, build_transport
 from .wirelog import (
-    Gate,
     WireTap,
-    call_gate,
     open_wire_tap,
     retrieve_handle,
     server_excluded,
@@ -632,12 +630,15 @@ class _PeerSender:
         self._thread.start()
 
     def send(self, line: str, origin: str | None = None) -> None:
+        # The exclusion decision of the client (or peer) line this send derives from is
+        # taken HERE, on the producing thread, and carried to the worker's tap.
+        ctx = self._wire.context() if self._wire is not None else None
         try:
-            self._q.put_nowait((line, origin))
+            self._q.put_nowait((line, origin, ctx))
         except queue.Full:
             if self._wire is not None:
                 self._wire.tap("server_out", line, peer=self._peer, status="dropped",
-                               origin="queue_full")
+                               origin="queue_full", inherit=ctx)
             # Peer worker can't keep up (stalled/hung peer). Drop rather than block the
             # shared routing thread or grow memory. Announce the first drop so a silently
             # falling-behind peer is visible; stay quiet after to avoid a stderr flood.
@@ -652,9 +653,10 @@ class _PeerSender:
             item = self._q.get()
             if item is self._STOP:
                 return
-            line, origin = item
+            line, origin, ctx = item
             if self._wire is not None:
-                self._wire.tap("server_out", line, peer=self._peer, origin=origin)
+                self._wire.tap("server_out", line, peer=self._peer, origin=origin,
+                               inherit=ctx)
             try:
                 w = self._transport.outbound()
                 w.write(line + "\n")
@@ -682,7 +684,7 @@ class _PeerSender:
                     continue
                 if self._wire is not None and evicted is not self._STOP:
                     self._wire.tap("server_out", evicted[0], peer=self._peer,
-                                   status="dropped", origin="evicted")
+                                   status="dropped", origin="evicted", inherit=evicted[2])
         self._thread.join(timeout=2.0)
 
 
@@ -705,7 +707,10 @@ class Router:
         self.peers = peers
         # The wire log (wirelog.py), or None. Every client-facing write goes through
         # `_write_client`, which records it; peer writes are recorded by `_PeerSender`.
+        # Its exclusion gate asks `_wire_resolve` where a client request goes.
         self.wire = wire
+        if wire is not None:
+            wire.resolve = self._wire_resolve
         # Writes one `router_session` ledger row per client `initialize` (#212) -- the
         # proof, for `primer_liability`, that a LAZY router ran this session even when no
         # result ever attached its primer. Fail-open: see `_broadcast`.
@@ -909,17 +914,28 @@ class Router:
 
     # ---------- client -> server ----------
 
-    def wire_gate(self, line: str) -> Any:
-        """The wire log's request-time exclusion decision for one client line: resolves a
-        tools/call / prompts/get name to (peer, bare name) through the same table and
-        `_resolve` that `_route_call` uses, then asks THAT peer's policy, exactly as its
-        Interceptor will (peer-qualified name, peer as server)."""
-        if self.wire is None:
-            return None
-        return call_gate(line, self._wire_resolve)
-
-    def _wire_resolve(self, method: str, params: dict) -> tuple[str | None, bool] | None:
+    def _wire_resolve(self, msg: dict) -> tuple[str | None, bool] | None:
+        """The wire log's decision for one parsed client message: where it goes, mirroring
+        `_dispatch_client`. A tools/call / prompts/get name resolves to (peer, bare name)
+        through the same table and `_resolve` `_route_call` uses, then THAT peer's policy
+        decides, exactly as its Interceptor will (peer-qualified name, peer as server).
+        Anything else is broadcast to every peer (a notification, or one of
+        `_BROADCAST_METHODS`) or sent to peer 0, and is excluded when any peer it reaches
+        is excluded as a whole. A response (no method) is matched by id in the tap."""
         assert self.wire is not None
+        method, params = msg.get("method"), msg.get("params")
+        if not isinstance(method, str):
+            return None
+        whole = self.wire.excluded_peers
+        if method not in ("tools/call", "prompts/get"):
+            targets = (self.peers if msg.get("id") is None or method in _BROADCAST_METHODS
+                       else self.peers[:1])
+            for p in targets:
+                if p.name in whole:
+                    return whole[p.name], True
+            return None
+        if not isinstance(params, dict):
+            return None                 # answered -32602 by the router, sent nowhere
         name = params.get("name")
         if method == "tools/call" and name == lossy_mod.RETRIEVE_TOOL:
             # The origin map is shared by every peer; it names the DROPPING peer and the
@@ -937,9 +953,8 @@ class Router:
                 return None
             peer = self.peers[target[0]]
             tool = f"{peer.name}{PREFIX_SEP}{target[1]}"
-        whole = self.wire.excluded_peers.get(peer.name)
-        if whole is not None:
-            return whole, True
+        if peer.name in whole:
+            return whole[peer.name], True
         if method != "tools/call":
             return None
         rule = peer.inter.policy.select(tool, peer.name)
@@ -1338,10 +1353,16 @@ class Router:
     def _write_client(self, line: str, *, status: str = "synthesized",
                       origin: str = "router") -> None:
         """Every router-originated client line (peer passthroughs go through `pump`).
-        `status`/`origin` label it in the wire log."""
+        `status`/`origin` label it in the wire log. A merged or snapshot-served reply holds
+        every peer's share, so with any peer excluded as a whole it is excluded outright
+        (over-excluding a list is the safe direction) — whatever its id says."""
         with self.out_lock:
             if self.wire is not None:
-                self.wire.tap("client_out", line, status=status, origin=origin)
+                force = None
+                if origin in ("router_broadcast", "snapshot") and self.wire.excluded_peers:
+                    force = next(iter(self.wire.excluded_peers.values()))
+                self.wire.tap("client_out", line, status=status, origin=origin,
+                              force=force)
             try:
                 self.out.write(line + "\n")
                 self.out.flush()
@@ -2277,13 +2298,12 @@ def _peer_reader(peer: Peer, cout: TextIO, transform: Callable[[str], Any], out_
     if wire is None:
         pump(peer.transport.inbound(), cout, transform, lock=out_lock)
         return
-    excluded = wire.excluded_peers.get(peer.name)
-    gate = None if excluded is None else Gate(excluded, True, None)
     tap, name = wire.tap, peer.name
     try:
+        # client_out inherits the server_in decision this thread just made (wirelog.py).
         pump(peer.transport.inbound(), cout, transform, lock=out_lock,
              on_read=lambda raw: tap("server_in", raw, peer=name),
-             on_write=lambda out: tap("client_out", out, gate=gate))
+             on_write=lambda out: tap("client_out", out))
     finally:
         proc = getattr(peer.transport, "proc", None)
         code = None
@@ -2423,7 +2443,7 @@ def run_multi_proxy(
         # "block until client stdin EOF" falls out of the for-loop ending, for free.
         for raw in cin:
             if wire is not None:
-                wire.tap("client_in", raw, gate=router.wire_gate(raw))
+                wire.tap("client_in", raw)
             line = raw.rstrip("\n")
             if not line:
                 continue

@@ -272,9 +272,10 @@ def test_capture_false_server_excludes_every_line_for_it(mode, tmp_path):
 DROP = {"result[].status": {"lossy": "drop-to-retrieve", "min": 1}}
 
 
+@pytest.mark.parametrize("escape", [False, True])
 @pytest.mark.parametrize("capture", [True, False])
 @pytest.mark.parametrize("mode", MODES)
-def test_retrieve_answered_locally(mode, capture, tmp_path):
+def test_retrieve_answered_locally(mode, capture, escape, tmp_path):
     pol = Policy(rules=[Rule("gh.*", TIERS, fields=DROP, capture=capture)])
     cout_probe: dict = {}
 
@@ -302,6 +303,8 @@ def test_retrieve_answered_locally(mode, capture, tmp_path):
             assert time.monotonic() < deadline
             time.sleep(0.01)
         last = retrieve()
+        if escape:                    # W1: the same call with its method JSON-escaped
+            last = last.replace("tools/call", "tools\\/call")
         sent.append(last)
         yield last + "\n"
         while 3 not in steps_gen._ids():
@@ -549,3 +552,332 @@ def test_cli_threads_wire_log_to_both_modes(extra, monkeypatch):
     seen.clear()
     assert main(["proxy", "--no-stats", *extra, *tail]) == 0
     assert "wire_log" not in seen
+
+
+# --- the exclusion gate: nothing from a capture:false call or peer reaches the file -----
+#
+# Every test below sends a fresh token through one path and greps the RAW BYTES of the wire
+# directory for it, so a leak through any field (line, a nested escape, an event detail)
+# fails, not only one through `line`.
+
+ASK_RULES = [Rule("*fake.echo", (), capture=False), Rule("*fake.ask", (), capture=False),
+             Rule("*fake.progress", (), capture=False), Rule("gh.*", TIERS)]
+SB = "secret-broker"
+
+
+def _wire_bytes(wdir: pathlib.Path) -> bytes:
+    return b"".join(p.read_bytes() for p in sorted(wdir.rglob("*")) if p.is_file())
+
+
+def _complete(recs: list[dict], out: str, sent: list[str]) -> None:
+    """The completeness invariant, holes allowed only as counted sink drops: one client_in
+    record per stdin line and one client_out record per stdout line, in order, each either
+    the exact line or (excluded) its length alone."""
+    seqs = [r["seq"] for r in recs]
+    assert seqs == sorted(set(seqs))
+    holes = set(range(seqs[-1] + 1)) - set(seqs)
+    assert len(holes) == sum(r["detail"]["count"] for r in _events(recs, "sink_drop"))
+    assert recs[0]["event"] == "start" and recs[-1]["event"] == "stop"
+    assert recs[-1]["detail"]["records"] == seqs[-1] + 1
+    for r in recs:
+        if r["capture_status"] == "excluded_by_policy":
+            assert r["line"] is None and r["sha256"] is None and r["rule"]
+        elif r["hop"] != "event":
+            assert r["sha256"] == _sha(r["line"]) and r["len"] == len(r["line"])
+    cin = [r for r in recs if r["hop"] == "client_in"]
+    assert [r["len"] for r in cin] == [len(s) for s in sent]
+    for r, s in zip(cin, sent, strict=True):
+        assert r["line"] in (None, s)
+    written = out.split("\n")[:-1]
+    couts = [r for r in recs if r["hop"] == "client_out"]
+    assert [r["len"] for r in couts] == [len(ln) for ln in written]
+    for r, ln in zip(couts, written, strict=True):
+        assert r["line"] in (None, ln)
+
+
+def _leak_run(mode, tmp_path, steps, pol, *, peers=None, **kw):
+    """One paced session; returns (stdout, records, raw wire bytes, client lines)."""
+    cout = io.StringIO()
+    cin, sent = _Paced(cout, steps), [s for s, _ in steps]
+    wdir = tmp_path / f"wire-{uuid.uuid4().hex[:6]}"
+    if mode == "single":
+        rc = run_proxy([sys.executable, str(FAKE)], pol, stdin=cin, stdout=cout,
+                       wire_log=str(wdir), **kw)
+    else:
+        rc = run_multi_proxy(str(_peers_cfg(tmp_path, peers)), pol, stdin=cin, stdout=cout,
+                             wire_log=str(wdir), broadcast_timeout=5, **kw)
+    assert rc == 0
+    out = cout.getvalue()
+    recs = _records(wdir)
+    _complete(recs, out, sent)
+    return out, recs, _wire_bytes(wdir), sent
+
+
+def _target_setup(mode, target, token, monkeypatch):
+    """(policy, peers, run kwargs, excluded tool-name prefix) for an excluded TOOL on an
+    otherwise-captured server, or an excluded whole PEER that leaks `token` everywhere."""
+    if target == "tool":
+        return Policy(rules=ASK_RULES), None, {}, ("" if mode == "single" else "gh__")
+    if mode == "single":
+        monkeypatch.setenv("FAKE_SECRET", token)
+        pol = Policy(rules=[Rule(f"{SB}.*", (), capture=False, require_server_name=True)])
+        return pol, None, {"server_name": SB}, ""
+    env = {"FAKE_SECRET": token, "FAKE_TOOLS": f"fake.echo,fake.ask,tool-{token}"}
+    peers = [{"name": SB, "command": [sys.executable, str(FAKE)], "env": env},
+             {"name": "gh", "command": [sys.executable, str(FAKE)]}]
+    pol = Policy(rules=[Rule(f"{SB}.*", (), capture=False), Rule("gh.*", TIERS)])
+    return pol, peers, {}, f"{SB}__"
+
+
+def _esc(s: str, rng) -> str:
+    """`s` as a JSON string literal with a random subset of its characters \\u-escaped."""
+    body = "".join(f"\\u{ord(c):04x}" if rng.random() < 0.5 else
+                   json.dumps(c)[1:-1] for c in s)
+    return f'"{body}"'
+
+
+def _fuzz_call(mid, name, args, rng, extra_params="") -> str:
+    """A tools/call whose method, keys and tool name are randomly escaped and spaced; the
+    argument VALUES (which carry the token) are never escaped, so a leak stays greppable."""
+    sp = " " * rng.randint(0, 2)
+    keys = {k: _esc(k, rng) for k in ("jsonrpc", "id", "method", "params", "name",
+                                      "arguments")}
+    parts = [f"{keys['jsonrpc']}:{sp}\"2.0\"", f"{keys['id']}:{sp}{json.dumps(mid)}",
+             f"{keys['method']}:{sp}{_esc('tools/call', rng)}",
+             f"{keys['params']}:{sp}{{{keys['name']}:{sp}{_esc(name, rng)},{sp}"
+             f"{keys['arguments']}:{sp}{json.dumps(args)}{extra_params}}}"]
+    rng.shuffle(parts)
+    return "{" + f",{sp}".join(parts) + "}"
+
+
+def _vector_steps(vector, mode, target, token, pre):
+    """Client steps for one leak vector: (line, ids that must be on stdout first)."""
+    import random
+    rng = random.Random(f"{vector}-{mode}-{target}")
+    echo = f"{pre}fake.echo"
+    ask_wait = "srv-1" if mode == "single" else "terse-s0"
+    plain = _req(5, "tools/call", {"name": echo, "arguments": {"token": token}})
+    if vector == "plain":
+        return [(INIT, ()), (plain, (1,))]
+    if vector == "escaped_method":       # W1: "tools\/call"
+        return [(INIT, ()), (plain.replace("tools/call", "tools\\/call"), (1,))]
+    if vector == "escaped_method_key":   # W1: "\u006dethod", no "tools/call" substring
+        line = plain.replace('"method"', '"\\u006dethod"').replace(
+            "tools/call", "tools\\u002fcall")
+        return [(INIT, ()), (line, (1,))]
+    if vector == "fuzzed_encodings":     # W1: 25 random encodings of the same call
+        return [(INIT, ())] + [(_fuzz_call(10 + i, echo, {"token": token, "i": i}, rng),
+                                (1,)) for i in range(25)]
+    if vector in ("batch_first", "batch_last"):   # W1: a batch with one excluded call
+        call = {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                "params": {"name": echo, "arguments": {"token": token}}}
+        ping = {"jsonrpc": "2.0", "id": 8, "method": "ping"}
+        batch = [call, ping] if vector == "batch_first" else [ping, call]
+        return [(INIT, ()), (json.dumps(batch), (1,))]
+    if vector == "float_and_string_ids":
+        return [(INIT, ()), (plain.replace('"id": 5', '"id": 5.0'), (1,)),
+                (plain.replace('"id": 5', '"id": "five"'), (1,))]
+    if vector == "progress":             # a progress notification for an excluded call
+        line = _req(5, "tools/call", {"name": f"{pre}fake.echo", "arguments": {
+            "token": token}, "_meta": {"progressToken": f"pt-{uuid.uuid4().hex[:4]}"}})
+        return [(INIT, ()), (line, (1,))]
+    if vector.startswith("ask_"):         # W3: a server request during the excluded call
+        method = {"ask_elicit": "elicitation/create", "ask_sampling":
+                  "sampling/createMessage", "ask_roots": "roots/list"}[vector]
+        call = _req(5, "tools/call", {"name": f"{pre}fake.ask", "arguments": {
+            "method": method}})
+        reply = json.dumps({"jsonrpc": "2.0", "id": ask_wait,
+                            "result": {"action": "accept", "content": {"pw": token}}})
+        return [(INIT, ()), (call, (1,)), (reply, (ask_wait,))]
+    if vector == "cancel":               # a cancellation naming the excluded call
+        cancel = json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                             "params": {"requestId": 5, "reason": token}})
+        return [(INIT, ()), (plain, (1,)), (cancel, (5,))]
+    # W4: any method to a whole-server-excluded peer, carrying the token
+    method = vector.removeprefix("method_")
+    params = {"argument": {"name": "x", "value": token}, "uri": f"x://{token}",
+              "level": "debug", "name": f"{pre}p", "ref": {"type": "ref/prompt",
+                                                           "name": token}}
+    return [(INIT, ()), (_req(9, method, params), (1,))]
+
+
+TOOL_VECTORS = ["plain", "escaped_method", "escaped_method_key", "fuzzed_encodings",
+                "batch_first", "batch_last", "float_and_string_ids", "progress",
+                "ask_elicit", "ask_sampling", "ask_roots", "cancel"]
+PEER_VECTORS = TOOL_VECTORS + [f"method_{m}" for m in (
+    "completion/complete", "resources/read", "resources/subscribe", "resources/unsubscribe",
+    "resources/list", "resources/templates/list", "prompts/list", "tools/list", "ping",
+    "logging/setLevel", "prompts/get")]
+LEAK_CASES = ([(m, "tool", v) for m in MODES for v in TOOL_VECTORS]
+              + [(m, "peer", v) for m in MODES for v in PEER_VECTORS])
+
+
+@pytest.mark.parametrize(("mode", "target", "vector"), LEAK_CASES)
+def test_excluded_content_never_reaches_the_wire_file(mode, target, vector, tmp_path,
+                                                      monkeypatch):
+    token = f"TOK{uuid.uuid4().hex}"
+    pol, peers, kw, pre = _target_setup(mode, target, token, monkeypatch)
+    steps = _vector_steps(vector, mode, target, token, pre)
+    out, recs, raw, _ = _leak_run(mode, tmp_path, steps, pol, peers=peers, **kw)
+    assert token.encode() not in raw
+    assert any(r["capture_status"] == "excluded_by_policy" for r in recs)
+    if vector in ("plain", "escaped_method", "progress") and (
+            target == "tool" or mode == "single"):
+        assert token in out                  # the path really carried it; forwarding intact
+
+
+def test_merged_lists_and_resources_read_from_an_excluded_peer(tmp_path):
+    """W2: a whole-server-excluded peer's resources/read answer and its share of every
+    merged list are excluded at every hop, cold (broadcast) and warm (snapshot-served)."""
+    token = f"TOK{uuid.uuid4().hex}"
+    env = {"FAKE_SECRET": token, "FAKE_TOOLS": f"fake.echo,tool-{token}"}
+    peers = [{"name": "gh", "command": [sys.executable, str(FAKE)]},
+             {"name": SB, "command": [sys.executable, str(FAKE)], "env": env}]
+    pol = Policy(rules=[Rule(f"{SB}.*", (), capture=False), Rule("gh.*", TIERS)])
+    lists = ["tools/list", "prompts/list", "resources/list", "resources/templates/list"]
+    steps = [(INIT, ()), (INITIALIZED, (1,))] + [
+        (_req(10 + i, m), (1,)) for i, m in enumerate(lists)] + [
+        (_req(20, "resources/read", {"uri": "x://1"}), tuple(range(10, 14)))]
+    for _run_no in ("cold", "warm"):
+        out, recs, raw, _ = _leak_run("multi", tmp_path, steps, pol, peers=peers)
+        assert token in out and token.encode() not in raw
+        merged = [r for r in recs if r["hop"] == "client_out" and r["jsonrpc_id"] in
+                  (1, 10, 11, 12, 13, 20)]
+        assert {r["capture_status"] for r in merged} == {"excluded_by_policy"}
+
+
+def _gate_tap(tmp_path, resolve, **kw):
+    tap = wirelog.open_wire_tap(str(tmp_path / "w"), "u", **kw)
+    assert tap is not None
+    tap.resolve = resolve
+    return tap
+
+
+def _echo_resolve(msg):
+    params = msg.get("params")
+    if msg.get("method") == "tools/call" and isinstance(params, dict):
+        name = params.get("name")
+        return ("*fake.echo", True) if name == "fake.echo" else ("gh.*", False)
+    return None
+
+
+def test_in_flight_excluded_id_is_never_evicted(tmp_path):
+    """W5: an excluded call still awaiting its reply survives 10k later excluded calls;
+    its late reply (on both hops) is excluded."""
+    token = f"TOK{uuid.uuid4().hex}"
+    tap = _gate_tap(tmp_path, _echo_resolve, queue_max=40000)
+    for i in range(10_001):
+        line = _req(i, "tools/call", {"name": "fake.echo", "arguments": {}})
+        tap.tap("client_in", line)
+        tap.tap("server_out", line, peer="gh")
+    late = json.dumps({"jsonrpc": "2.0", "id": 0, "result": {"t": token}})
+    tap.tap("server_in", late, peer="gh")
+    tap.tap("client_out", late)
+    tap.close()
+    raw = _wire_bytes(tmp_path / "w")
+    assert raw and token.encode() not in raw
+    recs = _records(tmp_path / "w")
+    assert [r["capture_status"] for r in recs if r["jsonrpc_id"] == 0] == [
+        "excluded_by_policy"] * 4
+
+
+def test_progress_token_of_an_excluded_call_is_excluded(tmp_path):
+    """notifications/progress carries no id: it is matched to the excluded call through
+    the request's params._meta.progressToken, on the client side as on the server side,
+    including after the call completed."""
+    token = f"TOK{uuid.uuid4().hex}"
+    tap = _gate_tap(tmp_path, _echo_resolve)
+    call = _req(3, "tools/call", {"name": "fake.echo", "arguments": {},
+                                  "_meta": {"progressToken": 77}})
+    prog = json.dumps({"jsonrpc": "2.0", "method": "notifications/progress",
+                       "params": {"progressToken": 77, "message": token}})
+    other = json.dumps({"jsonrpc": "2.0", "method": "notifications/progress",
+                        "params": {"progressToken": 78, "message": "fine"}})
+    tap.tap("client_in", call)
+    # inherit=None: what the server pump thread writing these would carry (this test
+    # thread just READ the excluded call, which client_out here would otherwise inherit)
+    tap.tap("client_out", prog, inherit=None)
+    tap.tap("client_out", json.dumps({"jsonrpc": "2.0", "id": 3, "result": {}}),
+            inherit=None)
+    tap.tap("client_out", prog, inherit=None)         # late: after the reply
+    tap.tap("client_out", other, inherit=None)
+    tap.close()
+    raw = _wire_bytes(tmp_path / "w")
+    assert token.encode() not in raw and b"fine" in raw
+
+
+def test_writer_exception_warns_once_and_close_is_bounded(tmp_path, monkeypatch, capsys):
+    """W6: an unexpected exception in the writer thread warns once on stderr, turns the
+    log off, never reaches forwarding, and close() does not wait out its timeout."""
+    def boom(*_a, **_k):
+        raise RuntimeError("render bug")
+
+    monkeypatch.setattr(wirelog.WireTap, "_render", boom)
+    lines = [INIT] + [_call("single", i, "gh.api.items") for i in (2, 3)]
+    cout = io.StringIO()
+    rc = run_proxy([sys.executable, str(FAKE)], FULL, stdin=io.StringIO(
+        "".join(ln + "\n" for ln in lines)), stdout=cout, wire_log=str(tmp_path / "p"))
+    _, out_off, _, _ = _run("single", tmp_path, lines, wire=False)
+    assert rc == 0 and cout.getvalue() == out_off
+    assert capsys.readouterr().err.count("[terse] wire log") == 1
+    tap = wirelog.open_wire_tap(str(tmp_path / "w"), "x", queue_max=8)
+    assert tap is not None
+    tap.tap("client_in", "first")
+    time.sleep(0.2)                                   # the writer dies on `first`
+    for i in range(100):
+        tap.tap("client_in", f"l{i}")
+    t0 = time.monotonic()
+    tap.close()
+    assert time.monotonic() - t0 < 1.5
+    assert tap.dead_drops >= 100
+    assert capsys.readouterr().err.count("[terse] wire log") == 1
+
+
+def test_tap_racing_close_never_lands_after_stop(tmp_path):
+    """W7: taps racing close() are either written before `stop` (numbered below it) or
+    counted as late; never a record after stop, and stop's count is exact."""
+    workers, per = 4, 200
+    for n in range(60):
+        tap = wirelog.open_wire_tap(str(tmp_path / f"w{n}"), "r")
+        assert tap is not None
+        barrier = threading.Barrier(workers + 1)
+
+        def spam(k, tap=tap, barrier=barrier):
+            barrier.wait()
+            for i in range(per):
+                tap.tap("client_in", f"t{k}-{i}")
+
+        threads = [threading.Thread(target=spam, args=(k,)) for k in range(workers)]
+        for t in threads:
+            t.start()
+        barrier.wait()
+        tap.close()
+        for t in threads:
+            t.join()
+        recs = _records(tmp_path / f"w{n}")
+        stop = recs[-1]
+        assert stop["event"] == "stop"
+        assert max(r["seq"] for r in recs) == stop["seq"]
+        assert stop["detail"]["records"] == stop["seq"] + 1
+        assert [r["seq"] for r in recs] == list(range(len(recs)))
+        lines = [r for r in recs if r["hop"] == "client_in"]
+        assert len(lines) + tap.late_drops == workers * per
+
+
+def test_http_synthesized_reply_keeps_its_label_at_client_out(tmp_path):
+    """W9: the -32000 the HTTP transport synthesizes is labelled http_synth on server_in
+    AND client_out (the pump used to strip the label along with the newline)."""
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]                     # closed again: connection refused
+    cout = io.StringIO()
+    wdir = tmp_path / "w"
+    rc = run_proxy([f"http://127.0.0.1:{port}/mcp"], FULL, stdin=_Paced(cout, [(INIT, ())]),
+                   stdout=cout, wire_log=str(wdir))
+    assert rc == 0
+    recs = _records(wdir)
+    got = [(r["hop"], r["origin"], r["capture_status"]) for r in recs
+           if r["jsonrpc_id"] == 1 and r["hop"] in ("server_in", "client_out")]
+    assert got == [("server_in", "http_synth", "synthesized"),
+                   ("client_out", "http_synth", "synthesized")]

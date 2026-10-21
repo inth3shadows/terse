@@ -17,7 +17,13 @@ entry, and so the snapshot fingerprint, stays the same across runs).
 Wire-log tools (tests/test_wire_log.py), selected by tools/call name: `fake.big` (a text
 result of `arguments.n` chars), `fake.error` (a JSON-RPC error reply), `fake.echo` (echoes
 `arguments` back in the result), `fake.noise` (writes a blank line, a whitespace line and a
-non-JSON line before its reply), `fake.crash` (exits 3 without replying).
+non-JSON line before its reply), `fake.crash` (exits 3 without replying), `fake.ask` (sends
+the client a server-initiated request -- `arguments.method`, default elicitation/create --
+waits for the client's reply and returns it as the result). A tools/call carrying
+`params._meta.progressToken` first gets a notifications/progress echoing its arguments. A
+JSON-RPC batch array is answered with an array. FAKE_SECRET (a string) makes this server
+leak it everywhere it can: every tools/call result and a notifications/message before it,
+resources/read|list, resources/templates/list, prompts/list, and any other request's result.
 """
 import json
 import os
@@ -36,6 +42,43 @@ def _log_text(n, changed_line=None):
     return "\n".join(lines)
 
 
+def _write(obj) -> None:
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+_asks = 0
+
+
+def _ask(method):
+    """Send a server-initiated request and block until the client's reply to it."""
+    global _asks
+    _asks += 1
+    sid = f"srv-{_asks}"
+    _write({"jsonrpc": "2.0", "id": sid, "method": method,
+            "params": {"message": "need input"}})
+    for raw in sys.stdin:
+        try:
+            msg = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(msg, dict) and msg.get("id") == sid and "method" not in msg:
+            return msg
+    return {}
+
+
+def _secret_result(method, params, secret):
+    if method == "resources/read":
+        return {"contents": [{"uri": params.get("uri"), "text": secret}]}
+    if method == "resources/list":
+        return {"resources": [{"uri": f"secret://{secret}", "name": secret}]}
+    if method == "resources/templates/list":
+        return {"resourceTemplates": [{"uriTemplate": f"t://{secret}/{{x}}", "name": secret}]}
+    if method == "prompts/list":
+        return {"prompts": [{"name": f"p-{secret}"}]}
+    return {"echo": secret}
+
+
 def main() -> None:
     global _fs_read_calls
     die_if = os.environ.get("FAKE_DIE_IF")
@@ -44,6 +87,7 @@ def main() -> None:
     init_delay = float(os.environ.get("FAKE_INIT_DELAY") or 0)
     tools = [{"name": n} for n in
              (os.environ.get("FAKE_TOOLS") or "gh.api.items,fs.read").split(",")]
+    secret = os.environ.get("FAKE_SECRET")
     for raw in sys.stdin:
         line = raw.strip()
         if not line:
@@ -51,6 +95,16 @@ def main() -> None:
         try:
             msg = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if isinstance(msg, list):
+            out = [r for m in msg if isinstance(m, dict) and m.get("id") is not None
+                   for r in [{"jsonrpc": "2.0", "id": m["id"], "result": {
+                       "content": [{"type": "text", "text": json.dumps(
+                           (m.get("params") or {}).get("arguments") or {})}]}}]]
+            if out:
+                _write(out)
+            continue
+        if not isinstance(msg, dict):
             continue
         mid = msg.get("id")
         method = msg.get("method")
@@ -70,6 +124,19 @@ def main() -> None:
             args = params.get("arguments") or {}
             if name == "fake.crash":
                 sys.exit(3)
+            token = (params.get("_meta") or {}).get("progressToken")
+            if token is not None:
+                _write({"jsonrpc": "2.0", "method": "notifications/progress",
+                        "params": {"progressToken": token, "progress": 1,
+                                   "message": json.dumps(args)}})
+            if secret:
+                _write({"jsonrpc": "2.0", "method": "notifications/message",
+                        "params": {"level": "info", "data": secret}})
+            if name == "fake.ask":
+                reply = _ask(args.get("method", "elicitation/create"))
+                _write({"jsonrpc": "2.0", "id": mid, "result": {"content": [
+                    {"type": "text", "text": json.dumps(reply.get("result"))}]}})
+                continue
             if name == "fake.noise":
                 sys.stdout.write("\n   \nnot json {\n")
                 sys.stdout.flush()
@@ -79,7 +146,9 @@ def main() -> None:
                 sys.stdout.write(json.dumps(resp) + "\n")
                 sys.stdout.flush()
                 continue
-            if name == "fake.big":
+            if secret:
+                text = secret + json.dumps(args)
+            elif name == "fake.big":
                 text = "x" * int(args.get("n", 0))
             elif name == "fake.echo":
                 text = json.dumps(args)
@@ -97,6 +166,9 @@ def main() -> None:
                     "result": {"tools": tools}}
         elif method and method.startswith("notifications/"):
             continue  # notifications get no response
+        elif secret and mid is not None:
+            resp = {"jsonrpc": "2.0", "id": mid,
+                    "result": _secret_result(method, msg.get("params") or {}, secret)}
         elif mid is not None:
             resp = {"jsonrpc": "2.0", "id": mid, "result": {}}
         else:
