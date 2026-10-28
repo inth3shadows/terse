@@ -776,9 +776,9 @@ def test_routed_call_registers_timeout_timer_before_writing_to_peer():
     seen_registered_before_send = []
     orig_send = router._senders[0].send
 
-    def spy_send(line):
+    def spy_send(line, origin=None):
         seen_registered_before_send.append((0, 7) in router._routed_timers)
-        return orig_send(line)
+        return orig_send(line, origin)
 
     router._senders[0].send = spy_send
     try:

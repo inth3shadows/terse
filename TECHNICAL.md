@@ -450,7 +450,9 @@ bytes hash back to the original bytes). A trailing `\r` is kept as part of the l
 decoding. Whether a write succeeded: writes are recorded just before they are made, and only
 the multiproxy peer sender reports a write that raised (`write_error`). Records still
 queued when the drain times out at shutdown. A client line Python's JSON parser rejects is
-logged in full as `parse_error`, even if a more lenient server would accept it.
+logged in full as `parse_error`, even if a more lenient server would accept it. A notification a server sends after an excluded call has been answered, and that names
+nothing linking it to that call (a `notifications/message` with no progress token, say), is
+logged in full, unless that server is excluded as a whole.
 
 ### Environment
 

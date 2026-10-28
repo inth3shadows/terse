@@ -91,6 +91,7 @@ from .proxy import (
     _install_sigterm_to_exit,
     _new_session_id,
     _restore_sigterm,
+    _transport_pid,
     _wire_teardown,
     pump,
     union_primer,
@@ -1481,10 +1482,7 @@ class Router:
         # Enqueued to the peer's own background sender (#5): never blocks this thread
         # on a peer's network round-trip, so one slow HTTP peer can't stall routing to
         # any OTHER peer — see _PeerSender's docstring.
-        if origin is None:
-            self._senders[idx].send(line)
-        else:
-            self._senders[idx].send(line, origin)
+        self._senders[idx].send(line, origin)
 
     def _write_client(self, line: str, *, status: str = "synthesized",
                       origin: str = "router") -> None:
@@ -1494,6 +1492,10 @@ class Router:
         (over-excluding a list is the safe direction) — whatever its id says."""
         with self.out_lock:
             if self.wire is not None:
+                # A second guard, kept on purpose (#526): the id-based exclusion already
+                # covers these replies, since the client request behind them reached an
+                # excluded peer and registered its id. The rule recorded is the first
+                # excluded peer's glob, whichever peer caused it.
                 force = None
                 if origin in ("router_broadcast", "snapshot") and self.wire.excluded_peers:
                     force = next(iter(self.wire.excluded_peers.values()))
@@ -2524,8 +2526,7 @@ def _build_peers(specs: list[DownstreamSpec], default_policy: policy_mod.Policy,
 
 
 def _peer_pid(peer: Peer) -> int | None:
-    proc = getattr(peer.transport, "proc", None)
-    return getattr(proc, "pid", None)
+    return _transport_pid(peer.transport)
 
 
 def _peer_alive(peer: Peer) -> bool:
