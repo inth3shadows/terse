@@ -231,8 +231,8 @@ class _Scope:
         ver, text = self._done_text
         if ver != self._done_ver:         # rebuilt once per change, not once per line
             ver, text = self._done_ver, {}
-            for key in list(self.done):
-                text.setdefault(key[0], set()).update(_spellings(key[2]))
+            for done_key in list(self.done):
+                text.setdefault(done_key[0], set()).update(_spellings(done_key[2]))
             self._done_text = (ver, text)
         spelled = text.get(side, set())
         for n, m in enumerate(_ID_VALUES.finditer(line)):
