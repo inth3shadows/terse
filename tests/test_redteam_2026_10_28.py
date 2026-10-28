@@ -309,3 +309,36 @@ def test_router_snapshot_creates_the_terse_state_dir_owner_only(tmp_path, monkey
     finally:
         os.umask(old)
     assert stat.S_IMODE(os.stat(tmp_path / "terse").st_mode) == 0o700
+
+
+# --- G3: control codes from tool names never reach the terminal -----------------------
+
+EVIL = "\x1b]0;PWNED\x07\x1b[2J\rfake\x9b"
+
+
+def test_scrub_control_defuses_escapes_but_keeps_colour_and_layout():
+    from terse.cli import scrub_control
+
+    out = scrub_control(f"a\t{EVIL}\n\x1b[32mgreen\x1b[0m")
+    assert "\x1b]" not in out and "\x07" not in out and "\r" not in out and "\x9b" not in out
+    assert "\x1b[2J" not in out and "?[2J" in out  # CSI-J is not SGR: its ESC is defused
+    assert "\t" in out and "\n" in out and "\x1b[32mgreen\x1b[0m" in out
+
+
+def test_stats_report_command_scrubs_tool_names(tmp_path, capsys):
+    from terse import cli
+    from terse.stats import append_stats, build_record
+
+    log = tmp_path / "stats.jsonl"
+    append_stats(build_record("srv" + EVIL, "tool" + EVIL, '{"a": 1}', '{"a":1}',
+                              passthrough=False), log)
+    assert cli.main(["stats", "--log", str(log)]) == 0
+    out = capsys.readouterr().out
+    assert "tool" in out
+    assert "\x1b]" not in out and "\x07" not in out and "\x9b" not in out
+
+
+def test_data_commands_are_not_scrubbed(capsys):
+    from terse import cli
+
+    assert cli._cmd_proxy in cli._STDOUT_IS_DATA and cli._cmd_compress in cli._STDOUT_IS_DATA

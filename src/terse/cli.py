@@ -29,6 +29,7 @@ import tempfile
 import time
 from datetime import UTC
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from . import transforms
@@ -2588,7 +2589,44 @@ def main(argv: list[str] | None = None) -> int:
     vf.set_defaults(func=_cmd_verify)
 
     args = parser.parse_args(argv)
-    return args.func(args)
+    if args.func in _STDOUT_IS_DATA or getattr(args, "json", False):
+        return args.func(args)
+    real = sys.stdout
+    sys.stdout = _ControlScrubbingWriter(real)
+    try:
+        return args.func(args)
+    finally:
+        sys.stdout = real
+
+
+# Report commands print tool, server and model names a downstream server chose. Raw, a
+# name like `\x1b]0;title\x07\x1b[2J` retitles the terminal, clears it, or forges report
+# lines. Every C0/DEL/C1 control except newline and tab becomes `?`; terse's own SGR colour
+# codes (`terminal_report._c`) are the one escape sequence let through.
+_CONTROL = re.compile(r"\x1b\[[0-9;]*m|[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def scrub_control(text: str) -> str:
+    return _CONTROL.sub(lambda m: m.group() if len(m.group()) > 1 else "?", text)
+
+
+class _ControlScrubbingWriter:
+    """`sys.stdout` for a report command: scrubs on write, delegates everything else
+    (`isatty`, `encoding`, `fileno`) so colour detection and redirection behave as before."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def write(self, text: str) -> int:
+        return self._inner.write(scrub_control(text))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+# Commands whose stdout is DATA — JSON-RPC, a compressed payload, a policy document — where a
+# rewritten byte would be a corrupted value rather than a defused escape.
+_STDOUT_IS_DATA = frozenset({_cmd_proxy, _cmd_compress, _cmd_policy_generate})
 
 
 if __name__ == "__main__":
