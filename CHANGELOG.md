@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.45.7] - 2026-10-28
+
 ### Fixed
 
 - `terse proxy --config` no longer cuts off a routed `tools/call` or `prompts/get` after 30 s. A tool that ran longer got -32001 while its server kept working, and the real result was then dropped. Routed calls now have no timeout by default, matching the single-server proxy. A server that exits gets every call still pending on it answered -32001 at once. The new `--routed-timeout SECONDS` sets a cap; when it fires, the server is also sent `notifications/cancelled`. At client EOF, pending calls get a grace period and are then answered, so a server that never replies cannot hold the process open.
