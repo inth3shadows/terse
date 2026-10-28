@@ -13,9 +13,9 @@ nondeterministic timestamp into the corpus (principle #31).
 
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
-import glob
 import re
 import sys
 import time

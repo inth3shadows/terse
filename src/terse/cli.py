@@ -1709,7 +1709,8 @@ def _redact_url(url: str) -> str:
     if "@" in netloc:
         netloc = "***@" + netloc.rpartition("@")[2]
     query = "***" if split.query else ""
-    return urlunsplit((split.scheme, netloc, split.path, query, split.fragment))
+    fragment = "***" if split.fragment else ""   # `#access_token=` is a credential too
+    return urlunsplit((split.scheme, netloc, split.path, query, fragment))
 
 
 def _redact_args(args: list) -> list:
@@ -1721,9 +1722,12 @@ def _redact_args(args: list) -> list:
             pending = None
             continue
         if pending == "value":
-            out.append("***")
             pending = None
-            continue
+            if not a.startswith("-"):
+                out.append("***")
+                continue
+            # The secret-looking flag was a boolean (`--no-auth`, `--oauth`): the next
+            # token is another flag, not its value. Fall through and handle it as one.
         flag = a.split("=", 1)[0]
         if flag == "--header":
             if "=" in a:
@@ -1739,8 +1743,14 @@ def _redact_args(args: list) -> list:
             out.append(f"{flag}=***" if "=" in a else a)
             pending = "value" if "=" not in a else None
             continue
-        if not a.startswith("-") and _ENV_ASSIGN.match(a):
-            out.append(_redact_header_value(a))
+        if "=" in a and (a.startswith("-") or _ENV_ASSIGN.match(a)):
+            # `--url=https://u:pw@h`, `DATABASE_URL=postgres://u:pw@db`: the value half is
+            # what can hold a credential, and a secret-looking NAME masks it outright.
+            name, _, value = a.partition("=")
+            if not a.startswith("-") and _SECRET_HEADER.search(name):
+                out.append(f"{name}=***")
+            else:
+                out.append(f"{name}={_redact_url(value)}" if "://" in value else a)
             continue
         out.append(_redact_url(a) if "://" in a else a)
     return out
@@ -1804,15 +1814,22 @@ def _entry_change_lines(before, after, indent: str = "    ") -> list[str]:
         if old is not None and new is not None and old != new:
             if field == "url":
                 old, new = _redact_url(str(old)), _redact_url(str(new))
+                if old == new:
+                    new = f"{new}  (differs only in a masked part)"
             lines += [f"{indent}{label} CHANGED — the client spawns a different "
                       f"target than before:",
                       f"{indent}  from: {old}",
                       f"{indent}  to:   {new}"]
     # Coerced, for the same reason `_full_cmd` coerces: `_redact_args` splits each token.
-    old_args = _redact_args([str(a) for a in (before.get("args") or [])])
-    new_args = _redact_args([str(a) for a in (after.get("args") or [])])
-    if old_args != new_args:
-        moved = [(o, n) for o, n in zip(old_args, new_args, strict=False) if o != n]
+    # CHANGED is decided on the RAW args and only displayed redacted: comparing the redacted
+    # lists hid a real change whose only difference sat inside a masked value.
+    raw_old = [str(a) for a in (before.get("args") or [])]
+    raw_new = [str(a) for a in (after.get("args") or [])]
+    old_args, new_args = _redact_args(raw_old), _redact_args(raw_new)
+    if raw_old != raw_new:
+        moved = [(o, n if o != n else f"{n}  (differs only in a masked value)")
+                 for o, n, ro, rn in zip(old_args, new_args, raw_old, raw_new, strict=False)
+                 if ro != rn]
         lines.append(f"{indent}args CHANGED — a bad path here fails at spawn exactly "
                      f"like a bad launcher:")
         for o, n in moved:
@@ -2601,9 +2618,10 @@ def main(argv: list[str] | None = None) -> int:
 
 # Report commands print tool, server and model names a downstream server chose. Raw, a
 # name like `\x1b]0;title\x07\x1b[2J` retitles the terminal, clears it, or forges report
-# lines. Every C0/DEL/C1 control except newline and tab becomes `?`; terse's own SGR colour
-# codes (`terminal_report._c`) are the one escape sequence let through.
-_CONTROL = re.compile(r"\x1b\[[0-9;]*m|[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# lines. Every C0/DEL/C1 control except newline and tab becomes `?`. The one escape let
+# through is the exact set of colours `terminal_report._c` emits (reset, 31-36): any SGR
+# would also pass a name's own `\x1b[8m` (hidden) or black-on-black, enough to hide a line.
+_CONTROL = re.compile(r"\x1b\[(?:0|3[1-6])m|[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
 def scrub_control(text: str) -> str:

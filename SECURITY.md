@@ -16,7 +16,9 @@ project scope — see USAGE.md's guidance on `.gitignore`.
 metadata-address refusal, cleartext-credential refusal) judge the downstream URL, not the
 proxy: with an `http://` loopback downstream and a configured `HTTP_PROXY`, the request —
 credential headers included — travels through that proxy. Set `NO_PROXY=localhost,127.0.0.1`
-(or unset the proxy) for local gateways that carry a key.
+(or unset the proxy) for local gateways that carry a key. Through a proxy, terse's
+connect-time check sees the proxy's address, not the target's, so a host name that resolves
+to a cloud-metadata address is only refused when there is no proxy in the way.
 
 **Out of scope:** vulnerabilities in wrapped downstream MCP servers themselves (report
 to their maintainers), and threats requiring local filesystem access an attacker

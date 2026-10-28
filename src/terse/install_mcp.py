@@ -40,10 +40,10 @@ testable without touching the filesystem; the `do_*` helpers add IO + backup.
 from __future__ import annotations
 
 import functools
+import glob
 import hashlib
 import json
 import os
-import glob
 import re
 import shutil
 import subprocess

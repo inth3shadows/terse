@@ -679,7 +679,7 @@ class WireTap:
                 continue                # keep draining, so close() never waits on us
             try:
                 out = self._within_cap([self._render(seq, item) for seq, item, _ in entries],
-                                       entries[0][0] if entries else 0)
+                                       [seq for seq, _, _ in entries])
                 self._fh.write(out)
                 self._fh.flush()
             except (OSError, ValueError) as exc:
@@ -691,16 +691,18 @@ class WireTap:
         except (OSError, ValueError) as exc:
             self._fail(f"write to {self.path} failed ({exc})")
 
-    def _within_cap(self, rendered: list[str], first_seq: int) -> str:
+    def _within_cap(self, rendered: list[str], seqs: list[int]) -> str:
         """The prefix of `rendered` that fits under the file cap; past it, a `truncated`
-        record in place of the rest, and the log stops for this connection."""
+        record in place of the rest, and the log stops for this connection. It takes the
+        seq of the first record it replaces: seqs in a batch can have gaps (a dropped tap
+        consumes one), so `first + i` could repeat a seq already written."""
         if self._file_max <= 0:
             return "".join(rendered)
         keep: list[str] = []
         for i, rec in enumerate(rendered):
             size = len(rec.encode("utf-8"))
             if self._written + size > self._file_max:
-                keep.append(self._render(first_seq + i, self._event_item(
+                keep.append(self._render(seqs[i], self._event_item(
                     "truncated", None, {"file_bytes_max": self._file_max})))
                 self._capped = True
                 sys.stderr.write(f"[terse] wire log {self.path} reached {self._file_max} "

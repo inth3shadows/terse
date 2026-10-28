@@ -181,6 +181,6 @@ def test_nothing_outside_envelope_shape_reads_a_stored_bucket():
                 offenders.append(f"{path.relative_to(root)}:{n}: {line.strip()}")
 
     # The one legitimate read: `envelope_shape`'s own fallback, which is the mechanism.
-    assert offenders == ['src/terse/capture.py:197: stored = env.get("shape")'], (
+    assert offenders == ['src/terse/capture.py:198: stored = env.get("shape")'], (
         "read an envelope's stored `shape` outside `capture.envelope_shape` — "
         "call `envelope_shape(env)` instead (#355):\n" + "\n".join(offenders))

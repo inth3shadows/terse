@@ -40,11 +40,23 @@ _MAX_RESPONSE_BYTES = 128 * 1024 * 1024
 # without a newline would otherwise be buffered whole by `readline` until the proxy OOMs.
 _MAX_LINE_CHARS = _MAX_RESPONSE_BYTES
 
-# Wall-clock ceiling on reading one HTTP response body. `timeout` is per socket operation,
-# so a server dripping one byte every 59s holds the (synchronous) client->server pump
-# forever without ever tripping it. Generous: a long tool call that streams progress over
-# SSE is legitimate, but no real reply takes a quarter of an hour to finish arriving.
-_RESPONSE_DEADLINE_S = 15 * 60
+# Wall-clock ceiling on one HTTP request, response body included. `timeout` is per socket
+# operation, so a server dripping one byte every 59s holds the (synchronous) client->server
+# pump forever without ever tripping it. Generous, because a long tool call that streams
+# progress over SSE is legitimate: an hour by default, `TERSE_HTTP_DEADLINE_S` to change it
+# (0 = no ceiling, the old behaviour).
+_RESPONSE_DEADLINE_S = 60 * 60
+
+
+def _response_deadline_s() -> float:
+    raw = os.environ.get("TERSE_HTTP_DEADLINE_S")
+    if raw is None:
+        return _RESPONSE_DEADLINE_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return _RESPONSE_DEADLINE_S
+    return value if value > 0 else float("inf")
 
 # How much of a non-JSON-RPC error body is quoted back in the synthesized error message
 # (a JSON-RPC-shaped body is forwarded verbatim, whole, as before).
@@ -169,7 +181,8 @@ class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
         # A 307/308 re-sends the POST BODY — the tool call's arguments, often repo content —
         # and only headers are stripped below. Same-origin keeps working; a cross-origin one
         # is refused rather than handing another host the payload.
-        if code in (307, 308) and _origin(newurl) != self._origin:
+        if code in (307, 308) and _origin(newurl) != self._origin \
+                and not _is_https_upgrade(self._origin, _origin(newurl)):
             raise urllib.error.HTTPError(
                 newurl, code, f"terse: refusing cross-origin {code} redirect to "
                 f"{parts.hostname!r} — it would re-send the request body there", headers, fp)
@@ -184,6 +197,13 @@ class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
                          if any(t in h.lower() for t in _SENSITIVE_HEADER_TOKENS)]:
                 del new.headers[name]
         return new
+
+
+def _is_https_upgrade(old: tuple[str, str, int | None],
+                      new: tuple[str, str, int | None]) -> bool:
+    """`http://h` -> `https://h` on the default ports: the same server moving to TLS, and
+    for a POST the only redirect that keeps the body (a 301/302 turns it into a GET)."""
+    return old == ("http", new[1], 80) and new == ("https", old[1], 443)
 
 
 def _as_ip(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -602,7 +622,7 @@ class HttpTransport:
             req_headers["Mcp-Session-Id"] = self.session
         req = urllib.request.Request(self.url, data=line.encode("utf-8"),
                                      headers=req_headers, method="POST")
-        deadline = time.monotonic() + _RESPONSE_DEADLINE_S
+        deadline = time.monotonic() + _response_deadline_s()
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:  # noqa: S310
                 # Only the CONFIGURED downstream may set our session id. After a redirect

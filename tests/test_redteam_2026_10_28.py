@@ -146,8 +146,15 @@ def test_http_error_body_read_is_capped(monkeypatch):
     assert msg["error"]["message"].endswith("Error: " + "E" * 100)
 
 
+def test_http_deadline_env_override(monkeypatch):
+    monkeypatch.setenv("TERSE_HTTP_DEADLINE_S", "0")
+    assert transport._response_deadline_s() == float("inf")
+    monkeypatch.setenv("TERSE_HTTP_DEADLINE_S", "30")
+    assert transport._response_deadline_s() == 30
+
+
 def test_http_dripped_body_hits_the_overall_deadline(monkeypatch):
-    monkeypatch.setattr(transport, "_RESPONSE_DEADLINE_S", 0.5)
+    monkeypatch.setenv("TERSE_HTTP_DEADLINE_S", "0.5")
     with _hostile("drip") as url:
         started = time.monotonic()
         msg = _post_one(HttpTransport(url, timeout=5))
@@ -196,6 +203,29 @@ def test_install_print_keeps_ordinary_args_readable():
     rendered = _full_cmd({"command": "npx", "args": ["-y", "pkg@1.2.3", "--port", "8080",
                                                      "https://h.example/mcp"]})
     assert rendered == "npx -y pkg@1.2.3 --port 8080 https://h.example/mcp"
+
+
+@pytest.mark.parametrize("args", [["-e", "DATABASE_URL=postgres://u:S1@db/x"],
+                                  ["--url=https://u:S1@h/mcp"], ["https://h/x#access_token=S1"]])
+def test_install_print_masks_urls_inside_assignments_and_fragments(args):
+    from terse.cli import _full_cmd
+
+    assert "S1" not in _full_cmd({"command": "npx", "args": args})
+
+
+def test_boolean_secret_flag_does_not_swallow_the_next_flag():
+    from terse.cli import _redact_args
+
+    assert _redact_args(["--no-auth", "--policy", "/p"]) == ["--no-auth", "--policy", "/p"]
+
+
+def test_args_changed_is_reported_even_when_only_a_masked_value_differs():
+    from terse.cli import _entry_change_lines
+
+    lines = _entry_change_lines({"args": ["--api-key", "OLD"]}, {"args": ["--api-key", "NEW"]})
+    joined = "\n".join(lines)
+    assert "args CHANGED" in joined and "masked" in joined
+    assert "OLD" not in joined and "NEW" not in joined
 
 
 def test_install_print_masks_url_entries_and_url_changes():
@@ -266,18 +296,36 @@ def test_model_limit_discovery_refuses_cleartext_remote_key(capsys):
     assert "cleartext" in capsys.readouterr().err
 
 
-def test_answerers_use_the_guarded_opener():
+def test_answerers_open_through_the_guarded_redirect_handler(monkeypatch):
     # dropeval's and fluency's answerers sent the bearer key through the module-global
     # urlopen, which forwards Authorization to wherever a 3xx points.
-    import inspect
+    import urllib.request
 
-    from terse import dropeval
-    from terse.fluency import answerers
+    from terse.dropeval import openai_tool_answerer
+    from terse.fluency.answerers import openai_answerer
 
-    for mod in (dropeval, answerers):
-        src = inspect.getsource(mod)
-        assert "urlopen(" not in src
-        assert "guarded_opener(" in src
+    seen: list[type] = []
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    body = json.dumps({"choices": [{"message": {"content": "hi"}}]}).encode()
+
+    def fake_build_opener(*handlers):
+        seen.extend(type(h) for h in handlers)
+        return type("_O", (), {"open": staticmethod(lambda *a, **k: _Resp(body))})()
+
+    monkeypatch.setattr(urllib.request, "build_opener", fake_build_opener)
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: pytest.fail("bearer key sent through urlopen"))
+    msgs = [{"role": "user", "content": "q"}]
+    openai_tool_answerer("https://api.example/v1", "k", "m", [])(msgs)
+    openai_answerer("https://api.example/v1", "k", "m")("sys", "q")
+    assert seen.count(transport._GuardedRedirectHandler) == 2
 
 
 def test_invalid_header_error_does_not_echo_the_value():
@@ -288,10 +336,35 @@ def test_invalid_header_error_does_not_echo_the_value():
     assert "SECRET123" not in msg["error"]["message"]
 
 
-@pytest.mark.parametrize("sid,kept", [("abc-123", True), ("bad\x01id", False),
-                                      ("sp ace", False)])
+class _SidHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_a):
+        pass
+
+    def do_POST(self) -> None:  # noqa: N802
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        body = _reply(7, "ok").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Mcp-Session-Id", self.server.sid)  # type: ignore[attr-defined]
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.mark.parametrize("sid,kept", [("abc-123", True), ("sp ace", False),
+                                      ("x" * 2000, False)])
 def test_session_id_is_stored_only_when_visible_ascii(sid, kept):
-    assert bool(transport._VALID_SESSION_ID.fullmatch(sid)) is kept
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _SidHandler)
+    srv.sid = sid  # type: ignore[attr-defined]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        t = HttpTransport(f"http://127.0.0.1:{srv.server_address[1]}/mcp", timeout=5)
+        _post_one(t)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert (t.session == sid) is kept
 
 
 def test_router_snapshot_creates_the_terse_state_dir_owner_only(tmp_path, monkeypatch):
@@ -341,7 +414,14 @@ def test_stats_report_command_scrubs_tool_names(tmp_path, capsys):
 def test_data_commands_are_not_scrubbed(capsys):
     from terse import cli
 
-    assert cli._cmd_proxy in cli._STDOUT_IS_DATA and cli._cmd_compress in cli._STDOUT_IS_DATA
+    assert {cli._cmd_proxy, cli._cmd_compress, cli._cmd_policy_generate} <= cli._STDOUT_IS_DATA
+
+
+def test_scrub_control_passes_only_terses_own_colours():
+    from terse.cli import scrub_control
+
+    assert scrub_control("\x1b[8mhidden\x1b[0m") == "?[8mhidden\x1b[0m"
+    assert scrub_control("\x1b[30;40mblack\x1b[0m").startswith("?[30;40m")
 
 
 # --- G4: SSRF guard gaps and peer isolation -------------------------------------------
@@ -408,6 +488,12 @@ def test_peer_check_lets_ordinary_connections_through():
     assert msg["result"]["content"][0]["text"] == "ok"
 
 
+def test_a_same_host_https_upgrade_is_not_a_cross_origin_redirect():
+    assert transport._is_https_upgrade(("http", "h", 80), ("https", "h", 443))
+    assert not transport._is_https_upgrade(("http", "h", 80), ("https", "other", 443))
+    assert not transport._is_https_upgrade(("https", "h", 443), ("http", "h", 80))
+
+
 def test_cross_origin_307_is_refused_and_same_origin_307_followed():
     with _ok_server() as sink_port:
         with _ok_server(target=f"http://localhost:{sink_port}/mcp") as red_port:
@@ -468,12 +554,31 @@ def test_peer_zero_may_answer_its_passthrough_ids_only():
         router.close_senders()
 
 
+def test_a_cancelled_passthrough_id_is_released():
+    router = _router()
+    try:
+        router.route_client_line(json.dumps({"jsonrpc": "2.0", "id": 8,
+                                             "method": "completion/complete"}))
+        assert 8 in router._passthrough_ids
+        router.route_client_line(json.dumps({"jsonrpc": "2.0",
+                                             "method": "notifications/cancelled",
+                                             "params": {"requestId": 8}}))
+        assert 8 not in router._passthrough_ids
+    finally:
+        router.close_senders()
+
+
 def test_a_broadcast_reply_must_come_from_the_peer_it_was_issued_to():
     router = _router()
     try:
-        router._local_id_map["terse-b0-1"] = 0
-        assert router._maybe_collect(0, {"id": "terse-b0-1", "result": {}}) is True
-        assert 0 not in getattr(router._pending.get(0), "parts", {})
+        router.route_client_line(json.dumps({"jsonrpc": "2.0", "id": 1,
+                                             "method": "tools/list"}))
+        (seq, pb), = router._pending.items()
+        forged = {"jsonrpc": "2.0", "id": f"terse-b{seq}-1", "result": {"tools": []}}
+        assert router._maybe_collect(0, forged) is True     # swallowed...
+        assert 0 not in pb.parts and pb.remaining == {0, 1}  # ...and never recorded
+        assert router._maybe_collect(1, forged) is True
+        assert 1 in pb.parts and pb.remaining == {0}
     finally:
         router.close_senders()
 

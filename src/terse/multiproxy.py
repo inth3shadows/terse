@@ -1140,6 +1140,15 @@ class Router:
         if mid is None:
             # A notification (no id at all): fan out fire-and-forget, no reply to track.
             if method is not None:
+                if method == "notifications/cancelled":
+                    # A cancelled passthrough call is never answered (MCP), so its id
+                    # would sit in `_passthrough_ids` until FIFO eviction pushed out a
+                    # live one — whose real reply would then be dropped as unowned.
+                    params = msg.get("params")
+                    rid = params.get("requestId") if isinstance(params, dict) else None
+                    if rid is not None and not _bad_id(rid):
+                        with self._pending_lock:
+                            self._passthrough_ids.pop(rid, None)
                 self._broadcast_notification(line)
                 if method == "notifications/initialized":
                     self._client_initialized()

@@ -18,13 +18,13 @@ fails that pull request until the section has moved.
 Fixes from a red-team audit (2026-10-28). No finding was Critical or High.
 
 - A stdio server that writes a non-UTF-8 byte, or deeply nested JSON, no longer stops all later replies and hangs the client. Any exception in the line transform now forwards the line unchanged instead of ending the reader thread.
-- Bounded reads: a stdio line over 128 MiB is dropped with a warning, HTTP error bodies are capped like success bodies, and an HTTP response that takes more than 15 minutes to arrive fails instead of blocking the proxy.
+- Bounded reads: a stdio line over 128 MiB is dropped with a warning, HTTP error bodies are capped like success bodies, and an HTTP request that takes more than an hour fails instead of blocking the proxy (`TERSE_HTTP_DEADLINE_S` changes the limit, `0` removes it).
 - Text diff skips inputs over 256 KB (a 3 MB result stalled the proxy for about 12 s) and no longer turns off on lone surrogates. `terse measure` and capture no longer crash on a 5000-digit integer.
 - `install-mcp` / `uninstall-mcp` output masks `--access-token`, `--client-secret`-style flags, `NAME=VALUE` args with a secret-looking name, and the password and query string of URLs.
 - Model-limit discovery and the drop-eval and fluency answerers refuse to send their API key over cleartext http to a remote host, and no longer forward it across a redirect.
 - An invalid HTTP header value is no longer quoted, credential and all, in the JSON-RPC error. A server-set `Mcp-Session-Id` must be visible ASCII.
 - Report commands (`stats`, `measure`, `validate`, ...) replace terminal control characters from tool, server and model names with `?`, so a server-chosen name cannot retitle or clear your terminal. Data output (`proxy`, `compress`, `policy generate`, `--json`) is unchanged.
-- HTTP downstreams refuse more cloud-metadata addresses (`100.100.100.200`, `192.0.0.192`, `fd00:ec2::254`, IPv4-mapped forms), refuse a connection whose host name resolved to one, and refuse a cross-origin 307/308 redirect, which would re-send the request body.
+- HTTP downstreams refuse more cloud-metadata addresses (`100.100.100.200`, `192.0.0.192`, `fd00:ec2::254`, IPv4-mapped forms), refuse a connection whose host name resolved to one, and refuse a cross-origin 307/308 redirect, which would re-send the request body (a same-host `http` to `https` upgrade is still followed).
 - `terse proxy --config` drops a server's reply to a request id it was never sent, so one server can no longer answer another server's call.
 - The router creates `~/.local/state/terse` as 0700. Capture pruning and `install-mcp` backup pruning touch only terse's own files (a user's `.claude.json.bak-before-upgrade` is kept), and a dangling backup symlink no longer aborts `install-mcp`.
 - `--wire-log` caps each file at 512 MiB (`TERSE_WIRE_LOG_MAX_BYTES`, `0` = unlimited).
