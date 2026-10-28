@@ -13,7 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- `--wire-log` refuses a log directory owned by another user, and a session directory that is a symlink, instead of following it (#522). A pre-existing session directory with a looser mode is tightened to 0700. `DIR` itself may still be a symlink to a directory you own, and its mode is left alone.
+- `--wire-log` reads each record's clocks when its `seq` is assigned, so `mono_ns` no longer goes backwards in `seq` order across threads (#522).
 
 ## [0.45.8] - 2026-10-28
 
