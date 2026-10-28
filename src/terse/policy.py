@@ -885,8 +885,21 @@ def apply(raw: str, tool: str, policy: Policy,
     data = _lossy_stage(obj, rule, tool=tool, never_lossy=never_lossy,
                         drop_sink=drop_sink, warnings=warnings, drop_origins=drop_origins)
     text, tiers = _lossless_stage(data, rule, warnings)
+    if _unwritable(text, data):
+        return Applied(text=raw, tool=tool, tiers=(), skipped=True,
+                       warnings=warnings + ["payload holds a number JSON cannot write (NaN, "
+                                            "or past float range); passed through "
+                                            "uncompressed"])
     return Applied(text=text, tool=tool, tiers=tiers, skipped=False, warnings=warnings,
                    drop_origins=drop_origins)
+
+
+def _unwritable(text: str, data: Any) -> bool:
+    """True when the emitted `text` carries a bare `NaN`/`Infinity` token, which is not
+    JSON: the raw payload wrote that number some legal way (`1e400`) that the parse turned
+    into a float infinity. The substring test is the cheap filter; the walk confirms it was
+    a number and not a string that merely says "NaN"."""
+    return ("NaN" in text or "Infinity" in text) and transforms.has_non_finite(data)
 
 
 # Reasons `apply_joined` returns when it declines to join, recorded in the ledger (the
@@ -898,6 +911,7 @@ JOIN_REFUSED_NON_JSON = "non_json"          # some block isn't JSON
 JOIN_REFUSED_HETEROGENEOUS = "heterogeneous"  # some block isn't a dict — not a record seq
 JOIN_REFUSED_MARKER = "marker"              # a reserved terse marker key is present
 JOIN_REFUSED_DEPTH = "depth"                # joined array nests past the codec cap
+JOIN_REFUSED_NON_FINITE = "non_finite"      # a block holds NaN/Infinity (see `_unwritable`)
 
 
 def apply_joined(raws: list[str], tool: str, policy: Policy,
@@ -964,6 +978,8 @@ def apply_joined(raws: list[str], tool: str, policy: Policy,
                          drop_sink=drop_sink, warnings=warnings,
                          drop_origins=drop_origins) for o in objs]
     text, tiers = _lossless_stage(data, rule, warnings)
+    if _unwritable(text, data):
+        return None, None, JOIN_REFUSED_NON_FINITE   # per-block `apply` passes each through
     return (Applied(text=text, tool=tool, tiers=tiers, skipped=False, warnings=warnings,
                     drop_origins=drop_origins),
             objs, "")

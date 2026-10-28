@@ -89,8 +89,11 @@ off by default because it failed rung 4 at the measured hit rate.
 - **1 — mechanical reconstruction: `transforms.roundtrip_ok`.** See *Lossless gate is
   non-negotiable* above and `transforms.py` under File Descriptions. Total and cheap, so
   it runs as a parametrized battery over the whole corpus. Note its exact claim — the
-  gate is byte-faithful **by value** (`values_equal`), which is `==` plus a NaN contract,
-  not string equality of the re-serialized text. Where a lossy mode replaces this gate it
+  gate is byte-faithful **by value** (`values_equal`): `==` plus a NaN contract, and
+  type-strict, so `true`, `1` and `1.0` are three different values (the diff gate uses it
+  too). It is not string equality of the re-serialized text, so key order is free. A
+  payload holding a number JSON cannot write (`1e400` parses to an infinity) is passed
+  through raw. Where a lossy mode replaces this gate it
   substitutes a *stronger* one for the affected span (`acceptable_loss`,
   `droppable_loss`, `text_droppable_loss` — see Known Limitations); no mode simply drops
   a rung.
