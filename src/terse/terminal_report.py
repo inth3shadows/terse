@@ -35,6 +35,7 @@ from .report import (
     fluency_gap_rows,
     is_diff_run,
     passes_tolerance,
+    savings_totals,
     strip_markup,
 )
 
@@ -134,13 +135,13 @@ def build_terminal_report(rows: list[dict[str, Any]], color: bool | None = None)
     shape_items = []
     for shape in shapes:
         sub = [r for r in rows if r["shape"] == shape]
-        raw, cmp_ = _sum(sub, "cl100k", "raw"), _sum(sub, "cl100k", "compressed")
+        raw, cmp_ = savings_totals(sub)
         shape_items.append((shape, ((raw - cmp_) / raw * 100) if raw else 0.0))
 
     tool_items = []
     for tool in tools:
         sub = [r for r in rows if (r.get("tool") or "?") == tool]
-        raw, cmp_ = _sum(sub, "cl100k", "raw"), _sum(sub, "cl100k", "compressed")
+        raw, cmp_ = savings_totals(sub)
         tool_items.append((tool, ((raw - cmp_) / raw * 100) if raw else 0.0))
     tool_items.sort(key=lambda kv: -kv[1])
 

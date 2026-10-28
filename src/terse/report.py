@@ -3103,6 +3103,17 @@ def _sum(rows: list[dict[str, Any]], *path: str) -> int:
     return total
 
 
+def savings_totals(rows: list[dict[str, Any]]) -> tuple[int, int]:
+    """(raw, terse) cl100k totals as the proxy would deliver them. A row that failed the
+    lossless gate is sent raw, so its terse count is its raw count: `measure` zeroes that
+    row's `saved_cl100k` but keeps the failed `compressed` count, and summing that would
+    bank a saving the proxy never emits."""
+    ok = [r for r in rows if r.get("roundtrip_ok", False)]
+    failed = [r for r in rows if not r.get("roundtrip_ok", False)]
+    raw = _sum(rows, "cl100k", "raw")
+    return raw, _sum(ok, "cl100k", "compressed") + _sum(failed, "cl100k", "raw")
+
+
 def build_probe_report(
     vr_rows: list[dict[str, Any]], overlap_rows: list[dict[str, Any]]
 ) -> str:
@@ -3400,7 +3411,7 @@ def verify_summary(rows: list[dict[str, Any]], coverage: dict[str, Any],
     """Machine-readable counterpart to build_verify_header + build_report: the same
     lossless-gate verdict and cl100k savings the markdown shows, as a dict for
     `terse verify --json` (scriptable / CI-checkable). Numbers come from the same
-    `_sum` path as the report, so the JSON can never disagree with it."""
+    `savings_totals` path as the report, so the JSON can never disagree with it."""
     failures = [r for r in rows if not r.get("roundtrip_ok", False)]
     # Reported as its own verdict, not folded into `lossless_gate` (#188). It does NOT
     # invalidate the savings below — those come from the default pipeline, which passed —
@@ -3417,8 +3428,7 @@ def verify_summary(rows: list[dict[str, Any]], coverage: dict[str, Any],
     total = len(rows)
 
     def _bucket(sub: list[dict[str, Any]]) -> dict[str, Any]:
-        raw = _sum(sub, "cl100k", "raw")
-        cmp_ = _sum(sub, "cl100k", "compressed")
+        raw, cmp_ = savings_totals(sub)
         return {"n": len(sub), "raw_tokens": raw, "terse_tokens": cmp_,
                 "saved_tokens": raw - cmp_,
                 "saved_pct": round((raw - cmp_) / raw * 100, 1) if raw else 0.0}
@@ -3509,19 +3519,18 @@ def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
     out += [
         "## Tier-0 savings by shape bucket (cl100k)",
         "",
-        "Headline = full Tier-0 (minify + tabularize) vs the raw bytes the model would see.",
+        "Headline = full Tier-0 (minify + tabularize + dictionary) vs the raw bytes the model would see; "
+        "a payload that fails the lossless gate counts as sent raw.",
         "",
         "| Shape | n | raw tok | terse tok | saved | % |",
         "|---|---|---|---|---|---|",
     ]
     for shape in shapes:
         sub = [r for r in rows if r["shape"] == shape]
-        raw = _sum(sub, "cl100k", "raw")
-        cmp_ = _sum(sub, "cl100k", "compressed")
+        raw, cmp_ = savings_totals(sub)
         saved = raw - cmp_
         out.append(f"| {shape} | {len(sub)} | {raw} | {cmp_} | {saved:+d} | {_pct(saved, raw)} |")
-    raw_all = _sum(rows, "cl100k", "raw")
-    cmp_all = _sum(rows, "cl100k", "compressed")
+    raw_all, cmp_all = savings_totals(rows)
     out.append(
         f"| **ALL** | {len(rows)} | {raw_all} | {cmp_all} | {raw_all - cmp_all:+d} | "
         f"{_pct(raw_all - cmp_all, raw_all)} |"
@@ -3551,8 +3560,7 @@ def build_report(rows: list[dict[str, Any]], coverage: dict[str, Any]) -> str:
     tool_rows = []
     for tool in tools:
         sub = [r for r in rows if (r.get("tool") or "?") == tool]
-        raw = _sum(sub, "cl100k", "raw")
-        cmp_ = _sum(sub, "cl100k", "compressed")
+        raw, cmp_ = savings_totals(sub)
         shape = sub[0]["shape"] if sub else "?"
         tool_rows.append((raw - cmp_, raw, cmp_, tool, shape))
     for saved, raw, cmp_, tool, shape in sorted(tool_rows, reverse=True):

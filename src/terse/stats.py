@@ -2092,6 +2092,10 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
             dest[rl] = dest.get(rl, 0) + n
 
     servers: list[dict[str, Any]] = []
+    # Every label some installed entry is billed for, each once. The fleet headline sums
+    # these, not the ledger total: the total also holds rows from servers since removed and
+    # from contested labels no entry owns, so it read larger than the rows beside it.
+    owned_labels: set[str] = set()
     # Which row speaks for a name defined in several scopes — the one the client launches,
     # not the first emitted (#398). Rendering order below is unchanged: the loop still walks
     # `scan_rows` as emitted and skips the rows that lost.
@@ -2483,6 +2487,7 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
         # so it is computed from them rather than alongside them.
         row_out.update(_recommend(row_out))
         servers.append(row_out)
+        owned_labels.update(labels)
 
     # Each server lands in exactly one bucket, and only two of them are money.
     per_turn = sum(s["primer_tokens"] or 0 for s in servers if s["cadence"] == _PER_TURN)
@@ -2493,8 +2498,8 @@ def primer_liability(scan_rows: list[dict[str, Any]], agg: dict[str, Any],
     # `retrieve_by_label`), so the headline and the rows it sums cannot disagree.
     retrieves = [r for r in agg.get("retrieves") or []
                  if by_label.get(str(r.get("server", "unknown")))]
-    retrieve_tokens = sum(retrieve_by_label.values())
-    saved = _context_saved(total) - retrieve_tokens
+    retrieve_tokens = sum(retrieve_by_label.get(lbl, 0) for lbl in owned_labels)
+    saved = sum(net_saved_by_label.get(lbl, 0) for lbl in owned_labels)
     # The per-server rates were netted row by row through `_context_saved` too, so the basis
     # is only `context` when the total AND every tool row carried the pair.
     rows_ctx = {_has_context_sums(t) for t in agg.get("tools", [])} | {_has_context_sums(total)}

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from ._secure_io import append_restricted, mkdir_restricted
-from .report import _sum
+from .report import savings_totals
 
 # One JSONL line per real `measure --history` run — tiny, but unbounded over a project's
 # life. Rotate a single generation once the live file passes this so it can't grow forever
@@ -33,8 +33,7 @@ def summarize_run(rows: list[dict[str, Any]], ts: str, *, label: str | None = No
     only, never raw payload content (a history file may be committed/shared even
     when the corpus that produced it isn't)."""
     failures = [r for r in rows if not r.get("roundtrip_ok", False)]
-    raw = _sum(rows, "cl100k", "raw")
-    cmp_ = _sum(rows, "cl100k", "compressed")
+    raw, cmp_ = savings_totals(rows)
     saved = raw - cmp_
     return {
         "ts": ts,

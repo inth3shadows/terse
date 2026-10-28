@@ -13,7 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- `measure`, `verify` (markdown, `--json`, `--html`, terminal bars) and `measure --history` no longer count a saving on a payload that failed the lossless gate. Those totals summed each payload's compressed size even when the proxy would send it raw, so one failed 100->60 payload beside a 100->100 one read +20% instead of +0%. The savings header also now names the dictionary tier it includes.
+- `terse stats`' fleet `saved_tokens` (and `retrieve_tokens`) now sum only the ledger labels an installed entry is billed for, each once. It summed the whole ledger, so rows from a removed server or a contested label lifted the headline above the per-server rows beside it. `wire_saved_tokens` is still the whole ledger.
 
 ## [0.45.5] - 2026-10-28
 

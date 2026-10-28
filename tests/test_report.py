@@ -127,3 +127,38 @@ def test_build_trend_report_handles_none_saved_pct():
     text = build_trend_report([zero_raw, _RUN_A])
     assert "n/a" in text
     assert "—" in text  # no label, no prior pct to delta against
+
+
+# A failed row's `compressed` is kept by `measure` but never sent: the proxy passes it raw.
+# The reviewer's repro: one failed 100->60 plus one passing 100->100 is +0%, not +20%.
+_FAILED_PLUS_NOOP = [
+    {"tool": "t", "sha": "bad", "shape": "s", "roundtrip_ok": False,
+     "cl100k": {"raw": 100, "compressed": 60}},
+    {"tool": "t", "sha": "ok", "shape": "s", "roundtrip_ok": True,
+     "cl100k": {"raw": 100, "compressed": 100}},
+]
+
+
+def test_a_failed_row_banks_no_saving_in_any_total():
+    from terse.history import summarize_run
+    from terse.terminal_report import build_terminal_report
+
+    rows = _FAILED_PLUS_NOOP
+    cov = {"total": 2, "by_tool": {"t": 2}, "by_shape": {"s": 2}}
+    s = verify_summary(rows, cov, "c")
+    assert s["tokens_cl100k"]["terse_tokens"] == 200
+    assert s["tokens_cl100k"]["saved_tokens"] == 0
+    assert s["by_shape"]["s"]["saved_tokens"] == 0
+    run = summarize_run(rows, "ts")
+    assert (run["compressed_tok"], run["saved_tok"]) == (200, 0)
+    md = build_report(rows, cov)
+    assert "| **ALL** | 2 | 200 | 200 | +0 | +0.0% |" in md
+    assert "| s | 2 | 200 | 200 | +0 | +0.0% |" in md
+    assert "| `t` | s | 200 | 200 | +0 | +0.0% |" in md
+    assert "+20.0%" not in build_html_report(rows, cov)
+    assert "+20" not in build_terminal_report(rows, color=False)
+
+
+def test_the_savings_header_names_the_dictionary_tier():
+    md = build_report(_FAILED_PLUS_NOOP, {"total": 2})
+    assert "minify + tabularize + dictionary" in md
