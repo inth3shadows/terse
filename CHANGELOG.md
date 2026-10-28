@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.45.3] - 2026-10-27
+
 ### Fixed
 
 - `terse proxy --config` handles a client that stops reading cleanly (#516). A dead client pipe now ends the session from any thread, with one stderr line and no BrokenPipeError tracebacks from server or timer threads. Calls still waiting on a server no longer hold up shutdown (up to 30 s each), and the process exits 0 instead of 120. A transient `EAGAIN` on a client write loses that line but no longer ends the session.
