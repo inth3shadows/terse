@@ -347,9 +347,10 @@ def test_server_crash_mid_session_records_peer_exit_and_stop(mode, tmp_path):
     if mode == "single":
         assert rc == 3
     else:
-        (timeout,) = [r for r in recs if r["hop"] == "client_out" and r["jsonrpc_id"] == 2]
-        assert timeout["origin"] == "timeout" and timeout["capture_status"] == "synthesized"
-        assert json.loads(timeout["line"])["error"]["code"] == -32001
+        # The crash answers the pending call (peer_exit), not a timer: there is none.
+        (answer,) = [r for r in recs if r["hop"] == "client_out" and r["jsonrpc_id"] == 2]
+        assert answer["origin"] == "peer_exit" and answer["capture_status"] == "synthesized"
+        assert json.loads(answer["line"])["error"]["code"] == -32001
 
 
 @pytest.mark.parametrize("mode", MODES)

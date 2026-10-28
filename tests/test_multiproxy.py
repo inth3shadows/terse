@@ -777,7 +777,7 @@ def test_routed_call_registers_timeout_timer_before_writing_to_peer():
     orig_send = router._senders[0].send
 
     def spy_send(line):
-        seen_registered_before_send.append(7 in router._routed_timers)
+        seen_registered_before_send.append((0, 7) in router._routed_timers)
         return orig_send(line)
 
     router._senders[0].send = spy_send
@@ -806,7 +806,7 @@ def test_peer_initiated_request_id_does_not_collide_with_routed_call_timeout():
         router.route_client_line(json.dumps(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
              "params": {"name": "a__gh.api.items"}}))
-        assert 1 in router._routed_timers  # the routed call's timeout is pending
+        assert (0, 1) in router._routed_timers  # the routed call's timeout is pending
 
         # the SAME peer sends its own server-initiated request, reusing id=1 — its own
         # id space, unrelated to the client's routed-call id
@@ -820,7 +820,7 @@ def test_peer_initiated_request_id_does_not_collide_with_routed_call_timeout():
         assert rewritten["id"] != 1  # namespaced, so the client's reply can route back
 
         # the routed call's OWN timeout must be untouched by the id coincidence
-        assert 1 in router._routed_timers
+        assert (0, 1) in router._routed_timers
 
         # its real reply still arrives and resolves normally afterward
         reply = router.from_peer(0)(json.dumps(
@@ -830,7 +830,7 @@ def test_peer_initiated_request_id_does_not_collide_with_routed_call_timeout():
         router.close_senders()
 
     assert reply not in (None, SWALLOW)
-    assert 1 not in router._routed_timers
+    assert (0, 1) not in router._routed_timers
 
 
 def test_routed_timeout_eviction_ages_out_stale_entries_independent_of_population(monkeypatch):
@@ -854,27 +854,27 @@ def test_routed_timeout_eviction_ages_out_stale_entries_independent_of_populatio
     router = Router(peers, out, Lock(), broadcast_timeout=1000)
     router._routed_timed_out_ttl = 10.0
     try:
-        router._routed_timers[1] = threading.Timer(1000, lambda: None)
+        router._routed_timers[(0, 1)] = threading.Timer(1000, lambda: None)
         router._timeout_routed_call(1, 0)
-        assert 1 in router._routed_timed_out
+        assert (0, 1) in router._routed_timed_out
 
         # a second, unrelated timeout fires WELL WITHIN id 1's TTL — id 1 must still
         # be there (a young entry is never evicted just because another, unrelated
         # call also timed out)
         fake_now[0] = 5.0
-        router._routed_timers[2] = threading.Timer(1000, lambda: None)
+        router._routed_timers[(0, 2)] = threading.Timer(1000, lambda: None)
         router._timeout_routed_call(2, 0)
-        assert 1 in router._routed_timed_out
+        assert (0, 1) in router._routed_timed_out
 
         # time passes past id 1's TTL (age 12 > 10) but NOT id 2's (age 12 - 5 = 7 <
         # 10) — the next timeout's proactive age-based sweep must clean up only the
         # genuinely stale one, with population nowhere near the (65536) backstop,
         # proving eviction here is driven by age, not by population pressure
         fake_now[0] = 12.0
-        router._routed_timers[3] = threading.Timer(1000, lambda: None)
+        router._routed_timers[(0, 3)] = threading.Timer(1000, lambda: None)
         router._timeout_routed_call(3, 0)
-        assert 1 not in router._routed_timed_out
-        assert 2 in router._routed_timed_out  # still within its own TTL window
+        assert (0, 1) not in router._routed_timed_out
+        assert (0, 2) in router._routed_timed_out  # still within its own TTL window
     finally:
         router.close_senders()
 
@@ -2217,7 +2217,7 @@ def _assert_router_still_routes(router, t1, out, mid=42):
          "result": {"content": [{"type": "text", "text": "ok"}]}}))
     assert reply is not None and reply is not SWALLOW
     assert json.loads(reply)["id"] == mid and "result" in json.loads(reply)
-    assert mid not in router._routed_timers
+    assert (1, mid) not in router._routed_timers
 
 
 @pytest.mark.parametrize("bad, reply", [
@@ -2749,3 +2749,209 @@ def test_an_invalid_peer_id_is_only_traced_under_debug(capsys):
         assert capsys.readouterr().err == ""
     finally:
         router.close_senders()
+
+
+# --- routed-call timeout (audit 2026-10-27 PR 3) and #511 ---
+
+def _routed(router, mid, tool="a__gh.api.items"):
+    router.route_client_line(json.dumps(
+        {"jsonrpc": "2.0", "id": mid, "method": "tools/call", "params": {"name": tool}}))
+
+
+def _reply(mid, text="ok"):
+    return json.dumps({"jsonrpc": "2.0", "id": mid,
+                       "result": {"content": [{"type": "text", "text": text}]}})
+
+
+def _await_lines(out, n, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while len(_lines(out)) < n and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return _lines(out)
+
+
+def test_a_routed_call_has_no_timer_by_default_and_gets_its_late_real_reply():
+    # A tool running past the old fixed 30 s cap was answered -32001 while the server
+    # kept working, and its real result was then swallowed. With no routed_timeout the
+    # call waits for its reply, however long the broadcast timeout is.
+    t0, _, _, out, router = _two_peer_router()
+    router.broadcast_timeout = 0.05
+    try:
+        _routed(router, 7)
+        assert router._routed_timers == {(0, 7): None}
+        time.sleep(0.2)                                   # well past broadcast_timeout
+        assert _lines(out) == []
+        reply = router.from_peer(0)(_reply(7, "slow but real"))
+    finally:
+        router.close_senders()
+    assert reply not in (None, SWALLOW) and "slow but real" in reply
+    assert not router._routed_timers
+
+
+def test_routed_timeout_answers_32001_and_cancels_the_call_on_the_peer():
+    t0 = _FakePeerTransport()
+    out = io.StringIO()
+    router = Router([Peer("a", t0, Interceptor(PLAIN_POLICY))], out, Lock(),
+                    broadcast_timeout=1000, routed_timeout=0.05)
+    try:
+        _routed(router, 7)
+        (msg,) = _await_lines(out, 1)
+        deadline = time.monotonic() + 2.0
+        while "notifications/cancelled" not in t0.out.getvalue() \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+        late = router.from_peer(0)(_reply(7, "late"))
+    finally:
+        router.close_senders()
+    assert msg["id"] == 7 and msg["error"]["code"] == -32001
+    assert "timed out after 0.05s" in msg["error"]["message"]
+    sent = [json.loads(ln) for ln in t0.out.getvalue().splitlines() if ln.strip()]
+    cancels = [m for m in sent if m.get("method") == "notifications/cancelled"]
+    assert [c["params"]["requestId"] for c in cancels] == [7]
+    assert late is SWALLOW and len(_lines(out)) == 1
+
+
+def test_a_peer_exit_answers_only_its_own_pending_calls_and_later_ones_at_once():
+    t0, t1, _, out, router = _two_peer_router()
+    try:
+        _routed(router, 7)                          # to a
+        _routed(router, 8, "b__search")             # to b
+        router.peer_exited(0)
+        (gone,) = _lines(out)
+        assert gone["id"] == 7 and gone["error"]["code"] == -32001
+        assert "'a' exited before answering" in gone["error"]["message"]
+        assert set(router._routed_timers) == {(1, 8)}
+        _routed(router, 9)                          # a is gone: answered at once
+        assert _lines(out)[-1]["id"] == 9 and "exited" in _lines(out)[-1]["error"]["message"]
+        assert set(router._routed_timers) == {(1, 8)}
+        assert router.from_peer(1)(_reply(8)) not in (None, SWALLOW)
+    finally:
+        router.close_senders()
+    assert "notifications/cancelled" not in t0.out.getvalue()   # nothing to cancel on a dead peer
+
+
+def test_a_late_reply_from_one_peer_cannot_answer_the_same_id_routed_to_another():
+    # Reviewer repro: after a timeout, the client reuses the id for a call to another
+    # peer. Keyed by id alone, the first peer's late reply popped the second call's entry
+    # and was delivered as its answer.
+    _, _, _, out, router = _two_peer_router()
+    try:
+        _routed(router, 7)                                   # to a
+        router._timeout_routed_call(7, 0)                    # answered -32001
+        _routed(router, 7, "b__search")                      # id reused, to b
+        assert router.from_peer(0)(_reply(7, "a late")) is SWALLOW
+        assert (1, 7) in router._routed_timers               # b's call still pending
+        answer = router.from_peer(1)(_reply(7, "b real"))
+    finally:
+        router.close_senders()
+    assert "b real" in answer and not router._routed_timers
+
+
+def test_the_shutdown_drain_returns_as_soon_as_the_reply_lands():
+    _, _, _, out, router = _two_peer_router()
+    router.broadcast_timeout = 30.0                          # the drain's grace
+    try:
+        _routed(router, 7)
+        threading.Timer(0.1, lambda: router.from_peer(0)(_reply(7))).start()
+        started = time.monotonic()
+        router.drain_routed_calls()
+        assert time.monotonic() - started < 5.0
+    finally:
+        router.close_senders()
+    assert _lines(out) == []        # the drain answered nothing: the peer did
+
+
+def test_the_shutdown_drain_answers_and_cancels_what_never_replied():
+    t0, _, _, out, router = _two_peer_router()
+    router.broadcast_timeout = 0.05
+    try:
+        _routed(router, 7)
+        router.drain_routed_calls()
+        (msg,) = _lines(out)
+        late = router.from_peer(0)(_reply(7))
+    finally:
+        router.close_senders()
+    assert msg["error"]["code"] == -32001 and "client disconnected" in msg["error"]["message"]
+    assert "notifications/cancelled" in t0.out.getvalue()
+    assert late is SWALLOW and not router._routed_timers
+
+
+def test_511_a_broadcast_that_raises_part_way_is_answered_exactly_once(monkeypatch):
+    # The issue's forced repro: a peer's note_request raises on resources/list. The
+    # catch-all answers -32603 at once; the pending broadcast it left behind then timed
+    # out and sent a second reply for the same id.
+    _, _, peers, out, router = _two_peer_router()
+    router.broadcast_timeout = 0.05
+
+    def boom(line, **kw):
+        raise RuntimeError("forced")
+
+    monkeypatch.setattr(peers[1].inter, "note_request", boom)
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 5, "method": "resources/list"}))
+        time.sleep(0.3)                                      # past the broadcast timer
+        router.drain_pending_broadcasts()
+    finally:
+        router.close_senders()
+    msgs = _lines(out)
+    assert [(m["id"], m["error"]["code"]) for m in msgs] == [(5, -32603)]
+    assert not router._pending and 5 not in router._active_seq
+
+
+@pytest.mark.parametrize("method", ["tools/call", "tools/list"])
+def test_511_a_timer_that_fails_to_start_leaves_nothing_registered(method, monkeypatch):
+    _, _, _, out, router = _two_peer_router()
+    router.routed_timeout = 1000
+
+    def refuse(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Timer, "start", refuse)
+    try:
+        params = {"name": "a__gh.api.items"} if method == "tools/call" else {}
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 5, "method": method, "params": params}))
+        assert [m["error"]["code"] for m in _lines(out)] == [-32603]
+        assert not router._routed_timers and not router._pending
+        router.drain_pending_broadcasts()                    # must not raise on join
+        router.drain_routed_calls()
+        assert len(_lines(out)) == 1
+    finally:
+        router.close_senders()
+
+
+def test_511_a_failed_peer_write_unregisters_the_routed_call(monkeypatch):
+    _, _, _, out, router = _two_peer_router()
+
+    def refuse(line, origin=None):
+        raise RuntimeError("queue gone")
+
+    monkeypatch.setattr(router._senders[0], "send", refuse)
+    try:
+        _routed(router, 5)
+        assert [m["error"]["code"] for m in _lines(out)] == [-32603]
+        assert not router._routed_timers
+    finally:
+        router.close_senders()
+
+
+def test_routed_timeout_flag_reaches_the_router_and_is_validated(tmp_path, monkeypatch, capsys):
+    import terse.multiproxy as mp
+    from terse.cli import main
+
+    seen = {}
+    monkeypatch.setattr(mp, "run_multi_proxy",
+                        lambda *a, **kw: seen.update(kw) or 0)
+    cfg = _write_config(tmp_path, [{"name": "a", "command": [sys.executable, str(FAKE)]}])
+    assert main(["proxy", "--no-stats", "--config", str(cfg)]) == 0
+    assert seen["routed_timeout"] is None                   # no flag: no timer
+    assert main(["proxy", "--no-stats", "--routed-timeout", "600",
+                 "--config", str(cfg)]) == 0
+    assert seen["routed_timeout"] == 600.0
+    capsys.readouterr()
+    assert main(["proxy", "--routed-timeout", "5", "--", "true"]) == 2
+    assert "only with --config" in capsys.readouterr().err
+    for bad in ("0", "-1", "nan", "inf", "soon"):
+        with pytest.raises(SystemExit):
+            main(["proxy", "--routed-timeout", bad, "--config", str(cfg)])

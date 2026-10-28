@@ -343,7 +343,8 @@ def test_a_peer_that_fails_to_start_still_errors_its_calls(tmp_path):
                    timeout=5)
     finally:
         assert c.close() == 0
-    assert dead["error"]["code"] == -32001 and "timed out" in dead["error"]["message"]
+    # The peer is gone, so its call is answered as soon as it is routed: no timer needed.
+    assert dead["error"]["code"] == -32001 and "exited" in dead["error"]["message"]
     assert "result" in live
     # A degraded live listing is never persisted over a complete snapshot.
     path = _path(cfg)
@@ -657,3 +658,35 @@ def test_peers_swapping_initialize_arrival_order_is_not_reported_as_a_change(tmp
     assert "live initialize differs" not in capsys.readouterr().err
     assert not [ln for ln in out.getvalue().splitlines() if "list_changed" in ln]
     assert path.read_bytes() == before
+
+
+def test_511_a_failed_background_initialize_does_not_answer_the_client_twice(
+        tmp_path, monkeypatch, capsys):
+    # `_fast_initialize` writes the snapshot's reply, THEN broadcasts to the peers. If
+    # that broadcast raised, the catch-all sent -32603 for an id already answered.
+    init = {"result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}}
+    parts = {"initialize": {"a": init},
+             "tools/list": {"a": {"result": {"tools": [{"name": "t1"}]}}}}
+    path = tmp_path / "snap.json"
+    RouterSnapshot(path, "fp").save(parts, "2025-06-18")
+    t, out = _FakeTransport(), io.StringIO()
+    inter = Interceptor(POLICY)
+    router = Router([Peer("a", t, inter)], out, Lock(), broadcast_timeout=0.05,
+                    snapshot=RouterSnapshot(path, "fp"))
+
+    def boom(line, **kw):
+        raise RuntimeError("forced")
+
+    monkeypatch.setattr(inter, "note_request", boom)
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2025-06-18"}}))
+        time.sleep(0.2)
+        router.drain_pending_broadcasts()
+    finally:
+        router.close_senders()
+    msgs = [json.loads(ln) for ln in out.getvalue().splitlines()]
+    assert [m["id"] for m in msgs] == [1] and "result" in msgs[0]
+    assert router._warm is None and not router._pending
+    assert "background initialize failed" in capsys.readouterr().err

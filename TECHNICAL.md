@@ -382,7 +382,7 @@ One JSON object per line (`ensure_ascii`, so any string round-trips):
 | `sha256` | of the line's UTF-8 encoding; `null` when excluded |
 | `line` | the exact line, newline excluded; `null` when excluded |
 | `capture_status` | `full`, `excluded_by_policy`, `parse_error` (blank, whitespace-only or not JSON), `dropped` (a peer line discarded instead of written), `synthesized` (terse wrote it, not a server), `local_answer` (a `terse.retrieve` reply) |
-| `origin` | for terse-made or discarded lines: `retrieve`, `snapshot`, `router_broadcast` (a fan-out copy or the merged reply), `router_internal` (the router's own background broadcasts), `timeout` (-32001), `router` (-32601 unknown tool/prompt), `error_writer` (-32600/-32602/-32603), `reconcile` (list_changed), `http_synth` (HTTP transport's -32000), `queue_full` / `evicted` (peer send queue) |
+| `origin` | for terse-made or discarded lines: `retrieve`, `snapshot`, `router_broadcast` (a fan-out copy or the merged reply), `router_internal` (the router's own background broadcasts), `timeout` (-32001, or the `notifications/cancelled` sent with it), `peer_exit` (-32001 for a call its peer exited without answering), `router` (-32601 unknown tool/prompt), `error_writer` (-32600/-32602/-32603), `reconcile` (list_changed), `http_synth` (HTTP transport's -32000), `queue_full` / `evicted` (peer send queue) |
 | `rule` | the policy rule glob behind an exclusion or a tools/call decision; for an exclusion no rule names, `<undecidable>` (a line the gate could not classify), `<unmatched-excluded-call>` (a peer's line after an excluded call its reply cannot be matched to), `<gate-error>` (the gate raised) or `<exclusion-overflow>` |
 | `event`, `detail` | on `hop: event` only: `start` (version, mode, policy path, config, peers, an argv summary with no arguments), `peer_start` (pid), `peer_exit` (pid, exit code), `drain_timeout`, `write_error` (a peer write that raised), `sink_drop` (count of records lost to a full queue), `exclusion_overflow` (the in-flight exclusion table is full; every later line is excluded), `teardown` (servers still running when the log closes, which get no `peer_exit`, and the exception that ended the session; written only when that list is non-empty), `stop` (records) |
 
@@ -648,6 +648,16 @@ by the next patch (PyPI versions cannot be re-uploaded).
   merging, and any client method outside `initialize`/`tools/list`/`tools/call` falls back
   to peer 0 (debug-logged). Each is a documented v1 limitation, not a silent gap — revisit
   if a real workload needs it.
+  A routed `tools/call` or `prompts/get` has **no timeout by default**, like the
+  single-server proxy, so a long-running tool's real result always comes back.
+  `--routed-timeout SECONDS` sets a cap: when it fires, the client gets -32001 and the peer
+  gets `notifications/cancelled`, and the peer's late reply is dropped. A peer that exits
+  (its stdout reaches EOF) has every call still pending on it answered -32001 at once, and
+  any later call to it too. At client EOF, pending routed calls get a grace period
+  (`--routed-timeout`, else the 30 s broadcast timeout) and are then answered -32001 and
+  cancelled, so a peer that never replies cannot hold the process open. Pending calls are
+  tracked per (peer, id), so a late reply from one peer cannot answer an id the client has
+  since reused for another.
 - **Cross-call diffing is built and OPT-IN (`proxy --diff` / policy
   `"diff": true`).** Default-off since #170: the tier is correct, but its primer
   paragraph is 34% of the primer (190 of 555) and the live ledger shows a 0.38% hit rate.
