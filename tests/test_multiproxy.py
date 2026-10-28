@@ -2454,7 +2454,10 @@ def test_an_exception_in_the_peer_transform_is_contained(monkeypatch, capsys):
 
     monkeypatch.setattr(peers[1].inter, "transform_response", _boom)
     try:
-        line = json.dumps({"jsonrpc": "2.0", "id": 99, "result": {}})
+        # A notification: a reply to an id peer 1 was never sent is now dropped before
+        # the transform (red-team 2026-10-28), so it would not exercise the containment.
+        line = json.dumps({"jsonrpc": "2.0", "method": "notifications/message",
+                           "params": {}})
         assert router.from_peer(1)(line) is None
         err = capsys.readouterr().err
         assert "transform boom" in err and "forwarded unchanged" in err

@@ -958,6 +958,11 @@ class Router:
         # _SERVER_REQ_MAX eviction.
         self._server_requests: OrderedDict[str, tuple[int, Any]] = OrderedDict()
         self._server_req_seq = 0
+        # Client ids forwarded to peer 0 by the no-handler passthrough below, which registers
+        # no routed timer. With `_routed_timers` this is the full set of ids a peer may
+        # answer: any other reply is a peer speaking for a call it was never sent. Bounded
+        # by _SERVER_REQ_MAX eviction, like `_server_requests`.
+        self._passthrough_ids: OrderedDict[Any, None] = OrderedDict()
         # (peer index, client id) -> its Timer, or None without `routed_timeout`: every
         # routed (single-peer) call awaiting its reply. Whoever pops an entry answers the
         # client: the real reply in from_peer, the timer, the peer's exit
@@ -1172,6 +1177,11 @@ class Router:
                 f"[terse-multiproxy] {_short(method)} has no broadcast/route handler; "
                 f"forwarding to peer 0 ({self.peers[0].name!r}) only "
                 "(scope — see multiproxy.py's module docstring)\n")
+            if msg.get("id") is not None:
+                with self._pending_lock:
+                    self._passthrough_ids[msg["id"]] = None
+                    while len(self._passthrough_ids) > _SERVER_REQ_MAX:
+                        self._passthrough_ids.popitem(last=False)
             self._write_peer(0, line)
 
     def _params_or_reject(self, msg: dict) -> dict | None:
@@ -1612,12 +1622,24 @@ class Router:
                                         and key in self._routed_timed_out)
                     if already_answered:
                         del self._routed_timed_out[key]
+                    # Neither routed to this peer nor passed through to it: a reply to an
+                    # id this peer never received. Client ids are small sequential ints,
+                    # so a hostile peer could otherwise answer another peer's in-flight
+                    # call first and have its forged result accepted as the real one.
+                    unowned = (timer is _NOT_PENDING and not already_answered
+                               and not (peer_idx == 0 and self._passthrough_ids.pop(
+                                   msg["id"], _NOT_PENDING) is not _NOT_PENDING))
                 if isinstance(timer, threading.Timer):
                     timer.cancel()
                 if already_answered:
                     # A timeout or the shutdown drain already answered the client — this
                     # is the peer's late real reply arriving after the fact; swallow it
                     # rather than double-answering.
+                    return SWALLOW
+                if unowned:
+                    sys.stderr.write(f"[terse-multiproxy] peer {self.peers[peer_idx].name} "
+                                     f"replied to id {_short(msg['id'])} it was never sent; "
+                                     "dropped\n")
                     return SWALLOW
             # A normal routed response (or the v1 forward-to-peer-0 passthrough): run it
             # through THIS peer's own Interceptor so its per-peer diff/drop/compress
@@ -1662,6 +1684,8 @@ class Router:
             seq = self._local_id_map.get(mid)
             if seq is None:
                 return False
+            if not str(mid).endswith(f"-{peer_idx}"):
+                return True  # another peer's broadcast-local id: swallow, never record
             pb = self._pending.get(seq)
             if pb is None or pb.done:
                 return True  # already merged/timed out — a late arrival; swallow, drop

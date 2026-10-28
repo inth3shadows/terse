@@ -166,6 +166,13 @@ class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
             raise urllib.error.HTTPError(
                 newurl, code, f"terse: refusing redirect to link-local/metadata address "
                 f"{parts.hostname!r} — the cloud instance-metadata SSRF target", headers, fp)
+        # A 307/308 re-sends the POST BODY — the tool call's arguments, often repo content —
+        # and only headers are stripped below. Same-origin keeps working; a cross-origin one
+        # is refused rather than handing another host the payload.
+        if code in (307, 308) and _origin(newurl) != self._origin:
+            raise urllib.error.HTTPError(
+                newurl, code, f"terse: refusing cross-origin {code} redirect to "
+                f"{parts.hostname!r} — it would re-send the request body there", headers, fp)
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is None:
             return None
@@ -217,12 +224,52 @@ def _canonical_host(hostname: str | None) -> str:
     return str(ip) if ip is not None else hostname.lower().rstrip(".")
 
 
+def _refuse_metadata_peer(sock: socket.socket) -> None:
+    """Close `sock` and raise if it is connected to a metadata address. The URL checks only
+    see the NAME: `169.254.169.254.nip.io`, or any attacker domain with that A record (or
+    one that rebinds to it between check and connect), passed them all. The connected peer
+    is what the resolver actually chose, so this is the check that cannot be talked past."""
+    peer = sock.getpeername()[0]
+    if _is_metadata_host(str(peer)):
+        sock.close()
+        raise OSError(f"terse: refusing connection — the host resolved to "
+                      f"link-local/metadata address {peer}")
+
+
+class _CheckedHTTPConnection(http.client.HTTPConnection):
+    def connect(self) -> None:
+        super().connect()
+        _refuse_metadata_peer(self.sock)
+
+
+class _CheckedHTTPSConnection(http.client.HTTPSConnection, _CheckedHTTPConnection):
+    # MRO: HTTPSConnection.connect -> _CheckedHTTPConnection.connect (TCP + peer check) ->
+    # back in HTTPSConnection for the TLS wrap, so a refused peer never gets a handshake.
+    pass
+
+
+class _CheckedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(_CheckedHTTPConnection, req)
+
+
+class _CheckedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        kwargs: dict[str, Any] = {"context": getattr(self, "_context", None)}
+        check_hostname = getattr(self, "_check_hostname", None)  # 3.11 only; gone in 3.12
+        if check_hostname is not None:
+            kwargs["check_hostname"] = check_hostname
+        return self.do_open(_CheckedHTTPSConnection, req, **kwargs)
+
+
 def guarded_opener(url: str) -> urllib.request.OpenerDirector:
     """An opener whose redirects re-apply this module's guards on every hop (scheme,
-    metadata address, cleartext credential, cross-origin credential strip). The one thing
-    any caller sending a bearer key to an operator-supplied URL should use instead of the
+    metadata address, cleartext credential, cross-origin credential strip), and whose
+    connections refuse a metadata PEER whatever name resolved to it. The one thing any
+    caller sending a bearer key to an operator-supplied URL should use instead of the
     module-global `urlopen`, which forwards `Authorization` to wherever a 3xx points."""
-    return urllib.request.build_opener(_GuardedRedirectHandler(url))
+    return urllib.request.build_opener(_GuardedRedirectHandler(url), _CheckedHTTPHandler(),
+                                       _CheckedHTTPSHandler())
 
 
 def _is_metadata_host(hostname: str | None) -> bool:
@@ -237,7 +284,18 @@ def _is_metadata_host(hostname: str | None) -> bool:
     if hostname.lower().rstrip(".") == "metadata.google.internal":
         return True
     ip = _as_ip(hostname)   # every encoding the resolver accepts, not just dotted-quad
-    return ip is not None and ip.is_link_local
+    if ip is None:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return ip.is_link_local or ip in _METADATA_IPS or (mapped is not None and (
+        mapped.is_link_local or mapped in _METADATA_IPS))
+
+
+# Instance-metadata endpoints OUTSIDE link-local, so `is_link_local` alone missed them:
+# Alibaba/Tencent (100.100.100.200, carrier-grade NAT space), Oracle (192.0.0.192) and
+# AWS's IPv6 IMDS (fd00:ec2::254).
+_METADATA_IPS = frozenset(ipaddress.ip_address(a) for a in
+                          ("100.100.100.200", "192.0.0.192", "fd00:ec2::254"))
 
 
 class Transport(Protocol):

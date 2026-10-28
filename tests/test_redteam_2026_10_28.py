@@ -342,3 +342,137 @@ def test_data_commands_are_not_scrubbed(capsys):
     from terse import cli
 
     assert cli._cmd_proxy in cli._STDOUT_IS_DATA and cli._cmd_compress in cli._STDOUT_IS_DATA
+
+
+# --- G4: SSRF guard gaps and peer isolation -------------------------------------------
+
+@pytest.mark.parametrize("host", ["100.100.100.200", "192.0.0.192", "fd00:ec2::254",
+                                  "[fd00:ec2::254]", "::ffff:100.100.100.200"])
+def test_non_link_local_metadata_addresses_are_blocked(host):
+    assert transport._is_metadata_host(host)
+
+
+def test_ordinary_private_and_loopback_hosts_stay_allowed():
+    for host in ("127.0.0.1", "10.0.0.5", "192.168.1.10", "100.64.0.1", "localhost"):
+        assert not transport._is_metadata_host(host)
+
+
+class _OkHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_a):
+        pass
+
+    def do_POST(self) -> None:  # noqa: N802
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        target = self.server.target  # type: ignore[attr-defined]
+        if target:
+            self.send_response(307)
+            self.send_header("Location", target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = _reply(7, "ok").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@contextlib.contextmanager
+def _ok_server(target=None):
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _OkHandler)
+    srv.target = target  # type: ignore[attr-defined]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        yield srv.server_address[1]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_a_name_that_resolves_to_a_metadata_address_is_refused_at_connect(monkeypatch):
+    # Stand-in for `169.254.169.254.nip.io`: "localhost" passes the name check, and the
+    # peer it connects to (127.0.0.1) is what the patched guard treats as metadata.
+    real = transport._is_metadata_host
+    monkeypatch.setattr(transport, "_is_metadata_host",
+                        lambda h: h == "127.0.0.1" or real(h))
+    with _ok_server() as port:
+        msg = _post_one(HttpTransport(f"http://localhost:{port}/mcp", timeout=5))
+    assert "metadata" in msg["error"]["message"]
+
+
+def test_peer_check_lets_ordinary_connections_through():
+    with _ok_server() as port:
+        msg = _post_one(HttpTransport(f"http://localhost:{port}/mcp", timeout=5))
+    assert msg["result"]["content"][0]["text"] == "ok"
+
+
+def test_cross_origin_307_is_refused_and_same_origin_307_followed():
+    with _ok_server() as sink_port:
+        with _ok_server(target=f"http://localhost:{sink_port}/mcp") as red_port:
+            msg = _post_one(HttpTransport(f"http://127.0.0.1:{red_port}/mcp", timeout=5))
+        assert "cross-origin 307" in msg["error"]["message"]
+        with _ok_server(target=f"http://localhost:{sink_port}/mcp") as red_port:
+            msg = _post_one(HttpTransport(f"http://localhost:{red_port}/mcp", timeout=5))
+        assert "cross-origin" in msg["error"]["message"]  # different port: still another origin
+        with _ok_server(target="/elsewhere") as red_port:
+            # A relative Location is the same origin; it lands on the redirecting server,
+            # which keeps redirecting — urllib's own loop limit ends it, not our refusal.
+            msg = _post_one(HttpTransport(f"http://127.0.0.1:{red_port}/mcp", timeout=5))
+        assert "cross-origin" not in msg["error"]["message"]
+
+
+def _router():
+    from threading import Lock
+
+    from terse.multiproxy import Peer, Router
+
+    class _T:
+        def __init__(self):
+            self.out = io.StringIO()
+
+        def outbound(self):
+            return self.out
+
+    peers = [Peer("a", _T(), Interceptor(FULL)), Peer("b", _T(), Interceptor(FULL))]
+    return Router(peers, io.StringIO(), Lock(), broadcast_timeout=1000)
+
+
+def test_a_peer_cannot_answer_an_id_it_was_never_sent(capsys):
+    from terse.proxy import SWALLOW
+
+    router = _router()
+    try:
+        forged = _reply(5, "forged")
+        assert router.from_peer(0)(forged) is SWALLOW
+        assert "never sent" in capsys.readouterr().err
+        router._routed_timers[(1, 5)] = None   # a call really routed to peer b
+        assert router.from_peer(0)(forged) is SWALLOW
+        assert router.from_peer(1)(_reply(5, "real")) is not SWALLOW
+    finally:
+        router.close_senders()
+
+
+def test_peer_zero_may_answer_its_passthrough_ids_only():
+    from terse.proxy import SWALLOW
+
+    router = _router()
+    try:
+        router.route_client_line(json.dumps({"jsonrpc": "2.0", "id": 6,
+                                             "method": "completion/complete"}))
+        assert router.from_peer(1)(_reply(6, "x")) is SWALLOW
+        assert router.from_peer(0)(_reply(6, "x")) is not SWALLOW
+        assert router.from_peer(0)(_reply(6, "again")) is SWALLOW  # one answer per id
+    finally:
+        router.close_senders()
+
+
+def test_a_broadcast_reply_must_come_from_the_peer_it_was_issued_to():
+    router = _router()
+    try:
+        router._local_id_map["terse-b0-1"] = 0
+        assert router._maybe_collect(0, {"id": "terse-b0-1", "result": {}}) is True
+        assert 0 not in getattr(router._pending.get(0), "parts", {})
+    finally:
+        router.close_senders()
