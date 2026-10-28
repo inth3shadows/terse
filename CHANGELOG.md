@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.45.8] - 2026-10-28
+
 ### Fixed
 
 - `--wire-log` under `terse proxy --config`: lines still queued for a server whose write hung (a stalled HTTP POST, say) are now recorded as `dropped` (origin `evicted`) when the proxy exits (#521). Before, once the 2 s wait for the stuck writer ran out they were neither written nor recorded, breaking the log's "written, or recorded as dropped" rule for exactly the broken-server case.
