@@ -19,6 +19,7 @@ import ipaddress
 import json
 import os
 import queue
+import re
 import socket
 import subprocess
 import sys
@@ -48,6 +49,8 @@ _RESPONSE_DEADLINE_S = 15 * 60
 # How much of a non-JSON-RPC error body is quoted back in the synthesized error message
 # (a JSON-RPC-shaped body is forwarded verbatim, whole, as before).
 _MAX_ERROR_DETAIL_CHARS = 1 << 20
+
+_VALID_SESSION_ID = re.compile(r"[\x21-\x7e]{1,1024}")
 
 # The only downstream URL schemes terse will dial. `urllib.request.urlopen` also
 # honors `file://`, `ftp://`, `data:` and more — so an unrestricted scheme turns a
@@ -212,6 +215,14 @@ def _canonical_host(hostname: str | None) -> str:
         return ""
     ip = _as_ip(hostname)
     return str(ip) if ip is not None else hostname.lower().rstrip(".")
+
+
+def guarded_opener(url: str) -> urllib.request.OpenerDirector:
+    """An opener whose redirects re-apply this module's guards on every hop (scheme,
+    metadata address, cleartext credential, cross-origin credential strip). The one thing
+    any caller sending a bearer key to an operator-supplied URL should use instead of the
+    module-global `urlopen`, which forwards `Authorization` to wherever a 3xx points."""
+    return urllib.request.build_opener(_GuardedRedirectHandler(url))
 
 
 def _is_metadata_host(hostname: str | None) -> bool:
@@ -488,7 +499,7 @@ class HttpTransport:
         # `_GuardedRedirectHandler`). Built per-transport because the handler is bound to
         # THIS downstream's origin, which is what decides a cross-origin credential strip.
         self._own_origin = _origin(url)
-        self._opener = urllib.request.build_opener(_GuardedRedirectHandler(url))
+        self._opener = guarded_opener(url)
         self._q: queue.Queue[Any] = queue.Queue()
         # MCP Streamable HTTP session affinity: some servers pin a client to
         # server-side state via this header, set on a prior response. Captured
@@ -545,7 +556,9 @@ class HttpTransport:
                 # url; on a non-redirected response it equals `self.url`.)
                 if _origin(resp.geturl()) == self._own_origin:
                     sid = resp.headers.get("Mcp-Session-Id")
-                    if sid:
+                    # Visible ASCII only (0x21-0x7E, the MCP spec's own rule). A session id
+                    # with a control character made every later POST fail header validation.
+                    if sid and _VALID_SESSION_ID.fullmatch(sid):
                         self.session = sid
                 ctype = resp.headers.get("Content-Type", "")
                 # Bounded read: one byte past the cap tells us it overflowed without
@@ -603,7 +616,13 @@ class HttpTransport:
             # client's call unanswered. Either way now: the in-flight request gets a
             # legible error instead of the client hanging forever on a reply that's
             # never coming.
-            self._maybe_enqueue_error(line, f"terse: downstream HTTP request failed: {exc}")
+            # A ValueError here is http.client rejecting a header value, and its text
+            # QUOTES that value — `Invalid header value b'Bearer <secret>\\n'` for a token
+            # read with a trailing newline. The reply reaches the client, the model and the
+            # wire log, so name the failure without echoing it.
+            reason = ("invalid request header value (not shown: it may be a credential)"
+                      if type(exc) is ValueError else str(exc))
+            self._maybe_enqueue_error(line, f"terse: downstream HTTP request failed: {reason}")
             return
         if "text/event-stream" in ctype:
             for msg in _iter_sse(body.decode("utf-8", errors="replace")):

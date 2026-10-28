@@ -38,7 +38,7 @@ from . import capture, fluency
 from . import lossy as lossy_mod
 from . import policy as policy_mod
 from .proxy import TERSE_PRIMER
-from .transport import guard_cleartext_credential
+from .transport import guard_cleartext_credential, guarded_opener
 
 
 # --------------------------------------------------------------------------- #
@@ -910,7 +910,7 @@ def openai_tool_answerer(base_url: str, api_key: str, model: str, tools: list[di
         req = urllib.request.Request(url, data=body, headers={
             "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
         })
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with guarded_opener(url).open(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         if "choices" not in data:
             raise RuntimeError(f"{model}: no choices in response: {data.get('error', data)}")

@@ -60,7 +60,7 @@ def test_pump_forwards_the_line_when_a_transform_raises(capsys):
     def boom(line):
         if line == "bad":
             raise RuntimeError("unanticipated")
-        return None
+        return
 
     out = io.StringIO()
     pump(iter(["bad\n", "good\n"]), out, boom)
@@ -174,3 +174,138 @@ def test_text_diff_tolerates_lone_surrogates():
 @pytest.mark.parametrize("fn", [measure_payload, classify_shape])
 def test_huge_integer_literal_does_not_crash(fn):
     fn('{"a":1' + "0" * 5000 + "}")  # must not raise ValueError (int-digit limit)
+
+
+# --- G2: secrets are never printed or sent loosely ------------------------------------
+
+@pytest.mark.parametrize("args", [
+    ["--access-token", "S1"], ["--client-secret=S1"], ["--auth-token", "S1"],
+    ["-e", "GH_TOKEN=S1"], ["API_KEY=S1"], ["https://u:S1@h.example/mcp"],
+    ["https://h.example/mcp?token=S1"],
+])
+def test_install_print_masks_every_secret_shape(args):
+    from terse.cli import _full_cmd
+
+    rendered = _full_cmd({"command": "npx", "args": ["srv", *args]})
+    assert "S1" not in rendered
+
+
+def test_install_print_keeps_ordinary_args_readable():
+    from terse.cli import _full_cmd
+
+    rendered = _full_cmd({"command": "npx", "args": ["-y", "pkg@1.2.3", "--port", "8080",
+                                                     "https://h.example/mcp"]})
+    assert rendered == "npx -y pkg@1.2.3 --port 8080 https://h.example/mcp"
+
+
+def test_install_print_masks_url_entries_and_url_changes():
+    from terse.cli import _entry_change_lines, _full_cmd
+
+    assert "S2" not in _full_cmd({"url": "https://u:S2@h.example/mcp?k=S2"})
+    lines = _entry_change_lines({"url": "https://h.example/?t=S3"},
+                                {"url": "https://h2.example/?t=S4"})
+    joined = "\n".join(lines)
+    assert "url CHANGED" in joined and "S3" not in joined and "S4" not in joined
+
+
+class _BearerRedirect(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_a):
+        pass
+
+    def _go(self) -> None:
+        self.server.seen.append(self.headers.get("Authorization"))  # type: ignore[attr-defined]
+        target = self.server.target  # type: ignore[attr-defined]
+        if target:
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = b'{"data": []}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST = _go  # noqa: N815
+
+
+@contextlib.contextmanager
+def _bearer_pair():
+    sink = http.server.HTTPServer(("127.0.0.1", 0), _BearerRedirect)
+    sink.seen, sink.target = [], None  # type: ignore[attr-defined]
+    # "localhost" vs 127.0.0.1: a different ORIGIN on the same loopback machine.
+    red = http.server.HTTPServer(("127.0.0.1", 0), _BearerRedirect)
+    red.seen = []  # type: ignore[attr-defined]
+    red.target = f"http://localhost:{sink.server_address[1]}/v1/models"  # type: ignore[attr-defined]
+    threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (sink, red)]
+    for th in threads:
+        th.start()
+    try:
+        yield f"http://127.0.0.1:{red.server_address[1]}", sink
+    finally:
+        for s in (sink, red):
+            s.shutdown()
+            s.server_close()
+
+
+def test_model_limit_discovery_does_not_forward_the_key_cross_origin():
+    from terse.cli import _discover_model_limits
+
+    with _bearer_pair() as (base, sink):
+        _discover_model_limits(base + "/v1", "SECRETKEY", ["m"])
+    assert sink.seen, "the redirect was not followed at all"
+    assert all(h is None for h in sink.seen)
+
+
+def test_model_limit_discovery_refuses_cleartext_remote_key(capsys):
+    from terse.cli import _discover_model_limits
+
+    assert _discover_model_limits("http://gateway.example/v1", "K", ["m"]) == {}
+    assert "cleartext" in capsys.readouterr().err
+
+
+def test_answerers_use_the_guarded_opener():
+    # dropeval's and fluency's answerers sent the bearer key through the module-global
+    # urlopen, which forwards Authorization to wherever a 3xx points.
+    import inspect
+
+    from terse import dropeval
+    from terse.fluency import answerers
+
+    for mod in (dropeval, answerers):
+        src = inspect.getsource(mod)
+        assert "urlopen(" not in src
+        assert "guarded_opener(" in src
+
+
+def test_invalid_header_error_does_not_echo_the_value():
+    t = HttpTransport("https://example.invalid/mcp",
+                      headers={"Authorization": "Bearer SECRET123\nx"}, timeout=3)
+    msg = _post_one(t)
+    assert msg["error"]["code"] == -32000
+    assert "SECRET123" not in msg["error"]["message"]
+
+
+@pytest.mark.parametrize("sid,kept", [("abc-123", True), ("bad\x01id", False),
+                                      ("sp ace", False)])
+def test_session_id_is_stored_only_when_visible_ascii(sid, kept):
+    assert bool(transport._VALID_SESSION_ID.fullmatch(sid)) is kept
+
+
+def test_router_snapshot_creates_the_terse_state_dir_owner_only(tmp_path, monkeypatch):
+    import os
+    import stat
+
+    from terse import multiproxy
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    old = os.umask(0o022)
+    try:
+        snap = multiproxy.RouterSnapshot(multiproxy.router_snapshot_path(
+            str(tmp_path / "peers.json")), "fp")
+        snap.save({}, "2024-11-05")
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(os.stat(tmp_path / "terse").st_mode) == 0o700

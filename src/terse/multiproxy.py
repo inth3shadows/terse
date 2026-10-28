@@ -569,6 +569,10 @@ class RouterSnapshot:
 
     def save(self, parts: dict[str, dict[str, dict]], protocol: str) -> None:
         try:
+            # The `terse` state dir first: `mkdir_restricted` pins only the leaf, so a router
+            # that saved before the ledger existed left `~/.local/state/terse` at 0755.
+            # A pre-existing directory keeps its mode, so this never chmods the operator's.
+            mkdir_restricted(self.path.parent.parent)
             mkdir_restricted(self.path.parent)
             # Atomic (temp + os.replace): a router killed mid-write leaves the previous
             # snapshot or the new one, never half of one.

@@ -29,6 +29,7 @@ import tempfile
 import time
 from datetime import UTC
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from . import transforms
 from ._secure_io import write_restricted
@@ -1055,7 +1056,17 @@ def _discover_model_limits(base_url: str | None, api_key: str | None,
     import urllib.error
     import urllib.request
 
+    from .transport import guard_cleartext_credential, guarded_opener
+
     if not base_url or not models:
+        return {}
+    # The same two guards every other bearer sender applies: no key over cleartext http to
+    # a remote host, and no key forwarded to wherever a redirect points. A refusal skips
+    # discovery (said on stderr, unlike the silent probe failures below) rather than abort.
+    try:
+        guard_cleartext_credential(base_url, bool(api_key), what="terse fluency")
+    except ValueError as exc:
+        print(f"{exc}; skipping max_input_tokens discovery", file=sys.stderr)
         return {}
     trimmed = base_url.rstrip("/")
     root = trimmed.removesuffix("/v1")
@@ -1069,7 +1080,7 @@ def _discover_model_limits(base_url: str | None, api_key: str | None,
         try:
             req = urllib.request.Request(url_root + path, headers={
                 "Authorization": f"Bearer {api_key or ''}", "Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with guarded_opener(url_root + path).open(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, OSError, ValueError, TimeoutError):
             continue
@@ -1651,8 +1662,15 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
 # after command lines get printed unconditionally by install/uninstall-mcp, including
 # to shared/logged terminals, so a secret-shaped flag's value is masked either way it
 # appears: `--api-key VALUE` (two args) or `--api-key=VALUE` (one arg).
-_SECRET_FLAG = re.compile(r"^--?(api[-_]?key|token|secret|password|passwd|auth|credential)s?$",
-                          re.IGNORECASE)
+# Substring, not anchored: the anchored form printed `--access-token`, `--auth-token` and
+# `--client-secret` values in the clear. Over-matching (`--author`) only masks one display
+# token, the safe direction on a shared terminal.
+_SECRET_FLAG = re.compile(r"^--?[\w-]*(api[-_]?key|access[-_]?key|private[-_]?key|token|secret"
+                          r"|password|passwd|auth|credential)[\w-]*$", re.IGNORECASE)
+
+# A bare `NAME=VALUE` arg (`docker run -e GH_TOKEN=...`, `npx ... API_KEY=...`) carries its
+# secret with no flag in front of it at all.
+_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*=")
 
 # `--header NAME=VALUE` (#5, HTTP downstream auth) carries its secret in the VALUE half
 # of a single arg, not in a flag NAME `_SECRET_FLAG` matches — so a bare `--header`
@@ -1674,6 +1692,23 @@ def _redact_header_value(entry: str) -> str:
         return entry
     name, _, _value = entry.partition("=")
     return f"{name}=***" if _SECRET_HEADER.search(name) else entry
+
+
+def _redact_url(url: str) -> str:
+    """`url` with any userinfo and query string masked: `https://u:pw@h/mcp?token=x` is a
+    credential printed whole otherwise. Unparseable input is returned as-is."""
+    try:
+        split = urlsplit(url)
+        host = split.hostname
+    except ValueError:
+        return url
+    if not split.scheme or host is None:
+        return url
+    netloc = split.netloc
+    if "@" in netloc:
+        netloc = "***@" + netloc.rpartition("@")[2]
+    query = "***" if split.query else ""
+    return urlunsplit((split.scheme, netloc, split.path, query, split.fragment))
 
 
 def _redact_args(args: list) -> list:
@@ -1703,7 +1738,10 @@ def _redact_args(args: list) -> list:
             out.append(f"{flag}=***" if "=" in a else a)
             pending = "value" if "=" not in a else None
             continue
-        out.append(a)
+        if not a.startswith("-") and _ENV_ASSIGN.match(a):
+            out.append(_redact_header_value(a))
+            continue
+        out.append(_redact_url(a) if "://" in a else a)
     return out
 
 
@@ -1715,7 +1753,7 @@ def _full_cmd(entry) -> str:
         # A url/headers-shaped entry (#5 HTTP downstream) has no "command"/"args" at
         # all — falling through to entry.get("command", "?") used to print just "?",
         # silently losing the url/headers info from the before/after display.
-        parts = [entry.get("url", "?")]
+        parts = [_redact_url(str(entry.get("url", "?")))]
         for k, v in (entry.get("headers") or {}).items():
             parts += ["--header", _redact_header_value(f"{k}={v}")]
         return " ".join(parts)
@@ -1763,6 +1801,8 @@ def _entry_change_lines(before, after, indent: str = "    ") -> list[str]:
     for field, label in (("command", "command"), ("url", "url")):
         old, new = before.get(field), after.get(field)
         if old is not None and new is not None and old != new:
+            if field == "url":
+                old, new = _redact_url(str(old)), _redact_url(str(new))
             lines += [f"{indent}{label} CHANGED — the client spawns a different "
                       f"target than before:",
                       f"{indent}  from: {old}",
