@@ -504,3 +504,28 @@ def test_backup_prune_spares_user_backups_and_survives_dangling_links(tmp_path):
     left = sorted(p.name for p in tmp_path.iterdir())
     assert ".claude.json.bak-before-upgrade" in left
     assert sum(n.startswith(".claude.json.bak-10") for n in left) <= 2
+
+
+def test_wire_log_stops_at_its_file_cap_with_one_truncated_record(tmp_path, capsys):
+    from terse import wirelog
+
+    tap = wirelog.open_wire_tap(str(tmp_path / "w"), "c", file_bytes_max=4000)
+    assert tap is not None
+    for i in range(200):
+        tap.tap("client_in", json.dumps({"jsonrpc": "2.0", "id": i, "method": "ping"}))
+    tap.close()
+    (log,) = (tmp_path / "w").glob("*/*.jsonl")
+    assert log.stat().st_size <= 4000 + 1024     # the cap, plus the one truncated record
+    recs = [json.loads(ln) for ln in log.read_text().splitlines()]
+    assert recs[-1]["event"] == "truncated"
+    assert sum(r.get("event") == "truncated" for r in recs) == 1
+    assert "TERSE_WIRE_LOG_MAX_BYTES" in capsys.readouterr().err
+
+
+def test_wire_log_cap_reads_the_env_override(monkeypatch):
+    from terse import wirelog
+
+    monkeypatch.setenv("TERSE_WIRE_LOG_MAX_BYTES", "0")
+    assert wirelog._file_bytes_max() == 0
+    monkeypatch.setenv("TERSE_WIRE_LOG_MAX_BYTES", "junk")
+    assert wirelog._file_bytes_max() == wirelog._FILE_BYTES_MAX
