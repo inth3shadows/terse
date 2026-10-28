@@ -2549,20 +2549,27 @@ def _wire_teardown(wire: Any, live: list[str]) -> None:
     wire.close()
 
 
+def _transport_pid(transport: Any) -> int | None:
+    """The downstream's process id, or None for a transport with no child (HTTP)."""
+    return getattr(getattr(transport, "proc", None), "pid", None)
+
+
 def _single_wire_tap(wire_log: str | None, conn: str, pol: policy_mod.Policy,
                      server_name: str | None, inter: Interceptor, cmd: list[str],
-                     policy_path: str | None, transport: Any) -> Any:
+                     policy_path: str | None, transport: Any) -> tuple[Any, str | None]:
     """The single proxy's wire tap with its tools/call policy installed (see wirelog.py),
-    or None without `--wire-log` or when the log cannot be opened."""
+    and the peer label its records carry; (None, None) without `--wire-log` or when the
+    log cannot be opened. The label is computed once, here, so the `start`/`peer_start`
+    events and every later record name the server the same way (#523)."""
     if wire_log is None:
-        return None
+        return None, None
     from . import __version__
     from .wirelog import may_exclude, open_wire_tap, retrieve_handle, server_excluded
 
     wire = open_wire_tap(wire_log, conn, exclude_all=server_excluded(pol, server_name),
                          may_exclude=may_exclude([pol]))
     if wire is None:
-        return None
+        return None, None
 
     def resolve(msg: dict) -> tuple[str | None, bool] | None:
         params = msg.get("params")
@@ -2580,7 +2587,7 @@ def _single_wire_tap(wire_log: str | None, conn: str, pol: policy_mod.Policy,
         rule = pol.select(name, server_name)
         return rule.tool_glob, not rule.capture
 
-    pid = getattr(getattr(transport, "proc", None), "pid", None)
+    pid = _transport_pid(transport)
     label = resolve_ledger_identity(server_name, cmd)
     wire.event("start", version=__version__, mode="single", policy=policy_path,
                peers=[label], argv={"cmd0": os.path.basename(cmd[0]) if pid else None,
@@ -2588,7 +2595,7 @@ def _single_wire_tap(wire_log: str | None, conn: str, pol: policy_mod.Policy,
                                     "stdio" if pid else "http"})
     wire.event("peer_start", peer=label, pid=pid)
     wire.resolve = resolve
-    return wire
+    return wire, label
 
 
 def run_proxy(
@@ -2742,9 +2749,8 @@ def run_proxy(
     # not just in which method to call (see the join/rc branch below).
     is_http = isinstance(transport, HttpTransport)
 
-    wire = _single_wire_tap(wire_log, conn, pol, server_name, inter, cmd, policy_path,
-                            transport)
-    peer_label = resolve_ledger_identity(server_name, cmd) if wire is not None else None
+    wire, peer_label = _single_wire_tap(wire_log, conn, pol, server_name, inter, cmd,
+                                        policy_path, transport)
 
     sigterm_token = _install_sigterm_to_exit()
 
@@ -2825,8 +2831,7 @@ def run_proxy(
         else:
             rc = transport.wait()
             if wire is not None:
-                wire.event("peer_exit", peer=peer_label,
-                           pid=getattr(getattr(transport, "proc", None), "pid", None),
+                wire.event("peer_exit", peer=peer_label, pid=_transport_pid(transport),
                            exit_code=rc)
             # The child has exited, so its stdout reaches EOF and the inbound pump WILL
             # terminate once it drains the last buffered reply — give it a generous window

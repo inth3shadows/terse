@@ -149,9 +149,7 @@ def _parse(line: str, strict: bool) -> tuple[str, Any]:
         return "bad", None
     try:
         if strict:
-            if line.startswith("﻿"):
-                return "bad", None      # json.loads refuses a BOM; so does the stdlib here
-            return "ok", _STRICT.decode(line)
+            return "ok", _STRICT.decode(line)   # a leading BOM raises JSONDecodeError
         return "ok", json.loads(line)
     except (_DuplicateKey, RecursionError):
         return "undecidable", None
@@ -446,10 +444,11 @@ def _sha(line: str) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _meta(msg: Any) -> tuple[bool, Any, Any]:
+def _meta(msg: Any) -> tuple[Any, Any]:
+    """(id, method) of a parsed line; both None for anything but an object."""
     if isinstance(msg, dict):
-        return True, msg.get("id"), msg.get("method")
-    return True, None, None
+        return msg.get("id"), msg.get("method")
+    return None, None
 
 
 _STOP: Any = object()
@@ -709,11 +708,12 @@ class WireTap:
             parsed, mid, method = False, None, None
             if line.strip():
                 try:
-                    parsed, mid, method = _meta(json.loads(line))
+                    mid, method = _meta(json.loads(line))
+                    parsed = True
                 except (ValueError, RecursionError):
                     pass
         else:
-            parsed, mid, method = meta
+            parsed, (mid, method) = True, meta
         excluded = rule is not None
         if excluded:
             status = "excluded_by_policy"

@@ -1179,3 +1179,17 @@ def test_a_sink_drop_written_ahead_of_a_line_is_stamped_in_seq_order(tmp_path, m
     assert kinds[:2] == ["sink_drop", "client_in"]
     monos = [r["mono_ns"] for r in recs]
     assert monos == sorted(monos)
+
+
+@pytest.mark.parametrize("server_name", [None, "named"])
+def test_every_record_names_the_server_the_way_start_does(server_name, tmp_path):
+    # #523: the single proxy derived the peer label twice, once for `start`/`peer_start`
+    # and again for the per-record `peer`; the two could drift apart.
+    kw = {} if server_name is None else {"server_name": server_name}
+    rc, out, recs, sent = _run("single", tmp_path, [INIT, _call("single", 2, "gh.api.items")],
+                               **kw)
+    (label,) = recs[0]["detail"]["peers"]
+    assert _events(recs, "peer_start")[0]["peer"] == label
+    assert _events(recs, "peer_exit")[0]["peer"] == label
+    peers = {r["peer"] for r in recs if r["hop"] in ("server_out", "server_in")}
+    assert peers == {label}
