@@ -122,6 +122,16 @@ PREFIX_SEP = policy_mod.PREFIX_SEP
 # test that waited the real default would need 30+ seconds of real time for no reason).
 BROADCAST_TIMEOUT = 30.0
 
+# A routed tools/call or prompts/get has NO timer by default, matching the single-server
+# proxy: a tool may legitimately run for minutes, and a timeout here answered -32001 while
+# the server kept working and then swallowed its real result. A dead peer is covered
+# without one: when its reader hits EOF, every call still pending on it is answered
+# (`Router.peer_exited`). `--routed-timeout SECONDS` restores a cap for whoever wants one.
+ROUTED_TIMEOUT: float | None = None
+
+# `Router._routed_timers.pop` default: tells "not pending" apart from "pending, no timer".
+_NOT_PENDING: Any = object()
+
 # Client methods whose N peer replies are AGGREGATED into one merged reply (concat the
 # lists / union the capabilities / one primer). Each has a branch in `_merge_broadcast`.
 _AGGREGATE_METHODS = ("initialize", "tools/list", "prompts/list",
@@ -748,6 +758,7 @@ class Router:
 
     def __init__(self, peers: list[Peer], out: TextIO, out_lock: Lock, *,
                  debug: bool = False, broadcast_timeout: float = BROADCAST_TIMEOUT,
+                 routed_timeout: float | None = ROUTED_TIMEOUT,
                  primer_latch: PrimerLatch | None = None,
                  on_session: Callable[[str], None] | None = None,
                  snapshot: RouterSnapshot | None = None,
@@ -781,6 +792,7 @@ class Router:
         self.client_gone = False
         self.debug = debug
         self.broadcast_timeout = broadcast_timeout
+        self.routed_timeout = routed_timeout
         # True if ANY peer's policy enables drop-to-retrieve — gates whether the merged
         # tools/list advertises the single synthetic terse.retrieve tool at all, mirroring
         # single-peer Interceptor.policy.has_drop() (#10).
@@ -919,19 +931,26 @@ class Router:
         # _SERVER_REQ_MAX eviction.
         self._server_requests: OrderedDict[str, tuple[int, Any]] = OrderedDict()
         self._server_req_seq = 0
-        # client id -> Timer, for a routed (single-peer) tools/call awaiting reply —
-        # mirrors _broadcast's BROADCAST_TIMEOUT guarantee ("a dead peer can't wedge
-        # it") for the routed path, which previously had no bound at all: a hung/dead
-        # stdio peer left the client's request unanswered forever. Whichever side wins
-        # the race to pop an entry (the real reply in from_peer, or _timeout_routed_call
-        # firing) is the one that answers the client; the loser does nothing.
-        self._routed_timers: dict[Any, threading.Timer] = {}
-        # ids whose routed call already got a synthesized timeout reply, mapped to the
-        # monotonic time that happened — the peer's eventual real (late) reply must be
-        # swallowed here, not double-delivered. Aged out by `_routed_timed_out_ttl`, not
-        # by population count (see `_ROUTED_TIMED_OUT_MAX`'s comment above).
-        self._routed_timed_out: OrderedDict[Any, float] = OrderedDict()
-        self._routed_timed_out_ttl = broadcast_timeout * 4
+        # (peer index, client id) -> its Timer, or None without `routed_timeout`: every
+        # routed (single-peer) call awaiting its reply. Whoever pops an entry answers the
+        # client: the real reply in from_peer, the timer, the peer's exit
+        # (`peer_exited`) or the shutdown drain; the others then do nothing. Keyed by
+        # PEER as well as id: a client may reuse an id for a call to another peer once
+        # the first was answered, and a late reply from the first peer must not answer
+        # the second call.
+        self._routed_timers: dict[tuple[int, Any], threading.Timer | None] = {}
+        # Signalled whenever an entry leaves `_routed_timers`; `drain_routed_calls` waits
+        # on it. Built on `_pending_lock`, which every pop already holds.
+        self._routed_cv = threading.Condition(self._pending_lock)
+        # (peer index, id) of routed calls already answered with a synthesized error,
+        # mapped to the monotonic time that happened — the peer's eventual real (late)
+        # reply must be swallowed here, not double-delivered. Aged out by
+        # `_routed_timed_out_ttl`, not by population count (see `_ROUTED_TIMED_OUT_MAX`).
+        self._routed_timed_out: OrderedDict[tuple[int, Any], float] = OrderedDict()
+        self._routed_timed_out_ttl = (routed_timeout or broadcast_timeout) * 4
+        # Peers whose reader hit EOF: a call routed to one is answered at once, since
+        # nothing will ever reply to it.
+        self._exited_peers: set[int] = set()
 
         # The fast initialize (#270). A broadcast `initialize` waits on the slowest peer
         # (4.2s on the live fleet, 2026-09-26), and a headless client sends its first
@@ -1304,28 +1323,47 @@ class Router:
 
     def _dispatch_routed(self, idx: int, line: str, mid: Any) -> None:
         """Send an already-rewritten routed request to peer `idx` and, if it carries an
-        id, arm the dead-peer timeout for it — shared by `_route_call` (tools/call) and
-        `_route_prompt_get` (prompts/get)."""
-        if mid is not None:
-            # Bound the wait — a hung/dead peer must not wedge this call forever,
-            # matching _broadcast's BROADCAST_TIMEOUT guarantee. Registered BEFORE the
-            # peer write below (mirroring _broadcast's own bookkeeping-then-send order):
-            # a peer fast enough to reply before this line ran would otherwise race
-            # from_peer's pop against this registration, leaving an orphaned timer that
-            # later fires a spurious timeout at a client who already got the real answer.
-            # Cancel-and-replace any prior timer for this id the same way _broadcast's
-            # _active_seq handling does, in case a client reuses an id (a protocol
-            # violation, but one worth failing safe against).
-            timer = threading.Timer(self.broadcast_timeout,
+        id, register it as pending (with a timer under `routed_timeout`) — shared by
+        `_route_call` (tools/call) and `_route_prompt_get` (prompts/get)."""
+        if mid is None:
+            self._write_peer(idx, line)
+            return
+        key = (idx, mid)
+        timer = None
+        if self.routed_timeout is not None:
+            timer = threading.Timer(self.routed_timeout,
                                     self._timeout_routed_call, args=(mid, idx))
             timer.daemon = True
-            with self._pending_lock:
-                prior = self._routed_timers.pop(mid, None)
+        # Registered BEFORE the peer write below (mirroring _broadcast's own
+        # bookkeeping-then-send order): a peer fast enough to reply before this line ran
+        # would otherwise race from_peer's pop against this registration, leaving an
+        # orphaned entry that is later answered a second time. Cancel-and-replace any
+        # prior entry for this key, in case a client reuses an id (a protocol violation,
+        # but one worth failing safe against).
+        with self._pending_lock:
+            exited = idx in self._exited_peers
+            if not exited:
+                prior = self._routed_timers.pop(key, None)
                 if prior is not None:
                     prior.cancel()
-                self._routed_timers[mid] = timer
-            timer.start()
-        self._write_peer(idx, line)
+                self._routed_timers[key] = timer
+        if exited:
+            self._answer_routed(idx, mid, "exited before answering", origin="peer_exit")
+            return
+        # Undo the registration if the send cannot happen (#511): the caller's catch-all
+        # answers -32603, and a still-registered entry would be answered again later.
+        try:
+            if timer is not None:
+                timer.start()
+            self._write_peer(idx, line)
+        except BaseException:
+            with self._pending_lock:
+                if self._routed_timers.get(key, _NOT_PENDING) is timer:
+                    del self._routed_timers[key]
+                    self._routed_cv.notify_all()
+            if timer is not None:
+                timer.cancel()
+            raise
 
     def _broadcast(self, msg: dict, kind: str,
                    on_done: Callable[[_PendingBroadcast], None] | None = None) -> None:
@@ -1366,8 +1404,32 @@ class Router:
                                     args=(seq,))
             timer.daemon = True
             pb.timer = timer
-        timer.start()
+        try:
+            timer.start()
+            self._fan_out(msg, kind, seq, on_done)
+        except BaseException:
+            # Undo the registration (#511): the caller's catch-all answers -32603, and a
+            # broadcast left pending would answer the same id again when its timer fired
+            # (or, unstarted, make `drain_pending_broadcasts`' join raise).
+            with self._pending_lock:
+                if self._pending.get(seq) is pb:
+                    del self._pending[seq]
+                if self._active_seq.get(client_id) == seq:
+                    del self._active_seq[client_id]
+            timer.cancel()
+            raise
+        if kind == "initialize" and self.on_session is not None:
+            try:
+                # `on_done` is set only by `_fast_initialize`: the client was already
+                # answered from the snapshot, so this session started warm.
+                self.on_session("warm" if on_done is not None else "cold")
+            except Exception as exc:  # noqa: BLE001 — a ledger sink is never load-bearing
+                if self.debug:
+                    sys.stderr.write(f"[terse-multiproxy] session ledger: {exc}\n")
 
+    def _fan_out(self, msg: dict, kind: str, seq: int,
+                 on_done: Callable[[_PendingBroadcast], None] | None) -> None:
+        """Send broadcast `seq` to every peer under its broadcast-local ids."""
         for i, peer in enumerate(self.peers):
             rewritten = dict(msg)
             rewritten["id"] = f"terse-b{seq}-{i}"
@@ -1388,14 +1450,6 @@ class Router:
                 peer.inter.clear_init_id()
             self._write_peer(i, line, "router_broadcast" if on_done is None
                              else "router_internal")
-        if kind == "initialize" and self.on_session is not None:
-            try:
-                # `on_done` is set only by `_fast_initialize`: the client was already
-                # answered from the snapshot, so this session started warm.
-                self.on_session("warm" if on_done is not None else "cold")
-            except Exception as exc:  # noqa: BLE001 — a ledger sink is never load-bearing
-                if self.debug:
-                    sys.stderr.write(f"[terse-multiproxy] session ledger: {exc}\n")
 
     def _broadcast_notification(self, line: str) -> None:
         for sender in self._senders:
@@ -1521,17 +1575,20 @@ class Router:
                     # treating it as a possible routed-call reply first could pop/cancel
                     # an unrelated in-flight call's timeout purely on id coincidence.
                     return self._rewrite_server_request(peer_idx, msg)
-                mid = msg["id"]
+                key = (peer_idx, msg["id"])
                 with self._pending_lock:
-                    timer = self._routed_timers.pop(mid, None)
-                    already_timed_out = timer is None and mid in self._routed_timed_out
-                    if already_timed_out:
-                        del self._routed_timed_out[mid]
-                if timer is not None:
+                    timer = self._routed_timers.pop(key, _NOT_PENDING)
+                    if timer is not _NOT_PENDING:
+                        self._routed_cv.notify_all()
+                    already_answered = (timer is _NOT_PENDING
+                                        and key in self._routed_timed_out)
+                    if already_answered:
+                        del self._routed_timed_out[key]
+                if isinstance(timer, threading.Timer):
                     timer.cancel()
-                if already_timed_out:
-                    # The routed call's timeout already answered the client — this is
-                    # the peer's late real reply arriving after the fact; swallow it
+                if already_answered:
+                    # A timeout or the shutdown drain already answered the client — this
+                    # is the peer's late real reply arriving after the fact; swallow it
                     # rather than double-answering.
                     return SWALLOW
             # A normal routed response (or the v1 forward-to-peer-0 passthrough): run it
@@ -1606,21 +1663,46 @@ class Router:
         for a client that can still be answered, and pointless once it cannot (#516)."""
         with self._pending_lock:
             timers = [pb.timer for pb in self._pending.values() if pb.timer is not None]
-            timers += self._routed_timers.values()
+            timers += [t for t in self._routed_timers.values() if t is not None]
         for timer in timers:
             timer.cancel()
 
     def drain_routed_calls(self) -> None:
-        """The routed-call counterpart to `drain_pending_broadcasts`: block until every
-        in-flight routed `tools/call` has either replied or hit its own timeout, instead
-        of having its still-pending `Timer` torn down mid-wait by shutdown. Without this,
-        a client that disconnects right after issuing a routed call to a slow/dead peer
-        would get an abruptly severed connection instead of the timeout error
-        `_timeout_routed_call` is meant to guarantee."""
+        """The routed-call counterpart to `drain_pending_broadcasts`, run at client EOF:
+        give every in-flight routed call a bounded grace to reply, then answer what is
+        left with -32001 instead of severing it at teardown. The grace is
+        `routed_timeout` when set (each call's own timer fires within it) and otherwise
+        `broadcast_timeout`: with no timer, a peer that never answers and never exits
+        would otherwise hold the process open for good after its client is gone."""
+        grace = (self.routed_timeout + 1.0 if self.routed_timeout is not None
+                 else self.broadcast_timeout)
+        with self._routed_cv:
+            self._routed_cv.wait_for(lambda: not self._routed_timers, timeout=grace)
+            left = list(self._routed_timers.items())
+            self._routed_timers.clear()
+            now = time.monotonic()
+            for key, _ in left:
+                self._routed_timed_out[key] = now
+        for (idx, mid), timer in left:
+            if timer is not None:
+                timer.cancel()
+            self._answer_routed(idx, mid, "timed out (no reply before the client "
+                                "disconnected)", origin="timeout", cancel=True)
+
+    def peer_exited(self, idx: int) -> None:
+        """Peer `idx`'s reader hit EOF: nothing will answer its pending routed calls, so
+        answer each with -32001 now, and any later call to it at once. This is what
+        bounds a routed call to a dead peer when there is no `routed_timeout`."""
         with self._pending_lock:
-            timers = list(self._routed_timers.values())
-        for timer in timers:
-            timer.join(timeout=self.broadcast_timeout + 1.0)
+            self._exited_peers.add(idx)
+            gone = [key for key in self._routed_timers if key[0] == idx]
+            left = [(key, self._routed_timers.pop(key)) for key in gone]
+            if left:
+                self._routed_cv.notify_all()
+        for (_, mid), timer in left:
+            if timer is not None:
+                timer.cancel()
+            self._answer_routed(idx, mid, "exited before answering", origin="peer_exit")
 
     def _timeout_broadcast(self, seq: int) -> None:
         with self._pending_lock:
@@ -1637,18 +1719,19 @@ class Router:
         self._finish_broadcast(seq)
 
     def _timeout_routed_call(self, mid: Any, peer_idx: int) -> None:
-        """Fires if a routed (single-peer) `tools/call`'s target peer never replies
-        within `broadcast_timeout` — the routed-call counterpart to `_timeout_broadcast`.
+        """Fires if a routed (single-peer) call's target peer never replies within
+        `routed_timeout` — the routed-call counterpart to `_timeout_broadcast`.
         Whichever side (this timer, or the real reply in `from_peer`) wins the race to
-        pop `_routed_timers[mid]` is the one that answers the client; if this timer
-        wins, the id is remembered in `_routed_timed_out` so the peer's eventual late
-        real reply is swallowed instead of double-answering the client."""
+        pop `_routed_timers[(peer_idx, mid)]` is the one that answers the client; if this
+        timer wins, the key is remembered in `_routed_timed_out` so the peer's eventual
+        late real reply is swallowed instead of double-answering the client."""
+        key = (peer_idx, mid)
         with self._pending_lock:
-            timer = self._routed_timers.pop(mid, None)
-            if timer is None:
+            if self._routed_timers.pop(key, _NOT_PENDING) is _NOT_PENDING:
                 return  # the real reply already arrived and cancelled this timer
+            self._routed_cv.notify_all()
             now = time.monotonic()
-            self._routed_timed_out[mid] = now
+            self._routed_timed_out[key] = now
             # Age out first (see _ROUTED_TIMED_OUT_MAX's comment): a burst of unrelated
             # timeouts must not evict an id that's still plausibly awaiting its own
             # peer's very late reply just because it happens to be the oldest entry.
@@ -1660,16 +1743,27 @@ class Router:
             # Population cap as a backstop against pathological unbounded growth.
             while len(self._routed_timed_out) > _ROUTED_TIMED_OUT_MAX:
                 self._routed_timed_out.popitem(last=False)
+        self._answer_routed(peer_idx, mid, f"timed out after {self.routed_timeout}s",
+                            origin="timeout", cancel=True)
+
+    def _answer_routed(self, peer_idx: int, mid: Any, why: str, *, origin: str,
+                       cancel: bool = False) -> None:
+        """Answer a routed call the peer did not, with -32001. The caller has already
+        popped it from `_routed_timers`, so nothing else answers it. With `cancel`, the
+        peer, which may still be working on it, is sent `notifications/cancelled`."""
         peer_name = self.peers[peer_idx].name if 0 <= peer_idx < len(self.peers) else "?"
-        sys.stderr.write(f"[terse-multiproxy] peer {peer_name!r} did not answer "
-                         f"tools/call id={_short(mid)} within {self.broadcast_timeout}s — "
-                         "replying with a timeout error; a dead/slow peer never wedges "
-                         "a routed call\n")
+        sys.stderr.write(f"[terse-multiproxy] peer {peer_name!r} {why} (routed call id="
+                         f"{_short(mid)}); replying with an error\n")
         self._write_client(json.dumps(
             {"jsonrpc": "2.0", "id": mid, "error": {
                 "code": -32001,
-                "message": f"terse-multiproxy: peer {peer_name!r} timed out"}},
-            separators=(",", ":"), ensure_ascii=False), origin="timeout")
+                "message": f"terse-multiproxy: peer {peer_name!r} {why}"}},
+            separators=(",", ":"), ensure_ascii=False), origin=origin)
+        if cancel:
+            self._write_peer(peer_idx, json.dumps(
+                {"jsonrpc": "2.0", "method": "notifications/cancelled",
+                 "params": {"requestId": mid, "reason": f"terse-multiproxy: {why}"}},
+                separators=(",", ":"), ensure_ascii=False), origin)
 
     def _finish_broadcast(self, seq: int) -> None:
         with self._pending_lock:
@@ -1782,7 +1876,17 @@ class Router:
                                        "result": result},
                                       separators=(",", ":"), ensure_ascii=False),
                            origin="snapshot")
-        self._broadcast(msg, "initialize", on_done=partial(self._warm_initialized, warm))
+        try:
+            self._broadcast(msg, "initialize", on_done=partial(self._warm_initialized, warm))
+        except Exception as exc:  # noqa: BLE001 — answered above; never answer twice (#511)
+            # The client already has its reply, so the catch-all must not send -32603 for
+            # the same id. Leave the warm session: with its broadcast undone, list methods
+            # are no longer served from a snapshot nothing will replace.
+            with self._snap_lock:
+                if self._warm is warm:
+                    self._warm = None
+            sys.stderr.write(f"[terse-multiproxy] background initialize failed: "
+                             f"{type(exc).__name__}: {_clip(str(exc))}\n")
         return True
 
     def _serve_warm(self, msg: dict, kind: str) -> bool:
@@ -2408,9 +2512,19 @@ def _peer_alive(peer: Peer) -> bool:
 
 
 def _peer_reader(peer: Peer, cout: TextIO, transform: Callable[[str], Any], out_lock: Lock,
-                 wire: WireTap | None) -> None:
+                 wire: WireTap | None, on_exit: Callable[[], None] | None = None) -> None:
     """One peer's server->client pump thread; with the wire log, taps both sides and
-    records the peer's exit once its stdout reaches EOF (a crash mid-session included)."""
+    records the peer's exit once its stdout reaches EOF (a crash mid-session included).
+    `on_exit` runs last, however the pump ended (`Router.peer_exited`)."""
+    try:
+        _pump_peer(peer, cout, transform, out_lock, wire)
+    finally:
+        if on_exit is not None:
+            on_exit()
+
+
+def _pump_peer(peer: Peer, cout: TextIO, transform: Callable[[str], Any], out_lock: Lock,
+               wire: WireTap | None) -> None:
     if wire is None:
         pump(peer.transport.inbound(), cout, transform, lock=out_lock)
         return
@@ -2455,6 +2569,7 @@ def run_multi_proxy(
     capture_dir: str | None = None,
     debug_log: str | None = None,
     broadcast_timeout: float = BROADCAST_TIMEOUT,
+    routed_timeout: float | None = ROUTED_TIMEOUT,
     diff_override: bool | None = None,
     diff_keyframe_override: int | None = None,
     join_blocks_override: bool | None = None,
@@ -2468,7 +2583,9 @@ def run_multi_proxy(
     peer (server->client) plus run the client->server fan-out loop on this thread, and
     block until the client's stdin hits EOF. `broadcast_timeout` overrides
     `BROADCAST_TIMEOUT` — a test-only knob so a dead-peer test doesn't need to wait out
-    the real 30s default. `diff_override`/`diff_keyframe_override` mirror cli.py's
+    the real 30s default. `routed_timeout` caps a routed tools/call or prompts/get
+    (`--routed-timeout`; None, the default, waits for the reply or the peer's exit).
+    `diff_override`/`diff_keyframe_override` mirror cli.py's
     single-peer `--diff`/`--no-diff`/`--diff-keyframe-interval` CLI flags — applied to
     EVERY peer's policy in `_build_peers`, including one loaded from its own
     `policy_path`, so the flag is proxy-wide (not silently skipped for a peer with a
@@ -2553,6 +2670,7 @@ def run_multi_proxy(
     out_lock = Lock()
     launch_dir = snapshot_scope(specs)
     router = Router(peers, cout, out_lock, debug=debug, broadcast_timeout=broadcast_timeout,
+                    routed_timeout=routed_timeout,
                     primer_latch=primer_latch,
                     on_session=(build_router_session_writer(stats_log, primer_label)
                                 if stats_log is not None else None),
@@ -2565,7 +2683,7 @@ def run_multi_proxy(
     try:
         threads = [Thread(target=_peer_reader,
                           args=(peer, router.peer_sink(), router.from_peer(i), out_lock,
-                                wire),
+                                wire, partial(router.peer_exited, i)),
                           daemon=True)
                   for i, peer in enumerate(peers)]
         for t in threads:

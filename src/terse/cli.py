@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import json as _json
+import math
 import re
 import sys
 import tempfile
@@ -141,6 +142,17 @@ def _cmd_measure(args: argparse.Namespace) -> int:
     return 0
 
 
+def _positive_seconds(text: str) -> float:
+    """argparse type for a duration: a finite number of seconds above zero."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {text!r}") from None
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a finite number above 0: {text!r}")
+    return value
+
+
 def _parse_headers(pairs: list[str] | None) -> dict[str, str]:
     """Parse repeated `--header NAME=VALUE` flags into a dict (#5, HTTP downstream
     auth). Raises ValueError with a clear message on a malformed entry (no `=`) rather
@@ -182,6 +194,10 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
             print("proxy: --header has no effect with --config — set a per-downstream "
                   '"headers" object in the config file instead', file=sys.stderr)
             return 2
+    elif args.routed_timeout is not None:
+        print("proxy: --routed-timeout applies only with --config — the single-server "
+              "proxy never times a call out", file=sys.stderr)
+        return 2
     elif not cmd:
         print("proxy: provide the downstream server command after `--`, e.g.\n"
               "  terse proxy --policy p.json -- uvx some-mcp-server", file=sys.stderr)
@@ -237,6 +253,7 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
                                    diff_keyframe_override=args.diff_keyframe_interval,
                                    join_blocks_override=join_blocks_override,
                                    stats_log=stats_log, primer_mode=args.primer,
+                                   routed_timeout=args.routed_timeout,
                                    **_wire_kwargs(args))
         except (OSError, ValueError) as e:
             print(f"proxy --config: {e}", file=sys.stderr)
@@ -2286,6 +2303,13 @@ def main(argv: list[str] | None = None) -> int:
                          '{"downstreams":[{"name":"gh","command":[...]},'
                          '{"name":"kb","url":"https://...","headers":{...}}]}. '
                          "Mutually exclusive with a positional downstream command.")
+    px.add_argument("--routed-timeout", metavar="SECONDS", type=_positive_seconds,
+                    default=None,
+                    help="with --config: answer a routed tools/call or prompts/get with "
+                         "-32001 when its server has not replied within SECONDS, and "
+                         "send it notifications/cancelled. Default: no limit, as in the "
+                         "single-server proxy; a server that exits still gets its pending "
+                         "calls answered.")
     px.add_argument("cmd", nargs=argparse.REMAINDER,
                     help="-- <downstream MCP server command and args, or a single URL>")
     px.set_defaults(func=_cmd_proxy)
