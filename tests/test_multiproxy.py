@@ -2316,6 +2316,23 @@ def test_client_loop_survives_malformed_lines_between_valid_calls(tmp_path):
     assert by_id["null"][0]["error"]["code"] == -32600
 
 
+def test_invalid_utf8_on_client_stdin_drops_the_line_not_the_session(tmp_path, capsys):
+    # #517: a strict stdin raised UnicodeDecodeError inside `for raw in cin`, outside the
+    # per-line containment, so the valid call behind it was never answered.
+    cfg = _write_config(tmp_path, [{"name": "gh", "command": [sys.executable, str(FAKE)]}])
+    call = {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "gh__gh.api.items"}}
+    data = (json.dumps({**call, "id": 1}).encode() + b"\n" + b"\xff\xfe{\n"
+            + b'{"jsonrpc":"2.0","id":"\xff","method":"ping"}\n'
+            + json.dumps({**call, "id": 2}).encode() + b"\n")
+    cin = io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="strict")
+    cout = io.StringIO()
+    assert run_multi_proxy(str(cfg), PLAIN_POLICY, stdin=cin, stdout=cout) == 0
+    by_id = {m.get("id"): m for m in _lines(cout)}
+    assert set(by_id) == {1, 2} and all("result" in m for m in by_id.values()), by_id
+    err = capsys.readouterr().err
+    assert err.count("not valid UTF-8") == 2 and "Traceback" not in err
+
+
 def _strict_utf8_out():
     """A client stdout like the real one: strict UTF-8, so a lone surrogate in a reply
     raises UnicodeEncodeError on write instead of passing through as io.StringIO does."""
@@ -2328,29 +2345,117 @@ def _strict_lines(out) -> list[dict]:
     return [json.loads(ln) for ln in raw.splitlines() if ln.strip()]
 
 
-@pytest.mark.parametrize("msg, code", [
-    # Unknown tool: the -32601 write raises; the backstop's -32603 must still go out.
-    ({"jsonrpc": "2.0", "id": "\ud800", "method": "tools/call",
-      "params": {"name": "nope"}}, -32603),
-    # Bad method: the -32600 rejection itself must be writable.
-    ({"jsonrpc": "2.0", "id": "\ud800", "method": 5}, -32600),
+@pytest.mark.parametrize("msg", [
+    {"jsonrpc": "2.0", "id": "\ud800", "method": "tools/call", "params": {"name": "nope"}},
+    {"jsonrpc": "2.0", "id": "x\ud800y", "method": 5},
+    # #518: these were answered from a peer pump / timer thread, whose writes still failed.
+    {"jsonrpc": "2.0", "id": "\ud800", "method": "ping"},
+    {"jsonrpc": "2.0", "id": "\ud800", "method": "tools/call", "params": {"name": "b__search"}},
 ])
-def test_an_unencodable_id_gets_a_valid_escaped_reply(msg, code, capsys):
-    # R2-1: id "\ud800" made every error write raise UnicodeEncodeError on a strict
-    # UTF-8 stdout, out of route_client_line and so out of the client loop.
+def test_an_unencodable_id_is_rejected_up_front(msg, capsys):
+    # #518 (was R2-1's escaped echo): a lone-surrogate id is not a JSON-RPC String, and
+    # no reply that echoes it can be written to a strict UTF-8 stdout from every thread.
+    # One -32600 with id null, before any peer or timer sees it.
     t0, t1 = _FakePeerTransport(), _FakePeerTransport()
     peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
     out = _strict_utf8_out()
     router = Router(peers, out, Lock(), broadcast_timeout=1000)
     try:
         router.route_client_line(json.dumps(msg))     # must not raise
-        out.flush()
-        assert b'"id":"\\ud800"' in out.buffer.getvalue()
         msgs = _strict_lines(out)
         assert len(msgs) == 1
-        assert msgs[0]["id"] == "\ud800" and msgs[0]["error"]["code"] == code
+        assert msgs[0]["id"] is None and msgs[0]["error"]["code"] == -32600
+        assert _peer_calls(t1) == [] and not router._pending and not router._routed_timers
         assert not router.client_gone
         _assert_router_still_routes(router, t1, out)
+    finally:
+        router.close_senders()
+
+
+@pytest.mark.parametrize("raw_id", ["NaN", "Infinity", "-Infinity"])
+def test_a_non_finite_id_is_rejected_not_echoed_as_invalid_json(raw_id):
+    # #512: Python's json parses these; echoing them wrote `"id":NaN`, which is not JSON.
+    _, t1, _, out, router = _two_peer_router()
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": float(raw_id), "method": "tools/call",
+             "params": {"name": "b__search"}}))
+        raw = out.getvalue()
+        assert "NaN" not in raw and "Infinity" not in raw
+        msgs = _lines(out)
+        assert len(msgs) == 1
+        assert msgs[0]["id"] is None and msgs[0]["error"]["code"] == -32600
+        assert _peer_calls(t1) == []
+        out.truncate(0)
+        out.seek(0)
+        _assert_router_still_routes(router, t1, out)
+    finally:
+        router.close_senders()
+
+
+@pytest.mark.parametrize("msg", [
+    {"jsonrpc": "2.0", "id": 1},
+    {"jsonrpc": "2.0", "id": "a", "method": None},
+    {"jsonrpc": "2.0", "id": 1, "params": {}},
+])
+def test_an_id_with_no_method_result_or_error_gets_invalid_request(msg):
+    # #513: this was read as a client response and dropped, so the client hung on it.
+    _, t1, _, out, router = _two_peer_router()
+    try:
+        router.route_client_line(json.dumps(msg))
+        msgs = _lines(out)
+        assert len(msgs) == 1
+        assert msgs[0]["id"] == msg["id"] and msgs[0]["error"]["code"] == -32600
+        out.truncate(0)
+        out.seek(0)
+        _assert_router_still_routes(router, t1, out)
+    finally:
+        router.close_senders()
+
+
+def test_a_client_response_is_still_not_answered():
+    # #513's boundary: a real response (result or error, no method) is never answered.
+    _, _, _, out, router = _two_peer_router()
+    try:
+        router.route_client_line(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}))
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 2, "error": {"code": 1, "message": "x"}}))
+        assert _lines(out) == []
+    finally:
+        router.close_senders()
+
+
+@pytest.mark.parametrize("bad", [
+    {"jsonrpc": "2.0", "id": [1], "result": {}},
+    {"jsonrpc": "2.0", "id": {"k": 1}, "method": "sampling/createMessage"},
+    {"jsonrpc": "2.0", "id": 7, "method": ["sampling/createMessage"]},
+    {"jsonrpc": "2.0", "id": float("nan"), "result": {}},
+])
+def test_an_invalid_peer_id_is_dropped_and_the_reader_survives(bad, capsys):
+    # #510: an unhashable id raised TypeError out of from_peer, killing that peer's
+    # reader thread; every later reply from the peer was lost.
+    _, t1, _, out, router = _two_peer_router()
+    try:
+        assert router.from_peer(1)(json.dumps(bad)) is SWALLOW   # must not raise
+        assert "sent an invalid id" in capsys.readouterr().err
+        _assert_router_still_routes(router, t1, out)
+    finally:
+        router.close_senders()
+
+
+def test_an_exception_in_the_peer_transform_is_contained(monkeypatch, capsys):
+    # #510's containment: whatever else raises fails open (line forwarded unchanged).
+    _, t1, peers, out, router = _two_peer_router()
+
+    def _boom(line):
+        raise RuntimeError("transform boom")
+
+    monkeypatch.setattr(peers[1].inter, "transform_response", _boom)
+    try:
+        line = json.dumps({"jsonrpc": "2.0", "id": 99, "result": {}})
+        assert router.from_peer(1)(line) is None
+        err = capsys.readouterr().err
+        assert "transform boom" in err and "forwarded unchanged" in err
     finally:
         router.close_senders()
 
@@ -2452,7 +2557,7 @@ def test_client_loop_survives_unwritable_deep_and_raising_lines(tmp_path, monkey
     text = "".join([
         json.dumps({**call, "id": 1}) + "\n",
         json.dumps({"jsonrpc": "2.0", "id": "\ud800", "method": "tools/call",
-                    "params": {"name": "nope"}}) + "\n",
+                    "params": {"name": "nope"}}) + "\n",       # -32600, id null (#518)
         json.dumps({**call, "id": 2}) + "\n",
         "[" * 100000 + "\n",
         json.dumps({**call, "id": 3}) + "\n",
@@ -2469,7 +2574,7 @@ def test_client_loop_survives_unwritable_deep_and_raising_lines(tmp_path, monkey
         by_id.setdefault(m.get("id"), []).append(m)
     for ok in (1, 2, 3, 4, 5):
         assert len(by_id[ok]) == 1 and "result" in by_id[ok][0], by_id
-    assert by_id["\ud800"][0]["error"]["code"] == -32603
+    assert by_id[None][0]["error"]["code"] == -32600
     assert by_id[50][0]["error"]["code"] == -32603
     assert 60 not in by_id                    # raised before any reply could be built
     err = capsys.readouterr().err

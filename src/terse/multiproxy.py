@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import queue
 import subprocess
@@ -230,6 +231,29 @@ def _clip(text: str) -> str:
 def _short(value: object) -> str:
     """`repr(value)`, clipped (see `_clip`)."""
     return _clip(repr(value))
+
+
+def _encodable(text: str) -> bool:
+    """False for a str holding a lone surrogate (or a surrogateescape'd byte), which a
+    strict UTF-8 stream cannot write."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _bad_id(mid: object) -> bool:
+    """True for a present id that is not a usable JSON-RPC id: not a str/number (bool
+    included, unhashable ones especially), a NaN/Infinity that would echo as invalid JSON
+    (#512), or a str with a lone surrogate that no client write could encode (#518)."""
+    if mid is None:
+        return False
+    if isinstance(mid, bool) or not isinstance(mid, (str, int, float)):
+        return True
+    if isinstance(mid, float):
+        return not math.isfinite(mid)
+    return isinstance(mid, str) and not _encodable(mid)
 
 
 def load_multi_config(path: str) -> list[DownstreamSpec]:
@@ -987,12 +1011,20 @@ class Router:
 
     def _reject_invalid_request(self, msg: dict) -> bool:
         """True after answering (or dropping) a message whose id or method is not a
-        JSON-RPC type. Checked up front so an unhashable id never reaches a pending-map
-        lookup and leaves half-registered state behind."""
+        JSON-RPC type (see `_bad_id`), or that carries an id but is neither a request nor a
+        response (#513). Checked up front so an unhashable id never reaches a pending-map
+        lookup and leaves half-registered state behind, and an id no client write can
+        encode never reaches a peer or timer thread (#518)."""
         mid, method = msg.get("id"), msg.get("method")
-        bad_id = mid is not None and (isinstance(mid, bool)
-                                      or not isinstance(mid, (str, int, float)))
+        bad_id = _bad_id(mid)
         bad_method = method is not None and not isinstance(method, str)
+        if (not bad_id and method is None and mid is not None
+                and "result" not in msg and "error" not in msg):
+            # Not a response either: the client is waiting on this id, so say so (#513).
+            sys.stderr.write(f"[terse-multiproxy] message with id {_short(mid)} has no "
+                             "method, result or error; rejected\n")
+            self._write_error(mid, -32600, "terse-multiproxy: invalid request")
+            return True
         if not (bad_id or bad_method):
             return False
         sys.stderr.write(f"[terse-multiproxy] invalid request (id {_short(mid)}, method "
@@ -1398,12 +1430,33 @@ class Router:
     # ---------- server -> client ----------
 
     def from_peer(self, peer_idx: int) -> Callable[[str], Any]:
-        """The `pump()` transform for peer `peer_idx`'s server->client reader thread."""
+        """The `pump()` transform for peer `peer_idx`'s server->client reader thread.
+        `pump` calls it unguarded, so anything it raises is contained here: one bad line
+        must not end the reader and lose every later reply from this peer (#510)."""
         def _transform(line: str) -> Any:
             try:
+                return _route(line)
+            except Exception as exc:  # noqa: BLE001 — fail open, like the not-JSON case
+                sys.stderr.write(f"[terse-multiproxy] peer {self.peers[peer_idx].name} "
+                                 f"line forwarded unchanged: {type(exc).__name__}: "
+                                 f"{_clip(str(exc))}\n")
+                return None
+
+        def _route(line: str) -> Any:
+            try:
                 msg = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
+            except (ValueError, RecursionError):   # JSONDecodeError is a ValueError
                 return None  # not JSON — forward unchanged, fail-open like proxy.py
+            if isinstance(msg, dict) and (
+                    _bad_id(msg.get("id"))
+                    or (msg.get("method") is not None
+                        and not isinstance(msg.get("method"), str))):
+                # Same check as the client side: such an id cannot match anything the
+                # router issued or the client sent, and would raise in the lookups below.
+                sys.stderr.write(f"[terse-multiproxy] peer {self.peers[peer_idx].name} "
+                                 f"sent an invalid id {_short(msg.get('id'))} or method "
+                                 f"{_short(msg.get('method'))}; dropped\n")
+                return SWALLOW
             if isinstance(msg, dict) and msg.get("id") is not None:
                 if self._maybe_collect(peer_idx, msg):
                     return SWALLOW  # a broadcast-local-id reply: never forwarded as-is
@@ -2447,11 +2500,19 @@ def run_multi_proxy(
         # to N destinations is a genuinely different shape than pump's 1:1 line-in/
         # line-out (see module docstring). Running it inline on THIS thread means
         # "block until client stdin EOF" falls out of the for-loop ending, for free.
+        # A strict decoder raises on invalid UTF-8 inside the iterator itself, outside the
+        # per-line containment below, and would end the session (#517).
+        if hasattr(cin, "reconfigure"):
+            cin.reconfigure(errors="surrogateescape")
         for raw in cin:
             if wire is not None:
                 wire.tap("client_in", raw)
             line = raw.rstrip("\n")
             if not line:
+                continue
+            if not _encodable(line):
+                sys.stderr.write("[terse-multiproxy] client line dropped: not valid "
+                                 "UTF-8\n")
                 continue
             try:
                 router.route_client_line(line)
