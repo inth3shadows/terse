@@ -39,7 +39,7 @@ uv run terse gate path/to/your-tool-output.json
 
 `terse verify` emits a single self-contained markdown report: the **lossless gate**
 (which voids the savings if any payload fails) plus **per-shape / per-tool token
-savings**, with a header stating exactly what it does and does not prove.
+savings**, where a payload that failed the gate counts as sent raw, the way the proxy sends it, with a header stating exactly what it does and does not prove.
 
 ```bash
 # zero-setup: runs on a bundled deterministic sample

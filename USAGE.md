@@ -996,6 +996,11 @@ parse it:
   counted. `retrieve_tokens` is the amount netted (gross = `saved_tokens + retrieve_tokens`);
   a non-zero `retrieve_untokenized` makes the net an upper bound. `wire_saved_tokens` stays
   gross.
+- **`saved_tokens` and `retrieve_tokens` cover installed entries only (#540)** — the sum over
+  the ledger labels some entry in the table is billed for, each once, so the headline equals
+  the sum of the per-server `contributors`. Rows left by a removed server, or under a
+  contested label no entry owns, are not counted. `wire_saved_tokens` is still the whole
+  ledger.
 - **`saved_basis` says which basis those savings are on (#440)** — `context` from any
   current `aggregate`; `wire` (or `mixed`) when the aggregate predates the context sums or
   was hand-rolled, in which case the figures can overstate what the model received.
