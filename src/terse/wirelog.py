@@ -63,11 +63,37 @@ _SAFE_SEGMENT = re.compile(r"[^A-Za-z0-9._-]")
 RULE_UNDECIDABLE = "<undecidable>"
 RULE_GATE_ERROR = "<gate-error>"
 RULE_OVERFLOW = "<exclusion-overflow>"
+# An excluded request went to a server with an id its reply cannot be matched by (null, or a
+# line only partly parseable): every later line from that server is excluded (#524).
+RULE_UNMATCHED = "<unmatched-excluded-call>"
 _CLIENT_HOPS = frozenset(("client_in", "client_out"))
 _READ_HOPS = frozenset(("client_in", "server_in"))
 # Hops on which a request carries an id the CLIENT chose (and a response answers one the
 # SERVER chose); on the other two it is the reverse.
 _CLIENT_ID_REQUEST_HOPS = frozenset(("client_in", "server_out"))
+
+_INT_ID = re.compile(r"-?[0-9]{1,19}")
+# Where an id-like value sits in a raw line: the values `_Scope.needs_parse` pre-scans
+# against answered keys. Key names written with escapes are not seen (see `needs_parse`).
+_ID_VALUES = re.compile(r'"(?:id|progressToken|requestId)"\s*:\s*'
+                        r'("(?:[^"\\]|\\.)*"|-?[0-9][0-9.eE+-]*)')
+_KINDS = ("c", "s", "pc", "ps")
+# Past this many id-like values a line is dense structured data, where the scan costs as
+# much as the parse it would save: parse it, as before #525.
+_SCAN_MAX = 256
+# A candidate spelled other than `_spellings` predicts (an escape or non-ASCII in a string,
+# a fraction or exponent in a number) is decoded before it is compared.
+_ODD_STR = re.compile(r'[\\\x80-\U0010ffff]')
+_ODD_NUM = re.compile(r"[.eE+]")
+
+
+def _spellings(key: str) -> tuple[str, ...]:
+    """How a line most likely writes an id whose `_id_key` is `key`."""
+    if key[:1] == '"':
+        return (key,)
+    if _INT_ID.fullmatch(key):
+        return (key, f'"{key}"')
+    return ()
 
 # `resolve(msg)` for one parsed client message: (rule glob, excluded) or None (no rule).
 Resolver = Callable[[dict], "tuple[str | None, bool] | None"]
@@ -76,6 +102,9 @@ Resolver = Callable[[dict], "tuple[str | None, bool] | None"]
 def _id_key(mid: Any) -> str:
     if isinstance(mid, float) and mid.is_integer():
         mid = int(mid)          # a server echoing 5 as 5.0 is still answering 5
+    elif isinstance(mid, str) and _INT_ID.fullmatch(mid):
+        mid = int(mid)          # nor is one coercing "5" to 5 (#524); a collision only
+                                # ever over-excludes
     try:
         return json.dumps(mid, sort_keys=True)
     except (TypeError, ValueError):
@@ -124,8 +153,10 @@ def _parse(line: str, strict: bool) -> tuple[str, Any]:
         return "ok", json.loads(line)
     except (_DuplicateKey, RecursionError):
         return "undecidable", None
-    except ValueError:
+    except json.JSONDecodeError:
         return "bad", None
+    except ValueError:      # valid JSON refused here, e.g. an int past the digit limit
+        return "undecidable", None
 
 
 class _Scope:
@@ -152,16 +183,28 @@ class _Scope:
     - `excluded_peers` (whole-server capture:false) excludes every server line of that
       peer; `exclude_all` the whole connection.
 
+    - An excluded request sent to a server with an id its reply cannot be matched by
+      (null, or a line that cannot be fully parsed) fails closed: every later server_in
+      line from that peer is excluded (`unmatched`) until it exits (#524).
+    - With `may_exclude` false (no rule anywhere has capture:false), an unparseable line
+      is logged like any other instead of excluded as undecidable.
+
     Live keys are never evicted; at `_LIVE_MAX` the scope fails closed for the rest of the
     connection (`overflow`) instead of forgetting one."""
 
-    def __init__(self, exclude_all: str | None, excluded_peers: dict[str, str]):
+    def __init__(self, exclude_all: str | None, excluded_peers: dict[str, str],
+                 may_exclude: bool = True):
         self.exclude_all = exclude_all
         self.excluded_peers = excluded_peers
+        self.may_exclude = may_exclude
         self.resolve: Resolver | None = None
         self.live: dict[tuple[str, str, str], tuple[str, list[tuple[str, str, str]]]] = {}
         self.done: OrderedDict[tuple[str, str, str], str] = OrderedDict()
         self.sides: dict[str, int] = {}   # keys (live or done) per side; 0 = nothing to match
+        self.live_sides: dict[str, int] = {}   # live keys alone, per side
+        self._done_ver = 0                     # bumped on every change to `done`
+        self._done_text: tuple[int, dict[str, set[str]]] = (-1, {})
+        self.unmatched: dict[str, str] = {}    # peer side -> rule, until the peer exits
         self.calls: dict[str, tuple[int, str]] = {}   # peer side -> (live requests, a rule)
         self.overflow: str | None = None
         self.overflowed = False           # set once, for the caller to emit an event
@@ -170,12 +213,40 @@ class _Scope:
     def side(hop: str, peer: str | None) -> str:
         return "c" if hop in _CLIENT_HOPS else f"p:{peer}"
 
-    def needs_parse(self, hop: str, peer: str | None, inherited: str | None) -> bool:
+    def needs_parse(self, hop: str, peer: str | None, inherited: str | None,
+                    line: str) -> bool:
         if hop == "client_in" or inherited is not None:
             return True
         if hop not in _CLIENT_HOPS and peer in self.excluded_peers:
             return True                   # its requests must register, for the replies
-        return bool(self.sides.get(self.side(hop, peer)))
+        side = self.side(hop, peer)
+        if self.live_sides.get(side):
+            return True
+        # Only answered keys left: parse just a line naming one (a late duplicate reply, a
+        # reused id), not every line for good (#525). Blind spot: a key name written with
+        # escapes ("\u0069d"), which no server sends for a reply it already gave.
+        return bool(self.sides.get(side)) and self._names_done(side, line)
+
+    def _names_done(self, side: str, line: str) -> bool:
+        ver, text = self._done_text
+        if ver != self._done_ver:         # rebuilt once per change, not once per line
+            ver, text = self._done_ver, {}
+            for key in list(self.done):
+                text.setdefault(key[0], set()).update(_spellings(key[2]))
+            self._done_text = (ver, text)
+        spelled = text.get(side, set())
+        for n, m in enumerate(_ID_VALUES.finditer(line)):
+            value = m.group(1)
+            if value in spelled or n >= _SCAN_MAX:
+                return True
+            if (_ODD_STR if value[0] == '"' else _ODD_NUM).search(value):
+                try:
+                    key = _id_key(json.loads(value))
+                except ValueError:
+                    return True           # cannot tell: parse it
+                if any((side, kind, key) in self.done for kind in _KINDS):
+                    return True
+        return False
 
     def _lookup(self, key: tuple[str, str, str]) -> str | None:
         hit = self.live.get(key)
@@ -186,16 +257,24 @@ class _Scope:
         return n_rule[1] if n_rule is not None else None
 
     def decide(self, hop: str, peer: str | None, state: str, msg: Any,
-               inherited: str | None, sent: bool) -> tuple[str | None, str | None]:
+               inherited: str | None, sent: bool,
+               resolved: list[Any] | None = None) -> tuple[str | None, str | None]:
         """(exclusion rule or None, informational rule) for one line, and its bookkeeping.
-        `state` is `_parse`'s verdict, or "skip" when the line was not parsed."""
+        `state` is `_parse`'s verdict, or "skip" when the line was not parsed. `resolved`
+        is `resolve()` per element of a client_in line, computed before the lock."""
         client = hop in _CLIENT_HOPS
         side = self.side(hop, peer)
         rule = inherited
         if rule is None and not client and peer is not None:
             rule = self.excluded_peers.get(peer)
+        if rule is None and hop == "server_in":
+            rule = self.unmatched.get(side)
+        fail_closed = hop == "server_out" and sent
         if state == "undecidable":
-            return rule or RULE_UNDECIDABLE, None
+            rule = rule or (RULE_UNDECIDABLE if self.may_exclude else None)
+            if rule is not None and fail_closed:
+                self.unmatched.setdefault(side, RULE_UNMATCHED)
+            return rule, None
         if state == "skip":
             return rule, None
         if state == "bad" or not isinstance(msg, (dict, list)):
@@ -205,20 +284,29 @@ class _Scope:
         batch = isinstance(msg, list)
         elems = msg if batch else [msg]
         info = None
-        for e in elems:
+        unmatchable = False
+        for i, e in enumerate(elems):
             if not isinstance(e, dict):
-                rule = rule or RULE_UNDECIDABLE
+                if self.may_exclude:
+                    rule = rule or RULE_UNDECIDABLE
+                unmatchable = True
                 continue
-            hit, info_e = self._classify(hop, side, e)
+            res = resolved[i] if resolved is not None else None
+            hit, info_e = self._classify(hop, side, e, res)
             rule = rule or hit
             if not batch:
                 info = info_e
+            if isinstance(e.get("method"), str) and "id" in e and e["id"] is None:
+                unmatchable = True        # a request whose reply carries no usable id
         for e in elems:
             if isinstance(e, dict):
                 self._account(hop, side, e, rule, sent)
+        if rule is not None and fail_closed and unmatchable:
+            self.unmatched.setdefault(side, RULE_UNMATCHED)
         return rule, info
 
-    def _classify(self, hop: str, side: str, e: dict) -> tuple[str | None, str | None]:
+    def _classify(self, hop: str, side: str, e: dict,
+                  res: Any) -> tuple[str | None, str | None]:
         mid, method = e.get("id"), e.get("method")
         client_ids = hop in _CLIENT_ID_REQUEST_HOPS
         hit: str | None = None
@@ -243,12 +331,10 @@ class _Scope:
         if hit is None and hop == "server_in":
             hit = self._in_flight(side)
         info = None
-        if hop == "client_in" and self.resolve is not None:
-            res = self.resolve(e)
-            if res is not None:
-                info = res[0]
-                if res[1] and hit is None:
-                    hit = res[0] or RULE_UNDECIDABLE
+        if hop == "client_in" and res is not None:
+            info = res[0]
+            if res[1] and hit is None:
+                hit = res[0] or RULE_UNDECIDABLE
         return hit, info
 
     def _account(self, hop: str, side: str, e: dict, rule: str | None, sent: bool) -> None:
@@ -280,8 +366,21 @@ class _Scope:
             return False
         if self.done.pop(key, None) is None:
             self.sides[key[0]] = self.sides.get(key[0], 0) + 1
+        else:
+            self._done_ver += 1
         self.live[key] = (rule, links)
+        self.live_sides[key[0]] = self.live_sides.get(key[0], 0) + 1
         return True
+
+    def _pop_live(self, key: tuple[str, str, str]) -> Any:
+        entry = self.live.pop(key, None)
+        if entry is not None:
+            n = self.live_sides[key[0]] - 1
+            if n:
+                self.live_sides[key[0]] = n
+            else:
+                del self.live_sides[key[0]]
+        return entry
 
     def _register(self, key: tuple[str, str, str], rule: str,
                   links: list[tuple[str, str, str]]) -> None:
@@ -295,13 +394,13 @@ class _Scope:
             self.calls[side] = (n + 1, rule)
 
     def _complete(self, key: tuple[str, str, str]) -> None:
-        entry = self.live.pop(key, None)
+        entry = self._pop_live(key)
         if entry is None:
             return
         rule, links = entry
         self._retire(key, rule)
         for link in links:
-            lentry = self.live.pop(link, None)
+            lentry = self._pop_live(link)
             if lentry is not None:
                 self._retire(link, lentry[0])
         side = key[0]
@@ -314,6 +413,7 @@ class _Scope:
 
     def _retire(self, key: tuple[str, str, str], rule: str) -> None:
         self.done[key] = rule
+        self._done_ver += 1
         while len(self.done) > _DONE_MAX:
             old, _ = self.done.popitem(last=False)
             n = self.sides.get(old[0], 1) - 1
@@ -328,6 +428,7 @@ class _Scope:
         for key in [k for k in self.live if k[0] == side]:
             self._complete(key)
         self.calls.pop(side, None)
+        self.unmatched.pop(side, None)
 
 
 def _segment(value: str) -> str:
@@ -356,14 +457,14 @@ _INHERIT: Any = object()
 class WireTap:
     def __init__(self, path: Path, fh: TextIO, conn: str, claude_session: str, *,
                  exclude_all: str | None = None,
-                 excluded_peers: dict[str, str] | None = None,
+                 excluded_peers: dict[str, str] | None = None, may_exclude: bool = True,
                  queue_max: int = _QUEUE_MAX, queue_bytes_max: int = _QUEUE_BYTES_MAX):
         self.path = path
         self._fh = fh
         self.conn = conn
         self.claude_session = claude_session
         self.excluded_peers = excluded_peers or {}
-        self._scope = _Scope(exclude_all, self.excluded_peers)
+        self._scope = _Scope(exclude_all, self.excluded_peers, may_exclude)
         self._ctx = threading.local()
         self._q: queue.Queue[Any] = queue.Queue(maxsize=queue_max)
         self._bytes_max = queue_bytes_max
@@ -421,13 +522,25 @@ class WireTap:
             base = force or inherit
             scope = self._scope
             state, msg = "skip", None
+            resolved: list[Any] | None = None
+            resolve_exc: Exception | None = None
             trivial = scope.overflow or scope.exclude_all
             if trivial is None:
                 try:
-                    if scope.needs_parse(hop, peer, base):
-                        state, msg = _parse(line, strict=hop == "client_in")
+                    if scope.needs_parse(hop, peer, base, line):
+                        # server_out strict too: a duplicate "id" must not register the
+                        # key a first-key-wins server will not answer with (#524).
+                        state, msg = _parse(line, strict=hop in ("client_in", "server_out"))
                 except Exception:  # noqa: BLE001 — fail closed, never into forwarding
                     state = "undecidable"
+                # The resolver (routing table, Policy.select) runs before the lock, which
+                # every forwarding thread's tap waits on (#525).
+                if hop == "client_in" and state == "ok" and scope.resolve is not None:
+                    try:
+                        resolved = [scope.resolve(e) if isinstance(e, dict) else None
+                                    for e in (msg if isinstance(msg, list) else [msg])]
+                    except Exception as exc:  # noqa: BLE001 — fail closed, below
+                        resolve_exc = exc
             with self._lock:
                 if self._closed:
                     self.late_drops += 1
@@ -438,8 +551,11 @@ class WireTap:
                     rule, info = trivial, None
                 else:
                     try:
+                        if resolve_exc is not None:
+                            raise resolve_exc
                         rule, info = scope.decide(hop, peer, state, msg, base,
-                                                  sent=status != "dropped")
+                                                  sent=status != "dropped",
+                                                  resolved=resolved)
                     except Exception as exc:  # noqa: BLE001 — fail closed
                         rule, info = RULE_GATE_ERROR, None
                         self._gate_error(exc)
@@ -605,6 +721,12 @@ class WireTap:
                    line=None if excluded else line, capture_status=status, origin=origin,
                    rule=rule if excluded else info)
         return json.dumps(rec, ensure_ascii=True, default=str) + "\n"
+
+
+def may_exclude(policies: Any) -> bool:
+    """Whether any rule in `policies` has capture:false — without one, nothing can be
+    excluded, and an unparseable line is logged like any other."""
+    return any(not r.capture for p in policies for r in p.rules)
 
 
 def open_wire_tap(root: str, conn: str, *, exclude_all: str | None = None,

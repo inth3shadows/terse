@@ -106,6 +106,7 @@ from .stats import (
 from .transport import Transport, build_transport
 from .wirelog import (
     WireTap,
+    may_exclude,
     open_wire_tap,
     retrieve_handle,
     server_excluded,
@@ -2539,7 +2540,8 @@ def run_multi_proxy(
     if wire_log is not None:
         excluded = {p.name: glob for p in peers
                     if (glob := server_excluded(p.inter.policy, p.name)) is not None}
-        wire = open_wire_tap(wire_log, conn, excluded_peers=excluded)
+        wire = open_wire_tap(wire_log, conn, excluded_peers=excluded,
+                             may_exclude=may_exclude(p.inter.policy for p in peers))
     if wire is not None:
         from . import __version__
         wire.event("start", version=__version__, mode="multi", policy=policy_path,
