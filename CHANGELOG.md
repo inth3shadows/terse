@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.45.1] - 2026-10-21
+
 ### Fixed
 
 - The wire log's `stop` event is no longer lost when the client ends the session with a signal (#528). The proxy reaped its servers before closing the log, and a server that ignores SIGTERM held that reap for 2 s before SIGKILL, long enough for Claude Code to kill the proxy first. The log now closes before the reap; servers still running at that point are named in a `teardown` event (with the exception that ended the session) just before `stop`, in place of the `peer_exit` records they no longer get.
