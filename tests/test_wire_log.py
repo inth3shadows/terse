@@ -493,6 +493,32 @@ def test_peer_queue_full_and_eviction_recorded_as_dropped(tmp_path, monkeypatch)
                    4: ("dropped", "queue_full"), 5: ("dropped", "queue_full")}
 
 
+def test_lines_queued_behind_a_hung_write_are_recorded_as_dropped_at_close(tmp_path,
+                                                                        monkeypatch):
+    # #521: the queue is NOT full, so close() evicts nothing to fit STOP. The worker is
+    # stuck writing #1, the join times out, and #2..#51 were neither written nor recorded.
+    monkeypatch.setattr(_PeerSender, "_CLOSE_JOIN", 0.1)
+    tap = wirelog.open_wire_tap(str(tmp_path / "w"), "h")
+    assert tap is not None
+    gate = threading.Event()
+    sender = _PeerSender(_BlockingTransport(gate), wire=tap, peer="hung")
+    sender.send(_req(1, "ping"))
+    time.sleep(0.2)            # the worker takes #1 and blocks writing it
+    for i in range(2, 52):
+        sender.send(_req(i, "ping"))
+    sender.close()
+    tap.close()
+    gate.set()
+    sender._thread.join(2.0)
+    assert not sender._thread.is_alive()   # STOP went back in: the unstuck worker exits
+    recs = _records(tmp_path / "w")
+    got = {r["jsonrpc_id"]: (r["capture_status"], r["origin"])
+           for r in recs if r["hop"] == "server_out"}
+    assert len([r for r in recs if r["hop"] == "server_out"]) == 51    # once per line
+    assert got[1] == ("full", None)
+    assert all(got[i] == ("dropped", "evicted") for i in range(2, 52))
+
+
 # --- the sink failing -------------------------------------------------------------------
 
 @pytest.mark.parametrize("mode", MODES)
