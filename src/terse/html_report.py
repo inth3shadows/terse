@@ -36,6 +36,7 @@ from .report import (
     attrition_block,
     is_diff_run,
     passes_tolerance,
+    savings_totals,
     unmeasured_cause,
 )
 
@@ -398,7 +399,7 @@ def build_html_report(rows: list[dict[str, Any]], coverage: dict[str, Any],
     shape_items, shape_rows_html = [], []
     for shape in shapes:
         sub = [r for r in rows if r["shape"] == shape]
-        raw, cmp_ = _sum(sub, "cl100k", "raw"), _sum(sub, "cl100k", "compressed")
+        raw, cmp_ = savings_totals(sub)
         saved = raw - cmp_
         pct = (saved / raw * 100) if raw else 0.0
         shape_items.append((shape, pct))
@@ -410,7 +411,7 @@ def build_html_report(rows: list[dict[str, Any]], coverage: dict[str, Any],
     tool_items, tool_rows_html = [], []
     for tool in tools:
         sub = [r for r in rows if (r.get("tool") or "?") == tool]
-        raw, cmp_ = _sum(sub, "cl100k", "raw"), _sum(sub, "cl100k", "compressed")
+        raw, cmp_ = savings_totals(sub)
         saved = raw - cmp_
         pct = (saved / raw * 100) if raw else 0.0
         tool_items.append((tool, pct))

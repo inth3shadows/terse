@@ -192,3 +192,22 @@ def test_an_unpaired_retrieve_moves_neither_the_headline_nor_any_row(tmp_path):
     assert liab["saved_tokens"] == 8_000 - 1_000
     assert sum(c["saved_tokens"] for s in liab["servers"] for c in s["contributors"]) \
         == liab["saved_tokens"]
+
+
+def test_a_removed_servers_rows_do_not_lift_the_fleet_headline(install, tmp_path, capsys):
+    """Audit repro: the headline summed the whole ledger, so a server uninstalled since its
+    100k->10k rows were written lifted `saved_tokens` far above the rows printed beside it."""
+    log = _ledger(tmp_path, retrieves=1)
+    append_stats({"ts": int(time.time()), "server": "gone-server", "tool": "t",
+                  "decision": "compressed", "raw_chars": 400_000, "out_chars": 40_000,
+                  "raw_tokens": 100_000, "out_tokens": 10_000}, log)
+    append_stats({"ts": int(time.time()), "server": "gone-server", "tool": "t",
+                  "event": "retrieve", "path": "$.body", "hit": True, "bytes": 2_000,
+                  "tokens": 500}, log)
+    liab = json.loads(_run(capsys, log, "--json"))["primer_liability"]
+    assert liab["saved_tokens"] == 9_000 - 1_000
+    assert liab["retrieve_tokens"] == 1_000
+    assert sum(c["saved_tokens"] for s in liab["servers"] for c in s["contributors"]) \
+        == liab["saved_tokens"]
+    # The pipe figure is still the whole ledger: it is not a per-entry claim.
+    assert liab["wire_saved_tokens"] == 9_000 + 90_000
