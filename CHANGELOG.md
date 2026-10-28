@@ -13,7 +13,9 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+
+- `--wire-log`: when the exclusion gate has to parse a line going to the client, it now does so before taking the client-stdout lock, so a large line being parsed no longer holds up every other server's output (#535). Records are still taken inside the lock, so the log's order is still stdout's order.
 
 ## [0.45.9] - 2026-10-28
 

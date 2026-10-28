@@ -387,8 +387,9 @@ One JSON object per line (`ensure_ascii`, so any string round-trips):
 | `event`, `detail` | on `hop: event` only: `start` (version, mode, policy path, config, peers, an argv summary with no arguments), `peer_start` (pid), `peer_exit` (pid, exit code), `drain_timeout`, `write_error` (a peer write that raised), `sink_drop` (count of records lost to a full queue), `exclusion_overflow` (the in-flight exclusion table is full; every later line is excluded), `teardown` (servers still running when the log closes, which get no `peer_exit`, and the exception that ended the session; written only when that list is non-empty), `stop` (records) |
 
 A record is taken once per physical line per hop. Reads are taken as the line arrives,
-including the blank lines the pumps skip. Writes are taken immediately before the write,
-inside the client-stdout lock, so `client_out` order is stdout order. A peer line is taken
+including the blank lines the pumps skip. Writes are parsed (when the gate needs it) before the
+client-stdout lock is taken and recorded inside it, immediately before the write, so
+`client_out` order is stdout order and a slow parse holds up no other writer. A peer line is taken
 when its sender thread writes it, or as `dropped` where it is discarded instead.
 
 **Exclusion.** Decided in `tap()`, on the thread that produced the line and under the lock

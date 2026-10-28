@@ -2371,7 +2371,7 @@ SWALLOW: Any = object()
 
 def pump(src: Iterable[str], dst: Any, transform: Callable[[str], Any],
          lock: Lock | None = None, on_read: Callable[[str], None] | None = None,
-         on_write: Callable[[str], None] | None = None) -> None:
+         on_write: Callable[[str], Callable[[], None]] | None = None) -> None:
     """Read lines from src, apply transform, write to dst with a single trailing newline.
     transform returns: a string to write, None to forward the line unchanged, or SWALLOW to
     write nothing (the transform handled it out-of-band). Stops at EOF. With `lock`, each
@@ -2379,8 +2379,10 @@ def pump(src: Iterable[str], dst: Any, transform: Callable[[str], Any],
     pump and the retrieve answerer write to (#10).
 
     `on_read`/`on_write` are the wire log's taps: every raw line read (including the
-    empty ones skipped below) and every line about to be written — the latter inside
-    `lock`, so the log's order is the stream's order. A line the transport synthesized
+    empty ones skipped below) and every line about to be written. `on_write` is
+    `WireTap.stage`: it parses with no lock held and returns the call that records the
+    line, which runs inside `lock`, so the log's order is the stream's order while the
+    parse holds up no other writer (#535). A line the transport synthesized
     (`transport._SynthesizedReply`) keeps that type on the way to `on_write`, so the log
     labels the client's copy too."""
     for raw in src:
@@ -2397,15 +2399,16 @@ def pump(src: Iterable[str], dst: Any, transform: Callable[[str], Any],
         if on_write is not None and hasattr(raw, "wire_origin") \
                 and not hasattr(out, "wire_origin"):
             out = type(raw)(out)
+        record = on_write(out) if on_write is not None else None
         if lock is not None:
             with lock:
-                if on_write is not None:
-                    on_write(out)
+                if record is not None:
+                    record()
                 dst.write(out + "\n")
                 dst.flush()
         else:
-            if on_write is not None:
-                on_write(out)
+            if record is not None:
+                record()
             dst.write(out + "\n")
             dst.flush()
 
@@ -2778,10 +2781,11 @@ def run_proxy(
                 # nothing when nothing was dropped: it returns a legible miss and swallows.
                 reply = inter.answer_retrieve(line)
                 if reply is not None:
+                    record = (wire.stage("client_out", reply, status="local_answer",
+                                         origin="retrieve") if wire is not None else None)
                     with out_lock:
-                        if wire is not None:
-                            wire.tap("client_out", reply, status="local_answer",
-                                     origin="retrieve")
+                        if record is not None:
+                            record()
                         cout.write(reply + "\n")
                         cout.flush()
                     return SWALLOW
@@ -2791,10 +2795,10 @@ def run_proxy(
                 if wire is None:
                     pump(cin, transport.outbound(), fwd)
                 else:
-                    tap = wire.tap
+                    tap, stage = wire.tap, wire.stage
                     pump(cin, transport.outbound(), fwd,
                          on_read=lambda raw: tap("client_in", raw),
-                         on_write=lambda out: tap("server_out", out, peer=peer_label))
+                         on_write=lambda out: stage("server_out", out, peer=peer_label))
             finally:
                 # transport.half_close() is what lets server_to_client's
                 # pump(transport.inbound(), ...) below ever terminate: for HTTP
@@ -2810,10 +2814,10 @@ def run_proxy(
             if wire is None:
                 pump(transport.inbound(), cout, inter.transform_response, lock=out_lock)
             else:
-                tap = wire.tap
+                tap, stage = wire.tap, wire.stage
                 pump(transport.inbound(), cout, inter.transform_response, lock=out_lock,
                      on_read=lambda raw: tap("server_in", raw, peer=peer_label),
-                     on_write=lambda out: tap("client_out", out))
+                     on_write=lambda out: stage("client_out", out))
 
         t_up = Thread(target=client_to_server, daemon=True)
         t_down = Thread(target=server_to_client, daemon=True)

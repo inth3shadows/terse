@@ -1490,17 +1490,21 @@ class Router:
         `status`/`origin` label it in the wire log. A merged or snapshot-served reply holds
         every peer's share, so with any peer excluded as a whole it is excluded outright
         (over-excluding a list is the safe direction) — whatever its id says."""
+        record = None
+        if self.wire is not None:
+            # A second guard, kept on purpose (#526): the id-based exclusion already
+            # covers these replies, since the client request behind them reached an
+            # excluded peer and registered its id. The rule recorded is the first
+            # excluded peer's glob, whichever peer caused it.
+            force = None
+            if origin in ("router_broadcast", "snapshot") and self.wire.excluded_peers:
+                force = next(iter(self.wire.excluded_peers.values()))
+            # Parsed here, before the lock; recorded inside it, in stdout order (#535).
+            record = self.wire.stage("client_out", line, status=status, origin=origin,
+                                     force=force)
         with self.out_lock:
-            if self.wire is not None:
-                # A second guard, kept on purpose (#526): the id-based exclusion already
-                # covers these replies, since the client request behind them reached an
-                # excluded peer and registered its id. The rule recorded is the first
-                # excluded peer's glob, whichever peer caused it.
-                force = None
-                if origin in ("router_broadcast", "snapshot") and self.wire.excluded_peers:
-                    force = next(iter(self.wire.excluded_peers.values()))
-                self.wire.tap("client_out", line, status=status, origin=origin,
-                              force=force)
+            if record is not None:
+                record()
             if self.client_gone:
                 return  # nothing can be delivered any more (#516)
             try:
@@ -2551,12 +2555,12 @@ def _pump_peer(peer: Peer, cout: TextIO, transform: Callable[[str], Any], out_lo
     if wire is None:
         pump(peer.transport.inbound(), cout, transform, lock=out_lock)
         return
-    tap, name = wire.tap, peer.name
+    tap, stage, name = wire.tap, wire.stage, peer.name
     try:
         # client_out inherits the server_in decision this thread just made (wirelog.py).
         pump(peer.transport.inbound(), cout, transform, lock=out_lock,
              on_read=lambda raw: tap("server_in", raw, peer=name),
-             on_write=lambda out: tap("client_out", out))
+             on_write=lambda out: stage("client_out", out))
     finally:
         proc = getattr(peer.transport, "proc", None)
         code = None
