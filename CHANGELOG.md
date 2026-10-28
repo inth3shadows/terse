@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.45.6] - 2026-10-28
+
 ### Fixed
 
 - `measure`, `verify` (markdown, `--json`, `--html`, terminal bars) and `measure --history` no longer count a saving on a payload that failed the lossless gate. Those totals summed each payload's compressed size even when the proxy would send it raw, so one failed 100->60 payload beside a 100->100 one read +20% instead of +0%. The savings header also now names the dictionary tier it includes.
