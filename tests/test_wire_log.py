@@ -925,3 +925,141 @@ def test_http_synthesized_reply_keeps_its_label_at_client_out(tmp_path):
            if r["jsonrpc_id"] == 1 and r["hop"] in ("server_in", "client_out")]
     assert got == [("server_in", "http_synth", "synthesized"),
                    ("client_out", "http_synth", "synthesized")]
+
+
+# --- an excluded call whose reply can't be matched by id fails closed (#524) ---------
+
+def _echo(mid_json: str, args: str = "{}") -> str:
+    return ('{"jsonrpc":"2.0","id":' + mid_json + ',"method":"tools/call","params":'
+            '{"name":"fake.echo","arguments":' + args + '}}')
+
+
+UNMATCHABLE = {
+    # (request line, the id the server answers with)
+    "big_int": (_echo("5", '{"n":' + "7" * 4400 + "}"), 5),
+    "deep_nesting": (_echo("5", "[" * 150_000 + "]" * 150_000), 5),
+    "duplicate_id_first_key_wins": (_echo("5,\"id\":6"), 5),
+    "null_id": (_echo("null"), None),
+    "string_id_coerced": (_echo('"5"'), 5),
+}
+
+
+@pytest.mark.parametrize("case", sorted(UNMATCHABLE))
+def test_an_unmatchable_excluded_call_never_leaks_its_reply(case, tmp_path):
+    token = f"TOK{uuid.uuid4().hex}"
+    tap = _gate_tap(tmp_path, _echo_resolve)
+    line, answered = UNMATCHABLE[case]
+    reply = json.dumps({"jsonrpc": "2.0", "id": answered, "result": {"t": token}})
+    tap.tap("client_in", line)
+    tap.tap("server_out", line, peer="gh")
+    tap.tap("server_in", reply, peer="gh")
+    tap.tap("client_out", reply)
+    tap.close()
+    raw = _wire_bytes(tmp_path / "w")
+    assert raw and token.encode() not in raw
+    recs = [r for r in _records(tmp_path / "w") if r["hop"] != "event"]
+    assert [r["capture_status"] for r in recs] == ["excluded_by_policy"] * 4
+
+
+def test_an_int_past_the_digit_limit_is_undecidable_not_a_parse_error(tmp_path):
+    # #524: the int-limit ValueError was read as "not JSON", so an excluded request
+    # carrying one was logged in full as a parse_error.
+    assert wirelog._parse(_echo("5", '{"n":' + "7" * 4400 + "}"), strict=True)[0] == \
+        "undecidable"
+    assert wirelog._parse("{not json", strict=True)[0] == "bad"
+
+
+def test_fail_closed_ends_when_the_peer_exits(tmp_path):
+    tap = _gate_tap(tmp_path, _echo_resolve)
+    line = _echo("null")
+    tap.tap("client_in", line)
+    tap.tap("server_out", line, peer="gh")
+    later = json.dumps({"jsonrpc": "2.0", "method": "notifications/message",
+                        "params": {"data": "fine"}})
+    tap.tap("server_in", later, peer="gh")
+    tap.event("peer_exit", peer="gh")
+    tap.tap("server_in", later, peer="gh")
+    tap.close()
+    recs = [r for r in _records(tmp_path / "w") if r["hop"] == "server_in"]
+    assert [r["rule"] for r in recs] == [wirelog.RULE_UNMATCHED, None]
+    assert recs[1]["line"] == later
+
+
+def test_without_any_capture_false_rule_an_unparseable_call_is_logged_in_full(tmp_path):
+    # A2: with nothing excludable, a 4400-digit int in an ordinary call must not hide
+    # the server's later lines from a fleet that excludes nothing.
+    tap = _gate_tap(tmp_path, lambda msg: None, may_exclude=False)
+    line, _ = UNMATCHABLE["big_int"]
+    reply = json.dumps({"jsonrpc": "2.0", "id": 5, "result": {"t": "fine"}})
+    tap.tap("client_in", line)
+    tap.tap("server_out", line, peer="gh")
+    tap.tap("server_in", reply, peer="gh")
+    tap.close()
+    recs = [r for r in _records(tmp_path / "w") if r["hop"] != "event"]
+    assert [r["line"] for r in recs] == [line, line, reply]
+
+
+def test_may_exclude_reads_every_policy():
+    assert not wirelog.may_exclude([FULL])
+    assert wirelog.may_exclude([FULL, Policy(rules=ASK_RULES)])
+
+
+# --- parsing stops once nothing excluded is in flight (#525) ---------------------------
+
+def test_an_answered_excluded_call_does_not_keep_parsing_every_line(tmp_path, monkeypatch):
+    token = f"TOK{uuid.uuid4().hex}"
+    tap = _gate_tap(tmp_path, _echo_resolve)
+    call = _echo("3")
+    reply = json.dumps({"jsonrpc": "2.0", "id": 3, "result": {}})
+    tap.tap("client_in", call)
+    tap.tap("server_out", call, peer="gh")
+    tap.tap("server_in", reply, peer="gh")
+    tap.tap("client_out", reply)
+    parsed: list[str] = []
+    real = wirelog._parse
+    monkeypatch.setattr(wirelog, "_parse",
+                        lambda line, strict: parsed.append(line[:20]) or real(line, strict))
+    big = json.dumps({"jsonrpc": "2.0", "id": 9, "result": {"x": "y" * 1_000_000,
+                                                            "id": 4}})
+    tap.tap("server_in", big, peer="gh")
+    tap.tap("client_out", big)
+    assert parsed == []                       # nothing on either side names id 3
+    late = json.dumps({"jsonrpc": "2.0", "id": 3, "result": {"t": token}})
+    tap.tap("server_in", late, peer="gh")     # a late duplicate: still excluded
+    tap.tap("client_out", late)
+    assert len(parsed) == 2
+    tap.close()
+    assert token.encode() not in _wire_bytes(tmp_path / "w")
+
+
+def test_resolve_runs_outside_the_tap_lock(tmp_path):
+    held: list[bool] = []
+    tap = _gate_tap(tmp_path, None)
+    tap.resolve = lambda msg: held.append(tap._lock.locked()) or _echo_resolve(msg)
+    tap.tap("client_in", json.dumps([json.loads(_echo("1")), json.loads(_echo("2"))]))
+    tap.close()
+    assert held == [False, False]
+
+
+@pytest.mark.parametrize(("line", "parse"), [
+    ('{"id":3,"result":{}}', True),
+    ('{"id":"3","result":{}}', True),         # coerced spelling
+    ('{"id": 3.0,"result":{}}', True),        # odd spelling: decoded, then matched
+    ('{"id":3e0,"result":{}}', True),
+    ('{"method":"notifications/progress","params":{"progressToken":3}}', True),
+    ('{"id":4,"result":{"id":5}}', False),
+    (json.dumps({"id": 4, "result": [{"id": i} for i in range(100, 400)]}), True),  # dense
+])
+def test_the_pre_scan_parses_exactly_the_lines_that_may_name_an_answered_key(line, parse):
+    scope = wirelog._Scope(None, {})
+    scope._register(("p:gh", "c", "3"), "r", [])
+    scope._complete(("p:gh", "c", "3"))
+    assert scope.needs_parse("server_in", "gh", None, line) is parse
+
+
+def test_the_pre_scan_sees_keys_answered_after_its_last_scan():
+    scope = wirelog._Scope(None, {})
+    for mid in ("3", "7"):
+        scope._register(("p:gh", "c", mid), "r", [])
+        scope._complete(("p:gh", "c", mid))
+        assert scope.needs_parse("server_in", "gh", None, f'{{"id":{mid},"result":{{}}}}')

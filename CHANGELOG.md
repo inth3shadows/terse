@@ -13,7 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- `--wire-log` no longer records the reply to a `capture: false` call in full when the reply cannot be matched to the request by id (#524). That happened with a null id, duplicate `"id"` keys, an integer past Python's digit limit or nesting too deep to parse; such a request itself was logged in full as a `parse_error` in the digit-limit case. The server's later lines are now excluded until it exits (`<unmatched-excluded-call>`). A string id that is an integer (`"5"`) now also matches a reply that answers it as `5`. With no `capture: false` rule anywhere, these lines are logged like any other.
+- `--wire-log` stops parsing every line once an excluded call has been answered (#525). It now parses only lines whose raw text names an answered excluded id, so a 5 MB text result costs a 2 ms scan instead of a 10–37 ms parse. Dense lists with more than 256 ids are still parsed. The policy lookup for a client request now runs outside the log's lock.
 
 ## [0.45.3] - 2026-10-27
 

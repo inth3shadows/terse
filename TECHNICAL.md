@@ -380,7 +380,7 @@ One JSON object per line (`ensure_ascii`, so any string round-trips):
 | `line` | the exact line, newline excluded; `null` when excluded |
 | `capture_status` | `full`, `excluded_by_policy`, `parse_error` (blank, whitespace-only or not JSON), `dropped` (a peer line discarded instead of written), `synthesized` (terse wrote it, not a server), `local_answer` (a `terse.retrieve` reply) |
 | `origin` | for terse-made or discarded lines: `retrieve`, `snapshot`, `router_broadcast` (a fan-out copy or the merged reply), `router_internal` (the router's own background broadcasts), `timeout` (-32001), `router` (-32601 unknown tool/prompt), `error_writer` (-32600/-32602/-32603), `reconcile` (list_changed), `http_synth` (HTTP transport's -32000), `queue_full` / `evicted` (peer send queue) |
-| `rule` | the policy rule glob behind an exclusion or a tools/call decision; for an exclusion no rule names, `<undecidable>` (a line the gate could not classify), `<gate-error>` (the gate raised) or `<exclusion-overflow>` |
+| `rule` | the policy rule glob behind an exclusion or a tools/call decision; for an exclusion no rule names, `<undecidable>` (a line the gate could not classify), `<unmatched-excluded-call>` (a peer's line after an excluded call its reply cannot be matched to), `<gate-error>` (the gate raised) or `<exclusion-overflow>` |
 | `event`, `detail` | on `hop: event` only: `start` (version, mode, policy path, config, peers, an argv summary with no arguments), `peer_start` (pid), `peer_exit` (pid, exit code), `drain_timeout`, `write_error` (a peer write that raised), `sink_drop` (count of records lost to a full queue), `exclusion_overflow` (the in-flight exclusion table is full; every later line is excluded), `teardown` (servers still running when the log closes, which get no `peer_exit`, and the exception that ended the session; written only when that list is non-empty), `stop` (records) |
 
 A record is taken once per physical line per hop. Reads are taken as the line arrives,
@@ -403,8 +403,14 @@ something on their side (the client, or that peer) is excluded.
   client notification, and a method forwarded to peer 0.
 - A JSON-RPC batch array is decided per element. One excluded element, or one the gate
   cannot classify, excludes the whole line. A client line with duplicate keys (parsers
-  disagree on which one wins) or nested too deep to parse is unclassifiable, and excluded
-  with `rule: "<undecidable>"`.
+  disagree on which one wins), nested too deep to parse, or holding an integer past
+  Python's digit limit is unclassifiable, and excluded with `rule: "<undecidable>"`. When
+  no rule anywhere has `capture: false`, nothing can be excluded and such a line is logged
+  like any other.
+- An excluded request sent to a server with an id its reply cannot be matched by (a null
+  id, or a line that cannot be fully parsed, duplicate keys included) fails closed: every
+  later line from that server is excluded (`<unmatched-excluded-call>`) until it exits.
+  A string id that is an integer (`"5"`) matches a reply that answers it as `5`.
 - An excluded request's id is excluded on every hop it travels, including the router's
   rewritten forms (`terse-b*` broadcast copies, `terse-s*` server requests), and so is any
   `notifications/progress` carrying its `params._meta.progressToken` and any
@@ -417,7 +423,10 @@ something on their side (the client, or that peer) is excluded.
   In single-proxy mode that is the whole connection.
 - A merged or snapshot-served reply is excluded whenever any peer is excluded as a whole.
 - Ids awaiting a reply are never evicted; answered ones are remembered (the last 4096), so
-  a late duplicate or a reused id stays excluded. Past 65536 ids in flight the connection
+  a late duplicate or a reused id stays excluded. Once nothing excluded is in flight on a
+  side, a line there is parsed only when a scan of its raw text finds one of those answered
+  ids (or more than 256 id-like values, where the scan would cost as much as the parse); a
+  late duplicate that writes the `"id"` key itself with escapes is not caught. Past 65536 ids in flight the connection
   fails closed: an `exclusion_overflow` event, then every line is excluded
   (`<exclusion-overflow>`). If the gate itself raises, that line is excluded
   (`<gate-error>`) and stderr warns once.

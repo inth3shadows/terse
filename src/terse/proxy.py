@@ -2557,9 +2557,10 @@ def _single_wire_tap(wire_log: str | None, conn: str, pol: policy_mod.Policy,
     if wire_log is None:
         return None
     from . import __version__
-    from .wirelog import open_wire_tap, retrieve_handle, server_excluded
+    from .wirelog import may_exclude, open_wire_tap, retrieve_handle, server_excluded
 
-    wire = open_wire_tap(wire_log, conn, exclude_all=server_excluded(pol, server_name))
+    wire = open_wire_tap(wire_log, conn, exclude_all=server_excluded(pol, server_name),
+                         may_exclude=may_exclude([pol]))
     if wire is None:
         return None
 
