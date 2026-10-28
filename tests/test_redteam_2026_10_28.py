@@ -476,3 +476,31 @@ def test_a_broadcast_reply_must_come_from_the_peer_it_was_issued_to():
         assert 0 not in getattr(router._pending.get(0), "parts", {})
     finally:
         router.close_senders()
+
+
+# --- G5: file hygiene ---------------------------------------------------------------
+
+def test_capture_prune_never_evicts_another_tools_samples(tmp_path):
+    from terse.capture import _prune_tool_samples
+
+    for name in ("kb__00000001.json", "kb__00000002.json", "kb__zzz__00000003.json"):
+        (tmp_path / name).write_text("{}")
+    _prune_tool_samples(tmp_path, "kb", keep=1)
+    left = sorted(p.name for p in tmp_path.iterdir())
+    assert "kb__zzz__00000003.json" in left
+    assert sum(n.startswith("kb__0000000") for n in left) == 1
+
+
+def test_backup_prune_spares_user_backups_and_survives_dangling_links(tmp_path):
+    from terse.install_mcp import _prune_backups
+
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text("{}")
+    for i in range(4):
+        (tmp_path / f".claude.json.bak-{1000 + i}").write_text("{}")
+    (tmp_path / ".claude.json.bak-before-upgrade").write_text("{}")
+    (tmp_path / ".claude.json.bak-1").symlink_to(tmp_path / "gone")
+    _prune_backups(cfg, keep=2)
+    left = sorted(p.name for p in tmp_path.iterdir())
+    assert ".claude.json.bak-before-upgrade" in left
+    assert sum(n.startswith(".claude.json.bak-10") for n in left) <= 2

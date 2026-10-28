@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import glob
 import re
 import sys
 import time
@@ -218,9 +219,13 @@ MAX_SAMPLES_PER_TOOL = 200
 def _prune_tool_samples(corpus: Path, safe_tool: str, keep: int) -> None:
     """Drop the oldest envelopes for one tool past `keep`. Best-effort by design: a
     prune failure must never fail the capture that triggered it."""
+    # Exact `{safe_tool}__{sha8}.json`, not the glob `{safe_tool}__*.json`: that also matched
+    # every tool whose name merely STARTS with `{safe_tool}__` (standalone `gh` vs a peer's
+    # `gh__x`, or a downstream naming a tool `kb__zzz`), letting one tool evict another's.
+    own = re.compile(re.escape(safe_tool) + r"__[0-9a-f]{8}\.json")
     try:
-        existing = sorted(corpus.glob(f"{safe_tool}__*.json"),
-                          key=lambda p: p.stat().st_mtime)
+        existing = sorted((p for p in corpus.glob(f"{glob.escape(safe_tool)}__*.json")
+                           if own.fullmatch(p.name)), key=lambda p: p.lstat().st_mtime)
     except OSError:
         return
     for stale in existing[:max(0, len(existing) - keep)]:

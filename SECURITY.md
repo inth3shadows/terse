@@ -11,6 +11,13 @@ other credentials inherited from wrapped servers' `env` blocks; these are writte
 `0600` and excluded from lossy transforms, but that does not stop a `git add -A` in
 project scope — see USAGE.md's guidance on `.gitignore`.
 
+**HTTP downstreams and environment proxies:** an HTTP downstream honors `HTTP_PROXY` /
+`HTTPS_PROXY` / `NO_PROXY` like any urllib client. terse's URL guards (scheme allow-list,
+metadata-address refusal, cleartext-credential refusal) judge the downstream URL, not the
+proxy: with an `http://` loopback downstream and a configured `HTTP_PROXY`, the request —
+credential headers included — travels through that proxy. Set `NO_PROXY=localhost,127.0.0.1`
+(or unset the proxy) for local gateways that carry a key.
+
 **Out of scope:** vulnerabilities in wrapped downstream MCP servers themselves (report
 to their maintainers), and threats requiring local filesystem access an attacker
 already has (terse does not attempt to defend against a compromised host).

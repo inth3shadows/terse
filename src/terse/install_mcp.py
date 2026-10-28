@@ -43,6 +43,7 @@ import functools
 import hashlib
 import json
 import os
+import glob
 import re
 import shutil
 import subprocess
@@ -1208,7 +1209,19 @@ def _prune_backups(cfg: Path, keep: int = _MAX_BACKUPS) -> None:
     never fatal to the install/uninstall that triggered the backup."""
     if keep <= 0:
         return
-    backups = sorted(cfg.parent.glob(f"{cfg.name}.bak-*"), key=lambda p: p.stat().st_mtime)
+    # Only terse's own `<cfg>.bak-<epoch>` names: the bare `.bak-*` glob also swept up a
+    # user's `.claude.json.bak-before-upgrade`. `lstat` inside the try: a dangling
+    # `.bak-1` symlink made `stat()` raise out of `sorted` and abort the install.
+    own = re.compile(re.escape(cfg.name) + r"\.bak-[0-9]+")
+    dated: list[tuple[float, Path]] = []
+    for p in cfg.parent.glob(f"{glob.escape(cfg.name)}.bak-*"):
+        if not own.fullmatch(p.name):
+            continue
+        try:
+            dated.append((p.lstat().st_mtime, p))
+        except OSError:
+            continue
+    backups = [p for _, p in sorted(dated, key=lambda t: t[0])]
     for old in backups[:-keep]:
         try:
             old.unlink()
