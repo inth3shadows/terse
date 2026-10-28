@@ -647,6 +647,8 @@ class _PeerSender:
     list was ever contacted."""
 
     _STOP: Any = object()
+    # How long `close` waits for the worker to drain before giving up on it.
+    _CLOSE_JOIN = 2.0
 
     def __init__(self, transport: Transport, debug: bool = False,
                  wire: WireTap | None = None, peer: str | None = None):
@@ -718,10 +720,30 @@ class _PeerSender:
                     evicted = self._q.get_nowait()
                 except queue.Empty:
                     continue
-                if self._wire is not None and evicted is not self._STOP:
-                    self._wire.tap("server_out", evicted[0], peer=self._peer,
-                                   status="dropped", origin="evicted", inherit=evicted[2])
-        self._thread.join(timeout=2.0)
+                self._record_evicted(evicted)
+        self._thread.join(timeout=self._CLOSE_JOIN)
+        if not self._thread.is_alive():
+            return
+        # The worker is stuck in a write (a hung HTTP POST, say), so whatever is still
+        # queued behind it will never be written. Record each as dropped, keeping the
+        # wire log's "written, or recorded as dropped" promise (#521). Each item leaves
+        # the queue once, so a worker that unsticks meanwhile writes (and records) only
+        # what it takes itself. STOP goes back in, so such a worker still exits.
+        while True:
+            try:
+                evicted = self._q.get_nowait()
+            except queue.Empty:
+                break
+            self._record_evicted(evicted)
+        try:
+            self._q.put_nowait(self._STOP)
+        except queue.Full:
+            pass
+
+    def _record_evicted(self, item: Any) -> None:
+        if self._wire is not None and item is not self._STOP:
+            self._wire.tap("server_out", item[0], peer=self._peer,
+                           status="dropped", origin="evicted", inherit=item[2])
 
 
 class _ClientOut:
