@@ -841,7 +841,7 @@ class Interceptor:
         else return unchanged."""
         try:
             msg = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
+        except (ValueError, RecursionError):  # deep nesting is a RuntimeError, not a ValueError
             return line
         if not isinstance(msg, dict) or msg.get("id") is None:
             return line
@@ -2389,7 +2389,15 @@ def pump(src: Iterable[str], dst: Any, transform: Callable[[str], Any],
         line = raw.rstrip("\n")
         if not line:
             continue
-        out = transform(line)
+        try:
+            out = transform(line)
+        except Exception as exc:  # noqa: BLE001 — fail-open: an escaped exception ends this thread
+            # Anything a transform misses (hostile downstream output it never anticipated)
+            # used to propagate out of this loop and silently end the pump thread, after
+            # which every later line was dropped and the client hung. Forward the line as-is.
+            print(f"terse: transform failed ({type(exc).__name__}); forwarding the line "
+                  "unchanged", file=sys.stderr)
+            out = line
         if out is SWALLOW:
             continue
         if out is None:

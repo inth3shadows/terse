@@ -135,7 +135,7 @@ def classify_shape(raw: str) -> str:
     """
     try:
         obj = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError):  # ValueError: JSONDecodeError or the int-digit limit
         return LONG_TEXT if len(raw) >= _LONG_TEXT_CHARS else OTHER
     except RecursionError:
         # On the 3.11 floor, json.loads itself recurses and overflows on a deeply nested

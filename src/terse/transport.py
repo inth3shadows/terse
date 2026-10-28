@@ -21,6 +21,8 @@ import os
 import queue
 import socket
 import subprocess
+import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
@@ -32,6 +34,20 @@ from urllib.parse import urlsplit
 # otherwise stream an unbounded body and exhaust memory. Generous — real tool outputs are
 # large — but finite; an over-limit response becomes a legible JSON-RPC error, not an OOM.
 _MAX_RESPONSE_BYTES = 128 * 1024 * 1024
+
+# The same bound for ONE stdio line, in characters. A stdio downstream that writes gigabytes
+# without a newline would otherwise be buffered whole by `readline` until the proxy OOMs.
+_MAX_LINE_CHARS = _MAX_RESPONSE_BYTES
+
+# Wall-clock ceiling on reading one HTTP response body. `timeout` is per socket operation,
+# so a server dripping one byte every 59s holds the (synchronous) client->server pump
+# forever without ever tripping it. Generous: a long tool call that streams progress over
+# SSE is legitimate, but no real reply takes a quarter of an hour to finish arriving.
+_RESPONSE_DEADLINE_S = 15 * 60
+
+# How much of a non-JSON-RPC error body is quoted back in the synthesized error message
+# (a JSON-RPC-shaped body is forwarded verbatim, whole, as before).
+_MAX_ERROR_DETAIL_CHARS = 1 << 20
 
 # The only downstream URL schemes terse will dial. `urllib.request.urlopen` also
 # honors `file://`, `ftp://`, `data:` and more — so an unrestricted scheme turns a
@@ -262,12 +278,17 @@ class StdioTransport:
         child_env = {**os.environ, **env} if env else None
         self.proc = subprocess.Popen(  # noqa: S603 — cmd is operator-supplied, by design
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
-            encoding="utf-8", env=child_env, cwd=cwd,
+            # errors="replace": a strict decode raised UnicodeDecodeError from INSIDE
+            # pump's `for raw in src`, ending the server->client thread on the first
+            # non-UTF-8 byte (a tool returning a Latin-1 file) and hanging the client.
+            # Not surrogateescape: the escaped surrogates would then fail the strict
+            # UTF-8 encode on the client-facing stdout instead.
+            encoding="utf-8", errors="replace", env=child_env, cwd=cwd,
         )
         assert self.proc.stdin is not None and self.proc.stdout is not None
 
-    def inbound(self) -> TextIO:
-        return self.proc.stdout  # type: ignore[return-value]  # already line-iterable
+    def inbound(self) -> Iterator[str]:
+        return _bounded_lines(self.proc.stdout, _MAX_LINE_CHARS)  # type: ignore[arg-type]
 
     def outbound(self) -> TextIO:
         return self.proc.stdin  # type: ignore[return-value]  # has .write()/.flush()
@@ -293,6 +314,43 @@ class StdioTransport:
 
     def wait(self) -> int:
         return self.proc.wait()
+
+
+def _bounded_lines(src: TextIO, cap: int) -> Iterator[str]:
+    """Iterate `src` line by line, never holding more than `cap + 1` characters of one
+    line. An over-cap line is discarded whole (drained to its newline) with a stderr note:
+    it cannot be forwarded intact, and a truncated JSON-RPC line is worse than none."""
+    while True:
+        line = src.readline(cap + 1)
+        if not line:
+            return
+        if len(line) > cap and not line.endswith("\n"):
+            while True:
+                rest = src.readline(cap + 1)
+                if not rest or rest.endswith("\n"):
+                    break
+            print(f"terse: dropped a downstream line longer than {cap} characters",
+                  file=sys.stderr)
+            continue
+        yield line
+
+
+def _read_bounded(resp: Any, limit: int, deadline: float) -> bytes:
+    """Read at most `limit + 1` bytes of `resp`, giving up at `deadline` (monotonic).
+    `read1` returns after at most one underlying recv, so the deadline is checked between
+    every chunk rather than only once the whole (possibly dripped) body has arrived."""
+    reader = getattr(resp, "read1", None) or resp.read
+    chunks: list[bytes] = []
+    total = 0
+    while total <= limit:
+        if time.monotonic() > deadline:
+            raise TimeoutError("downstream response did not finish within the deadline")
+        chunk = reader(min(1 << 16, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
 
 
 # Sentinel that ends `HttpTransport.inbound()`'s queue-backed iterator. A plain
@@ -475,6 +533,7 @@ class HttpTransport:
             req_headers["Mcp-Session-Id"] = self.session
         req = urllib.request.Request(self.url, data=line.encode("utf-8"),
                                      headers=req_headers, method="POST")
+        deadline = time.monotonic() + _RESPONSE_DEADLINE_S
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:  # noqa: S310
                 # Only the CONFIGURED downstream may set our session id. After a redirect
@@ -492,7 +551,7 @@ class HttpTransport:
                 # Bounded read: one byte past the cap tells us it overflowed without
                 # trusting a (possibly absent/lying) Content-Length. An over-limit body
                 # is refused with a legible error rather than being buffered to OOM.
-                body = resp.read(_MAX_RESPONSE_BYTES + 1)
+                body = _read_bounded(resp, _MAX_RESPONSE_BYTES, deadline)
                 if len(body) > _MAX_RESPONSE_BYTES:
                     self._maybe_enqueue_error(
                         line, f"terse: downstream response exceeded "
@@ -505,13 +564,16 @@ class HttpTransport:
             # like one, instead of discarding the real detail behind a generic
             # wrapper message the client can't act on.
             try:
-                raw_body = exc.read().decode("utf-8", errors="replace")
+                # Bounded like the success path: an uncapped 4xx/5xx body was the one
+                # read a hostile server could still use to exhaust memory.
+                raw_body = _read_bounded(exc, _MAX_RESPONSE_BYTES, deadline).decode(
+                    "utf-8", errors="replace")
             except Exception:  # noqa: BLE001 — reading the error body is best-effort
                 raw_body = ""
             if raw_body.strip():
                 try:
                     parsed = json.loads(raw_body)
-                except (json.JSONDecodeError, ValueError):
+                except (ValueError, RecursionError):  # JSONDecodeError is a ValueError
                     parsed = None
                 if isinstance(parsed, dict) and "jsonrpc" in parsed:
                     # Forward it verbatim ONLY if the outgoing line actually expected a
@@ -522,7 +584,7 @@ class HttpTransport:
                     if has_id:
                         self._q.put(raw_body)
                     return
-            detail = raw_body.strip() or str(exc)
+            detail = raw_body.strip()[:_MAX_ERROR_DETAIL_CHARS] or str(exc)
             self._maybe_enqueue_error(
                 line, f"terse: downstream HTTP {exc.code} {exc.reason}: {detail}")
             return
