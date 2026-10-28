@@ -116,6 +116,23 @@ def exceeds_depth(obj: Any, cap: int = MAX_DEPTH) -> bool:
     return False
 
 
+def has_non_finite(obj: Any) -> bool:
+    """True if obj holds a float JSON cannot write: NaN, or an infinity (`1e400` parses to
+    one). `json.dumps` would emit the bare tokens `NaN`/`Infinity`, which are not JSON.
+    Iterative, like `exceeds_depth`."""
+    stack: list[Any] = [obj]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, float):
+            if not math.isfinite(node):
+                return True
+        elif isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return False
+
+
 def has_terse_marker(obj: Any) -> bool:
     """True if obj contains, at ANY depth, a dict key reserved for a terse envelope or a
     string equal to a reserved sentinel VALUE.
@@ -797,7 +814,7 @@ def _encode_rows(prev: Any, curr: Any) -> dict | None:
     survivors = [i for i in prev_order if i in curr_by]
     if survivors + new_ids != curr_order:
         return None  # reordered/interleaved — not representable as prev+delta
-    changed = [curr_by[i] for i in survivors if curr_by[i] != prev_by[i]]
+    changed = [curr_by[i] for i in survivors if not values_equal(curr_by[i], prev_by[i])]
     new_recs = [curr_by[i] for i in new_ids]
     set_recs = changed + new_recs
     return {DIFF_MARKER: 1, "shape": "rows", "at": at_c, "by": by,
@@ -824,7 +841,7 @@ def _encode_keys(prev: Any, curr: Any) -> dict | None:
     record list moved/reordered, where the row diff bows out)."""
     if not (isinstance(prev, dict) and isinstance(curr, dict)):
         return None
-    set_k = {k: v for k, v in curr.items() if k not in prev or prev[k] != v}
+    set_k = {k: v for k, v in curr.items() if k not in prev or not values_equal(prev[k], v)}
     del_k = [k for k in prev if k not in curr]
     return {DIFF_MARKER: 1, "shape": "keys", "set": set_k, "del": del_k}
 
@@ -859,7 +876,7 @@ def diff_encode(prev: Any, curr: Any) -> dict | None:
         if diff is None:
             continue
         try:
-            if diff_decode(prev, diff) == curr:
+            if values_equal(diff_decode(prev, diff), curr):
                 return diff
         except (KeyError, TypeError, ValueError):
             pass
@@ -964,9 +981,18 @@ def decompress(text: str) -> Any:
     return decompress_structure(parsed)
 
 
+def _json_kind(v: Any) -> Any:
+    """The JSON value kind of `v`, by isinstance so an `OrderedDict` is still an object.
+    bool is checked before int (it subclasses int); anything else is its own type."""
+    for t in (bool, int, float, str, dict, list):
+        if isinstance(v, t):
+            return t
+    return type(v)
+
+
 def values_equal(a: Any, b: Any) -> bool:
-    """Value equality for the lossless gate — identical to `==` except that two NaNs in
-    the same position compare EQUAL.
+    """Value equality for the lossless gates — `==` with two differences: two NaNs in the
+    same position compare EQUAL, and `True`, `1` and `1.0` are three different values.
 
     Plain `==` answers the gate's question wrongly for NaN. IEEE-754 says `nan != nan`, so
     a payload the codec handled perfectly is reported as a losslessness failure: Python's
@@ -982,9 +1008,15 @@ def values_equal(a: Any, b: Any) -> bool:
     Only NaN needs this. `Infinity` compares equal to itself; `-0.0 == 0.0` is True and
     `-0.0` serialises back as `-0.0`, so both already pass unaided.
 
+    Type-strict because `==` is not: `True == 1 == 1.0` in Python, so a diff from
+    `{"a": 1}` to `{"a": true}` found nothing to send and the model rebuilt `1`. JSON
+    keeps the three apart and so must anything that certifies a rebuild of it.
+
     Deliberately NOT a canonical-bytes comparison: that would also make key REORDERING
     visible, which `==` has always ignored and which the codec is free to do.
     """
+    if _json_kind(a) is not _json_kind(b):
+        return False
     if isinstance(a, float) and isinstance(b, float):
         # `or` not `and`: two NaNs are equal here, and a NaN against any other float is
         # not — which `==` already gets right.
@@ -996,8 +1028,6 @@ def values_equal(a: Any, b: Any) -> bool:
         # `strict=True` is redundant behind the length check but keeps a future edit that
         # drops that check from silently comparing only the shorter prefix.
         return len(a) == len(b) and all(values_equal(x, y) for x, y in zip(a, b, strict=True))
-    # Everything else defers to `==` unchanged — including bool/int cross-equality, which
-    # this must not tighten: the gate's contract is "same as ==, plus NaN".
     return bool(a == b)
 
 

@@ -13,7 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- The lossless checks no longer treat `true`, `1` and `1.0` as the same value. Python's `==` does, so a diff from `{"a": 1}` to `{"a": true}` found nothing to send and the model rebuilt `1`; the same held for `1` to `1.0` in a record. `values_equal`, used by every lossless gate including the diff gate, is now type-strict, and the diff encoders detect changes with it.
+- A JSON payload holding a number past float range (`1e400`) is passed through raw instead of compressed to the invalid token `Infinity`; such a multi-block result is not joined.
 
 ## [0.45.4] - 2026-10-27
 

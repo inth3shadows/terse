@@ -12,7 +12,9 @@ import json
 
 import pytest
 
+from terse import policy as policy_mod
 from terse import transforms
+from terse.policy import Policy, Rule
 
 CASES = [
     pytest.param({}, id="empty-dict"),
@@ -401,11 +403,19 @@ def test_values_equal_still_rejects_every_real_difference():
     assert not ve("1", 1)
 
 
-def test_values_equal_does_not_tighten_what_equality_already_allowed():
+def test_values_equal_tells_bool_int_and_float_apart():
+    # Was `test_values_equal_does_not_tighten_what_equality_already_allowed` (#187), which
+    # pinned `True == 1 == 1.0`. JSON keeps the three apart, so a gate that does not lets a
+    # diff from 1 to true send nothing and the model rebuild 1.
+    from collections import OrderedDict
     ve = transforms.values_equal
-    assert ve({"a": 1, "b": 2}, {"b": 2, "a": 1})  # dicts compare order-insensitively
-    assert ve({"a": True}, {"a": 1})               # bool/int cross-equality, as `==` has it
-    assert ve({"a": 1}, {"a": 1.0})                # int/float, likewise
+    assert ve({"a": 1, "b": 2}, {"b": 2, "a": 1})  # dicts still compare order-insensitively
+    assert ve(OrderedDict(a=1), {"a": 1})          # a dict subclass is still an object
+    assert ve(-0.0, 0.0)
+    assert not ve({"a": True}, {"a": 1})
+    assert not ve({"a": 1}, {"a": 1.0})
+    assert not ve([False], [0])
+    assert not ve(1, "1")
 
 
 def test_the_gate_no_longer_leans_on_jsons_shared_NaN_object():
@@ -450,3 +460,57 @@ def test_text_spelling_a_tokenizer_special_token_is_counted_and_compressed():
     out = transforms.compress(rows)
     assert transforms.decompress(out) == rows
     assert len(out) < len(transforms.minify(rows)) // 2
+
+
+@pytest.mark.parametrize(("prev", "curr"), [
+    ({"a": 1, "b": "x" * 50}, {"a": True, "b": "x" * 50}),
+    ({"a": 1, "b": "x" * 50}, {"a": 1.0, "b": "x" * 50}),
+    ({"items": [{"id": 1, "v": 1}, {"id": 2, "v": 2}]},
+     {"items": [{"id": 1, "v": 1.0}, {"id": 2, "v": 2}]}),
+    ({"items": [{"id": 1, "v": False}, {"id": 2, "v": 2}]},
+     {"items": [{"id": 1, "v": 0}, {"id": 2, "v": 2}]}),
+])
+def test_a_diff_carries_a_type_change(prev, curr):
+    diff = transforms.diff_encode(prev, curr)
+    assert diff is not None
+    got = transforms.diff_decode(prev, json.loads(json.dumps(diff)))
+    assert transforms.values_equal(got, curr)
+    assert json.dumps(got, sort_keys=True) == json.dumps(curr, sort_keys=True)
+
+
+@pytest.mark.parametrize("raw", ['{"x":1e400,"y":[1,2]}', '{"x":-1e999}', '{"x":NaN}',
+                                 '[{"a":1},{"a":1e400}]'])
+def test_a_number_json_cannot_write_passes_through_raw(raw):
+    pol = Policy(rules=[Rule("*", ("minify", "tabularize", "dictionary"))])
+    out = policy_mod.apply(raw, "t", pol)
+    assert out.text == raw and out.skipped
+
+
+def test_a_string_saying_nan_still_compresses():
+    pol = Policy(rules=[Rule("*", ("minify", "tabularize", "dictionary"))])
+    out = policy_mod.apply('{"x": "NaN", "y": "Infinity"}', "t", pol)
+    assert not out.skipped and out.text == '{"x":"NaN","y":"Infinity"}'
+
+
+def test_joined_blocks_with_an_unwritable_number_refuse_the_join():
+    pol = Policy(rules=[Rule("*", ("minify", "tabularize"))])
+    applied, objs, reason = policy_mod.apply_joined(['{"a":1}', '{"a":1e400}'], "t", pol)
+    assert applied is None and reason == policy_mod.JOIN_REFUSED_NON_FINITE
+
+
+def test_a_type_change_in_one_record_stays_a_row_diff():
+    # The row encoder itself must see the change; otherwise its diff fails the gate and
+    # the result silently falls back to the coarser key diff (the whole list re-sent).
+    prev = {"items": [{"id": 1, "v": 1}, {"id": 2, "v": 2}]}
+    curr = {"items": [{"id": 1, "v": True}, {"id": 2, "v": 2}]}
+    diff = transforms.diff_encode(prev, curr)
+    assert diff is not None and diff["shape"] == "rows" and diff["set"] == [{"id": 1, "v": True}]
+
+
+def test_the_diff_gate_rejects_a_rebuild_that_changes_a_type(monkeypatch):
+    # The gate is the last line: an encoder that misses a type change must not get its
+    # diff emitted.
+    monkeypatch.setattr(transforms, "_encode_rows", lambda prev, curr: None)
+    monkeypatch.setattr(transforms, "_encode_keys", lambda prev, curr: {
+        transforms.DIFF_MARKER: 1, "shape": "keys", "set": {}, "del": []})
+    assert transforms.diff_encode({"a": 1}, {"a": True}) is None

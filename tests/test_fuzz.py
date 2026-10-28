@@ -102,7 +102,7 @@ def test_fuzz_row_diff_reconstructs_after_serialization(records, data):
     if diff is None:
         return  # no diff applies -> proxy sends the full form; nothing to reconstruct
     wire = json.loads(json.dumps(diff))          # what the wire actually does
-    assert transforms.diff_decode(prev, wire) == curr
+    assert transforms.values_equal(transforms.diff_decode(prev, wire), curr)
 
 
 @given(st.dictionaries(_keys, _cell, max_size=7), st.data())
@@ -121,7 +121,7 @@ def test_fuzz_key_diff_reconstructs_after_serialization(prev, data):
     if diff is None:
         return
     wire = json.loads(json.dumps(diff))
-    assert transforms.diff_decode(prev, wire) == curr
+    assert transforms.values_equal(transforms.diff_decode(prev, wire), curr)
 
 
 @given(st.text(max_size=400), st.text(max_size=60), st.data())
@@ -196,3 +196,27 @@ def test_fuzz_fenced_spans_are_disjoint_and_ordered(lines):
     spans = lossy.fenced_spans(text)
     assert all(0 <= s < e <= len(text) for s, e in spans)
     assert all(a[1] <= b[0] for a, b in zip(spans, spans[1:], strict=False))
+
+
+# --- property: a diff never hides a type change (1 -> true, 1 -> 1.0) ----------------
+
+_TWIN = {bool: lambda v: int(v), int: lambda v: float(v), float: lambda v: str(v)}
+
+
+@given(_records, st.data())
+@FUZZ
+def test_fuzz_diff_never_hides_a_type_twin(records, data):
+    """A value swapped for one that `==` calls equal but JSON does not (True/1/1.0) must
+    reach the model: a diff that rebuilds the OLD type is a silent change."""
+    cells = [(i, k) for i, r in enumerate(records) for k, v in r.items()
+             if type(v) in _TWIN]
+    if not cells:
+        return
+    i, k = data.draw(st.sampled_from(cells))
+    curr = [dict(r) for r in records]
+    curr[i][k] = _TWIN[type(curr[i][k])](curr[i][k])
+    for prev_, curr_ in ((records, curr), ({"items": records}, {"items": curr})):
+        diff = transforms.diff_encode(prev_, curr_)
+        if diff is not None:
+            got = transforms.diff_decode(prev_, json.loads(json.dumps(diff)))
+            assert transforms.values_equal(got, curr_)
