@@ -26,11 +26,13 @@ The writer only renders a decision already taken. See `_Scope` for the state mac
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import queue
 import re
+import stat
 import sys
 import threading
 import time
@@ -515,7 +517,6 @@ class WireTap:
                 origin = getattr(raw, "wire_origin", None)
                 if origin is not None and status is None:
                     status = "synthesized"
-            ts_ns, mono_ns = time.time_ns(), time.monotonic_ns()
             read = hop in _READ_HOPS
             if inherit is _INHERIT:
                 inherit = None if read else self.context()
@@ -564,8 +565,8 @@ class WireTap:
                     self._put_locked(self._event_item(
                         "exclusion_overflow", None, {"live_max": _LIVE_MAX}), 0)
                 meta = _meta(msg) if state == "ok" else None
-                self._put_locked((hop, peer, line, status, origin, rule, info, meta, ts_ns,
-                                  mono_ns, None), len(line))
+                self._put_locked((hop, peer, line, status, origin, rule, info, meta, None,
+                                  None, None), len(line))
             if read:
                 self._ctx.rule = rule
         except Exception as exc:  # noqa: BLE001 — the tap is never load-bearing
@@ -601,6 +602,10 @@ class WireTap:
     def _try_put(self, item: tuple, size: int) -> bool:
         if self._bytes + size > self._bytes_max and self._bytes:
             return False
+        # Both clocks are read here, under the lock and as `seq` is taken, so `mono_ns`
+        # never decreases in `seq` order (#522). Read earlier, on the producing thread,
+        # two threads could stamp in one order and take seqs in the other.
+        item = (*item[:8], time.time_ns(), time.monotonic_ns(), item[10])
         try:
             self._q.put_nowait((self._seq, item, size))
         except queue.Full:
@@ -729,6 +734,25 @@ def may_exclude(policies: Any) -> bool:
     return any(not r.capture for p in policies for r in p.rules)
 
 
+def _own_dir(path: Path, *, managed: bool) -> None:
+    """Create `path` 0700 if missing, then refuse it unless this user owns it (#522). The
+    file is opened O_NOFOLLOW/0600 either way; this keeps a pre-planted directory on a
+    shared host from collecting the log's names. `DIR` is the operator's: a symlink to a
+    directory they own is fine and its mode is theirs. The session directory below it is
+    terse's alone, so a symlink there is refused and a loose mode is tightened."""
+    mkdir_restricted(path)
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        if managed:
+            raise OSError(errno.ELOOP, "is a symlink", str(path))
+        st = os.stat(path)
+    getuid = getattr(os, "getuid", None)        # absent on Windows: no owner to check
+    if getuid is not None and st.st_uid != getuid():
+        raise PermissionError(errno.EPERM, "owned by another user", str(path))
+    if managed and stat.S_IMODE(st.st_mode) & 0o077:
+        os.chmod(path, 0o700)
+
+
 def open_wire_tap(root: str, conn: str, *, exclude_all: str | None = None,
                   excluded_peers: dict[str, str] | None = None,
                   **kw: Any) -> WireTap | None:
@@ -737,8 +761,8 @@ def open_wire_tap(root: str, conn: str, *, exclude_all: str | None = None,
     session = os.environ.get("CLAUDE_CODE_SESSION_ID") or NO_SESSION
     path = Path(root) / _segment(session) / f"{_segment(conn)}.jsonl"
     try:
-        mkdir_restricted(root)
-        mkdir_restricted(path.parent)
+        _own_dir(Path(root), managed=False)
+        _own_dir(path.parent, managed=True)
         fh = open_append_restricted(path)
     except OSError as exc:
         sys.stderr.write(f"[terse] wire log disabled: cannot open {path} ({exc}); "

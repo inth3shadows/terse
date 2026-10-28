@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import signal
+import stat
 import sys
 import threading
 import time
@@ -1090,3 +1091,91 @@ def test_the_pre_scan_sees_keys_answered_after_its_last_scan():
         scope._register(("p:gh", "c", mid), "r", [])
         scope._complete(("p:gh", "c", mid))
         assert scope.needs_parse("server_in", "gh", None, f'{{"id":{mid},"result":{{}}}}')
+
+
+# --- #522: directory ownership and clock order --------------------------------------------
+
+def _open(root, monkeypatch, session="s1"):
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", session)
+    return wirelog.open_wire_tap(str(root), "c")
+
+
+def test_a_symlinked_session_directory_is_refused(tmp_path, monkeypatch, capsys):
+    root, elsewhere = tmp_path / "w", tmp_path / "elsewhere"
+    root.mkdir()
+    elsewhere.mkdir()
+    (root / "s1").symlink_to(elsewhere)
+    assert _open(root, monkeypatch) is None
+    assert "wire log disabled" in capsys.readouterr().err
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_a_symlinked_root_to_a_directory_we_own_is_followed(tmp_path, monkeypatch):
+    real, link = tmp_path / "real", tmp_path / "link"
+    real.mkdir()
+    link.symlink_to(real)
+    tap = _open(link, monkeypatch)
+    assert tap is not None
+    tap.close()
+    assert (real / "s1" / "c.jsonl").exists()
+
+
+def test_a_directory_owned_by_another_user_is_refused(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "w"
+    root.mkdir()
+    real_uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
+    assert _open(root, monkeypatch) is None
+    assert "owned by another user" in capsys.readouterr().err
+
+
+def test_a_loose_session_directory_is_tightened_and_the_root_left_alone(tmp_path,
+                                                                        monkeypatch):
+    root = tmp_path / "w"
+    (root / "s1").mkdir(parents=True)
+    os.chmod(root, 0o755)
+    os.chmod(root / "s1", 0o755)
+    tap = _open(root, monkeypatch)
+    assert tap is not None
+    tap.close()
+    assert stat.S_IMODE(os.stat(root / "s1").st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(root).st_mode) == 0o755          # the operator's mode
+
+
+def test_mono_ns_never_decreases_in_seq_order_across_threads(tmp_path, monkeypatch):
+    tap = _open(tmp_path / "w", monkeypatch)
+    assert tap is not None
+
+    def burst(k):
+        for i in range(300):
+            tap.tap("client_in", _req(k * 1000 + i, "ping"))
+            if i % 50 == 0:
+                tap.event("drain_timeout", peer=None)
+
+    threads = [threading.Thread(target=burst, args=(k,)) for k in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    tap.close()
+    recs = sorted(_records(tmp_path / "w"), key=lambda r: r["seq"])
+    assert len(recs) > 2400
+    monos = [r["mono_ns"] for r in recs]
+    assert monos == sorted(monos)
+
+
+def test_a_sink_drop_written_ahead_of_a_line_is_stamped_in_seq_order(tmp_path, monkeypatch):
+    # Deterministic half of the clock-order test: `_put_locked` writes a pending
+    # `sink_drop` BEFORE the line that triggered it. Stamped on the producing thread, the
+    # line's clock predated the sink_drop's although its seq came after.
+    tap = _open(tmp_path / "w", monkeypatch)
+    assert tap is not None
+    with tap._lock:
+        tap._dropped = 3
+    tap.tap("client_in", _req(1, "ping"))
+    tap.close()
+    recs = sorted(_records(tmp_path / "w"), key=lambda r: r["seq"])
+    kinds = [r["event"] if r["hop"] == "event" else r["hop"] for r in recs]
+    assert kinds[:2] == ["sink_drop", "client_in"]
+    monos = [r["mono_ns"] for r in recs]
+    assert monos == sorted(monos)

@@ -363,7 +363,7 @@ full tiers, kb drops dictionary, `*.rate_limit` skipped).
 
 Off by default. One file per proxy process: `DIR/<CLAUDE_CODE_SESSION_ID or
 no-session>/<conn>.jsonl`, where `conn` is the per-process id that also scopes capture
-result ids. Directories are created 0700 and the file 0600 (`O_APPEND|O_NOFOLLOW`). A
+result ids. Directories are created 0700 and the file 0600 (`O_APPEND|O_NOFOLLOW`). Both directories must be owned by the user running terse, or the wire log is turned off with a warning. `DIR` may be a symlink to a directory you own, and its mode is left as you set it. The session directory is terse's own: a symlink there is refused, and a looser mode is tightened to 0700. A
 connection never shares a file, so v1 needs no rotation. No fsync: each batch is flushed,
 and the file is flushed and closed when the proxy exits.
 
@@ -373,7 +373,7 @@ One JSON object per line (`ensure_ascii`, so any string round-trips):
 |---|---|
 | `v` | schema version, `1` |
 | `conn`, `seq` | process id; record number, from 0, +1 per record, kept or dropped (a missing number is a record lost to a full queue, counted by the next `sink_drop`) |
-| `ts_ns`, `mono_ns` | wall clock and monotonic clock, nanoseconds |
+| `ts_ns`, `mono_ns` | wall clock and monotonic clock, nanoseconds, read when `seq` is assigned: `mono_ns` never decreases in `seq` order (`ts_ns` follows the wall clock, which can step) |
 | `claude_session` | `$CLAUDE_CODE_SESSION_ID`, or `no-session` |
 | `peer` | the server's name on `server_out`/`server_in` (single proxy: `--server-name`, else the ledger label); `null` on client hops |
 | `hop` | `client_in`, `server_out`, `server_in`, `client_out`, or `event` |
