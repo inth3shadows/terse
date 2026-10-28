@@ -713,6 +713,28 @@ class _PeerSender:
         self._thread.join(timeout=2.0)
 
 
+class _ClientOut:
+    """A peer pump's client stream (`Router.peer_sink`). Lock-free on purpose: `pump`
+    already holds `out_lock` around its write+flush, and `_write_client` takes it."""
+
+    def __init__(self, router: Router) -> None:
+        self._router = router
+
+    def write(self, text: str) -> None:
+        if not self._router.client_gone:
+            try:
+                self._router.out.write(text)
+            except OSError as exc:
+                self._router._client_write_failed(exc)
+
+    def flush(self) -> None:
+        if not self._router.client_gone:
+            try:
+                self._router.out.flush()
+            except OSError as exc:
+                self._router._client_write_failed(exc)
+
+
 class Router:
     """Owns id-remapping, collision-only tool naming, broadcast/merge, and routing for a
     multi-peer session. One `Router` per `run_multi_proxy` call; long-lived for the
@@ -1002,6 +1024,8 @@ class Router:
         try:
             self._dispatch_client(msg, line)
         except Exception as exc:  # noqa: BLE001 — answer the client rather than go silent
+            if self.client_gone:
+                return  # already said once; no reply could be written anyway (#516)
             mid, method = msg.get("id"), msg.get("method")
             sys.stderr.write(f"[terse-multiproxy] internal error routing {_short(method)} "
                              f"(id {_short(mid)}): {type(exc).__name__}: "
@@ -1021,14 +1045,16 @@ class Router:
         if (not bad_id and method is None and mid is not None
                 and "result" not in msg and "error" not in msg):
             # Not a response either: the client is waiting on this id, so say so (#513).
-            sys.stderr.write(f"[terse-multiproxy] message with id {_short(mid)} has no "
-                             "method, result or error; rejected\n")
+            if self.debug:
+                sys.stderr.write(f"[terse-multiproxy] message with id {_short(mid)} has "
+                                 "no method, result or error; rejected\n")
             self._write_error(mid, -32600, "terse-multiproxy: invalid request")
             return True
         if not (bad_id or bad_method):
             return False
-        sys.stderr.write(f"[terse-multiproxy] invalid request (id {_short(mid)}, method "
-                         f"{_short(method)}); rejected\n")
+        if self.debug:
+            sys.stderr.write(f"[terse-multiproxy] invalid request (id {_short(mid)}, "
+                             f"method {_short(method)}); rejected\n")
         # A response (no method) is never answered; a notification likewise. JSON-RPC 2.0
         # §5: when the id itself is invalid it cannot be echoed, so the reply carries null.
         if method is not None and mid is not None:
@@ -1084,7 +1110,7 @@ class Router:
                 self._write_peer(peer_idx, json.dumps(restored, separators=(",", ":"),
                                                        ensure_ascii=False))
             elif self.debug:
-                sys.stderr.write(f"[terse-multiproxy] reply for unknown id {mid!r} — "
+                sys.stderr.write(f"[terse-multiproxy] reply for unknown id {_short(mid)} — "
                                  "no peer is waiting on it; dropped\n")
             return
 
@@ -1096,7 +1122,7 @@ class Router:
         # to hide); a caller who needs more can front that server alone.
         if self.peers:
             sys.stderr.write(
-                f"[terse-multiproxy] {method!r} has no broadcast/route handler; "
+                f"[terse-multiproxy] {_short(method)} has no broadcast/route handler; "
                 f"forwarding to peer 0 ({self.peers[0].name!r}) only "
                 "(scope — see multiproxy.py's module docstring)\n")
             self._write_peer(0, line)
@@ -1396,12 +1422,33 @@ class Router:
                     force = next(iter(self.wire.excluded_peers.values()))
                 self.wire.tap("client_out", line, status=status, origin=origin,
                               force=force)
+            if self.client_gone:
+                return  # nothing can be delivered any more (#516)
             try:
                 self.out.write(line + "\n")
                 self.out.flush()
-            except OSError:
-                self.client_gone = True
-                raise
+            except OSError as exc:
+                self._client_write_failed(exc)
+
+    def _client_write_failed(self, exc: OSError) -> None:
+        """The one rule for a failed client write, on any thread (#516). EAGAIN is
+        transient: that line is lost, the client is not. Anything else means the client's
+        stdout is gone: say so once; later writes become no-ops and the client loop ends
+        at its next line. Callers hold `out_lock`."""
+        if isinstance(exc, BlockingIOError):
+            sys.stderr.write(f"[terse-multiproxy] client write would block; line dropped: "
+                             f"{_clip(str(exc))}\n")
+            return
+        if not self.client_gone:
+            self.client_gone = True
+            sys.stderr.write(f"[terse-multiproxy] client stdout is gone: "
+                             f"{type(exc).__name__}: {_clip(str(exc))}\n")
+
+    def peer_sink(self) -> _ClientOut:
+        """The `dst` for a peer's `pump` thread: its writes follow the same rule as
+        `_write_client`, so a dead pipe hit first by a peer reply ends the session and no
+        reader thread dies with a BrokenPipeError traceback (#516)."""
+        return _ClientOut(self)
 
     def _write_error(self, mid: Any, code: int, message: str) -> None:
         """Write one JSON-RPC error envelope to the client. Never raises: it is what the
@@ -1413,11 +1460,9 @@ class Router:
                           separators=(",", ":"), ensure_ascii=True)
         try:
             self._write_client(line, origin="error_writer")
-        except (OSError, ValueError) as exc:
-            gone = " (client stdout is gone)" if self.client_gone else ""
+        except ValueError as exc:
             sys.stderr.write(f"[terse-multiproxy] could not write {code} reply (id "
-                             f"{_short(mid)}){gone}: {type(exc).__name__}: "
-                             f"{_clip(str(exc))}\n")
+                             f"{_short(mid)}): {type(exc).__name__}: {_clip(str(exc))}\n")
 
     def close_senders(self) -> None:
         """Stop every peer's background sender thread (#5). Called once, after the
@@ -1453,9 +1498,11 @@ class Router:
                         and not isinstance(msg.get("method"), str))):
                 # Same check as the client side: such an id cannot match anything the
                 # router issued or the client sent, and would raise in the lookups below.
-                sys.stderr.write(f"[terse-multiproxy] peer {self.peers[peer_idx].name} "
-                                 f"sent an invalid id {_short(msg.get('id'))} or method "
-                                 f"{_short(msg.get('method'))}; dropped\n")
+                if self.debug:
+                    sys.stderr.write(f"[terse-multiproxy] peer "
+                                     f"{self.peers[peer_idx].name} sent an invalid id "
+                                     f"{_short(msg.get('id'))} or method "
+                                     f"{_short(msg.get('method'))}; dropped\n")
                 return SWALLOW
             if isinstance(msg, dict) and msg.get("id") is not None:
                 if self._maybe_collect(peer_idx, msg):
@@ -1553,6 +1600,15 @@ class Router:
         for timer in timers:
             timer.join(timeout=self.broadcast_timeout + 1.0)
 
+    def cancel_timers(self) -> None:
+        """Cancel every pending broadcast and routed-call timer: what the drains wait out
+        for a client that can still be answered, and pointless once it cannot (#516)."""
+        with self._pending_lock:
+            timers = [pb.timer for pb in self._pending.values() if pb.timer is not None]
+            timers += self._routed_timers.values()
+        for timer in timers:
+            timer.cancel()
+
     def drain_routed_calls(self) -> None:
         """The routed-call counterpart to `drain_pending_broadcasts`: block until every
         in-flight routed `tools/call` has either replied or hit its own timeout, instead
@@ -1573,7 +1629,7 @@ class Router:
             missing = sorted(pb.remaining)
             client_id = pb.client_id
         names = [self.peers[i].name for i in missing]
-        sys.stderr.write(f"[terse-multiproxy] broadcast (client id {client_id!r}) timed "
+        sys.stderr.write(f"[terse-multiproxy] broadcast (client id {_short(client_id)}) timed "
                          f"out after {self.broadcast_timeout}s waiting on peer(s) {names}; "
                          "merging with whatever arrived — a dead/slow peer never wedges "
                          "the proxy\n")
@@ -1605,7 +1661,7 @@ class Router:
                 self._routed_timed_out.popitem(last=False)
         peer_name = self.peers[peer_idx].name if 0 <= peer_idx < len(self.peers) else "?"
         sys.stderr.write(f"[terse-multiproxy] peer {peer_name!r} did not answer "
-                         f"tools/call id={mid!r} within {self.broadcast_timeout}s — "
+                         f"tools/call id={_short(mid)} within {self.broadcast_timeout}s — "
                          "replying with a timeout error; a dead/slow peer never wedges "
                          "a routed call\n")
         self._write_client(json.dumps(
@@ -2374,6 +2430,20 @@ def _peer_reader(peer: Peer, cout: TextIO, transform: Callable[[str], Any], out_
         wire.event("peer_exit", peer=name, pid=_peer_pid(peer), exit_code=code)
 
 
+def _detach_dead_stdout() -> None:
+    """Point fd 1 at /dev/null once the client's pipe is gone, so the interpreter's exit
+    flush of what `sys.stdout` still buffers cannot fail and turn exit 0 into 120 (#516;
+    the remedy the `signal` docs give for SIGPIPE)."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, sys.stdout.fileno())
+        finally:
+            os.close(devnull)
+    except (OSError, ValueError):   # no real fd behind sys.stdout: nothing to protect
+        pass
+
+
 def run_multi_proxy(
     config_path: str,
     default_policy: policy_mod.Policy,
@@ -2407,7 +2477,9 @@ def run_multi_proxy(
     path), 127 if a stdio peer can't be launched (mirrors `run_proxy`'s OSError path), 0
     once the client disconnects cleanly. There is no single child exit code to propagate
     (there are N children) — 0 means "the client's stdin hit EOF and every peer was
-    closed", same meaning `run_proxy` gives an HTTP downstream today."""
+    closed", same meaning `run_proxy` gives an HTTP downstream today. A client whose stdout
+    pipe died also ends with 0: that is how a client disconnects, not a proxy failure,
+    and `_detach_dead_stdout` keeps the interpreter's exit flush from overriding it."""
     cin = stdin or sys.stdin
     cout = stdout or sys.stdout
 
@@ -2490,7 +2562,8 @@ def run_multi_proxy(
 
     try:
         threads = [Thread(target=_peer_reader,
-                          args=(peer, cout, router.from_peer(i), out_lock, wire),
+                          args=(peer, router.peer_sink(), router.from_peer(i), out_lock,
+                                wire),
                           daemon=True)
                   for i, peer in enumerate(peers)]
         for t in threads:
@@ -2511,8 +2584,9 @@ def run_multi_proxy(
             if not line:
                 continue
             if not _encodable(line):
-                sys.stderr.write("[terse-multiproxy] client line dropped: not valid "
-                                 "UTF-8\n")
+                if debug:
+                    sys.stderr.write("[terse-multiproxy] client line dropped: not valid "
+                                     "UTF-8\n")
                 continue
             try:
                 router.route_client_line(line)
@@ -2531,8 +2605,11 @@ def run_multi_proxy(
         # in flight (bounded by its own timeout) before tearing peers down. Same
         # reasoning for a still-in-flight routed tools/call.
         router.end_warm()
-        router.drain_pending_broadcasts()
-        router.drain_routed_calls()
+        if router.client_gone:
+            router.cancel_timers()      # their replies could not be written (#516)
+        else:
+            router.drain_pending_broadcasts()
+            router.drain_routed_calls()
 
         # Stop every peer's background sender BEFORE closing any transport below —
         # otherwise a sender thread could still be mid-write to a transport that's
@@ -2565,3 +2642,5 @@ def run_multi_proxy(
         for peer in peers:
             peer.transport.close()
         _restore_sigterm(sigterm_token)
+        if router.client_gone and cout is sys.stdout:
+            _detach_dead_stdout()

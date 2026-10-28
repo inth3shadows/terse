@@ -15,6 +15,13 @@ fails that pull request until the section has moved.
 
 ### Fixed
 
+- `terse proxy --config` handles a client that stops reading cleanly (#516). A dead client pipe now ends the session from any thread, with one stderr line and no BrokenPipeError tracebacks from server or timer threads. Calls still waiting on a server no longer hold up shutdown (up to 30 s each), and the process exits 0 instead of 120. A transient `EAGAIN` on a client write loses that line but no longer ends the session.
+- `terse proxy --config` stderr (#519): a malformed message from the client or a server, which is already answered with an error or dropped, is now logged only under `--debug`, so a client looping on a bad line no longer floods stderr. Terse's own failures, timeouts and lost replies are still always logged. The remaining unclipped ids and method names in log lines are now cut to 200 characters.
+
+## [0.45.2] - 2026-10-27
+
+### Fixed
+
 - `terse proxy --config` no longer loses a session or a server to one malformed line. Invalid UTF-8 from the client drops that line instead of ending the session (#517). A server reply with an unusable id (a list or object, say) is dropped instead of killing that server's reader thread, and anything else that raises while handling a server line is logged and the line forwarded unchanged (#510). A client id that is NaN/Infinity (#512) or holds a lone surrogate (#518) is now rejected up front with -32600 and a null id; before, NaN was echoed back as invalid JSON, and a lone surrogate went unanswered whenever the reply came from a server or a timeout. A message with an id but no method, result or error gets -32600 instead of silence (#513).
 
 ## [0.45.1] - 2026-10-21

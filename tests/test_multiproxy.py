@@ -2236,6 +2236,7 @@ def _assert_router_still_routes(router, t1, out, mid=42):
 def test_malformed_id_or_method_is_rejected_and_the_router_keeps_working(bad, reply,
                                                                          capsys):
     _, t1, _, out, router = _two_peer_router()
+    router.debug = True     # the client's own protocol error: traced only under --debug
     try:
         router.route_client_line(json.dumps(bad))     # must not raise
         msgs = _lines(out)
@@ -2326,7 +2327,7 @@ def test_invalid_utf8_on_client_stdin_drops_the_line_not_the_session(tmp_path, c
             + json.dumps({**call, "id": 2}).encode() + b"\n")
     cin = io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="strict")
     cout = io.StringIO()
-    assert run_multi_proxy(str(cfg), PLAIN_POLICY, stdin=cin, stdout=cout) == 0
+    assert run_multi_proxy(str(cfg), PLAIN_POLICY, stdin=cin, stdout=cout, debug=True) == 0
     by_id = {m.get("id"): m for m in _lines(cout)}
     assert set(by_id) == {1, 2} and all("result" in m for m in by_id.values()), by_id
     err = capsys.readouterr().err
@@ -2435,6 +2436,7 @@ def test_an_invalid_peer_id_is_dropped_and_the_reader_survives(bad, capsys):
     # #510: an unhashable id raised TypeError out of from_peer, killing that peer's
     # reader thread; every later reply from the peer was lost.
     _, t1, _, out, router = _two_peer_router()
+    router.debug = True
     try:
         assert router.from_peer(1)(json.dumps(bad)) is SWALLOW   # must not raise
         assert "sent an invalid id" in capsys.readouterr().err
@@ -2522,6 +2524,7 @@ def test_a_bad_params_notification_is_traced_under_debug(capsys):
 def test_stderr_lines_for_a_huge_id_are_bounded(capsys):
     # R2-6: the rejection log used to repr the whole id (1 MB id -> 1 MB stderr line).
     _, _, _, out, router = _two_peer_router()
+    router.debug = True
     try:
         router.route_client_line(json.dumps(
             {"jsonrpc": "2.0", "id": ["a" * 1_000_000], "method": "ping"}))
@@ -2592,4 +2595,157 @@ def test_client_loop_ends_cleanly_when_client_stdout_is_gone(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "Traceback" not in err
     assert err.count("ending the session") == 1
-    assert err.count("invalid request") == 1
+    assert err.count("client stdout is gone:") == 1
+    assert "invalid request" not in err       # a client protocol error: --debug only
+
+
+# --- a dead client pipe (#516) ---
+
+class _FlakyOut(io.StringIO):
+    """Raises `exc` on the next `fail` writes, then behaves like StringIO."""
+
+    def __init__(self, exc, fail=1):
+        super().__init__()
+        self.exc, self.fail = exc, fail
+
+    def write(self, s):
+        if self.fail:
+            self.fail -= 1
+            raise self.exc
+        return super().write(s)
+
+
+def test_eagain_on_a_client_write_drops_the_line_not_the_client(capsys):
+    # #516: any OSError used to set client_gone, so a transient EAGAIN ended a healthy
+    # session at its next line.
+    _, t1, peers, _, _ = _two_peer_router()
+    out = _FlakyOut(BlockingIOError(11, "Resource temporarily unavailable"))
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        router.route_client_line(json.dumps({"jsonrpc": "2.0", "id": 1, "method": 5}))
+        assert not router.client_gone and out.getvalue() == ""
+        assert "would block" in capsys.readouterr().err
+        _assert_router_still_routes(router, t1, out)
+    finally:
+        router.close_senders()
+
+
+def test_a_dead_pipe_on_any_thread_marks_the_client_gone_once_without_raising(capsys):
+    # #516: peer pump writes bypassed `_write_client`, so a dead pipe hit first by a peer
+    # reply raised BrokenPipeError out of the reader thread and never set client_gone;
+    # timer-thread writes raised too.
+    _, _, peers, _, _ = _two_peer_router()
+    out = _BrokenPipeOut()
+    router = Router(peers, out, Lock(), broadcast_timeout=1000)
+    try:
+        sink = router.peer_sink()
+        sink.write("{}\n")                            # a peer reply: must not raise
+        sink.flush()
+        assert router.client_gone
+        router._write_client("{}")                    # a timer-thread write: no-op now
+        sink.write("{}\n")
+        assert out.writes == 1                        # nothing written after the first
+    finally:
+        router.close_senders()
+    err = capsys.readouterr().err
+    assert err.count("client stdout is gone") == 1 and "Traceback" not in err
+
+
+def test_the_catch_all_is_quiet_once_the_client_is_gone(monkeypatch, capsys):
+    # #516: a dispatch failure after the pipe died logged "internal error" and then
+    # tried a doomed -32603 write.
+    _, _, peers, _, _ = _two_peer_router()
+    router = Router(peers, _BrokenPipeOut(), Lock(), broadcast_timeout=1000)
+    router.client_gone = True
+
+    def _boom(msg, line):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(router, "_dispatch_client", _boom)
+    try:
+        router.route_client_line(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+    finally:
+        router.close_senders()
+    assert capsys.readouterr().err == ""
+
+
+def test_a_gone_client_does_not_wait_out_pending_timers(tmp_path, capsys):
+    # #516: on client_gone the loop still drained every pending call, joining each
+    # timer (30 s by default) for a reply that could no longer be written.
+    hang_cmd = [sys.executable, "-c", "import sys\nfor _ in sys.stdin:\n    pass\n"]
+    cfg = _write_config(tmp_path, [{"name": "dead", "command": hang_cmd}])
+    text = (json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": {"name": "dead__x"}}) + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 2, "method": 5}) + "\n")
+    start = time.monotonic()
+    assert run_multi_proxy(str(cfg), PLAIN_POLICY, stdin=io.StringIO(text),
+                           stdout=_BrokenPipeOut(), broadcast_timeout=20) == 0
+    assert time.monotonic() - start < 10
+    assert "Traceback" not in capsys.readouterr().err
+
+
+def test_a_real_process_exits_0_when_the_client_closes_its_read_end(tmp_path):
+    # #516: run_multi_proxy returned 0, but the interpreter's exit flush of sys.stdout
+    # hit the dead pipe and the process exited 120.
+    import subprocess
+    cfg = _write_config(tmp_path, [{"name": "gh", "command": [sys.executable, str(FAKE)]}])
+    call = {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "gh__gh.api.items"}}
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import sys; from terse.cli import main; "
+         "sys.exit(main(sys.argv[1:]))", "proxy", "--config", str(cfg)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc.stdout.close()                               # the client stops reading
+    _, err = proc.communicate(
+        "".join(json.dumps({**call, "id": i}) + "\n" for i in range(1, 4)).encode(),
+        timeout=30)
+    assert proc.returncode == 0, err.decode()
+    assert b"Traceback" not in err and b"Exception ignored" not in err
+
+
+# --- stderr convention (#519) ---
+
+def test_remaining_stderr_reprs_are_clipped(capsys):
+    # #519: a 300k-char method gave a 300k-char always-on line; the --debug unknown-id
+    # line was unclipped too.
+    _, _, _, _, router = _two_peer_router()
+    router.debug = True
+    try:
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": "i" * 300_000, "result": {}}))
+        router.route_client_line(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "m" * 300_000}))
+    finally:
+        router.close_senders()
+    err = capsys.readouterr().err
+    assert "reply for unknown id" in err and "has no broadcast/route handler" in err
+    assert max(len(ln) for ln in err.splitlines()) < 1000
+
+
+@pytest.mark.parametrize("line", [
+    json.dumps({"jsonrpc": "2.0", "id": 1, "method": 5}),           # -32600
+    json.dumps({"jsonrpc": "2.0", "id": [1], "method": "ping"}),    # -32600, id null
+    json.dumps({"jsonrpc": "2.0", "id": 1}),                        # -32600 (#513)
+])
+def test_a_client_protocol_error_is_answered_but_only_traced_under_debug(line, capsys):
+    # #519: one convention. The other side's protocol error, already answered with an
+    # error, is a --debug line; a client looping on it no longer floods stderr.
+    _, _, _, out, router = _two_peer_router()
+    try:
+        router.route_client_line(line)
+        assert _lines(out)[0]["error"]["code"] == -32600
+        assert capsys.readouterr().err == ""
+        router.debug = True
+        router.route_client_line(line)
+        assert "rejected" in capsys.readouterr().err
+    finally:
+        router.close_senders()
+
+
+def test_an_invalid_peer_id_is_only_traced_under_debug(capsys):
+    _, _, _, _, router = _two_peer_router()
+    try:
+        bad = json.dumps({"jsonrpc": "2.0", "id": [1], "result": {}})
+        assert router.from_peer(1)(bad) is SWALLOW
+        assert capsys.readouterr().err == ""
+    finally:
+        router.close_senders()
