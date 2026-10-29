@@ -1193,3 +1193,107 @@ def test_every_record_names_the_server_the_way_start_does(server_name, tmp_path)
     assert _events(recs, "peer_exit")[0]["peer"] == label
     peers = {r["peer"] for r in recs if r["hop"] in ("server_out", "server_in")}
     assert peers == {label}
+
+
+# --- #535: no parse under the client-stdout lock -----------------------------------------
+
+def _parse_spy(monkeypatch, lock):
+    held = []
+    real = wirelog._parse
+
+    def spy(line, strict):
+        held.append(lock.locked())
+        return real(line, strict)
+
+    monkeypatch.setattr(wirelog, "_parse", spy)
+    return held
+
+
+def test_pump_parses_client_out_before_taking_the_stdout_lock(tmp_path, monkeypatch):
+    from terse.proxy import pump
+
+    tap = _open(tmp_path / "w", monkeypatch)
+    assert tap is not None
+    monkeypatch.setattr(tap._scope, "needs_parse", lambda *a: True)   # force the parse
+    lock = threading.Lock()
+    held = _parse_spy(monkeypatch, lock)
+    dst = io.StringIO()
+    pump(iter([_req(i, "ping") + "\n" for i in range(5)]), dst, lambda line: None,
+         lock=lock, on_write=lambda out: tap.stage("client_out", out))
+    tap.close()
+    assert held == [False] * 5
+    assert len([r for r in _records(tmp_path / "w") if r["hop"] == "client_out"]) == 5
+
+
+def test_router_write_client_parses_before_taking_the_stdout_lock(tmp_path, monkeypatch):
+    from terse.multiproxy import Peer, Router
+    from terse.proxy import Interceptor
+
+    tap = _open(tmp_path / "w", monkeypatch)
+    assert tap is not None
+    monkeypatch.setattr(tap._scope, "needs_parse", lambda *a: True)
+
+    class _T:
+        def outbound(self):
+            return io.StringIO()
+
+        def inbound(self):
+            return iter([])
+
+    out, lock = io.StringIO(), threading.Lock()
+    router = Router([Peer("a", _T(), Interceptor(FULL))], out, lock, wire=tap)
+    held = _parse_spy(monkeypatch, lock)
+    try:
+        router._write_client(json.dumps({"jsonrpc": "2.0", "id": 9, "error": {
+            "code": -32601, "message": "x"}}))
+    finally:
+        router.close_senders()
+        tap.close()
+    assert held == [False]
+
+
+def test_record_order_is_stdout_order_with_concurrent_writers(tmp_path, monkeypatch):
+    from terse.proxy import pump
+
+    tap = _open(tmp_path / "w", monkeypatch)
+    assert tap is not None
+    lock, dst = threading.Lock(), io.StringIO()
+
+    def writer(k):
+        pump(iter([_req(k * 1000 + i, "ping") + "\n" for i in range(200)]), dst,
+             lambda line: None, lock=lock,
+             on_write=lambda out: tap.stage("client_out", out))
+
+    threads = [threading.Thread(target=writer, args=(k,)) for k in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    tap.close()
+    logged = [r["line"] for r in sorted(_records(tmp_path / "w"), key=lambda r: r["seq"])
+              if r["hop"] == "client_out"]
+    assert logged == dst.getvalue().splitlines()
+    assert len(logged) == 1200
+
+
+def test_pump_records_inside_the_stdout_lock(tmp_path, monkeypatch):
+    # The other half of the split: `seq` is taken inside the lock, or two writers could
+    # record in one order and write in the other.
+    from terse.proxy import pump
+
+    tap = _open(tmp_path / "w", monkeypatch)
+    assert tap is not None
+    lock, held = threading.Lock(), []
+
+    def stage(out):
+        record = tap.stage("client_out", out)
+
+        def checked():
+            held.append(lock.locked())
+            record()
+        return checked
+
+    pump(iter([_req(i, "ping") + "\n" for i in range(3)]), io.StringIO(),
+         lambda line: None, lock=lock, on_write=stage)
+    tap.close()
+    assert held == [True] * 3
