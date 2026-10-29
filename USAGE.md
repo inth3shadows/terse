@@ -707,6 +707,34 @@ If the worst-case model **PASSES**, enable a field by renaming that tool's
 `_suggested_fields` → `fields`. Start with `[prose]`; leave any `[unknown]` that fails.
 The dropeval gate — not the role guess — is the real safety net.
 
+### Judging the drop rules already firing (`terse tune --from-ledger`)
+
+`terse tune` decides what *could* be dropped, from a corpus. `terse tune --from-ledger`
+judges the drop-to-retrieve rules that are already live, from the ledger's drop and
+retrieve counts. No corpus and no model are needed:
+
+```sh
+terse tune --from-ledger --since 30d
+# KEEP   codegraph codegraph_explore $text.code_blocks  dropped=96 retrieved=2 rate=2%
+#   why: 2% fetched back (<= 5%): the drop is close to free on this evidence
+#   candidate: widen ... only after `terse tune --drop-eval` passes
+```
+
+Each rule gets one verdict:
+
+- **insufficient**: fewer than 30 dropped values in the window.
+- **retract**: 40% or more were fetched back.
+- **raise_keep_first**: 80% of the indexed retrieves fetched blocks before index k, and k
+  is above the current `keep_first`.
+- **keep**: 5% or less were fetched back. Widening is offered only as a candidate to
+  verify with `--drop-eval`.
+- **watch**: anything in between.
+
+It only reports. `--out` is refused, so edit the policy by hand. The policy comes from
+the `install-mcp` wiring unless you pass `--policy`, and `--json` prints the verdicts and
+thresholds as JSON. A rate counts retrieves only: a model that re-reads the source
+instead of calling `terse.retrieve` shows no retrieve, so a low rate is a best case.
+
 ### Forbidding lossy on a credential/personal server (`--never-lossy`)
 
 Lossy transforms are **structurally forbidden** on a *never-lossy* server (a credential or

@@ -1270,6 +1270,53 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
     return 0
 
 
+def _tune_from_ledger(args: argparse.Namespace) -> int:
+    """`terse tune --from-ledger` (#252): verdicts for the drop rules already FIRING, read
+    from the ledger. Prints only — it never writes a policy (`--out` is refused), because a
+    suggestion here is evidence for a human edit, not a change terse can prove safe."""
+    from . import droptune
+    from .policy import load_policy
+    from .stats import default_stats_log, load_stats, parse_window
+
+    if args.out:
+        print("tune --from-ledger: --out is not supported — this mode only reports; edit the "
+              "policy by hand", file=sys.stderr)
+        return 2
+    path = Path(args.ledger).expanduser() if args.ledger else default_stats_log()
+    if not path.exists() and not path.with_name(path.name + ".1").exists():
+        print(f"tune --from-ledger: no ledger at {path}", file=sys.stderr)
+        return 2
+    since_ts = None
+    if args.since:
+        try:
+            since_ts = int(time.time()) - parse_window(args.since)
+        except ValueError as e:
+            print(f"tune --from-ledger: {e}", file=sys.stderr)
+            return 2
+    policy_arg = args.policy
+    if policy_arg is None:
+        resolved, _corpus, note, ambiguous = _installed_autotune_defaults()
+        if note:
+            print(f"tune --from-ledger: {note}", file=sys.stderr)
+        if resolved and "policy" not in ambiguous:
+            policy_arg = resolved
+            print(f"# resolved from install-mcp wiring: --policy {resolved}")
+    policy = None
+    if policy_arg:
+        try:
+            policy = load_policy(Path(policy_arg).expanduser())
+        except (OSError, ValueError) as exc:
+            print(f"tune --from-ledger: cannot load policy {policy_arg} ({exc})",
+                  file=sys.stderr)
+            return 2
+    rows = droptune.verdicts(load_stats(str(path), since_ts), policy)
+    if args.json:
+        print(_json.dumps({"thresholds": droptune.THRESHOLDS, "rules": rows}, indent=2))
+    else:
+        print(droptune.build_report(rows), end="")
+    return 0
+
+
 def _cmd_tune(args: argparse.Namespace) -> int:
     """One-command lossy tuning: analyze a captured corpus, surface safe-first drop-to-
     retrieve candidates (role-classified — prose is safe, unknown may be load-bearing), write
@@ -1278,6 +1325,8 @@ def _cmd_tune(args: argparse.Namespace) -> int:
     assemble by hand."""
     from .policy_gen import MIN_CANDIDATE_PAYLOADS, _presence_suffix, generate_policy
 
+    if args.from_ledger:
+        return _tune_from_ledger(args)
     envelopes = load_corpus(args.corpus)
     if not envelopes:
         print(f"no payloads in {args.corpus}/ — capture some first (`terse capture` or "
@@ -2476,6 +2525,17 @@ def main(argv: list[str] | None = None) -> int:
                                      "surface safe-first drop-to-retrieve candidates, write the "
                                      "policy, and optionally verify with a live model")
     tn.add_argument("--corpus", default=DEFAULT_CORPUS)
+    tn.add_argument("--from-ledger", action="store_true",
+                    help="judge the drop-to-retrieve rules already firing from the ledger's "
+                         "drop and retrieve counts (keep / raise keep_first / retract); "
+                         "reports only, never writes a policy (#252)")
+    tn.add_argument("--policy", default=None, metavar="FILE",
+                    help="with --from-ledger: the policy whose rules are judged (default: "
+                         "resolved from the install-mcp wiring)")
+    tn.add_argument("--since", default=None, metavar="WINDOW",
+                    help="with --from-ledger: only ledger rows newer than WINDOW (e.g. 30d)")
+    tn.add_argument("--json", action="store_true",
+                    help="with --from-ledger: print the verdicts as JSON")
     tn.add_argument("--out", help="write the generated policy here (suggestions inactive)")
     tn.add_argument("--threshold", type=float, default=5.0, metavar="PCT",
                     help="min total savings %% to compress a tool at all (default 5.0)")
