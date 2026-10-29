@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.45.11] - 2026-10-28
+
 ### Security
 
 Fixes from a red-team audit (2026-10-28). No finding was Critical or High.
