@@ -588,6 +588,13 @@ Two knobs tune how much stays inline, both from live retrieve data (#252):
 counting `keep_first`-kept blocks), so a later `terse tune` can suggest values for both
 knobs from what a session actually fetched back.
 
+Each result row also records how many values each rule dropped (`drops`), so
+`terse stats` can show a retrieve **rate** per rule: retrieves per dropped value. The
+drop-to-retrieve table lists every rule that dropped something, including the ones never
+fetched back. The rate is a best case: a model that re-reads the source instead of calling
+`terse.retrieve` leaves a drop with no retrieve. Rows written before this field existed are
+counted from `text_dropped` as one value each and marked `~`.
+
 This is **lossy and opt-in** — the same bar as any drop:
 
 - Everything is recoverable, and the gate proves it: terse restores the entire payload from

@@ -13,7 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- The ledger records how many values each drop-to-retrieve rule dropped per result (`drops: {rule path: count}`, labels and counts only), and `terse stats` shows each rule's dropped count and retrieve rate (retrieves per dropped value) beside its retrieve cost (#252). Rules that dropped but were never fetched back are now listed. The rate is a lower bound on how often a value was needed: a model that re-reads the source instead of retrieving shows no retrieve. Older rows are counted from `text_dropped` as one value each and marked `~`.
+- `terse stats --json` gains a `drop_rules` list: `server`, `tool`, `path`, `blocks`, `spans`, `estimated`, `retrieves`, `retrieve_tokens`, `rate` (`null` when nothing was dropped in the window).
 
 ## [0.45.11] - 2026-10-28
 

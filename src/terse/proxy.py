@@ -626,6 +626,12 @@ class Interceptor:
         # `_store_lock` alongside the dict it mirrors, and evicted in lockstep with it.
         self._drop_origin: dict[str, tuple[str, str, str, int | None]] = (
             origins if origins is not None else {})
+        # `rule path -> spans dropped` for the result being transformed right now (#252):
+        # the DENOMINATOR of a rule's retrieve rate, which the ledger never recorded.
+        # Filled by `_note_drop_origins`, taken (and reset) once per result when its stats
+        # row is queued. Per-Interceptor, unlike the shared maps above: a result is
+        # transformed by one Interceptor under its own `_local_lock`.
+        self._result_drops: dict[str, int] = {}
         # `(tool, rule path) -> retrieve HITS this session` (#252), for a drop spec's
         # `retract_after`. SHARED with the store for the same reason `_drop_origin` is: the
         # router answers every retrieve through peers[0], so the peer whose rule should
@@ -1420,6 +1426,9 @@ class Interceptor:
                     "primer ledger", "(primer)",
                     partial(self._emit_primer, PRIMER_CADENCE_ONCE, primer),
                 ))
+            # Taken unconditionally, so a result written with no stats sink cannot leak its
+            # drops into the next result's row.
+            result_drops, self._result_drops = self._result_drops, {}
             if self.stats is not None:
                 deferred.append((
                     "stats", capture_tool,
@@ -1427,7 +1436,8 @@ class Interceptor:
                             display_tool=capture_tool, diff_reason=diff_reason,
                             structured=structured_raw, structured_out=structured_out,
                             force_passthrough=hold_all,
-                            offload_at=offload_limit(self.client_name)),
+                            offload_at=offload_limit(self.client_name),
+                            drops=result_drops or None),
                 ))
 
             if not changed:
@@ -2046,6 +2056,7 @@ class Interceptor:
                 if handle in self.dropped:
                     self._drop_origin[handle] = (self._ledger_label, otool, opath,
                                                  rest[0] if rest else None)
+                    self._result_drops[opath] = self._result_drops.get(opath, 0) + 1
 
     def _inject_retrieve_tool(self, msg: dict) -> str | None:
         """If `msg` is a tools/list result, append the synthetic terse.retrieve tool so the
@@ -2313,7 +2324,8 @@ class Interceptor:
                     structured: str | None = None,
                     structured_out: str | None = None,
                     force_passthrough: bool = False,
-                    offload_at: int | None = None) -> None:
+                    offload_at: int | None = None,
+                    drops: dict[str, int] | None = None) -> None:
         """Hand the stats callback one
         (tool, raw, emitted, passthrough, diff_reason, structured, structured_out) per
         emitted block, for the payload-free savings ledger (stats.py). Same fail-open
@@ -2334,7 +2346,11 @@ class Interceptor:
         limit applies to the whole result while rows are per block. Every row of an
         affected result is tagged `offload`: "out" when the client offloaded what terse
         emitted, "raw" when only the raw result would have been. Passed to the writer only
-        when set, so a writer from before the field keeps working."""
+        when set, so a writer from before the field keeps working.
+
+        `drops` is `rule path -> spans dropped` for this result (#252), the denominator of
+        each rule's retrieve rate. Per-RESULT like `structured`, so it rides the first pair
+        only, and is passed only when set, for the same writer-compatibility reason."""
         stats = self.stats
         if stats is None:
             return
@@ -2355,10 +2371,12 @@ class Interceptor:
                 args = (shown_tool, raw, emitted, passthrough, diff_reason,
                         structured if index == 0 else None,
                         structured_out if index == 0 else None)
-                if offload is None:
-                    stats(*args)
-                else:
-                    stats(*args, offload=offload)
+                extra: dict[str, Any] = {}
+                if offload is not None:
+                    extra["offload"] = offload
+                if drops and index == 0:
+                    extra["drops"] = drops
+                stats(*args, **extra)
             except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
                 self._warn_sink("stats", shown_tool, exc)
 
