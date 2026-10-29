@@ -13,7 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- `policy generate` reports and decides on only the savings the rule it writes will deliver (#562). A tier left out for falling under its own threshold (`dictionary`, `embedded` or `pyliteral`) no longer counts toward the tool's saving, so it can't lift a tool over the passthrough threshold. Example: tabularize 3% plus a dropped dictionary 3% used to read "6.0% saved" for a rule that delivers 3%. This can turn a tool that only cleared the threshold that way into passthrough.
+- A Python-literal result's saving is now split the way the proxy applies it: `terse measure` credits the dictionary share to `dictionary`, which only ships when the rule has both tiers. A tool that reported 75% for a rule delivering 23% now reports what the rule delivers. A Python-literal result left unread is again counted in the reason's "non-JSON, passed through" note.
 
 ## [0.48.1] - 2026-10-29
 

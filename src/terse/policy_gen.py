@@ -733,8 +733,6 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
     # Counted over ROWS, so a joined result contributes 1 whatever its block count — see
     # the ratio note where these are rendered. Only `gate_fail` disqualifies the tool;
     # `non_json` is reported, not acted on (#147, and the reasoning at the branch below).
-    non_json = sum(1 for r in rows if not r["applicable"]
-                   and not r["saved_cl100k"].get("pyliteral"))   # a folded one is read
     gate_fail = sum(1 for r in rows if not r["roundtrip_ok"])
     # The embedded gate is counted separately and costs only its own tier (#188): the
     # default pipeline round-tripped, so the tool still compresses — demoting it to
@@ -750,35 +748,45 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
     raw_tok = sum(r["cl100k"]["raw"] or 0 for r in rows)
     minify = sum(r["saved_cl100k"]["minify"] or 0 for r in rows)
     tabularize = sum(r["saved_cl100k"]["tabularize"] or 0 for r in rows)
-    dictionary = sum(r["saved_cl100k"]["dictionary"] or 0 for r in rows)
+    # A Python-literal row's `dictionary` saving is the dictionary tier applied INSIDE the
+    # pyliteral fold (#562), so it ships only when both tiers are on. Kept apart from the
+    # JSON rows' share for that reason.
+    dict_json = sum(r["saved_cl100k"]["dictionary"] or 0 for r in rows if r["applicable"])
+    dict_py = sum(r["saved_cl100k"]["dictionary"] or 0 for r in rows if not r["applicable"])
     # `.get` with a default, defensively: every row here comes from `measure_payload` /
     # `measure_joined`, which always emit the key — but a row reaching this sum without it
     # should read as "this tier saved nothing" rather than KeyError the whole run.
     embedded = sum(r["saved_cl100k"].get("embedded") or 0 for r in rows)
     pyliteral = sum(r["saved_cl100k"].get("pyliteral") or 0 for r in rows)
-    total = sum(r["saved_cl100k"]["tier_total"] or 0 for r in rows)
     if emb_fail:
         # The tier is dropped for the WHOLE tool — the policy matches on tool name, so
         # there is no way to enable it for only the results whose fold round-tripped. Every
         # row's embedded saving is therefore undeliverable, including the rows that PASSED
-        # the gate, and `total` must fall back to what the surviving tiers actually ship.
-        # Without this the generator writes a rule advertising savings it has just refused
-        # to enable, and — worse — a tool can clear the passthrough threshold entirely on
-        # them: measured 22.5% saved on a tool whose remaining tiers deliver 0.0%.
+        # the gate. Measured before this was zeroed: 22.5% saved reported on a tool whose
+        # remaining tiers deliver 0.0%.
         embedded = 0
-        total = sum((r["cl100k"]["raw"] or 0) - (r["cl100k"]["compressed"] or 0)
-                    # A row that failed the DEFAULT gate banks nothing, per the zeroing rule
-                    # in `measure`; recomputing from raw counts here would resurrect it.
-                    for r in rows if r["roundtrip_ok"]) + pyliteral
+
+    # Each opt-in tier is decided on its own marginal saving FIRST, and `total` is then the
+    # base tiers plus only the tiers the rule will carry (#562). Summing every row's
+    # `tier_total` instead let a dropped tier's saving lift the tool over the passthrough
+    # threshold and inflate the reported percentage: threshold 5, tabularize 3% and a
+    # dropped dictionary 3% read as "6.0% saved" for a rule that delivers 3%.
     py_pct = _pct(pyliteral, raw_tok)
-    if py_pct < threshold:
-        # Below its own marginal bar the tier is not enabled (see the end of this
-        # function), so its saving is not delivered and must not lift the tool over the
-        # passthrough threshold either -- the `emb_fail` lesson above.
-        total -= pyliteral
-    total_pct = _pct(total, raw_tok)
+    py_on = py_pct >= threshold
+    dictionary = dict_json + (dict_py if py_on else 0)
     dict_pct = _pct(dictionary, raw_tok)
+    dict_on = dict_pct >= threshold
     emb_pct = _pct(embedded, raw_tok)
+    emb_on = emb_pct >= threshold       # 0 on an `emb_fail`, zeroed above
+    total = (minify + tabularize + (dictionary if dict_on else 0)
+             + (embedded if emb_on else 0) + (pyliteral if py_on else 0))
+    total_pct = _pct(total, raw_tok)
+    # Counted over ROWS, so a joined result contributes 1 whatever its block count — see
+    # the ratio note where these are rendered. Only `gate_fail` disqualifies the tool;
+    # `non_json` is reported, not acted on (#147, and the reasoning at the branch below).
+    # A Python-literal row is read, not passed through, only when the tier is on.
+    non_json = sum(1 for r in rows if not r["applicable"]
+                   and not (py_on and r["saved_cl100k"].get("pyliteral")))
 
     # Drop-to-retrieve candidates are detected INDEPENDENTLY of the lossless-tier decision:
     # the highest-value case (kb `embedding`) is a tool whose lossless savings fall BELOW the
@@ -830,7 +838,7 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
                 "reason": f"passthrough — {total_pct:.1f}% < {threshold:.1f}% threshold{mixed}"}
 
     tiers = list(_BASE_TIERS)
-    if dict_pct >= threshold:
+    if dict_on:
         tiers.append("dictionary")
         parts = [f"dictionary +{dict_pct:.1f}%"]
     else:
@@ -845,14 +853,14 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
     if emb_fail:
         parts.append(f"embedded dropped — {emb_fail}/{len(rows)} result(s) failed the "
                      f"embedded round-trip")
-    elif emb_pct >= threshold:
+    elif emb_on:
         tiers.append("embedded")
         parts.append(f"embedded +{emb_pct:.1f}%")
     elif embedded:
         parts.append(f"embedded +{emb_pct:.1f}% below threshold — dropped")
     # `pyliteral` (#460) by the same marginal test: it costs a primer paragraph, and only
     # a tool returning Python-literal text (`str(rows)`) measures anything for it.
-    if py_pct >= threshold:
+    if py_on:
         tiers.append("pyliteral")
         parts.append(f"pyliteral +{py_pct:.1f}%")
     elif pyliteral:

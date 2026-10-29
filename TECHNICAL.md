@@ -196,8 +196,11 @@ off by default because it failed rung 4 at the measured hit rate.
   candidate against *every* rule before the bare one against any, so a bare `structure`
   rule is dead behind a deployed `runecho.*` wherever in the file it sits (#152).
 - **`measure.py`** — `measure_payload` (per-tier cl100k decomposition: `minify +
-  tabularize + dictionary == tier_total`, re-runs the gate), `measure_corpus`, and
-  `cross_tokenizer_savings` (cl100k vs o200k invariance).
+  tabularize + dictionary + embedded + pyliteral == tier_total`, re-runs the gate; a
+  Python-literal row splits its fold into `pyliteral` and `dictionary`, #562),
+  `measure_corpus`, and `cross_tokenizer_savings` (cl100k vs o200k invariance).
+  `policy_gen._tool_decision` decides each opt-in tier on its own marginal saving, then
+  totals only the tiers the rule will carry, so a dropped tier never counts (#562).
 - **`probes.py`** — `value_redundancy` and `cross_call_overlap`: upper-bound
   estimators for whether higher-ceiling levers (dictionary, cross-call diffing) are
   worth building. They measure, they do not compress.

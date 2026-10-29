@@ -53,12 +53,21 @@ def measure_payload(raw: str) -> dict[str, Any]:
         # trivially. The one lossless saving left is the opt-in `pyliteral` fold (#460), a
         # block that is the exact `repr` of JSON-native data; `fold_pyliteral` carries its
         # own exact-decode gate, so a fold it returns is one the proxy would emit.
+        #
+        # Folded twice so the saving splits the way the runtime fold does (#562): without
+        # `dictionary` it is the tier's own, and the rest is `dictionary`'s, which a rule
+        # leaving `dictionary` out does not deliver (`policy.apply` folds with the rule's
+        # tiers).
         raw_tok = count_cl100k(raw)
-        folded = transforms.fold_pyliteral(raw) if obj is None else None
-        py_saved = 0
-        if folded is not None and raw_tok is not None:
-            py_tok = count_cl100k(folded)
-            py_saved = raw_tok - py_tok if py_tok is not None else 0
+        py_saved = dict_saved = 0
+        plain = transforms.fold_pyliteral(raw, dictionary=False) if obj is None else None
+        coded = transforms.fold_pyliteral(raw) if obj is None else None
+        if raw_tok is not None:
+            plain_tok = count_cl100k(plain) if plain is not None else raw_tok
+            coded_tok = count_cl100k(coded) if coded is not None else plain_tok
+            if plain_tok is not None and coded_tok is not None:
+                py_saved = raw_tok - plain_tok
+                dict_saved = max(plain_tok - coded_tok, 0)
         row: dict[str, Any] = {
             "shape": shape,
             "applicable": False,
@@ -67,8 +76,9 @@ def measure_payload(raw: str) -> dict[str, Any]:
             "embedded_ok": True,
             "cl100k": {"raw": raw_tok, "minified": raw_tok, "tabular": raw_tok,
                        "compressed": raw_tok, "embedded": raw_tok},
-            "saved_cl100k": {"minify": 0, "tabularize": 0, "dictionary": 0, "embedded": 0,
-                             "pyliteral": py_saved, "tier_total": py_saved},
+            "saved_cl100k": {"minify": 0, "tabularize": 0, "dictionary": dict_saved,
+                             "embedded": 0, "pyliteral": py_saved,
+                             "tier_total": py_saved + dict_saved},
         }
         return row
 
