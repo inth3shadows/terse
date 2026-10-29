@@ -13,15 +13,15 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-### Fixed
-
-- `terse proxy` and `terse proxy --config` now give the same answer to a `tools/call` or `prompts/get` whose `params` is a list, string, number or bool: -32602 "terse: params must be an object", sent by terse, with nothing forwarded (a notification is dropped). Before, the single proxy forwarded the line and the server answered, while the router rejected it. The router's message changes from "terse-multiproxy: params must be an object". (#514)
-
-## [0.46.0] - 2026-10-28
-
 ### Added
 
 - `terse tune --from-ledger` judges each live drop-to-retrieve rule from the ledger's drop and retrieve counts and prints one verdict: `insufficient` (under 30 dropped values), `retract` (40% or more fetched back), `raise_keep_first` (retrieves cluster on early blocks), `keep` (5% or less), or `watch` (#252). It never writes a policy (`--out` is refused), offers widening only as a candidate to verify with `--drop-eval`, and prints its thresholds. `--policy`, `--since` and `--json` are supported.
+
+## [0.46.1] - 2026-10-28
+
+### Fixed
+
+- `terse proxy` and `terse proxy --config` now give the same answer to a `tools/call` or `prompts/get` whose `params` is a list, string, number or bool: -32602 "terse: params must be an object", sent by terse, with nothing forwarded (a notification is dropped). Before, the single proxy forwarded the line and the server answered, while the router rejected it. The router's message changes from "terse-multiproxy: params must be an object". (#514)
 
 ## [0.46.0] - 2026-10-28
 
