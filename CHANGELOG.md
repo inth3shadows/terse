@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.48.2] - 2026-10-29
+
 ### Fixed
 
 - `policy generate` reports and decides on only the savings the rule it writes will deliver (#562). A tier left out for falling under its own threshold (`dictionary`, `embedded` or `pyliteral`) no longer counts toward the tool's saving, so it can't lift a tool over the passthrough threshold. Example: tabularize 3% plus a dropped dictionary 3% used to read "6.0% saved" for a rule that delivers 3%. This can turn a tool that only cleared the threshold that way into passthrough.
