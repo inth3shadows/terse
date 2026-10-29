@@ -84,7 +84,7 @@ suggest: `kb` has no drop rule of its own and pays 312, while `gh` pays 248 beca
 `gh.*` terminates the walk first. `terse stats` prints the real figure for each wrapped
 server; do not infer it from the rules by eye.
 
-The 555 in the router table below is the all-gates-on ceiling: reachable for a
+The 595 in the router table below is the all-gates-on ceiling: reachable for a
 router whose peers collectively enable every gate, not for a standalone entry
 under a default policy.
 
@@ -106,7 +106,7 @@ say the same.
 
 For a router/multiproxy setup wrapping several servers behind one shared primer, the
 break-even arithmetic is different in *kind*, not degree. The router's
-`union_primer` is a boolean OR over five fixed sections, not a concatenation of N
+`union_primer` is a boolean OR over six fixed sections, not a concatenation of N
 per-peer primers — so it is O(1) in peer count, not O(N):
 
 | section | tokens |
@@ -115,16 +115,17 @@ per-peer primers — so it is O(1) in peer count, not O(N):
 | table | 155 |
 | dict | 44 |
 | embedded | 53 |
+| pyliteral | 40 |
 | diff | 190 |
 | dropped | 64 |
 | tail | 8 |
-| **full (all sections gated on)** | **555** |
+| **full (all sections gated on)** | **595** |
 
-555 cl100k tokens is the hard ceiling. Before #212 it was sent at `initialize`
+595 cl100k tokens is the hard ceiling. Before #212 it was sent at `initialize`
 and re-read every turn as `cache_read` — a RECURRING charge, paid from the first
 turn whether or not any peer was ever called. Since #212 it attaches once per
-session to the first terse-marked result, like a standalone entry's lazy primer. The diff paragraph alone is 190 of 555 cl100k tokens, so a router at
-that ceiling spent 34% of a (pre-#212) recurring charge explaining one wire form — which is
+session to the first terse-marked result, like a standalone entry's lazy primer. The diff paragraph alone is 190 of 595 cl100k tokens, so a router at
+that ceiling spent 32% of a (pre-#212) recurring charge explaining one wire form — which is
 the shape of the cost #170 weighed. A router that enables diffing and nothing else
 does not sit at the ceiling: it pays 438, of which the same paragraph is 43%. That is why
 `terse stats` reports it under a separate cadence from the standalone one, and never

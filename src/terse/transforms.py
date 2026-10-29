@@ -4,6 +4,8 @@ Tier 0   — minify (whitespace) + tabularize (fold repeated KEYS of record arra
 Tier 0.5 — dictionary coding (fold repeated VALUES via an inline legend)
 Tier 0.6 — embedded JSON (fold a string leaf that is itself a JSON document, so the
            tiers above can reach records delivered double-encoded; opt-in)
+Tier 0.65 — Python literal (a non-JSON text block that is a Python `repr` of JSON-native
+           data, e.g. `str(rows)`, read as that data; whole-block, opt-in, #460)
 Tier 0.7 — cross-call diffing (encode a result as a lossless delta vs the prior
            same-tool result; stateful, applied by the proxy, opt-in)
 
@@ -27,6 +29,7 @@ Tier 1 lossy lives in `lossy.py` (truncate built; summarize / drop-to-retrieve d
 
 from __future__ import annotations
 
+import ast
 import copy
 import hashlib
 import json
@@ -42,6 +45,8 @@ DICT_MARKER = "__terse_dict__"
 DIFF_MARKER = "__terse_diff__"
 # Tier 0.6: a string leaf that is itself a JSON document (`embedded`).
 JSON_STR_MARKER = "__terse_json__"
+# Tier 0.65: a whole text block that was a Python literal (`pyliteral`, #460).
+PY_MARKER = "__terse_py__"
 # The drop-to-retrieve inline handle marker (#10). Not a transforms envelope — it is
 # produced by the lossy layer and consumed by the proxy's retrieve handler — but it lives
 # in this registry so all `__terse_*` wire keys have one home and are reserved together.
@@ -57,7 +62,7 @@ ALIAS_SIGIL = "~"
 # so it would mis-reconstruct the user's literal dict as a terse envelope. The codec
 # has no escape convention, so the only lossless move is to leave such a payload alone.
 _RESERVED_MARKERS = frozenset({TABLE_MARKER, DICT_MARKER, DIFF_MARKER, DROPPED_MARKER,
-                               JSON_STR_MARKER})
+                               JSON_STR_MARKER, PY_MARKER})
 
 # Reserved as a VALUE, not a key — the one sentinel the codec writes into a cell rather
 # than into a header. It needs its own set because `has_terse_marker` screens keys, and
@@ -286,6 +291,85 @@ def _embed_json_string(s: str, tabularize: bool = True) -> dict | None:
     return wrapper
 
 
+# `pyliteral` input caps (#460), checked BEFORE `ast.literal_eval`, which builds a full AST
+# and recurses on nesting: a size bomb costs memory, a depth bomb a RecursionError deep in
+# the parser. The depth count is of opening brackets, quotes ignored, so it can only
+# over-count and refuse a payload it could have read.
+MAX_PYLITERAL_CHARS = 8 << 20
+
+
+def _bracket_depth_exceeds(text: str, cap: int) -> bool:
+    depth = 0
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+            if depth > cap:
+                return True
+        elif ch in ")]}":
+            depth -= 1
+    return False
+
+
+def _json_native(obj: Any) -> bool:
+    """True when every node is one JSON writes back as itself: dict with str keys, list,
+    str, int, finite float, bool, None. A tuple, set, bytes or non-str key would come back
+    as something else, so its `repr` could not be rebuilt. Exact types, so a subclass with
+    its own `repr` is refused too. Iterative."""
+    stack: list[Any] = [obj]
+    while stack:
+        node = stack.pop()
+        t = type(node)
+        if t is dict:
+            if any(type(k) is not str for k in node):
+                return False
+            stack.extend(node.values())
+        elif t is list:
+            stack.extend(node)
+        elif t is float:
+            if not math.isfinite(node):
+                return False
+        elif t not in (str, int, bool, type(None)):
+            return False
+    return True
+
+
+def parse_pyliteral(text: str) -> Any:
+    """The value `text` is the exact `repr` of, or None. Only a list or dict of JSON-native
+    data qualifies, and only when `repr` of the parse gives back `text` byte for byte (the
+    same bar `embedded` sets for JSON forms): `str(rows)` from a Python MCP server passes;
+    a tuple, a set, `"` quoting or extra whitespace does not."""
+    if (not text or text[0] not in "[{" or text[-1] not in "]}"
+            or len(text) > MAX_PYLITERAL_CHARS
+            or _bracket_depth_exceeds(text, MAX_DEPTH)):
+        return None
+    try:
+        obj = ast.literal_eval(text)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
+    if (type(obj) not in (list, dict) or not _json_native(obj) or has_terse_marker(obj)
+            or repr(obj) != text):
+        return None
+    return obj
+
+
+def fold_pyliteral(text: str, *, tabularize: bool = True, dictionary: bool = True,
+                   embedded: bool = False) -> str | None:
+    """`text` as `{"__terse_py__":1,"v":V}` with V compressed by the selected tiers, or None
+    when `text` is not a Python literal (`parse_pyliteral`), when the envelope does not
+    decode back to `text` exactly, or when it is not fewer tokens than `text`."""
+    obj = parse_pyliteral(text)
+    if obj is None:
+        return None
+    out = compress_with({PY_MARKER: 1, "v": obj}, tabularize=tabularize,
+                        dictionary=dictionary, embedded=embedded)
+    try:
+        if decompress(out) != text:
+            return None
+    except (ValueError, TypeError, KeyError, RecursionError):
+        return None
+    return out if _tok_text(out) < _tok_text(text) else None
+
+
 def _fold_records(records: list[dict], embedded: bool = False,
                   union_keys: list | None = None,
                   absent_columns: set | None = None,
@@ -452,6 +536,8 @@ def decompress_structure(obj: Any) -> Any:
                 # the plain minified form, which is the safe outcome.
                 raise ValueError(f"unknown embedded-JSON form {obj['f']!r}")
             return json.dumps(decompress_structure(obj["v"]), **kwargs)
+        if obj.get(PY_MARKER) == 1 and "v" in obj:
+            return repr(decompress_structure(obj["v"]))
         return {k: decompress_structure(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [decompress_structure(item) for item in obj]

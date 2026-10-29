@@ -50,8 +50,15 @@ def measure_payload(raw: str) -> dict[str, Any]:
         applicable = False
     if not applicable:
         # Non-JSON (long-text / other) or too-deep: Tier-0 is a pass-through. Lossless
-        # trivially; any real saving here would come from the (unbuilt, opt-in) lossy tier.
+        # trivially. The one lossless saving left is the opt-in `pyliteral` fold (#460), a
+        # block that is the exact `repr` of JSON-native data; `fold_pyliteral` carries its
+        # own exact-decode gate, so a fold it returns is one the proxy would emit.
         raw_tok = count_cl100k(raw)
+        folded = transforms.fold_pyliteral(raw) if obj is None else None
+        py_saved = 0
+        if folded is not None and raw_tok is not None:
+            py_tok = count_cl100k(folded)
+            py_saved = raw_tok - py_tok if py_tok is not None else 0
         row: dict[str, Any] = {
             "shape": shape,
             "applicable": False,
@@ -61,7 +68,7 @@ def measure_payload(raw: str) -> dict[str, Any]:
             "cl100k": {"raw": raw_tok, "minified": raw_tok, "tabular": raw_tok,
                        "compressed": raw_tok, "embedded": raw_tok},
             "saved_cl100k": {"minify": 0, "tabularize": 0, "dictionary": 0, "embedded": 0,
-                             "tier_total": 0},
+                             "pyliteral": py_saved, "tier_total": py_saved},
         }
         return row
 
@@ -133,6 +140,8 @@ def measure_payload(raw: str) -> dict[str, Any]:
         # (`raw - compressed`), which is what the proxy would actually deliver — not 0,
         # which would argue for passthrough on a tool that compresses fine.
         "tier_total": _saved(raw_tok, emb_tok if embedded_ok else cmp_tok),
+        # A JSON payload is never a Python literal (#460).
+        "pyliteral": 0,
     }
     if not gate:
         saved = dict.fromkeys(saved, 0)
@@ -212,6 +221,7 @@ def measure_joined(raws: list[str]) -> dict[str, Any] | None:
         # see measure_payload for why embedded counts, and why an embedded-gate failure
         # falls back to the default pipeline's total rather than to 0
         "tier_total": _saved(raw_tok, emb_tok if embedded_ok else cmp_tok),
+        "pyliteral": 0,
     }
     if not gate:
         saved = dict.fromkeys(saved, 0)       # same rule as measure_payload: no banking a loss

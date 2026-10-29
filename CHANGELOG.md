@@ -13,7 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- An opt-in `pyliteral` tier (#460). A text block that is the Python `repr` of a list or dict of JSON data, as `mcp-server-sqlite` and `postgres-mcp` return query rows (`str(rows)`), is read as that data and compressed like JSON, shipped as `{"__terse_py__":1,"v":...}`. It applies only when `repr` of the parse rebuilds the text exactly and the result is smaller, and refuses oversized or over-deep input before parsing. A 40-row sqlite fixture compresses to under 70% of its size. `terse measure` reports its saving, and `policy generate` adds it only where a corpus shows it winning. It adds a 40-token primer sentence where enabled. Model comprehension of the form is not yet measured, so #460 stays open.
+- `__terse_py__` is now a reserved key: a JSON payload carrying it passes through uncompressed, like the other `__terse_*` keys.
 
 ## [0.47.0] - 2026-10-29
 

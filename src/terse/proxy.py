@@ -118,7 +118,7 @@ def _args_key(arguments: Any) -> str:
 # at initialize time — so a server explains only what it can actually put on the wire.
 #
 # Measured cost of the whole primer, cl100k: header 41, table 155, dict 44, diff 190,
-# embedded 53, dropped 64, tail 8 = 555 with every gate on. A default policy emits head +
+# embedded 53, pyliteral 40 (#460), dropped 64, tail 8 = 595 with every gate on. A default policy emits head +
 # table + dict + tail = 248, since `diff` is off (#170) and embedded/dropped are per-rule.
 # Paid per wrapped server, ONCE per session since #211 — it was re-read every turn as
 # cache_read before that, which is why terse measured a 14.0% win at one wrapped server
@@ -191,6 +191,10 @@ PRIMER_EMBEDDED = (
     'returned as a STRING — read it as that document. "f" is a re-serialization tag; '
     "ignore it.\n"
 )
+PRIMER_PYLITERAL = (
+    '- Python literal {"__terse_py__":1,"v":V}: the tool returned the Python repr of V '
+    "(single quotes, True/False/None); read V as that result.\n"
+)
 PRIMER_DROPPED = (
     '- Dropped field {"__terse_dropped__":"H","bytes":N,"retrieve":"terse.retrieve"}: a '
     "large field value was omitted to save context. It is NOT lost — when you actually need "
@@ -208,8 +212,8 @@ PRIMER_TAIL = "Always reason about the fully reconstructed result."
 
 # The full assembly, for tests and for callers that want every section regardless of
 # policy. `build_primer(default_policy())` reproduces this exactly.
-TERSE_PRIMER = (PRIMER_HEAD + PRIMER_TABLE + PRIMER_DICT + PRIMER_EMBEDDED + PRIMER_DIFF
-                + PRIMER_DROPPED + PRIMER_TAIL)
+TERSE_PRIMER = (PRIMER_HEAD + PRIMER_TABLE + PRIMER_DICT + PRIMER_EMBEDDED + PRIMER_PYLITERAL
+                + PRIMER_DIFF + PRIMER_DROPPED + PRIMER_TAIL)
 
 # Clients that SAVE an over-limit tool result to a file and hand the model only its path
 # (code.claude.com/docs/en/mcp, "MCP output limits and warnings"). Keyed on
@@ -305,7 +309,7 @@ PRIMER_MODES = (PRIMER_ALWAYS, PRIMER_NEVER, PRIMER_AUTO)
 # attaches on 6 of 9 payloads -- it declines on flat, scalar-aliased results only.
 _AUTO_TABLE_KEYS = ("subcols", "absent_cols", "sentinel_cols")
 _AUTO_FORMS = (transforms.DIFF_MARKER, text_diff.DIFF_MARKER, transforms.JSON_STR_MARKER,
-               transforms.DROPPED_MARKER)
+               transforms.DROPPED_MARKER, transforms.PY_MARKER)
 
 
 def _node_needs_primer(node: Any) -> bool:
@@ -369,13 +373,14 @@ def build_primer(pol: policy_mod.Policy, server: str | None = None) -> str:
     """
     return _assemble_primer(
         table=pol.emits_table(server), dictionary=pol.emits_dict(server),
-        embedded=pol.emits_embedded(server),
+        embedded=pol.emits_embedded(server), pyliteral=pol.emits_pyliteral(server),
         diff=pol.emits_diff(server), dropped=pol.has_drop(server),
     )
 
 
 def _assemble_primer(*, table: bool, dictionary: bool, diff: bool, dropped: bool,
-                     embedded: bool = False, structured: bool = False) -> str:
+                     embedded: bool = False, pyliteral: bool = False,
+                     structured: bool = False) -> str:
     """Join the selected sections, or "" when none are selected.
 
     `structured` (#463) never makes a primer non-empty on its own: the wrapper only ever
@@ -384,6 +389,7 @@ def _assemble_primer(*, table: bool, dictionary: bool, diff: bool, dropped: bool
         (table, PRIMER_TABLE),
         (dictionary, PRIMER_DICT),
         (embedded, PRIMER_EMBEDDED),
+        (pyliteral, PRIMER_PYLITERAL),
         (diff, PRIMER_DIFF),
         (dropped, PRIMER_DROPPED),
     ) if gate)
@@ -411,6 +417,7 @@ def union_primer(pairs: list[tuple[policy_mod.Policy, str | None]], *,
         table=any(p.emits_table(s) for p, s in pairs),
         dictionary=any(p.emits_dict(s) for p, s in pairs),
         embedded=any(p.emits_embedded(s) for p, s in pairs),
+        pyliteral=any(p.emits_pyliteral(s) for p, s in pairs),
         diff=any(p.emits_diff(s) for p, s in pairs),
         dropped=any(p.has_drop(s) for p, s in pairs),
         structured=structured_wrap and any(p.rewrites_structured(s) for p, s in pairs),
@@ -1464,7 +1471,7 @@ class Interceptor:
         when it is smaller. Updates the per-tool diff base. Returns `(changed, reason)`,
         where `reason` is the Phase 1 instrumentation datum — a short label for WHY the
         diff did/didn't fire (no_prior | keyframe | emitted | not_smaller_same_args |
-        not_smaller_diff_args | text_emitted | text_dropped | non_json | passthrough |
+        not_smaller_diff_args | text_emitted | text_dropped | pyliteral | non_json | passthrough |
         error), for the ledger.
 
         Three labels the ledger carries do NOT originate here, so the enumeration above is
@@ -1516,6 +1523,19 @@ class Interceptor:
             # misreports file-read/log-tail traffic.
             changed = self._text_diff_or_store(block, tool, text)
             return changed, ("text_emitted" if changed else "non_json")
+
+        if "pyliteral" in applied.tiers:
+            # A Python-literal block (#460): not JSON on the wire, so no JSON diff base
+            # either way, and the model's previous same-tool result is now this envelope,
+            # so the JSON and text diff bases are both stale.
+            self.last.pop(tool, None)
+            self.last_args.pop(tool, None)
+            self.last_joined.pop(tool, None)
+            self.since_keyframe.pop(tool, None)
+            self.last_text.pop(tool, None)
+            self.since_text_keyframe.pop(tool, None)
+            block["text"] = applied.text
+            return True, "pyliteral"
 
         chosen = applied.text
         reason = "non_json"  # curr unparseable/too-deep: no JSON diff decision was possible

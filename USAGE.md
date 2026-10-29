@@ -174,8 +174,8 @@ nothing at all. The same 1/3/6-server sweep re-run against it is flat — **-3.8
 / -3.5%** weighted — where it used to degrade from -9.2% to +17.4%.
 
 So consolidate for the operational reasons above, not to rescue a scaling loss. The
-router keeps one shared `union_primer`, which is a boolean OR over five fixed sections
-rather than a concatenation of N — bounded at 555 cl100k tokens whether it fronts 1 peer
+router keeps one shared `union_primer`, which is a boolean OR over six fixed sections
+rather than a concatenation of N — bounded at 595 cl100k tokens whether it fronts 1 peer
 or 20 — and since #212 it is lazy too: attached once per session to the first result from
 any peer that carries a terse wire form, and not at all in a session that never gets one.
 Until that first primer has attached, a router passes any result carrying `structuredContent`
@@ -800,6 +800,34 @@ It is **opt-in**, like every tier that costs a primer paragraph: a form the clie
 about enlarges that server's primer (#168), so a server that never double-encodes should
 not pay for the explanation. `policy generate` / `policy autotune` will add it where the
 measurement justifies it.
+
+### Reading a Python-literal result (`"pyliteral"`)
+
+Some Python MCP servers return query rows as the Python `repr` of a list, not as JSON
+(`mcp-server-sqlite`'s `read_query`, `postgres-mcp`):
+
+```
+[{'id': 1, 'name': 'Ada', 'active': True, 'note': None}, {'id': 2, ...}]
+```
+
+That is not JSON, so every other tier passes it through at 0%. The `pyliteral` tier reads
+it as the data it spells, then compresses that data like any other payload. Add it to the
+rule for that server:
+
+```json
+{ "match": { "tool": "sqlite.*" },
+  "tiers": ["minify", "tabularize", "dictionary", "pyliteral"] }
+```
+
+The result ships as `{"__terse_py__":1,"v":<the rows>}`. It applies only when the Python
+`repr` of what it read is the original text, character for character, so a tuple, a set,
+bytes, a non-string key or hand-written spacing passes through unchanged. It also applies
+only when the result gets smaller.
+
+It is **opt-in** and adds one sentence to that server's primer. Model comprehension of the
+form has not been measured yet (#460), so enable it on a server you have seen return this
+shape, and check its answers. `policy generate` adds it only where a captured corpus shows
+it saving tokens.
 
 ### Compressing `structuredContent` (`"structured": "compress"`)
 

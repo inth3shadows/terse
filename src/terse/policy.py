@@ -30,7 +30,7 @@ from typing import Any
 from . import lossy as lossy_mod
 from . import transforms
 
-VALID_TIERS = ("minify", "tabularize", "dictionary", "embedded")
+VALID_TIERS = ("minify", "tabularize", "dictionary", "embedded", "pyliteral")
 
 # What `defaults.tiers` means when a policy file omits it. Deliberately NOT `VALID_TIERS`:
 # `embedded` is opt-in, so widening the valid set must not silently switch a new tier on for
@@ -450,6 +450,10 @@ class Policy:
         """True if `embedded` is reachable, so a `__terse_json__` envelope can appear."""
         return "embedded" in self.reachable_tiers(server)
 
+    def emits_pyliteral(self, server: str | None = None) -> bool:
+        """True if `pyliteral` is reachable, so a `__terse_py__` envelope can appear."""
+        return "pyliteral" in self.reachable_tiers(server)
+
     def emits_diff(self, server: str | None = None) -> bool:
         """True if a `__terse_diff__` / `__terse_textdiff__` envelope can appear.
 
@@ -849,6 +853,17 @@ def apply(raw: str, tool: str, policy: Policy,
         # RecursionError: nesting so deep even the C parser blows the stack — the
         # depth guard below can't run on what never parsed.
         #
+        # `pyliteral` (#460) first: a block that is the exact `repr` of JSON-native data
+        # (`str(rows)` from a Python server) is read as that data. Lossless only; lossy
+        # field rules address JSON paths and do not reach it.
+        if "pyliteral" in rule.tiers:
+            folded = transforms.fold_pyliteral(
+                raw, tabularize="tabularize" in rule.tiers,
+                dictionary="dictionary" in rule.tiers, embedded="embedded" in rule.tiers)
+            if folded is not None:
+                return Applied(text=folded, tool=tool, tiers=rule.tiers, skipped=False,
+                               warnings=warnings)
+        #
         # The lossless codec has nothing to fold in prose, so a long-text payload used to
         # end here at 0% saved. Tier-1 lossy CAN reach it, addressed by span instead of by
         # field (`$text.code_blocks`) — same opt-in, same fail-closed contract, same
@@ -890,8 +905,10 @@ def apply(raw: str, tool: str, policy: Policy,
                        warnings=warnings + ["payload holds a number JSON cannot write (NaN, "
                                             "or past float range); passed through "
                                             "uncompressed"])
-    return Applied(text=text, tool=tool, tiers=tiers, skipped=False, warnings=warnings,
-                   drop_origins=drop_origins)
+    # `pyliteral` never fires on a JSON payload, so it is not reported as applied: the
+    # proxy reads it in `tiers` as "this block was a Python literal".
+    return Applied(text=text, tool=tool, tiers=tuple(t for t in tiers if t != "pyliteral"),
+                   skipped=False, warnings=warnings, drop_origins=drop_origins)
 
 
 def _unwritable(text: str, data: Any) -> bool:
@@ -980,6 +997,7 @@ def apply_joined(raws: list[str], tool: str, policy: Policy,
     text, tiers = _lossless_stage(data, rule, warnings)
     if _unwritable(text, data):
         return None, None, JOIN_REFUSED_NON_FINITE   # per-block `apply` passes each through
-    return (Applied(text=text, tool=tool, tiers=tiers, skipped=False, warnings=warnings,
+    return (Applied(text=text, tool=tool, tiers=tuple(t for t in tiers if t != "pyliteral"),
+                    skipped=False, warnings=warnings,
                     drop_origins=drop_origins),
             objs, "")

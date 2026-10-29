@@ -52,6 +52,7 @@ from terse.proxy import (
     PRIMER_DROPPED,
     PRIMER_EMBEDDED,
     PRIMER_HEAD,
+    PRIMER_PYLITERAL,
     PRIMER_TABLE,
     PRIMER_TAIL,
     _assemble_primer,
@@ -63,14 +64,15 @@ REPO = Path(__file__).resolve().parent.parent
 
 # The names are POSITIONING's row labels, so the table test can look each row up directly.
 SECTIONS = {"head": PRIMER_HEAD, "table": PRIMER_TABLE, "dict": PRIMER_DICT,
-            "embedded": PRIMER_EMBEDDED, "diff": PRIMER_DIFF, "dropped": PRIMER_DROPPED,
+            "embedded": PRIMER_EMBEDDED, "pyliteral": PRIMER_PYLITERAL,
+            "diff": PRIMER_DIFF, "dropped": PRIMER_DROPPED,
             "tail": PRIMER_TAIL}
 
 # Every gate on, which is what "full-gate ceiling" means: the largest primer any policy can
 # produce. Computed, not summed from SECTIONS — the assembly is what ships, and a future
 # joiner or separator between sections would make the sum a different number from the truth.
 FULL = count_cl100k(_assemble_primer(table=True, dictionary=True, diff=True, dropped=True,
-                                     embedded=True))
+                                     embedded=True, pyliteral=True))
 
 # Sizes a real install actually PAYS, as against sizes the primer can be made to have.
 # The distinction is #224: 555 is a live size, so the membership sweep below passed on it
@@ -83,8 +85,8 @@ INSTALLED = {count_cl100k(build_primer(default_policy()))} | {
     for s in ("runecho", "kb", "codegraph", "secret-broker", "gh", None)
 } - {0}
 
-# Every size the assembly can actually produce — all 32 gate combinations. A ROUTER's
-# union_primer is a boolean OR over the five gates, so any of these is reachable in prose
+# Every size the assembly can actually produce — all 64 gate combinations. A ROUTER's
+# union_primer is a boolean OR over the six gates, so any of these is reachable in prose
 # about routers: POSITIONING publishes 438 (diff on, embedded/dropped off) for exactly that
 # case. 438 is a true live size that `INSTALLED` does not contain, and it slipped the sweep
 # only because the sentence says "it pays 438" with no `tokens` after it — one wording
@@ -93,8 +95,8 @@ INSTALLED = {count_cl100k(build_primer(default_policy()))} | {
 REACHABLE = {
     count_cl100k(_assemble_primer(table=bool(m & 1), dictionary=bool(m & 2),
                                   embedded=bool(m & 4), diff=bool(m & 8),
-                                  dropped=bool(m & 16)))
-    for m in range(32)
+                                  dropped=bool(m & 16), pyliteral=bool(m & 32)))
+    for m in range(64)
 } - {0}
 
 COVERED = ("README.md", "USAGE.md", "docs/POSITIONING.md", "src/terse/policy.py")

@@ -280,8 +280,8 @@ off by default because it failed rung 4 at the measured hit rate.
   and which multiproxy supplies per-peer from each peer's `name`. Without it, matching is
   unchanged (bare names only). A tool that already self-prefixes is never double-qualified
   (`kb.read.search` under server `kb` stays `kb.read.search`, not `kb.kb.read.search`).
-- **Tiers:** any subset of `minify` / `tabularize` / `dictionary` / `embedded`. `minify` is
-  implied by serialization (a warning is emitted if omitted). `[]` = passthrough.
+- **Tiers:** any subset of `minify` / `tabularize` / `dictionary` / `embedded` / `pyliteral`.
+  `minify` is implied by serialization (a warning is emitted if omitted). `[]` = passthrough.
   `VALID_TIERS` and `DEFAULT_TIERS` are deliberately distinct: a policy file that omits
   `defaults.tiers` gets `DEFAULT_TIERS`, so adding a tier to the valid set never silently
   switches it on for configs already on disk.
@@ -292,6 +292,18 @@ off by default because it failed rung 4 at the measured hit rate.
   original string byte-for-byte; `f` records which. Declines duplicate keys, `1.50`/`1.5e0`
   renormalization, unusual whitespace, and any embedded `__terse_*` key. The form ids are a
   wire contract — append, never edit, or payloads already encoded decode wrong.
+- **`pyliteral` (opt-in, #460):** a whole non-JSON text block that is the exact `repr` of
+  a list or dict of JSON-native data (`str(rows)` from `mcp-server-sqlite`) becomes
+  `{"__terse_py__":1,"v":...}` with `v` compressed by the rule's other tiers
+  (`transforms.fold_pyliteral`). `parse_pyliteral` refuses anything over
+  `MAX_PYLITERAL_CHARS` or with bracket depth past `MAX_DEPTH` before calling
+  `ast.literal_eval`, refuses non-JSON-native types (tuple, set, bytes, non-str keys) and
+  reserved markers, and requires `repr(parsed) == text`. The fold then requires the
+  envelope to decode back to the text and to cost fewer tokens. Tried in `policy.apply`'s
+  non-JSON branch before text drops. The proxy records it as diff reason `pyliteral` and
+  clears the tool's JSON and text diff bases, as for a text drop. `measure` credits it as
+  `saved_cl100k.pyliteral`; `policy generate` offers it by the same marginal test as
+  `embedded`. Lossless only: lossy field rules address JSON paths and do not reach it.
 - **`structured` (default `"auto"`, #128):** `"compress"` also runs this tool's
   `structuredContent` through the codec, replacing the typed field with a terse envelope.
   MCP 2025-06-18 lets a tool return that field beside a text block mirroring it, and
@@ -666,7 +678,7 @@ by the next patch (PyPI versions cannot be re-uploaded).
   since reused for another.
 - **Cross-call diffing is built and OPT-IN (`proxy --diff` / policy
   `"diff": true`).** Default-off since #170: the tier is correct, but its primer
-  paragraph is 34% of the primer (190 of 555) and the live ledger shows a 0.38% hit rate.
+  paragraph is 32% of the primer (190 of 595) and the live ledger shows a 0.38% hit rate.
  The probe shows 91% overlap between successive
   same-tool calls; the proxy emits a lossless delta against the prior result (keyed row
   diff for record arrays, shallow key diff for objects) instead of the full payload. It
@@ -768,9 +780,11 @@ by the next patch (PyPI versions cannot be re-uploaded).
 
 <!-- docvet:anchors
 CLAUDE_CONFIG -> src/terse/install_mcp.py
+MAX_PYLITERAL_CHARS -> src/terse/transforms.py
 NO_COLOR -> src/terse/terminal_report.py
 TERSE_MCP_CMD -> src/terse/install_mcp.py
 XDG_STATE_HOME -> src/terse/stats.py
+fold_pyliteral -> src/terse/transforms.py
 has_nonobject_params -> src/terse/proxy.py
 install-mcp -> src/terse/cli.py
 mcp-status -> src/terse/cli.py
