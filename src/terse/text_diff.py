@@ -46,6 +46,12 @@ _MOD = (1 << 61) - 1  # a Mersenne prime; keeps the rolling hash cheap and well-
 _POW = pow(_BASE, _WINDOW - 1, _MOD)
 _MASK = (1 << _MASK_BITS) - 1
 
+# Largest prior/current text diffed at all. `_chunk` is a per-character pure-Python loop run
+# four times per call (prev, curr, and both again in the verifying decode) on the proxy's
+# reply thread: a 3 MB result stalled it ~12s, again on every repeat call. Past this size
+# the result is sent whole instead; the target workload is KB-scale text anyway.
+_MAX_DIFF_CHARS = 256 * 1024
+
 
 def _chunk(text: str) -> list[str]:
     """Split text into content-defined chunks. Deterministic and position-independent:
@@ -80,7 +86,9 @@ def _chunk(text: str) -> list[str]:
 
 
 def _fingerprint(chunk: str) -> str:
-    return hashlib.sha1(chunk.encode("utf-8")).hexdigest()[:16]
+    # surrogatepass: a lone surrogate in tool text made a strict encode raise, which
+    # switched the diff off for that tool (fail-open, but steerable by the server).
+    return hashlib.sha1(chunk.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
 
 def text_diff_encode(prev: str, curr: str) -> dict[str, Any] | None:
@@ -89,6 +97,8 @@ def text_diff_encode(prev: str, curr: str) -> dict[str, Any] | None:
     before it is returned, so a caller never has to trust the greedy match itself --
     a hash collision between two different chunks just fails the check and falls
     through to None (fail-closed, same contract as `transforms.diff_encode`)."""
+    if len(prev) > _MAX_DIFF_CHARS or len(curr) > _MAX_DIFF_CHARS:
+        return None
     prev_chunks = _chunk(prev)
     if not prev_chunks:
         return None
@@ -155,7 +165,7 @@ def text_diff_wire(prev: str, curr: str, tool: str = "") -> str | None:
     diff = text_diff_encode(prev, curr)
     if diff is None:
         return None
-    base = hashlib.sha1(prev.encode("utf-8")).hexdigest()[:8]
+    base = hashlib.sha1(prev.encode("utf-8", "surrogatepass")).hexdigest()[:8]
     label = f" {tool}" if tool else ""
     note = (f"Text diff of the previous{label} result above: rebuild by processing "
             '"ops" in order -- ["=",a,b] copies chunks a..b of the PRIOR text (same '

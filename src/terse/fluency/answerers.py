@@ -28,7 +28,11 @@ from collections.abc import Callable
 # check at all while this module did — the parity gap that motivated centralizing it.
 # `_LOOPBACK_HOSTS` is re-exported (not redefined) to keep `fluency._LOOPBACK_HOSTS`
 # importable for the existing tests while there is still only one definition.
-from ..transport import _LOOPBACK_HOSTS, guard_cleartext_credential  # noqa: F401
+from ..transport import (  # noqa: F401
+    _LOOPBACK_HOSTS,
+    guard_cleartext_credential,
+    guarded_opener,
+)
 
 # An answerer takes (system_prompt, user_prompt) and returns the model's reply text, or
 # **None** when the backend produced no content at all. Empty system_prompt means "no
@@ -61,7 +65,7 @@ def openai_answerer(base_url: str, api_key: str, model: str,
         req = urllib.request.Request(url, data=body, headers={
             "Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
         })
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with guarded_opener(url).open(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         # Some OpenAI-compatible gateways return 200 with an error body (no choices);
         # surface a clear message instead of a bare KeyError.

@@ -932,6 +932,10 @@ fails or the log itself hits a bug, terse warns once on stderr and turns the wir
 for that process. Proxying
 carries on as before.
 
+Each connection's file is capped at 512 MiB. At the cap terse writes one `truncated` event,
+warns on stderr, and logs nothing more for that connection. Set
+`TERSE_WIRE_LOG_MAX_BYTES` to change the cap (`0` = unlimited).
+
 It holds raw tool payloads, the same kind of content as Claude Code's own transcripts.
 Treat the directory that way: keep it local and don't sync it. The full record schema is
 in TECHNICAL.md ("Wire log").

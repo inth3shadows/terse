@@ -44,7 +44,9 @@ def measure_payload(raw: str) -> dict[str, Any]:
         # as not-applicable with zero savings, instead of crashing `terse measure`.
         if transforms.exceeds_depth(obj):
             applicable = False
-    except (json.JSONDecodeError, TypeError, RecursionError):
+    except (ValueError, TypeError, RecursionError):
+        # ValueError covers JSONDecodeError AND the int-digit limit (a 5000-digit
+        # integer literal raises a plain ValueError from json.loads).
         applicable = False
     if not applicable:
         # Non-JSON (long-text / other) or too-deep: Tier-0 is a pass-through. Lossless

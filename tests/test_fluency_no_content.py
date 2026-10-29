@@ -37,13 +37,20 @@ from terse.fluency.scoring import score
 from terse.report import _unmeasured
 
 
+def _opener_with(fake_urlopen):
+    """The bearer-key senders open through `transport.guarded_opener` (a private opener with
+    the redirect guards), not the module-global `urlopen`; stub the opener it builds."""
+    return lambda *handlers: type("_Opener", (), {"open": staticmethod(fake_urlopen)})()
+
+
+
 def _gateway(monkeypatch, choice: dict):
     """Stub the HTTP layer so a real `openai_answerer` sees `choice` verbatim."""
     class _Resp(io.BytesIO):
         def __enter__(self): return self
         def __exit__(self, *a): return False
     payload = json.dumps({"choices": [choice]}).encode()
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp(payload))
+    monkeypatch.setattr(urllib.request, "build_opener", _opener_with(lambda *a, **k: _Resp(payload)))
     return openai_answerer("https://api.example/v1", "k", "empty-replying-model")
 
 
@@ -128,7 +135,7 @@ def test_dropeval_no_content_is_an_error_not_a_wrong_answer(monkeypatch, capsys)
         def __exit__(self, *a): return False
     def gw(choice):
         payload = json.dumps({"choices": [choice]}).encode()
-        monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp(payload))
+        monkeypatch.setattr(urllib.request, "build_opener", _opener_with(lambda *a, **k: _Resp(payload)))
         return openai_tool_answerer("https://api.example/v1", "k", "m", [])
 
     # All four no-content shapes, matching the fluency side rather than only `null` —

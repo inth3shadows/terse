@@ -44,6 +44,12 @@ ALL_SHORT_PAYLOAD = {"result": [
     {"id": 2, "body": "short-b"},
 ]}
 
+def _opener_with(fake_urlopen):
+    """The bearer-key senders open through `transport.guarded_opener` (a private opener with
+    the redirect guards), not the module-global `urlopen`; stub the opener it builds."""
+    return lambda *handlers: type("_Opener", (), {"open": staticmethod(fake_urlopen)})()
+
+
 
 def _miss_text_from_proxy(handle: str) -> str:
     """Ground truth for a retrieve miss: drive the REAL proxy.Interceptor.answer_retrieve
@@ -381,8 +387,7 @@ def test_openai_tool_answerer_sends_sanitized_name_and_maps_the_reply_back(monke
     # A real endpoint echoes back the SANITIZED name it was given, so the adapter must
     # map it home — otherwise `_run_question`'s `c.name == RETRIEVE_TOOL` filter never
     # matches and every retrieve call is scored as "didn't retrieve".
-    monkeypatch.setattr(urllib.request, "urlopen",
-                        _fake_urlopen(captured, "terse_retrieve"))
+    monkeypatch.setattr(urllib.request, "build_opener", _opener_with(_fake_urlopen(captured, "terse_retrieve")))
     ask = dropeval.openai_tool_answerer("http://127.0.0.1:1/v1", "k", "m", tools=[RETRIEVE_TOOL_DEF])
     turn = ask([{"role": "user", "content": "hi"}])
 

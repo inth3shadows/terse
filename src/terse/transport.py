@@ -19,8 +19,11 @@ import ipaddress
 import json
 import os
 import queue
+import re
 import socket
 import subprocess
+import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
@@ -32,6 +35,34 @@ from urllib.parse import urlsplit
 # otherwise stream an unbounded body and exhaust memory. Generous — real tool outputs are
 # large — but finite; an over-limit response becomes a legible JSON-RPC error, not an OOM.
 _MAX_RESPONSE_BYTES = 128 * 1024 * 1024
+
+# The same bound for ONE stdio line, in characters. A stdio downstream that writes gigabytes
+# without a newline would otherwise be buffered whole by `readline` until the proxy OOMs.
+_MAX_LINE_CHARS = _MAX_RESPONSE_BYTES
+
+# Wall-clock ceiling on one HTTP request, response body included. `timeout` is per socket
+# operation, so a server dripping one byte every 59s holds the (synchronous) client->server
+# pump forever without ever tripping it. Generous, because a long tool call that streams
+# progress over SSE is legitimate: an hour by default, `TERSE_HTTP_DEADLINE_S` to change it
+# (0 = no ceiling, the old behaviour).
+_RESPONSE_DEADLINE_S = 60 * 60
+
+
+def _response_deadline_s() -> float:
+    raw = os.environ.get("TERSE_HTTP_DEADLINE_S")
+    if raw is None:
+        return _RESPONSE_DEADLINE_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return _RESPONSE_DEADLINE_S
+    return value if value > 0 else float("inf")
+
+# How much of a non-JSON-RPC error body is quoted back in the synthesized error message
+# (a JSON-RPC-shaped body is forwarded verbatim, whole, as before).
+_MAX_ERROR_DETAIL_CHARS = 1 << 20
+
+_VALID_SESSION_ID = re.compile(r"[\x21-\x7e]{1,1024}")
 
 # The only downstream URL schemes terse will dial. `urllib.request.urlopen` also
 # honors `file://`, `ftp://`, `data:` and more — so an unrestricted scheme turns a
@@ -147,6 +178,14 @@ class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
             raise urllib.error.HTTPError(
                 newurl, code, f"terse: refusing redirect to link-local/metadata address "
                 f"{parts.hostname!r} — the cloud instance-metadata SSRF target", headers, fp)
+        # A 307/308 re-sends the POST BODY — the tool call's arguments, often repo content —
+        # and only headers are stripped below. Same-origin keeps working; a cross-origin one
+        # is refused rather than handing another host the payload.
+        if code in (307, 308) and _origin(newurl) != self._origin \
+                and not _is_https_upgrade(self._origin, _origin(newurl)):
+            raise urllib.error.HTTPError(
+                newurl, code, f"terse: refusing cross-origin {code} redirect to "
+                f"{parts.hostname!r} — it would re-send the request body there", headers, fp)
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is None:
             return None
@@ -158,6 +197,13 @@ class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
                          if any(t in h.lower() for t in _SENSITIVE_HEADER_TOKENS)]:
                 del new.headers[name]
         return new
+
+
+def _is_https_upgrade(old: tuple[str, str, int | None],
+                      new: tuple[str, str, int | None]) -> bool:
+    """`http://h` -> `https://h` on the default ports: the same server moving to TLS, and
+    for a POST the only redirect that keeps the body (a 301/302 turns it into a GET)."""
+    return old == ("http", new[1], 80) and new == ("https", old[1], 443)
 
 
 def _as_ip(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -198,6 +244,54 @@ def _canonical_host(hostname: str | None) -> str:
     return str(ip) if ip is not None else hostname.lower().rstrip(".")
 
 
+def _refuse_metadata_peer(sock: socket.socket) -> None:
+    """Close `sock` and raise if it is connected to a metadata address. The URL checks only
+    see the NAME: `169.254.169.254.nip.io`, or any attacker domain with that A record (or
+    one that rebinds to it between check and connect), passed them all. The connected peer
+    is what the resolver actually chose, so this is the check that cannot be talked past."""
+    peer = sock.getpeername()[0]
+    if _is_metadata_host(str(peer)):
+        sock.close()
+        raise OSError(f"terse: refusing connection — the host resolved to "
+                      f"link-local/metadata address {peer}")
+
+
+class _CheckedHTTPConnection(http.client.HTTPConnection):
+    def connect(self) -> None:
+        super().connect()
+        _refuse_metadata_peer(self.sock)
+
+
+class _CheckedHTTPSConnection(http.client.HTTPSConnection, _CheckedHTTPConnection):
+    # MRO: HTTPSConnection.connect -> _CheckedHTTPConnection.connect (TCP + peer check) ->
+    # back in HTTPSConnection for the TLS wrap, so a refused peer never gets a handshake.
+    pass
+
+
+class _CheckedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(_CheckedHTTPConnection, req)
+
+
+class _CheckedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        kwargs: dict[str, Any] = {"context": getattr(self, "_context", None)}
+        check_hostname = getattr(self, "_check_hostname", None)  # 3.11 only; gone in 3.12
+        if check_hostname is not None:
+            kwargs["check_hostname"] = check_hostname
+        return self.do_open(_CheckedHTTPSConnection, req, **kwargs)
+
+
+def guarded_opener(url: str) -> urllib.request.OpenerDirector:
+    """An opener whose redirects re-apply this module's guards on every hop (scheme,
+    metadata address, cleartext credential, cross-origin credential strip), and whose
+    connections refuse a metadata PEER whatever name resolved to it. The one thing any
+    caller sending a bearer key to an operator-supplied URL should use instead of the
+    module-global `urlopen`, which forwards `Authorization` to wherever a 3xx points."""
+    return urllib.request.build_opener(_GuardedRedirectHandler(url), _CheckedHTTPHandler(),
+                                       _CheckedHTTPSHandler())
+
+
 def _is_metadata_host(hostname: str | None) -> bool:
     """True for a link-local target — the cloud instance-metadata SSRF endpoint
     (169.254.169.254 across AWS/Azure/GCP/DO, fe80::/10, and GCP's
@@ -210,7 +304,18 @@ def _is_metadata_host(hostname: str | None) -> bool:
     if hostname.lower().rstrip(".") == "metadata.google.internal":
         return True
     ip = _as_ip(hostname)   # every encoding the resolver accepts, not just dotted-quad
-    return ip is not None and ip.is_link_local
+    if ip is None:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return ip.is_link_local or ip in _METADATA_IPS or (mapped is not None and (
+        mapped.is_link_local or mapped in _METADATA_IPS))
+
+
+# Instance-metadata endpoints OUTSIDE link-local, so `is_link_local` alone missed them:
+# Alibaba/Tencent (100.100.100.200, carrier-grade NAT space), Oracle (192.0.0.192) and
+# AWS's IPv6 IMDS (fd00:ec2::254).
+_METADATA_IPS = frozenset(ipaddress.ip_address(a) for a in
+                          ("100.100.100.200", "192.0.0.192", "fd00:ec2::254"))
 
 
 class Transport(Protocol):
@@ -262,12 +367,17 @@ class StdioTransport:
         child_env = {**os.environ, **env} if env else None
         self.proc = subprocess.Popen(  # noqa: S603 — cmd is operator-supplied, by design
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
-            encoding="utf-8", env=child_env, cwd=cwd,
+            # errors="replace": a strict decode raised UnicodeDecodeError from INSIDE
+            # pump's `for raw in src`, ending the server->client thread on the first
+            # non-UTF-8 byte (a tool returning a Latin-1 file) and hanging the client.
+            # Not surrogateescape: the escaped surrogates would then fail the strict
+            # UTF-8 encode on the client-facing stdout instead.
+            encoding="utf-8", errors="replace", env=child_env, cwd=cwd,
         )
         assert self.proc.stdin is not None and self.proc.stdout is not None
 
-    def inbound(self) -> TextIO:
-        return self.proc.stdout  # type: ignore[return-value]  # already line-iterable
+    def inbound(self) -> Iterator[str]:
+        return _bounded_lines(self.proc.stdout, _MAX_LINE_CHARS)  # type: ignore[arg-type]
 
     def outbound(self) -> TextIO:
         return self.proc.stdin  # type: ignore[return-value]  # has .write()/.flush()
@@ -293,6 +403,43 @@ class StdioTransport:
 
     def wait(self) -> int:
         return self.proc.wait()
+
+
+def _bounded_lines(src: TextIO, cap: int) -> Iterator[str]:
+    """Iterate `src` line by line, never holding more than `cap + 1` characters of one
+    line. An over-cap line is discarded whole (drained to its newline) with a stderr note:
+    it cannot be forwarded intact, and a truncated JSON-RPC line is worse than none."""
+    while True:
+        line = src.readline(cap + 1)
+        if not line:
+            return
+        if len(line) > cap and not line.endswith("\n"):
+            while True:
+                rest = src.readline(cap + 1)
+                if not rest or rest.endswith("\n"):
+                    break
+            print(f"terse: dropped a downstream line longer than {cap} characters",
+                  file=sys.stderr)
+            continue
+        yield line
+
+
+def _read_bounded(resp: Any, limit: int, deadline: float) -> bytes:
+    """Read at most `limit + 1` bytes of `resp`, giving up at `deadline` (monotonic).
+    `read1` returns after at most one underlying recv, so the deadline is checked between
+    every chunk rather than only once the whole (possibly dripped) body has arrived."""
+    reader = getattr(resp, "read1", None) or resp.read
+    chunks: list[bytes] = []
+    total = 0
+    while total <= limit:
+        if time.monotonic() > deadline:
+            raise TimeoutError("downstream response did not finish within the deadline")
+        chunk = reader(min(1 << 16, limit + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
 
 
 # Sentinel that ends `HttpTransport.inbound()`'s queue-backed iterator. A plain
@@ -430,7 +577,7 @@ class HttpTransport:
         # `_GuardedRedirectHandler`). Built per-transport because the handler is bound to
         # THIS downstream's origin, which is what decides a cross-origin credential strip.
         self._own_origin = _origin(url)
-        self._opener = urllib.request.build_opener(_GuardedRedirectHandler(url))
+        self._opener = guarded_opener(url)
         self._q: queue.Queue[Any] = queue.Queue()
         # MCP Streamable HTTP session affinity: some servers pin a client to
         # server-side state via this header, set on a prior response. Captured
@@ -475,6 +622,7 @@ class HttpTransport:
             req_headers["Mcp-Session-Id"] = self.session
         req = urllib.request.Request(self.url, data=line.encode("utf-8"),
                                      headers=req_headers, method="POST")
+        deadline = time.monotonic() + _response_deadline_s()
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:  # noqa: S310
                 # Only the CONFIGURED downstream may set our session id. After a redirect
@@ -486,13 +634,15 @@ class HttpTransport:
                 # url; on a non-redirected response it equals `self.url`.)
                 if _origin(resp.geturl()) == self._own_origin:
                     sid = resp.headers.get("Mcp-Session-Id")
-                    if sid:
+                    # Visible ASCII only (0x21-0x7E, the MCP spec's own rule). A session id
+                    # with a control character made every later POST fail header validation.
+                    if sid and _VALID_SESSION_ID.fullmatch(sid):
                         self.session = sid
                 ctype = resp.headers.get("Content-Type", "")
                 # Bounded read: one byte past the cap tells us it overflowed without
                 # trusting a (possibly absent/lying) Content-Length. An over-limit body
                 # is refused with a legible error rather than being buffered to OOM.
-                body = resp.read(_MAX_RESPONSE_BYTES + 1)
+                body = _read_bounded(resp, _MAX_RESPONSE_BYTES, deadline)
                 if len(body) > _MAX_RESPONSE_BYTES:
                     self._maybe_enqueue_error(
                         line, f"terse: downstream response exceeded "
@@ -505,13 +655,16 @@ class HttpTransport:
             # like one, instead of discarding the real detail behind a generic
             # wrapper message the client can't act on.
             try:
-                raw_body = exc.read().decode("utf-8", errors="replace")
+                # Bounded like the success path: an uncapped 4xx/5xx body was the one
+                # read a hostile server could still use to exhaust memory.
+                raw_body = _read_bounded(exc, _MAX_RESPONSE_BYTES, deadline).decode(
+                    "utf-8", errors="replace")
             except Exception:  # noqa: BLE001 — reading the error body is best-effort
                 raw_body = ""
             if raw_body.strip():
                 try:
                     parsed = json.loads(raw_body)
-                except (json.JSONDecodeError, ValueError):
+                except (ValueError, RecursionError):  # JSONDecodeError is a ValueError
                     parsed = None
                 if isinstance(parsed, dict) and "jsonrpc" in parsed:
                     # Forward it verbatim ONLY if the outgoing line actually expected a
@@ -522,7 +675,7 @@ class HttpTransport:
                     if has_id:
                         self._q.put(raw_body)
                     return
-            detail = raw_body.strip() or str(exc)
+            detail = raw_body.strip()[:_MAX_ERROR_DETAIL_CHARS] or str(exc)
             self._maybe_enqueue_error(
                 line, f"terse: downstream HTTP {exc.code} {exc.reason}: {detail}")
             return
@@ -541,7 +694,13 @@ class HttpTransport:
             # client's call unanswered. Either way now: the in-flight request gets a
             # legible error instead of the client hanging forever on a reply that's
             # never coming.
-            self._maybe_enqueue_error(line, f"terse: downstream HTTP request failed: {exc}")
+            # A ValueError here is http.client rejecting a header value, and its text
+            # QUOTES that value — `Invalid header value b'Bearer <secret>\\n'` for a token
+            # read with a trailing newline. The reply reaches the client, the model and the
+            # wire log, so name the failure without echoing it.
+            reason = ("invalid request header value (not shown: it may be a credential)"
+                      if type(exc) is ValueError else str(exc))
+            self._maybe_enqueue_error(line, f"terse: downstream HTTP request failed: {reason}")
             return
         if "text/event-stream" in ctype:
             for msg in _iter_sse(body.decode("utf-8", errors="replace")):

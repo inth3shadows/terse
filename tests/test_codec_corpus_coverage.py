@@ -27,6 +27,12 @@ PAYLOAD = {"result": [{"id": i, "blob": {"owner": f"owner-{i}", "tags": ["x", "y
                       for i in range(1, 13)]}
 RAW_TEXT = json.dumps(PAYLOAD)
 
+def _opener_with(fake_urlopen):
+    """The bearer-key senders open through `transport.guarded_opener` (a private opener with
+    the redirect guards), not the module-global `urlopen`; stub the opener it builds."""
+    return lambda *handlers: type("_Opener", (), {"open": staticmethod(fake_urlopen)})()
+
+
 
 def _env(**extra) -> dict:
     return {"tool": "demo.list", "sha": "a" * 40, "raw": RAW_TEXT, **extra}
@@ -297,19 +303,19 @@ def test_discover_model_limits_reads_the_litellm_shape(monkeypatch):
         {"model_name": "m", "model_info": {"max_input_tokens": 4096}},
         {"model_name": "other", "model_info": {"max_input_tokens": 8}},
     ]}})
-    assert cli._discover_model_limits("http://gw/v1", "k", ["m"]) == {"m": 4096}
+    assert cli._discover_model_limits("http://localhost:4000/v1", "k", ["m"]) == {"m": 4096}
 
 
 def test_discover_model_limits_falls_back_to_context_length(monkeypatch):
     _stub_http(monkeypatch, {"/models": {"data": [{"id": "m", "context_length": 2048}]}})
-    assert cli._discover_model_limits("http://gw/v1", "k", ["m"]) == {"m": 2048}
+    assert cli._discover_model_limits("http://localhost:4000/v1", "k", ["m"]) == {"m": 2048}
 
 
 def test_discover_model_limits_is_silent_when_the_gateway_says_nothing(monkeypatch):
     """A discovery error must leave the model unlimited and the run working — a non-LiteLLM
     backend has no `/model/info`, and that is not a reason to fail an eval."""
     _stub_http(monkeypatch, {})
-    assert cli._discover_model_limits("http://gw/v1", "k", ["m"]) == {}
+    assert cli._discover_model_limits("http://localhost:4000/v1", "k", ["m"]) == {}
 
 
 def _stub_http(monkeypatch, by_path: dict[str, dict], seen: list[str] | None = None):
@@ -329,7 +335,7 @@ def _stub_http(monkeypatch, by_path: dict[str, dict], seen: list[str] | None = N
                 return _Resp(json.dumps(payload).encode())
         raise OSError("no such endpoint")
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(urllib.request, "build_opener", _opener_with(fake_urlopen))
 
 
 def test_envelope_shape_still_classifies_an_excluded_payloads_neighbours(monkeypatch):
@@ -619,7 +625,7 @@ def test_discovery_takes_the_SMALLEST_of_duplicate_deployments(monkeypatch):
         {"model_name": "m", "model_info": {"max_input_tokens": 262144}},
         {"model_name": "m", "model_info": {"max_input_tokens": 32768}},
     ]}})
-    assert cli._discover_model_limits("http://gw/v1", "k", ["m"]) == {"m": 32768}
+    assert cli._discover_model_limits("http://localhost:4000/v1", "k", ["m"]) == {"m": 32768}
 
 
 def test_discovery_reaches_an_openrouter_style_models_endpoint_under_v1(monkeypatch):

@@ -49,6 +49,11 @@ NO_SESSION = "no-session"
 _QUEUE_MAX = 16384
 _QUEUE_BYTES_MAX = 64 * 1024 * 1024
 _BATCH_MAX = 512
+# Per-file size cap. The log is lossless by design, so nothing else bounded it: a chatty or
+# hostile downstream could fill the disk through one connection's file. Past the cap one
+# `truncated` event is written and the rest of the connection is not logged.
+# `TERSE_WIRE_LOG_MAX_BYTES` overrides it; 0 means unlimited.
+_FILE_BYTES_MAX = 512 * 1024 * 1024
 # Excluded ids/progress tokens still awaiting their reply are never evicted (an evicted one
 # would let its late reply through in full); past this many the scope fails closed instead.
 _LIVE_MAX = 65536
@@ -459,8 +464,15 @@ class WireTap:
     def __init__(self, path: Path, fh: TextIO, conn: str, claude_session: str, *,
                  exclude_all: str | None = None,
                  excluded_peers: dict[str, str] | None = None, may_exclude: bool = True,
-                 queue_max: int = _QUEUE_MAX, queue_bytes_max: int = _QUEUE_BYTES_MAX):
+                 queue_max: int = _QUEUE_MAX, queue_bytes_max: int = _QUEUE_BYTES_MAX,
+                 file_bytes_max: int | None = None):
         self.path = path
+        self._file_max = _file_bytes_max() if file_bytes_max is None else file_bytes_max
+        try:
+            self._written = os.fstat(fh.fileno()).st_size   # appending: count what is there
+        except (OSError, ValueError, AttributeError):
+            self._written = 0
+        self._capped = False
         self._fh = fh
         self.conn = conn
         self.claude_session = claude_session
@@ -685,10 +697,11 @@ class WireTap:
                 freed += entry[2]
             with self._lock:
                 self._bytes -= freed
-            if self._dead or not entries:
+            if self._dead or self._capped or not entries:
                 continue                # keep draining, so close() never waits on us
             try:
-                out = "".join(self._render(seq, item) for seq, item, _ in entries)
+                out = self._within_cap([self._render(seq, item) for seq, item, _ in entries],
+                                       [seq for seq, _, _ in entries])
                 self._fh.write(out)
                 self._fh.flush()
             except (OSError, ValueError) as exc:
@@ -699,6 +712,28 @@ class WireTap:
             self._fh.close()
         except (OSError, ValueError) as exc:
             self._fail(f"write to {self.path} failed ({exc})")
+
+    def _within_cap(self, rendered: list[str], seqs: list[int]) -> str:
+        """The prefix of `rendered` that fits under the file cap; past it, a `truncated`
+        record in place of the rest, and the log stops for this connection. It takes the
+        seq of the first record it replaces: seqs in a batch can have gaps (a dropped tap
+        consumes one), so `first + i` could repeat a seq already written."""
+        if self._file_max <= 0:
+            return "".join(rendered)
+        keep: list[str] = []
+        for i, rec in enumerate(rendered):
+            size = len(rec.encode("utf-8"))
+            if self._written + size > self._file_max:
+                keep.append(self._render(seqs[i], self._event_item(
+                    "truncated", None, {"file_bytes_max": self._file_max})))
+                self._capped = True
+                sys.stderr.write(f"[terse] wire log {self.path} reached {self._file_max} "
+                                 "bytes; the rest of this connection is not logged "
+                                 "(TERSE_WIRE_LOG_MAX_BYTES)\n")
+                break
+            self._written += size
+            keep.append(rec)
+        return "".join(keep)
 
     def _fail(self, what: str) -> None:
         self._dead = True
@@ -748,6 +783,18 @@ class WireTap:
                    line=None if excluded else line, capture_status=status, origin=origin,
                    rule=rule if excluded else info)
         return json.dumps(rec, ensure_ascii=True, default=str) + "\n"
+
+
+def _file_bytes_max() -> int:
+    raw = os.environ.get("TERSE_WIRE_LOG_MAX_BYTES")
+    if raw is None:
+        return _FILE_BYTES_MAX
+    try:
+        return int(raw)
+    except ValueError:
+        sys.stderr.write(f"[terse] TERSE_WIRE_LOG_MAX_BYTES={raw!r} is not an integer; "
+                         f"using {_FILE_BYTES_MAX}\n")
+        return _FILE_BYTES_MAX
 
 
 def may_exclude(policies: Any) -> bool:
