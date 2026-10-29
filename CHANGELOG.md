@@ -30,6 +30,12 @@ Fixes from a red-team audit (2026-10-28). No finding was Critical or High.
 - `--wire-log` caps each file at 512 MiB (`TERSE_WIRE_LOG_MAX_BYTES`, `0` = unlimited).
 - certifi 2026.10.18 -> 2026.10.23 (PYSEC-2026-4320). SECURITY.md documents that `HTTP_PROXY` carries loopback traffic.
 
+## [0.45.10] - 2026-10-28
+
+### Changed
+
+- `--wire-log`: when the exclusion gate has to parse a line going to the client, it now does so before taking the client-stdout lock, so a large line being parsed no longer holds up every other server's output (#535). Records are still taken inside the lock, so the log's order is still stdout's order.
+
 ## [0.45.9] - 2026-10-28
 
 ### Fixed

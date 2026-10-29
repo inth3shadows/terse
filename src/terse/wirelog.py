@@ -518,10 +518,19 @@ class WireTap:
         """Record one physical line at `hop`. Never raises, never blocks. A write hop
         inherits the exclusion of the read this thread last tapped (or `inherit`); `force`
         excludes the line under that rule regardless."""
+        self.stage(hop, raw, peer=peer, status=status, origin=origin, inherit=inherit,
+                   force=force)()
+
+    def stage(self, hop: str, raw: str, *, peer: str | None = None,
+              status: str | None = None, origin: str | None = None,
+              inherit: Any = _INHERIT, force: str | None = None) -> Callable[[], None]:
+        """`tap` in two steps (#535): the parse and the resolver run here, on the calling
+        thread with no lock held, and the returned call takes `seq` and records the line.
+        A writer stages BEFORE taking its stream lock and calls the result inside it, so
+        the log's order is still the stream's order while a slow parse holds up nobody
+        else's write. Neither step raises."""
         if self._dead:
-            with self._lock:
-                self.dead_drops += 1
-            return
+            return self._count_dead
         try:
             line = raw[:-1] if raw.endswith("\n") else raw
             if origin is None:
@@ -536,8 +545,7 @@ class WireTap:
             state, msg = "skip", None
             resolved: list[Any] | None = None
             resolve_exc: Exception | None = None
-            trivial = scope.overflow or scope.exclude_all
-            if trivial is None:
+            if (scope.overflow or scope.exclude_all) is None:
                 try:
                     if scope.needs_parse(hop, peer, base, line):
                         # server_out strict too: a duplicate "id" must not register the
@@ -553,35 +561,49 @@ class WireTap:
                                     for e in (msg if isinstance(msg, list) else [msg])]
                     except Exception as exc:  # noqa: BLE001 — fail closed, below
                         resolve_exc = exc
-            with self._lock:
-                if self._closed:
-                    self.late_drops += 1
-                    return
-                rule: str | None
-                info: str | None
-                if trivial is not None:
-                    rule, info = trivial, None
-                else:
-                    try:
-                        if resolve_exc is not None:
-                            raise resolve_exc
-                        rule, info = scope.decide(hop, peer, state, msg, base,
-                                                  sent=status != "dropped",
-                                                  resolved=resolved)
-                    except Exception as exc:  # noqa: BLE001 — fail closed
-                        rule, info = RULE_GATE_ERROR, None
-                        self._gate_error(exc)
-                if scope.overflowed:
-                    scope.overflowed = False
-                    self._put_locked(self._event_item(
-                        "exclusion_overflow", None, {"live_max": _LIVE_MAX}), 0)
-                meta = _meta(msg) if state == "ok" else None
-                self._put_locked((hop, peer, line, status, origin, rule, info, meta, None,
-                                  None, None), len(line))
-            if read:
-                self._ctx.rule = rule
         except Exception as exc:  # noqa: BLE001 — the tap is never load-bearing
             self._fail(f"tap failed ({type(exc).__name__}: {exc})")
+            return self._count_dead
+
+        def commit() -> None:
+            try:
+                with self._lock:
+                    if self._closed:
+                        self.late_drops += 1
+                        return
+                    rule: str | None
+                    info: str | None
+                    # Read again: an overflow since staging excludes this line too.
+                    trivial = scope.overflow or scope.exclude_all
+                    if trivial is not None:
+                        rule, info = trivial, None
+                    else:
+                        try:
+                            if resolve_exc is not None:
+                                raise resolve_exc
+                            rule, info = scope.decide(hop, peer, state, msg, base,
+                                                      sent=status != "dropped",
+                                                      resolved=resolved)
+                        except Exception as exc:  # noqa: BLE001 — fail closed
+                            rule, info = RULE_GATE_ERROR, None
+                            self._gate_error(exc)
+                    if scope.overflowed:
+                        scope.overflowed = False
+                        self._put_locked(self._event_item(
+                            "exclusion_overflow", None, {"live_max": _LIVE_MAX}), 0)
+                    meta = _meta(msg) if state == "ok" else None
+                    self._put_locked((hop, peer, line, status, origin, rule, info, meta,
+                                      None, None, None), len(line))
+                if read:
+                    self._ctx.rule = rule
+            except Exception as exc:  # noqa: BLE001 — the tap is never load-bearing
+                self._fail(f"tap failed ({type(exc).__name__}: {exc})")
+
+        return commit
+
+    def _count_dead(self) -> None:
+        with self._lock:
+            self.dead_drops += 1
 
     def event(self, name: str, *, peer: str | None = None, **detail: Any) -> None:
         if self._dead:
