@@ -144,7 +144,9 @@ off by default because it failed rung 4 at the measured hit rate.
   `has_nonobject_params`: a `tools/call` or `prompts/get` whose `params` is present but
   not an object is answered -32602 by terse and never forwarded (a notification is
   dropped). Absent or null `params` counts as `{}`.
-- **`stats.py`** — the live savings ledger + `terse stats`. `build_record` /
+- **`stats.py`** — the live savings ledger + `terse stats`. A result row that dropped
+  values carries `drops` (rule path → count), and `aggregate` reports `drop_rules`: per
+  rule, values dropped, retrieves and the retrieve rate (#252). `build_record` /
   `classify_decision` produce one payload-FREE line per result (ts, version, server,
   tool, decision, char + cl100k token sizes — never content, which is what makes
   always-on safe where capture/audit must stay opt-in); the decision label is derived by
@@ -235,6 +237,46 @@ off by default because it failed rung 4 at the measured hit rate.
   ANSI color only when stdout is a tty and `NO_COLOR` is unset (piped/CI output keeps
   the shape of the win, just uncolored). Wired via `--bars` on `measure`/`verify`/
   `fluency`, printed straight to the terminal (nothing written to disk).
+- **`multiproxy.py`** — `proxy --config`: one `Router` fronting N peers (`Peer`, each with
+  its own `Interceptor`), merging their lists, routing `tools/call`/`prompts/get` to the
+  owning peer and sharing one drop-to-retrieve store. A `_PeerSender` thread per peer does
+  the writes, so a slow peer cannot block the others. `RouterSnapshot` serves cached lists
+  before the peers are up (#270). See the `--config` notes under Known Limitations.
+- **`transport.py`** — the `Transport` protocol `pump` reads and writes through:
+  `StdioTransport` (a subprocess) and `HttpTransport` (Streamable HTTP, synchronous
+  POST-then-drain, with a wall-clock deadline per request), chosen by `build_transport`.
+  `guard_cleartext_credential` refuses to send a credential (an `Authorization` header, an
+  eval's API key) over plain http to a remote host.
+- **`lossy.py`** — Tier-1 lossy primitives, pure and stateless: `truncate`,
+  `drop-to-retrieve` on JSON paths (`apply_drops`) and on text spans
+  (`apply_text_drops`, `$text.code_blocks`, with `keep_first`/`retract_after`), and the
+  deterministic gates that replace the round-trip gate for them (`acceptable_loss`,
+  `droppable_loss`). The store and the `terse.retrieve` tool live in `proxy.py`.
+- **`text_diff.py`** — Tier 0.7 for non-JSON text: a content-defined-chunking diff of a
+  tool's text result against its previous one (`text_diff_encode`/`text_diff_decode`, gated by
+  `text_diff_roundtrip_ok`).
+- **`policy_gen.py`** — `policy generate`/`policy autotune`: measures a corpus the way the
+  proxy compresses it and writes a lossless per-tool rule. Each opt-in tier is enabled only
+  on its own marginal saving, and the reported saving counts only the tiers the rule
+  carries (#562). Drop-to-retrieve candidates are suggested, never enabled.
+- **`droptune.py`** — `terse tune --from-ledger` (#252): one verdict per live drop rule
+  (`insufficient`, `retract`, `raise_keep_first`, `keep`, `watch`) from the ledger's drop
+  and retrieve counts, with fixed `THRESHOLDS`. Print-only.
+- **`dropeval.py`** — `fluency --drop-eval` / `tune --drop-eval`: a 2-turn tool-calling eval
+  of whether a real model calls `terse.retrieve` when a dropped field matters.
+- **`codeceval.py`** — the codec-tier behavioural eval (#295): does a model's downstream
+  tool argument stay identical whether it read the raw or the compressed payload.
+- **`fluency/`** — the format-fluency eval package: `questions`, `answerers`,
+  `harnesses` (raw-vs-terse, diff, soak, text-diff), `scoring`, `pack` (offline packs and
+  the primer) and `ledger` (one JSONL row per live model call).
+- **`install_mcp.py`** — `install-mcp`/`uninstall-mcp`/`mcp-status`: rewrites Claude Code
+  `mcpServers` entries (user, project or local scope) to run through `terse proxy`, or folds
+  them into one `--config` router (`wrap_multi`), and undoes it (`do_uninstall`).
+- **`history.py`** — `measure --history`: appends one summary line per run to a JSONL file
+  and reads it back for the trend.
+- **`_secure_io.py`** — creates files and directories that may hold secrets or payloads
+  with owner-only permissions set before any content is written (`write_restricted`,
+  `append_restricted`, `mkdir_restricted`).
 - **`cli.py`** — argparse dispatch for the subcommands.
 
 ## API Integrations
@@ -495,6 +537,15 @@ logged in full, unless that server is excluded as a whole.
 - `XDG_STATE_HOME` — overrides where `terse stats` persists its ledger
   (`$XDG_STATE_HOME/terse/stats.jsonl`, fallback `~/.local/state`).
 - `NO_COLOR` — when set, disables ANSI color in terminal reports (`terminal_report.py`).
+- `TERSE_HTTP_DEADLINE_S` — wall-clock limit on one HTTP downstream request, body
+  included (default 3600; `0` = none). `timeout` alone is per socket read, so a server
+  sending one byte a minute would otherwise hold the request forever (`transport.py`).
+- `TERSE_WIRE_LOG_MAX_BYTES` — per-file cap for `--wire-log` (default 512 MiB; `0` =
+  unlimited). Past it one `truncated` event is written and the connection stops logging.
+- `TERSE_FLUENCY_LEDGER` — path of the fluency eval's call ledger (default
+  `$XDG_STATE_HOME/terse/fluency-ledger.jsonl`; empty string disables it).
+- `CLAUDE_CONFIG_DIR` — where `mcp-status` reads the user `settings.json` when judging
+  whether a project server was approved (default `~/.claude/settings.json`).
 
 ## Deployment
 
@@ -669,11 +720,15 @@ by the next patch (PyPI versions cannot be re-uploaded).
   qualification only on a genuine cross-peer name collision, #168) and sharing one
   content-addressed drop-to-retrieve store across all of them (`multiproxy.py`). v1 scope
   is proportionate, not exhaustive: HTTP is synchronous POST-then-drain (no cross-request
-  pipelining) with no standalone GET-SSE listener for unsolicited server pushes; multi-peer
-  broadcasts (`initialize`/`tools/list`) wait on every peer up to a bounded timeout before
-  merging, and any client method outside `initialize`/`tools/list`/`tools/call` falls back
-  to peer 0 (debug-logged). Each is a documented v1 limitation, not a silent gap — revisit
-  if a real workload needs it.
+  pipelining) with no standalone GET-SSE listener for unsolicited server pushes. Methods
+  are handled four ways: `tools/call` and `prompts/get` route to the owning peer;
+  `initialize`, `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`
+  and `ping` go to every peer, wait up to a bounded timeout, and merge
+  (`_AGGREGATE_METHODS`); `resources/read`/`subscribe`/`unsubscribe` go to every peer and
+  the first success wins (`_SCATTER_METHODS`); any other method with an id
+  (`completion/complete`, `logging/setLevel`) goes to peer 0 only, with a stderr line every
+  time, not only under `--debug`. Each is a documented v1 limitation, not a silent gap —
+  revisit if a real workload needs it.
   A routed `tools/call` or `prompts/get` has **no timeout by default**, like the
   single-server proxy, so a long-running tool's real result always comes back.
   `--routed-timeout SECONDS` sets a cap: when it fires, the client gets -32001 and the peer
@@ -788,10 +843,16 @@ by the next patch (PyPI versions cannot be re-uploaded).
 
 <!-- docvet:anchors
 CLAUDE_CONFIG -> src/terse/install_mcp.py
+CLAUDE_CONFIG_DIR -> src/terse/install_mcp.py
 MAX_PYLITERAL_CHARS -> src/terse/transforms.py
 NO_COLOR -> src/terse/terminal_report.py
+TERSE_FLUENCY_LEDGER -> src/terse/fluency/ledger.py
+TERSE_HTTP_DEADLINE_S -> src/terse/transport.py
 TERSE_MCP_CMD -> src/terse/install_mcp.py
+TERSE_WIRE_LOG_MAX_BYTES -> src/terse/wirelog.py
+THRESHOLDS -> src/terse/droptune.py
 XDG_STATE_HOME -> src/terse/stats.py
+_AGGREGATE_METHODS -> src/terse/multiproxy.py
 escape_surrogates -> src/terse/transforms.py
 fold_pyliteral -> src/terse/transforms.py
 has_nonobject_params -> src/terse/proxy.py

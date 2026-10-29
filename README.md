@@ -145,6 +145,12 @@ then (optionally) serves it through a per-tool policy that decides which tiers r
 - **Tier 0.5 — dictionary code**: repeated string values *and repeated whole subtrees*
   are folded into an inline legend (`~0`, `~1`, …) proven disjoint from every literal in
   the payload. Committed only when it actually saves tokens, so it never regresses.
+- **Tier 0.6 — embedded JSON (opt-in, `"embedded"`)**: a string field that is itself a
+  JSON document (`{"response_text": json.dumps(body)}`) is folded so the tiers above can
+  reach it. Only when the original string can be rebuilt byte for byte.
+- **Tier 0.65 — Python literal (opt-in, `"pyliteral"`)**: a text result that is a Python
+  `repr` of data rather than JSON (`str(rows)` from `mcp-server-sqlite`) is read as that
+  data and compressed. Only when `repr` of what was read is the original text exactly.
 - **Tier 0.7 — cross-call diff (stateful, OPT-IN — `"diff": true`)**: when the same tool is called
   repeatedly, the proxy emits a lossless delta against the prior result instead of
   the full payload (the 91%-overlap headroom). Self-describing, verified to reconstruct
@@ -288,6 +294,14 @@ src/terse/
   transforms.py  lossless tiers (minify, tabularize, dict coding) + round-trip gate
   policy.py      selective per-tool policy: load, match, apply
   proxy.py       MCP stdio middleware: compress a downstream server's tool results
+  multiproxy.py  `proxy --config`: one process fronting several servers
+  transport.py   the downstream link: a subprocess (stdio) or Streamable HTTP
+  lossy.py       opt-in lossy primitives: truncate, drop-to-retrieve
+  text_diff.py   cross-call diff for non-JSON text results
+  wirelog.py     `--wire-log`: an exact record of every line through the proxy
+  policy_gen.py  write a lossless policy from a captured corpus
+  droptune.py    `tune --from-ledger`: verdicts for live drop rules
+  install_mcp.py wrap / unwrap Claude Code MCP servers
   stats.py       live savings ledger (payload-free) + the `terse stats` aggregation
   capture.py     corpus capture (shape-tagged envelopes) + shape classifier
   measure.py     per-payload + cross-tokenizer token measurement

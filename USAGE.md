@@ -146,10 +146,20 @@ The synthetic `terse.retrieve` tool (drop-to-retrieve) is advertised once, share
 every peer, regardless of which peer dropped the field; it is a reserved name, so a peer
 exporting `terse.retrieve` is qualified rather than shadowing it.
 This is an ergonomics convenience — MCP clients can already talk to several servers
-directly — so keep expectations proportionate: broadcast requests (`initialize`,
-`tools/list`) wait on every peer up to a bounded timeout before merging what arrived, and
-methods outside `initialize`/`tools/list`/`tools/call` fall back to peer 0 for now (a
-debug-logged, documented v1 limitation, not a silent gap).
+directly — so keep expectations proportionate:
+
+- A tool call or prompt request goes to the server that owns it.
+- Listing requests (tools, prompts, resources), the opening handshake and `ping` go to
+  every server, wait up to 30 seconds, and merge what arrived.
+- Reading or subscribing to a resource goes to every server, and the first good answer
+  is kept.
+- Anything else (for example `completion/complete`) goes to the first server only, and
+  terse prints a line on stderr each time it does that.
+
+A tool call has **no time limit** by default, as with a single server, so a long-running
+tool's real result always comes back. `--routed-timeout SECONDS` sets one: past it the
+client gets error -32001 and the server is told the call was cancelled. If a server
+exits, its unanswered calls get -32001 at once instead of hanging.
 
 ### Fold your whole fleet into one proxy (`install-mcp --multiproxy`)
 
@@ -1029,9 +1039,9 @@ command that answers the what-if. The verdict is in `--json` either way, so a sc
 needs both flags.
 
 `--json` is a **contract**, not a debug dump: `tests/test_stats_json_contract.py` pins every
-field name and type at ten shapes — the top level, `total`, each `tools[]` row, each value
-of the `versions` object, each `retrieves[]` row, each `primers[]` row, each
-`router_sessions[]` row, the `primer_liability`
+field name and type at eleven shapes — the top level, `total`, each `tools[]` row, each value
+of the `versions` object, each `retrieves[]` row, each `drop_rules[]` row, each `primers[]`
+row, each `router_sessions[]` row, the `primer_liability`
 blob, each of its `servers[]` rows, and each of those rows' `contributors[]` — so a rename or
 a removal fails CI rather than a consumer's script. Things worth knowing before you
 parse it:
@@ -1093,6 +1103,14 @@ actually fired), and a per-server/per-tool breakdown — with a `diff%` column (
 tool's cross-call diff hit rate) so you can see *which* tools the diff tier is actually
 paying off on. When tiktoken wasn't available at record time the per-tool columns fall
 back to characters (`chr raw`/`chr out`), matching the header rather than showing zeros.
+
+If a drop-to-retrieve rule is live, a **drop-to-retrieve cost** table follows. One row per
+rule: how many values it dropped, how many times the model fetched one back (`calls`), the
+rate between the two, misses, and the tokens the fetches cost. A `~` beside the dropped
+count means some rows were written before drops were counted, and count as one value each.
+The rate is a floor on how often a value was needed: a model that re-reads the source
+instead of fetching shows no fetch. `terse tune --from-ledger` turns these numbers into a
+verdict per rule (see above).
 Real numbers from your real sessions, complementing the synthetic-corpus `measure` report. The ledger lives at
 `$XDG_STATE_HOME/terse/stats.jsonl` (usually `~/.local/state/terse/stats.jsonl`);
 redirect it with `proxy --stats-log FILE` or disable it with `proxy --no-stats`
