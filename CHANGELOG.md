@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.47.0] - 2026-10-29
+
 ### Added
 
 - `terse tune --from-ledger` judges each live drop-to-retrieve rule from the ledger's drop and retrieve counts and prints one verdict: `insufficient` (under 30 dropped values), `retract` (40% or more fetched back), `raise_keep_first` (retrieves cluster on early blocks), `keep` (5% or less), or `watch` (#252). It never writes a policy (`--out` is refused), offers widening only as a candidate to verify with `--drop-eval`, and prints its thresholds. `--policy`, `--since` and `--json` are supported.
