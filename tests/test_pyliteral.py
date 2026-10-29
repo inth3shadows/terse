@@ -196,3 +196,52 @@ def test_policy_generate_offers_the_tier_only_where_it_wins():
     assert "pyliteral" in by_tool["sqlite.read_query"]["tiers"]
     assert "non-JSON" not in by_tool["sqlite.read_query"]["reason"]
     assert "pyliteral" not in by_tool["gh.list"]["tiers"]
+
+
+# --- review of #559 ---
+
+def test_an_int_too_long_to_print_is_refused_not_raised():
+    """`literal_eval` reads `0xfff...` as an int `repr` cannot print (Python's int-to-str
+    digit limit). That ValueError used to escape into `terse measure` and `policy
+    generate`, which run the check on every non-JSON payload whatever the policy."""
+    raw = "[0x" + "f" * 5000 + "]"
+    assert transforms.parse_pyliteral(raw) is None
+    assert transforms.fold_pyliteral(raw) is None
+    assert measure.measure_payload(raw)["saved_cl100k"]["pyliteral"] == 0
+
+
+def test_the_size_cap_keeps_the_parse_small():
+    """The AST is what costs memory: 8 MiB of `[0, 0, ...]` peaked at ~2.6 GB."""
+    assert transforms.MAX_PYLITERAL_CHARS <= 256 << 10
+
+
+def test_brackets_inside_a_string_cannot_smuggle_depth_past_the_cap(monkeypatch):
+    """The pre-parse bracket count ignores quotes, so `)` inside a string lowers it. Today
+    CPython's own parser refuses nesting past ~200 ("too many nested parentheses"), so the
+    parse cannot return deeper than `MAX_DEPTH`; the parsed value is checked anyway, for a
+    parser that allows more. Simulated: the parse returns a value one level past the cap
+    whose `repr` is exactly the text."""
+    deep: list = [1]
+    for _ in range(transforms.MAX_DEPTH):
+        deep = [deep]
+    obj = [")" * 400, deep]
+    raw = repr(obj)
+    assert not transforms._bracket_depth_exceeds(raw, transforms.MAX_DEPTH)
+    assert transforms.exceeds_depth(obj)
+    monkeypatch.setattr(ast, "literal_eval", lambda _: obj)
+    assert transforms.parse_pyliteral(raw) is None
+
+
+def test_a_tier_below_its_bar_does_not_lift_the_tool_over_the_threshold():
+    """Like `emb_fail`: a saving the generated rule will not deliver must not decide
+    whether the tool is compressed at all."""
+    envs = ([{"tool": "mixed", "raw": _sqlite_rows(30)}]
+            + [{"tool": "mixed", "raw": json.dumps({"items": [{"id": i, "state": "open"}
+                                                             for i in range(8)]}, indent=1)}]
+            + [{"tool": "mixed", "raw": "plain prose line\n" * 400}])
+    (probe,) = generate_policy(envs, threshold=0.0)[1]
+    py, rest = probe["py_pct"], probe["saved_pct"] - probe["py_pct"]
+    assert py > 0 and rest > 0
+    bar = (max(py, rest) + py + rest) / 2      # each alone is under it, together over
+    (row,) = generate_policy(envs, threshold=bar)[1]
+    assert row["tiers"] == [], row["reason"]

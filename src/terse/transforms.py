@@ -292,10 +292,12 @@ def _embed_json_string(s: str, tabularize: bool = True) -> dict | None:
 
 
 # `pyliteral` input caps (#460), checked BEFORE `ast.literal_eval`, which builds a full AST
-# and recurses on nesting: a size bomb costs memory, a depth bomb a RecursionError deep in
-# the parser. The depth count is of opening brackets, quotes ignored, so it can only
-# over-count and refuse a payload it could have read.
-MAX_PYLITERAL_CHARS = 8 << 20
+# and recurses on nesting. The AST is the cost: a 1 MiB literal of small numbers peaked at
+# ~360 MB and 8 MiB at ~2.6 GB, where the same data as JSON stays near its own size. At
+# 256 KiB (the text-diff cap too) the worst case is ~100 MB and a few thousand sqlite rows
+# still fit. The bracket count ignores quotes, so a bracket inside a string can push it
+# either way; it only screens the parser, and `parse_pyliteral` re-checks the real depth.
+MAX_PYLITERAL_CHARS = 256 << 10
 
 
 def _bracket_depth_exceeds(text: str, cap: int) -> bool:
@@ -346,10 +348,14 @@ def parse_pyliteral(text: str) -> Any:
         obj = ast.literal_eval(text)
     except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
         return None
-    if (type(obj) not in (list, dict) or not _json_native(obj) or has_terse_marker(obj)
-            or repr(obj) != text):
+    if (type(obj) not in (list, dict) or exceeds_depth(obj) or not _json_native(obj)
+            or has_terse_marker(obj)):
         return None
-    return obj
+    try:
+        rebuilt = repr(obj)
+    except ValueError:      # an int past Python's int-to-str digit limit (`0xfff...`)
+        return None
+    return obj if rebuilt == text else None
 
 
 def fold_pyliteral(text: str, *, tabularize: bool = True, dictionary: bool = True,
