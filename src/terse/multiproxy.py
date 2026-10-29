@@ -95,6 +95,7 @@ from .proxy import (
     _transport_pid,
     _wire_teardown,
     error_line,
+    escape_surrogates,
     has_nonobject_params,
     pump,
     union_primer,
@@ -700,6 +701,7 @@ class _PeerSender:
             if item is self._STOP:
                 return
             line, origin, ctx = item
+            line = escape_surrogates(line)     # writable as UTF-8 (#564)
             if self._wire is not None:
                 self._wire.tap("server_out", line, peer=self._peer, origin=origin,
                                inherit=ctx)
@@ -1513,6 +1515,7 @@ class Router:
         `status`/`origin` label it in the wire log. A merged or snapshot-served reply holds
         every peer's share, so with any peer excluded as a whole it is excluded outright
         (over-excluding a list is the safe direction) — whatever its id says."""
+        line = escape_surrogates(line)      # writable as UTF-8 (#564)
         record = None
         if self.wire is not None:
             # A second guard, kept on purpose (#526): the id-based exclusion already

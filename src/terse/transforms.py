@@ -34,6 +34,7 @@ import copy
 import hashlib
 import json
 import math
+import re
 from collections import Counter
 from typing import Any
 
@@ -159,8 +160,26 @@ def has_terse_marker(obj: Any) -> bool:
 # minify
 # --------------------------------------------------------------------------- #
 def minify(obj: Any) -> str:
-    """Serialize with no insignificant whitespace. Lossless for JSON-native data."""
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    """Serialize with no insignificant whitespace. Lossless for JSON-native data. A lone
+    surrogate keeps its `\\uXXXX` escape (#564): see `escape_surrogates`."""
+    return escape_surrogates(json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
+
+
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def escape_surrogates(text: str) -> str:
+    """`text` with every lone surrogate written as its `\\uXXXX` escape (#564).
+
+    A server may send `"\\ud800"` in pure ASCII; `json.loads` turns it into the code point,
+    and `ensure_ascii=False` writes that back raw, which no UTF-8 stream can encode: the
+    write raised and ended the proxy's reply thread, so that call and every later one went
+    unanswered. In JSON text a surrogate can only sit inside a string, where the escape
+    means exactly the same code point, so this is lossless and the output stays JSON.
+    ASCII text, the common case, returns at once."""
+    if text.isascii():
+        return text
+    return _SURROGATE.sub(lambda m: f"\\u{ord(m.group()):04x}", text)
 
 
 # --------------------------------------------------------------------------- #

@@ -200,7 +200,7 @@ def envelope_shape(env: dict[str, Any], default: str = "?") -> str:
 
 
 def _sha8(raw: str) -> str:
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+    return hashlib.sha1(raw.encode("utf-8", "surrogatepass")).hexdigest()[:8]   # #564
 
 
 # Retention cap, PER TOOL rather than over the whole corpus. Every consumer of this

@@ -259,7 +259,9 @@ def _handle(tool: str, path: str, serialized: str) -> str:
     # collide by shifting the boundary. json.dumps of a list is injection-proof: the
     # structure, not an in-band delimiter, delimits the fields.
     key = json.dumps([tool, path, serialized], ensure_ascii=False)
-    digest = hashlib.sha1(key.encode()).hexdigest()  # noqa: S324 — dedup key, not a MAC
+    # `surrogatepass`: a value holding a lone surrogate (#564) must hash, not raise; every
+    # other string encodes exactly as before, so existing handles are unchanged.
+    digest = hashlib.sha1(key.encode("utf-8", "surrogatepass")).hexdigest()  # noqa: S324 — dedup key, not a MAC
     return digest[:HANDLE_LEN]
 
 

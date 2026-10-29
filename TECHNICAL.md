@@ -125,6 +125,11 @@ off by default because it failed rung 4 at the measured hit rate.
   - `compress_with(obj, tabularize, dictionary)` applies a selectable subset of
     tiers; `compress`/`decompress`/`roundtrip_ok` are the full pipeline + gate.
   - Markers: `TABLE_MARKER`, `DICT_MARKER`, `ALIAS_SIGIL` (`~`).
+  - `escape_surrogates` (#564): a lone surrogate keeps its `\uXXXX` escape. `minify`
+    applies it, and so does every client- or server-bound write (`proxy.pump`, the
+    retrieve answer, `Router._write_client`, `_PeerSender`), since a raw surrogate cannot
+    be written to a UTF-8 stream. Hashes and sizes of payload text encode with
+    `surrogatepass` for the same reason.
   - Depends on `tokenize.count_cl100k` for the tokenizer-aware aliasing threshold.
 - **`policy.py`** — `Rule`/`Policy` dataclasses, `load_policy` (JSON parse + validate),
   `default_policy`, `Policy.select` (first tool-glob match wins), and `apply()` which
@@ -787,6 +792,7 @@ MAX_PYLITERAL_CHARS -> src/terse/transforms.py
 NO_COLOR -> src/terse/terminal_report.py
 TERSE_MCP_CMD -> src/terse/install_mcp.py
 XDG_STATE_HOME -> src/terse/stats.py
+escape_surrogates -> src/terse/transforms.py
 fold_pyliteral -> src/terse/transforms.py
 has_nonobject_params -> src/terse/proxy.py
 install-mcp -> src/terse/cli.py
