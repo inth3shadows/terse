@@ -25,6 +25,7 @@
     "reports/measure-history.jsonl",
     "reports/verify-report.html",
     "reports/verify-report.md",
+    "settings.json",
     "some-output.json",
     "terse-peers-project-<hash>.json",
     "terse-policy.json",
