@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.48.1] - 2026-10-29
+
 ### Fixed
 
 - `terse measure`, `policy generate` and `tune` no longer crash on a non-JSON payload like `[0xfff…]`, whose integer is too long for Python to print. The Python-literal check (#460) runs on every non-JSON payload in those commands, whatever the policy, and now refuses such input instead of raising.
