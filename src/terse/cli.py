@@ -155,6 +155,28 @@ def _positive_seconds(text: str) -> float:
     return value
 
 
+def _unit_fraction(text: str) -> float:
+    """argparse type for a rate: a number from 0 to 1."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not 0 <= value <= 1:
+        raise argparse.ArgumentTypeError(f"must be between 0 and 1: {text!r}")
+    return value
+
+
+def _positive_int(text: str) -> int:
+    """argparse type for a count above zero."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1: {text!r}")
+    return value
+
+
 def _parse_headers(pairs: list[str] | None) -> dict[str, str]:
     """Parse repeated `--header NAME=VALUE` flags into a dict (#5, HTTP downstream
     auth). Raises ValueError with a clear message on a malformed entry (no `=`) rather
@@ -1270,6 +1292,29 @@ def _tune_drop_eval(args: argparse.Namespace, doc: dict, envelopes: list) -> int
     return 0
 
 
+def _cmd_tune_suggest(args: argparse.Namespace) -> int:
+    """`terse tune --suggest` (#252): retune live drop-to-retrieve rules from the ledger's
+    drop and retrieve counts. Print-only; the corpus is not read and no policy is written."""
+    from .stats import aggregate, default_stats_log, load_stats, suggest_drop_tuning
+
+    path = Path(args.ledger).expanduser() if args.ledger is not None else default_stats_log()
+    if not path.exists() and not path.with_name(path.name + ".1").exists():
+        print(f"tune --suggest: no ledger at {path}", file=sys.stderr)
+        return 2
+    rows = aggregate(load_stats(str(path)))["drop_rules"]
+    print(f"# terse tune --suggest — {path}, {len(rows)} drop rule(s) with recorded drops")
+    if not rows:
+        print("No ledger row records a drop yet (`dropped_paths`). Rows written before "
+              "this field, or an install with no drop rule, give nothing to suggest from.")
+        return 0
+    for line in suggest_drop_tuning(rows, retract_rate=args.retract_rate,
+                                    widen_min=args.widen_min_drops,
+                                    widen_rate=args.widen_rate):
+        print(line)
+    print("Suggestions only: nothing was changed.")
+    return 0
+
+
 def _cmd_tune(args: argparse.Namespace) -> int:
     """One-command lossy tuning: analyze a captured corpus, surface safe-first drop-to-
     retrieve candidates (role-classified — prose is safe, unknown may be load-bearing), write
@@ -1278,6 +1323,8 @@ def _cmd_tune(args: argparse.Namespace) -> int:
     assemble by hand."""
     from .policy_gen import MIN_CANDIDATE_PAYLOADS, _presence_suffix, generate_policy
 
+    if args.suggest:
+        return _cmd_tune_suggest(args)
     envelopes = load_corpus(args.corpus)
     if not envelopes:
         print(f"no payloads in {args.corpus}/ — capture some first (`terse capture` or "
@@ -2486,6 +2533,19 @@ def main(argv: list[str] | None = None) -> int:
                          "it is blind to call frequency — this surfaces a passthrough "
                          "tool's live numbers so you can judge whether it under-sampled "
                          "(#274).")
+    tn.add_argument("--suggest", action="store_true",
+                    help="instead of reading the corpus, suggest changes to live "
+                         "drop-to-retrieve rules from the ledger's drop and retrieve counts "
+                         "(#252): retract, keep_first, or widen. Print-only")
+    tn.add_argument("--retract-rate", type=_unit_fraction, default=0.25, metavar="R",
+                    help="--suggest: retract a rule retrieved on at least this share of "
+                         "its dropped results (default 0.25)")
+    tn.add_argument("--widen-min-drops", type=_positive_int, default=100, metavar="N",
+                    help="--suggest: dropped results a rule needs before widening is "
+                         "suggested (default 100)")
+    tn.add_argument("--widen-rate", type=_unit_fraction, default=0.02, metavar="R",
+                    help="--suggest: suggest widening at or below this retrieve rate "
+                         "(default 0.02)")
     tn.add_argument("--drop-eval", action="store_true",
                     help="also verify the suggested drops with a live tool-calling model "
                          "(needs TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS or --base-url/--models)")

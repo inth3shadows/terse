@@ -585,8 +585,8 @@ Two knobs tune how much stays inline, both from live retrieve data (#252):
 ```
 
 `terse.retrieve` rows in the ledger now record which block a fetch pulled (`index`,
-counting `keep_first`-kept blocks), so a later `terse tune` can suggest values for both
-knobs from what a session actually fetched back.
+counting `keep_first`-kept blocks), so `terse tune --suggest` can suggest values for both
+knobs from what sessions actually fetched back (see below).
 
 This is **lossy and opt-in** — the same bar as any drop:
 
@@ -699,6 +699,31 @@ terse tune --corpus corpus/ --out policy.json --drop-eval \
 If the worst-case model **PASSES**, enable a field by renaming that tool's
 `_suggested_fields` → `fields`. Start with `[prose]`; leave any `[unknown]` that fails.
 The dropeval gate — not the role guess — is the real safety net.
+
+### Retuning live drop rules (`terse tune --suggest`)
+
+Once a drop rule is live, the ledger records each result that dropped a value and each
+time the model fetched one back. `terse stats` shows the two side by side, per rule, as a
+retrieve rate. `terse tune --suggest` reads the same counts and prints what to change:
+
+```bash
+terse tune --suggest
+# # terse tune --suggest — /home/you/.local/state/terse/stats.jsonl, 1 drop rule(s) with recorded drops
+# kb codegraph_explore $text.code_blocks: keep_first: 1 -- 9 of 14 indexed retrieves fetched block 0.
+# Suggestions only: nothing was changed.
+```
+
+- **retract**: the rule's values were fetched back on at least 25% of the results that
+  dropped them (`--retract-rate`). Remove the drop, or set `retract_after` on it.
+- **keep_first**: at least 5 fetches name a block position, and half or more of them
+  fetched the same block. Keeping that many blocks inline saves the round-trips.
+- **widen candidate**: at least 100 dropped results (`--widen-min-drops`) and a rate of 2%
+  or less (`--widen-rate`). A low rate shows the model did not ask for the field back, not
+  that its answers were unharmed, so check with `terse tune --drop-eval` before widening.
+- **no change**: anything else, with the reason.
+
+It never edits the policy. Only results written by this version or later carry the drop
+count, so a rule needs fresh traffic before it shows up.
 
 ### Forbidding lossy on a credential/personal server (`--never-lossy`)
 

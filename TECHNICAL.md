@@ -166,6 +166,13 @@ off by default because it failed rung 4 at the measured hit rate.
   default in `cli.py` (`--no-stats` / `--stats-log FILE`);
   the `run_proxy`/`run_multi_proxy` API default stays None (disabled) so library
   callers opt in explicitly.
+  Drop-rule tuning (#252): a result row that dropped values carries `dropped_paths`
+  (rule path -> count; per result, on its first row only), filled by
+  `Interceptor._note_drop_origins` and cleared when a held result reverts to raw.
+  `aggregate` joins it with the retrieve rows into `drop_rules` (results that dropped,
+  retrieves on or after the first of them, rate, retrieves by block index).
+  `suggest_drop_tuning` turns those into the print-only lines of `terse tune --suggest`
+  (retract, keep_first, widen, from fixed thresholds).
 - **`wirelog.py`** — the `--wire-log` sink (see "Wire log" below). `WireTap.tap()` runs on
   the forwarding threads: it stamps clocks, makes the `capture: false` decision (`_Scope`,
   with the mode's `resolve` for client requests and `server_excluded` for whole servers),
@@ -768,9 +775,11 @@ CLAUDE_CONFIG -> src/terse/install_mcp.py
 NO_COLOR -> src/terse/terminal_report.py
 TERSE_MCP_CMD -> src/terse/install_mcp.py
 XDG_STATE_HOME -> src/terse/stats.py
+dropped_paths -> src/terse/stats.py
 install-mcp -> src/terse/cli.py
 mcp-status -> src/terse/cli.py
 policy generate -> src/terse/cli.py
+suggest_drop_tuning -> src/terse/stats.py
 tune -> src/terse/cli.py
 uninstall-mcp -> src/terse/cli.py
 verify -> src/terse/cli.py

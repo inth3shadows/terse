@@ -46,7 +46,10 @@ TOP_LEVEL = {"total", "decisions", "diff_reasons", "tools", "versions", "retriev
              "primers",
              # #212: lazy-router sessions, by router label. Empty = "cannot say".
              "router_sessions",
-             "primer_liability"}
+             "primer_liability",
+             # #252: per drop rule, results that dropped at the path and how often its
+             # values were fetched back. Empty when no row carries `dropped_paths`.
+             "drop_rules"}
 
 # `context_*_tokens` added on purpose (#420): what the model RECEIVES when the client drops
 # the text mirror of a typed field, beside the wire sums. Same row set as the wire sums.
@@ -74,6 +77,10 @@ VERSION_ROW = {"blocks", "tokenized", "raw_tokens", "out_tokens"}
 # that spent a model call and returned nothing.
 RETRIEVE_ROW = {"server", "tool", "path", "calls", "hits", "misses", "bytes", "tokens",
                 "untokenized"}
+
+# #252. `rate` is `retrieved / dropped_calls`, the figure `terse tune --suggest` reads.
+DROP_RULE_ROW = {"server", "tool", "path", "dropped_calls", "dropped_values", "retrieved",
+                 "rate", "indexes"}
 
 # #311. `emissions` is the load-bearing one and the likeliest to be dropped by someone
 # tidying `aggregate`: `primer_liability` divides `tokens` by it to recover the PER-SESSION
@@ -186,6 +193,8 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     "contributors": (list,), "label": (str,),
     # #251 retrieve rows. All plain counters — a retrieve either happened or it did not,
     # so unlike a liability row there is no "we could not ask" null anywhere here.
+    "dropped_calls": (int,), "dropped_values": (int,), "retrieved": (int,),
+    "rate": (float,), "indexes": (dict,),
     "path": (str,), "calls": (int,), "hits": (int,), "misses": (int,), "bytes": (int,),
     "tokens": (int,),
 }
@@ -263,7 +272,8 @@ def test_every_named_field_also_has_a_pinned_type():
     person to add a field only has to touch the NAME manifest to go green and the type
     promise silently stops applying to it (found in review — the same
     tolerates-growth-silently failure this module's own docstring warns about)."""
-    named = (TOTAL | TOOL_ROW | VERSION_ROW | RETRIEVE_ROW | PRIMER_ROW | ROUTER_SESSION_ROW
+    named = (TOTAL | TOOL_ROW | VERSION_ROW | RETRIEVE_ROW | DROP_RULE_ROW | PRIMER_ROW
+             | ROUTER_SESSION_ROW
              | LIABILITY
              | LIABILITY_SERVER | LIABILITY_CONTRIBUTOR)
     assert not named - set(TYPES), (
@@ -337,6 +347,20 @@ def test_the_retrieve_rows_are_exactly_these_keys(stats_json):
     for row in out["retrieves"]:
         assert set(row) == RETRIEVE_ROW, _ADD_ON_PURPOSE
         _check_types("retrieves[]", row)
+
+
+def test_the_drop_rule_rows_are_exactly_these_keys(stats_json):
+    """A drop rule's use row (#252), from a tool row carrying `dropped_paths`."""
+    from terse.stats import build_retrieve_record
+    out = stats_json([_rec(tool="codegraph_explore",
+                           dropped_paths={"$text.code_blocks": 3}),
+                      build_retrieve_record("kb-server", "codegraph_explore",
+                                            "$text.code_blocks", hit=True, payload="x",
+                                            index=0)])
+    assert out["drop_rules"], "a dropped_paths row must produce a drop rule row"
+    for row in out["drop_rules"]:
+        assert set(row) == DROP_RULE_ROW, _ADD_ON_PURPOSE
+        _check_types("drop_rules[]", row)
 
 
 def test_a_retrieve_row_never_inflates_the_block_or_savings_totals(stats_json):

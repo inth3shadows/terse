@@ -13,7 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- `terse tune --suggest` (#252): print-only suggestions for live drop-to-retrieve rules, read from the ledger. It suggests retracting a rule whose values were fetched back on at least 25% of the results that dropped them. It suggests `keep_first` when fetches cluster at one block. It flags a rule as a widen candidate at 100+ dropped results and a rate of 2% or less, with a reminder to check it with `--drop-eval` first. `--retract-rate`, `--widen-min-drops` and `--widen-rate` change the thresholds. Nothing is ever applied.
+- The ledger's result rows now record `dropped_paths` (rule path -> values dropped), and `terse stats` shows a "drop-to-retrieve use" table with dropped results, retrieves and the retrieve rate per rule. `terse stats --json` gains a top-level `drop_rules` list.
 
 ## [0.45.11] - 2026-10-28
 

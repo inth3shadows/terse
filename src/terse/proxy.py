@@ -693,6 +693,10 @@ class Interceptor:
         self._primer_declined_logged = False
         # Per-result: see the tools/call branch of `transform_response` (#212).
         self._structured_hold = False
+        # Per-result (#252): rule path -> values this result dropped, filled by
+        # `_note_drop_origins` and written to the ledger row as `dropped_paths`, so a
+        # rule's retrieve rate has a denominator. Under `_local_lock`.
+        self._result_drops: dict[str, int] = {}
         # The two proxy pump threads call note_request (client->server) and
         # transform_response (server->client) concurrently, both mutating pending/last/
         # since_keyframe/init_id state. `_local_lock` serializes each method against the
@@ -901,6 +905,7 @@ class Interceptor:
                         return injected
                 return line
             tool, capture_tool, args_key = tracked
+            self._result_drops = {}
             # Hold `structuredContent` RAW while a router's shared primer is still owed
             # (#212 review, user decision). The primer cannot attach to a result carrying
             # `structuredContent` (the client discards the text block), so before #212 the
@@ -1177,6 +1182,7 @@ class Interceptor:
                     emitted_pairs = ([(r, r) for r in raw_texts]
                                      if raw_texts is not None else [])
                     structured_out = structured_raw
+                    self._result_drops = {}     # the client saw no marker
 
             # Tee the RAW payload (#32), AFTER the path is known so a joined result is
             # captured ONCE as the array terse actually compresses — not N per-block
@@ -1427,7 +1433,8 @@ class Interceptor:
                             display_tool=capture_tool, diff_reason=diff_reason,
                             structured=structured_raw, structured_out=structured_out,
                             force_passthrough=hold_all,
-                            offload_at=offload_limit(self.client_name)),
+                            offload_at=offload_limit(self.client_name),
+                            dropped=dict(self._result_drops) or None),
                 ))
 
             if not changed:
@@ -2046,6 +2053,7 @@ class Interceptor:
                 if handle in self.dropped:
                     self._drop_origin[handle] = (self._ledger_label, otool, opath,
                                                  rest[0] if rest else None)
+                    self._result_drops[opath] = self._result_drops.get(opath, 0) + 1
 
     def _inject_retrieve_tool(self, msg: dict) -> str | None:
         """If `msg` is a tools/list result, append the synthetic terse.retrieve tool so the
@@ -2313,7 +2321,8 @@ class Interceptor:
                     structured: str | None = None,
                     structured_out: str | None = None,
                     force_passthrough: bool = False,
-                    offload_at: int | None = None) -> None:
+                    offload_at: int | None = None,
+                    dropped: dict[str, int] | None = None) -> None:
         """Hand the stats callback one
         (tool, raw, emitted, passthrough, diff_reason, structured, structured_out) per
         emitted block, for the payload-free savings ledger (stats.py). Same fail-open
@@ -2334,7 +2343,10 @@ class Interceptor:
         limit applies to the whole result while rows are per block. Every row of an
         affected result is tagged `offload`: "out" when the client offloaded what terse
         emitted, "raw" when only the raw result would have been. Passed to the writer only
-        when set, so a writer from before the field keeps working."""
+        when set, so a writer from before the field keeps working.
+
+        `dropped` (#252) is rule path -> values this result dropped; per-result like the
+        typed field, so it rides the first row only, and only when set."""
         stats = self.stats
         if stats is None:
             return
@@ -2355,10 +2367,12 @@ class Interceptor:
                 args = (shown_tool, raw, emitted, passthrough, diff_reason,
                         structured if index == 0 else None,
                         structured_out if index == 0 else None)
-                if offload is None:
-                    stats(*args)
-                else:
-                    stats(*args, offload=offload)
+                extra: dict[str, Any] = {}
+                if offload is not None:
+                    extra["offload"] = offload
+                if dropped and index == 0:
+                    extra["dropped"] = dropped
+                stats(*args, **extra)
             except Exception as exc:  # noqa: BLE001 — stats is never load-bearing
                 self._warn_sink("stats", shown_tool, exc)
 

@@ -565,6 +565,12 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     # — a retrieve is not a compressed block, and adding it to a tool's `blocks` would
     # make the same call show up twice in the saving denominator.
     retrieves: dict[tuple[str, str, str], dict[str, int]] = {}
+    # Drop-rule USE (#252): per (server, tool, rule path), the results that dropped at the
+    # path, the values dropped, and when the first such row was written. Retrieves are
+    # kept with their ts and index so the rate counts only those on or after that first
+    # row: a retrieve written before `dropped_paths` existed has no denominator.
+    drops: dict[tuple[str, str, str], dict[str, int]] = {}
+    drop_retrieves: dict[tuple[str, str, str], list[tuple[int, int | None]]] = {}
     # Primer-emission rows (#311): a primer that was ACTUALLY sent, keyed by the ledger
     # label that sent it. Its own map for the same reason `retrieves` has one -- a primer
     # is not a compressed block, and it must never reach the saving denominator. Keyed by
@@ -629,6 +635,10 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
                                                "bytes": 0, "tokens": 0, "untokenized": 0})
             rrow["calls"] += 1
             rrow["hits" if rec.get("hit") else "misses"] += 1
+            rts, ridx = rec.get("ts"), rec.get("index")
+            drop_retrieves.setdefault(rkey, []).append((
+                rts if isinstance(rts, int) and not isinstance(rts, bool) else 0,
+                ridx if isinstance(ridx, int) and not isinstance(ridx, bool) else None))
             rb = rec.get("bytes")
             if isinstance(rb, int):
                 rrow["bytes"] += rb
@@ -656,6 +666,19 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         # Canonicalized at READ time, not at write time: this also repairs the 2,000+
         # records already on disk, which a writer-side fix could never reach.
         key = (srv, canonical_tool(srv, str(rec.get("tool", "unknown"))))
+        dpaths = rec.get("dropped_paths")
+        if isinstance(dpaths, dict):
+            dts = rec.get("ts")
+            dts = dts if isinstance(dts, int) and not isinstance(dts, bool) else 0
+            for dpath, n in dpaths.items():
+                if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+                    continue
+                drow = drops.setdefault((*key, str(dpath)),
+                                        {"dropped_calls": 0, "dropped_values": 0,
+                                         "first_ts": dts})
+                drow["dropped_calls"] += 1
+                drow["dropped_values"] += n
+                drow["first_ts"] = min(drow["first_ts"], dts)
         ver = rec.get("version")
         vrow = None
         if isinstance(ver, str):
@@ -749,11 +772,36 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
                           for (s, t, p), row in sorted(
                               retrieves.items(),
                               key=lambda kv: kv[1]["tokens"], reverse=True)],
+            # Drop-rule use (#252), one row per rule that dropped at least once.
+            "drop_rules": _drop_rule_rows(drops, drop_retrieves),
             "tools": [{"server": s, "tool": t, **row}
                       for (s, t), row in sorted(
                           tools.items(),
                           key=lambda kv: kv[1]["raw_tokens"] - kv[1]["out_tokens"],
                           reverse=True)]}
+
+
+def _drop_rule_rows(drops: dict[tuple[str, str, str], dict[str, int]],
+                    drop_retrieves: dict[tuple[str, str, str], list[tuple[int, int | None]]]
+                    ) -> list[dict[str, Any]]:
+    """One row per drop rule (#252): results that dropped at the path, retrieves of its
+    values on or after the first such result, and their rate. `indexes` counts retrieves
+    by text block position, the numbering `keep_first` uses. Most-retrieved rate first."""
+    rows: list[dict[str, Any]] = []
+    for (s, t, p), d in drops.items():
+        seen = [idx for ts, idx in drop_retrieves.get((s, t, p), []) if ts >= d["first_ts"]]
+        indexes: dict[int, int] = {}
+        for idx in seen:
+            if idx is not None:
+                indexes[idx] = indexes.get(idx, 0) + 1
+        rows.append({"server": s, "tool": t, "path": p,
+                     "dropped_calls": d["dropped_calls"],
+                     "dropped_values": d["dropped_values"],
+                     "retrieved": len(seen),
+                     "rate": len(seen) / d["dropped_calls"],
+                     "indexes": dict(sorted(indexes.items()))})
+    rows.sort(key=lambda r: (-r["rate"], r["server"], r["tool"], r["path"]))
+    return rows
 
 
 def _pct_saved(raw: int, out: int) -> str:
@@ -857,6 +905,7 @@ def build_stats_report(agg: dict[str, Any], *, log_path: str | Path,
                      f"{raw_n:>10,} {out_n:>10,} "
                      f"{_pct_saved(raw_n, out_n):>6}")
     lines += build_retrieve_section(agg, use_tokens)
+    lines += build_drop_rule_section(agg)
     lines += build_version_section(agg)
     if liability:
         lines += build_primer_section(liability)
@@ -905,6 +954,70 @@ def build_retrieve_section(agg: dict[str, Any], use_tokens: bool = True) -> list
     untok = sum(r["untokenized"] for r in rows)
     if untok and use_tokens:
         out.append(f"  ({untok} retrieve(s) uncounted — tiktoken unavailable when recorded)")
+    return out
+
+
+def build_drop_rule_section(agg: dict[str, Any]) -> list[str]:
+    """How often each drop rule's values were fetched back (#252): results that dropped at
+    the path, retrieves since the first of them, and the rate `terse tune --suggest` reads.
+    Suppressed when no row carries `dropped_paths` (a ledger from before the field, or an
+    install with no drop rule), since an empty table would claim a rate of zero."""
+    rows = agg.get("drop_rules") or []
+    if not rows:
+        return []
+    out = ["", "drop-to-retrieve use — how often each rule's dropped values were fetched back:",
+           f"{'server':<18} {'tool':<28} {'rule path':<22} {'dropped':>8} "
+           f"{'retrieved':>9} {'rate':>6}"]
+    for r in rows:
+        out.append(f"{r['server'][:18]:<18} {r['tool'][:28]:<28} {r['path'][:22]:<22} "
+                   f"{r['dropped_calls']:>8,} {r['retrieved']:>9,} {r['rate']:>6.1%}")
+    return out
+
+
+# `terse tune --suggest` thresholds (#252). Print-only: nothing is ever applied.
+RETRACT_RATE = 0.25
+WIDEN_MIN_DROPS = 100
+WIDEN_RATE = 0.02
+# keep_first: at least this many retrieves with a block index, at least this share of
+# them at one index.
+CLUSTER_MIN = 5
+CLUSTER_SHARE = 0.5
+
+
+def suggest_drop_tuning(rows: list[dict[str, Any]], *, retract_rate: float = RETRACT_RATE,
+                        widen_min: int = WIDEN_MIN_DROPS,
+                        widen_rate: float = WIDEN_RATE) -> list[str]:
+    """One line per `drop_rules` row (#252): retract, keep_first, widen, or no change, from
+    counts and fixed thresholds alone. Retract when the rate is at least `retract_rate`.
+    Suggest `keep_first: i+1` when retrieves cluster at block i. Widen only with at least
+    `widen_min` dropped results at a rate of at most `widen_rate`, and then with the issue's
+    caveat: a low retrieve rate shows the model did not ask for the field, not that the
+    answer was unharmed."""
+    out = []
+    for r in rows:
+        name = f"{r['server']} {r['tool']} {r['path']}"
+        seen = f"{r['retrieved']} retrieve(s) over {r['dropped_calls']} dropped result(s)"
+        notes = []
+        if r["rate"] >= retract_rate:
+            notes.append(f"retract: {seen}, rate {r['rate']:.1%} >= {retract_rate:.0%}. "
+                         "Remove the drop, or set `retract_after` on it.")
+        indexes = r.get("indexes") or {}
+        indexed = sum(indexes.values())
+        if indexed >= CLUSTER_MIN:
+            top, count = max(indexes.items(), key=lambda kv: (kv[1], -int(kv[0])))
+            if count / indexed >= CLUSTER_SHARE:
+                notes.append(f"keep_first: {int(top) + 1} -- {count} of {indexed} "
+                             f"indexed retrieves fetched block {top}.")
+        if not notes and r["dropped_calls"] >= widen_min and r["rate"] <= widen_rate:
+            notes.append(f"widen candidate: {seen}, rate {r['rate']:.1%} <= "
+                         f"{widen_rate:.0%}. A low rate shows the model did not ask for the "
+                         "field back, not that its answers were unharmed: check with "
+                         "`terse tune --drop-eval` before widening.")
+        if not notes:
+            why = (f"fewer than {widen_min} dropped results" if r["dropped_calls"] < widen_min
+                   else f"rate {r['rate']:.1%} is between the thresholds")
+            notes.append(f"no change: {seen} ({why}).")
+        out += [f"{name}: {n}" for n in notes]
     return out
 
 
@@ -3189,9 +3302,14 @@ def build_stats_writer(stats_log: str | Path, server: str, router: str | None = 
     first-failure warning dead code, so a dead ledger stayed silent (#131)."""
     def stats(tool: str, raw: str, emitted: str, passthrough: bool,
               diff_reason: str | None = None, structured: str | None = None,
-              structured_out: str | None = None, offload: str | None = None) -> None:
+              structured_out: str | None = None, offload: str | None = None,
+              dropped: dict[str, int] | None = None) -> None:
         rec = build_record(server, tool, raw, emitted, passthrough, diff_reason,
                            structured, structured_out)
+        if dropped:
+            # Rule path -> values this result dropped (#252): the denominator a drop rule's
+            # retrieve rate needs. Paths are policy text, never payload.
+            rec["dropped_paths"] = dropped
         if offload is not None:
             # "out" | "raw": the client offloaded this result to a file, or would have
             # offloaded the raw one (`proxy.Interceptor._emit_stats`). Read by
