@@ -135,7 +135,10 @@ off by default because it failed rung 4 at the measured hit rate.
   `policy.apply`); it is transparent (non-result messages forwarded unchanged),
   fail-open (any error forwards the original), and frame-safe. `run_proxy` launches
   the downstream server as a subprocess and wires `Interceptor` to stdio with two
-  pump threads.
+  pump threads. One exception to "forwarded unchanged", shared with the router through
+  `has_nonobject_params`: a `tools/call` or `prompts/get` whose `params` is present but
+  not an object is answered -32602 by terse and never forwarded (a notification is
+  dropped). Absent or null `params` counts as `{}`.
 - **`stats.py`** — the live savings ledger + `terse stats`. `build_record` /
   `classify_decision` produce one payload-FREE line per result (ts, version, server,
   tool, decision, char + cl100k token sizes — never content, which is what makes
@@ -768,6 +771,7 @@ CLAUDE_CONFIG -> src/terse/install_mcp.py
 NO_COLOR -> src/terse/terminal_report.py
 TERSE_MCP_CMD -> src/terse/install_mcp.py
 XDG_STATE_HOME -> src/terse/stats.py
+has_nonobject_params -> src/terse/proxy.py
 install-mcp -> src/terse/cli.py
 mcp-status -> src/terse/cli.py
 policy generate -> src/terse/cli.py
