@@ -733,7 +733,8 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
     # Counted over ROWS, so a joined result contributes 1 whatever its block count — see
     # the ratio note where these are rendered. Only `gate_fail` disqualifies the tool;
     # `non_json` is reported, not acted on (#147, and the reasoning at the branch below).
-    non_json = sum(1 for r in rows if not r["applicable"])
+    non_json = sum(1 for r in rows if not r["applicable"]
+                   and not r["saved_cl100k"].get("pyliteral"))   # a folded one is read
     gate_fail = sum(1 for r in rows if not r["roundtrip_ok"])
     # The embedded gate is counted separately and costs only its own tier (#188): the
     # default pipeline round-tripped, so the tool still compresses — demoting it to
@@ -754,6 +755,7 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
     # `measure_joined`, which always emit the key — but a row reaching this sum without it
     # should read as "this tier saved nothing" rather than KeyError the whole run.
     embedded = sum(r["saved_cl100k"].get("embedded") or 0 for r in rows)
+    pyliteral = sum(r["saved_cl100k"].get("pyliteral") or 0 for r in rows)
     total = sum(r["saved_cl100k"]["tier_total"] or 0 for r in rows)
     if emb_fail:
         # The tier is dropped for the WHOLE tool — the policy matches on tool name, so
@@ -767,10 +769,11 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
         total = sum((r["cl100k"]["raw"] or 0) - (r["cl100k"]["compressed"] or 0)
                     # A row that failed the DEFAULT gate banks nothing, per the zeroing rule
                     # in `measure`; recomputing from raw counts here would resurrect it.
-                    for r in rows if r["roundtrip_ok"])
+                    for r in rows if r["roundtrip_ok"]) + pyliteral
     total_pct = _pct(total, raw_tok)
     dict_pct = _pct(dictionary, raw_tok)
     emb_pct = _pct(embedded, raw_tok)
+    py_pct = _pct(pyliteral, raw_tok)
 
     # Drop-to-retrieve candidates are detected INDEPENDENTLY of the lossless-tier decision:
     # the highest-value case (kb `embedding`) is a tool whose lossless savings fall BELOW the
@@ -788,9 +791,9 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
         "tool": tool, "n": n, "n_results": len(groups), "joined_results": joined_results,
         "raw_tok": raw_tok,
         "saved_pct": round(total_pct, 1), "dict_pct": round(dict_pct, 1),
-        "emb_pct": round(emb_pct, 1),
+        "emb_pct": round(emb_pct, 1), "py_pct": round(py_pct, 1),
         "minify": minify, "tabularize": tabularize, "dictionary": dictionary,
-        "embedded": embedded, "emb_fail": emb_fail,
+        "embedded": embedded, "emb_fail": emb_fail, "pyliteral": pyliteral,
         "drop_suggestion": drop_suggestion, "drop_rows": drop_rows,
     }
 
@@ -842,6 +845,13 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
         parts.append(f"embedded +{emb_pct:.1f}%")
     elif embedded:
         parts.append(f"embedded +{emb_pct:.1f}% below threshold — dropped")
+    # `pyliteral` (#460) by the same marginal test: it costs a primer paragraph, and only
+    # a tool returning Python-literal text (`str(rows)`) measures anything for it.
+    if py_pct >= threshold:
+        tiers.append("pyliteral")
+        parts.append(f"pyliteral +{py_pct:.1f}%")
+    elif pyliteral:
+        parts.append(f"pyliteral +{py_pct:.1f}% below threshold — dropped")
     return {**base, "tiers": tiers, "reason": f"{total_pct:.1f}% saved ({', '.join(parts)}){mixed}"}
 
 
