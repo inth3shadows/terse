@@ -770,10 +770,15 @@ def _tool_decision(tool: str, groups: list[list[str]], threshold: float,
                     # A row that failed the DEFAULT gate banks nothing, per the zeroing rule
                     # in `measure`; recomputing from raw counts here would resurrect it.
                     for r in rows if r["roundtrip_ok"]) + pyliteral
+    py_pct = _pct(pyliteral, raw_tok)
+    if py_pct < threshold:
+        # Below its own marginal bar the tier is not enabled (see the end of this
+        # function), so its saving is not delivered and must not lift the tool over the
+        # passthrough threshold either -- the `emb_fail` lesson above.
+        total -= pyliteral
     total_pct = _pct(total, raw_tok)
     dict_pct = _pct(dictionary, raw_tok)
     emb_pct = _pct(embedded, raw_tok)
-    py_pct = _pct(pyliteral, raw_tok)
 
     # Drop-to-retrieve candidates are detected INDEPENDENTLY of the lossless-tier decision:
     # the highest-value case (kb `embedding`) is a tool whose lossless savings fall BELOW the

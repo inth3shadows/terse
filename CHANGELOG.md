@@ -13,7 +13,11 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- `terse measure`, `policy generate` and `tune` no longer crash on a non-JSON payload like `[0xfff…]`, whose integer is too long for Python to print. The Python-literal check (#460) runs on every non-JSON payload in those commands, whatever the policy, and now refuses such input instead of raising.
+- The `pyliteral` tier reads at most 256 KiB (was 8 MiB). Parsing builds a syntax tree far larger than the text: 8 MiB of small numbers peaked at about 2.6 GB. It also re-checks nesting depth after parsing.
+- `policy generate` no longer counts a `pyliteral` saving it then leaves out of the rule (below its own threshold) toward compressing the tool at all.
 
 ## [0.48.0] - 2026-10-29
 
