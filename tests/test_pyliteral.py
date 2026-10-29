@@ -182,7 +182,8 @@ def test_measure_credits_the_fold_only_on_a_python_literal():
     row = measure.measure_payload(raw)
     saved = row["saved_cl100k"]
     assert not row["applicable"] and saved["pyliteral"] > 0
-    assert saved["tier_total"] == saved["pyliteral"]
+    # split the way the runtime fold does: the dictionary share ships only with that tier
+    assert saved["tier_total"] == saved["pyliteral"] + saved["dictionary"]
     assert measure.measure_payload(json.dumps({"a": 1}))["saved_cl100k"]["pyliteral"] == 0
     assert measure.measure_payload("plain prose")["saved_cl100k"]["pyliteral"] == 0
 
