@@ -193,7 +193,7 @@ def measure_joined(raws: list[str]) -> dict[str, Any] | None:
     for raw in raws:
         try:
             obj = json.loads(raw)
-        except (json.JSONDecodeError, TypeError, RecursionError):
+        except (ValueError, TypeError, RecursionError):   # ValueError: #563
             return None                      # non-JSON block: apply_joined refuses
         if not isinstance(obj, dict):
             return None                      # not a record sequence: apply_joined refuses
@@ -259,7 +259,7 @@ def cross_tokenizer_savings(envelopes: list[dict[str, Any]]) -> list[dict[str, A
         raw = env["raw"]
         try:
             comp = transforms.compress(json.loads(raw))
-        except (json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError):   # ValueError: the int-digit limit, #563
             comp = raw
         # Qualified name — the same one coverage/policy use, so a report's measure rows and
         # coverage counts name one tool the same way (#158).

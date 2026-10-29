@@ -490,7 +490,7 @@ def _drop_candidates(
     for raw in raws:
         try:
             obj = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError):   # ValueError: the int-digit limit, #563
             continue
         records, p = find_record_list_with_path(obj)
         if records is None or p is None:

@@ -1676,7 +1676,7 @@ class Interceptor:
                 return False
             try:
                 return isinstance(json.loads(b["text"]), dict)
-            except (json.JSONDecodeError, TypeError, RecursionError):
+            except (ValueError, TypeError, RecursionError):   # ValueError: #563
                 return False
 
         # Partition `content` into maximal runs of adjacent object-text blocks vs
