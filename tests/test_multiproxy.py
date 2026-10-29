@@ -2205,6 +2205,52 @@ def test_falsy_non_object_params_get_invalid_params_too(params):
     assert msgs[0]["id"] == 5 and msgs[0]["error"]["code"] == -32602
 
 
+_NONOBJECT_LINES = [
+    {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": ["x"]},
+    {"jsonrpc": "2.0", "id": 6, "method": "prompts/get", "params": 7},
+    {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": False},
+    {"jsonrpc": "2.0", "method": "tools/call", "params": "oops"},     # notification
+]
+
+
+def _errors(msgs):
+    return sorted((m["id"], m["error"]["code"], m["error"]["message"])
+                  for m in msgs if "error" in m)
+
+
+def test_single_proxy_and_router_answer_nonobject_params_the_same(tmp_path):
+    # #514: `terse proxy` used to forward these with params treated as `{}`, so the
+    # downstream answered, while the router answered -32602 itself. One shared check now
+    # answers both: each request gets the same -32602, the notification gets nothing, and
+    # none reaches a server.
+    from terse.proxy import NONOBJECT_PARAMS_MESSAGE, run_proxy
+    wire = tmp_path / "wire"
+    lines = _NONOBJECT_LINES + [
+        {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "gh.x"}}]
+    cin = io.StringIO("".join(json.dumps(m) + "\n" for m in lines))
+    cout = io.StringIO()
+    fake = pathlib.Path(__file__).parent / "fake_mcp_server.py"
+    assert run_proxy([sys.executable, str(fake)], PLAIN_POLICY, stdin=cin, stdout=cout,
+                     wire_log=str(wire)) == 0
+    single = _lines(cout)
+    # the valid call after the junk is still forwarded and answered by the server
+    assert [m["id"] for m in single if "result" in m] == [9]
+    sent = [json.loads(ln) for f in wire.rglob("*.jsonl") for ln in f.read_text().splitlines()]
+    downstream = [r for r in sent if r.get("hop") == "server_out"]
+    assert len(downstream) == 1
+
+    _, t1, _, out, router = _two_peer_router()
+    try:
+        for m in _NONOBJECT_LINES:
+            router.route_client_line(json.dumps(m))
+        assert _peer_calls(t1) == []
+    finally:
+        router.close_senders()
+
+    expected = [(i, -32602, NONOBJECT_PARAMS_MESSAGE) for i in (5, 6, 7)]
+    assert _errors(single) == _errors(_lines(out)) == expected
+
+
 def _assert_router_still_routes(router, t1, out, mid=42):
     """A valid call after a malformed line reaches peer b and its reply comes back."""
     router.route_client_line(json.dumps(
