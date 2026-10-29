@@ -565,6 +565,15 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     # — a retrieve is not a compressed block, and adding it to a tool's `blocks` would
     # make the same call show up twice in the saving denominator.
     retrieves: dict[tuple[str, str, str], dict[str, int]] = {}
+    # Drop-rule FIRING rows (#252): how often each (server, tool, rule path) actually dropped
+    # something -- the denominator a retrieve count needs before it says anything. `spans`
+    # is the unit a retrieve fetches back; `estimated` counts blocks inferred from a
+    # pre-#252 `text_dropped` row, which recorded THAT a text drop fired but not how many
+    # spans or under which path (one span, the only text selector, is assumed).
+    drops: dict[tuple[str, str, str], dict[str, int]] = {}
+    from .lossy import (
+        TEXT_SELECTOR_CODE_BLOCKS,  # read path only; stats stays light to import
+    )
     # Primer-emission rows (#311): a primer that was ACTUALLY sent, keyed by the ledger
     # label that sent it. Its own map for the same reason `retrieves` has one -- a primer
     # is not a compressed block, and it must never reach the saving denominator. Keyed by
@@ -656,6 +665,20 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         # Canonicalized at READ time, not at write time: this also repairs the 2,000+
         # records already on disk, which a writer-side fix could never reach.
         key = (srv, canonical_tool(srv, str(rec.get("tool", "unknown"))))
+        rec_drops = rec.get("drops")
+        if isinstance(rec_drops, dict):
+            for dpath, n in rec_drops.items():
+                if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                    drow = drops.setdefault((*key, str(dpath)),
+                                            {"blocks": 0, "spans": 0, "estimated": 0})
+                    drow["blocks"] += 1
+                    drow["spans"] += n
+        elif reason == "text_dropped":
+            drow = drops.setdefault((*key, TEXT_SELECTOR_CODE_BLOCKS),
+                                    {"blocks": 0, "spans": 0, "estimated": 0})
+            drow["blocks"] += 1
+            drow["spans"] += 1
+            drow["estimated"] += 1
         ver = rec.get("version")
         vrow = None
         if isinstance(ver, str):
@@ -749,11 +772,35 @@ def aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
                           for (s, t, p), row in sorted(
                               retrieves.items(),
                               key=lambda kv: kv[1]["tokens"], reverse=True)],
+            # Every rule that dropped OR was retrieved, with its retrieve rate (#252). A rule
+            # that dropped and was never fetched back is the "free" case, and until this row
+            # it was invisible -- the cost table only listed rules somebody retrieved.
+            "drop_rules": _drop_rules(drops, retrieves),
             "tools": [{"server": s, "tool": t, **row}
                       for (s, t), row in sorted(
                           tools.items(),
                           key=lambda kv: kv[1]["raw_tokens"] - kv[1]["out_tokens"],
                           reverse=True)]}
+
+
+def _drop_rules(drops: dict[tuple[str, str, str], dict[str, int]],
+                retrieves: dict[tuple[str, str, str], dict[str, int]]) -> list[dict[str, Any]]:
+    """One row per attributable drop rule: firings joined to the retrieves billed to it.
+
+    `rate` is retrieves per dropped SPAN (one retrieve fetches one span), None when nothing
+    was dropped in the window -- a retrieve of a value dropped before the window opened has
+    no denominator here, and dividing by zero spans is not a rate. It is a LOWER bound on how
+    often the value was needed: a model that re-reads the source instead of retrieving shows
+    up as a drop with no retrieve (#252's routing-around confound). Unattributed retrieves
+    (a miss, path "") have no rule and stay out of this table."""
+    rows = []
+    for key in sorted(set(drops) | {k for k in retrieves if k[2]}):
+        d = drops.get(key, {"blocks": 0, "spans": 0, "estimated": 0})
+        r = retrieves.get(key, {"calls": 0, "hits": 0, "tokens": 0, "untokenized": 0})
+        rows.append({"server": key[0], "tool": key[1], "path": key[2], **d,
+                     "retrieves": r["calls"], "retrieve_tokens": r["tokens"],
+                     "rate": (r["calls"] / d["spans"]) if d["spans"] else None})
+    return sorted(rows, key=lambda r: (-r["spans"], r["server"], r["tool"], r["path"]))
 
 
 def _pct_saved(raw: int, out: int) -> str:
@@ -871,29 +918,54 @@ def build_retrieve_section(agg: dict[str, Any], use_tokens: bool = True) -> list
     only that half systematically flattered every lossy rule. A rule whose field the model
     fetches back on most calls is not saving what the table above credits it with.
 
-    Suppressed entirely when no retrieve was ever recorded — which is every ledger written
-    before this shipped, and every install with no drop rule (the default). An empty
-    section would read as "your drop rules cost nothing", a claim this data cannot make
-    about a ledger that could not record it."""
+    Since #252 it also carries each rule's FIRINGS (`drop_rules`), so a retrieve count has a
+    denominator and a rule that dropped but was never fetched back is listed at all.
+
+    Suppressed entirely when nothing was dropped or retrieved — every install with no drop
+    rule (the default). An empty section would read as "your drop rules cost nothing", a
+    claim this data cannot make about a ledger that could not record it."""
     rows = agg.get("retrieves") or []
-    if not rows:
+    rules = agg.get("drop_rules") or []
+    if not rows and not rules:
         return []
     # Mirror the per-tool table's unit choice (`use_tokens`): on a tiktoken-less ledger the
     # token column is all zeros, and rendering only that turned the entire cost table into
     # a wall of nothing while the byte counts sitting right there were known. Same fallback,
     # same reason — a cost the operator cannot read is a cost they will not act on.
     cost_col = "tok" if use_tokens else "chr"
-    out = ["", "drop-to-retrieve cost — round-trips the model spent fetching dropped values back:",
-           f"{'server':<18} {'tool':<28} {'rule path':<22} {'calls':>6} "
-           f"{'miss':>5} {cost_col:>9}"]
-    for r in rows:
+    out = ["", "drop-to-retrieve cost — how often each rule dropped a value, and how often "
+               "the model fetched it back:",
+           f"{'server':<18} {'tool':<28} {'rule path':<22} {'dropped':>8} {'calls':>6} "
+           f"{'rate':>6} {'miss':>5} {cost_col:>9}"]
+    by_key = {(r["server"], r["tool"], r["path"]): r for r in rows}
+    estimated = False
+    for rule in rules:
+        key = (rule["server"], rule["tool"], rule["path"])
+        r = by_key.pop(key, None)
+        cost = (r["tokens"] if use_tokens else r["bytes"]) if r else 0
+        rate = "–" if rule["rate"] is None else f"{rule['rate']:.0%}"
+        mark = "~" if rule["estimated"] else " "
+        estimated = estimated or bool(rule["estimated"])
+        out.append(f"{rule['server'][:18]:<18} {rule['tool'][:28]:<28} {rule['path'][:22]:<22} "
+                   f"{mark}{rule['spans']:>7} {rule['retrieves']:>6} {rate:>6} "
+                   f"{(r['misses'] if r else 0):>5} {cost:>9,}")
+    for r in by_key.values():
         # An empty path is a MISS (the origin is always gone by then — see
         # `build_retrieve_record`), or a handle stored without provenance: billed, never
-        # hidden, but named as unknown rather than guessed at.
+        # hidden, but named as unknown rather than guessed at. No rule, so no denominator.
         path = r["path"] or "(unattributed)"
         cost = r["tokens"] if use_tokens else r["bytes"]
         out.append(f"{r['server'][:18]:<18} {r['tool'][:28]:<28} {path[:22]:<22} "
-                   f"{r['calls']:>6} {r['misses']:>5} {cost:>9,}")
+                   f"{'–':>8} {r['calls']:>6} {'–':>6} {r['misses']:>5} {cost:>9,}")
+    if rules:
+        # The honest limit, said where the number is: a model that re-reads the source
+        # instead of retrieving leaves a drop with no retrieve, so a low rate is a best case.
+        out.append("  (rate = retrieves per dropped value; a LOWER bound on how often the value "
+                   "was needed — a model that re-reads the source instead shows no retrieve)")
+    if estimated:
+        out.append("  (~ = includes rows written before drops were recorded, counted as one "
+                   "value each)")
+    rows = list(rows)
     misses = sum(r["misses"] for r in rows)
     if misses:
         # The worst outcome there is: the model spent a whole call and got nothing back,
@@ -3189,9 +3261,15 @@ def build_stats_writer(stats_log: str | Path, server: str, router: str | None = 
     first-failure warning dead code, so a dead ledger stayed silent (#131)."""
     def stats(tool: str, raw: str, emitted: str, passthrough: bool,
               diff_reason: str | None = None, structured: str | None = None,
-              structured_out: str | None = None, offload: str | None = None) -> None:
+              structured_out: str | None = None, offload: str | None = None,
+              drops: dict[str, int] | None = None) -> None:
         rec = build_record(server, tool, raw, emitted, passthrough, diff_reason,
                            structured, structured_out)
+        if drops:
+            # `rule path -> spans dropped` (#252): labels and counts, never content. The
+            # denominator of each drop rule's retrieve rate; absent on every row that
+            # dropped nothing, which is nearly all of them.
+            rec["drops"] = dict(drops)
         if offload is not None:
             # "out" | "raw": the client offloaded this result to a file, or would have
             # offloaded the raw one (`proxy.Interceptor._emit_stats`). Read by

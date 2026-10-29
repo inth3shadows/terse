@@ -46,6 +46,9 @@ TOP_LEVEL = {"total", "decisions", "diff_reasons", "tools", "versions", "retriev
              "primers",
              # #212: lazy-router sessions, by router label. Empty = "cannot say".
              "router_sessions",
+             # #252: each drop rule's firings joined to its retrieves, with the rate.
+             # Empty = nothing dropped or retrieved in the window.
+             "drop_rules",
              "primer_liability"}
 
 # `context_*_tokens` added on purpose (#420): what the model RECEIVES when the client drops
@@ -74,6 +77,13 @@ VERSION_ROW = {"blocks", "tokenized", "raw_tokens", "out_tokens"}
 # that spent a model call and returned nothing.
 RETRIEVE_ROW = {"server", "tool", "path", "calls", "hits", "misses", "bytes", "tokens",
                 "untokenized"}
+
+# One row per drop rule that fired or was retrieved (#252). `spans` is the denominator of
+# `rate` (retrieves per dropped value); `rate` is None — not 0 — when nothing was dropped in
+# the window, because a retrieve of an older drop has no denominator here. `estimated`
+# counts blocks inferred from pre-#252 `text_dropped` rows.
+DROP_RULE_ROW = {"server", "tool", "path", "blocks", "spans", "estimated", "retrieves",
+                 "retrieve_tokens", "rate"}
 
 # #311. `emissions` is the load-bearing one and the likeliest to be dropped by someone
 # tidying `aggregate`: `primer_liability` divides `tokens` by it to recover the PER-SESSION
@@ -188,6 +198,8 @@ TYPES: dict[str, tuple[type | None, ...]] = {
     # so unlike a liability row there is no "we could not ask" null anywhere here.
     "path": (str,), "calls": (int,), "hits": (int,), "misses": (int,), "bytes": (int,),
     "tokens": (int,),
+    # #252 drop-rule rows.
+    "spans": (int,), "estimated": (int,), "retrieves": (int,), "rate": (float, type(None)),
 }
 
 # Per-shape overrides, because a name does not mean the same thing everywhere. `blocks` is a
@@ -206,6 +218,7 @@ SHAPE_TYPES: dict[str, dict[str, tuple[type | None, ...]]] = {
     "total": {"blocks": (int,)},
     "tools[]": {"blocks": (int,)},
     "versions[]": {"blocks": (int,)},
+    "drop_rules[]": {"blocks": (int,), "retrieve_tokens": (int,)},
     # A contributor exists only BECAUSE a ledger label does, so neither counter can be the
     # "we never found the rows to ask" null a liability row's `blocks` legitimately is.
     "primer_liability.servers[].contributors[]": {"blocks": (int,),
@@ -263,7 +276,8 @@ def test_every_named_field_also_has_a_pinned_type():
     person to add a field only has to touch the NAME manifest to go green and the type
     promise silently stops applying to it (found in review — the same
     tolerates-growth-silently failure this module's own docstring warns about)."""
-    named = (TOTAL | TOOL_ROW | VERSION_ROW | RETRIEVE_ROW | PRIMER_ROW | ROUTER_SESSION_ROW
+    named = (TOTAL | TOOL_ROW | VERSION_ROW | RETRIEVE_ROW | DROP_RULE_ROW | PRIMER_ROW
+             | ROUTER_SESSION_ROW
              | LIABILITY
              | LIABILITY_SERVER | LIABILITY_CONTRIBUTOR)
     assert not named - set(TYPES), (
@@ -337,6 +351,19 @@ def test_the_retrieve_rows_are_exactly_these_keys(stats_json):
     for row in out["retrieves"]:
         assert set(row) == RETRIEVE_ROW, _ADD_ON_PURPOSE
         _check_types("retrieves[]", row)
+
+
+def test_the_drop_rule_rows_are_exactly_these_keys(stats_json):
+    """A drop rule's firings joined to its retrieves (#252), through the CLI like the rest."""
+    from terse.stats import build_retrieve_record
+    out = stats_json([_rec(drops={"$text.code_blocks": 2}),
+                      _rec(diff_reason="text_dropped"),
+                      build_retrieve_record("kb", "codegraph_explore",
+                                            "$text.code_blocks", hit=True, payload="x" * 40)])
+    assert out["drop_rules"], "a drop must produce a drop-rule row"
+    for row in out["drop_rules"]:
+        assert set(row) == DROP_RULE_ROW, _ADD_ON_PURPOSE
+        _check_types("drop_rules[]", row)
 
 
 def test_a_retrieve_row_never_inflates_the_block_or_savings_totals(stats_json):
