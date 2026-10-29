@@ -80,6 +80,7 @@ from . import lossy as lossy_mod
 from . import policy as policy_mod
 from ._secure_io import mkdir_restricted, write_restricted
 from .proxy import (
+    NONOBJECT_PARAMS_MESSAGE,
     PRIMER_ALWAYS,
     PRIMER_HEAD,
     RETRIEVE_TOOL_DEF,
@@ -93,6 +94,8 @@ from .proxy import (
     _restore_sigterm,
     _transport_pid,
     _wire_teardown,
+    error_line,
+    has_nonobject_params,
     pump,
     union_primer,
 )
@@ -1198,14 +1201,11 @@ class Router:
         non-object value with -32602 (a notification, having no id, is dropped
         silently). `or {}` alone passes a truthy list/string/number, whose `.get` would
         raise out of the client loop and end the session."""
-        params = msg.get("params")
-        if params is None:
-            return {}
-        if isinstance(params, dict):
-            return params
+        if not has_nonobject_params(msg):
+            params = msg.get("params")
+            return params if isinstance(params, dict) else {}
         if msg.get("id") is not None:
-            self._write_error(msg["id"], -32602,
-                              "terse-multiproxy: params must be an object")
+            self._write_error(msg["id"], -32602, NONOBJECT_PARAMS_MESSAGE)
         elif self.debug:
             sys.stderr.write(f"[terse-multiproxy] notification {_short(msg.get('method'))} "
                              "with non-object params; dropped\n")
@@ -1561,9 +1561,7 @@ class Router:
         error paths fall back on, so it must not be the next thing that fails.
         `ensure_ascii=True` escapes a lone surrogate in a client id (`"\\ud800"`), which
         strict UTF-8 stdout cannot encode; a failed write is noted once and dropped."""
-        line = json.dumps({"jsonrpc": "2.0", "id": mid,
-                           "error": {"code": code, "message": message}},
-                          separators=(",", ":"), ensure_ascii=True)
+        line = error_line(mid, code, message)
         try:
             self._write_client(line, origin="error_writer")
         except ValueError as exc:

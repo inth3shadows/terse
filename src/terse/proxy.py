@@ -2386,6 +2386,44 @@ class Interceptor:
 # synthetic terse.retrieve call itself and must not forward it downstream (#10).
 SWALLOW: Any = object()
 
+# One policy for a non-object `params` on a named call, shared by `terse proxy` and the
+# router so the same malformed line gets the same answer behind either (#514). MCP's
+# tools/call and prompts/get take an object; a list, string, number or bool there is
+# invalid, so terse answers -32602 itself rather than forwarding it. Absent or null
+# params is an empty object, not an error.
+_NAMED_CALL_METHODS = ("tools/call", "prompts/get")
+NONOBJECT_PARAMS_MESSAGE = "terse: params must be an object"
+
+
+def has_nonobject_params(msg: dict) -> bool:
+    """True when `msg` is a tools/call or prompts/get whose params is present, not null,
+    and not an object."""
+    params = msg.get("params")
+    return (msg.get("method") in _NAMED_CALL_METHODS
+            and params is not None and not isinstance(params, dict))
+
+
+def error_line(mid: Any, code: int, message: str) -> str:
+    """One JSON-RPC error envelope. `ensure_ascii=True` escapes a lone surrogate in a
+    client id (`"\\ud800"`), which strict UTF-8 stdout cannot encode."""
+    return json.dumps({"jsonrpc": "2.0", "id": mid,
+                       "error": {"code": code, "message": message}},
+                      separators=(",", ":"), ensure_ascii=True)
+
+
+def nonobject_params_reply(line: str) -> str | None:
+    """None when `line` is not a named call with non-object params (forward it as usual).
+    Otherwise the -32602 reply to write back, or "" for a notification, which has no id
+    to answer and is dropped. Either way the line is not forwarded."""
+    try:
+        msg = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(msg, dict) or not has_nonobject_params(msg):
+        return None
+    mid = msg.get("id")
+    return "" if mid is None else error_line(mid, -32602, NONOBJECT_PARAMS_MESSAGE)
+
 
 def pump(src: Iterable[str], dst: Any, transform: Callable[[str], Any],
          lock: Lock | None = None, on_read: Callable[[str], None] | None = None,
@@ -2805,6 +2843,20 @@ def run_proxy(
                 # downstream turns "one wasted paragraph" into an unredeemable handle and a
                 # -32601 from a server that never had the tool. `answer_retrieve` costs
                 # nothing when nothing was dropped: it returns a legible miss and swallows.
+                # A named call with non-object params is answered -32602 here, as the
+                # router does, and never forwarded (#514).
+                rejected = nonobject_params_reply(line)
+                if rejected is not None:
+                    if rejected:
+                        record = (wire.stage("client_out", rejected, status="synthesized",
+                                             origin="error_writer")
+                                  if wire is not None else None)
+                        with out_lock:
+                            if record is not None:
+                                record()
+                            cout.write(rejected + "\n")
+                            cout.flush()
+                    return SWALLOW
                 reply = inter.answer_retrieve(line)
                 if reply is not None:
                     record = (wire.stage("client_out", reply, status="local_answer",

@@ -13,6 +13,12 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Fixed
+
+- `terse proxy` and `terse proxy --config` now give the same answer to a `tools/call` or `prompts/get` whose `params` is a list, string, number or bool: -32602 "terse: params must be an object", sent by terse, with nothing forwarded (a notification is dropped). Before, the single proxy forwarded the line and the server answered, while the router rejected it. The router's message changes from "terse-multiproxy: params must be an object". (#514)
+
+## [0.46.0] - 2026-10-28
+
 ### Added
 
 - The ledger records how many values each drop-to-retrieve rule dropped per result (`drops: {rule path: count}`, labels and counts only), and `terse stats` shows each rule's dropped count and retrieve rate (retrieves per dropped value) beside its retrieve cost (#252). Rules that dropped but were never fetched back are now listed. The rate is a lower bound on how often a value was needed: a model that re-reads the source instead of retrieving shows no retrieve. Older rows are counted from `text_dropped` as one value each and marked `~`.
