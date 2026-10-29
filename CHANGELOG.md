@@ -13,7 +13,9 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- A JSON payload holding an integer longer than 4300 digits is treated as non-JSON and passed through unchanged, instead of crashing `terse compress`, `policy generate`, `terse measure`'s tokenizer comparison and the drop and codec evals (#563). Python's `json` raises a plain `ValueError` for it, which those parse sites did not catch. In the proxy, a multi-block result holding one no longer skips compressing its other blocks.
 
 ## [0.48.3] - 2026-10-29
 

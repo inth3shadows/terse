@@ -755,7 +755,7 @@ def _probe_envelope(env: dict, rule_for: Callable[..., Any]) -> tuple[DropProbe,
     rule = rule_for(tool, env.get("server"))
     try:
         obj = json.loads(env["raw"])
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError):   # ValueError: the int-digit limit, #563
         # Not JSON: the span-addressed text path is the only one that can drop here. Same
         # probe shape, so a text payload's results merge into the report exactly like a
         # JSON one's — and its skip reasons into the coverage table the same way.

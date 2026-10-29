@@ -914,7 +914,7 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
     for i, env in enumerate(envelopes, 1):
         try:
             obj = json.loads(env["raw"])
-        except (json.JSONDecodeError, TypeError):
+        except (ValueError, TypeError):   # ValueError: the int-digit limit, #563
             obj = None  # these questions need parsed JSON; a non-JSON/text payload has none
         terse = None
         if obj is not None and policy is not None:
