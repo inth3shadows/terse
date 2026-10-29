@@ -13,7 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- A tool result holding an escaped lone surrogate (`\ud800`, legal in JSON) no longer kills the proxy's reply path (#564). terse decoded it and wrote it back raw, which a UTF-8 stdout cannot encode. The write raised, the reply thread ended, and that call and every later reply on the connection went unanswered (live: 0 bytes to the client). Every line written to the client or a server, and every JSON text the codec emits, now keeps such a character as its `\uXXXX` escape. The meaning is the same.
+- The same character no longer breaks drop-to-retrieve, the diff args key, the offload size check or the capture id. Each hashed or measured the text with a strict UTF-8 encode; a drop on such a value silently left the field inline. Hashes of every other string are unchanged.
 
 ## [0.48.2] - 2026-10-29
 

@@ -51,6 +51,7 @@ from .stats import (
     resolve_ledger_identity,
 )
 from .tokenize import count_cl100k
+from .transforms import escape_surrogates
 from .transport import HttpTransport, build_transport
 
 # How long to let the inbound pump finish draining the downstream's final reply after the
@@ -104,7 +105,7 @@ def _args_key(arguments: Any) -> str:
                            ensure_ascii=False)
     except (TypeError, ValueError):
         return ""
-    return hashlib.sha1(canon.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha1(canon.encode("utf-8", "surrogatepass")).hexdigest()[:12]   # #564
 
 
 # A one-time, system-level explanation of terse's wire forms, injected into the MCP
@@ -269,7 +270,7 @@ def over_limit(text: str, limit: int | None) -> bool:
         return False
     if len(text) > OFFLOAD_DEFAULT_CHARS:
         return True
-    if len(text.encode("utf-8")) <= limit:
+    if len(text.encode("utf-8", "surrogatepass")) <= limit:     # #564
         return False
     try:
         n = count_cl100k(text[: limit * 8])
@@ -2480,6 +2481,9 @@ def pump(src: Iterable[str], dst: Any, transform: Callable[[str], Any],
             continue
         if out is None:
             out = line
+        # A raw lone surrogate cannot be written to a UTF-8 stream (#564); escaped, the
+        # JSON line means the same thing.
+        out = escape_surrogates(out)
         if on_write is not None and hasattr(raw, "wire_origin") \
                 and not hasattr(out, "wire_origin"):
             out = type(raw)(out)
@@ -2879,6 +2883,7 @@ def run_proxy(
                     return SWALLOW
                 reply = inter.answer_retrieve(line)
                 if reply is not None:
+                    reply = escape_surrogates(reply)     # #564
                     record = (wire.stage("client_out", reply, status="local_answer",
                                          origin="retrieve") if wire is not None else None)
                     with out_lock:
