@@ -288,6 +288,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         build_recommend_report,
         build_stats_report,
         default_stats_log,
+        exclude_records,
         load_stats,
         parse_window,
         primer_liability,
@@ -306,7 +307,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
               f"automatically on its next tool call (unless run with --no-stats)",
               file=sys.stderr)
         return 2
-    agg = aggregate(load_stats(log_path, since_ts))
+    agg = aggregate(exclude_records(load_stats(log_path, since_ts), args.exclude))
     # The primer is a real cost the ledger never sees (#168), so the report is incomplete
     # without it. `scan_scopes` is read-only and documented never to raise, but a report
     # must not die because a config file is malformed — the ledger numbers are still worth
@@ -2429,6 +2430,10 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--since", metavar="WINDOW",
                     help="only count records newer than this window, e.g. 30m, 24h, 7d "
                          "(default: all recorded history)")
+    st.add_argument("--exclude", metavar="GLOB", action="append", default=[],
+                    help="leave out records whose SERVER/TOOL matches this glob, e.g. "
+                         "'*/pub' or 'kb/*'; repeatable. For rows that never belonged in "
+                         "the ledger, such as a scratch proxy run without --no-stats")
     st.add_argument("--json", action="store_true",
                     help="emit the aggregate as JSON instead of the text report")
     st.add_argument("--recommend", action="store_true",

@@ -173,7 +173,10 @@ off by default because it failed rung 4 at the measured hit rate.
   under `--debug`, so a dead sink can't go silent *or* flood stderr; #131. The
   bookkeeping lives on the `Interceptor`, which multiproxy builds per peer, so there
   the guard is once per (peer, kind) — attribution over a single line). ON by
-  default in `cli.py` (`--no-stats` / `--stats-log FILE`);
+  default in `cli.py` (`--no-stats` / `--stats-log FILE`), so a scratch or review run
+  of `terse proxy` must pass `--no-stats` or it writes the real ledger (#573; the test
+  suite is isolated by conftest's `_isolate_xdg_state`). `exclude_records` backs
+  `terse stats --exclude`, matching `<server>/<canonical tool>` globs;
   the `run_proxy`/`run_multi_proxy` API default stays None (disabled) so library
   callers opt in explicitly.
 - **`wirelog.py`** — the `--wire-log` sink (see "Wire log" below). `WireTap.tap()` runs on

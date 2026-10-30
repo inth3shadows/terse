@@ -1026,6 +1026,7 @@ uv run terse stats               # all recorded history
 uv run terse stats --since 7d    # just the last week (30m / 24h / 7d / 1w forms)
 uv run terse stats --recommend   # one wrap/don't-wrap verdict per installed entry
 uv run terse stats --json        # the raw aggregate, for scripts
+uv run terse stats --exclude '*/pub'   # leave out rows that never belonged (repeatable)
 ```
 
 `--recommend` rolls the break-even table's two numeric columns into one word per installed
@@ -1114,7 +1115,11 @@ verdict per rule (see above).
 Real numbers from your real sessions, complementing the synthetic-corpus `measure` report. The ledger lives at
 `$XDG_STATE_HOME/terse/stats.jsonl` (usually `~/.local/state/terse/stats.jsonl`);
 redirect it with `proxy --stats-log FILE` or disable it with `proxy --no-stats`
-(bake the opt-out into a wrapped entry with `install-mcp --no-stats`).
+(bake the opt-out into a wrapped entry with `install-mcp --no-stats`). A one-off test
+run of `terse proxy` against a made-up server should pass `--no-stats` too: otherwise its
+calls land in the same ledger as your real sessions and skew every total. If that has
+already happened, `terse stats --exclude SERVER/TOOL` (a glob such as `'*/pub'` or
+`'kb/*'`, repeatable) leaves those rows out of the report.
 
 ### See how well it does across many tools
 

@@ -25,6 +25,7 @@ file. Timestamps are real wall-clock here (unlike the corpus, principle #31): a
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -519,6 +520,24 @@ def load_stats(log_path: str | Path, since_ts: int | None = None) -> list[dict[s
                 continue
             records.append(rec)
     return records
+
+
+def exclude_records(records: list[dict[str, Any]], globs: list[str]) -> list[dict[str, Any]]:
+    """Drop records whose `<server>/<tool>` matches any glob (fnmatch, case-sensitive).
+
+    The tool is canonicalized first, so `kb/pub` also drops a router's `kb__pub`. A record
+    without a tool (a primer or router-session row) matches as `<server>/`, so `kb/*`
+    drops every row of that server. For recovering from rows that never belonged in the
+    ledger, such as a scratch proxy run without `--no-stats` (#573)."""
+    if not globs:
+        return records
+    kept = []
+    for rec in records:
+        server = str(rec.get("server", "unknown"))
+        tool = canonical_tool(server, str(rec["tool"])) if "tool" in rec else ""
+        if not any(fnmatch.fnmatchcase(f"{server}/{tool}", g) for g in globs):
+            kept.append(rec)
+    return kept
 
 
 _WINDOW = re.compile(r"^(\d+)([smhdw])$")
