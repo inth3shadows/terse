@@ -13,7 +13,11 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- `terse stats --exclude GLOB` (repeatable) leaves out ledger rows whose `SERVER/TOOL`
+  matches, e.g. `'*/pub'` or `'kb/*'`. A scratch `terse proxy` run without `--no-stats`
+  had written 2,075 synthetic records into a live ledger, ~90% of its raw tokens, and the
+  only recovery was hand-editing the JSONL (#573).
 
 ## [0.48.4] - 2026-10-29
 
