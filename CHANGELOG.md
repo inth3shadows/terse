@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.49.0] - 2026-10-29
+
 ### Added
 - `terse stats --exclude GLOB` (repeatable) leaves out ledger rows whose `SERVER/TOOL`
   matches, e.g. `'*/pub'` or `'kb/*'`. A scratch `terse proxy` run without `--no-stats`
