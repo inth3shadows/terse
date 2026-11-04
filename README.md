@@ -29,10 +29,13 @@ minified. What the model gets instead costs 181:
   **59.1%** fewer tokens, against −6.5% for TOON and 4.5% for compressmcp on the same
   corpus ([Benchmarks](#benchmarks-terse-vs-alternatives)).
 - **Measured on real sessions, priced at the billed rate.** A replay of the maintainer's
-  own Claude Code sessions puts terse at **23.4% of what MCP results cost**, and under 1%
-  of a session's whole bill ([What it is worth in real sessions](#what-it-is-worth-in-real-sessions)).
-- **Selective, never worse.** It works per tool and passes through anything it can't
-  shrink, so it never inflates a result. `terse stats` shows what it actually saved.
+  own Claude Code sessions: terse saves **23.4% of what the MCP results it handled would
+  have cost**, and 0.77% of the whole bill of the sessions that used it
+  ([What it is worth in real sessions](#what-it-is-worth-in-real-sessions)).
+- **Selective.** It works per tool and passes through anything it can't shrink, so a
+  result's body never grows. The one-time format primer and fetch-backs of dropped values
+  are extra costs, and in short sessions they can outweigh the saving (below).
+  `terse stats` shows what it saved.
 
 ## What it is worth in real sessions
 
@@ -44,36 +47,37 @@ first, cache read after, write again on a cache rebuild, nothing after compactio
 charges every `terse.retrieve` fetch-back to terse. No model calls; it reads the ledger and
 the transcripts already on disk.
 
-Run on 2026-11-04 over 8,993 transcripts from mid-July (736 with a terse result; 96.4% of
-the results terse changed joined a transcript; test servers removed from a copy of the
-ledger first):
+Run on 2026-11-04 over 8,993 transcripts from 2026-07-14 to 2026-11-04 (736 with a terse
+result; 96.4% of the results terse changed joined a transcript; test servers removed from a
+copy of the ledger first):
 
 | measure | value |
 |---|--:|
-| share of what the joined MCP results would have cost | **23.4%** of 118.9M input-equivalent tokens |
-| share of the whole bill, Opus 5.5 sessions that used terse | 0.81% |
+| saved, share of what the joined MCP results would have cost | **23.4%** of 118.9M input-equivalent tokens, after fetch-backs (26.7% before) |
+| share of the whole bill, sessions that used terse | 0.77% (Opus 5.5 0.81%, Sonnet 5 0.98%, Opus 5 0.73%) |
 | share of the whole bill, every session scanned | 0.42% |
 | saving from `secret.list_credentials` + `codegraph_explore`, before fetch-backs | 92% |
 | sessions over 100 calls | +24.2% of their MCP cost |
-| sessions of 1-5 calls | **−15.5%** (the primer is never paid back; [#577](https://github.com/inth3shadows/terse/issues/577)) |
-| same call repeated within 3 calls: changed vs unchanged results | 0.1% vs 2.76% |
+| sessions of 1-5 calls | **−15.5%**: the results terse changed still come out ahead (+44,615), but fetch-backs of dropped code blocks cost 111,698, 92,235 of it in Claude Haiku 4.5 sessions ([#577](https://github.com/inth3shadows/terse/issues/577)) |
+| the model repeated the same call within 3 calls (a sign it could not use the result): changed vs unchanged results | 0.1% vs 2.76% |
 
 Why it is smaller than 59.1%:
 
 - **Cache pricing.** 96.9% of input tokens in the maintainer's sessions are cache reads,
   billed at a tenth of input price (measured 2026-09-22, 1,093 sessions). A removed token is
   mostly one that would have been re-read cheaply.
-- **MCP results are a small share of a session.** The MCP results terse handled were about
-  1.8% of what all scanned sessions cost. Shell output (16.1%) and file reads (7.1%) are
-  larger, and no MCP proxy sees them.
-- **The client already moves big results out.** Claude Code saves an MCP text result over
-  50,000 characters to a file and shows the model a path and a preview; it loads tool
-  names only at session start, and it compacts long sessions. A result that size saves
-  nothing through terse (72 in this replay), and terse keeps its primer out of it (#496).
+- **MCP results are a small share of a session.** The MCP results that went through terse
+  were about 1.8% of what all scanned sessions cost. In the 2026-10-07 shell replay (6,776
+  transcripts), shell output was 16.1% and file reads 7.1% of the whole bill, and no MCP
+  proxy sees either.
+- **The client already moves big results out.** Claude Code limits an MCP result to 25,000
+  tokens by default and saves a text result over 50,000 characters to a file, showing the
+  model a path and a preview; it also compacts long sessions. A result it saves to a file
+  saves nothing through terse (72 in this replay), and terse keeps its primer out of it
+  (#496).
 
 So the value is narrow: a few large, repetitive results re-read across long sessions, with a
-lossless guarantee, and a replay that prices any change to what the agent reads. Since
-2026-10-07 terse takes only narrow improvements chosen from this replay.
+lossless guarantee, and a replay that prices any change to what the agent reads.
 
 ## Design: What Carries The Savings
 
@@ -159,8 +163,8 @@ same non-win, relabelled. **Only ~69 are addressable**, worth at most ~60 extra 
 measured 87%: roughly 26 → 86, a **~3.3x on a tier that fires on 0.67% of blocks**, which
 had to clear the 502 tok/turn router primer (once per session since #212). Real and cheap, but small. #419 carries it at
 that reduced size. The drop tier is where the measured tokens are (#252, #271, #273):
-`codegraph_explore`'s single rule accounts for 604,892 saved tokens here, 22.2% of all
-savings.
+`codegraph_explore`'s single rule accounts for 604,892 saved tokens in the 2026-09-22
+ledger, 22.2% of all savings.
 
 It remains **opt-in and not the headline** (#170). When a loop really does re-fetch
 mostly-unchanged results it compounds hard; short sessions with wide tool variety never
@@ -439,7 +443,7 @@ with the exact reproduce commands. The running competitor queue, including every
 screened out and why, is
 [docs/competitors-to-benchmark.md](docs/competitors-to-benchmark.md).
 
-Adoption honesty: terse has been on PyPI since v0.3.1 (2026-07-18) and is at v0.33.8;
+Adoption honesty: terse has been on PyPI since v0.3.1 (2026-07-18) and is at v0.49.0;
 TOON, headroom and the other measured entrants are far more established. terse's wedge is
 narrow and specific — unconditionally lossless, no expiring retrieve-cache, no ML
 dependency, MCP-transparent — not breadth of adoption.
