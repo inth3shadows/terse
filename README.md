@@ -29,12 +29,13 @@ minified. What the model gets instead costs 181:
   **59.1%** fewer tokens, against −6.5% for TOON and 4.5% for compressmcp on the same
   corpus ([Benchmarks](#benchmarks-terse-vs-alternatives)).
 - **Measured on real sessions, priced at the billed rate.** A replay of the maintainer's
-  own Claude Code sessions: terse saves **23.4% of what the MCP results it handled would
+  own Claude Code sessions: terse saves **23.5% of what the MCP results it handled would
   have cost**, and 0.77% of the whole bill of the sessions that used it
   ([What it is worth in real sessions](#what-it-is-worth-in-real-sessions)).
 - **Selective.** It works per tool and passes through anything it can't shrink, so a
   result's body never grows. The one-time format primer (and its typed wrapper, #463) and
-  fetch-backs of dropped values are extra costs, and in short sessions they can outweigh the saving (below).
+  fetch-backs of dropped values are extra costs; in the replay below they shrink the saving
+  in short sessions without erasing it.
   `terse stats` shows what it saved.
 
 ## What it is worth in real sessions
@@ -47,18 +48,20 @@ first, cache read after, write again on a cache rebuild, nothing after compactio
 charges every `terse.retrieve` fetch-back to terse. No model calls; it reads the ledger and
 the transcripts already on disk.
 
-Run on 2026-11-04 over 8,993 transcripts from 2026-07-14 to 2026-11-04 (736 with a terse
-result; 96.4% of the results terse changed joined a transcript; test servers removed from a
-copy of the ledger first):
+Run on 2026-11-04 over transcripts from 2026-07-14 to 2026-11-04: 6,309 from real work, 720
+of them with a terse result (96.4% of the results terse changed joined a transcript). Test
+servers were removed from a copy of the ledger first, and test-harness sessions (`claude -p`
+runs from a `/tmp` directory, 16 with a terse result) are left out of the summary; see #577.
 
 | measure | value |
 |---|--:|
-| saved, share of what the joined MCP results would have cost | **23.4%** of 118.9M input-equivalent tokens, after fetch-backs (26.7% before) |
-| share of the whole bill, sessions that used terse | 0.77% (Opus 5.5 0.81%, Sonnet 5 0.98%, Opus 5 0.73%) |
-| share of the whole bill, every session scanned | 0.42% |
+| saved, share of what the joined MCP results would have cost | **23.5%** of 119.0M input-equivalent tokens, after fetch-backs (26.7% before) |
+| share of the whole bill, sessions that used terse | 0.77% (Opus 5.5 0.80%, Sonnet 5 0.98%, Opus 5 0.73%) |
+| share of the whole bill, every real-work session scanned | 0.43% |
 | saving from `secret.list_credentials` + `codegraph_explore`, before fetch-backs | 92% |
-| sessions over 100 calls | +24.2% of their MCP cost |
-| sessions of 1-5 calls | **−15.5%**: the results terse changed still come out ahead (+44,615), but fetch-backs of dropped code blocks cost 111,698, 92,235 of it in Claude Haiku 4.5 sessions ([#577](https://github.com/inth3shadows/terse/issues/577)) |
+| sessions over 100 calls | +24.1% of their MCP cost |
+| sessions of 1-5 calls | +6.4% (an earlier −15.5% came from the 16 test-harness sessions; [#577](https://github.com/inth3shadows/terse/issues/577)) |
+| fetch-backs of dropped code blocks | 3.8M, about a third of what that rule saved; since `keep_first` and `retract_after` went live (2026-09-26, #252), sessions over 100 calls fetched back once, 2% of the rule's saving there |
 | the model repeated the same call within 3 calls (a possible sign it could not use the result): changed vs unchanged results | 0.1% vs 2.76% |
 
 Why it is smaller than 59.1%:

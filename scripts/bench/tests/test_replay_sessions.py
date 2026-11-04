@@ -549,3 +549,16 @@ def test_main_writes_a_row_per_transcript_and_a_summary(tmp_path, capsys):
     assert summary["join"]["joined"] == 1 and summary["join"]["rate_pct"] == 100.0
     assert summary["net_weighted"] == rows[0]["net_weighted"] > 0
     assert "join: 1 of 1" in capsys.readouterr().out
+
+
+def test_a_transcript_under_tmp_is_a_harness_run(tmp_path):
+    root = tmp_path / "projects"
+    assert rs.is_harness(root / "-tmp-claude-1000--home-x-terse" / "a.jsonl", root)
+    assert rs.is_harness(root / "-tmp-run" / "s" / "subagents" / "b.jsonl", root)
+
+
+def test_a_transcript_elsewhere_is_real_work(tmp_path):
+    root = tmp_path / "projects"
+    assert not rs.is_harness(root / "-home-ericm-personal-projects-terse" / "a.jsonl", root)
+    assert not rs.is_harness(root / "-home-ericm-tmp-notes" / "a.jsonl", root)
+    assert not rs.is_harness(tmp_path / "elsewhere" / "a.jsonl", root)

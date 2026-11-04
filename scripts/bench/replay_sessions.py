@@ -45,6 +45,16 @@ kept beside it.
 
 Rows are written to `<out>/sessions.jsonl` as each transcript finishes; `<out>/summary.json`
 and a text table follow at the end.
+
+Test-harness sessions are left out of the summary by default (#577). A transcript whose
+project directory is under `/tmp` (Claude Code names it `-tmp-...`) is a scripted run -- the
+cost-per-task suite and the drop-rule evals run `claude -p` from a scratch directory -- not
+real work. They are still SCANNED, because their calls go through the live proxy and land in
+the ledger: dropping them before the join would leave those ledger rows unjoined, and their
+billed responses would no longer de-duplicate later copies of the same history. Every row
+in `sessions.jsonl` keeps them, tagged `"harness": true`. `--include-harness` puts them back
+into the summary. On the 2026-11-04 run they were 16 of 736 sessions and turned the 1-5-call
+band from +6.4% to -15.5%.
 """
 
 from __future__ import annotations
@@ -918,6 +928,16 @@ def render(summary: dict) -> str:
     return "\n".join(lines)
 
 
+def is_harness(path: Path, root: Path) -> bool:
+    """Is this transcript a scripted test run (#577)? Its project directory, the first part
+    of the path under `root`, is Claude Code's name for a directory under `/tmp`."""
+    try:
+        first = path.relative_to(root).parts[0]
+    except (ValueError, IndexError):
+        return False
+    return first.startswith("-tmp-") or first == "-tmp"
+
+
 def find_transcripts(root: Path, since: float) -> list[Path]:
     paths = list(root.glob("*/*.jsonl")) + list(root.glob("*/*/subagents/*.jsonl"))
     return sorted(p for p in paths if p.stat().st_mtime >= since)
@@ -930,6 +950,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--transcripts", type=Path, default=Path.home() / ".claude/projects",
                     help="Claude Code projects directory")
     ap.add_argument("--out", type=Path, required=True, help="results directory")
+    ap.add_argument("--include-harness", action="store_true",
+                    help="keep test-harness sessions (transcripts under a /tmp project "
+                         "directory) in the summary; they are always scanned and joined")
     ap.add_argument("--min-join", type=float, default=90.0,
                     help="stop before pricing if under this percent of the results terse "
                          "changed, or of the saved tokens they hold, join a transcript")
@@ -982,6 +1005,7 @@ def main(argv: list[str] | None = None) -> int:
             row = replay(events, joined, ratio)
             row["transcript"] = str(path)
             row["subagent"] = path.parent.name == "subagents"
+            row["harness"] = is_harness(path, args.transcripts)
             sessions.append(row)
             fh.write(json.dumps(row) + "\n")
             fh.flush()
@@ -990,9 +1014,18 @@ def main(argv: list[str] | None = None) -> int:
                       f"  results {len(row['items']):>3}  net {row['net_weighted']:>12,.0f}",
                       file=sys.stderr)
 
-    summary = summarize(sessions, counts, calib)
+    harness = [s for s in sessions if s["harness"] and s["items"]]
+    kept = sessions if args.include_harness else [s for s in sessions if not s["harness"]]
+    summary = summarize(kept, counts, calib)
+    summary["harness_sessions"] = {"with_terse_result": len(harness),
+                                   "in_summary": bool(args.include_harness),
+                                   "net_weighted": round(sum(s["net_weighted"] for s in harness), 1)}
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    text = render(summary)
+    text = render(summary) + (
+        f"\ntest-harness sessions (transcripts under /tmp): {len(harness)} with a terse result, "
+        f"net {summary['harness_sessions']['net_weighted']:,.0f}, "
+        + ("INCLUDED above" if args.include_harness else "left out of everything above "
+           "(--include-harness keeps them)"))
     (args.out / "summary.txt").write_text(text + "\n")
     print(text)
     return 0
