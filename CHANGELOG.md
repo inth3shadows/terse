@@ -13,7 +13,12 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Documentation
+- README: a "What it is worth in real sessions" section from the session replay re-run on
+  2026-11-04 (8,993 transcripts): 23.4% of the MCP result cost terse handled, 0.77% of the
+  bill of the sessions that used it, 92% of the saving from two tools, and the 1-5-call band
+  at -15.5%, all of it fetch-backs (#577). The 59.1% GitHub benchmark is labelled as the
+  best case; "never inflates a result" now names the primer and fetch-back costs.
 
 ## [0.49.0] - 2026-10-29
 
