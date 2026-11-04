@@ -33,8 +33,8 @@ minified. What the model gets instead costs 181:
   have cost**, and 0.77% of the whole bill of the sessions that used it
   ([What it is worth in real sessions](#what-it-is-worth-in-real-sessions)).
 - **Selective.** It works per tool and passes through anything it can't shrink, so a
-  result's body never grows. The one-time format primer and fetch-backs of dropped values
-  are extra costs, and in short sessions they can outweigh the saving (below).
+  result's body never grows. The one-time format primer (and its typed wrapper, #463) and
+  fetch-backs of dropped values are extra costs, and in short sessions they can outweigh the saving (below).
   `terse stats` shows what it saved.
 
 ## What it is worth in real sessions
@@ -59,7 +59,7 @@ copy of the ledger first):
 | saving from `secret.list_credentials` + `codegraph_explore`, before fetch-backs | 92% |
 | sessions over 100 calls | +24.2% of their MCP cost |
 | sessions of 1-5 calls | **−15.5%**: the results terse changed still come out ahead (+44,615), but fetch-backs of dropped code blocks cost 111,698, 92,235 of it in Claude Haiku 4.5 sessions ([#577](https://github.com/inth3shadows/terse/issues/577)) |
-| the model repeated the same call within 3 calls (a sign it could not use the result): changed vs unchanged results | 0.1% vs 2.76% |
+| the model repeated the same call within 3 calls (a possible sign it could not use the result): changed vs unchanged results | 0.1% vs 2.76% |
 
 Why it is smaller than 59.1%:
 
@@ -70,9 +70,9 @@ Why it is smaller than 59.1%:
   were about 1.8% of what all scanned sessions cost. In the 2026-10-07 shell replay (6,776
   transcripts), shell output was 16.1% and file reads 7.1% of the whole bill, and no MCP
   proxy sees either.
-- **The client already moves big results out.** Claude Code limits an MCP result to 25,000
-  tokens by default and saves a text result over 50,000 characters to a file, showing the
-  model a path and a preview; it also compacts long sessions. A result it saves to a file
+- **The client already moves big results out.** Claude Code saves an MCP result over
+  25,000 tokens (by default) or 50,000 characters to a file, showing the model a path and a
+  preview; it also compacts long sessions. A result it saves to a file
   saves nothing through terse (72 in this replay), and terse keeps its primer out of it
   (#496).
 
