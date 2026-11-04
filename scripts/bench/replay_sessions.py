@@ -1025,7 +1025,7 @@ def main(argv: list[str] | None = None) -> int:
         f"\ntest-harness sessions (transcripts under /tmp): {len(harness)} with a terse result, "
         f"net {summary['harness_sessions']['net_weighted']:,.0f}, "
         + ("INCLUDED above" if args.include_harness else "left out of everything above "
-           "(--include-harness keeps them)"))
+           "except the join and tokenizer-ratio lines (--include-harness keeps them)"))
     (args.out / "summary.txt").write_text(text + "\n")
     print(text)
     return 0

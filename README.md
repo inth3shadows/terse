@@ -48,10 +48,12 @@ first, cache read after, write again on a cache rebuild, nothing after compactio
 charges every `terse.retrieve` fetch-back to terse. No model calls; it reads the ledger and
 the transcripts already on disk.
 
-Run on 2026-11-04 over transcripts from 2026-07-14 to 2026-11-04: 6,309 from real work, 720
-of them with a terse result (96.4% of the results terse changed joined a transcript). Test
-servers were removed from a copy of the ledger first, and test-harness sessions (`claude -p`
-runs from a `/tmp` directory, 16 with a terse result) are left out of the summary; see #577.
+Run on 2026-11-04 over transcripts from 2026-07-14 to 2026-11-04: 6,309 not under `/tmp`,
+720 of them with a terse result. Test servers were removed from a copy of the ledger first,
+and transcripts under `/tmp` (the test harness: 16 with a terse result) are left out of the
+summary; see #577. Some scripted `claude -p` probes run elsewhere are still in it (35
+sessions with a terse result); without them the 1-5-call band is +13.1%. The join rate,
+96.4% of the results terse changed, is measured over all transcripts.
 
 | measure | value |
 |---|--:|
@@ -62,7 +64,7 @@ runs from a `/tmp` directory, 16 with a terse result) are left out of the summar
 | sessions over 100 calls | +24.1% of their MCP cost |
 | sessions of 1-5 calls | +6.4% (an earlier −15.5% came from the 16 test-harness sessions; [#577](https://github.com/inth3shadows/terse/issues/577)) |
 | fetch-backs of dropped code blocks | 3.8M, about a third of what that rule saved; since `keep_first` and `retract_after` went live (2026-09-26, #252), sessions over 100 calls fetched back once, 2% of the rule's saving there |
-| the model repeated the same call within 3 calls (a possible sign it could not use the result): changed vs unchanged results | 0.1% vs 2.76% |
+| the model repeated the same call within 3 calls (a possible sign it could not use the result): changed vs unchanged results | 0.1% vs 2.77% |
 
 Why it is smaller than 59.1%:
 
