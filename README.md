@@ -25,11 +25,55 @@ minified. What the model gets instead costs 181:
 - **Lossless, and checked.** Every transform has an exact inverse, and a round-trip gate
   asserts `decompress(compress(x)) == x`. Other tools in this space drop rows or old
   results to save tokens; terse only removes repetition.
-- **Measured against the alternatives.** On real GitHub API payloads: **59.1%** fewer
-  tokens, against −6.5% for TOON and 4.5% for compressmcp on the same corpus
-  ([Benchmarks](#benchmarks-terse-vs-alternatives)).
+- **Measured against the alternatives, on its best case.** On real GitHub API payloads:
+  **59.1%** fewer tokens, against −6.5% for TOON and 4.5% for compressmcp on the same
+  corpus ([Benchmarks](#benchmarks-terse-vs-alternatives)).
+- **Measured on real sessions, priced at the billed rate.** A replay of the maintainer's
+  own Claude Code sessions puts terse at **23.4% of what MCP results cost**, and under 1%
+  of a session's whole bill ([What it is worth in real sessions](#what-it-is-worth-in-real-sessions)).
 - **Selective, never worse.** It works per tool and passes through anything it can't
   shrink, so it never inflates a result. `terse stats` shows what it actually saved.
+
+## What it is worth in real sessions
+
+The 59.1% above is the codec on large, repetitive JSON. What it saves on a bill is smaller,
+and this section is the number to judge terse by. `scripts/bench/replay_sessions.py` matches
+every result terse changed to the Claude Code session it landed in, then prices the removed
+tokens on each later API call that re-read them at that call's billed rate (cache write
+first, cache read after, write again on a cache rebuild, nothing after compaction), and
+charges every `terse.retrieve` fetch-back to terse. No model calls; it reads the ledger and
+the transcripts already on disk.
+
+Run on 2026-11-04 over 8,993 transcripts from mid-July (736 with a terse result; 96.4% of
+the results terse changed joined a transcript; test servers removed from a copy of the
+ledger first):
+
+| measure | value |
+|---|--:|
+| share of what the joined MCP results would have cost | **23.4%** of 118.9M input-equivalent tokens |
+| share of the whole bill, Opus 5.5 sessions that used terse | 0.81% |
+| share of the whole bill, every session scanned | 0.42% |
+| saving from `secret.list_credentials` + `codegraph_explore`, before fetch-backs | 92% |
+| sessions over 100 calls | +24.2% of their MCP cost |
+| sessions of 1-5 calls | **−15.5%** (the primer is never paid back; [#577](https://github.com/inth3shadows/terse/issues/577)) |
+| same call repeated within 3 calls: changed vs unchanged results | 0.1% vs 2.76% |
+
+Why it is smaller than 59.1%:
+
+- **Cache pricing.** 96.9% of input tokens in the maintainer's sessions are cache reads,
+  billed at a tenth of input price (measured 2026-09-22, 1,093 sessions). A removed token is
+  mostly one that would have been re-read cheaply.
+- **MCP results are a small share of a session.** The MCP results terse handled were about
+  1.8% of what all scanned sessions cost. Shell output (16.1%) and file reads (7.1%) are
+  larger, and no MCP proxy sees them.
+- **The client already moves big results out.** Claude Code saves an MCP text result over
+  50,000 characters to a file and shows the model a path and a preview; it loads tool
+  names only at session start, and it compacts long sessions. A result that size saves
+  nothing through terse (72 in this replay), and terse keeps its primer out of it (#496).
+
+So the value is narrow: a few large, repetitive results re-read across long sessions, with a
+lossless guarantee, and a replay that prices any change to what the agent reads. Since
+2026-10-07 terse takes only narrow improvements chosen from this replay.
 
 ## Design: What Carries The Savings
 
@@ -47,8 +91,9 @@ on uniform arrays but **falls back to dropping rows** on larger/irregular record
 recoverable only via a `retrieve` round-trip against a cache that expires (verified,
 v0.34.0; default 30-min TTL); Anthropic/OpenAI context-editing **drops** old tool results
 server-side. terse never silently mutates what the model sees — and "lossless" is the
-category, not the token count. In terse's own production ledger this codec is where
-essentially all the savings come from (see Status). Its one honest caveat: the
+category, not the token count. In the session replay the one lossy rule, code blocks
+dropped from `codegraph_explore` behind a fetch handle, nets about a quarter of the saving
+after fetch-backs; this codec carries the rest, most of it on the credentials list. Its one honest caveat: the
 tabularization primitive is public (formats like [TOON](https://toonformat.dev/) publish
 it standalone, MIT-licensed, ~40% on flat arrays), so a motivated competitor could clone
 the codec in a weekend.
@@ -345,9 +390,10 @@ terse verify --corpus corpus --json                  # machine-readable gate + s
 ## Benchmarks: terse vs alternatives
 
 Head-to-head token reduction on **real, public GitHub API payloads** (`scripts/bench/`) —
-the nested, record-shaped output that dominates real MCP tool traffic. Lossless and
-verified per payload, counted in `cl100k_base`. The corpus is already-compact JSON, so
-every number is *pure structural* gain, the hardest honest case.
+large, nested, record-shaped output, where the codec does best. Lossless and verified per
+payload, counted in `cl100k_base`. The corpus is already-compact JSON, so every number is
+*pure structural* gain. For what this is worth in live sessions, see
+[What it is worth in real sessions](#what-it-is-worth-in-real-sessions).
 
 **terse is not alone in this niche.** A prior-art sweep (#298) found at least ten projects
 in the same space; three were installed and measured on 2026-09-22 against the same corpus

@@ -13,7 +13,11 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Documentation
+- README: a "What it is worth in real sessions" section from the session replay re-run on
+  2026-11-04 (8,993 transcripts): 23.4% of MCP result cost, under 1% of a session's bill,
+  92% of the saving from two tools, and the 1-5-call band at -15.5% (#577). The 59.1%
+  GitHub benchmark is labelled as the best case.
 
 ## [0.49.0] - 2026-10-29
 
