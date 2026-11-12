@@ -507,6 +507,62 @@ def _iter_sse(body: str) -> Iterator[str]:
         yield "\n".join(data_lines)
 
 
+def _compact_json_text(text: str) -> str:
+    """`text` with every whitespace character OUTSIDE a JSON string removed, everything
+    else kept byte-for-byte. Lexical, never a parse/re-serialize, so it cannot round a
+    number or collapse a duplicate key (#580). A raw newline can only survive inside a
+    string, where it makes the text invalid JSON anyway, which the caller then rejects."""
+    if "\n" not in text and "\r" not in text and not text[:1].isspace() \
+            and not text[-1:].isspace():
+        return text   # the common case: already one line, nothing to strip
+    out: list[str] = []
+    in_str = esc = False
+    for ch in text:
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+            out.append(ch)
+        elif ch not in " \t\r\n":
+            out.append(ch)
+    return "".join(out)
+
+
+def _split_top_level_array(compact: str) -> list[str]:
+    """The literal text of each element of a compact JSON array (already validated by the
+    caller), split at depth-1 commas outside strings."""
+    parts: list[str] = []
+    depth = 0
+    start = 1
+    in_str = esc = False
+    for i, ch in enumerate(compact):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+            if depth == 0:
+                parts.append(compact[start:i].strip())
+        elif ch == "," and depth == 1:
+            parts.append(compact[start:i].strip())
+            start = i + 1
+    return parts
+
+
 def _parse_request_id(line: str) -> tuple[bool, Any]:
     """Parse `line` (an outgoing JSON-RPC request) once: whether it carries an `"id"`
     key at all (a notification has none and per JSON-RPC must never get a reply) and
@@ -667,13 +723,20 @@ class HttpTransport:
                 except (ValueError, RecursionError):  # JSONDecodeError is a ValueError
                     parsed = None
                 if isinstance(parsed, dict) and "jsonrpc" in parsed:
-                    # Forward it verbatim ONLY if the outgoing line actually expected a
-                    # reply — a notification (no "id") must never get one, the same
-                    # invariant _maybe_enqueue_error enforces for a non-JSON-RPC-shaped
-                    # error body just below.
-                    has_id, _ = _parse_request_id(line)
+                    # Forward it ONLY if the outgoing line actually expected a reply — a
+                    # notification (no "id") must never get one, the same invariant
+                    # _maybe_enqueue_error enforces for a non-JSON-RPC-shaped error body
+                    # just below. Servers answer a 400/404 (an expired session, a bad
+                    # request) with `"id": null`, which matches no request the client
+                    # sent, so it hung on its own timeout: carry the request's id instead.
+                    has_id, mid = _parse_request_id(line)
                     if has_id:
-                        self._q.put(raw_body)
+                        if parsed.get("id") != mid:
+                            parsed["id"] = mid
+                            self._q.put(json.dumps(parsed, separators=(",", ":"),
+                                                   ensure_ascii=False))
+                        else:
+                            self._q.put(_compact_json_text(raw_body))
                     return
             detail = raw_body.strip()[:_MAX_ERROR_DETAIL_CHARS] or str(exc)
             self._maybe_enqueue_error(
@@ -704,13 +767,39 @@ class HttpTransport:
             return
         if "text/event-stream" in ctype:
             for msg in _iter_sse(body.decode("utf-8", errors="replace")):
-                self._q.put(msg)
+                self._enqueue_body(line, msg)
         else:
             text = body.decode("utf-8", errors="replace")
             if text.strip():
-                self._q.put(text)
+                self._enqueue_body(line, text)
             # else: a 202 Accepted / empty body is valid Streamable-HTTP and
             # means nothing to enqueue (e.g. the reply to a notification).
+
+    def _enqueue_body(self, line: str, text: str) -> None:
+        """Enqueue one HTTP body / SSE event as newline-free JSON-RPC message(s).
+
+        The queue feeds a newline-delimited stdio stream, so a body was framing-unsafe
+        whenever it was not one compact JSON object: a pretty-printed reply (or an SSE
+        event whose `data:` spanned lines) reached the client as N physical lines of
+        non-JSON and the request hung; an HTML 200 (captive portal, login page) was
+        forwarded as junk; a batch array went out unsplit. Now: whitespace outside
+        strings is removed LEXICALLY (literal text kept, so no number or duplicate key
+        is rewritten by a parse/re-serialize), a batch is split into its elements, and a
+        body that is not JSON-RPC answers the request with an error."""
+        compact = _compact_json_text(text)
+        try:
+            parsed = json.loads(compact)
+        except (ValueError, RecursionError):
+            parsed = None
+        if isinstance(parsed, dict):
+            self._q.put(compact)
+            return
+        if isinstance(parsed, list) and parsed and all(isinstance(m, dict) for m in parsed):
+            for element in _split_top_level_array(compact):
+                self._q.put(element)
+            return
+        self._maybe_enqueue_error(line, "terse: downstream HTTP response is not a JSON-RPC "
+                                        f"message ({len(text)} chars, not shown)")
 
     def _maybe_enqueue_error(self, line: str, message: str) -> None:
         """Enqueue a synthesized JSON-RPC error for `line`'s in-flight request —
