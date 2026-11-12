@@ -1736,19 +1736,36 @@ _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*=")
 # open-ended and caller-defined (`X-Api-Key`, `Proxy-Authorization`, `Cookie`, ...), so
 # over-redacting a borderline name is the safe failure direction for a value that could
 # be printed to a shared terminal.
-_SECRET_HEADER = re.compile(r"(api[-_]?key|token|secret|password|passwd|auth|credential|cookie)",
-                            re.IGNORECASE)
+_SECRET_HEADER = re.compile(r"(api[-_]?key|token|secret|password|passwd|auth|credential|cookie"
+                            r"|(?:^|[_-])(?:pat|key|bearer|session)(?:$|[_-]))", re.IGNORECASE)
+
+# Short secret-bearing flags `_SECRET_FLAG`'s substring set cannot carry without masking
+# ordinary flags (`pat` would hit `--path`, `key` would hit `--keyframe`), so matched whole.
+_SECRET_FLAG_EXACT = re.compile(r"^--?(key|pat|bearer|session)$", re.IGNORECASE)
+
+# Flags whose next arg is a header: terse's own `--header NAME=VALUE`, and the
+# `NAME: VALUE` form `mcp-remote`/curl take as `--header`/`-H`.
+_HEADER_FLAGS = ("--header", "-H")
 
 
 def _redact_header_value(entry: str) -> str:
-    """Mask a `--header NAME=VALUE` entry's VALUE when NAME looks secret-shaped.
-    Leaves the entry alone (name AND value) when it doesn't look secret-shaped, and
-    when there's no `=` at all (a malformed entry `_parse_headers` would reject anyway —
-    not this function's job to validate)."""
-    if "=" not in entry:
-        return entry
-    name, _, _value = entry.partition("=")
-    return f"{name}=***" if _SECRET_HEADER.search(name) else entry
+    """Mask a `--header NAME=VALUE` (or `NAME: VALUE`) entry's VALUE when NAME looks
+    secret-shaped. Leaves the entry alone (name AND value) when it doesn't look
+    secret-shaped, and when it has neither separator."""
+    eq, colon = entry.find("="), entry.find(":")
+    if eq != -1 and (colon == -1 or eq < colon):
+        name, _, _value = entry.partition("=")
+        return f"{name}=***" if _SECRET_HEADER.search(name) else entry
+    if colon != -1:
+        # Whichever separator comes FIRST is the one: `Authorization: Basic dXNlcjpwdw==`
+        # split on its `=` padding printed nearly the whole credential.
+        # `Authorization: Bearer xyz` (the mcp-remote / curl form). Before this, an entry
+        # without `=` was returned whole, printing the token.
+        name, _, value = entry.partition(":")
+        if not value.strip():
+            return entry   # `Authorization:` with the value in the NEXT arg (see caller)
+        return f"{name}: ***" if _SECRET_HEADER.search(name) else entry
+    return entry
 
 
 def _redact_url(url: str) -> str:
@@ -1769,13 +1786,29 @@ def _redact_url(url: str) -> str:
     return urlunsplit((split.scheme, netloc, split.path, query, fragment))
 
 
+def _value_in_next_arg(header: str) -> bool:
+    """`Authorization:` alone: a secret-shaped header whose value is the NEXT arg."""
+    head = header.rstrip()
+    return head.endswith(":") and bool(_SECRET_HEADER.search(head[:-1]))
+
+
 def _redact_args(args: list) -> list:
     out = []
-    pending: str | None = None  # None | "value" (generic secret flag) | "header"
+    pending: str | None = None  # None | "value" | "header" | "header-value"
     for a in args:
+        if pending == "header-value":
+            # `--header "Authorization:" "Bearer x"`: the value came as its own arg.
+            out.append("***")
+            pending = None
+            continue
         if pending == "header":
             out.append(_redact_header_value(a))
-            pending = None
+            pending = "header-value" if _value_in_next_arg(a) else None
+            continue
+        if a.startswith("-H") and len(a) > 2 and a[2] != "=":
+            # curl's attached form, `-HAuthorization: Bearer x`.
+            out.append("-H" + _redact_header_value(a[2:]))
+            pending = "header-value" if _value_in_next_arg(a[2:]) else None
             continue
         if pending == "value":
             pending = None
@@ -1785,17 +1818,17 @@ def _redact_args(args: list) -> list:
             # The secret-looking flag was a boolean (`--no-auth`, `--oauth`): the next
             # token is another flag, not its value. Fall through and handle it as one.
         flag = a.split("=", 1)[0]
-        if flag == "--header":
+        if flag in _HEADER_FLAGS:
             if "=" in a:
                 # Inline form `--header=NAME=VALUE` (argparse also accepts this): the
                 # first `=` separates the flag from the NAME=VALUE payload.
                 _, rest = a.split("=", 1)
-                out.append(f"--header={_redact_header_value(rest)}")
+                out.append(f"{flag}={_redact_header_value(rest)}")
             else:
                 out.append(a)
                 pending = "header"  # the NEXT arg is the NAME=VALUE payload
             continue
-        if _SECRET_FLAG.match(flag):
+        if _SECRET_FLAG.match(flag) or _SECRET_FLAG_EXACT.match(flag):
             out.append(f"{flag}=***" if "=" in a else a)
             pending = "value" if "=" not in a else None
             continue
@@ -2067,6 +2100,14 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
     from .stats import _WRITES_LEDGER_ROWS, _contested_labels, _precedence_winner
 
     rows = scan_scopes(file=args.file, repo_path=args.repo_path)
+    # `wraps` is the downstream argv joined with spaces, straight from the config: it held
+    # `--api-key sk-...` in the clear on both the table and `--json`. Redact the argv LIST
+    # (`wraps_argv`, so a header value containing spaces stays one arg) with the same rules
+    # install/uninstall print with, then join. A router's `wraps` is its peer-name list
+    # and has no argv. `wraps_argv` itself is raw and never leaves this function.
+    rows = [{**{k: v for k, v in r.items() if k != "wraps_argv"},
+             **({"wraps": " ".join(_redact_args(r["wraps_argv"]))}
+                if r.get("wraps_argv") else {})} for r in rows]
     if args.json:
         # Scriptable/CI-checkable parity with `terse stats --json`; [] on no servers.
         print(json.dumps(rows, indent=2))

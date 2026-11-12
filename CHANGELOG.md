@@ -14,6 +14,19 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Fixed
+- `terse mcp-status` (table and `--json`) printed each wrapped server's downstream command
+  unredacted, so `--api-key sk-…` appeared in the clear. It now goes through the same
+  redaction as `install-mcp`/`uninstall-mcp` output. That redaction also covers more
+  shapes: the `Authorization: Bearer …` header form (`--header`/`-H`, as `mcp-remote`
+  takes it, including curl's attached `-HName: value` and a value passed as its own arg),
+  the `--key`/`--pat`/`--bearer`/`--session` flags, and `PAT`/`KEY`/`BEARER`/`SESSION`
+  name parts (`GH_PAT=`, `STRIPE_KEY=`, `SESSION_ID=`, `X-GitHub-PAT`). `mcp-status`
+  redacts the argument list before joining it, so a header value containing spaces is
+  masked whole.
+- The savings ledger labelled an HTTP downstream by its full URL netloc, so a
+  `https://user:pass@host/mcp` target wrote `user:pass@host` into every ledger row and into
+  `terse stats` output. The label is now the `host[:port]` alone, and rows already in the
+  ledger with a `user:pass@` or `token@` label are read back under the host.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,
