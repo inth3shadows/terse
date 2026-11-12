@@ -2955,3 +2955,21 @@ def test_child_that_ignores_stdin_eof_is_terminated_after_the_grace(monkeypatch)
     rc = run_proxy(stubborn, FULL, stdin=io.StringIO(""), stdout=io.StringIO())
     assert _time.monotonic() - start < 10
     assert rc != 0          # killed by SIGTERM, not a clean exit
+
+
+def test_a_slow_reply_after_client_eof_is_still_delivered(monkeypatch):
+    # The child answers 1.5 s after EOF, past a 0.5 s grace: an in-flight tools/call
+    # keeps it alive, so the reply the client asked for is not cut off (#582 review).
+    from terse import proxy as proxy_mod
+    monkeypatch.setattr(proxy_mod, "_EOF_GRACE_S", 0.5)
+    slow = [sys.executable, "-c",
+            "import sys, time, json\n"
+            "req = json.loads(sys.stdin.readline())\n"
+            "time.sleep(1.5)\n"
+            "print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': "
+            "{'content': [{'type': 'text', 'text': 'done'}]}}), flush=True)\n"]
+    call = json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                       "params": {"name": "items.get", "arguments": {}}}) + "\n"
+    cout = io.StringIO()
+    assert run_proxy(slow, FULL, stdin=io.StringIO(call), stdout=cout) == 0
+    assert '"id":4' in cout.getvalue().replace(" ", "")

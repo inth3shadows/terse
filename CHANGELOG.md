@@ -19,9 +19,10 @@ fails that pull request until the section has moved.
   client-to-server thread. Client stdin is now read with `surrogateescape`, as the
   multiproxy router has done since #517.
 - A stdio downstream that ignores stdin EOF kept `terse proxy` blocked forever once the
-  client disconnected without signalling it, orphaning both processes. After client EOF
-  the child now gets 5 seconds to exit on its own, then is terminated (SIGTERM, then
-  SIGKILL), with a stderr note.
+  client disconnected without signalling it, orphaning both processes. After client EOF,
+  a child that stays idle for 30 seconds (no tool call in flight and no output) is now
+  terminated (SIGTERM, then SIGKILL), with a stderr note. A child still answering a
+  request the client sent before EOF is never cut off for being slow.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,
