@@ -2009,6 +2009,11 @@ def test_redact_args_leaves_ordinary_args_alone(args):
     (["-HAuthorization: Bearer sk-1"], ["-HAuthorization: ***"]),
     (["--header", "Authorization:", "Bearer sk-1"], ["--header", "Authorization:", "***"]),
     (["-e", "SESSION_ID=sk-1"], ["-e", "SESSION_ID=***"]),
+    (["-H", "Authorization: Basic dXNlcjpwdw=="], ["-H", "Authorization: ***"]),
+    (["--header", "Authorization: Bearer abc=="], ["--header", "Authorization: ***"]),
+    (["-HAuthorization:", "Bearer S"], ["-HAuthorization:", "***"]),
+    (["--header", "Authorization:  ", "Bearer S"], ["--header", "Authorization:  ", "***"]),
+    (["--header", "X-Api-Key=a:b"], ["--header", "X-Api-Key=***"]),
 ])
 def test_redact_args_review_round_shapes(args, want):
     assert _redact_args(args) == want

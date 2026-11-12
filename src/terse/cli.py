@@ -1752,10 +1752,13 @@ def _redact_header_value(entry: str) -> str:
     """Mask a `--header NAME=VALUE` (or `NAME: VALUE`) entry's VALUE when NAME looks
     secret-shaped. Leaves the entry alone (name AND value) when it doesn't look
     secret-shaped, and when it has neither separator."""
-    if "=" in entry:
+    eq, colon = entry.find("="), entry.find(":")
+    if eq != -1 and (colon == -1 or eq < colon):
         name, _, _value = entry.partition("=")
         return f"{name}=***" if _SECRET_HEADER.search(name) else entry
-    if ":" in entry:
+    if colon != -1:
+        # Whichever separator comes FIRST is the one: `Authorization: Basic dXNlcjpwdw==`
+        # split on its `=` padding printed nearly the whole credential.
         # `Authorization: Bearer xyz` (the mcp-remote / curl form). Before this, an entry
         # without `=` was returned whole, printing the token.
         name, _, value = entry.partition(":")
@@ -1783,6 +1786,12 @@ def _redact_url(url: str) -> str:
     return urlunsplit((split.scheme, netloc, split.path, query, fragment))
 
 
+def _value_in_next_arg(header: str) -> bool:
+    """`Authorization:` alone: a secret-shaped header whose value is the NEXT arg."""
+    head = header.rstrip()
+    return head.endswith(":") and bool(_SECRET_HEADER.search(head[:-1]))
+
+
 def _redact_args(args: list) -> list:
     out = []
     pending: str | None = None  # None | "value" | "header" | "header-value"
@@ -1794,12 +1803,12 @@ def _redact_args(args: list) -> list:
             continue
         if pending == "header":
             out.append(_redact_header_value(a))
-            pending = ("header-value" if a.endswith(":")
-                       and _SECRET_HEADER.search(a[:-1]) else None)
+            pending = "header-value" if _value_in_next_arg(a) else None
             continue
         if a.startswith("-H") and len(a) > 2 and a[2] != "=":
             # curl's attached form, `-HAuthorization: Bearer x`.
             out.append("-H" + _redact_header_value(a[2:]))
+            pending = "header-value" if _value_in_next_arg(a[2:]) else None
             continue
         if pending == "value":
             pending = None
