@@ -461,7 +461,13 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
     neither key is not a valid MCP server entry and can't be wrapped."""
     servers = config.setdefault("mcpServers", {})
     live = servers.get(server)
-    if server in stash:
+    if server in stash and _replaced_by_hand(live, stash[server]):
+        # The stashed original is stale: the user replaced the wrapped entry with a new,
+        # unwrapped one. Wrapping the stash would silently bring the OLD command back and
+        # discard theirs (#582), so the live entry becomes the original.
+        original = live
+        stash[server] = original
+    elif server in stash:
         original = stash[server]
     elif live is not None:
         original = live
@@ -732,7 +738,12 @@ def wrap_multi(config: dict, stash: dict, servers: list[str], policy: str,
                 f"'{name}' is itself a terse multiproxy router (it runs `proxy --config`) "
                 f"— folding it in would nest a proxy inside a proxy. Uninstall its fleet "
                 f"first, or name its peers individually")
-        if name in stash:
+        if name in stash and _replaced_by_hand(live_servers.get(name), stash[name]):
+            # Same rule as single-server `wrap` (#582): a live entry the user swapped for a
+            # new command is the original now, not the stale stash copy.
+            original = live_servers[name]
+            stash[name] = original
+        elif name in stash:
             original = stash[name]
         elif name in live_servers:
             # `_unnest` FIRST, then stash: a server can be live-wrapped with its stash
@@ -887,8 +898,42 @@ def _prune_peer(peers_doc: dict, server: str) -> bool:
     return was_there
 
 
+def _replaced_by_hand(live: object, original: object) -> bool:
+    """True when `live` is an ordinary (non-terse, non-router) entry that differs from the
+    stashed `original` — the user swapped the wrapped entry for a new command by hand, so
+    the stash no longer describes what they run."""
+    return (isinstance(live, dict) and proxy_arg_segment(live) is None
+            and not _is_router_entry(live) and live != original
+            and not _wraps_original(live, original))
+
+
+def _wraps_original(live: dict, original: object) -> bool:
+    """True when `live`'s args END with `-- <original's launch>`: the shape `wrap` writes
+    whatever the launcher. A `$TERSE_MCP_CMD` launcher that `_looks_like_terse_launcher`
+    cannot recognise (`/path/tmcp`) is still our wrapper by this test, so it is never
+    mistaken for a hand-replacement (which would double-wrap it on re-install and drop
+    the stash on uninstall)."""
+    if not isinstance(original, dict):
+        return False
+    args = live.get("args")
+    if not isinstance(args, list):
+        return False
+    if isinstance(original.get("url"), str):
+        launch = [original["url"]]
+    elif isinstance(original.get("command"), str):
+        launch = [original["command"], *(original.get("args") or [])]
+    else:
+        return False
+    n = len(launch)
+    # `proxy` before the `--` too: `sb-run --secret X -- kb-mcp` ends with the original's
+    # launch but is the user's own wrapper, not terse's (review of #582 item 5).
+    return (len(args) > n and args[-n - 1] == "--" and args[-n:] == launch
+            and "proxy" in args[:-n - 1])
+
+
 def unwrap(config: dict, stash: dict, server: str,
-           peers_doc: dict | None = None, router: str | None = None) -> tuple[dict, dict]:
+           peers_doc: dict | None = None, router: str | None = None,
+           *, keep_live: bool = False) -> tuple[dict, dict]:
     """Restore `server`'s original entry from the stash (byte-for-byte).
 
     With a `peers_doc`, also detach the server from a multiproxy router (#179): prune it
@@ -898,7 +943,9 @@ def unwrap(config: dict, stash: dict, server: str,
     if server not in stash:
         raise KeyError(server)
     servers = config.setdefault("mcpServers", {})
-    servers[server] = stash.pop(server)
+    original = stash.pop(server)
+    if not keep_live:   # `keep_live`: the live entry was replaced by hand; never overwrite it
+        servers[server] = original
     if peers_doc is not None:
         _prune_peer(peers_doc, server)
         # Gated on "no peers REMAIN", not on "this server's prune fired". Requiring the
@@ -1315,7 +1362,10 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
         # An explicit --diff/--no-diff always wins; only an unstated one is inferred.
         # Classified on the ORIGINAL entry (the stash on a re-wrap), since a wrapped
         # entry's command is terse itself.
-        orig = stash.get(s) or before or {}
+        # A hand-replaced entry is the original now (`wrap` adopts it below), so classify
+        # and compare against it, not the stale stash copy.
+        replaced = s in stash and _replaced_by_hand(before, stash[s])
+        orig = (before if replaced else stash.get(s) or before) or {}
         s_diff = diff
         if diff is None and classify_design_server(
                 s, [orig.get("command", ""), *(orig.get("args") or [])]):
@@ -1328,7 +1378,7 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
         preserved = sorted(
             k for k in (before or {})
             if k not in ("command", "args", "url", "headers")
-            and s in stash and (before or {}).get(k) != stash[s].get(k)
+            and s in stash and not replaced and (before or {}).get(k) != stash[s].get(k)
         )
         wrap(node, stash, s, policy_abs, terse_cmd, capture_dir=capture_abs,
              diff=s_diff, diff_keyframe_interval=diff_keyframe_interval,
@@ -2039,6 +2089,20 @@ def do_uninstall(servers: list[str] | None, *, all_: bool = False,
         detached = peers_doc is not None and any(
             isinstance(d, dict) and d.get("name") == s
             for d in (peers_doc.get("downstreams") or []))
+        live = node.get("mcpServers", {}).get(s)
+        if _replaced_by_hand(live, stash[s]):
+            # Restoring the stash would overwrite the user's newer entry with the old one.
+            detached = peers_doc is not None and any(
+                isinstance(d, dict) and d.get("name") == s
+                for d in (peers_doc.get("downstreams") or []))
+            unwrap(node, stash, s, peers_doc=peers_doc, router=router_name, keep_live=True)
+            kept = {"server": s, "restored": False, "stash_dropped": True,
+                    **({"detached_from": router_name} if detached and router_name else {})}
+            changes.append({**kept,
+                            "reason": "the live entry is no longer wrapped by terse (it was "
+                                      "replaced by hand); kept it and dropped the stale "
+                                      "stash copy"})
+            continue
         unwrap(node, stash, s, peers_doc=peers_doc, router=router_name)
         change = {"server": s, "restored": True}
         if detached and router_name:
@@ -2072,7 +2136,7 @@ def do_uninstall(servers: list[str] | None, *, all_: bool = False,
         # must not destroy the peers file those entries depend on, which is what the old
         # unlink did while leaving both behind, unrepairable.
         result["router_ambiguous"] = all_routers
-    if not dry_run and any(c.get("restored") for c in changes):
+    if not dry_run and any(c.get("restored") or c.get("stash_dropped") for c in changes):
         result["backup"] = str(_backup(target.cfg))
         # CONFIG first, stash last — the OPPOSITE of the install path, because `unwrap()`
         # inverts which side is "recovery" and which is "destructive" (code-review catch

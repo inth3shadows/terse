@@ -2049,6 +2049,10 @@ def _cmd_uninstall_mcp(args: argparse.Namespace) -> int:
             print(f"{tag} {c['server']}")
             if c.get("partial"):
                 print(f"    PARTIAL: {c.get('reason')}")
+        elif c.get("stash_dropped"):
+            # Not a skip: the stash (and any peer) IS rewritten, the live entry is kept.
+            verb = "would keep" if res["dry_run"] else "kept"
+            print(f"{verb} {c['server']}: {c.get('reason')}")
         else:
             print(f"skip {c['server']}: {c.get('reason')}")
     if res.get("router_ambiguous"):
