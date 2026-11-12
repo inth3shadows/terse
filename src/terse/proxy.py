@@ -1541,7 +1541,10 @@ class Interceptor:
         chosen = applied.text
         reason = "non_json"  # curr unparseable/too-deep: no JSON diff decision was possible
         try:
-            curr = json.loads(text)
+            # Faithful parse: a diff is emitted from `curr`, so a collapsed duplicate key or
+            # renormalized number here would reach the model as a value the server never
+            # sent. `UnfaithfulJSON` is a ValueError -> treated as non-JSON, no diff.
+            curr = transforms.loads_faithful(text)
             # Depth guard (#79): a payload past the codec-wide cap must not become the
             # diff base — the diff encoders/decoders recurse and deep-compare without a
             # depth argument. Treat it like non-JSON: no diff in, no base stored.
@@ -1944,7 +1947,9 @@ class Interceptor:
             # `1` where the block said `true`. The guard's whole claim is that a block
             # carrying anything the typed field does not is never dropped; value-level
             # equality is a hole in it.
-            mirrored = json.dumps(json.loads(text_blocks[0]["text"]),
+            # Faithful parse: `1.50` in the block must not canonicalize into a match with a
+            # typed `1.5` and get the block dropped (UnfaithfulJSON -> ValueError -> keep).
+            mirrored = json.dumps(transforms.loads_faithful(text_blocks[0]["text"]),
                                   sort_keys=True, separators=(",", ":"))
             typed = json.dumps(result["structuredContent"],
                                sort_keys=True, separators=(",", ":"))

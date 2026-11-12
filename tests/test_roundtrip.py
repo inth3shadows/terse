@@ -514,3 +514,56 @@ def test_the_diff_gate_rejects_a_rebuild_that_changes_a_type(monkeypatch):
     monkeypatch.setattr(transforms, "_encode_keys", lambda prev, curr: {
         transforms.DIFF_MARKER: 1, "shape": "keys", "set": {}, "del": []})
     assert transforms.diff_encode({"a": 1}, {"a": True}) is None
+
+
+# -- Value-faithful parse (audit 2026-11-12): `json.loads` itself collapses duplicate keys and
+# renormalizes number literals, and the round-trip gate compares PARSED values, so it could
+# not see either. Each of these used to compress with `round-trip lossless: PASS` and no
+# warning while emitting a value the server never sent.
+
+_UNFAITHFUL = [
+    '{"a":1,"a":2,"items":[{"k":"v"},{"k":"v"}]}',     # duplicate key -> last wins
+    '{"rows":[{"id":1,"id":1}]}',                       # duplicate key, nested
+    '{"price":1.50,"rows":[1,2,3]}',                     # trailing zero
+    '{"x":0.10000000000000000001,"rows":[1,2]}',         # past double precision
+    '{"n":1E5,"rows":[1,2]}',                            # exponent form
+    '{"n":-0,"rows":[1,2]}',                             # negative zero int
+    '[{"a":1.0e2},{"a":2}]',                             # exponent with fraction
+]
+
+
+@pytest.mark.parametrize("raw", _UNFAITHFUL)
+def test_a_parse_that_would_rewrite_the_payload_passes_through_raw(raw):
+    pol = Policy(rules=[Rule("*", ("minify", "tabularize", "dictionary"))])
+    out = policy_mod.apply(raw, "t", pol)
+    assert out.text == raw and out.skipped
+    assert any("passed through uncompressed to stay lossless" in w for w in out.warnings)
+
+
+@pytest.mark.parametrize("raw", _UNFAITHFUL)
+def test_an_unfaithful_parse_is_not_read_as_a_python_literal(raw):
+    # `pyliteral` would `literal_eval` the same text and collapse the same duplicate keys.
+    pol = Policy(rules=[Rule("*", ("minify", "tabularize", "dictionary", "pyliteral"))])
+    out = policy_mod.apply(raw, "t", pol)
+    assert out.text == raw and out.skipped
+
+
+@pytest.mark.parametrize("raw", ['{"price": 1.5, "n": 100000.0, "z": -0.0, "i": -3}',
+                                 '{"big": 12345678901234567890, "e": 1e+100}',
+                                 '{"x":1e400}'])
+def test_canonical_numbers_still_parse(raw):
+    transforms.loads_faithful(raw)   # no raise: these re-serialize to their own literal
+
+
+def test_whitespace_is_not_a_fidelity_concern():
+    pol = Policy(rules=[Rule("*", ("minify",))])
+    out = policy_mod.apply('{ "a" : 1.5 ,\n "b" : [ 1, 2 ] }', "t", pol)
+    assert not out.skipped and out.text == '{"a":1.5,"b":[1,2]}'
+
+
+def test_joined_blocks_with_an_unfaithful_parse_refuse_the_join():
+    pol = Policy(rules=[Rule("*", ("minify", "tabularize"))])
+    applied, objs, reason = policy_mod.apply_joined(['{"a":1}', '{"a":1,"a":2}'], "t", pol)
+    assert applied is None and reason == policy_mod.JOIN_REFUSED_UNFAITHFUL
+    applied, objs, reason = policy_mod.apply_joined(['{"a":1}', '{"a":1.50}'], "t", pol)
+    assert applied is None and reason == policy_mod.JOIN_REFUSED_UNFAITHFUL

@@ -14,6 +14,18 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Fixed
+- A JSON payload whose parse is not value-faithful to its text now passes through
+  uncompressed with a warning instead of being rewritten. `json.loads` collapses duplicate
+  keys (`{"a":1,"a":2}` -> `{"a":2}`) and renormalizes number literals (`1.50` -> `1.5`,
+  `1E5` -> `100000.0`, `0.10000000000000000001` -> `0.1`, `-0` -> `0`), and the round-trip
+  gate compares parsed values, so these compressed with `round-trip lossless: PASS` and no
+  signal. The new `transforms.loads_faithful` guards `apply`, `apply_joined` (new refusal
+  reason `unfaithful`), the proxy's diff base and the `structuredContent` mirror check.
+  Whitespace is unaffected.
+
+## [0.49.1] - 2026-11-04
+
+### Fixed
 - `scripts/bench/replay_sessions.py` leaves test-harness sessions out of its summary: a
   transcript whose project directory is under `/tmp` (the cost-per-task suite and drop-rule
   evals run `claude -p` there). They are still scanned and joined, tagged `"harness": true`

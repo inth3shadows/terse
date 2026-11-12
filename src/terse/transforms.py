@@ -105,6 +105,49 @@ _EMBED_FORMS: dict[str, dict[str, Any]] = {
 MAX_DEPTH = 200
 
 
+class UnfaithfulJSON(ValueError):
+    """`raw` parses, but re-serializing the parse would not say what the server said."""
+
+
+def _faithful_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise UnfaithfulJSON("duplicate object key")
+    return obj
+
+
+def _faithful_float(lit: str) -> float:
+    value = float(lit)
+    # An overflowing literal (`1e400` -> inf) is left to the existing non-finite guard
+    # (`_unwritable` / JOIN_REFUSED_NON_FINITE), which already passes it through raw.
+    if math.isfinite(value) and json.dumps(value) != lit:
+        raise UnfaithfulJSON(f"number {lit!r} would re-serialize as {json.dumps(value)!r}")
+    return value
+
+
+def _faithful_int(lit: str) -> int:
+    value = int(lit)
+    if str(value) != lit:            # `-0` -> `0`
+        raise UnfaithfulJSON(f"number {lit!r} would re-serialize as {value!r}")
+    return value
+
+
+def loads_faithful(raw: str) -> Any:
+    """`json.loads`, refusing any document whose parse is not value-faithful to its text.
+
+    Everything downstream re-serializes the parsed value, and the round-trip gate compares
+    parsed values, so a collapse inside `json.loads` itself is invisible to both:
+    `{"a":1,"a":2}` -> `{"a":2}`, `1.50` -> `1.5`, `1E5` -> `100000.0`,
+    `0.10000000000000000001` -> `0.1`, `-0` -> `0`. Raises `UnfaithfulJSON` (a
+    `ValueError`) for those, so a caller passes the payload through untouched rather than
+    emit a value the server never sent. Whitespace is NOT a fidelity concern: dropping it
+    is what minify does. The embedded tier holds the stricter byte-for-byte bar
+    (`_embed_json_string`) because it re-emits a string, not a structure.
+    """
+    return json.loads(raw, object_pairs_hook=_faithful_pairs,
+                      parse_float=_faithful_float, parse_int=_faithful_int)
+
+
 def exceeds_depth(obj: Any, cap: int = MAX_DEPTH) -> bool:
     """True if obj nests containers deeper than `cap`. Iterative — safe to call on the
     pathological payloads it exists to screen out."""
