@@ -536,7 +536,7 @@ _UNFAITHFUL = [
 
 _SAME_VALUE = ['1.50', '1E5', '0.00001', '1e-7', '1.0E7', '1e16', '10.00', '2.5e-3', '-0',
                '-0.0', '1e+100', '5e-324', '1.7976931348623157e308',
-               # %.17g (C, old PHP) and JDK<19 spellings: non-shortest, same double (round 2)
+               # %.17g (C, old PHP) and other non-shortest spellings of the same double (round 2)
                '0.10000000000000001', '1.1000000000000001', '0.29999999999999999',
                '8.409999999999999E21', '4.9E-324',
                # zeros however spelled, including an exponent past Decimal's range
@@ -636,3 +636,15 @@ def test_every_spelling_a_double_encoder_emits_is_kept():
             continue
         for f in fmts:
             assert transforms.loads_faithful(f(v)) == v
+
+
+def test_the_shortest_repr_of_every_power_of_two_is_kept_however_spelled():
+    # Round-4 review of #580: at a power of two the shortest repr can differ from the
+    # correctly rounded digits at its length; Java/.NET/Rust spellings of it were refused.
+    import math
+    from decimal import Decimal
+    for k in range(-1074, 1024):
+        v = math.ldexp(1.0, k)
+        fixed = format(Decimal(repr(v)), "f")   # Go/Rust 'f': the repr digits, no exponent
+        for lit in (repr(v), repr(v).upper(), fixed if abs(k) < 200 else repr(v)):
+            transforms.loads_faithful(lit)   # must not raise (an integral `fixed` is a JSON int)

@@ -141,7 +141,12 @@ def _faithful_float(lit: str) -> float:
     if digits == 0:
         return value                       # a zero, however spelled (`0e5`, `-0.00`)
     try:
-        exact = Decimal(lit) == Decimal(format(value, f".{digits - 1}e"))
+        # `or`: at a power of two the gap below is half the gap above, so the shortest
+        # repr is not always the correct rounding at its own length (2**-44 is
+        # `5.684341886080802e-14`, correctly rounded `...801`). The repr IS the double,
+        # so another spelling of it (Java's `5.684341886080802E-14`) is kept too.
+        exact = (Decimal(lit) == Decimal(format(value, f".{digits - 1}e"))
+                 or Decimal(lit) == Decimal(repr(value)))
     except ArithmeticError:                # an exponent past Decimal's range
         exact = False
     if not exact:
