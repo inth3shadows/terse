@@ -150,6 +150,7 @@ _FRAMING_MODES = {
         "id: 1\ndata:\n\ndata: ping\n\ndata: " + json.dumps(
             {"jsonrpc": "2.0", "id": mid, "result": _TOOLS}) + "\n\n").encode()),
     "sse_junk_only": lambda h, mid: _raw(h, 200, "text/event-stream", b"data: ping\n\n"),
+    "sse_blank_only": lambda h, mid: _raw(h, 200, "text/event-stream", b"data:\n\n"),
     "not_jsonrpc": lambda h, mid: _raw(h, 200, "application/json",
                                        b'{"error": "login required"}'),
     "bom": lambda h, mid: _raw(h, 200, "application/json", ("\ufeff" + json.dumps(
@@ -740,8 +741,9 @@ def test_sse_priming_and_keepalive_events_are_skipped_not_errored():
     assert msgs == [{"jsonrpc": "2.0", "id": 3, "result": _TOOLS}]
 
 
-def test_sse_stream_with_no_message_answers_with_an_error():
-    msgs = [json.loads(ln) for ln in _one_list_call("sse_junk_only")]
+@pytest.mark.parametrize("mode", ["sse_junk_only", "sse_blank_only"])
+def test_sse_stream_with_no_message_answers_with_an_error(mode):
+    msgs = [json.loads(ln) for ln in _one_list_call(mode)]
     assert len(msgs) == 1 and "no JSON-RPC message" in msgs[0]["error"]["message"]
 
 
@@ -761,3 +763,13 @@ def test_lexers_handle_escapes_and_nesting():
     compact = _compact_json_text(text)
     assert compact == '[{"a":[1,2]},{"b":"\\"] , {x"}]'
     assert _split_top_level_array(compact) == ['{"a":[1,2]}', '{"b":"\\"] , {x"}']
+
+
+def test_compaction_is_linear_on_a_truncated_string_full_of_escaped_quotes():
+    import time as _time
+
+    from terse.transport import _compact_json_text
+    text = '\n{"a":"' + '\\"' * 200_000      # cut off mid-string
+    start = _time.monotonic()
+    assert _compact_json_text(text) == text.lstrip("\n")
+    assert _time.monotonic() - start < 2.0

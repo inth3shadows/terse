@@ -510,9 +510,14 @@ def _iter_sse(body: str) -> Iterator[str]:
 # A JSON string literal (escapes included) or a run of JSON whitespace. Matching strings
 # first is what keeps whitespace INSIDE them; the regex engine does the scanning, so a
 # multi-megabyte pretty-printed body is not walked one character at a time in Python.
-_JSON_STRING_OR_WS = re.compile(r'("(?:[^"\\]|\\.)*")|[ \t\r\n]+', re.DOTALL)
+# The string pattern is the unrolled `"[^"\\]*(?:\\.[^"\\]*)*"?`: its closing quote is
+# OPTIONAL, so an unterminated string (a truncated body) is consumed to the end in one
+# linear pass instead of failing and being retried from every later `"`, which was
+# quadratic on a cut-off string full of `\"` (review of #582 item 4).
+_STRING = r'"[^"\\]*(?:\\.[^"\\]*)*"?'
+_JSON_STRING_OR_WS = re.compile(r'(' + _STRING + r')|[ \t\r\n]+', re.DOTALL)
 # A string literal, or one structural character that can change nesting or split a batch.
-_JSON_STRING_OR_STRUCT = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{},]', re.DOTALL)
+_JSON_STRING_OR_STRUCT = re.compile(_STRING + r'|[\[\]{},]', re.DOTALL)
 
 
 def _compact_json_text(text: str) -> str:
@@ -759,7 +764,7 @@ class HttpTransport:
             events = list(_iter_sse(body.decode("utf-8", errors="replace")))
             delivered = sum(self._enqueue_body(line, msg, on_junk=None) for msg in events
                             if msg.strip())
-            if not delivered and any(m.strip() for m in events):
+            if not delivered:
                 self._maybe_enqueue_error(line, "terse: downstream SSE stream carried no "
                                                 "JSON-RPC message")
         else:
