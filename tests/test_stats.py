@@ -487,3 +487,12 @@ def test_server_label_drops_url_userinfo():
     # `netloc` kept `user:pass@` and wrote it to every ledger row (#582).
     assert server_label(["https://bob:s3cr3t@mcp.example.com:8443/mcp"]) == "mcp.example.com:8443"
     assert server_label(["https://tok@mcp.example.com/mcp"]) == "mcp.example.com"
+
+
+def test_load_stats_strips_userinfo_from_old_ledger_rows(tmp_path):
+    log = tmp_path / "stats.jsonl"
+    log.write_text("\n".join(json.dumps({"ts": 1, "server": s, "tool": "t"}) for s in
+                             ("bob:s3cr3t@mcp.example.com", "tok@mcp.example.com",
+                              "kb@work")) + "\n", encoding="utf-8")
+    assert [r["server"] for r in load_stats(log)] == [
+        "mcp.example.com", "mcp.example.com", "kb@work"]

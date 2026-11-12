@@ -2003,3 +2003,32 @@ def test_redact_args_masks_more_secret_shapes(args, want):
 ])
 def test_redact_args_leaves_ordinary_args_alone(args):
     assert _redact_args(args) == args
+
+
+@pytest.mark.parametrize(("args", "want"), [
+    (["-HAuthorization: Bearer sk-1"], ["-HAuthorization: ***"]),
+    (["--header", "Authorization:", "Bearer sk-1"], ["--header", "Authorization:", "***"]),
+    (["-e", "SESSION_ID=sk-1"], ["-e", "SESSION_ID=***"]),
+])
+def test_redact_args_review_round_shapes(args, want):
+    assert _redact_args(args) == want
+
+
+def test_mcp_status_redacts_a_header_value_containing_spaces(tmp_path, monkeypatch, capsys):
+    # `wraps` is space-joined; redacting after the join split the value into words and
+    # masked only the first (`Authorization: *** Bearer SECRET`).
+    cfg = tmp_path / "claude.json"
+    cfg.write_text(json.dumps({"mcpServers": {"r": {"command": "npx", "args": [
+        "mcp-remote", "https://h.example/mcp", "--header", "Authorization: Bearer SECRET1"]}}}),
+        encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    monkeypatch.chdir(tmp_path)
+    policy = _write(tmp_path, "policy.json", json.dumps({"rules": []}))
+    assert main(["install-mcp", "r", "--policy", str(policy), "--no-diff"]) == 0
+    capsys.readouterr()
+    assert main(["mcp-status"]) == 0
+    out = capsys.readouterr().out
+    assert "SECRET1" not in out and "--header Authorization: ***" in out
+    assert main(["mcp-status", "--json"]) == 0
+    raw = capsys.readouterr().out
+    assert "SECRET1" not in raw and "wraps_argv" not in raw

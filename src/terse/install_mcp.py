@@ -1745,6 +1745,10 @@ def _scan_target(target: Target, scope: str, approval=None) -> list[dict]:
         launcher = None
         launcher_gone = False
         wraps = None
+        # The downstream argv as a list: `wraps` joins it with spaces, which loses the
+        # arg boundaries a redactor needs (`--header "Authorization: Bearer x"`), so the
+        # CLI redacts this and joins afterwards. Never printed raw.
+        wraps_argv: list[str] | None = None
         diff = None
         stats_on = None
         stats_log = None
@@ -1810,6 +1814,7 @@ def _scan_target(target: Target, scope: str, approval=None) -> list[dict]:
                 downstream = args[args.index("--") + 1:]
                 if downstream:
                     wraps = " ".join(downstream)
+                    wraps_argv = [str(a) for a in downstream]
             # A router's policy lives in the peers file, not in `--policy` (it carries
             # `--config`), and it has to resolve BEFORE the label below reads it: resolving
             # it afterwards made every router row print the dataclass default `default
@@ -1887,7 +1892,8 @@ def _scan_target(target: Target, scope: str, approval=None) -> list[dict]:
         shown_state = "unapproved" if approval_status == "rejected" else state
         rows.append({"scope": scope, "server": name, "state": shown_state, "policy": policy,
                     "policy_missing": policy_missing, "launcher": launcher,
-                    "launcher_missing": launcher_gone, "wraps": wraps, "diff": diff,
+                    "launcher_missing": launcher_gone, "wraps": wraps,
+                    "wraps_argv": wraps_argv, "diff": diff,
                     "stats": stats_on, "stats_log": stats_log, "config": str(target.cfg),
                     # The baked `--primer` mode (#325), None when absent (= `always`).
                     "primer": primer_mode,

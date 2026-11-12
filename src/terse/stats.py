@@ -518,6 +518,15 @@ def load_stats(log_path: str | Path, since_ts: int | None = None) -> list[dict[s
                 continue
             if not isinstance(rec, dict):
                 continue
+            server = rec.get("server")
+            if isinstance(server, str) and "@" in server:
+                # Rows written before `server_label` dropped URL userinfo carry
+                # `user:pass@host` or `token@host`; show (and group) them under the host
+                # alone. Only when the tail looks like a host or the head like `user:pass`,
+                # so a config key that merely contains `@` (`kb@work`) is left alone.
+                head, _, tail = server.rpartition("@")
+                if ":" in head or "." in tail:
+                    rec["server"] = tail
             if since_ts is not None and not (isinstance(rec.get("ts"), int)
                                              and rec["ts"] >= since_ts):
                 continue

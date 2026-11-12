@@ -1737,7 +1737,7 @@ _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*=")
 # over-redacting a borderline name is the safe failure direction for a value that could
 # be printed to a shared terminal.
 _SECRET_HEADER = re.compile(r"(api[-_]?key|token|secret|password|passwd|auth|credential|cookie"
-                            r"|(?:^|[_-])(?:pat|key|bearer)(?:$|[_-]))", re.IGNORECASE)
+                            r"|(?:^|[_-])(?:pat|key|bearer|session)(?:$|[_-]))", re.IGNORECASE)
 
 # Short secret-bearing flags `_SECRET_FLAG`'s substring set cannot carry without masking
 # ordinary flags (`pat` would hit `--path`, `key` would hit `--keyframe`), so matched whole.
@@ -1758,7 +1758,9 @@ def _redact_header_value(entry: str) -> str:
     if ":" in entry:
         # `Authorization: Bearer xyz` (the mcp-remote / curl form). Before this, an entry
         # without `=` was returned whole, printing the token.
-        name, _, _value = entry.partition(":")
+        name, _, value = entry.partition(":")
+        if not value.strip():
+            return entry   # `Authorization:` with the value in the NEXT arg (see caller)
         return f"{name}: ***" if _SECRET_HEADER.search(name) else entry
     return entry
 
@@ -1783,11 +1785,21 @@ def _redact_url(url: str) -> str:
 
 def _redact_args(args: list) -> list:
     out = []
-    pending: str | None = None  # None | "value" (generic secret flag) | "header"
+    pending: str | None = None  # None | "value" | "header" | "header-value"
     for a in args:
+        if pending == "header-value":
+            # `--header "Authorization:" "Bearer x"`: the value came as its own arg.
+            out.append("***")
+            pending = None
+            continue
         if pending == "header":
             out.append(_redact_header_value(a))
-            pending = None
+            pending = ("header-value" if a.endswith(":")
+                       and _SECRET_HEADER.search(a[:-1]) else None)
+            continue
+        if a.startswith("-H") and len(a) > 2 and a[2] != "=":
+            # curl's attached form, `-HAuthorization: Bearer x`.
+            out.append("-H" + _redact_header_value(a[2:]))
             continue
         if pending == "value":
             pending = None
@@ -2080,11 +2092,13 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
 
     rows = scan_scopes(file=args.file, repo_path=args.repo_path)
     # `wraps` is the downstream argv joined with spaces, straight from the config: it held
-    # `--api-key sk-...` in the clear on both the table and `--json`. Redacted here with the
-    # same rules install/uninstall print with; split on single spaces so a router's
-    # `a, b` peer list rejoins unchanged.
-    rows = [{**r, "wraps": " ".join(_redact_args(r["wraps"].split(" ")))}
-            if isinstance(r.get("wraps"), str) else r for r in rows]
+    # `--api-key sk-...` in the clear on both the table and `--json`. Redact the argv LIST
+    # (`wraps_argv`, so a header value containing spaces stays one arg) with the same rules
+    # install/uninstall print with, then join. A router's `wraps` is its peer-name list
+    # and has no argv. `wraps_argv` itself is raw and never leaves this function.
+    rows = [{**{k: v for k, v in r.items() if k != "wraps_argv"},
+             **({"wraps": " ".join(_redact_args(r["wraps_argv"]))}
+                if r.get("wraps_argv") else {})} for r in rows]
     if args.json:
         # Scriptable/CI-checkable parity with `terse stats --json`; [] on no servers.
         print(json.dumps(rows, indent=2))
