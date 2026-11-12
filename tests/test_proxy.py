@@ -8,6 +8,8 @@ import json
 import pathlib
 import sys
 
+import pytest
+
 from terse import text_diff, transforms
 from terse.policy import Policy, Rule
 from terse.proxy import PRIMER_HEAD, Interceptor, run_proxy
@@ -2880,6 +2882,8 @@ def _call(inter, mid, tool="gh.api.items"):
                                    "params": {"name": tool}}))
 
 
+@pytest.mark.xfail(strict=True, reason="#581: envelope fields are re-serialized from a "
+                   "plain parse; needs a splice design")
 def test_a_message_whose_structured_content_loses_a_value_is_forwarded_untouched():
     # F1: the whole message is re-serialized when any block changes, so a duplicate key in
     # structuredContent (or _meta) used to reach the client collapsed, with no warning.

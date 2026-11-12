@@ -117,15 +117,42 @@ def _faithful_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return obj
 
 
+_MIN_NORMAL = 2.2250738585072014e-308
+_DOUBLE_DIGITS = 17   # any double is pinned down by 17 significant digits, and no more
+
+
+def _significant_digits(lit: str) -> int:
+    mantissa = lit.lstrip("-").split("e")[0].split("E")[0].replace(".", "")
+    return len(mantissa.strip("0"))
+
+
 def _faithful_float(lit: str) -> float:
+    """The double `lit` parses to, or `UnfaithfulJSON` when that double loses what `lit` says.
+
+    Spelling is not value: `1.50`, `1E5`, `0.00001` and the `%.17g` form
+    `0.10000000000000001` all name exactly one double, and re-emitting it as its shortest
+    repr changes nothing a reader of the double can see. What IS lost:
+    - underflow: a nonzero literal that parses to 0.0 (`1e-400`);
+    - precision: more than 17 significant digits that the double cannot hold
+      (`0.10000000000000000001`), or a subnormal, which holds fewer than 17.
+    Overflow (`1e400` -> inf) is left to the non-finite guard (`_unwritable`), as before.
+    """
     value = float(lit)
     shortest = repr(value)
-    # Fast path: the literal already IS the shortest repr (the common case). Otherwise
-    # compare VALUES, not spelling: `1.50`, `1E5`, `0.00001`, `1.0E7` state exactly the
-    # double they parse to and stay; `0.10000000000000000001` (precision) and `1e-400`
-    # (underflow to 0.0) state a value no double holds and are refused. Overflow
-    # (`1e400` -> inf) is left to the non-finite guard (`_unwritable`), as before.
-    if shortest != lit and math.isfinite(value) and Decimal(lit) != Decimal(shortest):
+    if shortest == lit or not math.isfinite(value):
+        return value                       # fast path; or the non-finite guard's job
+    digits = _significant_digits(lit)
+    if value == 0.0:
+        if digits:
+            raise UnfaithfulJSON(f"number {lit} underflows to {shortest}")
+        return value                       # a zero, however spelled (`0e5`, `-0.00`)
+    if abs(value) >= _MIN_NORMAL and digits <= _DOUBLE_DIGITS:
+        return value
+    try:
+        exact = Decimal(lit) == Decimal(shortest)
+    except ArithmeticError:                # e.g. an exponent past Decimal's range
+        exact = False
+    if not exact:
         raise UnfaithfulJSON(f"number {lit} has more precision than JSON can carry "
                              f"(reads as {shortest})")
     return value

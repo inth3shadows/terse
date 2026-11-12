@@ -19,11 +19,12 @@ fails that pull request until the section has moved.
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,
   `1e-400` -> `0.0`), and the round-trip gate compares parsed values, so both compressed
   with `round-trip lossless: PASS` and no warning. The new `transforms.loads_faithful`
-  guards the proxy's whole-message parse (so `structuredContent` and `_meta` are covered),
-  `policy.apply` (ledger reason `unfaithful`), `apply_joined` (refusal `unfaithful`, which
-  now also triggers the partial join), the `structuredContent` mirror check, `terse gate`
-  (prints `REFUSED`) and `terse measure`. Re-spelling the same value (`1.50`, `1E5`,
-  `0.00001`) is not a loss and still compresses.
+  guards every content block: `policy.apply` (ledger reason `unfaithful`), `apply_joined`
+  (refusal `unfaithful`, which now also triggers the partial join), the `structuredContent`
+  mirror check, `terse gate` (prints `REFUSED`) and `terse measure`. Re-spelling the same
+  double (`1.50`, `1E5`, `0.00001`, `%.17g`'s `0.10000000000000001`) is not a loss and
+  still compresses. Known gap: untouched envelope fields (`structuredContent`, `_meta`,
+  multiproxy broadcasts) are still re-serialized from a plain parse (#581).
 
 ## [0.49.1] - 2026-11-04
 

@@ -526,11 +526,19 @@ _UNFAITHFUL = [
     '{"rows":[{"id":1,"id":1}]}',                       # duplicate key, nested
     '{"x":0.10000000000000000001,"rows":[1,2]}',         # past double precision
     '{"x":1e-400,"rows":[1,2]}',                         # underflows to 0.0
-    '[{"a":4.9e-324},{"a":2}]',                          # reads back as 5e-324
+    '[{"a":4.9e-324},{"a":2}]',                          # subnormal, reads back as 5e-324
+    '{"x":2e-324,"rows":[1,2]}',                         # underflows to 0.0
+    '{"x":1e-99999999999999999999999,"rows":[1,2]}',     # underflow, exponent past Decimal
+    '{"x":1.23456789012345678e5,"rows":[1,2]}',          # 18 digits, not the double's value
 ]
 
 _SAME_VALUE = ['1.50', '1E5', '0.00001', '1e-7', '1.0E7', '1e16', '10.00', '2.5e-3', '-0',
-               '-0.0', '1e+100', '5e-324', '1.7976931348623157e308']
+               '-0.0', '1e+100', '5e-324', '1.7976931348623157e308',
+               # %.17g (C, old PHP) and JDK<19 spellings: non-shortest, same double (round 2)
+               '0.10000000000000001', '1.1000000000000001', '0.29999999999999999',
+               '8.409999999999999E21', '1.7976931348623158e308',
+               # zeros however spelled, including an exponent past Decimal's range
+               '0e5', '-0.00', '0e99999999999999999999999']
 
 
 @pytest.mark.parametrize("raw", _UNFAITHFUL)

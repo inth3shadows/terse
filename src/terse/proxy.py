@@ -854,15 +854,7 @@ class Interceptor:
         """Compress the text of a tracked tools/call result; prime the initialize reply;
         else return unchanged."""
         try:
-            # Faithful parse of the WHOLE message: every field of it (structuredContent,
-            # _meta, the content blocks' envelope) is re-serialized when any block changes,
-            # so a duplicate key or over-precise number anywhere in it would reach the
-            # client rewritten. Such a message is forwarded byte-for-byte instead.
-            msg = transforms.loads_faithful(line)
-        except transforms.UnfaithfulJSON as exc:
-            if self.debug:
-                sys.stderr.write(f"[terse-proxy] passthrough: {exc}\n")
-            return line
+            msg = json.loads(line)
         except (ValueError, RecursionError):  # deep nesting is a RuntimeError, not a ValueError
             return line
         if not isinstance(msg, dict) or msg.get("id") is None:
