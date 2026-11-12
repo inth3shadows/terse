@@ -526,7 +526,9 @@ _UNFAITHFUL = [
     '{"rows":[{"id":1,"id":1}]}',                       # duplicate key, nested
     '{"x":0.10000000000000000001,"rows":[1,2]}',         # past double precision
     '{"x":1e-400,"rows":[1,2]}',                         # underflows to 0.0
-    '[{"a":4.9e-324},{"a":2}]',                          # subnormal, reads back as 5e-324
+    '{"x":2.0000000000000003,"rows":[1,2]}',             # 17 digits, but the double is ...04
+    '{"x":9007199254740993.0,"rows":[1,2]}',             # 2**53+1: reads back as ...992
+    '{"x":1.7976931348623158e308,"rows":[1,2]}',         # MSVC DBL_MAX: not the double's rounding
     '{"x":2e-324,"rows":[1,2]}',                         # underflows to 0.0
     '{"x":1e-99999999999999999999999,"rows":[1,2]}',     # underflow, exponent past Decimal
     '{"x":1.23456789012345678e5,"rows":[1,2]}',          # 18 digits, not the double's value
@@ -536,7 +538,7 @@ _SAME_VALUE = ['1.50', '1E5', '0.00001', '1e-7', '1.0E7', '1e16', '10.00', '2.5e
                '-0.0', '1e+100', '5e-324', '1.7976931348623157e308',
                # %.17g (C, old PHP) and JDK<19 spellings: non-shortest, same double (round 2)
                '0.10000000000000001', '1.1000000000000001', '0.29999999999999999',
-               '8.409999999999999E21', '1.7976931348623158e308',
+               '8.409999999999999E21', '4.9E-324',
                # zeros however spelled, including an exponent past Decimal's range
                '0e5', '-0.00', '0e99999999999999999999999']
 
@@ -593,3 +595,44 @@ def test_joined_blocks_with_an_unfaithful_parse_refuse_the_join():
     for bad in ('{"a":1,"a":2}', '{"a":0.10000000000000000001}'):
         applied, objs, reason = policy_mod.apply_joined(['{"a":1}', bad], "t", pol)
         assert applied is None and reason == policy_mod.JOIN_REFUSED_UNFAITHFUL
+
+
+def test_a_literal_is_kept_iff_it_is_the_doubles_own_rounding():
+    # Round-3 review of #580: "<= 17 digits" was not the rule (17 digits recover a double
+    # from text, not text from a double). The rule is: the literal equals its double
+    # correctly rounded to the literal's own digit count. Checked against Decimal's own
+    # rounding of the double's exact value, on seeded random literals of 1-19 digits.
+    import random
+    from decimal import ROUND_HALF_EVEN, Context, Decimal
+    rng = random.Random(581)
+    for _ in range(20_000):
+        d = rng.randint(1, 19)
+        mant = str(rng.randint(10 ** (d - 1), 10 ** d - 1))
+        e = rng.randint(-320, 300)
+        lit = f"{mant[0]}.{mant[1:]}e{e}" if d > 1 else f"{mant}e{e}"
+        v = float(lit)
+        if v == 0.0 or v in (float("inf"), float("-inf")):
+            continue
+        k = len(mant.rstrip("0"))
+        oracle = Context(prec=k, rounding=ROUND_HALF_EVEN).plus(Decimal(v)) == Decimal(lit)
+        try:
+            transforms.loads_faithful(lit)
+            got = True
+        except transforms.UnfaithfulJSON:
+            got = False
+        assert got == oracle, lit
+
+
+def test_every_spelling_a_double_encoder_emits_is_kept():
+    import json as _json
+    import random
+    import struct
+    rng = random.Random(580)
+    fmts = (repr, lambda v: format(v, ".17g"), lambda v: format(v, ".16e"),
+            lambda v: format(v, ".17g").upper(), _json.dumps)
+    for _ in range(5_000):
+        v = struct.unpack("d", struct.pack("Q", rng.getrandbits(64)))[0]
+        if v != v or v in (float("inf"), float("-inf")):
+            continue
+        for f in fmts:
+            assert transforms.loads_faithful(f(v)) == v

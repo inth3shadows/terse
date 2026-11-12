@@ -21,9 +21,11 @@ fails that pull request until the section has moved.
   with `round-trip lossless: PASS` and no warning. The new `transforms.loads_faithful`
   guards every content block: `policy.apply` (ledger reason `unfaithful`), `apply_joined`
   (refusal `unfaithful`, which now also triggers the partial join), the `structuredContent`
-  mirror check, `terse gate` (prints `REFUSED`) and `terse measure`. Re-spelling the same
-  double (`1.50`, `1E5`, `0.00001`, `%.17g`'s `0.10000000000000001`) is not a loss and
-  still compresses. Known gap: untouched envelope fields (`structuredContent`, `_meta`,
+  mirror check, `terse gate` (prints `REFUSED`) and `terse measure`. A number is kept iff
+  it is its double correctly rounded to its own digit count, so every double encoder's
+  output (`1.50`, `1E5`, `0.00001`, `%.17g`'s `0.10000000000000001`, Java's `4.9E-324`)
+  still compresses, while `2.0000000000000003` (the double is `...04`) is refused.
+  Known gap: untouched envelope fields (`structuredContent`, `_meta`,
   multiproxy broadcasts) are still re-serialized from a plain parse (#581).
 
 ## [0.49.1] - 2026-11-04
