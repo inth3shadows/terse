@@ -20,9 +20,11 @@ fails that pull request until the section has moved.
   or login page) was forwarded as junk, and a batch array went out unsplit. Each body is
   now compacted by removing whitespace outside strings, lexically, so no number or
   duplicate key is rewritten. A batch is split into its messages, and a body that is not
-  JSON-RPC answers the request with an error that does not echo the body. A 4xx/5xx
-  JSON-RPC error carrying `"id": null` (a server's reply to an expired session) is now
-  answered under the request's own id instead of matching nothing. This applies to
+  JSON-RPC answers the request with an error that does not echo the body. In an SSE
+  stream, blank priming events and non-JSON keepalives are skipped, and the request gets
+  an error only if the stream carried no message. A 4xx/5xx JSON-RPC error carrying
+  `"id": null` (a server's reply to an expired session) is now answered under the
+  request's own id instead of matching nothing. This applies to
   `terse proxy` and to multiproxy HTTP peers.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and

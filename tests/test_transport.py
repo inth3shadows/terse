@@ -146,6 +146,14 @@ _FRAMING_MODES = {
     "batch": lambda h, mid: _raw(h, 200, "application/json", json.dumps([
         {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"p": 1}},
         {"jsonrpc": "2.0", "id": mid, "result": _TOOLS}], indent=1).encode()),
+    "sse_priming": lambda h, mid: _raw(h, 200, "text/event-stream", (
+        "id: 1\ndata:\n\ndata: ping\n\ndata: " + json.dumps(
+            {"jsonrpc": "2.0", "id": mid, "result": _TOOLS}) + "\n\n").encode()),
+    "sse_junk_only": lambda h, mid: _raw(h, 200, "text/event-stream", b"data: ping\n\n"),
+    "not_jsonrpc": lambda h, mid: _raw(h, 200, "application/json",
+                                       b'{"error": "login required"}'),
+    "bom": lambda h, mid: _raw(h, 200, "application/json", ("\ufeff" + json.dumps(
+        {"jsonrpc": "2.0", "id": mid, "result": _TOOLS})).encode()),
     "fail_null_id": lambda h, mid: _raw(h, 404, "application/json", json.dumps(
         {"jsonrpc": "2.0", "id": None,
          "error": {"code": -32001, "message": "session expired"}}).encode()),
@@ -725,3 +733,31 @@ def test_compaction_keeps_literal_numbers_and_duplicate_keys():
     lines = _one_list_call("precise")
     assert lines == ['{"jsonrpc":"2.0","id":3,"result":{"v":0.12345678901234567890123,'
                      '"a":1,"a":2}}']
+
+
+def test_sse_priming_and_keepalive_events_are_skipped_not_errored():
+    msgs = [json.loads(ln) for ln in _one_list_call("sse_priming")]
+    assert msgs == [{"jsonrpc": "2.0", "id": 3, "result": _TOOLS}]
+
+
+def test_sse_stream_with_no_message_answers_with_an_error():
+    msgs = [json.loads(ln) for ln in _one_list_call("sse_junk_only")]
+    assert len(msgs) == 1 and "no JSON-RPC message" in msgs[0]["error"]["message"]
+
+
+def test_json_object_that_is_not_jsonrpc_answers_with_an_error():
+    msgs = [json.loads(ln) for ln in _one_list_call("not_jsonrpc")]
+    assert len(msgs) == 1 and "not a JSON-RPC message" in msgs[0]["error"]["message"]
+
+
+def test_bom_prefixed_body_is_forwarded():
+    msgs = [json.loads(ln) for ln in _one_list_call("bom")]
+    assert msgs == [{"jsonrpc": "2.0", "id": 3, "result": _TOOLS}]
+
+
+def test_lexers_handle_escapes_and_nesting():
+    from terse.transport import _compact_json_text, _split_top_level_array
+    text = '[ {"a": [1, 2]},\n {"b": "\\"] , {x"} ]'
+    compact = _compact_json_text(text)
+    assert compact == '[{"a":[1,2]},{"b":"\\"] , {x"}]'
+    assert _split_top_level_array(compact) == ['{"a":[1,2]}', '{"b":"\\"] , {x"}']
