@@ -237,7 +237,7 @@ def build_terminal_diff_report(results: dict, form_label: str = "diff-form",
     also covers a backend that answered with no content at all."""
     gap_rows, excluded = diff_gap_rows(results)
     plot_rows = []
-    for model, (facc, fse, cacc, cse) in gap_rows.items():
+    for model, (facc, fse, cacc, cse, *_) in gap_rows.items():
         gap = facc - cacc
         passed = passes_tolerance(gap)
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
@@ -263,7 +263,7 @@ def build_terminal_fluency_report(results: dict, color: bool | None = None) -> s
     whose raw control failed (backend/config error) are excluded, same as the markdown."""
     gap_rows, broken = fluency_gap_rows(results)
     plot_rows = []
-    for model, (facc, fse, cacc, cse) in gap_rows.items():
+    for model, (facc, fse, cacc, cse, *_) in gap_rows.items():
         gap = facc - cacc
         passed = passes_tolerance(gap)
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
@@ -344,7 +344,7 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None,
             metric = metrics.get(key)
             if metric is None:
                 continue
-            facc, fse, cacc, cse = metric
+            facc, fse, cacc, cse, *_ = metric
             gap = facc - cacc
             passed = passes_tolerance(gap)
             plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),

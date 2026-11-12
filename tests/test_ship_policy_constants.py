@@ -93,8 +93,10 @@ def test_a_gap_inside_the_ship_tolerance_publishes_a_PASS():
     assert g.excluded is None
     assert g.form_acc - g.control_acc == pytest.approx(-0.045)
 
+    # Not FAIL: the point estimate is inside the line. Whether it is PASS or INCONCLUSIVE
+    # is the interval's call (#582), which is not what this test pins.
     md = build_diff_report({"m": rows})
-    assert "**PASS**" in md, f"a -4.5% gap did not pass a 5% tolerance:\n{md}"
+    assert "**FAIL**" not in md, f"a -4.5% gap failed a 5% tolerance:\n{md}"
 
 
 def test_a_gap_outside_the_ship_tolerance_publishes_a_FAIL():

@@ -34,6 +34,7 @@ from .report import (
     arm_gap,
     attrition,
     attrition_block,
+    gate_word,
     is_diff_run,
     passes_tolerance,
     savings_totals,
@@ -531,10 +532,10 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
         if g.excluded:
             excluded[model] = g.excluded
             continue
-        gap_rows[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
+        gap_rows[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se, g.gap_se)
 
     worst = _worst_case_gap(gap_rows)
-    for model, (facc, fse, cacc, cse) in gap_rows.items():
+    for model, (facc, fse, cacc, cse, *_) in gap_rows.items():
         gap = facc - cacc
         # `_GAP_TOLERANCE`, not a second hardcoded 0.05 that has to be remembered.
         passed = passes_tolerance(gap)
@@ -543,8 +544,10 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
 
     verdict_html = ""
     if worst:
-        cls = "good" if worst.passed else "critical"
-        verdict_html = (f'<div class="banner {cls}">{"✓ PASS" if worst.passed else "✕ FAIL"} — '
+        word = gate_word(worst, withheld=any(r != "not a diff run" for r in excluded.values()))
+        cls = {"PASS": "good", "INCONCLUSIVE": "warn"}.get(word, "critical")
+        mark = {"PASS": "✓", "INCONCLUSIVE": "?"}.get(word, "✕")
+        verdict_html = (f'<div class="banner {cls}">{mark} {word} — '
                         f'worst-case model <code>{_esc(worst.model)}</code>: {form_label} '
                         f'{worst.form_acc:.0%} vs {control_label} {worst.control_acc:.0%} '
                         f'(gap {worst.gap:+.0%} ±{worst.gap_ci * 100:.0f}pt)</div>')

@@ -13,6 +13,20 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Changed
+- Comprehension verdicts (`terse fluency`, `fluency --diff`, the diff soak, the HTML
+  report, and `dropeval`'s accuracy gate) now PASS only when the gap's 95% interval clears
+  the 5% tolerance, not just its point estimate. 19/20 vs 20/20 used to print **PASS**,
+  "safe to enable `proxy --diff`", at "-5% ±10 pts". A point estimate inside the line
+  whose interval reaches past it is now **INCONCLUSIVE** (dropeval: INSUFFICIENT), naming
+  the model whose interval reaches furthest. The interval is now the paired,
+  question-clustered SE of the per-question difference rather than the two arms' SEs
+  combined as if independent, which overstated the noise for paired arms. Two identical
+  arms at 50% over 24 questions printed ±28 pts and now print ±0. A model withheld from
+  the gate (unmeasured, underpowered, or with a broken control) now turns a would-be PASS
+  into INCONCLUSIVE in the diff, soak and fluency reports, as dropeval already did (#344).
+  It still never turns into a FAIL.
+
 ### Fixed
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and

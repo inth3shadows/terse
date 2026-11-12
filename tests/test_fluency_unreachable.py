@@ -128,7 +128,9 @@ def test_a_partially_failing_model_cannot_force_a_regression_verdict():
     # The healthy model is measured and holds, so the run must PASS. With `flaky` gated,
     # its 0% terse against 100% raw is a -100pt worst-case gap and this reads FAIL.
     assert "regresses beyond tolerance" not in verdict
-    assert "preserves comprehension" in verdict
+    # Since #582 a withheld model blocks the PASS rather than being ignored.
+    assert "preserves comprehension" not in verdict
+    assert "measure the excluded model(s)" in verdict
 
 
 def test_a_run_where_every_model_failed_states_a_NON_verdict_rather_than_staying_silent():
@@ -589,10 +591,17 @@ def test_an_unmeasured_model_changes_no_renderers_verdict():
 
     for name, baseline, with_dead in cases:
         assert baseline.strip(), f"{name}: baseline verdict is empty — this would pin nothing"
-        assert with_dead == baseline, (
+        # Since #582 the one permitted move is PASS -> INCONCLUSIVE: a withheld model means
+        # the tested set was only partly measured. Its calls must still never be SCORED,
+        # so the measured numbers stay put and no FAIL can appear.
+        assert ("FAIL" in with_dead) == ("FAIL" in baseline), (
             f"{name} changed its verdict because an UNMEASURED model was added — "
             f"it is scoring calls that never happened"
         )
+        if with_dead != baseline:
+            assert "PASS" in baseline and "INCONCLUSIVE" in with_dead, (name, with_dead)
+            nums = re.compile(r"-?\d+%")
+            assert nums.findall(with_dead)[:3] == nums.findall(baseline)[:3], name
 
 
 def test_the_renderers_agree_on_which_models_were_dropped():
