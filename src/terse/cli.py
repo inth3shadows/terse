@@ -77,7 +77,13 @@ def _read(file: str) -> str:
 
 def _cmd_gate(args: argparse.Namespace) -> int:
     raw = _read(args.file)
-    obj = json.loads(raw)
+    try:
+        obj = transforms.loads_faithful(raw)
+    except transforms.UnfaithfulJSON as e:
+        # The proxy forwards this payload untouched, which is lossless but saves nothing.
+        print(f"round-trip lossless: REFUSED ({e}) — passed through uncompressed")
+        print(f"shape bucket:        {classify_shape(raw)}")
+        return 0
     ok = transforms.roundtrip_ok(obj)
     before, after = count_cl100k(raw), count_cl100k(transforms.compress(obj))
     print(f"round-trip lossless: {'PASS' if ok else 'FAIL'}")

@@ -8,6 +8,8 @@ import json
 import pathlib
 import sys
 
+import pytest
+
 from terse import text_diff, transforms
 from terse.policy import Policy, Rule
 from terse.proxy import PRIMER_HEAD, Interceptor, run_proxy
@@ -2867,3 +2869,61 @@ def test_answering_retrieve_is_ungated_even_where_advertising_is_not():
     # answered with its own records (or a -32601) had the request been forwarded.
     assert resp["id"] == 1 and resp["result"]["isError"] is True
     assert '"status"' not in resp["result"]["content"][0]["text"]
+
+
+# --- Value-faithful parse at the message level (PR #580 review) ---
+
+_ROWS = ",".join(f'{{"id":{i},"state":"open","url":"https://example.com/a/b/c"}}'
+                 for i in range(12))
+
+
+def _call(inter, mid, tool="gh.api.items"):
+    inter.note_request(json.dumps({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+                                   "params": {"name": tool}}))
+
+
+@pytest.mark.xfail(strict=True, reason="#581: envelope fields are re-serialized from a "
+                   "plain parse; needs a splice design")
+def test_a_message_whose_structured_content_loses_a_value_is_forwarded_untouched():
+    # F1: the whole message is re-serialized when any block changes, so a duplicate key in
+    # structuredContent (or _meta) used to reach the client collapsed, with no warning.
+    for rule in (Rule("gh.*", ("minify", "tabularize", "dictionary"), structured="compress"),
+                 Rule("gh.*", ("minify", "tabularize", "dictionary"))):
+        inter = Interceptor(Policy(rules=[rule]), lazy_primer=False)
+        _call(inter, 1)
+        wire = ('{{"jsonrpc":"2.0","id":1,"result":{{"content":[{{"type":"text","text":{}}}],'
+                '"structuredContent":{{"dup":1,"dup":2,"rows":[{}]}}}}}}'.format(json.dumps("[" + _ROWS + "]"), _ROWS))
+        assert inter.transform_response(wire) == wire
+
+
+def test_a_respelled_number_in_structured_content_still_compresses_the_text():
+    inter = Interceptor(FULL, lazy_primer=False)
+    _call(inter, 1)
+    wire = ('{{"jsonrpc":"2.0","id":1,"result":{{"content":[{{"type":"text","text":{}}}],'
+            '"structuredContent":{{"price":1.50}}}}}}'.format(json.dumps("[" + _ROWS + "]")))
+    out = json.loads(inter.transform_response(wire))
+    assert out["result"]["content"][0]["text"] != "[" + _ROWS + "]"
+    assert out["result"]["structuredContent"] == {"price": 1.5}
+
+
+def test_an_unfaithful_text_block_is_ledgered_as_unfaithful_not_non_json():
+    reasons, stats = _capture_stats()
+    inter = Interceptor(DIFF, stats=stats, lazy_primer=False)   # diff off -> "diff_off"
+    _call(inter, 1)
+    inter.transform_response(_result_msg(1, f'{{"a":1,"a":2,"rows":[{_ROWS}]}}'))
+    assert reasons[-1] == "unfaithful"
+
+
+def test_one_unfaithful_block_does_not_sink_the_partial_join_of_the_rest():
+    reasons, stats = _capture_stats()
+    inter = Interceptor(FULL, stats=stats, lazy_primer=False)
+    _call(inter, 1)
+    recs = [json.dumps({"id": i, "state": "open", "url": "https://example.com/a/b/c"})
+            for i in range(6)]
+    bad = '{"id":99,"id":98}'
+    blocks = [{"type": "text", "text": t} for t in recs[:3] + [bad] + recs[3:]]
+    out = inter.transform_response(json.dumps({"jsonrpc": "2.0", "id": 1,
+                                               "result": {"content": blocks}}))
+    texts = [b["text"] for b in json.loads(out)["result"]["content"]]
+    assert bad in texts                                  # passed through byte-for-byte
+    assert reasons[-1] == "multiblock_partial"

@@ -638,6 +638,10 @@ class Applied:
     # drop (#251); nothing else reads it, and it holds no payload content. Defaulted so
     # every existing `Applied(...)` construction and test fake stays valid.
     drop_origins: dict[str, lossy_mod.Origin] = field(default_factory=dict)
+    # True when the payload was valid JSON refused by `transforms.loads_faithful` (duplicate
+    # key, or a number past double precision): passed through raw, and the proxy ledgers
+    # it as `unfaithful` rather than `non_json`.
+    unfaithful: bool = False
 
 
 def _apply_text_drops(raw: str, tool: str, rule: Rule, warnings: list[str],
@@ -848,7 +852,14 @@ def apply(raw: str, tool: str, policy: Policy,
         warnings.append("'minify' implied by serialization; added")
 
     try:
-        obj = json.loads(raw)
+        obj = transforms.loads_faithful(raw)
+    except transforms.UnfaithfulJSON as e:
+        # Valid JSON whose parse loses a value (duplicate key, a number past double precision):
+        # caught BEFORE the non-JSON branch, because `pyliteral` would `literal_eval` the
+        # same text and collapse the same duplicate keys.
+        return Applied(text=raw, tool=tool, tiers=(), skipped=True,
+                       warnings=warnings + [f"{e}; passed through uncompressed to stay "
+                                            "lossless"], unfaithful=True)
     except (ValueError, TypeError, RecursionError):
         # ValueError, not just JSONDecodeError (its subclass): an integer past Python's
         # 4300-digit limit raises a plain ValueError (#563), and it is non-JSON here too.
@@ -931,6 +942,7 @@ JOIN_REFUSED_HETEROGENEOUS = "heterogeneous"  # some block isn't a dict — not 
 JOIN_REFUSED_MARKER = "marker"              # a reserved terse marker key is present
 JOIN_REFUSED_DEPTH = "depth"                # joined array nests past the codec cap
 JOIN_REFUSED_NON_FINITE = "non_finite"      # a block holds NaN/Infinity (see `_unwritable`)
+JOIN_REFUSED_UNFAITHFUL = "unfaithful"      # a block's parse loses a value (dup key, precision)
 
 
 def apply_joined(raws: list[str], tool: str, policy: Policy,
@@ -964,7 +976,9 @@ def apply_joined(raws: list[str], tool: str, policy: Policy,
     objs: list[Any] = []
     for raw in raws:
         try:
-            objs.append(json.loads(raw))
+            objs.append(transforms.loads_faithful(raw))
+        except transforms.UnfaithfulJSON:
+            return None, None, JOIN_REFUSED_UNFAITHFUL
         except (ValueError, TypeError, RecursionError):   # see `apply` (#563)
             return None, None, JOIN_REFUSED_NON_JSON
     if not all(isinstance(o, dict) for o in objs):

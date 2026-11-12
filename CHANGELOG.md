@@ -14,6 +14,23 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Fixed
+- A JSON payload whose parse would lose a value is now forwarded untouched instead of
+  compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
+  rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,
+  `1e-400` -> `0.0`), and the round-trip gate compares parsed values, so both compressed
+  with `round-trip lossless: PASS` and no warning. The new `transforms.loads_faithful`
+  guards every content block: `policy.apply` (ledger reason `unfaithful`), `apply_joined`
+  (refusal `unfaithful`, which now also triggers the partial join), the `structuredContent`
+  mirror check, `terse gate` (prints `REFUSED`) and `terse measure`. A number is kept iff
+  it is its double correctly rounded to its own digit count, so every double encoder's
+  output (`1.50`, `1E5`, `0.00001`, `%.17g`'s `0.10000000000000001`, Java's `4.9E-324`)
+  still compresses, while `2.0000000000000003` (the double is `...04`) is refused.
+  Known gap: untouched envelope fields (`structuredContent`, `_meta`,
+  multiproxy broadcasts) are still re-serialized from a plain parse (#581).
+
+## [0.49.1] - 2026-11-04
+
+### Fixed
 - `scripts/bench/replay_sessions.py` leaves test-harness sessions out of its summary: a
   transcript whose project directory is under `/tmp` (the cost-per-task suite and drop-rule
   evals run `claude -p` there). They are still scanned and joined, tagged `"harness": true`

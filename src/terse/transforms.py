@@ -36,6 +36,7 @@ import json
 import math
 import re
 from collections import Counter
+from decimal import Decimal
 from typing import Any
 
 from .tokenize import count_cl100k
@@ -103,6 +104,78 @@ _EMBED_FORMS: dict[str, dict[str, Any]] = {
 # 200 sits far under CPython's ~1000 recursion limit, leaving headroom for the frames
 # the codec adds per level.
 MAX_DEPTH = 200
+
+
+class UnfaithfulJSON(ValueError):
+    """`raw` parses, but its parse does not hold the values the text states."""
+
+
+def _faithful_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise UnfaithfulJSON("duplicate object key")
+    return obj
+
+
+def _significant_digits(lit: str) -> int:
+    mantissa = lit.lstrip("-").split("e")[0].split("E")[0].replace(".", "")
+    return len(mantissa.strip("0"))
+
+
+def _faithful_float(lit: str) -> float:
+    """The double `lit` parses to, or `UnfaithfulJSON` when that double loses what `lit` says.
+
+    One rule: `lit` must equal the double correctly rounded to `lit`'s own number of
+    significant digits. Then any reader of the double sees the value `lit` stated, and
+    re-emitting the shortest repr changes spelling only. That accepts `1.50`, `1E5`,
+    `0.00001`, `%.17g`'s `0.10000000000000001` and Java's `4.9E-324`, and refuses
+    `2.0000000000000003` (the double is ...04), `0.10000000000000000001` and underflow
+    (`1e-400` -> 0.0). Note 17 digits recover a double from text, NOT text from a double:
+    a 16-17 digit literal can name a value no double holds. Overflow (`1e400` -> inf) is
+    left to the non-finite guard (`_unwritable`), as before.
+    """
+    value = float(lit)
+    if not math.isfinite(value) or repr(value) == lit:
+        return value                       # the non-finite guard's job; or the fast path
+    digits = _significant_digits(lit)
+    if digits == 0:
+        return value                       # a zero, however spelled (`0e5`, `-0.00`)
+    try:
+        # `or`: at a power of two the gap below is half the gap above, so the shortest
+        # repr is not always the correct rounding at its own length (2**-44 is
+        # `5.684341886080802e-14`, correctly rounded `...801`). The repr IS the double,
+        # so another spelling of it (Java's `5.684341886080802E-14`) is kept too.
+        exact = (Decimal(lit) == Decimal(format(value, f".{digits - 1}e"))
+                 or Decimal(lit) == Decimal(repr(value)))
+    except ArithmeticError:                # an exponent past Decimal's range
+        exact = False
+    if not exact:
+        raise UnfaithfulJSON(f"number {lit} is not a value a double can hold "
+                             f"(reads as {value!r})")
+    return value
+
+
+def loads_faithful(raw: str) -> Any:
+    """`json.loads`, refusing a document whose parse would not hold the values it states.
+
+    Everything downstream re-serializes the parsed value, and the round-trip gate compares
+    parsed values, so a loss inside `json.loads` itself is invisible to both. Two exist:
+    a duplicate key collapses to the last one (`{"a":1,"a":2}` -> `{"a":2}`), and a float
+    literal past double precision rounds (`0.10000000000000000001` -> `0.1`, `1e-400` ->
+    `0.0`). Raises `UnfaithfulJSON` (a `ValueError`) for those, so the caller passes the
+    payload through untouched. Re-spelling the same value (`1.50` -> `1.5`) is not a loss,
+    any more than dropping whitespace is. Ints need no check: Python's are exact.
+
+    A text that merely STARTS with such a value (`2.50000000000000000001 s elapsed`) is
+    not JSON at all, and raises the plain parse error instead, so the caller's non-JSON
+    path (text drops, `pyliteral`) still sees it.
+    """
+    try:
+        return json.loads(raw, object_pairs_hook=_faithful_pairs,
+                          parse_float=_faithful_float)
+    except UnfaithfulJSON:
+        json.loads(raw)   # not one complete document -> its own ValueError wins
+        raise
 
 
 def exceeds_depth(obj: Any, cap: int = MAX_DEPTH) -> bool:

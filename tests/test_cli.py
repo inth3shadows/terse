@@ -1949,3 +1949,12 @@ def test_policy_generate_states_the_denominator_too(tmp_path, capsys):
     blob = cap.out + cap.err
     assert "drop-candidate result[].embedding" in blob, blob[:800]
     assert "1/4 payloads ⚠" in blob, blob[:800]
+
+
+def test_gate_refuses_a_payload_whose_parse_loses_a_value(monkeypatch, capsys):
+    # Review F3: `gate` printed `round-trip lossless: PASS` for a duplicate key the proxy
+    # now refuses, so the two disagreed.
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"a":1,"a":2,"rows":[{"k":"v"},{"k":"v"}]}'))
+    rc = main(["gate", "-"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "REFUSED" in out and "PASS" not in out

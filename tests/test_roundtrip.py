@@ -514,3 +514,137 @@ def test_the_diff_gate_rejects_a_rebuild_that_changes_a_type(monkeypatch):
     monkeypatch.setattr(transforms, "_encode_keys", lambda prev, curr: {
         transforms.DIFF_MARKER: 1, "shape": "keys", "set": {}, "del": []})
     assert transforms.diff_encode({"a": 1}, {"a": True}) is None
+
+
+# -- Value-faithful parse (audit 2026-11-12): `json.loads` itself loses two things — a duplicate
+# key collapses to the last one, and a float literal past double precision rounds — and the
+# round-trip gate compares PARSED values, so it could not see either. Re-spelling the SAME
+# value (`1.50` -> `1.5`) is not a loss and must keep compressing (PR #580 review, F2).
+
+_UNFAITHFUL = [
+    '{"a":1,"a":2,"items":[{"k":"v"},{"k":"v"}]}',     # duplicate key -> last wins
+    '{"rows":[{"id":1,"id":1}]}',                       # duplicate key, nested
+    '{"x":0.10000000000000000001,"rows":[1,2]}',         # past double precision
+    '{"x":1e-400,"rows":[1,2]}',                         # underflows to 0.0
+    '{"x":2.0000000000000003,"rows":[1,2]}',             # 17 digits, but the double is ...04
+    '{"x":9007199254740993.0,"rows":[1,2]}',             # 2**53+1: reads back as ...992
+    '{"x":1.7976931348623158e308,"rows":[1,2]}',         # MSVC DBL_MAX: not the double's rounding
+    '{"x":2e-324,"rows":[1,2]}',                         # underflows to 0.0
+    '{"x":1e-99999999999999999999999,"rows":[1,2]}',     # underflow, exponent past Decimal
+    '{"x":1.23456789012345678e5,"rows":[1,2]}',          # 18 digits, not the double's value
+]
+
+_SAME_VALUE = ['1.50', '1E5', '0.00001', '1e-7', '1.0E7', '1e16', '10.00', '2.5e-3', '-0',
+               '-0.0', '1e+100', '5e-324', '1.7976931348623157e308',
+               # %.17g (C, old PHP) and other non-shortest spellings of the same double (round 2)
+               '0.10000000000000001', '1.1000000000000001', '0.29999999999999999',
+               '8.409999999999999E21', '4.9E-324',
+               # zeros however spelled, including an exponent past Decimal's range
+               '0e5', '-0.00', '0e99999999999999999999999']
+
+
+@pytest.mark.parametrize("raw", _UNFAITHFUL)
+def test_a_parse_that_loses_a_value_passes_through_raw(raw):
+    pol = Policy(rules=[Rule("*", ("minify", "tabularize", "dictionary"))])
+    out = policy_mod.apply(raw, "t", pol)
+    assert out.text == raw and out.skipped and out.unfaithful
+    assert any("passed through uncompressed to stay lossless" in w for w in out.warnings)
+
+
+@pytest.mark.parametrize("raw", _UNFAITHFUL)
+def test_an_unfaithful_parse_is_not_read_as_a_python_literal(raw):
+    pol = Policy(rules=[Rule("*", ("minify", "tabularize", "dictionary", "pyliteral"))])
+    out = policy_mod.apply(raw, "t", pol)
+    assert out.text == raw and out.skipped
+
+
+@pytest.mark.parametrize("lit", _SAME_VALUE)
+def test_a_respelled_number_of_the_same_value_still_compresses(lit):
+    raw = f'{{"n": {lit}, "rows": [{{"k": "v"}}, {{"k": "v"}}]}}'
+    pol = Policy(rules=[Rule("*", ("minify", "tabularize", "dictionary"))])
+    out = policy_mod.apply(raw, "t", pol)
+    assert not out.skipped and not out.unfaithful
+    assert transforms.decompress(out.text)["n"] == float(lit)
+
+
+def test_an_overflowing_number_still_goes_to_the_non_finite_guard():
+    assert transforms.loads_faithful('{"x":1e400}') == {"x": float("inf")}
+
+
+def test_whitespace_is_not_a_fidelity_concern():
+    pol = Policy(rules=[Rule("*", ("minify",))])
+    out = policy_mod.apply('{ "a" : 1.5 ,\n "b" : [ 1, 2 ] }', "t", pol)
+    assert not out.skipped and out.text == '{"a":1.5,"b":[1,2]}'
+
+
+@pytest.mark.parametrize("prefix", ['0.10000000000000000001 seconds elapsed. ',
+                                    '[{"a":1,"a":2}] see: '])
+def test_text_that_only_starts_with_an_unfaithful_value_is_still_prose(prefix):
+    # The hooks fire on the leading value before the parser reaches the trailing prose; that
+    # must not turn a non-JSON payload into an "unfaithful JSON" refusal that skips the
+    # opted-in text drop (review F4).
+    rule = Rule("t", ("minify",),
+                fields={"$text.code_blocks": {"lossy": "drop-to-retrieve", "min": 10}})
+    raw = prefix + "intro\n```\n" + "x" * 200 + "\n```\ntail"
+    out = policy_mod.apply(raw, "t", Policy(rules=[rule]), drop_sink=lambda *a, **k: None)
+    assert not out.unfaithful and len(out.text) < len(raw)
+
+
+def test_joined_blocks_with_an_unfaithful_parse_refuse_the_join():
+    pol = Policy(rules=[Rule("*", ("minify", "tabularize"))])
+    for bad in ('{"a":1,"a":2}', '{"a":0.10000000000000000001}'):
+        applied, objs, reason = policy_mod.apply_joined(['{"a":1}', bad], "t", pol)
+        assert applied is None and reason == policy_mod.JOIN_REFUSED_UNFAITHFUL
+
+
+def test_a_literal_is_kept_iff_it_is_the_doubles_own_rounding():
+    # Round-3 review of #580: "<= 17 digits" was not the rule (17 digits recover a double
+    # from text, not text from a double). The rule is: the literal equals its double
+    # correctly rounded to the literal's own digit count. Checked against Decimal's own
+    # rounding of the double's exact value, on seeded random literals of 1-19 digits.
+    import random
+    from decimal import ROUND_HALF_EVEN, Context, Decimal
+    rng = random.Random(581)
+    for _ in range(20_000):
+        d = rng.randint(1, 19)
+        mant = str(rng.randint(10 ** (d - 1), 10 ** d - 1))
+        e = rng.randint(-320, 300)
+        lit = f"{mant[0]}.{mant[1:]}e{e}" if d > 1 else f"{mant}e{e}"
+        v = float(lit)
+        if v == 0.0 or v in (float("inf"), float("-inf")):
+            continue
+        k = len(mant.rstrip("0"))
+        oracle = Context(prec=k, rounding=ROUND_HALF_EVEN).plus(Decimal(v)) == Decimal(lit)
+        try:
+            transforms.loads_faithful(lit)
+            got = True
+        except transforms.UnfaithfulJSON:
+            got = False
+        assert got == oracle, lit
+
+
+def test_every_spelling_a_double_encoder_emits_is_kept():
+    import json as _json
+    import random
+    import struct
+    rng = random.Random(580)
+    fmts = (repr, lambda v: format(v, ".17g"), lambda v: format(v, ".16e"),
+            lambda v: format(v, ".17g").upper(), _json.dumps)
+    for _ in range(5_000):
+        v = struct.unpack("d", struct.pack("Q", rng.getrandbits(64)))[0]
+        if v != v or v in (float("inf"), float("-inf")):
+            continue
+        for f in fmts:
+            assert transforms.loads_faithful(f(v)) == v
+
+
+def test_the_shortest_repr_of_every_power_of_two_is_kept_however_spelled():
+    # Round-4 review of #580: at a power of two the shortest repr can differ from the
+    # correctly rounded digits at its length; Java/.NET/Rust spellings of it were refused.
+    import math
+    from decimal import Decimal
+    for k in range(-1074, 1024):
+        v = math.ldexp(1.0, k)
+        fixed = format(Decimal(repr(v)), "f")   # Go/Rust 'f': the repr digits, no exponent
+        for lit in (repr(v), repr(v).upper(), fixed if abs(k) < 200 else repr(v)):
+            transforms.loads_faithful(lit)   # must not raise (an integral `fixed` is a JSON int)
