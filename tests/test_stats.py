@@ -481,3 +481,9 @@ def test_the_report_prints_both_bases_only_when_they_differ():
     # the first version of this test.
     assert f"context:        {ctx_raw:,} -> {ctx_out:,}   saved {ctx_raw - ctx_out:,}" in text
     assert "context:" not in build_stats_report(aggregate([plain]), log_path="l")
+
+
+def test_server_label_drops_url_userinfo():
+    # `netloc` kept `user:pass@` and wrote it to every ledger row (#582).
+    assert server_label(["https://bob:s3cr3t@mcp.example.com:8443/mcp"]) == "mcp.example.com:8443"
+    assert server_label(["https://tok@mcp.example.com/mcp"]) == "mcp.example.com"

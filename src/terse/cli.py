@@ -1736,19 +1736,31 @@ _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*=")
 # open-ended and caller-defined (`X-Api-Key`, `Proxy-Authorization`, `Cookie`, ...), so
 # over-redacting a borderline name is the safe failure direction for a value that could
 # be printed to a shared terminal.
-_SECRET_HEADER = re.compile(r"(api[-_]?key|token|secret|password|passwd|auth|credential|cookie)",
-                            re.IGNORECASE)
+_SECRET_HEADER = re.compile(r"(api[-_]?key|token|secret|password|passwd|auth|credential|cookie"
+                            r"|(?:^|[_-])(?:pat|key|bearer)(?:$|[_-]))", re.IGNORECASE)
+
+# Short secret-bearing flags `_SECRET_FLAG`'s substring set cannot carry without masking
+# ordinary flags (`pat` would hit `--path`, `key` would hit `--keyframe`), so matched whole.
+_SECRET_FLAG_EXACT = re.compile(r"^--?(key|pat|bearer|session)$", re.IGNORECASE)
+
+# Flags whose next arg is a header: terse's own `--header NAME=VALUE`, and the
+# `NAME: VALUE` form `mcp-remote`/curl take as `--header`/`-H`.
+_HEADER_FLAGS = ("--header", "-H")
 
 
 def _redact_header_value(entry: str) -> str:
-    """Mask a `--header NAME=VALUE` entry's VALUE when NAME looks secret-shaped.
-    Leaves the entry alone (name AND value) when it doesn't look secret-shaped, and
-    when there's no `=` at all (a malformed entry `_parse_headers` would reject anyway —
-    not this function's job to validate)."""
-    if "=" not in entry:
-        return entry
-    name, _, _value = entry.partition("=")
-    return f"{name}=***" if _SECRET_HEADER.search(name) else entry
+    """Mask a `--header NAME=VALUE` (or `NAME: VALUE`) entry's VALUE when NAME looks
+    secret-shaped. Leaves the entry alone (name AND value) when it doesn't look
+    secret-shaped, and when it has neither separator."""
+    if "=" in entry:
+        name, _, _value = entry.partition("=")
+        return f"{name}=***" if _SECRET_HEADER.search(name) else entry
+    if ":" in entry:
+        # `Authorization: Bearer xyz` (the mcp-remote / curl form). Before this, an entry
+        # without `=` was returned whole, printing the token.
+        name, _, _value = entry.partition(":")
+        return f"{name}: ***" if _SECRET_HEADER.search(name) else entry
+    return entry
 
 
 def _redact_url(url: str) -> str:
@@ -1785,17 +1797,17 @@ def _redact_args(args: list) -> list:
             # The secret-looking flag was a boolean (`--no-auth`, `--oauth`): the next
             # token is another flag, not its value. Fall through and handle it as one.
         flag = a.split("=", 1)[0]
-        if flag == "--header":
+        if flag in _HEADER_FLAGS:
             if "=" in a:
                 # Inline form `--header=NAME=VALUE` (argparse also accepts this): the
                 # first `=` separates the flag from the NAME=VALUE payload.
                 _, rest = a.split("=", 1)
-                out.append(f"--header={_redact_header_value(rest)}")
+                out.append(f"{flag}={_redact_header_value(rest)}")
             else:
                 out.append(a)
                 pending = "header"  # the NEXT arg is the NAME=VALUE payload
             continue
-        if _SECRET_FLAG.match(flag):
+        if _SECRET_FLAG.match(flag) or _SECRET_FLAG_EXACT.match(flag):
             out.append(f"{flag}=***" if "=" in a else a)
             pending = "value" if "=" not in a else None
             continue
@@ -2067,6 +2079,12 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
     from .stats import _WRITES_LEDGER_ROWS, _contested_labels, _precedence_winner
 
     rows = scan_scopes(file=args.file, repo_path=args.repo_path)
+    # `wraps` is the downstream argv joined with spaces, straight from the config: it held
+    # `--api-key sk-...` in the clear on both the table and `--json`. Redacted here with the
+    # same rules install/uninstall print with; split on single spaces so a router's
+    # `a, b` peer list rejoins unchanged.
+    rows = [{**r, "wraps": " ".join(_redact_args(r["wraps"].split(" ")))}
+            if isinstance(r.get("wraps"), str) else r for r in rows]
     if args.json:
         # Scriptable/CI-checkable parity with `terse stats --json`; [] on no servers.
         print(json.dumps(rows, indent=2))

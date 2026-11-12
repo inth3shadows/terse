@@ -65,7 +65,10 @@ def server_label(cmd: list[str]) -> str:
         return "unknown"
     target = cmd[0]
     if "://" in target:
-        return urlparse(target).netloc or target
+        # `netloc` includes any `user:pass@`, which then sat in every ledger row and in
+        # `terse stats` output; the host[:port] after the last `@` is the identity.
+        netloc = urlparse(target).netloc.rpartition("@")[2]
+        return netloc or target.rpartition("@")[2]
     return Path(target).name or target
 
 
