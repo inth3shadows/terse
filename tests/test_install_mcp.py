@@ -2628,3 +2628,52 @@ def test_merely_MENTIONING_terse_does_not_make_a_folded_and_live_peer_a_proxy(tm
     row = {r["server"]: r for r in scan_scopes(cfg=cfg) if r["scope"] == "user"}["kb"]
     assert row["state"] == "folded-and-live"
     assert row["wraps"] is None and row["ledger_identity"] is None
+
+
+# --- a hand-replaced entry beats a stale stash (audit 2026-11-12, #582) ---
+def _install_then_replace(tmp_path, monkeypatch):
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(kb={"command": "old-kb", "args": ["--v1"]})))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    config = json.loads(cfg.read_text())
+    config["mcpServers"]["kb"] = {"command": "new-kb", "args": ["--v2"]}   # by hand
+    cfg.write_text(json.dumps(config))
+    return cfg, policy
+
+
+def test_reinstall_wraps_the_hand_replaced_command_not_the_stashed_one(tmp_path, monkeypatch):
+    cfg, policy = _install_then_replace(tmp_path, monkeypatch)
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    args = json.loads(cfg.read_text())["mcpServers"]["kb"]["args"]
+    assert args[args.index("--") + 1:] == ["new-kb", "--v2"]
+    assert json.loads(im.stash_path(cfg).read_text())["user"]["kb"] == {
+        "command": "new-kb", "args": ["--v2"]}
+    im.do_uninstall(["kb"], cfg=cfg)
+    assert json.loads(cfg.read_text())["mcpServers"]["kb"] == {
+        "command": "new-kb", "args": ["--v2"]}
+
+
+def test_uninstall_keeps_a_hand_replaced_entry(tmp_path, monkeypatch):
+    cfg, _ = _install_then_replace(tmp_path, monkeypatch)
+    res = im.do_uninstall(["kb"], cfg=cfg)
+    assert json.loads(cfg.read_text())["mcpServers"]["kb"] == {
+        "command": "new-kb", "args": ["--v2"]}
+    assert "kb" not in json.loads(im.stash_path(cfg).read_text()).get("user", {})
+    (change,) = res["changes"]
+    assert change["restored"] is False and "replaced by hand" in change["reason"]
+
+
+def test_reinstall_over_a_still_wrapped_entry_uses_the_stash(tmp_path, monkeypatch):
+    # The ordinary re-wrap (live entry is terse's own wrapper) must keep using the stash.
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(kb={"command": "old-kb", "args": ["--v1"]})))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    args = json.loads(cfg.read_text())["mcpServers"]["kb"]["args"]
+    assert args[args.index("--") + 1:] == ["old-kb", "--v1"]
