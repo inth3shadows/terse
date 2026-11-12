@@ -115,7 +115,10 @@ def _paired_gap_se(rows: list[dict[str, Any]], form: str, control: str) -> float
     n = len(pairs)
     sum_tf = sum(p[1] for p in pairs)
     sum_tc = sum(p[3] for p in pairs)
-    if n < 2 or not sum_tf or not sum_tc:
+    # Each ARM needs two scored rows, `_form_stats`' own n<2 rule: an arm scored on one
+    # row has a residual of exactly 0 there, so it would add no noise at all and a
+    # one-question control could publish `±0 pts PASS` (review of #582).
+    if n < 2 or sum(1 for p in pairs if p[1]) < 2 or sum(1 for p in pairs if p[3]) < 2:
         return None
     acc_f = sum(p[0] for p in pairs) / sum_tf
     acc_c = sum(p[2] for p in pairs) / sum_tc
@@ -4144,12 +4147,16 @@ def build_diff_soak_report(results: dict) -> str:
         # harmless now: it printed "No depth-correlated comprehension drift" about the one
         # depth nobody scored. Absence of a measurement is not a passing measurement.
         deep_withheld = bool(deep_rows) and not deep_gaps
+        # A model whose OWN deepest slice was withheld, while others scored: the deepest
+        # verdict covers only part of the tested set, which blocks a PASS like any other
+        # withheld model (#582).
+        deep_partial = bool(deep_gaps) and bool(set(deep_rows) - set(deep_gaps))
         if deepest:
             out.append(f"- At the deepest tested depth ({deep}): worst model "
                        f"`{deepest.model}` chain {deepest.form_acc:.0%} vs full "
                        f"{deepest.control_acc:.0%} (gap {deepest.gap:+.0%} "
                        f"±{deepest.gap_ci * 100:.0f} pts). "
-                       f"**{gate_word(deepest, soak_withheld)}** at "
+                       f"**{gate_word(deepest, soak_withheld or deep_partial)}** at "
                        f"{_GAP_TOLERANCE:.0%} tolerance.")
         elif deep_withheld:
             out.append(f"- **NO VERDICT at the deepest tested depth ({deep})** — every "
@@ -4168,7 +4175,7 @@ def build_diff_soak_report(results: dict) -> str:
         failed = any(not v.passed and not v.inconclusive for v in scored)
         inconclusive = any(v.inconclusive for v in scored)
         if scored and not failed and not inconclusive and not soak_withheld \
-                and not deep_withheld:
+                and not deep_withheld and not deep_partial:
             out.append("- No depth-correlated comprehension drift within tolerance — "
                        "chained diffs up to the tested depth read as well as fulls.")
         elif scored and not failed and not deep_withheld:

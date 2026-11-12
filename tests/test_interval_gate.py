@@ -102,3 +102,28 @@ def test_paired_se_counts_a_row_only_one_arm_scored():
     rows = [_q(i, 1, 1) for i in range(20)]
     rows.append({**_q(99, 0, 0), "terse_trials": 0})
     assert _paired_gap_se(rows, "diff_ok", "terse_ok") > 0
+
+
+def test_an_arm_scored_on_one_row_falls_back_to_the_independent_bound():
+    # Review round 2 of #582: a one-row control had residual 0 and published ±0 PASS.
+    rows = [{**_q(i, 23, 0 if i else 24, trials=25), "diff_trials": 25,
+             "terse_trials": 25 if i == 0 else 0} for i in range(20)]
+    assert _paired_gap_se(rows, "diff_ok", "terse_ok") is None
+    md = build_diff_report({"m": rows})
+    assert "±0 pts" not in md and "safe to enable" not in md
+
+
+def test_a_model_whose_deepest_slice_is_withheld_blocks_the_soak_pass():
+    from terse.report import _unmeasured, build_diff_soak_report
+
+    def clean(depth):
+        return [{**_q(f"{depth}-{i}", 1, 1), "depth": depth} for i in range(20)]
+
+    dead = [{**_q(f"5-{i}", 0, 0), "depth": 5, "fails": 2, "attempts": 2,
+             "diff_trials": 0, "terse_trials": 0} for i in range(5)]
+    assert _unmeasured(dead)
+    results = {"good": [r for d in range(1, 6) for r in clean(d)],
+               "bad": [r for d in range(1, 5) for r in clean(d)] + dead}
+    md = build_diff_soak_report(results)
+    assert "No depth-correlated comprehension drift" not in md
+    assert "**PASS** at" not in md.split("deepest tested depth", 1)[1].split("\n", 1)[0]
