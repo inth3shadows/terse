@@ -14,6 +14,14 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Fixed
+- `terse proxy` (single server) ended the whole session with exit 0 on one byte of invalid
+  UTF-8 from the client. The strict decoder raised inside the stdin loop and killed the
+  client-to-server thread. Client stdin is now read with `surrogateescape`, as the
+  multiproxy router has done since #517.
+- A stdio downstream that ignores stdin EOF kept `terse proxy` blocked forever once the
+  client disconnected without signalling it, orphaning both processes. After client EOF
+  the child now gets 5 seconds to exit on its own, then is terminated (SIGTERM, then
+  SIGKILL), with a stderr note.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,

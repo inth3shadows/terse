@@ -28,6 +28,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
@@ -2522,6 +2523,37 @@ def stdio_transport_error(cmd: list[str]) -> str | None:
     return None
 
 
+# How long a stdio child may keep running after the client closed our stdin (we close the
+# child's in turn) before it is terminated. A server that ignores stdin EOF otherwise kept
+# `run_proxy` blocked in `wait()` forever, orphaning both processes, whenever the client
+# left without signalling us.
+_EOF_GRACE_S = 5.0
+
+
+def _wait_child(transport: Any, t_up: Any, poll_s: float = 0.2) -> int:
+    """The stdio child's exit code. Waits as long as the session lasts, but once the
+    client->server thread has ended (client EOF) gives the child `_EOF_GRACE_S` to exit
+    on its own, then terminates it (SIGTERM, then SIGKILL)."""
+    proc = getattr(transport, "proc", None)
+    if proc is None:   # a non-subprocess transport: nothing to poll or escalate
+        return int(transport.wait())
+    eof_at: float | None = None
+    while True:
+        try:
+            return int(proc.wait(timeout=poll_s))
+        except subprocess.TimeoutExpired:
+            pass
+        if t_up.is_alive():
+            continue
+        if eof_at is None:
+            eof_at = time.monotonic()
+        elif time.monotonic() - eof_at >= _EOF_GRACE_S:
+            sys.stderr.write(f"[terse] downstream did not exit within {_EOF_GRACE_S:.0f}s "
+                             "of client EOF; terminating it\n")
+            _terminate_child(proc)
+            return int(proc.wait())
+
+
 def _terminate_child(proc: subprocess.Popen[Any], timeout: float = 2.0) -> None:
     """Reap the downstream server if it is still running, so it shares the proxy's
     lifecycle and is never orphaned (#21). SIGTERM first, then SIGKILL on timeout."""
@@ -2904,6 +2936,11 @@ def run_proxy(
                     return SWALLOW
                 inter.note_request(line)
                 return line  # forward request unchanged; only observe
+            # A strict decoder raises on invalid UTF-8 INSIDE pump's iterator, outside its
+            # per-line containment: one stray byte killed this thread, half-closed the
+            # child and ended the session with exit 0. multiproxy has had this since #517.
+            if hasattr(cin, "reconfigure"):
+                cin.reconfigure(errors="surrogateescape")
             try:
                 if wire is None:
                     pump(cin, transport.outbound(), fwd)
@@ -2946,7 +2983,7 @@ def run_proxy(
             if wire is not None:
                 wire.event("peer_exit", peer=peer_label, pid=None, exit_code=None)
         else:
-            rc = transport.wait()
+            rc = _wait_child(transport, t_up)
             if wire is not None:
                 wire.event("peer_exit", peer=peer_label, pid=_transport_pid(transport),
                            exit_code=rc)

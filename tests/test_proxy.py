@@ -2927,3 +2927,31 @@ def test_one_unfaithful_block_does_not_sink_the_partial_join_of_the_rest():
     texts = [b["text"] for b in json.loads(out)["result"]["content"]]
     assert bad in texts                                  # passed through byte-for-byte
     assert reasons[-1] == "multiblock_partial"
+
+
+# --- single-proxy lifecycle edges (audit 2026-11-12, #582) ---
+def test_invalid_utf8_on_client_stdin_does_not_end_the_session():
+    # One stray byte used to kill the client->server thread (exit 0, empty output).
+    raw = (json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}) + "\n\xff\n"
+           ).encode("latin-1") + (json.dumps({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+                                  + "\n").encode()
+    cin = io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8")
+    cout = io.StringIO()
+    echo = [sys.executable, "-c", "import sys\nfor l in sys.stdin: sys.stdout.write(l); "
+            "sys.stdout.flush()"]
+    assert run_proxy(echo, FULL, stdin=cin, stdout=cout) == 0
+    ids = [json.loads(ln).get("id") for ln in cout.getvalue().splitlines()
+           if ln.startswith("{")]
+    assert ids == [1, 2]
+
+
+def test_child_that_ignores_stdin_eof_is_terminated_after_the_grace(monkeypatch):
+    import time as _time
+
+    from terse import proxy as proxy_mod
+    monkeypatch.setattr(proxy_mod, "_EOF_GRACE_S", 0.3)
+    stubborn = [sys.executable, "-c", "import time; time.sleep(60)"]
+    start = _time.monotonic()
+    rc = run_proxy(stubborn, FULL, stdin=io.StringIO(""), stdout=io.StringIO())
+    assert _time.monotonic() - start < 10
+    assert rc != 0          # killed by SIGTERM, not a clean exit
