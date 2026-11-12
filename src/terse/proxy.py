@@ -28,6 +28,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
@@ -2522,6 +2523,52 @@ def stdio_transport_error(cmd: list[str]) -> str | None:
     return None
 
 
+# How long a stdio child may sit IDLE after the client closed our stdin (we close the
+# child's in turn) before it is terminated. A server that ignores stdin EOF otherwise kept
+# `run_proxy` blocked in `wait()` forever, orphaning both processes, whenever the client
+# left without signalling us. Idle means no tool call still in flight and no output for
+# this long: a child still answering a request the client sent just before EOF (a slow
+# tool, a cold `npx` start) is never cut off for being slow.
+_EOF_GRACE_S = 30.0
+# The hard ceiling after client EOF, busy or not. `busy` reads the in-flight tool calls,
+# and an entry there is only cleared by its reply: a call the client cancelled (or a hung
+# tool it gave up on, the likeliest reason it left) stays "in flight" forever, as does a
+# child that keeps emitting notifications. Without a ceiling either brings the orphan
+# back. Generous, because a reply after EOF can still be legitimately slow.
+_EOF_MAX_S = 600.0
+
+
+def _wait_child(transport: Any, t_up: Any, *, busy: Callable[[], bool] = lambda: False,
+                last_output: Callable[[], float] = lambda: 0.0,
+                poll_s: float = 0.2) -> int:
+    """The stdio child's exit code. Waits as long as the session lasts; once the
+    client->server thread has ended (client EOF), a child that stays idle (`busy()` false
+    and no output, per `last_output()`, a monotonic timestamp) for `_EOF_GRACE_S` is
+    terminated (SIGTERM, then SIGKILL)."""
+    proc = getattr(transport, "proc", None)
+    if proc is None:   # a non-subprocess transport: nothing to poll or escalate
+        return int(transport.wait())
+    eof_at: float | None = None
+    while True:
+        try:
+            return int(proc.wait(timeout=poll_s))
+        except subprocess.TimeoutExpired:
+            pass
+        if t_up.is_alive():
+            continue
+        now = time.monotonic()
+        if eof_at is None:
+            eof_at = now
+        capped = now - eof_at >= _EOF_MAX_S
+        if not capped and (busy() or now - max(eof_at, last_output()) < _EOF_GRACE_S):
+            continue
+        why = (f"was still running {_EOF_MAX_S:g}s after client EOF" if capped else
+               f"stayed idle {_EOF_GRACE_S:g}s after client EOF")
+        sys.stderr.write(f"[terse] downstream {why} without exiting; terminating it\n")
+        _terminate_child(proc)
+        return int(proc.wait())
+
+
 def _terminate_child(proc: subprocess.Popen[Any], timeout: float = 2.0) -> None:
     """Reap the downstream server if it is still running, so it shares the proxy's
     lifecycle and is never orphaned (#21). SIGTERM first, then SIGKILL on timeout."""
@@ -2904,7 +2951,12 @@ def run_proxy(
                     return SWALLOW
                 inter.note_request(line)
                 return line  # forward request unchanged; only observe
+            # A strict decoder raises on invalid UTF-8 INSIDE pump's iterator, outside its
+            # per-line containment: one stray byte killed this thread, half-closed the
+            # child and ended the session with exit 0. multiproxy has had this since #517.
             try:
+                if hasattr(cin, "reconfigure"):
+                    cin.reconfigure(errors="surrogateescape")
                 if wire is None:
                     pump(cin, transport.outbound(), fwd)
                 else:
@@ -2917,18 +2969,25 @@ def run_proxy(
                 # pump(transport.inbound(), ...) below ever terminate: for HTTP
                 # (a queue.Queue iterator with no other EOF condition) it closes
                 # outright; for stdio it closes the child's stdin so the child can
-                # flush any remaining reply and exit on its own (transport.wait()
-                # below blocks for that real exit; the outer finally's
+                # flush any remaining reply and exit on its own (`_wait_child` below
+                # waits for that real exit, terminating an idle child that ignores the
+                # EOF; the outer finally's
                 # transport.close() — SIGTERM/SIGKILL escalation — stays the
                 # last-resort reaper either way).
                 transport.half_close()
 
+        last_output = [time.monotonic()]   # when the child last wrote; read by `_wait_child`
+
+        def downstream_line(line: str) -> Any:
+            last_output[0] = time.monotonic()
+            return inter.transform_response(line)
+
         def server_to_client() -> None:
             if wire is None:
-                pump(transport.inbound(), cout, inter.transform_response, lock=out_lock)
+                pump(transport.inbound(), cout, downstream_line, lock=out_lock)
             else:
                 tap, stage = wire.tap, wire.stage
-                pump(transport.inbound(), cout, inter.transform_response, lock=out_lock,
+                pump(transport.inbound(), cout, downstream_line, lock=out_lock,
                      on_read=lambda raw: tap("server_in", raw, peer=peer_label),
                      on_write=lambda out: stage("client_out", out))
 
@@ -2946,7 +3005,8 @@ def run_proxy(
             if wire is not None:
                 wire.event("peer_exit", peer=peer_label, pid=None, exit_code=None)
         else:
-            rc = transport.wait()
+            rc = _wait_child(transport, t_up, busy=lambda: bool(inter.pending),
+                             last_output=lambda: last_output[0])
             if wire is not None:
                 wire.event("peer_exit", peer=peer_label, pid=_transport_pid(transport),
                            exit_code=rc)
