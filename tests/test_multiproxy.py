@@ -3004,3 +3004,80 @@ def test_routed_timeout_flag_reaches_the_router_and_is_validated(tmp_path, monke
     for bad in ("0", "-1", "nan", "inf", "soon"):
         with pytest.raises(SystemExit):
             main(["proxy", "--routed-timeout", bad, "--config", str(cfg)])
+
+
+# --- a dead peer must not stall broadcasts (audit 2026-11-12, #582) ---
+def _dead_peer_router():
+    t0, t1 = _FakePeerTransport(), _FakePeerTransport()
+    peers = [Peer("a", t0, Interceptor(PLAIN_POLICY)), Peer("b", t1, Interceptor(PLAIN_POLICY))]
+    out = io.StringIO()
+    return Router(peers, out, Lock(), broadcast_timeout=1000), out, t0, t1  # timer never fires
+
+
+def test_in_flight_broadcast_finishes_when_the_last_outstanding_peer_exits():
+    router, out, _, _ = _dead_peer_router()
+    try:
+        router.route_client_line(json.dumps({"jsonrpc": "2.0", "id": 7, "method": "ping"}))
+        router.from_peer(0)(json.dumps({"jsonrpc": "2.0", "id": "terse-b0-0", "result": {}}))
+        assert _lines(out) == []          # still waiting on peer 1
+        router.peer_exited(1)
+        assert [m["id"] for m in _lines(out)] == [7]
+    finally:
+        router.close_senders()
+
+
+def test_later_broadcast_does_not_wait_on_an_exited_peer():
+    router, out, _, t1 = _dead_peer_router()
+    try:
+        router.peer_exited(1)
+        router.route_client_line(json.dumps({"jsonrpc": "2.0", "id": 8, "method": "ping"}))
+        router.from_peer(0)(json.dumps({"jsonrpc": "2.0", "id": "terse-b0-0", "result": {}}))
+        assert [m["id"] for m in _lines(out)] == [8]
+        router.close_senders()
+        assert t1.out.getvalue() == ""    # nothing written to the dead peer
+    finally:
+        router.close_senders()
+
+
+def test_broadcast_with_every_peer_exited_answers_at_once():
+    router, out, _, _ = _dead_peer_router()
+    try:
+        router.peer_exited(0)
+        router.peer_exited(1)
+        router.route_client_line(json.dumps({"jsonrpc": "2.0", "id": 9, "method": "ping"}))
+        assert [m["id"] for m in _lines(out)] == [9]
+    finally:
+        router.close_senders()
+
+
+def test_listing_that_lacks_an_exited_peer_is_not_snapshotted():
+    # `remaining` still names the dead peer, so `_record` keeps refusing the partial view.
+    router, _, _, _ = _dead_peer_router()
+    try:
+        router.peer_exited(1)
+        router.route_client_line(json.dumps({"jsonrpc": "2.0", "id": 10,
+                                             "method": "tools/list"}))
+        with router._pending_lock:
+            pb = router._pending[0]
+        router.from_peer(0)(json.dumps({"jsonrpc": "2.0", "id": "terse-b0-0",
+                                        "result": {"tools": []}}))
+        assert pb.done and pb.remaining == {1}
+    finally:
+        router.close_senders()
+
+
+def test_peer_exit_finishes_every_stalled_broadcast_and_logs_once(capsys):
+    router, out, _, _ = _dead_peer_router()
+    try:
+        for mid, method in ((11, "ping"), (12, "initialize")):
+            router.route_client_line(json.dumps({"jsonrpc": "2.0", "id": mid,
+                                                 "method": method, "params": {}}))
+        router.from_peer(0)(json.dumps({"jsonrpc": "2.0", "id": "terse-b0-0", "result": {}}))
+        router.from_peer(0)(json.dumps({"jsonrpc": "2.0", "id": "terse-b1-0", "result": {
+            "protocolVersion": "2024-11-05", "capabilities": {}}}))
+        router.peer_exited(1)
+        router.peer_exited(1)   # a second notice must not log again
+        assert sorted(m["id"] for m in _lines(out)) == [11, 12]
+    finally:
+        router.close_senders()
+    assert capsys.readouterr().err.count("peer 'b' exited") == 1

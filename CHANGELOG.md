@@ -14,6 +14,13 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Fixed
+- In the multiproxy router, a downstream server that exited kept every later `ping`,
+  `tools/list`, `resources/list` and `initialize` waiting the full 30-second broadcast
+  timeout, because the dead peer stayed in each broadcast's set of peers still owed an
+  answer. A broadcast now completes as soon as every outstanding peer has exited,
+  including one already in flight when the peer dies, and nothing is written to a dead
+  peer. A listing that lacks the dead peer is still never saved to the warm-start
+  snapshot.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,
