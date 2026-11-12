@@ -178,6 +178,23 @@ def loads_faithful(raw: str) -> Any:
         raise
 
 
+# What parsing an untrusted corpus/payload string can raise. `json.loads` raises a plain
+# ValueError (JSONDecodeError's base) for a >4300-digit integer, RecursionError for deep
+# nesting, TypeError for a non-str; UnicodeDecodeError is a ValueError too. Catching only
+# JSONDecodeError let one such payload abort a whole command, a paid eval run included.
+PARSE_ERRORS: tuple[type[Exception], ...] = (ValueError, TypeError, RecursionError)
+
+
+def loads_within_depth(raw: Any) -> Any:
+    """`json.loads(raw)`, raising ValueError for a value nested past `MAX_DEPTH`, which
+    every later recursive walk (the codec, question generators) would RecursionError on.
+    Callers catch `PARSE_ERRORS`."""
+    obj = json.loads(raw)
+    if exceeds_depth(obj):
+        raise ValueError(f"nested deeper than {MAX_DEPTH}")
+    return obj
+
+
 def exceeds_depth(obj: Any, cap: int = MAX_DEPTH) -> bool:
     """True if obj nests containers deeper than `cap`. Iterative — safe to call on the
     pathological payloads it exists to screen out."""

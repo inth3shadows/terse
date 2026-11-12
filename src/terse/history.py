@@ -69,12 +69,15 @@ def load_history(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     runs = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    # errors="replace": one torn multibyte write must not make every later render raise.
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            runs.append(json.loads(line))
-        except json.JSONDecodeError:
+            run = json.loads(line)
+        except (ValueError, RecursionError):
             continue
+        if isinstance(run, dict):   # a `[1]` / `5` line is not a run summary
+            runs.append(run)
     return runs

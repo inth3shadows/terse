@@ -257,8 +257,11 @@ def cross_tokenizer_savings(envelopes: list[dict[str, Any]]) -> list[dict[str, A
     for env in envelopes:
         raw = env["raw"]
         try:
-            comp = transforms.compress(transforms.loads_faithful(raw))
-        except (ValueError, TypeError):   # ValueError: #563 int-digit limit, UnfaithfulJSON
+            obj = transforms.loads_faithful(raw)
+            if transforms.exceeds_depth(obj):
+                raise ValueError("too deep")   # the proxy passes it through (#79)
+            comp = transforms.compress(obj)
+        except transforms.PARSE_ERRORS:   # #563 int-digit limit, UnfaithfulJSON, depth
             comp = raw
         # Qualified name — the same one coverage/policy use, so a report's measure rows and
         # coverage counts name one tool the same way (#158).

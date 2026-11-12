@@ -117,7 +117,7 @@ from typing import Any, NamedTuple
 from . import capture, fluency
 from .dropeval import ToolAnswerer, Turn, _safe_call
 from .tokenize import count_cl100k
-from .transforms import minify
+from .transforms import PARSE_ERRORS, loads_within_depth, minify
 
 # OpenAI function-calling schemas can't cleanly express "any JSON type" — see the module
 # docstring's spike note. `{"description": ...}` with no `"type"` is the untyped form that
@@ -913,8 +913,8 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
     merged_duplicates: dict[str, int] = {}
     for i, env in enumerate(envelopes, 1):
         try:
-            obj = json.loads(env["raw"])
-        except (ValueError, TypeError):   # ValueError: the int-digit limit, #563
+            obj = loads_within_depth(env["raw"])
+        except PARSE_ERRORS:   # int-digit limit (#563), deep nesting, non-str
             obj = None  # these questions need parsed JSON; a non-JSON/text payload has none
         terse = None
         if obj is not None and policy is not None:

@@ -505,13 +505,15 @@ def load_stats(log_path: str | Path, since_ts: int | None = None) -> list[dict[s
     records: list[dict[str, Any]] = []
     for path in (p.with_name(p.name + ".1"), p):
         try:
-            text = path.read_text(encoding="utf-8")
+            # errors="replace": a torn multibyte write raised UnicodeDecodeError (not an
+            # OSError) and took `terse stats` down; the damaged line is skipped below.
+            text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         for line in text.splitlines():
             try:
                 rec = json.loads(line)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):   # also the int-digit limit
                 continue
             if not isinstance(rec, dict):
                 continue

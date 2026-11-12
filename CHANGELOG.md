@@ -14,6 +14,15 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Fixed
+- One malformed payload or file no longer aborts a whole command. Several readers caught
+  only `JSONDecodeError`, so a >4300-digit integer (a plain `ValueError`), deep nesting
+  (`RecursionError`) or a torn multibyte write (`UnicodeDecodeError`) escaped and ended
+  the run. This affected `measure`, `policy`, `fluency` (a multi-model paid run lost every
+  scored row), `dropeval`, `codeceval`, `terse stats` and `measure --history`. Each now
+  skips the bad item. Two related crashes are fixed too: a model's tool call whose
+  `arguments` is not an object (`"[1]"`, `"null"`) or whose retrieve `handle` is
+  unhashable no longer aborts a `dropeval`/`codeceval` sweep, and a history line that is
+  not an object is ignored.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,

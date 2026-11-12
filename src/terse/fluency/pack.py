@@ -7,11 +7,9 @@ later, keylessly, with `score_pack`.
 
 from __future__ import annotations
 
-import json
-
 from ..capture import extract_records
 from ..tokenize import count_cl100k
-from ..transforms import compress
+from ..transforms import PARSE_ERRORS, compress, loads_within_depth
 from .questions import gen_questions
 from .scoring import MISSING, _score_form
 
@@ -51,8 +49,8 @@ def build_pack(envelopes: list[dict], primer: str = PRIMER, trials: int = 1) -> 
     payloads = []
     for env in envelopes:
         try:
-            obj = json.loads(env["raw"])
-        except (json.JSONDecodeError, TypeError):
+            obj = loads_within_depth(env["raw"])
+        except PARSE_ERRORS:
             continue
         qs = gen_questions(obj)
         if not qs:
@@ -144,8 +142,8 @@ def token_summary(envelopes: list[dict]) -> list[dict]:
     rows: list[dict] = []
     for env in envelopes:
         try:
-            obj = json.loads(env["raw"])
-        except (json.JSONDecodeError, TypeError):
+            obj = loads_within_depth(env["raw"])
+        except PARSE_ERRORS:
             continue
         if not extract_records(obj):
             continue

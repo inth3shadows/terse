@@ -376,7 +376,7 @@ def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
     for path in corpus.glob("*.json"):
         try:
             env = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):   # JSONDecodeError, bad UTF-8, int-digit, depth
             # A corrupt/torn envelope was previously dropped silently, so it just
             # disappeared from coverage with no signal. Skipping is still correct (one
             # bad file mustn't fail the whole measure), but count and surface it.

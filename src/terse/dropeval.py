@@ -38,6 +38,7 @@ from . import capture, fluency
 from . import lossy as lossy_mod
 from . import policy as policy_mod
 from .proxy import TERSE_PRIMER
+from .transforms import PARSE_ERRORS, loads_within_depth
 from .transport import guard_cleartext_credential, guarded_opener
 
 
@@ -590,6 +591,8 @@ def _run_question(question: DropQuestion, applied_text: str, staging: dict[str, 
         hit_expected_handle = False
         for c in retrieve_calls:
             call_handle = c.arguments.get("handle")
+            if not isinstance(call_handle, str):
+                call_handle = None   # an unhashable handle (`["x"]`) raised at `in staging`
             if call_handle in staging:
                 content = lossy_mod._serialize(staging[call_handle])
                 if call_handle == question.expected_handle:
@@ -754,8 +757,8 @@ def _probe_envelope(env: dict, rule_for: Callable[..., Any]) -> tuple[DropProbe,
     tool = env["tool"]
     rule = rule_for(tool, env.get("server"))
     try:
-        obj = json.loads(env["raw"])
-    except (ValueError, TypeError):   # ValueError: the int-digit limit, #563
+        obj = loads_within_depth(env["raw"])
+    except PARSE_ERRORS:   # int-digit limit (#563), deep nesting, non-str
         # Not JSON: the span-addressed text path is the only one that can drop here. Same
         # probe shape, so a text payload's results merge into the report exactly like a
         # JSON one's — and its skip reasons into the coverage table the same way.
@@ -920,8 +923,12 @@ def openai_tool_answerer(base_url: str, api_key: str, model: str, tools: list[di
             fn = tc.get("function", {})
             try:
                 arguments = json.loads(fn.get("arguments") or "{}")
-            except json.JSONDecodeError:
+            except PARSE_ERRORS:
                 arguments = {}  # a malformed tool-call payload scores as "called with no args"
+            if not isinstance(arguments, dict):
+                # `"arguments": "[1]"` / `"null"`: every reader calls `.get` on it, which
+                # raised outside `_safe_call` and aborted the whole sweep (#582).
+                arguments = {}
             name = fn.get("name", "")
             calls.append(ToolCall(call_id=tc.get("id", ""), name=mcp_name.get(name, name),
                                   arguments=arguments))

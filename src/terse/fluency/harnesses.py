@@ -9,14 +9,13 @@ reports cross-tokenizer divergence rather than averaging it away).
 
 from __future__ import annotations
 
-import json
 import time
 from collections.abc import Callable
 from typing import Any
 
 from .. import text_diff
 from ..capture import LONG_TEXT, OTHER, classify_shape
-from ..transforms import compress, diff_wire
+from ..transforms import PARSE_ERRORS, compress, diff_wire, loads_within_depth
 from .answerers import Answerer
 from .ledger import log_call
 from .pack import PRIMER
@@ -249,8 +248,8 @@ def run_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
         started = time.monotonic()
         for i, env in enumerate(envelopes, 1):
             try:
-                obj = json.loads(env["raw"])
-            except (json.JSONDecodeError, TypeError):
+                obj = loads_within_depth(env["raw"])
+            except PARSE_ERRORS:
                 obj = None
             if obj is not None:
                 for row in run_payload(obj, env["raw"], fn, primer, trials, model=name):
@@ -353,9 +352,9 @@ def diff_pairs(envelopes: list[dict]) -> list[tuple]:
     pairs: list[tuple] = []
     for tool, csha, prev_raw, curr_raw in _iter_consecutive_pairs(envelopes):
         try:
-            prev_obj = json.loads(prev_raw)
-            curr_obj = json.loads(curr_raw)
-        except (json.JSONDecodeError, TypeError):
+            prev_obj = loads_within_depth(prev_raw)
+            curr_obj = loads_within_depth(curr_raw)
+        except PARSE_ERRORS:
             continue
         pairs.append((tool, csha, prev_obj, curr_obj))
     return pairs
@@ -398,8 +397,8 @@ def build_chain_windows(envelopes: list[dict], max_depth: int = 5,
         seq: list[tuple] = []
         for e in envs:
             try:
-                seq.append((e.get("sha", "?"), json.loads(e["raw"])))
-            except (json.JSONDecodeError, TypeError):
+                seq.append((e.get("sha", "?"), loads_within_depth(e["raw"])))
+            except PARSE_ERRORS:
                 seq.append((e.get("sha", "?"), None))
         cur: list[tuple] = []
         for (psha, p), (csha, c) in zip(seq, seq[1:], strict=False):  # sliding pairs
