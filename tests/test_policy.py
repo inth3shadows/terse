@@ -690,3 +690,38 @@ def test_never_lossy_floor_does_not_overmatch_ordinary_servers(server):
     # silently disable lossy on servers that were never sensitive.
     pol = Policy(rules=[], never_lossy_servers=frozenset())
     assert not pol.server_never_lossy(server)
+
+
+# --- load-time validation of safety keys (audit 2026-11-12) ---
+def _load_doc(tmp_path, doc):
+    p = tmp_path / "policy.json"
+    p.write_text(json.dumps({"version": 1, **doc}), encoding="utf-8")
+    return load_policy(p)
+
+
+@pytest.mark.parametrize("bad", ["mybank", None, {"mybank": True}, ["ok", 3]])
+def test_never_lossy_servers_must_be_a_list_of_names(tmp_path, bad):
+    # A bare string used to load as the set of its characters, turning the floor off.
+    with pytest.raises(ValueError, match="'never_lossy_servers' must be a list"):
+        _load_doc(tmp_path, {"never_lossy_servers": bad})
+
+
+def test_never_lossy_servers_list_loads(tmp_path):
+    pol = _load_doc(tmp_path, {"never_lossy_servers": ["mybank"]})
+    assert pol.server_never_lossy("mybank")
+
+
+@pytest.mark.parametrize(("key", "bad"), [("max", "abc"), ("max", None), ("max", -3),
+                                          ("max", 0), ("max", True), ("max", 2.5),
+                                          ("min", "abc"), ("min", -1)])
+def test_lossy_size_knobs_must_be_integers(tmp_path, key, bad):
+    with pytest.raises(ValueError, match=f"'{key}' must be an integer"):
+        _load_doc(tmp_path, {"policies": [{"match": {"tool": "x"}, "tiers": ["minify"],
+                                           "fields": {"a": {"lossy": "truncate", key: bad}}}]})
+
+
+def test_add_never_lossy_server_keeps_a_bare_string_whole():
+    from terse.install_mcp import add_never_lossy_server
+    doc = {"never_lossy_servers": "mybank"}
+    assert add_never_lossy_server(doc, "kb")
+    assert doc["never_lossy_servers"] == ["kb", "mybank"]

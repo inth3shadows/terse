@@ -103,7 +103,10 @@ def add_never_lossy_server(policy_doc: dict, name: str) -> bool:
     the doc changed. Pure — the caller owns reading/writing the file. `name` is the server's
     config key, which install-mcp also bakes as `--server-name`, so it matches the identity
     `policy.apply` sees at runtime — making lossy structurally forbidden on it (PR #89)."""
-    existing = list(policy_doc.get("never_lossy_servers", []))
+    existing = policy_doc.get("never_lossy_servers", [])
+    if isinstance(existing, str):
+        existing = [existing]   # a hand-written bare string; `list()` would split it to chars
+    existing = list(existing)
     if name in existing:
         return False
     policy_doc["never_lossy_servers"] = sorted([*existing, name])
