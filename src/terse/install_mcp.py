@@ -925,7 +925,10 @@ def _wraps_original(live: dict, original: object) -> bool:
     else:
         return False
     n = len(launch)
-    return len(args) > n and args[-n - 1] == "--" and args[-n:] == launch
+    # `proxy` before the `--` too: `sb-run --secret X -- kb-mcp` ends with the original's
+    # launch but is the user's own wrapper, not terse's (review of #582 item 5).
+    return (len(args) > n and args[-n - 1] == "--" and args[-n:] == launch
+            and "proxy" in args[:-n - 1])
 
 
 def unwrap(config: dict, stash: dict, server: str,

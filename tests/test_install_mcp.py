@@ -2716,3 +2716,19 @@ def test_multiproxy_reinstall_folds_the_hand_replaced_entry(tmp_path):
     peers = json.loads(Path(res["peers_file"]).read_text())["downstreams"]
     kb = next(d for d in peers if d["name"] == "kb")
     assert kb["command"] == ["new-kb", "--v2"]
+
+
+def test_a_user_wrapper_ending_in_the_old_command_is_a_hand_replacement(tmp_path, monkeypatch):
+    # `sb-run --secret X -- old-kb --v1` ends like terse's wrapper but runs no proxy.
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(kb={"command": "old-kb", "args": ["--v1"]})))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    mine = {"command": "sb-run", "args": ["--secret", "X", "--", "old-kb", "--v1"]}
+    config = json.loads(cfg.read_text())
+    config["mcpServers"]["kb"] = mine
+    cfg.write_text(json.dumps(config))
+    im.do_uninstall(["kb"], cfg=cfg)
+    assert json.loads(cfg.read_text())["mcpServers"]["kb"] == mine
