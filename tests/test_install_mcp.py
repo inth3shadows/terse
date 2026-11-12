@@ -2677,3 +2677,42 @@ def test_reinstall_over_a_still_wrapped_entry_uses_the_stash(tmp_path, monkeypat
     im.do_install(["kb"], str(policy), cfg=cfg)
     args = json.loads(cfg.read_text())["mcpServers"]["kb"]["args"]
     assert args[args.index("--") + 1:] == ["old-kb", "--v1"]
+
+
+def test_a_custom_launcher_wrapper_is_not_mistaken_for_a_hand_replacement(tmp_path, monkeypatch):
+    # `$TERSE_MCP_CMD=/path/tmcp` writes a wrapper `_looks_like_terse_launcher` can't see.
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(kb={"command": "old-kb", "args": ["--v1"]})))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: [str(tmp_path / "tmcp")])
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    args = json.loads(cfg.read_text())["mcpServers"]["kb"]["args"]
+    assert args.count("--") == 1 and args[args.index("--") + 1:] == ["old-kb", "--v1"]
+    res = im.do_uninstall(["kb"], cfg=cfg)
+    assert res["changes"][0]["restored"] is True
+    assert json.loads(cfg.read_text())["mcpServers"]["kb"] == {
+        "command": "old-kb", "args": ["--v1"]}
+
+
+def test_uninstall_prints_kept_for_a_hand_replaced_entry(tmp_path, monkeypatch, capsys):
+    from terse.cli import main
+    cfg, _ = _install_then_replace(tmp_path, monkeypatch)
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    assert main(["uninstall-mcp", "kb"]) == 0
+    out = capsys.readouterr().out
+    assert "kept kb:" in out and "skip kb" not in out
+
+
+def test_multiproxy_reinstall_folds_the_hand_replaced_entry(tmp_path):
+    from terse.install_mcp import do_install
+    cfg, pol = _multi_cfg(tmp_path)
+    res = do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    config = json.loads(cfg.read_text())
+    config["mcpServers"]["kb"] = {"command": "new-kb", "args": ["--v2"]}   # by hand
+    cfg.write_text(json.dumps(config))
+    res = do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    peers = json.loads(Path(res["peers_file"]).read_text())["downstreams"]
+    kb = next(d for d in peers if d["name"] == "kb")
+    assert kb["command"] == ["new-kb", "--v2"]

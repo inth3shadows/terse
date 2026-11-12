@@ -19,7 +19,9 @@ fails that pull request until the section has moved.
   and re-running install brought the old one back and discarded yours, and
   `uninstall-mcp` restored the old one over it. An entry that is no longer a terse
   wrapper (and not a router) and differs from the stash is now treated as the new
-  original. Re-install wraps it, and uninstall keeps it and drops the stale stash copy.
+  original. Re-install wraps it, including `--multiproxy` folds, and uninstall keeps it
+  (printing `kept`) and drops the stale stash copy. A wrapper written through a custom
+  `$TERSE_MCP_CMD` launcher is still recognised as terse's own.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,
