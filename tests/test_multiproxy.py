@@ -3064,3 +3064,20 @@ def test_listing_that_lacks_an_exited_peer_is_not_snapshotted():
         assert pb.done and pb.remaining == {1}
     finally:
         router.close_senders()
+
+
+def test_peer_exit_finishes_every_stalled_broadcast_and_logs_once(capsys):
+    router, out, _, _ = _dead_peer_router()
+    try:
+        for mid, method in ((11, "ping"), (12, "initialize")):
+            router.route_client_line(json.dumps({"jsonrpc": "2.0", "id": mid,
+                                                 "method": method, "params": {}}))
+        router.from_peer(0)(json.dumps({"jsonrpc": "2.0", "id": "terse-b0-0", "result": {}}))
+        router.from_peer(0)(json.dumps({"jsonrpc": "2.0", "id": "terse-b1-0", "result": {
+            "protocolVersion": "2024-11-05", "capabilities": {}}}))
+        router.peer_exited(1)
+        router.peer_exited(1)   # a second notice must not log again
+        assert sorted(m["id"] for m in _lines(out)) == [11, 12]
+    finally:
+        router.close_senders()
+    assert capsys.readouterr().err.count("peer 'b' exited") == 1

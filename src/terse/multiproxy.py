@@ -988,6 +988,7 @@ class Router:
         # Peers whose reader hit EOF: a call routed to one is answered at once, since
         # nothing will ever reply to it.
         self._exited_peers: set[int] = set()
+        self._warned_exit: set[int] = set()   # peers whose exit has been logged once
 
         # The fast initialize (#270). A broadcast `initialize` waits on the slowest peer
         # (4.2s on the live fleet, 2026-09-26), and a headless client sends its first
@@ -1786,8 +1787,19 @@ class Router:
             if timer is not None:
                 timer.cancel()
             self._answer_routed(idx, mid, "exited before answering", origin="peer_exit")
+        if idx not in self._warned_exit:
+            self._warned_exit.add(idx)
+            sys.stderr.write(f"[terse-multiproxy] peer {self.peers[idx].name!r} exited; "
+                             "broadcasts no longer wait on it (its tools, prompts and "
+                             "resources are missing from later listings)\n")
         for seq in stalled:
-            self._finish_broadcast(seq)
+            # One merge failing must not skip the rest (they would fall back to their
+            # full timeout), nor escape into the reader thread's `finally`.
+            try:
+                self._finish_broadcast(seq)
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(f"[terse-multiproxy] finishing a broadcast after peer "
+                                 f"{self.peers[idx].name!r} exited failed: {exc}\n")
 
     def _timeout_broadcast(self, seq: int) -> None:
         with self._pending_lock:
@@ -2365,8 +2377,9 @@ class Router:
                 self._tool_state = (pb.seq, table, silent)
                 self._tool_entries = list(tools)   # COPY — see __init__
                 # Warn only for the reasons nothing else warns about. A `no reply` peer was
-                # already named by `_timeout_broadcast` (a broadcast completes on arrival or
-                # on timeout, so that is the only way to be absent), and `empty` is a peer
+                # already named by `_timeout_broadcast`, or by `peer_exited` when it died
+                # (a broadcast completes on arrival, on timeout, or once every outstanding
+                # peer has exited, so those are the only ways to be absent), and `empty` is a peer
                 # exercising its right to export nothing. Warning inside the seq guard, not
                 # before it, so a listing refused as stale does not report peers that are
                 # missing from a table which was never installed.
