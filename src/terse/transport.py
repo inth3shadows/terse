@@ -507,6 +507,51 @@ def _iter_sse(body: str) -> Iterator[str]:
         yield "\n".join(data_lines)
 
 
+# A JSON string literal (escapes included) or a run of JSON whitespace. Matching strings
+# first is what keeps whitespace INSIDE them; the regex engine does the scanning, so a
+# multi-megabyte pretty-printed body is not walked one character at a time in Python.
+# The string pattern is the unrolled `"[^"\\]*(?:\\.[^"\\]*)*"?`: its closing quote is
+# OPTIONAL, so an unterminated string (a truncated body) is consumed to the end in one
+# linear pass instead of failing and being retried from every later `"`, which was
+# quadratic on a cut-off string full of `\"` (review of #582 item 4).
+_STRING = r'"[^"\\]*(?:\\.[^"\\]*)*"?'
+_JSON_STRING_OR_WS = re.compile(r'(' + _STRING + r')|[ \t\r\n]+', re.DOTALL)
+# A string literal, or one structural character that can change nesting or split a batch.
+_JSON_STRING_OR_STRUCT = re.compile(_STRING + r'|[\[\]{},]', re.DOTALL)
+
+
+def _compact_json_text(text: str) -> str:
+    """`text` with every whitespace character OUTSIDE a JSON string removed, everything
+    else kept byte-for-byte. Lexical, never a parse/re-serialize, so it cannot round a
+    number or collapse a duplicate key (#580). A raw newline can only survive inside a
+    string, where it makes the text invalid JSON anyway, which the caller then rejects."""
+    text = text.removeprefix("\ufeff")   # a UTF-8 BOM is not JSON; json.loads rejects it
+    if "\n" not in text and "\r" not in text and not text[:1].isspace() \
+            and not text[-1:].isspace():
+        return text   # the common case: already one line, nothing to strip
+    return _JSON_STRING_OR_WS.sub(lambda m: m.group(1) or "", text)
+
+
+def _split_top_level_array(compact: str) -> list[str]:
+    """The literal text of each element of a compact JSON array (already validated by the
+    caller), split at depth-1 commas outside strings."""
+    parts: list[str] = []
+    depth = 0
+    start = 1
+    for m in _JSON_STRING_OR_STRUCT.finditer(compact):
+        ch = m.group()
+        if ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+            if depth == 0:
+                parts.append(compact[start:m.start()].strip())
+        elif ch == "," and depth == 1:
+            parts.append(compact[start:m.start()].strip())
+            start = m.end()
+    return parts
+
+
 def _parse_request_id(line: str) -> tuple[bool, Any]:
     """Parse `line` (an outgoing JSON-RPC request) once: whether it carries an `"id"`
     key at all (a notification has none and per JSON-RPC must never get a reply) and
@@ -667,13 +712,22 @@ class HttpTransport:
                 except (ValueError, RecursionError):  # JSONDecodeError is a ValueError
                     parsed = None
                 if isinstance(parsed, dict) and "jsonrpc" in parsed:
-                    # Forward it verbatim ONLY if the outgoing line actually expected a
-                    # reply — a notification (no "id") must never get one, the same
-                    # invariant _maybe_enqueue_error enforces for a non-JSON-RPC-shaped
-                    # error body just below.
-                    has_id, _ = _parse_request_id(line)
+                    # Forward it ONLY if the outgoing line actually expected a reply — a
+                    # notification (no "id") must never get one, the same invariant
+                    # _maybe_enqueue_error enforces for a non-JSON-RPC-shaped error body
+                    # just below. Servers answer a 400/404 (an expired session, a bad
+                    # request) with `"id": null`, which matches no request the client
+                    # sent, so it hung on its own timeout: carry the request's id instead.
+                    has_id, mid = _parse_request_id(line)
                     if has_id:
-                        self._q.put(raw_body)
+                        # Only a RESPONSE with no usable id (`null` or absent) is re-keyed;
+                        # anything else is forwarded literally.
+                        if parsed.get("id") is None and "method" not in parsed:
+                            parsed["id"] = mid
+                            self._q.put(json.dumps(parsed, separators=(",", ":"),
+                                                   ensure_ascii=False))
+                        else:
+                            self._q.put(_compact_json_text(raw_body))
                     return
             detail = raw_body.strip()[:_MAX_ERROR_DETAIL_CHARS] or str(exc)
             self._maybe_enqueue_error(
@@ -703,14 +757,52 @@ class HttpTransport:
             self._maybe_enqueue_error(line, f"terse: downstream HTTP request failed: {reason}")
             return
         if "text/event-stream" in ctype:
-            for msg in _iter_sse(body.decode("utf-8", errors="replace")):
-                self._q.put(msg)
+            # Only real messages are forwarded. An empty `data:` (a Streamable-HTTP priming
+            # or resume event) or a non-JSON keepalive (`data: ping`) is skipped; erroring on
+            # one would answer the request with a failure AHEAD of its real reply. The
+            # request gets an error only if the whole stream carried no message at all.
+            events = list(_iter_sse(body.decode("utf-8", errors="replace")))
+            delivered = sum(self._enqueue_body(line, msg, on_junk=None) for msg in events
+                            if msg.strip())
+            if not delivered:
+                self._maybe_enqueue_error(line, "terse: downstream SSE stream carried no "
+                                                "JSON-RPC message")
         else:
             text = body.decode("utf-8", errors="replace")
             if text.strip():
-                self._q.put(text)
+                self._enqueue_body(line, text)
             # else: a 202 Accepted / empty body is valid Streamable-HTTP and
             # means nothing to enqueue (e.g. the reply to a notification).
+
+    def _enqueue_body(self, line: str, text: str, on_junk: str | None = "error") -> bool:
+        """Enqueue one HTTP body / SSE event as newline-free JSON-RPC message(s).
+
+        The queue feeds a newline-delimited stdio stream, so a body was framing-unsafe
+        whenever it was not one compact JSON object: a pretty-printed reply (or an SSE
+        event whose `data:` spanned lines) reached the client as N physical lines of
+        non-JSON and the request hung; an HTML 200 (captive portal, login page) was
+        forwarded as junk; a batch array went out unsplit. Now: whitespace outside
+        strings is removed LEXICALLY (literal text kept, so no number or duplicate key
+        is rewritten by a parse/re-serialize), a batch is split into its elements, and a
+        body that is not JSON-RPC answers the request with an error (`on_junk="error"`) or
+        is dropped (`on_junk=None`, an SSE event). Returns whether anything was enqueued."""
+        compact = _compact_json_text(text)
+        try:
+            parsed = json.loads(compact)
+        except (ValueError, RecursionError):
+            parsed = None
+        if isinstance(parsed, dict) and "jsonrpc" in parsed:
+            self._q.put(compact)
+            return True
+        if isinstance(parsed, list) and parsed and all(
+                isinstance(m, dict) and "jsonrpc" in m for m in parsed):
+            for element in _split_top_level_array(compact):
+                self._q.put(element)
+            return True
+        if on_junk == "error":
+            self._maybe_enqueue_error(line, "terse: downstream HTTP response is not a "
+                                            f"JSON-RPC message ({len(text)} chars, not shown)")
+        return False
 
     def _maybe_enqueue_error(self, line: str, message: str) -> None:
         """Enqueue a synthesized JSON-RPC error for `line`'s in-flight request —

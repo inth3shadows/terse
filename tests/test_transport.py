@@ -66,6 +66,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
 
+        if mode in _FRAMING_MODES:
+            _FRAMING_MODES[mode](self, mid)
+            return
+
         method = msg.get("method")
         if method == "initialize":
             self._send_json({"jsonrpc": "2.0", "id": mid,
@@ -119,6 +123,45 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+
+def _raw(handler, status: int, ctype: str, payload: bytes) -> None:
+    handler.send_response(status)
+    handler.send_header("Content-Type", ctype)
+    handler.send_header("Content-Length", str(len(payload)))
+    handler.end_headers()
+    handler.wfile.write(payload)
+
+
+# Response shapes that are legal HTTP but were framing-unsafe on the stdio side (#582):
+# each is answered to ANY request, so the test drives one tools/list.
+_TOOLS = {"tools": [{"name": "items.get", "description": "a b"}]}
+_FRAMING_MODES = {
+    "pretty": lambda h, mid: _raw(h, 200, "application/json", json.dumps(
+        {"jsonrpc": "2.0", "id": mid, "result": _TOOLS}, indent=2).encode()),
+    "sse_multiline": lambda h, mid: _raw(h, 200, "text/event-stream", (
+        "data: " + json.dumps({"jsonrpc": "2.0", "id": mid, "result": _TOOLS},
+                              indent=2).replace("\n", "\ndata: ") + "\n\n").encode()),
+    "html": lambda h, mid: _raw(h, 200, "text/html", b"<html>\n<body>login</body>\n</html>"),
+    "batch": lambda h, mid: _raw(h, 200, "application/json", json.dumps([
+        {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"p": 1}},
+        {"jsonrpc": "2.0", "id": mid, "result": _TOOLS}], indent=1).encode()),
+    "sse_priming": lambda h, mid: _raw(h, 200, "text/event-stream", (
+        "id: 1\ndata:\n\ndata: ping\n\ndata: " + json.dumps(
+            {"jsonrpc": "2.0", "id": mid, "result": _TOOLS}) + "\n\n").encode()),
+    "sse_junk_only": lambda h, mid: _raw(h, 200, "text/event-stream", b"data: ping\n\n"),
+    "sse_blank_only": lambda h, mid: _raw(h, 200, "text/event-stream", b"data:\n\n"),
+    "not_jsonrpc": lambda h, mid: _raw(h, 200, "application/json",
+                                       b'{"error": "login required"}'),
+    "bom": lambda h, mid: _raw(h, 200, "application/json", ("\ufeff" + json.dumps(
+        {"jsonrpc": "2.0", "id": mid, "result": _TOOLS})).encode()),
+    "fail_null_id": lambda h, mid: _raw(h, 404, "application/json", json.dumps(
+        {"jsonrpc": "2.0", "id": None,
+         "error": {"code": -32001, "message": "session expired"}}).encode()),
+    "precise": lambda h, mid: _raw(h, 200, "application/json", (
+        '{\n "jsonrpc": "2.0",\n "id": ' + json.dumps(mid) + ',\n "result": '
+        '{"v": 0.12345678901234567890123, "a": 1, "a": 2}\n}').encode()),
+}
 
 
 @contextlib.contextmanager
@@ -648,3 +691,85 @@ def test_redirect_target_cannot_fixate_the_mcp_session():
         _post_one(t)
         assert t.session != "ATTACKER-CHOSEN"
         assert t.session is None
+
+
+# --- framing: every downstream body becomes newline-free JSON-RPC lines (#582) ---
+def _one_list_call(mode: str) -> list[str]:
+    cin = io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}) + "\n")
+    cout = io.StringIO()
+    with _fake_server(mode=mode) as srv:
+        assert run_proxy([_url(srv)], FULL, stdin=cin, stdout=cout) == 0
+    return [ln for ln in cout.getvalue().splitlines() if ln.strip()]
+
+
+@pytest.mark.parametrize("mode", ["pretty", "sse_multiline"])
+def test_multi_line_body_reaches_the_client_as_one_message(mode):
+    lines = _one_list_call(mode)
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == {"jsonrpc": "2.0", "id": 3, "result": _TOOLS}
+
+
+def test_batch_body_is_split_into_its_messages():
+    msgs = [json.loads(ln) for ln in _one_list_call("batch")]
+    assert [m.get("method") for m in msgs] == ["notifications/progress", None]
+    assert msgs[1]["id"] == 3
+
+
+def test_non_json_body_answers_the_request_with_an_error():
+    msgs = [json.loads(ln) for ln in _one_list_call("html")]
+    assert len(msgs) == 1 and msgs[0]["id"] == 3
+    assert "not a JSON-RPC message" in msgs[0]["error"]["message"]
+    assert "login" not in msgs[0]["error"]["message"]   # body content never echoed
+
+
+def test_error_body_with_null_id_is_answered_under_the_request_id():
+    msgs = [json.loads(ln) for ln in _one_list_call("fail_null_id")]
+    assert len(msgs) == 1 and msgs[0]["id"] == 3
+    assert msgs[0]["error"]["message"] == "session expired"
+
+
+def test_compaction_keeps_literal_numbers_and_duplicate_keys():
+    # Whitespace removal is lexical: the over-precise float and the duplicate key a
+    # json round-trip would rewrite reach the client exactly as the server sent them.
+    lines = _one_list_call("precise")
+    assert lines == ['{"jsonrpc":"2.0","id":3,"result":{"v":0.12345678901234567890123,'
+                     '"a":1,"a":2}}']
+
+
+def test_sse_priming_and_keepalive_events_are_skipped_not_errored():
+    msgs = [json.loads(ln) for ln in _one_list_call("sse_priming")]
+    assert msgs == [{"jsonrpc": "2.0", "id": 3, "result": _TOOLS}]
+
+
+@pytest.mark.parametrize("mode", ["sse_junk_only", "sse_blank_only"])
+def test_sse_stream_with_no_message_answers_with_an_error(mode):
+    msgs = [json.loads(ln) for ln in _one_list_call(mode)]
+    assert len(msgs) == 1 and "no JSON-RPC message" in msgs[0]["error"]["message"]
+
+
+def test_json_object_that_is_not_jsonrpc_answers_with_an_error():
+    msgs = [json.loads(ln) for ln in _one_list_call("not_jsonrpc")]
+    assert len(msgs) == 1 and "not a JSON-RPC message" in msgs[0]["error"]["message"]
+
+
+def test_bom_prefixed_body_is_forwarded():
+    msgs = [json.loads(ln) for ln in _one_list_call("bom")]
+    assert msgs == [{"jsonrpc": "2.0", "id": 3, "result": _TOOLS}]
+
+
+def test_lexers_handle_escapes_and_nesting():
+    from terse.transport import _compact_json_text, _split_top_level_array
+    text = '[ {"a": [1, 2]},\n {"b": "\\"] , {x"} ]'
+    compact = _compact_json_text(text)
+    assert compact == '[{"a":[1,2]},{"b":"\\"] , {x"}]'
+    assert _split_top_level_array(compact) == ['{"a":[1,2]}', '{"b":"\\"] , {x"}']
+
+
+def test_compaction_is_linear_on_a_truncated_string_full_of_escaped_quotes():
+    import time as _time
+
+    from terse.transport import _compact_json_text
+    text = '\n{"a":"' + '\\"' * 200_000      # cut off mid-string
+    start = _time.monotonic()
+    assert _compact_json_text(text) == text.lstrip("\n")
+    assert _time.monotonic() - start < 2.0

@@ -14,6 +14,18 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Fixed
+- An HTTP downstream's response reached the client unframed. A pretty-printed JSON body,
+  or an SSE event whose `data:` spanned several lines, was written to the client's stdio
+  stream as several lines of non-JSON, and the request hung. An HTML 200 (a captive portal
+  or login page) was forwarded as junk, and a batch array went out unsplit. Each body is
+  now compacted by removing whitespace outside strings, lexically, so no number or
+  duplicate key is rewritten. A batch is split into its messages, and a body that is not
+  JSON-RPC answers the request with an error that does not echo the body. In an SSE
+  stream, blank priming events and non-JSON keepalives are skipped, and the request gets
+  an error only if the stream carried no message. A 4xx/5xx JSON-RPC error carrying
+  `"id": null` (a server's reply to an expired session) is now answered under the
+  request's own id instead of matching nothing. This applies to
+  `terse proxy` and to multiproxy HTTP peers.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,
