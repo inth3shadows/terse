@@ -34,8 +34,9 @@ from .report import (
     arm_gap,
     attrition,
     attrition_block,
+    gate_word,
     is_diff_run,
-    passes_tolerance,
+    row_verdict,
     savings_totals,
     unmeasured_cause,
 )
@@ -313,11 +314,15 @@ def forest_plot(rows: list[dict[str, Any]], form_label: str, control_label: str)
                        f'stroke="var(--surface-1)" stroke-width="2">'
                        f'<title>{_esc(r["model"])} — {key}: {acc:.0%} ±{ci * 100:.0f}pt</title>'
                        f'</circle>')
+        word = r.get("verdict") or ("PASS" if r["passed"] else "FAIL")
         out.append(f'<text x="{label_w + plot_w + 10}" y="{y + 10}" '
-                    f'class="value-label" fill="var(--{"good" if r["passed"] else "critical"})">'
-                    f'{"PASS" if r["passed"] else "FAIL"}</text>')
+                    f'class="value-label" fill="var(--{_VERDICT_TONE.get(word, "critical")})">'
+                    f'{word}</text>')
     out.append("</svg>")
     return "".join(out)
+
+
+_VERDICT_TONE = {"PASS": "good", "INCONCLUSIVE": "warn", "FAIL": "critical"}
 
 
 def _shas(rows: list[dict[str, Any]]) -> str:
@@ -531,20 +536,23 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
         if g.excluded:
             excluded[model] = g.excluded
             continue
-        gap_rows[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
+        gap_rows[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se, g.gap_se)
 
     worst = _worst_case_gap(gap_rows)
-    for model, (facc, fse, cacc, cse) in gap_rows.items():
-        gap = facc - cacc
-        # `_GAP_TOLERANCE`, not a second hardcoded 0.05 that has to be remembered.
-        passed = passes_tolerance(gap)
+    for model, row in gap_rows.items():
+        facc, fse, cacc, cse, *_ = row
+        # The verdict's own rule, not a second point-estimate copy (#582).
+        word = row_verdict(row)
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
-                           "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
+                           "control_acc": cacc, "control_ci": _ci(cse),
+                           "passed": word == "PASS", "verdict": word})
 
     verdict_html = ""
     if worst:
-        cls = "good" if worst.passed else "critical"
-        verdict_html = (f'<div class="banner {cls}">{"✓ PASS" if worst.passed else "✕ FAIL"} — '
+        word = gate_word(worst, withheld=any(r != "not a diff run" for r in excluded.values()))
+        cls = {"PASS": "good", "INCONCLUSIVE": "warn"}.get(word, "critical")
+        mark = {"PASS": "✓", "INCONCLUSIVE": "?"}.get(word, "✕")
+        verdict_html = (f'<div class="banner {cls}">{mark} {word} — '
                         f'worst-case model <code>{_esc(worst.model)}</code>: {form_label} '
                         f'{worst.form_acc:.0%} vs {control_label} {worst.control_acc:.0%} '
                         f'(gap {worst.gap:+.0%} ±{worst.gap_ci * 100:.0f}pt)</div>')

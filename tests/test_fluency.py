@@ -362,21 +362,23 @@ def _rows(raw, terse, primer, n=20, transform="table"):
 
 def test_verdict_passes_at_exactly_tolerance_boundary():
     from terse.report import build_fluency_report
-    # raw 100%, best terse-form 95% -> gap exactly -5% must be PASS (not a float FAIL)
+    # raw 100%, best terse-form 95% -> gap exactly -5% must not be a float FAIL. Its
+    # interval reaches past the line, so since #582 it is INCONCLUSIVE rather than PASS.
     report = build_fluency_report({"m": _rows(20, 19, 19)}, [])
     verdict = report.split("## Verdict", 1)[1]
-    assert "PASS" in verdict and "FAIL" not in verdict
+    assert "FAIL" not in verdict and "**INCONCLUSIVE**" in verdict
 
 
 def test_verdict_excludes_models_that_fail_the_raw_control():
     from terse.report import build_fluency_report
     # a model at 0% on raw is a backend error, not comprehension — excluded from the
-    # gate, and the good model still drives a PASS
+    # gate. It is never scored as a FAIL; since #582 its absence blocks a PASS.
     results = {"broken": _rows(0, 0, 0), "good": _rows(20, 20, 20)}
     report = build_fluency_report(results, [])
     verdict = report.split("## Verdict", 1)[1]
     assert "Excluded" in verdict and "`broken`" in verdict
-    assert "PASS" in verdict
+    assert "**INCONCLUSIVE**" in verdict and "FAIL" not in verdict
+    assert "measure the excluded model(s)" in verdict
 
 
 DIFF_PREV = [{"id": i, "status": "active-long-status-string-value", "score": i} for i in range(8)]
@@ -429,7 +431,7 @@ def test_diff_gap_rows_matches_build_diff_report_verdict():
     rows = [{"tool": "t", "sha": "s", "qid": f"q{i}", "qtype": "count", "transform": "table",
              "trials": 1, "terse_ok": 1, "diff_ok": 1 if i < 20 else 0} for i in range(25)]
     gap_rows, excluded = diff_gap_rows({"m": rows})
-    facc, _, cacc, _ = gap_rows["m"]
+    facc, _, cacc, *_ = gap_rows["m"]
     assert facc == 0.8 and cacc == 1.0
     # Rows predating the failure counters carry no `fails`/`attempts`, so the #264 gate
     # must treat them as measured — otherwise every stored result file goes dark.
@@ -445,7 +447,7 @@ def test_fluency_gap_rows_best_of_terse_or_primer_vs_raw():
     from terse.report import fluency_gap_rows
     # raw 100%, terse 95%, primer 100% -> best form is primer (100%), gap 0
     gap_rows, broken = fluency_gap_rows({"m": _rows(20, 19, 20)})
-    facc, _, cacc, _ = gap_rows["m"]
+    facc, _, cacc, *_ = gap_rows["m"]
     assert facc == 1.0 and cacc == 1.0
     assert broken == {}
 

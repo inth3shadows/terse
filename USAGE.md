@@ -1205,9 +1205,13 @@ TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \
 
 The report shows accuracy per model for raw vs compressed vs compressed-with-a-one-time
 format note ("primer"), flags which transform (if any) costs comprehension, and gives a
-PASS/FAIL gated on the *worst* model. A model that scores 0% on raw JSON is a setup
-error (wrong model id, no key) and is excluded from the verdict, not counted as a
-comprehension failure. `--trials N` repeats each question N times and reports each
+PASS / INCONCLUSIVE / FAIL gated on the *worst* model. PASS needs the gap's 95%
+interval (the paired, question-clustered SE of the per-question difference) to clear the
+5% tolerance, not just its point estimate; a point inside the line whose interval reaches
+past it is INCONCLUSIVE. A model that scores 0% on raw JSON is a setup error (wrong
+model id, no key) and is excluded from the verdict, not counted as a comprehension
+failure, but any excluded model turns a would-be PASS into INCONCLUSIVE: the tested set
+was only partly measured. `--trials N` repeats each question N times and reports each
 accuracy with a question-clustered `±` 95% bound — more questions tighten it without
 limit, more trials only down to a between-question floor they can't cross, so treat a
 wide `±` as "not yet tightly measured," not as "run more trials."

@@ -91,6 +91,42 @@ def _ci(se: float) -> float:
     return 1.96 * se
 
 
+def _paired_gap_se(rows: list[dict[str, Any]], form: str, control: str) -> float | None:
+    """Cluster-robust SE of `acc(form) - acc(control)` over questions BOTH arms scored,
+    clustering on the question (#582).
+
+    The two arms answer the same questions, so their errors are correlated: a hard
+    question is hard for both. Combining the arms' own SEs as if independent,
+    `sqrt(se_f² + se_c²)`, overstates the gap's noise in exactly that normal case: two
+    identical arms at 50% over 24 questions printed ±28 pts. This is the sandwich SE of
+    the difference of the two ratio estimators, `sqrt(n/(n-1) · Σ dᵢ²)`, with
+    `dᵢ = (kfᵢ − acc_f·tfᵢ)/Σtf − (kcᵢ − acc_c·tcᵢ)/Σtc`, which is 0 for identical arms.
+    None below two shared questions, where a between-question spread cannot be estimated
+    (the caller then falls back to the independent bound)."""
+    # Every row EITHER arm scored, exactly the rows `_form_stats` counts for each, so the
+    # SE covers the same questions as the two accuracies it is the SE of. A row only one
+    # arm scored contributes a zero term for the other (review of #582).
+    pairs = []
+    for r in rows:
+        tf, tc = _arm_trials(r, form), _arm_trials(r, control)
+        if tf > 0 or tc > 0:
+            pairs.append((int(r[form]) if tf > 0 else 0, tf,
+                          int(r[control]) if tc > 0 else 0, tc))
+    n = len(pairs)
+    sum_tf = sum(p[1] for p in pairs)
+    sum_tc = sum(p[3] for p in pairs)
+    # Each ARM needs two scored rows, `_form_stats`' own n<2 rule: an arm scored on one
+    # row has a residual of exactly 0 there, so it would add no noise at all and a
+    # one-question control could publish `±0 pts PASS` (review of #582).
+    if n < 2 or sum(1 for p in pairs if p[1]) < 2 or sum(1 for p in pairs if p[3]) < 2:
+        return None
+    acc_f = sum(p[0] for p in pairs) / sum_tf
+    acc_c = sum(p[2] for p in pairs) / sum_tc
+    d_sq = sum(((kf - acc_f * tf) / sum_tf - (kc - acc_c * tc) / sum_tc) ** 2
+               for kf, tf, kc, tc in pairs)
+    return math.sqrt(n / (n - 1) * d_sq)
+
+
 
 
 def _arm_attempts(r: dict[str, Any], trials_key: str, default: int) -> int:
@@ -944,6 +980,10 @@ class ArmGap(NamedTuple):
     # absent here: they are complete on every row by construction, so `len(rows)` is their
     # count and a second copy could only disagree. Same read-only proxy, same reason.
     display_n: Mapping[str, int] = MappingProxyType({})
+    # Paired SE of `form_acc - control_acc` (`_paired_gap_se`), for the winning form arm.
+    # None when it could not be estimated; `_worst_case_gap` then falls back to combining
+    # the arms' SEs as if independent.
+    gap_se: float | None = None
 
 
 # How many PAIRED questions a PASS needs before "no regression observed" means anything
@@ -1073,7 +1113,9 @@ def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
     # than tolerance publishes at any question count.
     if len(pr) < floor and passes_tolerance(best[0] - cacc):
         return ArmGap(0.0, 0.0, 0.0, 0.0, [], "underpowered")
-    return ArmGap(best[0], best[1], cacc, cse, pr, None, arms, dn)
+    best_name = max(gating, key=lambda f: arms[f][0])
+    return ArmGap(best[0], best[1], cacc, cse, pr, None, arms, dn,
+                  _paired_gap_se(pr, best_name, control))
 
 
 def arm_gap(rows: list[dict[str, Any]], form: str, control: str, *,
@@ -2300,6 +2342,10 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
     return "\n".join(out)
 
 
+# (form_acc, form_se, control_acc, control_se[, paired gap SE or None]).
+GapRow = tuple[float, ...] | tuple[float, float, float, float, float | None]
+
+
 class GapVerdict(NamedTuple):
     model: str
     gap: float
@@ -2307,22 +2353,46 @@ class GapVerdict(NamedTuple):
     control_acc: float
     gap_ci: float
     passed: bool
+    # The point estimate clears the tolerance but the interval's lower bound does not:
+    # the run cannot tell "no harm" from "harm beyond tolerance" (#582). Never also
+    # `passed`. Defaulted so every existing construction stays valid.
+    inconclusive: bool = False
+
+
+def row_verdict(row: GapRow, tol: float | None = None) -> str:
+    """PASS / INCONCLUSIVE / FAIL for ONE model's gap row, by the same rule as the
+    verdict, so a chart's per-model badge can never contradict the headline above it."""
+    v = _worst_case_gap({"": row}) if tol is None else _worst_case_gap({"": row}, tol)
+    return "FAIL" if v is None else gate_word(v)
+
+
+def gate_word(verdict: GapVerdict, withheld: bool = False) -> str:
+    """PASS / FAIL / INCONCLUSIVE for a gap verdict. A withheld model blocks PASS: the
+    tested set did not all pass, it was only partly measured (as dropeval does, #344)."""
+    if not verdict.passed and not verdict.inconclusive:
+        return "FAIL"
+    return "INCONCLUSIVE" if verdict.inconclusive or withheld else "PASS"
 
 
 def _worst_case_gap(
-    rows: dict[str, tuple[float, float, float, float]], tol: float = _GAP_TOLERANCE
+    rows: Mapping[str, GapRow], tol: float = _GAP_TOLERANCE
 ) -> GapVerdict | None:
     """Shared verdict-gating math for both fluency-style reports — principle #24, gate on
     the worst model, never the mean. `rows` maps model to a 4-tuple of form_acc, form_se,
     control_acc, control_se. Returns the model with the lowest gap as a GapVerdict, or
     None if `rows` is empty. gap = form_acc minus control_acc; gap_ci is the 95%
     half-width of the independence-combined question-clustered (sandwich) SE of the two
-    arms; passed iff gap is at least -tol, inclusive of the boundary. Callers access
+    arms; passed iff every model's gap AND the lower end of its interval (gap - gap_ci)
+    are at least -tol, inclusive of the boundary; `inconclusive` when every gap clears
+    but some interval does not (that model is then the one returned). Callers access
     fields by name, e.g. verdict.form_acc, never by position, so a future field reorder
     can't silently swap values."""
+    lowest = None  # same shape: the model whose interval's LOWER bound is lowest
     worst = None  # (model, gap, facc, cacc, gap_ci) — cheapest to track positionally here;
-    for model, (facc, fse, cacc, cse) in rows.items():  # this is a private local, not the
-        gap = facc - cacc                               # public interface callers rely on.
+    for model, row in rows.items():   # `worst` is a private local, not the public interface
+        facc, fse, cacc, cse = row[:4]
+        paired_se = row[4] if len(row) > 4 else None
+        gap = facc - cacc
         # sqrt(fse^2+cse^2) assumes the two arms' SEs are independent, which overstates
         # the true paired-on-question variance FOR ANY PAIR OF ARMS THAT ARE POSITIVELY
         # CORRELATED — the normal case, since question difficulty is shared across arms.
@@ -2343,24 +2413,42 @@ def _worst_case_gap(
         # a formality. A tighter, correct fix is a paired cluster-robust SE on the
         # per-question DIFFERENCE rather than combining two independent arm SEs; tracked
         # as a follow-up rather than folded into #297's scope.
-        gap_ci = _ci(math.sqrt(fse ** 2 + cse ** 2))
+        # The PAIRED SE when the row carries one (#582); else the independence bound.
+        gap_ci = _ci(paired_se if paired_se is not None else math.sqrt(fse ** 2 + cse ** 2))
         if worst is None or gap < worst[1]:
             worst = (model, gap, facc, cacc, gap_ci)
-    if worst is None:
+        if lowest is None or gap - gap_ci < lowest[1] - lowest[4]:
+            lowest = (model, gap, facc, cacc, gap_ci)
+    if worst is None or lowest is None:
         return None
     model, gap, facc, cacc, gap_ci = worst
-    passed = passes_tolerance(gap, tol)
-    return GapVerdict(model, gap, facc, cacc, gap_ci, passed)
+    if not passes_tolerance(gap, tol):
+        return GapVerdict(model, gap, facc, cacc, gap_ci, False)
+    # Every point estimate clears the tolerance. PASS also needs every model's interval
+    # to clear it (#582): 19/20 vs 20/20 used to print PASS at "-5% ±10 pts", a verdict
+    # the run's own interval could not support. The model reported is the one whose lower
+    # bound reaches furthest, which need not be the lowest point estimate.
+    model, gap, facc, cacc, gap_ci = lowest
+    if passes_tolerance(gap - gap_ci, tol):
+        return GapVerdict(*worst, True)
+    return GapVerdict(model, gap, facc, cacc, gap_ci, False, inconclusive=True)
 
 
-def _format_worst_case_line(verdict: GapVerdict, tol: float, form_label: str, control_label: str) -> str:
-    return (f"- Worst-case model `{verdict.model}`: {form_label} {verdict.form_acc:.0%} vs "
+def _format_worst_case_line(verdict: GapVerdict, tol: float, form_label: str,
+                            control_label: str, withheld: bool = False) -> str:
+    word = gate_word(verdict, withheld)
+    line = (f"- Worst-case model `{verdict.model}`: {form_label} {verdict.form_acc:.0%} vs "
             f"{control_label} {verdict.control_acc:.0%} (gap {verdict.gap:+.0%} "
-            f"±{verdict.gap_ci * 100:.0f} pts). **{'PASS' if verdict.passed else 'FAIL'}** "
-            f"at {tol:.0%} tolerance.")
+            f"±{verdict.gap_ci * 100:.0f} pts). **{word}** at {tol:.0%} tolerance.")
+    if verdict.inconclusive:
+        line += (f" The interval reaches {verdict.gap - verdict.gap_ci:+.0%}, past "
+                 f"-{tol:.0%}: too few questions to rule out a regression.")
+    elif verdict.passed and withheld:
+        line += " Measured models only: a model was withheld from the gate (named above)."
+    return line
 
 
-def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, float]],
+def diff_gap_rows(results: dict) -> tuple[dict[str, GapRow],
                                           dict[str, ExclusionReason | None]]:
     """(form=diff_ok, control=terse_ok) gap-row tuples per model — the same shape
     `_worst_case_gap` and the bar-chart renderers (html/terminal) consume, computed
@@ -2373,7 +2461,7 @@ def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, f
     the markdown while the forest plot printed directly beneath it still drew a FAIL bar
     off the same rows. `cli` prints both together for all three diff paths (`--diff`,
     `--diff-soak`, `--text-diff-eval`), and the chart is what a reader sees first."""
-    out: dict[str, tuple[float, float, float, float]] = {}
+    out: dict[str, GapRow] = {}
     excluded: dict[str, ExclusionReason | None] = {}
     for model, rows in results.items():
         if not rows:
@@ -2384,11 +2472,11 @@ def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, f
             # exclusion as "calls went unanswered", which is false for an `unpaired` model.
             excluded[model] = g.excluded
             continue
-        out[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
+        out[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se, g.gap_se)
     return out, excluded
 
 
-def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, float]],
+def fluency_gap_rows(results: dict) -> tuple[dict[str, GapRow],
                                              dict[str, ExclusionReason | None]]:
     """(form=best of terse/primer, control=raw) gap-row tuples per model, for the bar-
     chart renderers. Excludes any model whose raw control failed (0% — a backend/config
@@ -2401,7 +2489,7 @@ def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float
     the chart immediately below plotted its depressed gap as a red FAIL bar — the exact
     false verdict #263 exists to kill, surviving in the renderer the reader looks at
     first."""
-    out: dict[str, tuple[float, float, float, float]] = {}
+    out: dict[str, GapRow] = {}
     broken: dict[str, ExclusionReason | None] = {}
     for model, rows in results.items():
         if not rows:
@@ -2410,7 +2498,7 @@ def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float
         if g.excluded:
             broken[model] = g.excluded
             continue
-        out[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
+        out[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se, g.gap_se)
     return out, broken
 
 
@@ -2534,7 +2622,7 @@ def _accuracy_gate(rows: list[dict[str, Any]]) -> ArmGap:
     return g
 
 
-def dropeval_gap_rows(results: dict) -> tuple[dict[str, dict[Metric, tuple[float, float, float, float]]],
+def dropeval_gap_rows(results: dict) -> tuple[dict[str, dict[Metric, GapRow]],
                                               dict[str, ExclusionReason]]:
     """(gap_rows, accuracy_excluded) — the `diff_gap_rows`/`fluency_gap_rows` shape, now a
     projection of `dropeval_verdict` rather than a second copy of its math.
@@ -2756,7 +2844,7 @@ class DropevalVerdict(NamedTuple):
     # model -> metric -> (form_acc, form_se, control_acc, control_se), for the table and
     # the forest plots. "accuracy" is ABSENT rather than zeroed for a withheld model, so a
     # renderer that iterates what it finds cannot draw a bar for a gap nobody measured.
-    gates: dict[str, dict[Metric, tuple[float, float, float, float]]]
+    gates: dict[str, dict[Metric, GapRow]]
     # Transport failure past the INCONCLUSIVE threshold. Non-empty means the run measures
     # the harness, not the model, and no behavioral claim survives.
     inconclusive: dict[str, tuple[int, int]]
@@ -2774,7 +2862,7 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
     over a small input space can be swept EXHAUSTIVELY in seconds — which is how
     `tests/test_dropeval_monotonicity.py` covers a cross product that 29 hand-written
     examples left a hole in, and how the same sweep can be a gate rather than a review."""
-    gates: dict[str, dict[Metric, tuple[float, float, float, float]]] = {}
+    gates: dict[str, dict[Metric, GapRow]] = {}
     excluded_by_metric: dict[Metric, dict[str, ExclusionReason]] = {
         m: {} for m, _, _ in DROPEVAL_METRICS}
     thin_by_metric: dict[Metric, dict[str, int]] = {m: {} for m, _, _ in DROPEVAL_METRICS}
@@ -2886,7 +2974,7 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
         if g.excluded:
             excluded_by_metric["accuracy"][model] = g.excluded
         else:
-            gates[model]["accuracy"] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
+            gates[model]["accuracy"] = (g.form_acc, g.form_se, g.control_acc, g.control_se, g.gap_se)
 
     inconclusive = inconclusive_models(results)
     degraded_accepted: dict[str, tuple[int, int]] = {}
@@ -2909,7 +2997,8 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
         # FAILS, `worst` contributes BLOCK and outranks every one of these.
         outcomes += [Directive.INSUFFICIENT] * len(thin)
         if worst is not None:
-            outcomes.append(Directive.SHIP if worst.passed else Directive.BLOCK)
+            outcomes.append(Directive.SHIP if worst.passed else
+                            Directive.INSUFFICIENT if worst.inconclusive else Directive.BLOCK)
         # `default` fires for an empty fleet — no model scored, none withheld, nothing
         # known. It must not be SHIP, and it is the one place in this function where that
         # is a choice rather than a consequence, so
@@ -3669,7 +3758,7 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         f"| Model | q | {control_label} | diff | regressions |",
         "|---|---|---|---|---|",
     ]
-    gap_rows: dict[str, tuple[float, float, float, float]] = {}
+    gap_rows: dict[str, GapRow] = {}
     unmeasured: dict[str, tuple[ExclusionReason | None, int, int, int]] = {}  # (why, fails, attempts, paired)
     for model, rows in results.items():
         n = len(rows)
@@ -3701,7 +3790,7 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         # issue named only the fluency one.
         regr = sum(1 for r in g.rows
                    if _arm_full(r, "terse_ok") and not _arm_full(r, "diff_ok"))
-        gap_rows[model] = (dacc, dse, facc, fse)  # form=diff, control=control_label
+        gap_rows[model] = (dacc, dse, facc, fse, g.gap_se)  # form=diff, control=control_label
         # `len(g.rows)`, not `len(rows)`: every accuracy on this line is computed over the
         # PAIRED subset, so printing the full question count beside them states a
         # denominator the numbers do not use. `q` is the exam that was actually sat.
@@ -3721,10 +3810,16 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
     out += ["## Verdict", ""]
     worst = _worst_case_gap(gap_rows)
     if worst:
-        out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "diff-form", control_label))
-        if worst.passed:
+        out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "diff-form", control_label,
+                                           withheld=bool(unmeasured)))
+        if worst.passed and not unmeasured:
             out.append("- Reading the diff costs no comprehension beyond tolerance — safe to "
                        "enable `proxy --diff` for the tested models.")
+        elif worst.passed or worst.inconclusive:
+            out.append("- Not concluded — do not enable `proxy --diff` on this run: "
+                       + ("re-run with more questions to tighten the interval."
+                          if worst.inconclusive else
+                          "measure the withheld model(s) first."))
         else:
             out.append("- The diff form regresses comprehension beyond tolerance — keep "
                        "`proxy --diff` off, or restrict it to tools whose diffs stay legible.")
@@ -3953,7 +4048,7 @@ def build_diff_soak_report(results: dict) -> str:
                 tail += unmeasured_cause(slice_fails)
             out += [lead + at + tail, ""]
 
-    gap_rows: dict[str, tuple[float, float, float, float]] = {}
+    gap_rows: dict[str, GapRow] = {}
     pooled_out: dict[str, ExclusionReason | None] = {}
     for model, rows in results.items():
         if not rows or model in unmeasured:
@@ -3966,7 +4061,7 @@ def build_diff_soak_report(results: dict) -> str:
             # exclusions and this one did not.
             pooled_out[model] = g.excluded
             continue
-        gap_rows[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
+        gap_rows[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se, g.gap_se)
     if pooled_out:
         # "the pooled verdict", precisely: a model withheld here may still appear in the
         # by-depth table and in the deepest-depth line, because those are scored per depth
@@ -4005,9 +4100,10 @@ def build_diff_soak_report(results: dict) -> str:
                    "above name each model, its reason, and the remedy that reason "
                    "licenses — see the note on the sibling line in `build_diff_report` for "
                    "why they are not re-listed here.")
+    soak_withheld = bool(unmeasured or pooled_out)
     if worst:
         out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "chain-form",
-                                           "full-terse"))
+                                           "full-terse", withheld=soak_withheld))
     # DELIBERATELY NOT nested under `if worst:`. This block's own comments below insist it
     # is independent of the POOLED exclusion — and it was not: being inside that branch
     # meant a withheld pooled gap skipped the deepest-depth analysis entirely. #334 made
@@ -4041,7 +4137,7 @@ def build_diff_soak_report(results: dict) -> str:
             dg = arm_gap(rs, *DIFF_ARMS)
             if dg.excluded:
                 continue
-            deep_gaps[m] = (dg.form_acc, dg.form_se, dg.control_acc, dg.control_se)
+            deep_gaps[m] = (dg.form_acc, dg.form_se, dg.control_acc, dg.control_se, dg.gap_se)
         deepest = _worst_case_gap(deep_gaps)
         # The deepest slice can now be WITHHELD while the overall gap still publishes —
         # the per-depth gate above is per-slice, so a depth-5 arm that lost its hard
@@ -4051,12 +4147,16 @@ def build_diff_soak_report(results: dict) -> str:
         # harmless now: it printed "No depth-correlated comprehension drift" about the one
         # depth nobody scored. Absence of a measurement is not a passing measurement.
         deep_withheld = bool(deep_rows) and not deep_gaps
+        # A model whose OWN deepest slice was withheld, while others scored: the deepest
+        # verdict covers only part of the tested set, which blocks a PASS like any other
+        # withheld model (#582).
+        deep_partial = bool(deep_gaps) and bool(set(deep_rows) - set(deep_gaps))
         if deepest:
             out.append(f"- At the deepest tested depth ({deep}): worst model "
                        f"`{deepest.model}` chain {deepest.form_acc:.0%} vs full "
                        f"{deepest.control_acc:.0%} (gap {deepest.gap:+.0%} "
                        f"±{deepest.gap_ci * 100:.0f} pts). "
-                       f"**{'PASS' if deepest.passed else 'FAIL'}** at "
+                       f"**{gate_word(deepest, soak_withheld or deep_partial)}** at "
                        f"{_GAP_TOLERANCE:.0%} tolerance.")
         elif deep_withheld:
             out.append(f"- **NO VERDICT at the deepest tested depth ({deep})** — every "
@@ -4066,12 +4166,25 @@ def build_diff_soak_report(results: dict) -> str:
                           f"says nothing about drift at {deep}." if worst else
                           " The pooled gap was withheld too, so this run has no verdict at "
                           "any depth."))
-        if worst and worst.passed and not deep_withheld and (
-                deepest is None or deepest.passed):
+        # Three outcomes, decided once so no two lines can disagree (#582):
+        #   failed        — a scored gap (pooled or deepest) is past tolerance;
+        #   not concluded — nothing failed, but an interval reaches past the line or a
+        #                   model was withheld from the pooled gate;
+        #   no drift      — everything scored passed, interval included.
+        scored = [v for v in (worst, deepest) if v is not None]
+        failed = any(not v.passed and not v.inconclusive for v in scored)
+        inconclusive = any(v.inconclusive for v in scored)
+        if scored and not failed and not inconclusive and not soak_withheld \
+                and not deep_withheld and not deep_partial:
             out.append("- No depth-correlated comprehension drift within tolerance — "
                        "chained diffs up to the tested depth read as well as fulls.")
-        elif not deep_withheld and (worst or deepest):
-            # `worst or deepest` is the guard un-nesting this block made necessary: with
+        elif scored and not failed and not deep_withheld:
+            out.append("- Not concluded — this run does not identify a safe keyframe "
+                       "interval: " + ("an interval reaches past tolerance; re-run with "
+                                       "more questions." if inconclusive else
+                                       "measure the withheld model(s) first."))
+        elif failed and not deep_withheld:
+            # `failed` implies something was scored; the old `worst or deepest` guard un-nesting this block made necessary: with
             # neither, NOTHING was scored, and "comprehension drifts beyond tolerance" is a
             # finding rather than the absence of one. The NO VERDICT line above already
             # said what happened; a conclusion here would contradict it.
@@ -4296,7 +4409,7 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
             acc_cell = "not gated"
             ctl_cell = "not run" if reason == "no control arm" else REASON_LABEL[reason]
         else:
-            aacc, ase, cacc, _ = scored
+            aacc, ase, cacc, *_ = scored
             acc_cell = f"{aacc:.0%} ±{_ci(ase) * 100:.0f}"
             ctl_cell = f"{cacc:.0%}"
         out.append(f"| `{model}` | {len(recall_rows)} | {cells['recall']} "
@@ -4624,7 +4737,8 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
                           # prints this, so that read was a dead constant 0 — which reads
                           # as "nothing paired at all", the OTHER reason.
                           "paired": len(paired_rows(rows, "terse_ok", "primer_ok", "raw_ok")),
-                          "gap_form": g.form_acc, "gap_form_se": g.form_se}
+                          "gap_form": g.form_acc, "gap_form_se": g.form_se,
+                          "gap_se": g.gap_se if g.gap_se is not None else math.nan}
         if has_inline:
             summary[model].update({"inline": iacc, "inline_se": ise})
         # The inline arm's own q, stated in the cell WHENEVER it is smaller than the row's
@@ -4739,39 +4853,38 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
     # Straight from `best_arm_gap`, which already picked the best arm over the paired
     # subset. This used to re-derive the best-of math here, a second copy of
     # `fluency_gap_rows`' body that could (and did) drift from it.
-    gap_rows = {m: (s["gap_form"], s["gap_form_se"], s["raw"], s["raw_se"])
+    gap_rows = {m: (s["gap_form"], s["gap_form_se"], s["raw"], s["raw_se"],
+                    None if math.isnan(s["gap_se"]) else s["gap_se"])
                 for m, s in gated.items()}
     worst = _worst_case_gap(gap_rows)
     if worst:
         helps = sum(1 for s in gated.values() if s["primer"] > s["terse"] + 1e-9)
-        out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "best terse-form", "raw"))
-        # `gap_ci` combines the two arms' SEs as if independent (√(fse²+cse²)), which
-        # overstates the true variance of a PAIRED gap whenever the arms are positively
-        # correlated (the normal case — question difficulty is shared) — before #297 that
-        # didn't matter because both SEs were ~0 by default, but the cluster-robust SE is
-        # routinely several points wide, and this bound is wide enough in practice to call
-        # a genuine regression "noise" (the correct paired CI on the same data can be
-        # several times tighter and not cross the gap at all). A bound that is only ever
-        # an OVER-estimate cannot support a "not distinguishable" conclusion on EITHER
-        # side of the tolerance line, so neither branch below claims one — only that the
-        # gap is smaller than a loose ceiling on its own noise. (A proper paired
-        # cluster-robust SE on the per-question difference would let this section make a
-        # real significance claim — tracked as a follow-up, not folded into #297's scope.)
-        if worst.gap_ci > 1e-9 and abs(worst.gap) < worst.gap_ci:
+        fluency_withheld = bool(unmeasured_models or underpowered_models or broken)
+        out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "best terse-form", "raw",
+                                           withheld=fluency_withheld))
+        # `gap_ci` is the paired, question-clustered interval of the gap (#582), so the
+        # verdict line above already says whether the run can tell "within tolerance"
+        # from "beyond it". The note below adds one thing only, for a PASS: the margin
+        # is real but not yet tight. On INCONCLUSIVE or FAIL the verdict line says it all.
+        if (worst.passed and not fluency_withheld and worst.gap_ci > 1e-9
+                and abs(worst.gap) < worst.gap_ci):
             # More questions tighten this bound without limit; more trials also tighten
             # it, but only down to a between-question floor they can't cross (they
-            # resample k, not the question set) — so this is neither "raise `--trials`"
-            # (#297's own estimator makes that false as the SOLE lever) nor "trials never
-            # help" (also false).
-            verdict_word = "This passing gap" if worst.passed else "Note: this gap"
-            out.append(f"- {verdict_word} is smaller than a (loose, conservative) "
-                       "upper-bound estimate of its own noise floor — treat the verdict "
-                       "above as real, not yet as a tightly measured margin; more "
-                       "questions would tighten this bound further than more trials would.")
+            # resample k, not the question set).
+            out.append("- This passing gap is smaller than its own 95% interval — treat "
+                       "the verdict above as real, not yet as a tightly measured margin; "
+                       "more questions would tighten this bound further than more trials "
+                       "would.")
         out.append(f"- The primer improves terse-form accuracy for {helps}/{len(gated)} model(s).")
-        if worst.passed:
+        if worst.passed and not fluency_withheld:
             out.append("- terse's compressed form preserves comprehension within tolerance — "
                        "the proxy's in-place rewrite holds for the tested models.")
+        elif worst.passed or worst.inconclusive:
+            out.append("- Not concluded — " + ("the interval reaches past tolerance; re-run "
+                                               "with more questions before shipping."
+                                               if worst.inconclusive else
+                                               "measure the excluded model(s) before "
+                                               "shipping."))
         else:
             out.append("- Comprehension regresses beyond tolerance — the proxy's in-place rewrite "
                        "is not safe to ship as-is for the worst model; prefer the primer or restrict "

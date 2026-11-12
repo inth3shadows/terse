@@ -128,7 +128,9 @@ def test_a_partially_failing_model_cannot_force_a_regression_verdict():
     # The healthy model is measured and holds, so the run must PASS. With `flaky` gated,
     # its 0% terse against 100% raw is a -100pt worst-case gap and this reads FAIL.
     assert "regresses beyond tolerance" not in verdict
-    assert "preserves comprehension" in verdict
+    # Since #582 a withheld model blocks the PASS rather than being ignored.
+    assert "preserves comprehension" not in verdict
+    assert "measure the excluded model(s)" in verdict
 
 
 def test_a_run_where_every_model_failed_states_a_NON_verdict_rather_than_staying_silent():
@@ -527,6 +529,20 @@ def _payload_rows(*, degraded: bool):
                  trials=2, fails=2, attempts=8) for _ in range(20)]
 
 
+_WITHHELD_NOTE = " Measured models only: a model was withheld from the gate (named above)."
+# The conclusion lines a PASS prints, and the ones a withheld-blocked PASS prints instead.
+_CONCLUSION_LINE = re.compile(
+    r"^- (Reading the diff costs no comprehension|terse's compressed form preserves"
+    r"|No depth-correlated comprehension drift|Not concluded — ).*$", re.M)
+
+
+def _undo_withheld_block(text: str) -> str:
+    """`text` with the PASS -> INCONCLUSIVE move a withheld model makes (#582) undone."""
+    text = text.replace(_WITHHELD_NOTE, "").replace("INCONCLUSIVE", "PASS")
+    text = text.replace('class="banner warn">? PASS', 'class="banner good">✓ PASS')
+    return _CONCLUSION_LINE.sub("- <conclusion>", text)
+
+
 def test_an_unmeasured_model_changes_no_renderers_verdict():
     """THE rule. Adding a backend that never answered must not move any verdict, in any
     renderer, in either direction.
@@ -589,10 +605,17 @@ def test_an_unmeasured_model_changes_no_renderers_verdict():
 
     for name, baseline, with_dead in cases:
         assert baseline.strip(), f"{name}: baseline verdict is empty — this would pin nothing"
-        assert with_dead == baseline, (
+        # Since #582 the one permitted move is PASS -> INCONCLUSIVE: a withheld model means
+        # the tested set was only partly measured. Its calls must still never be SCORED,
+        # so the measured numbers stay put and no FAIL can appear.
+        # Equality after undoing exactly that move, so any OTHER change (a number, a
+        # model, an interval moved by the dead model's calls) still fails here.
+        assert _undo_withheld_block(with_dead) == _undo_withheld_block(baseline), (
             f"{name} changed its verdict because an UNMEASURED model was added — "
             f"it is scoring calls that never happened"
         )
+        if with_dead != baseline:
+            assert "PASS" in baseline and "INCONCLUSIVE" in with_dead, (name, with_dead)
 
 
 def test_the_renderers_agree_on_which_models_were_dropped():
