@@ -14,6 +14,21 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Fixed
+- A `{"critical": true}` field could still be lost through an overlapping lossy rule. The
+  denylist matched only the exact path string, so a truncate on `items` (`max: 1`) cut away
+  `items[].id` from every record past the first, a drop on `a` replaced a critical
+  `a.secret`, and `a.[].b` did not match a critical `a[].b`. Any lossy path that is an
+  ancestor of, descendant of, or equal to a critical path (compared by parsed tokens) is
+  now skipped with a warning naming the critical field.
+- A policy's `never_lossy_servers` written as a bare string (`"mybank"`) loaded as the set
+  of its characters, so no server matched and the credential-server floor was silently
+  off. `load_policy` now requires a list of strings, and `install-mcp --never-lossy` keeps a
+  hand-written bare string whole when adding to it.
+- A field's `max`/`min` that is not an integer (`"abc"`, `null`, `2.5`, `true`) or is out of
+  range (`max` < 1, `min` < 0) is now rejected at load. A non-integer used to raise on
+  every payload past the lossy stage's handler, so the tool was silently never
+  compressed, and a negative `max` sliced from the end of the value. Values that already
+  worked (`"50"`, `120.0`) still load.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,

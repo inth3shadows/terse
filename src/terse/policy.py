@@ -521,7 +521,36 @@ def _coerce_fields(raw: Any, where: str) -> dict:
     if bad:
         raise ValueError(f"{where}: 'fields' spec for {bad} must be an object "
                          f"(e.g. {{\"lossy\": \"drop-to-retrieve\"}}), not a bare value")
+    for path, spec in raw.items():
+        # `max` (truncate length) and `min` (drop size floor) reach `int()` on every
+        # payload: a value `int()` rejects raised there, past `_lossy_stage`'s
+        # PathError-only handler, so the tool was silently never compressed; a negative
+        # `max` sliced from the END. Reject exactly those here. Values `int()` already
+        # accepted losslessly (`"50"`, `120.0`) keep loading, so a policy that runs today
+        # does not start failing at load. A bool is an int in Python: excluded by name.
+        for key, floor in (("max", 1), ("min", 0)):
+            if key in spec:
+                v = spec[key]
+                try:
+                    n = int(v)
+                    ok = (not isinstance(v, bool) and n >= floor
+                          and (not isinstance(v, float) or v.is_integer()))
+                except (TypeError, ValueError, OverflowError):
+                    ok = False
+                if not ok:
+                    raise ValueError(f"{where}: field '{path}' {key!r} must be an integer "
+                                     f">= {floor}, got {v!r}")
     return raw
+
+
+def _coerce_server_list(raw: Any, where: str) -> frozenset[str]:
+    """Strict, like `capture`: `never_lossy_servers` is the credential-server floor. A
+    bare string (`"mybank"`) used to become the set of its CHARACTERS, so no server
+    matched and the floor was silently off; reject anything but a list of strings."""
+    if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+        raise ValueError(f"{where}: 'never_lossy_servers' must be a list of server names, "
+                         f"got {type(raw).__name__} {raw!r}")
+    return frozenset(raw)
 
 
 VALID_STRUCTURED = ("auto", "leave", "compress", "replace")
@@ -622,7 +651,8 @@ def load_policy(path: str | Path) -> Policy:
     return Policy(rules=rules, default_tiers=default_tiers, diff=bool(doc.get("diff", False)),
                   join_blocks=bool(doc.get("join_blocks", True)),
                   diff_keyframe_interval=int(doc.get("diff_keyframe_interval", 5)),
-                  never_lossy_servers=frozenset(doc.get("never_lossy_servers", ())))
+                  never_lossy_servers=_coerce_server_list(doc.get("never_lossy_servers", []),
+                                                          str(path)))
 
 
 @dataclass
@@ -695,8 +725,11 @@ def _lossy_warnings(rule: Rule) -> list[str]:
             out.append(f"field '{path}': lossy mode '{mode}' not implemented yet (left lossless)")
         elif mode not in LOSSY_MODES:
             out.append(f"field '{path}': unknown lossy mode '{mode}' (ignored)")
-        elif path in critical:
+        elif (shield := lossy_mod.shielding_critical(path, critical)) == path:
             out.append(f"field '{path}': marked '{mode}' AND critical — kept lossless")
+        elif shield is not None:
+            out.append(f"field '{path}': marked '{mode}' but overlaps critical field "
+                       f"'{shield}' — kept lossless")
         if "retract_after" in spec and lossy_mod.retract_after(spec) is None:
             out.append(f"field '{path}': 'retract_after' must be a positive integer, "
                        f"got {spec['retract_after']!r} (ignored)")

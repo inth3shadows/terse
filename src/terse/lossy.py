@@ -185,11 +185,42 @@ def critical_paths(rule: Any) -> set[str]:
     return {p for p, s in rule.fields.items() if isinstance(s, dict) and s.get("critical")}
 
 
+def _path_key(path: str) -> tuple[str, ...] | None:
+    """`path` as its parsed token tuple, so `a.[].b` and `a[].b` compare equal; None for a
+    text selector or an unparseable path, which can only be compared verbatim."""
+    if is_text_path(path):
+        return None
+    try:
+        return tuple(_parse_path(path))
+    except PathError:
+        return None
+
+
+def shielding_critical(path: str, crit: set[str]) -> str | None:
+    """The critical path that forbids making `path` lossy, or None.
+
+    A lossy rule must not touch a critical field directly, NOR through an ancestor (a
+    truncate on `items` cuts away `items[].id`; a drop on `a` replaces `a.secret`), NOR
+    reach inside a critical subtree (`a` critical, `a.b` truncated rewrites `a`). So any
+    two paths whose token tuples are prefix-related conflict, and critical wins."""
+    if path in crit:
+        return path
+    key = _path_key(path)
+    if key is None:
+        return None
+    for c in sorted(crit):
+        ck = _path_key(c)
+        if ck is not None and (ck[:len(key)] == key or key[:len(ck)] == ck):
+            return c
+    return None
+
+
 def _truncate_specs(rule: Any) -> list[tuple[str, dict]]:
-    """The (path, spec) entries that are truncate AND not marked critical."""
+    """The (path, spec) entries that are truncate AND overlap no critical path."""
     crit = critical_paths(rule)
     return [(p, s) for p, s in rule.fields.items()
-            if isinstance(s, dict) and s.get("lossy") == "truncate" and p not in crit]
+            if isinstance(s, dict) and s.get("lossy") == "truncate"
+            and shielding_critical(p, crit) is None]
 
 
 def unsupported_truncate_paths(obj: Any, rule: Any) -> list[str]:
@@ -314,7 +345,7 @@ def _drop_specs(rule: Any) -> list[tuple[str, dict]]:
     crit = critical_paths(rule)
     return [(p, s) for p, s in rule.fields.items()
             if isinstance(s, dict) and s.get("lossy") == "drop-to-retrieve"
-            and p not in crit and not is_text_path(p)]
+            and not is_text_path(p) and shielding_critical(p, crit) is None]
 
 
 def apply_drops(obj: Any, rule: Any, tool: str, sink: Callable[[str, Any], None],
