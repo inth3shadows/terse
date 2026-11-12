@@ -144,3 +144,19 @@ def test_overlap_is_warned():
     from terse.policy import _lossy_warnings
     rule = _rule({"items": {"lossy": "truncate", "max": 1}, "items[].id": {"critical": True}})
     assert any("overlaps critical field 'items[].id'" in w for w in _lossy_warnings(rule))
+
+
+def test_shared_string_prefix_is_not_an_ancestor():
+    rule = _rule({"items": {"lossy": "truncate", "max": 1}, "items2[].id": {"critical": True}})
+    assert [p for p, _ in lossy._truncate_specs(rule)] == ["items"]
+
+
+def test_root_list_path_shields_its_children():
+    rule = _rule({"[]": {"lossy": "truncate", "max": 1}, "[].id": {"critical": True}})
+    assert lossy._truncate_specs(rule) == []
+
+
+def test_same_path_lossy_and_critical_is_warned():
+    from terse.policy import _lossy_warnings
+    rule = _rule({"a": {"lossy": "truncate", "max": 1, "critical": True}})
+    assert "field 'a': marked 'truncate' AND critical — kept lossless" in _lossy_warnings(rule)

@@ -523,13 +523,21 @@ def _coerce_fields(raw: Any, where: str) -> dict:
                          f"(e.g. {{\"lossy\": \"drop-to-retrieve\"}}), not a bare value")
     for path, spec in raw.items():
         # `max` (truncate length) and `min` (drop size floor) reach `int()` on every
-        # payload: a string or null raised there, past `_lossy_stage`'s PathError-only
-        # handler, so the tool was silently never compressed; a negative `max` sliced from
-        # the END. A bool is an int in Python, so it is excluded by name.
+        # payload: a value `int()` rejects raised there, past `_lossy_stage`'s
+        # PathError-only handler, so the tool was silently never compressed; a negative
+        # `max` sliced from the END. Reject exactly those here. Values `int()` already
+        # accepted losslessly (`"50"`, `120.0`) keep loading, so a policy that runs today
+        # does not start failing at load. A bool is an int in Python: excluded by name.
         for key, floor in (("max", 1), ("min", 0)):
             if key in spec:
                 v = spec[key]
-                if isinstance(v, bool) or not isinstance(v, int) or v < floor:
+                try:
+                    n = int(v)
+                    ok = (not isinstance(v, bool) and n >= floor
+                          and (not isinstance(v, float) or v.is_integer()))
+                except (TypeError, ValueError, OverflowError):
+                    ok = False
+                if not ok:
                     raise ValueError(f"{where}: field '{path}' {key!r} must be an integer "
                                      f">= {floor}, got {v!r}")
     return raw

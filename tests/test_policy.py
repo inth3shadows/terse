@@ -713,7 +713,8 @@ def test_never_lossy_servers_list_loads(tmp_path):
 
 @pytest.mark.parametrize(("key", "bad"), [("max", "abc"), ("max", None), ("max", -3),
                                           ("max", 0), ("max", True), ("max", 2.5),
-                                          ("min", "abc"), ("min", -1)])
+                                          ("max", float("inf")), ("min", "abc"),
+                                          ("min", -1)])
 def test_lossy_size_knobs_must_be_integers(tmp_path, key, bad):
     with pytest.raises(ValueError, match=f"'{key}' must be an integer"):
         _load_doc(tmp_path, {"policies": [{"match": {"tool": "x"}, "tiers": ["minify"],
@@ -725,3 +726,11 @@ def test_add_never_lossy_server_keeps_a_bare_string_whole():
     doc = {"never_lossy_servers": "mybank"}
     assert add_never_lossy_server(doc, "kb")
     assert doc["never_lossy_servers"] == ["kb", "mybank"]
+
+
+@pytest.mark.parametrize("ok", [50, "50", 120.0])
+def test_lossy_size_knobs_that_int_accepts_still_load(tmp_path, ok):
+    # These already worked at apply time (`int("50")`); rejecting them at load would take
+    # a running proxy down for a config that compresses today.
+    _load_doc(tmp_path, {"policies": [{"match": {"tool": "x"}, "tiers": ["minify"],
+                                       "fields": {"a": {"lossy": "truncate", "max": ok}}}]})

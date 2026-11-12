@@ -27,7 +27,8 @@ fails that pull request until the section has moved.
 - A field's `max`/`min` that is not an integer (`"abc"`, `null`, `2.5`, `true`) or is out of
   range (`max` < 1, `min` < 0) is now rejected at load. A non-integer used to raise on
   every payload past the lossy stage's handler, so the tool was silently never
-  compressed, and a negative `max` sliced from the end of the value.
+  compressed, and a negative `max` sliced from the end of the value. Values that already
+  worked (`"50"`, `120.0`) still load.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,
