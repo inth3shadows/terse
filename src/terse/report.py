@@ -103,16 +103,20 @@ def _paired_gap_se(rows: list[dict[str, Any]], form: str, control: str) -> float
     `dᵢ = (kfᵢ − acc_f·tfᵢ)/Σtf − (kcᵢ − acc_c·tcᵢ)/Σtc`, which is 0 for identical arms.
     None below two shared questions, where a between-question spread cannot be estimated
     (the caller then falls back to the independent bound)."""
+    # Every row EITHER arm scored, exactly the rows `_form_stats` counts for each, so the
+    # SE covers the same questions as the two accuracies it is the SE of. A row only one
+    # arm scored contributes a zero term for the other (review of #582).
     pairs = []
     for r in rows:
         tf, tc = _arm_trials(r, form), _arm_trials(r, control)
-        if tf > 0 and tc > 0:
-            pairs.append((int(r[form]), tf, int(r[control]), tc))
+        if tf > 0 or tc > 0:
+            pairs.append((int(r[form]) if tf > 0 else 0, tf,
+                          int(r[control]) if tc > 0 else 0, tc))
     n = len(pairs)
-    if n < 2:
-        return None
     sum_tf = sum(p[1] for p in pairs)
     sum_tc = sum(p[3] for p in pairs)
+    if n < 2 or not sum_tf or not sum_tc:
+        return None
     acc_f = sum(p[0] for p in pairs) / sum_tf
     acc_c = sum(p[2] for p in pairs) / sum_tc
     d_sq = sum(((kf - acc_f * tf) / sum_tf - (kc - acc_c * tc) / sum_tc) ** 2
@@ -2352,6 +2356,13 @@ class GapVerdict(NamedTuple):
     inconclusive: bool = False
 
 
+def row_verdict(row: GapRow, tol: float | None = None) -> str:
+    """PASS / INCONCLUSIVE / FAIL for ONE model's gap row, by the same rule as the
+    verdict, so a chart's per-model badge can never contradict the headline above it."""
+    v = _worst_case_gap({"": row}) if tol is None else _worst_case_gap({"": row}, tol)
+    return "FAIL" if v is None else gate_word(v)
+
+
 def gate_word(verdict: GapVerdict, withheld: bool = False) -> str:
     """PASS / FAIL / INCONCLUSIVE for a gap verdict. A withheld model blocks PASS: the
     tested set did not all pass, it was only partly measured (as dropeval does, #344)."""
@@ -2430,7 +2441,7 @@ def _format_worst_case_line(verdict: GapVerdict, tol: float, form_label: str,
         line += (f" The interval reaches {verdict.gap - verdict.gap_ci:+.0%}, past "
                  f"-{tol:.0%}: too few questions to rule out a regression.")
     elif verdict.passed and withheld:
-        line += " Measured models only: a model was not measured (named above)."
+        line += " Measured models only: a model was withheld from the gate (named above)."
     return line
 
 
@@ -4138,7 +4149,7 @@ def build_diff_soak_report(results: dict) -> str:
                        f"`{deepest.model}` chain {deepest.form_acc:.0%} vs full "
                        f"{deepest.control_acc:.0%} (gap {deepest.gap:+.0%} "
                        f"±{deepest.gap_ci * 100:.0f} pts). "
-                       f"**{gate_word(deepest)}** at "
+                       f"**{gate_word(deepest, soak_withheld)}** at "
                        f"{_GAP_TOLERANCE:.0%} tolerance.")
         elif deep_withheld:
             out.append(f"- **NO VERDICT at the deepest tested depth ({deep})** — every "
@@ -4148,24 +4159,25 @@ def build_diff_soak_report(results: dict) -> str:
                           f"says nothing about drift at {deep}." if worst else
                           " The pooled gap was withheld too, so this run has no verdict at "
                           "any depth."))
-        not_concluded = ((worst is not None and worst.inconclusive)
-                         or (deepest is not None and deepest.inconclusive)
-                         or (worst is not None and worst.passed and soak_withheld))
-        failed = ((worst is not None and not worst.passed and not worst.inconclusive)
-                  or (deepest is not None and not deepest.passed
-                      and not deepest.inconclusive))
-        if worst and worst.passed and not deep_withheld and not soak_withheld and (
-                deepest is None or deepest.passed):
+        # Three outcomes, decided once so no two lines can disagree (#582):
+        #   failed        — a scored gap (pooled or deepest) is past tolerance;
+        #   not concluded — nothing failed, but an interval reaches past the line or a
+        #                   model was withheld from the pooled gate;
+        #   no drift      — everything scored passed, interval included.
+        scored = [v for v in (worst, deepest) if v is not None]
+        failed = any(not v.passed and not v.inconclusive for v in scored)
+        inconclusive = any(v.inconclusive for v in scored)
+        if scored and not failed and not inconclusive and not soak_withheld \
+                and not deep_withheld:
             out.append("- No depth-correlated comprehension drift within tolerance — "
                        "chained diffs up to the tested depth read as well as fulls.")
-        elif not_concluded and not failed and not deep_withheld:
+        elif scored and not failed and not deep_withheld:
             out.append("- Not concluded — this run does not identify a safe keyframe "
                        "interval: " + ("an interval reaches past tolerance; re-run with "
-                                       "more questions." if not (worst and worst.passed
-                                                                 and soak_withheld)
-                                       else "measure the withheld model(s) first."))
-        elif not deep_withheld and (worst or deepest):
-            # `worst or deepest` is the guard un-nesting this block made necessary: with
+                                       "more questions." if inconclusive else
+                                       "measure the withheld model(s) first."))
+        elif failed and not deep_withheld:
+            # `failed` implies something was scored; the old `worst or deepest` guard un-nesting this block made necessary: with
             # neither, NOTHING was scored, and "comprehension drifts beyond tolerance" is a
             # finding rather than the absence of one. The NO VERDICT line above already
             # said what happened; a conclusion here would contradict it.
@@ -4843,26 +4855,16 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         fluency_withheld = bool(unmeasured_models or underpowered_models or broken)
         out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "best terse-form", "raw",
                                            withheld=fluency_withheld))
-        # `gap_ci` combines the two arms' SEs as if independent (√(fse²+cse²)), which
-        # overstates the true variance of a PAIRED gap whenever the arms are positively
-        # correlated (the normal case — question difficulty is shared) — before #297 that
-        # didn't matter because both SEs were ~0 by default, but the cluster-robust SE is
-        # routinely several points wide, and this bound is wide enough in practice to call
-        # a genuine regression "noise" (the correct paired CI on the same data can be
-        # several times tighter and not cross the gap at all). A bound that is only ever
-        # an OVER-estimate cannot support a "not distinguishable" conclusion on EITHER
-        # side of the tolerance line, so neither branch below claims one — only that the
-        # gap is smaller than a loose ceiling on its own noise. (A proper paired
-        # cluster-robust SE on the per-question difference would let this section make a
-        # real significance claim — tracked as a follow-up, not folded into #297's scope.)
-        if worst.gap_ci > 1e-9 and abs(worst.gap) < worst.gap_ci:
+        # `gap_ci` is the paired, question-clustered interval of the gap (#582), so the
+        # verdict line above already says whether the run can tell "within tolerance"
+        # from "beyond it". The note below adds one thing only, for a PASS: the margin
+        # is real but not yet tight. On INCONCLUSIVE or FAIL the verdict line says it all.
+        if (worst.passed and not fluency_withheld and worst.gap_ci > 1e-9
+                and abs(worst.gap) < worst.gap_ci):
             # More questions tighten this bound without limit; more trials also tighten
             # it, but only down to a between-question floor they can't cross (they
-            # resample k, not the question set) — so this is neither "raise `--trials`"
-            # (#297's own estimator makes that false as the SOLE lever) nor "trials never
-            # help" (also false).
-            verdict_word = "This passing gap" if worst.passed else "Note: this gap"
-            out.append(f"- {verdict_word} is smaller than its own 95% interval — treat "
+            # resample k, not the question set).
+            out.append("- This passing gap is smaller than its own 95% interval — treat "
                        "the verdict above as real, not yet as a tightly measured margin; "
                        "more questions would tighten this bound further than more trials "
                        "would.")

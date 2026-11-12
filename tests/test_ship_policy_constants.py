@@ -80,8 +80,10 @@ def test_the_ship_tolerance_is_five_points():
         f"is why the literal exists")
 
 
-def test_a_gap_inside_the_ship_tolerance_publishes_a_PASS():
-    """-4.5%: inside 5%, outside 4%. Reddens if the tolerance is tightened."""
+def test_a_gap_inside_the_ship_tolerance_is_not_a_FAIL():
+    """-4.5%: inside 5%, outside 4%. Reddens if the tolerance is tightened. Since #582
+    PASS also needs the interval inside the line, which this fixture's is not; that a gap
+    inside tolerance CAN reach PASS is pinned in `test_interval_gate.py`."""
     rows = _diff_rows(9)
     g = arm_gap(rows, "diff_ok", "terse_ok")
     # Fixture integrity, asserted before the verdict so a broken fixture reads as a

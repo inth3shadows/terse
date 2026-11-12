@@ -72,3 +72,33 @@ def test_html_banner_shows_inconclusive_as_a_warning():
     from terse.html_report import build_html_diff_report
     html = build_html_diff_report({"m": [_q(i, 0 if i == 0 else 1, 1) for i in range(20)]})
     assert 'class="banner warn"' in html and "INCONCLUSIVE" in html
+
+
+def _nineteen_of_twenty():
+    return {"m": [_q(i, 0 if i == 0 else 1, 1) for i in range(20)]}
+
+
+def test_chart_badges_agree_with_the_markdown_verdict():
+    # Review of #582: the forest plots kept badging PASS from the point estimate.
+    from terse.html_report import build_html_diff_report
+    from terse.terminal_report import build_terminal_diff_report
+    results = _nineteen_of_twenty()
+    assert "**INCONCLUSIVE**" in build_diff_report(results)
+    plot = build_terminal_diff_report(results, color=False)
+    assert "INCONCLUSIVE" in plot and "PASS" not in plot
+    html = build_html_diff_report(results)
+    assert ">PASS</text>" not in html and ">INCONCLUSIVE</text>" in html
+
+
+def test_a_gap_inside_tolerance_with_a_tight_interval_reaches_pass():
+    # 12 misses in 400 questions: gap -3%, interval about ±1.7 pts, clear of -5%.
+    md = build_diff_report({"m": [_q(i, 0 if i < 12 else 1, 1) for i in range(400)]})
+    assert "**PASS**" in md and "safe to enable" in md
+
+
+def test_paired_se_counts_a_row_only_one_arm_scored():
+    # A legacy row with no `attempts` key can pair while one arm has zero trials;
+    # dropping it from the SE made the interval cover fewer questions than the gap.
+    rows = [_q(i, 1, 1) for i in range(20)]
+    rows.append({**_q(99, 0, 0), "terse_trials": 0})
+    assert _paired_gap_se(rows, "diff_ok", "terse_ok") > 0

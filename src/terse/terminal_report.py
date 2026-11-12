@@ -34,7 +34,7 @@ from .report import (
     exclusion_note,
     fluency_gap_rows,
     is_diff_run,
-    passes_tolerance,
+    row_verdict,
     savings_totals,
     strip_markup,
 )
@@ -217,8 +217,8 @@ def forest_bar_lines(rows: list[dict[str, Any]], form_label: str, control_label:
     scale = "0%" + "·" * (_TRACK_WIDTH + 1 - len("0%") - len("100%")) + "100%"
     lines = [f"  {'':<{label_w}}  ○ {control_label}   ● {form_label}   {scale}"]
     for r in rows:
-        badge = "PASS" if r["passed"] else "FAIL"
-        badge_sgr = "32" if r["passed"] else "31"
+        badge = r.get("verdict") or ("PASS" if r["passed"] else "FAIL")
+        badge_sgr = {"PASS": "32", "INCONCLUSIVE": "33"}.get(badge, "31")
         c_track = _c("36", _track(r["control_acc"], r["control_ci"], "○"), enabled)
         f_track = _c("35", _track(r["form_acc"], r["form_ci"], "●"), enabled)
         lines.append(f"  {r['model'][:label_w]:<{label_w}}  {c_track}")
@@ -237,11 +237,12 @@ def build_terminal_diff_report(results: dict, form_label: str = "diff-form",
     also covers a backend that answered with no content at all."""
     gap_rows, excluded = diff_gap_rows(results)
     plot_rows = []
-    for model, (facc, fse, cacc, cse, *_) in gap_rows.items():
-        gap = facc - cacc
-        passed = passes_tolerance(gap)
+    for model, row in gap_rows.items():
+        facc, fse, cacc, cse, *_ = row
+        word = row_verdict(row)   # same rule as the markdown headline (#582)
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
-                           "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
+                           "control_acc": cacc, "control_ci": _ci(cse),
+                           "passed": word == "PASS", "verdict": word})
     text = forest_bar_lines(plot_rows, form_label, control_label, color=color)
     # THIS chart is the one an operator sees without `--html`: `cli` prints the markdown
     # and this plot on every diff path and writes the HTML page only under `--html`, so
@@ -263,11 +264,12 @@ def build_terminal_fluency_report(results: dict, color: bool | None = None) -> s
     whose raw control failed (backend/config error) are excluded, same as the markdown."""
     gap_rows, broken = fluency_gap_rows(results)
     plot_rows = []
-    for model, (facc, fse, cacc, cse, *_) in gap_rows.items():
-        gap = facc - cacc
-        passed = passes_tolerance(gap)
+    for model, row in gap_rows.items():
+        facc, fse, cacc, cse, *_ = row
+        word = row_verdict(row)   # same rule as the markdown headline (#582)
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
-                           "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
+                           "control_acc": cacc, "control_ci": _ci(cse),
+                           "passed": word == "PASS", "verdict": word})
     text = forest_bar_lines(plot_rows, "best terse-form", "raw", color=color)
     if broken:
         text += f"\n  ({exclusion_note(broken)})"
@@ -345,10 +347,10 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None,
             if metric is None:
                 continue
             facc, fse, cacc, cse, *_ = metric
-            gap = facc - cacc
-            passed = passes_tolerance(gap)
+            word = row_verdict(metric)   # same rule as the dropeval verdict (#582)
             plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
-                               "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
+                               "control_acc": cacc, "control_ci": _ci(cse),
+                               "passed": word == "PASS", "verdict": word})
         # The note comes FIRST, and is emitted even when there is nothing to plot. The
         # `continue` used to sit above it, so a metric from which EVERY model was withheld
         # lost its disclosure along with its empty chart — and `dropeval_directive_line`,
