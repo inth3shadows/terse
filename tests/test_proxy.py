@@ -2973,3 +2973,20 @@ def test_a_slow_reply_after_client_eof_is_still_delivered(monkeypatch):
     cout = io.StringIO()
     assert run_proxy(slow, FULL, stdin=io.StringIO(call), stdout=cout) == 0
     assert '"id":4' in cout.getvalue().replace(" ", "")
+
+
+def test_an_unanswered_call_does_not_keep_a_stubborn_child_forever(monkeypatch):
+    # A cancelled/hung call stays "in flight"; the hard ceiling still ends it (#582 review).
+    import time as _time
+
+    from terse import proxy as proxy_mod
+    monkeypatch.setattr(proxy_mod, "_EOF_GRACE_S", 0.3)
+    monkeypatch.setattr(proxy_mod, "_EOF_MAX_S", 1.0)
+    hung = [sys.executable, "-c", "import sys, time\nsys.stdin.readline()\ntime.sleep(60)"]
+    lines = (json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": "items.get", "arguments": {}}}) + "\n"
+             + json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                           "params": {"requestId": 1}}) + "\n")
+    start = _time.monotonic()
+    rc = run_proxy(hung, FULL, stdin=io.StringIO(lines), stdout=io.StringIO())
+    assert _time.monotonic() - start < 10 and rc != 0

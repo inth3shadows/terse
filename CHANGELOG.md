@@ -22,7 +22,9 @@ fails that pull request until the section has moved.
   client disconnected without signalling it, orphaning both processes. After client EOF,
   a child that stays idle for 30 seconds (no tool call in flight and no output) is now
   terminated (SIGTERM, then SIGKILL), with a stderr note. A child still answering a
-  request the client sent before EOF is never cut off for being slow.
+  request the client sent before EOF is not cut off for being slow, up to a 10-minute
+  ceiling after EOF that also ends a child kept "busy" by a cancelled call or a stream of
+  notifications.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,

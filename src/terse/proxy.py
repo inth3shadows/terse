@@ -2530,6 +2530,12 @@ def stdio_transport_error(cmd: list[str]) -> str | None:
 # this long: a child still answering a request the client sent just before EOF (a slow
 # tool, a cold `npx` start) is never cut off for being slow.
 _EOF_GRACE_S = 30.0
+# The hard ceiling after client EOF, busy or not. `busy` reads the in-flight tool calls,
+# and an entry there is only cleared by its reply: a call the client cancelled (or a hung
+# tool it gave up on, the likeliest reason it left) stays "in flight" forever, as does a
+# child that keeps emitting notifications. Without a ceiling either brings the orphan
+# back. Generous, because a reply after EOF can still be legitimately slow.
+_EOF_MAX_S = 600.0
 
 
 def _wait_child(transport: Any, t_up: Any, *, busy: Callable[[], bool] = lambda: False,
@@ -2553,10 +2559,12 @@ def _wait_child(transport: Any, t_up: Any, *, busy: Callable[[], bool] = lambda:
         now = time.monotonic()
         if eof_at is None:
             eof_at = now
-        if busy() or now - max(eof_at, last_output()) < _EOF_GRACE_S:
+        capped = now - eof_at >= _EOF_MAX_S
+        if not capped and (busy() or now - max(eof_at, last_output()) < _EOF_GRACE_S):
             continue
-        sys.stderr.write(f"[terse] downstream stayed idle {_EOF_GRACE_S:.0f}s after client "
-                         "EOF without exiting; terminating it\n")
+        why = (f"was still running {_EOF_MAX_S:g}s after client EOF" if capped else
+               f"stayed idle {_EOF_GRACE_S:g}s after client EOF")
+        sys.stderr.write(f"[terse] downstream {why} without exiting; terminating it\n")
         _terminate_child(proc)
         return int(proc.wait())
 
