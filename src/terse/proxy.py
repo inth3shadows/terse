@@ -854,7 +854,15 @@ class Interceptor:
         """Compress the text of a tracked tools/call result; prime the initialize reply;
         else return unchanged."""
         try:
-            msg = json.loads(line)
+            # Faithful parse of the WHOLE message: every field of it (structuredContent,
+            # _meta, the content blocks' envelope) is re-serialized when any block changes,
+            # so a duplicate key or over-precise number anywhere in it would reach the
+            # client rewritten. Such a message is forwarded byte-for-byte instead.
+            msg = transforms.loads_faithful(line)
+        except transforms.UnfaithfulJSON as exc:
+            if self.debug:
+                sys.stderr.write(f"[terse-proxy] passthrough: {exc}\n")
+            return line
         except (ValueError, RecursionError):  # deep nesting is a RuntimeError, not a ValueError
             return line
         if not isinstance(msg, dict) or msg.get("id") is None:
@@ -1058,7 +1066,8 @@ class Interceptor:
                     text_blocks, tool, args_key, force_lossless=error_result)
                 if new_text is not None:
                     joined_block = {"type": "text", "text": new_text}
-                elif diff_reason in ("multiblock_non_json", "multiblock_heterogeneous"):
+                elif diff_reason in ("multiblock_non_json", "multiblock_heterogeneous",
+                                     "multiblock_unfaithful"):
                     # #140: the FULL join refused because at least one block is not a
                     # record (a bare error string, a JSON array). Rather than drop the
                     # whole result to the per-block path — losing cross-record folding on
@@ -1523,7 +1532,9 @@ class Interceptor:
             # `text_emitted`, not `non_json`, or the ledger's emitted-vs-non_json split
             # misreports file-read/log-tail traffic.
             changed = self._text_diff_or_store(block, tool, text)
-            return changed, ("text_emitted" if changed else "non_json")
+            if changed:
+                return changed, "text_emitted"
+            return changed, ("unfaithful" if applied.unfaithful else "non_json")
 
         if "pyliteral" in applied.tiers:
             # A Python-literal block (#460): not JSON on the wire, so no JSON diff base
@@ -1541,10 +1552,9 @@ class Interceptor:
         chosen = applied.text
         reason = "non_json"  # curr unparseable/too-deep: no JSON diff decision was possible
         try:
-            # Faithful parse: a diff is emitted from `curr`, so a collapsed duplicate key or
-            # renormalized number here would reach the model as a value the server never
-            # sent. `UnfaithfulJSON` is a ValueError -> treated as non-JSON, no diff.
-            curr = transforms.loads_faithful(text)
+            # Plain parse is enough: `apply` above already parsed this same text with
+            # `loads_faithful` and did not skip, so it holds every value it states.
+            curr = json.loads(text)
             # Depth guard (#79): a payload past the codec-wide cap must not become the
             # diff base — the diff encoders/decoders recurse and deep-compare without a
             # depth argument. Treat it like non-JSON: no diff in, no base stored.
@@ -1678,8 +1688,10 @@ class Interceptor:
                     and isinstance(b.get("text"), str)):
                 return False
             try:
-                return isinstance(json.loads(b["text"]), dict)
-            except (ValueError, TypeError, RecursionError):   # ValueError: #563
+                # Faithful: an unfaithful block is a singleton non-record, so it no longer
+                # sinks the whole run's join (`apply` passes it through raw per-block).
+                return isinstance(transforms.loads_faithful(b["text"]), dict)
+            except (ValueError, TypeError, RecursionError):   # ValueError: #563, UnfaithfulJSON
                 return False
 
         # Partition `content` into maximal runs of adjacent object-text blocks vs
@@ -1947,8 +1959,9 @@ class Interceptor:
             # `1` where the block said `true`. The guard's whole claim is that a block
             # carrying anything the typed field does not is never dropped; value-level
             # equality is a hole in it.
-            # Faithful parse: `1.50` in the block must not canonicalize into a match with a
-            # typed `1.5` and get the block dropped (UnfaithfulJSON -> ValueError -> keep).
+            # Faithful parse: a duplicate key or over-precise number in the block must not
+            # collapse into a match with the typed field and get the block dropped
+            # (UnfaithfulJSON -> ValueError -> keep).
             mirrored = json.dumps(transforms.loads_faithful(text_blocks[0]["text"]),
                                   sort_keys=True, separators=(",", ":"))
             typed = json.dumps(result["structuredContent"],

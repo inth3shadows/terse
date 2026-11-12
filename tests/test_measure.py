@@ -158,3 +158,9 @@ def test_failed_lossless_gate_zeroes_banked_savings(monkeypatch):
     assert set(row["saved_cl100k"].values()) == {0}
     # raw token counts stay for transparency — only the *banked savings* are zeroed.
     assert row["cl100k"]["raw"] > 0
+
+
+def test_measure_treats_a_value_losing_payload_as_passthrough():
+    # Review F3: the proxy passes this through raw, so measure must not credit savings.
+    row = measure_payload('{"a":1,"a":2,"rows":[{"k":"v"},{"k":"v"},{"k":"v"}]}')
+    assert row["applicable"] is False

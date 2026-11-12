@@ -24,7 +24,6 @@ demoted to passthrough.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from . import transforms
@@ -38,7 +37,7 @@ def measure_payload(raw: str) -> dict[str, Any]:
     applicable = True
     obj: Any = None
     try:
-        obj = json.loads(raw)
+        obj = transforms.loads_faithful(raw)   # UnfaithfulJSON: proxy passes it through
         # Depth guard (#79): past the codec-wide cap the transforms would RecursionError,
         # and the proxy passes such a payload through anyway — report it the same way,
         # as not-applicable with zero savings, instead of crashing `terse measure`.
@@ -185,16 +184,16 @@ def measure_joined(raws: list[str]) -> dict[str, Any] | None:
 
     Returns None — meaning "the caller must fall back to per-block" — under the same
     conditions `policy.apply_joined` refuses, so the measurement models what would actually
-    happen rather than a best case: a block that isn't JSON, a block that isn't an object,
+    happen rather than a best case: a block that isn't JSON or whose parse loses a value, a block that isn't an object,
     a reserved terse marker already present, or a joined array past the depth cap."""
     if len(raws) < 2:
         return None
     objs: list[Any] = []
     for raw in raws:
         try:
-            obj = json.loads(raw)
-        except (ValueError, TypeError, RecursionError):   # ValueError: #563
-            return None                      # non-JSON block: apply_joined refuses
+            obj = transforms.loads_faithful(raw)
+        except (ValueError, TypeError, RecursionError):   # ValueError: #563, UnfaithfulJSON
+            return None                      # non-JSON/unfaithful block: apply_joined refuses
         if not isinstance(obj, dict):
             return None                      # not a record sequence: apply_joined refuses
         objs.append(obj)
@@ -258,8 +257,8 @@ def cross_tokenizer_savings(envelopes: list[dict[str, Any]]) -> list[dict[str, A
     for env in envelopes:
         raw = env["raw"]
         try:
-            comp = transforms.compress(json.loads(raw))
-        except (ValueError, TypeError):   # ValueError: the int-digit limit, #563
+            comp = transforms.compress(transforms.loads_faithful(raw))
+        except (ValueError, TypeError):   # ValueError: #563 int-digit limit, UnfaithfulJSON
             comp = raw
         # Qualified name — the same one coverage/policy use, so a report's measure rows and
         # coverage counts name one tool the same way (#158).

@@ -793,7 +793,8 @@ by the next patch (PyPI versions cannot be re-uploaded).
   array; (2) the join fires only when every block is a JSON **dict** (a mixed bag of dicts,
   scalars, and arrays is not a record sequence) and none carries a reserved terse marker or
   nests past the depth cap — otherwise it falls back to the per-block path and records
-  *why* (`multiblock_non_json` / `_heterogeneous` / `_marker` / `_depth` / `_passthrough` /
+  *why* (`multiblock_non_json` / `_heterogeneous` / `_marker` / `_depth` / `_non_finite` /
+  `_unfaithful` / `_passthrough` /
   `_off`); (3) the per-result verify-before-emit gate proves the joined payload round-trips
   before it ships; (4) N → 1 changes the content-block count, which the MCP spec (2025-06-18
   server/tools) permits — block count carries no meaning, blocks have no index a payload can

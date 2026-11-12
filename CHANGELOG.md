@@ -14,14 +14,16 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Fixed
-- A JSON payload whose parse is not value-faithful to its text now passes through
-  uncompressed with a warning instead of being rewritten. `json.loads` collapses duplicate
-  keys (`{"a":1,"a":2}` -> `{"a":2}`) and renormalizes number literals (`1.50` -> `1.5`,
-  `1E5` -> `100000.0`, `0.10000000000000000001` -> `0.1`, `-0` -> `0`), and the round-trip
-  gate compares parsed values, so these compressed with `round-trip lossless: PASS` and no
-  signal. The new `transforms.loads_faithful` guards `apply`, `apply_joined` (new refusal
-  reason `unfaithful`), the proxy's diff base and the `structuredContent` mirror check.
-  Whitespace is unaffected.
+- A JSON payload whose parse would lose a value is now forwarded untouched instead of
+  compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
+  rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,
+  `1e-400` -> `0.0`), and the round-trip gate compares parsed values, so both compressed
+  with `round-trip lossless: PASS` and no warning. The new `transforms.loads_faithful`
+  guards the proxy's whole-message parse (so `structuredContent` and `_meta` are covered),
+  `policy.apply` (ledger reason `unfaithful`), `apply_joined` (refusal `unfaithful`, which
+  now also triggers the partial join), the `structuredContent` mirror check, `terse gate`
+  (prints `REFUSED`) and `terse measure`. Re-spelling the same value (`1.50`, `1E5`,
+  `0.00001`) is not a loss and still compresses.
 
 ## [0.49.1] - 2026-11-04
 

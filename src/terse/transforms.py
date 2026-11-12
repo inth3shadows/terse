@@ -36,6 +36,7 @@ import json
 import math
 import re
 from collections import Counter
+from decimal import Decimal
 from typing import Any
 
 from .tokenize import count_cl100k
@@ -106,7 +107,7 @@ MAX_DEPTH = 200
 
 
 class UnfaithfulJSON(ValueError):
-    """`raw` parses, but re-serializing the parse would not say what the server said."""
+    """`raw` parses, but its parse does not hold the values the text states."""
 
 
 def _faithful_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -118,34 +119,39 @@ def _faithful_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _faithful_float(lit: str) -> float:
     value = float(lit)
-    # An overflowing literal (`1e400` -> inf) is left to the existing non-finite guard
-    # (`_unwritable` / JOIN_REFUSED_NON_FINITE), which already passes it through raw.
-    if math.isfinite(value) and json.dumps(value) != lit:
-        raise UnfaithfulJSON(f"number {lit!r} would re-serialize as {json.dumps(value)!r}")
-    return value
-
-
-def _faithful_int(lit: str) -> int:
-    value = int(lit)
-    if str(value) != lit:            # `-0` -> `0`
-        raise UnfaithfulJSON(f"number {lit!r} would re-serialize as {value!r}")
+    shortest = repr(value)
+    # Fast path: the literal already IS the shortest repr (the common case). Otherwise
+    # compare VALUES, not spelling: `1.50`, `1E5`, `0.00001`, `1.0E7` state exactly the
+    # double they parse to and stay; `0.10000000000000000001` (precision) and `1e-400`
+    # (underflow to 0.0) state a value no double holds and are refused. Overflow
+    # (`1e400` -> inf) is left to the non-finite guard (`_unwritable`), as before.
+    if shortest != lit and math.isfinite(value) and Decimal(lit) != Decimal(shortest):
+        raise UnfaithfulJSON(f"number {lit} has more precision than JSON can carry "
+                             f"(reads as {shortest})")
     return value
 
 
 def loads_faithful(raw: str) -> Any:
-    """`json.loads`, refusing any document whose parse is not value-faithful to its text.
+    """`json.loads`, refusing a document whose parse would not hold the values it states.
 
     Everything downstream re-serializes the parsed value, and the round-trip gate compares
-    parsed values, so a collapse inside `json.loads` itself is invisible to both:
-    `{"a":1,"a":2}` -> `{"a":2}`, `1.50` -> `1.5`, `1E5` -> `100000.0`,
-    `0.10000000000000000001` -> `0.1`, `-0` -> `0`. Raises `UnfaithfulJSON` (a
-    `ValueError`) for those, so a caller passes the payload through untouched rather than
-    emit a value the server never sent. Whitespace is NOT a fidelity concern: dropping it
-    is what minify does. The embedded tier holds the stricter byte-for-byte bar
-    (`_embed_json_string`) because it re-emits a string, not a structure.
+    parsed values, so a loss inside `json.loads` itself is invisible to both. Two exist:
+    a duplicate key collapses to the last one (`{"a":1,"a":2}` -> `{"a":2}`), and a float
+    literal past double precision rounds (`0.10000000000000000001` -> `0.1`, `1e-400` ->
+    `0.0`). Raises `UnfaithfulJSON` (a `ValueError`) for those, so the caller passes the
+    payload through untouched. Re-spelling the same value (`1.50` -> `1.5`) is not a loss,
+    any more than dropping whitespace is. Ints need no check: Python's are exact.
+
+    A text that merely STARTS with such a value (`2.50000000000000000001 s elapsed`) is
+    not JSON at all, and raises the plain parse error instead, so the caller's non-JSON
+    path (text drops, `pyliteral`) still sees it.
     """
-    return json.loads(raw, object_pairs_hook=_faithful_pairs,
-                      parse_float=_faithful_float, parse_int=_faithful_int)
+    try:
+        return json.loads(raw, object_pairs_hook=_faithful_pairs,
+                          parse_float=_faithful_float)
+    except UnfaithfulJSON:
+        json.loads(raw)   # not one complete document -> its own ValueError wins
+        raise
 
 
 def exceeds_depth(obj: Any, cap: int = MAX_DEPTH) -> bool:

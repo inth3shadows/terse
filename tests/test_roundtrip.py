@@ -516,43 +516,49 @@ def test_the_diff_gate_rejects_a_rebuild_that_changes_a_type(monkeypatch):
     assert transforms.diff_encode({"a": 1}, {"a": True}) is None
 
 
-# -- Value-faithful parse (audit 2026-11-12): `json.loads` itself collapses duplicate keys and
-# renormalizes number literals, and the round-trip gate compares PARSED values, so it could
-# not see either. Each of these used to compress with `round-trip lossless: PASS` and no
-# warning while emitting a value the server never sent.
+# -- Value-faithful parse (audit 2026-11-12): `json.loads` itself loses two things — a duplicate
+# key collapses to the last one, and a float literal past double precision rounds — and the
+# round-trip gate compares PARSED values, so it could not see either. Re-spelling the SAME
+# value (`1.50` -> `1.5`) is not a loss and must keep compressing (PR #580 review, F2).
 
 _UNFAITHFUL = [
     '{"a":1,"a":2,"items":[{"k":"v"},{"k":"v"}]}',     # duplicate key -> last wins
     '{"rows":[{"id":1,"id":1}]}',                       # duplicate key, nested
-    '{"price":1.50,"rows":[1,2,3]}',                     # trailing zero
     '{"x":0.10000000000000000001,"rows":[1,2]}',         # past double precision
-    '{"n":1E5,"rows":[1,2]}',                            # exponent form
-    '{"n":-0,"rows":[1,2]}',                             # negative zero int
-    '[{"a":1.0e2},{"a":2}]',                             # exponent with fraction
+    '{"x":1e-400,"rows":[1,2]}',                         # underflows to 0.0
+    '[{"a":4.9e-324},{"a":2}]',                          # reads back as 5e-324
 ]
+
+_SAME_VALUE = ['1.50', '1E5', '0.00001', '1e-7', '1.0E7', '1e16', '10.00', '2.5e-3', '-0',
+               '-0.0', '1e+100', '5e-324', '1.7976931348623157e308']
 
 
 @pytest.mark.parametrize("raw", _UNFAITHFUL)
-def test_a_parse_that_would_rewrite_the_payload_passes_through_raw(raw):
+def test_a_parse_that_loses_a_value_passes_through_raw(raw):
     pol = Policy(rules=[Rule("*", ("minify", "tabularize", "dictionary"))])
     out = policy_mod.apply(raw, "t", pol)
-    assert out.text == raw and out.skipped
+    assert out.text == raw and out.skipped and out.unfaithful
     assert any("passed through uncompressed to stay lossless" in w for w in out.warnings)
 
 
 @pytest.mark.parametrize("raw", _UNFAITHFUL)
 def test_an_unfaithful_parse_is_not_read_as_a_python_literal(raw):
-    # `pyliteral` would `literal_eval` the same text and collapse the same duplicate keys.
     pol = Policy(rules=[Rule("*", ("minify", "tabularize", "dictionary", "pyliteral"))])
     out = policy_mod.apply(raw, "t", pol)
     assert out.text == raw and out.skipped
 
 
-@pytest.mark.parametrize("raw", ['{"price": 1.5, "n": 100000.0, "z": -0.0, "i": -3}',
-                                 '{"big": 12345678901234567890, "e": 1e+100}',
-                                 '{"x":1e400}'])
-def test_canonical_numbers_still_parse(raw):
-    transforms.loads_faithful(raw)   # no raise: these re-serialize to their own literal
+@pytest.mark.parametrize("lit", _SAME_VALUE)
+def test_a_respelled_number_of_the_same_value_still_compresses(lit):
+    raw = f'{{"n": {lit}, "rows": [{{"k": "v"}}, {{"k": "v"}}]}}'
+    pol = Policy(rules=[Rule("*", ("minify", "tabularize", "dictionary"))])
+    out = policy_mod.apply(raw, "t", pol)
+    assert not out.skipped and not out.unfaithful
+    assert transforms.decompress(out.text)["n"] == float(lit)
+
+
+def test_an_overflowing_number_still_goes_to_the_non_finite_guard():
+    assert transforms.loads_faithful('{"x":1e400}') == {"x": float("inf")}
 
 
 def test_whitespace_is_not_a_fidelity_concern():
@@ -561,9 +567,21 @@ def test_whitespace_is_not_a_fidelity_concern():
     assert not out.skipped and out.text == '{"a":1.5,"b":[1,2]}'
 
 
+@pytest.mark.parametrize("prefix", ['0.10000000000000000001 seconds elapsed. ',
+                                    '[{"a":1,"a":2}] see: '])
+def test_text_that_only_starts_with_an_unfaithful_value_is_still_prose(prefix):
+    # The hooks fire on the leading value before the parser reaches the trailing prose; that
+    # must not turn a non-JSON payload into an "unfaithful JSON" refusal that skips the
+    # opted-in text drop (review F4).
+    rule = Rule("t", ("minify",),
+                fields={"$text.code_blocks": {"lossy": "drop-to-retrieve", "min": 10}})
+    raw = prefix + "intro\n```\n" + "x" * 200 + "\n```\ntail"
+    out = policy_mod.apply(raw, "t", Policy(rules=[rule]), drop_sink=lambda *a, **k: None)
+    assert not out.unfaithful and len(out.text) < len(raw)
+
+
 def test_joined_blocks_with_an_unfaithful_parse_refuse_the_join():
     pol = Policy(rules=[Rule("*", ("minify", "tabularize"))])
-    applied, objs, reason = policy_mod.apply_joined(['{"a":1}', '{"a":1,"a":2}'], "t", pol)
-    assert applied is None and reason == policy_mod.JOIN_REFUSED_UNFAITHFUL
-    applied, objs, reason = policy_mod.apply_joined(['{"a":1}', '{"a":1.50}'], "t", pol)
-    assert applied is None and reason == policy_mod.JOIN_REFUSED_UNFAITHFUL
+    for bad in ('{"a":1,"a":2}', '{"a":0.10000000000000000001}'):
+        applied, objs, reason = policy_mod.apply_joined(['{"a":1}', bad], "t", pol)
+        assert applied is None and reason == policy_mod.JOIN_REFUSED_UNFAITHFUL
