@@ -351,3 +351,18 @@ def test_a_non_string_retrieve_handle_misses_like_production():
     _run_question(q, "applied", {"h1": {"a": 1}}, ans)
     tool_msg = [m for m in seen[-1] if m.get("role") == "tool"][0]
     assert "handle ''" in tool_msg["content"]
+
+
+def test_measure_joined_skips_a_parseable_dict_nested_past_the_marker_walk():
+    """A dict envelope nested deep enough to overflow the recursive terse-marker walk
+    (but still parseable) must be refused like any other too-deep payload, not abort
+    `policy generate` / `tune` (review of #591, round 2)."""
+    from terse import measure
+
+    deep: dict = {}
+    node = deep
+    for _ in range(3000):
+        node["k"] = {}
+        node = node["k"]
+    raw = json.dumps({"items": [{"id": 1}, {"id": 2}], "deep": deep})
+    assert measure.measure_joined([raw, raw]) is None

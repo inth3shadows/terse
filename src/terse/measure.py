@@ -197,7 +197,8 @@ def measure_joined(raws: list[str]) -> dict[str, Any] | None:
         if not isinstance(obj, dict):
             return None                      # not a record sequence: apply_joined refuses
         objs.append(obj)
-    if transforms.has_terse_marker(objs) or transforms.exceeds_depth(objs):
+    # exceeds_depth first: it is iterative, has_terse_marker recurses (#591 review).
+    if transforms.exceeds_depth(objs) or transforms.has_terse_marker(objs):
         return None
 
     raw_tok = count_cl100k("\n".join(raws))
