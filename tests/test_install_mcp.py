@@ -2732,3 +2732,123 @@ def test_a_user_wrapper_ending_in_the_old_command_is_a_hand_replacement(tmp_path
     cfg.write_text(json.dumps(config))
     im.do_uninstall(["kb"], cfg=cfg)
     assert json.loads(cfg.read_text())["mcpServers"]["kb"] == mine
+
+
+# --- review of #587: a downstream edited INSIDE the wrapper, any launcher ---
+def _install_then_edit_tail(tmp_path, monkeypatch, launcher, tail,
+                            original=None):
+    """Install `kb`, then hand-edit the downstream after the wrapper's `--` to `tail`."""
+    cfg = tmp_path / ".claude.json"
+    original = original or {"command": "old-kb", "args": ["--v1"]}
+    cfg.write_text(json.dumps(_cfg(kb=original)))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: launcher)
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    config = json.loads(cfg.read_text())
+    args = config["mcpServers"]["kb"]["args"]
+    config["mcpServers"]["kb"]["args"] = [*args[:args.index("--") + 1], *tail]
+    cfg.write_text(json.dumps(config))
+    return cfg, policy
+
+
+def _live_kb(cfg):
+    return json.loads(cfg.read_text())["mcpServers"]["kb"]
+
+
+def _stash_kb(cfg):
+    return json.loads(im.stash_path(cfg).read_text()).get("user", {}).get("kb")
+
+
+@pytest.mark.parametrize("tail", [["old-kb", "--v2"], ["new-kb"]])
+def test_reinstall_adopts_a_downstream_edited_inside_the_wrapper(tmp_path, monkeypatch, tail):
+    # B1: the live entry is still terse's wrapper, but its downstream is no longer the
+    # stash's. Re-wrapping the stash would silently undo the user's edit.
+    cfg, policy = _install_then_edit_tail(tmp_path, monkeypatch, TERSE_CMD, tail)
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    args = _live_kb(cfg)["args"]
+    assert args.count("--") == 1 and args[args.index("--") + 1:] == tail
+    assert _stash_kb(cfg) == {"command": tail[0], "args": tail[1:]}
+    im.do_uninstall(["kb"], cfg=cfg)
+    assert _live_kb(cfg) == {"command": tail[0], "args": tail[1:]}
+
+
+def test_uninstall_unwraps_to_a_downstream_edited_inside_the_wrapper(tmp_path, monkeypatch):
+    # B1: uninstall must restore what the wrapper launches now, not the stale stash.
+    cfg, _ = _install_then_edit_tail(tmp_path, monkeypatch, TERSE_CMD, ["old-kb", "--v2"])
+    res = im.do_uninstall(["kb"], cfg=cfg)
+    assert _live_kb(cfg) == {"command": "old-kb", "args": ["--v2"]}
+    assert _stash_kb(cfg) is None
+    assert res["changes"][0]["restored"] is True
+
+
+def test_a_custom_launcher_wrapper_with_an_edited_downstream_is_never_adopted(
+        tmp_path, monkeypatch):
+    # B2: under `$TERSE_MCP_CMD=/path/tmcp` the edited wrapper was adopted AS the original:
+    # re-install double-wrapped it, uninstall kept the wrapper live and dropped the stash.
+    launcher = [str(tmp_path / "tmcp")]
+    cfg, policy = _install_then_edit_tail(tmp_path, monkeypatch, launcher, ["old-kb", "--v2"])
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    args = _live_kb(cfg)["args"]
+    assert args.count("--") == 1 and args.count("proxy") == 1
+    assert args[args.index("--") + 1:] == ["old-kb", "--v2"]
+    assert _stash_kb(cfg) == {"command": "old-kb", "args": ["--v2"]}
+    im.do_uninstall(["kb"], cfg=cfg)
+    assert _live_kb(cfg) == {"command": "old-kb", "args": ["--v2"]}
+
+
+def test_custom_launcher_uninstall_of_an_edited_wrapper_restores_its_downstream(
+        tmp_path, monkeypatch):
+    # B2, uninstall side: never `kept` (wrapper left live, original unrecoverable).
+    launcher = [str(tmp_path / "tmcp")]
+    cfg, _ = _install_then_edit_tail(tmp_path, monkeypatch, launcher, ["old-kb", "--v2"])
+    res = im.do_uninstall(["kb"], cfg=cfg)
+    assert not res["changes"][0].get("stash_dropped")
+    assert _live_kb(cfg) == {"command": "old-kb", "args": ["--v2"]}
+    assert _stash_kb(cfg) is None
+
+
+def test_custom_launcher_entry_with_command_AND_url_is_terses_wrapper(tmp_path, monkeypatch):
+    # B3: `wrap` launches `command` when both are set; the wrapper test must agree, or the
+    # entry reads as hand-replaced, is double-wrapped, and the stash is lost.
+    original = {"command": "old-kb", "args": ["--v1"], "url": "https://kb.example/mcp"}
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(kb=original)))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: [str(tmp_path / "tmcp")])
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    args = _live_kb(cfg)["args"]
+    assert args.count("--") == 1 and args[args.index("--") + 1:] == ["old-kb", "--v1"]
+    res = im.do_uninstall(["kb"], cfg=cfg)
+    assert res["changes"][0]["restored"] is True
+    assert _live_kb(cfg) == original
+
+
+def test_an_unlaunchable_hand_replacement_is_refused_before_any_change(tmp_path, monkeypatch):
+    # B4: a hand-replacement with neither `command` nor `url` (a typo'd `URL`) used to be
+    # written into the stash in memory before `wrap` raised its generic error.
+    cfg = tmp_path / ".claude.json"
+    cfg.write_text(json.dumps(_cfg(kb={"command": "old-kb", "args": ["--v1"]},
+                                   gh={"command": "gh-mcp"})))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: TERSE_CMD)
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    config = json.loads(cfg.read_text())
+    config["mcpServers"]["kb"] = {"URL": "https://kb.example/mcp"}   # by hand, typo'd
+    cfg.write_text(json.dumps(config))
+    cfg_bytes, stash_bytes = cfg.read_bytes(), im.stash_path(cfg).read_bytes()
+    with pytest.raises(ValueError, match=r"'kb'.*replaced by hand"):
+        im.do_install(["gh", "kb"], str(policy), cfg=cfg)
+    assert cfg.read_bytes() == cfg_bytes and im.stash_path(cfg).read_bytes() == stash_bytes
+    # The in-memory stash must not be half-changed either (`wrap` is public API).
+    stash = {"kb": {"command": "old-kb", "args": ["--v1"]}}
+    with pytest.raises(ValueError, match="replaced by hand"):
+        im.wrap(dict(config), stash, "kb", str(policy), TERSE_CMD)
+    assert stash == {"kb": {"command": "old-kb", "args": ["--v1"]}}
+    with pytest.raises(ValueError, match="replaced by hand"):
+        im.wrap_multi(json.loads(json.dumps(config)), stash, ["kb"], str(policy), TERSE_CMD,
+                      peers_file=str(tmp_path / "peers.json"))
+    assert stash == {"kb": {"command": "old-kb", "args": ["--v1"]}}

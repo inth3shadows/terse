@@ -461,12 +461,11 @@ def wrap(config: dict, stash: dict, server: str, policy: str,
     neither key is not a valid MCP server entry and can't be wrapped."""
     servers = config.setdefault("mcpServers", {})
     live = servers.get(server)
-    if server in stash and _replaced_by_hand(live, stash[server]):
-        # The stashed original is stale: the user replaced the wrapped entry with a new,
-        # unwrapped one. Wrapping the stash would silently bring the OLD command back and
-        # discard theirs (#582), so the live entry becomes the original.
-        original = live
-        stash[server] = original
+    if server in stash and (adopted := _adopt_live(stash, server, live)) is not None:
+        # The stashed original is stale: the user replaced the wrapped entry, or edited
+        # the downstream inside it. Wrapping the stash would silently bring the OLD
+        # command back and discard theirs (#582), so what they run now is the original.
+        original = adopted
     elif server in stash:
         original = stash[server]
     elif live is not None:
@@ -738,11 +737,11 @@ def wrap_multi(config: dict, stash: dict, servers: list[str], policy: str,
                 f"'{name}' is itself a terse multiproxy router (it runs `proxy --config`) "
                 f"— folding it in would nest a proxy inside a proxy. Uninstall its fleet "
                 f"first, or name its peers individually")
-        if name in stash and _replaced_by_hand(live_servers.get(name), stash[name]):
-            # Same rule as single-server `wrap` (#582): a live entry the user swapped for a
-            # new command is the original now, not the stale stash copy.
-            original = live_servers[name]
-            stash[name] = original
+        if name in stash and (
+                adopted := _adopt_live(stash, name, live_servers.get(name))) is not None:
+            # Same rule as single-server `wrap` (#582): what the user runs now is the
+            # original, not the stale stash copy.
+            original = adopted
         elif name in stash:
             original = stash[name]
         elif name in live_servers:
@@ -898,37 +897,103 @@ def _prune_peer(peers_doc: dict, server: str) -> bool:
     return was_there
 
 
-def _replaced_by_hand(live: object, original: object) -> bool:
-    """True when `live` is an ordinary (non-terse, non-router) entry that differs from the
-    stashed `original` — the user swapped the wrapped entry for a new command by hand, so
-    the stash no longer describes what they run."""
-    return (isinstance(live, dict) and proxy_arg_segment(live) is None
-            and not _is_router_entry(live) and live != original
-            and not _wraps_original(live, original))
+def _wrapper_split(entry: dict) -> tuple[list, list] | None:
+    """`(terse_segment, downstream_tail)` when `entry` is a terse wrapper written by
+    `wrap` under ANY launcher, else None. The segment is terse's own tokens between
+    `proxy` and the `--`; the tail is everything after that `--`.
 
-
-def _wraps_original(live: dict, original: object) -> bool:
-    """True when `live`'s args END with `-- <original's launch>`: the shape `wrap` writes
-    whatever the launcher. A `$TERSE_MCP_CMD` launcher that `_looks_like_terse_launcher`
-    cannot recognise (`/path/tmcp`) is still our wrapper by this test, so it is never
-    mistaken for a hand-replacement (which would double-wrap it on re-install and drop
-    the stash on uninstall)."""
-    if not isinstance(original, dict):
-        return False
-    args = live.get("args")
+    Two recognisers, tried in order. A launcher `_looks_like_terse_launcher` can see
+    (`terse`, `-m terse`, `uvx terse`) must have `proxy` in terse's subcommand position
+    (`_proxy_subcommand_index`), so a bare `terse` token alone never counts. A
+    `$TERSE_MCP_CMD` launcher it cannot see (`/path/tmcp`) is matched by the shape `wrap`
+    has always written after the launcher, `proxy --policy <p> ... -- <downstream>`. A
+    user's own wrapper (`sb-run --secret X -- kb-mcp`) matches neither."""
+    args = entry.get("args")
     if not isinstance(args, list):
-        return False
-    if isinstance(original.get("url"), str):
-        launch = [original["url"]]
-    elif isinstance(original.get("command"), str):
-        launch = [original["command"], *(original.get("args") or [])]
-    else:
-        return False
-    n = len(launch)
-    # `proxy` before the `--` too: `sb-run --secret X -- kb-mcp` ends with the original's
-    # launch but is the user's own wrapper, not terse's (review of #582 item 5).
-    return (len(args) > n and args[-n - 1] == "--" and args[-n:] == launch
-            and "proxy" in args[:-n - 1])
+        return None
+    start = (_proxy_subcommand_index(entry, args)
+             if _looks_like_terse_launcher(entry) else None)
+    if start is None:
+        start = next((i for i in range(len(args) - 1)
+                      if args[i] == "proxy" and args[i + 1] == "--policy"), None)
+    if start is None or "--" not in args[start + 1:]:
+        return None
+    sep = args.index("--", start + 1)
+    return args[start + 1:sep], args[sep + 1:]
+
+
+def _segment_headers(segment: list) -> list:
+    """The `--header k=v` tokens `wrap` writes for a URL downstream, in order."""
+    return [tok for i, tok in enumerate(segment)
+            if i > 0 and segment[i - 1] == "--header"]
+
+
+def _launch_of(original: object) -> tuple[list, list] | None:
+    """What `wrap` writes for `original`: `(downstream_tail, header_values)`, with the
+    SAME precedence as `wrap` (a truthy `command` beats `url`), or None when `original`
+    has neither and `wrap` would refuse it."""
+    if not isinstance(original, dict):
+        return None
+    if original.get("command"):
+        return [original["command"], *list(original.get("args") or [])], []
+    if original.get("url"):
+        headers = original.get("headers") or {}
+        values = ([f"{k}={v}" for k, v in headers.items()]
+                  if isinstance(headers, dict) else [])
+        return [original["url"]], values
+    return None
+
+
+def _live_original(live: object, original: object) -> dict | None:
+    """The entry that should replace the stashed `original`, or None when the stash still
+    describes what `live` launches.
+
+    Two ways the stash goes stale (#582): the user replaced the wrapped entry with an
+    ordinary one (returned as-is, the very same object), or edited the downstream INSIDE
+    terse's wrapper (`-- old-kb --v1` -> `-- old-kb --v2`), whatever the launcher. For
+    the second, the wrapper's downstream, unnested through every terse layer, is the new
+    original, rebuilt with the live entry's other keys. A terse wrapper is never returned
+    itself: adopting one makes re-install double-wrap it and uninstall leave it live with
+    the original gone. A router or a wrapper with no downstream left keeps the stash."""
+    if not isinstance(live, dict) or _is_router_entry(live):
+        return None
+    split = _wrapper_split(live)
+    if split is None:
+        return live if live != original else None
+    # Unnest through every terse layer; if ANY layer launches the stash's original, the
+    # stash still describes it (e.g. a stashed entry that was itself a wrapper, #172).
+    launch = _launch_of(original)
+    while True:
+        segment, tail = split
+        headers = _segment_headers(segment)
+        if not tail or (tail, headers) == launch:
+            return None
+        split = _wrapper_split({"command": tail[0], "args": tail[1:]})
+        if split is None:
+            break
+    rest = {k: v for k, v in live.items() if k not in ("command", "args", "url", "headers")}
+    if len(tail) == 1 and isinstance(tail[0], str) and "://" in tail[0]:
+        pairs = [h.partition("=") for h in headers if isinstance(h, str) and "=" in h]
+        return {**rest, "url": tail[0],
+                **({"headers": {k: v for k, _, v in pairs}} if pairs else {})}
+    return {**rest, "command": tail[0], "args": tail[1:]}
+
+
+def _adopt_live(stash: dict, server: str, live: object) -> dict | None:
+    """Adopt `_live_original` into `stash[server]` and return it, or return None when
+    the stash stands. Validated BEFORE the stash is touched: an adopted entry with
+    neither `command` nor `url` (a typo'd `URL`, a stub) cannot be wrapped, and
+    raising only after overwriting the stash left it half-changed."""
+    adopted = _live_original(live, stash[server])
+    if adopted is None:
+        return None
+    if _launch_of(adopted) is None:
+        raise ValueError(
+            f"server '{server}' was replaced by hand with an entry that has no 'command' "
+            f"or 'url' — terse can't wrap it. Fix that entry in the config and re-run; "
+            f"nothing was changed and the stashed original is kept")
+    stash[server] = adopted
+    return adopted
 
 
 def unwrap(config: dict, stash: dict, server: str,
@@ -1364,8 +1429,8 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
         # entry's command is terse itself.
         # A hand-replaced entry is the original now (`wrap` adopts it below), so classify
         # and compare against it, not the stale stash copy.
-        replaced = s in stash and _replaced_by_hand(before, stash[s])
-        orig = (before if replaced else stash.get(s) or before) or {}
+        adopted = _live_original(before, stash[s]) if s in stash else None
+        orig = (adopted or stash.get(s) or before) or {}
         s_diff = diff
         if diff is None and classify_design_server(
                 s, [orig.get("command", ""), *(orig.get("args") or [])]):
@@ -1378,7 +1443,8 @@ def do_install(servers: list[str], policy: str, *, dry_run: bool = False,
         preserved = sorted(
             k for k in (before or {})
             if k not in ("command", "args", "url", "headers")
-            and s in stash and not replaced and (before or {}).get(k) != stash[s].get(k)
+            and s in stash and adopted is None
+            and (before or {}).get(k) != stash[s].get(k)
         )
         wrap(node, stash, s, policy_abs, terse_cmd, capture_dir=capture_abs,
              diff=s_diff, diff_keyframe_interval=diff_keyframe_interval,
@@ -2090,8 +2156,10 @@ def do_uninstall(servers: list[str] | None, *, all_: bool = False,
             isinstance(d, dict) and d.get("name") == s
             for d in (peers_doc.get("downstreams") or []))
         live = node.get("mcpServers", {}).get(s)
-        if _replaced_by_hand(live, stash[s]):
-            # Restoring the stash would overwrite the user's newer entry with the old one.
+        adopted = _live_original(live, stash[s])
+        if adopted is not None and adopted is live:
+            # Replaced by hand with an ordinary entry: restoring the stash would overwrite
+            # the user's newer entry with the old one.
             detached = peers_doc is not None and any(
                 isinstance(d, dict) and d.get("name") == s
                 for d in (peers_doc.get("downstreams") or []))
@@ -2103,6 +2171,10 @@ def do_uninstall(servers: list[str] | None, *, all_: bool = False,
                                       "replaced by hand); kept it and dropped the stale "
                                       "stash copy"})
             continue
+        if adopted is not None:
+            # Still terse's wrapper, but its downstream was edited by hand: unwrap to THAT
+            # downstream, not the stale stash copy.
+            stash[s] = adopted
         unwrap(node, stash, s, peers_doc=peers_doc, router=router_name)
         change = {"server": s, "restored": True}
         if detached and router_name:
