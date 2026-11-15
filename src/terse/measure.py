@@ -43,7 +43,7 @@ def measure_payload(raw: str) -> dict[str, Any]:
         # as not-applicable with zero savings, instead of crashing `terse measure`.
         if transforms.exceeds_depth(obj):
             applicable = False
-    except (ValueError, TypeError, RecursionError):
+    except transforms.PARSE_ERRORS:
         # ValueError covers JSONDecodeError AND the int-digit limit (a 5000-digit
         # integer literal raises a plain ValueError from json.loads).
         applicable = False
@@ -192,7 +192,7 @@ def measure_joined(raws: list[str]) -> dict[str, Any] | None:
     for raw in raws:
         try:
             obj = transforms.loads_faithful(raw)
-        except (ValueError, TypeError, RecursionError):   # ValueError: #563, UnfaithfulJSON
+        except transforms.PARSE_ERRORS:   # ValueError: #563, UnfaithfulJSON
             return None                      # non-JSON/unfaithful block: apply_joined refuses
         if not isinstance(obj, dict):
             return None                      # not a record sequence: apply_joined refuses
@@ -252,22 +252,37 @@ def cross_tokenizer_savings(envelopes: list[dict[str, Any]]) -> list[dict[str, A
     Stability of the savings % across two very different tokenizers is the keyless
     evidence that the structural savings hold for Claude's (unpublished) tokenizer:
     folding whitespace/keys/values removes tokens regardless of vocabulary.
+
+    A payload that nests too deep to parse or to encode (RecursionError) has no compressed
+    form to count: its row carries `skipped` (`transforms.TOO_DEEP`) and `None` for the
+    compressed count and the %, never a 0% that reads as "measured, no saving". There is
+    no fixed depth screen: a payload past `MAX_DEPTH` that the codec encodes is measured.
     """
     out = []
     for env in envelopes:
         raw = env["raw"]
+        comp: str | None = raw            # None: too deep to parse or encode
         try:
             obj = transforms.loads_faithful(raw)
-            if transforms.exceeds_depth(obj):
-                raise ValueError("too deep")   # the proxy passes it through (#79)
-            comp = transforms.compress(obj)
-        except transforms.PARSE_ERRORS:   # #563 int-digit limit, UnfaithfulJSON, depth
-            comp = raw
+        except RecursionError:
+            comp = None
+        except transforms.PARSE_ERRORS:   # #563 int-digit limit, UnfaithfulJSON, non-JSON
+            pass                          # passed through as-is, like the proxy does
+        else:
+            # Outside the parse's try: a TypeError from `compress` itself is a codec fault
+            # and must surface, not be scored as 0% savings (#591 B8).
+            try:
+                comp = transforms.compress(obj)
+            except RecursionError:
+                comp = None
         # Qualified name — the same one coverage/policy use, so a report's measure rows and
         # coverage counts name one tool the same way (#158).
         row: dict[str, Any] = {"tool": qualified_tool(env)}
+        if comp is None:
+            row["skipped"] = transforms.TOO_DEEP
         for enc in (CL100K, O200K):
-            r, c = count(raw, enc), count(comp, enc)
+            r = count(raw, enc)
+            c = None if comp is None else count(comp, enc)
             pct = ((r - c) / r * 100) if (r and c is not None) else None
             row[enc] = {"raw": r, "compressed": c, "pct": pct}
         out.append(row)

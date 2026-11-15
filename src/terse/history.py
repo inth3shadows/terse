@@ -20,6 +20,7 @@ from typing import Any
 
 from ._secure_io import append_restricted, mkdir_restricted
 from .report import savings_totals
+from .transforms import PARSE_ERRORS
 
 # One JSONL line per real `measure --history` run — tiny, but unbounded over a project's
 # life. Rotate a single generation once the live file passes this so it can't grow forever
@@ -69,14 +70,15 @@ def load_history(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     runs = []
-    # errors="replace": one torn multibyte write must not make every later render raise.
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line:
+    # Decoded per line, strictly: one torn multibyte write must not make every later render
+    # raise, and `errors="replace"` would read a bad byte inside a string as a different,
+    # valid run. The damaged line alone is skipped.
+    for raw_line in path.read_bytes().splitlines():
+        if not raw_line.strip():
             continue
         try:
-            run = json.loads(line)
-        except (ValueError, RecursionError):
+            run = json.loads(raw_line.decode("utf-8"))
+        except PARSE_ERRORS:   # bad UTF-8, the int-digit limit, deep nesting
             continue
         if isinstance(run, dict):   # a `[1]` / `5` line is not a run summary
             runs.append(run)

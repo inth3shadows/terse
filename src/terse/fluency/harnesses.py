@@ -9,13 +9,14 @@ reports cross-tokenizer divergence rather than averaging it away).
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from typing import Any
 
 from .. import text_diff
 from ..capture import LONG_TEXT, OTHER, classify_shape
-from ..transforms import PARSE_ERRORS, compress, diff_wire, loads_within_depth
+from ..transforms import PARSE_ERRORS, TOO_DEEP, compress, diff_wire
 from .answerers import Answerer
 from .ledger import log_call
 from .pack import PRIMER
@@ -110,9 +111,10 @@ def _ask_n(answerer: Answerer, system: str, user: str,
 
 
 def run_payload(obj: Any, raw_text: str, answerer: Answerer,
-                primer: str = PRIMER, trials: int = 1, model: str = "") -> list[dict]:
+                primer: str = PRIMER, trials: int = 1, model: str = "") -> list[dict] | None:
     """Ask one payload's questions over raw / terse / terse+primer / terse+inline-primer,
-    `trials` times each.
+    `trials` times each. None, with nothing asked, when `obj` nests too deep for `compress`
+    or `gen_questions` to walk (RecursionError): the caller reports that skip (#591 B4).
 
     Each returned row carries per-form success COUNTS (0..trials) plus `trials`, not
     booleans. At trials=1 a count is 0 or 1 — truthy/falsy exactly like the old bool —
@@ -135,9 +137,13 @@ def run_payload(obj: Any, raw_text: str, answerer: Answerer,
     role in scoring. Callers that don't have a name for their answerer (most direct test
     calls) can leave it as `""`; `run_fluency` passes the answerer's dict key.
     """
-    terse_text = compress(obj)
+    try:
+        terse_text = compress(obj)
+        questions = gen_questions(obj)
+    except RecursionError:
+        return None
     out: list[dict] = []
-    for q in gen_questions(obj):
+    for q in questions:
         raw_u = _user_prompt(q.prompt, q.instruction, raw_text)
         terse_u = _user_prompt(q.prompt, q.instruction, terse_text)
         # The primer PREFIXES the result body, which is where a lazy primer would put it:
@@ -229,6 +235,14 @@ def progress_line(label: str, model: str, done: int, total: int, rows: list[dict
             f"{fails}/{attempts} call(s) failed  ({elapsed:.0f}s)")
 
 
+def too_deep_line(label: str, tool: Any, model: str, done: int, total: int) -> str:
+    """The `progress` line for a payload skipped because it nests too deep to parse or to
+    walk (`TOO_DEEP`), in place of `progress_line` for that payload: the skip is named
+    as it happens rather than reading as a payload with no questions."""
+    return (f"[{label}] (skipped: {TOO_DEEP}) {str(tool):<24} {model}: "
+            f"{done}/{total} payload(s)")
+
+
 def run_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
                 primer: str = PRIMER, trials: int = 1,
                 progress: Progress | None = None) -> dict:
@@ -239,7 +253,8 @@ def run_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
     (no record list, no nested dict-map, not a flat record) are skipped.
 
     `progress`, when given, receives one `progress_line` per (model, payload) as each
-    completes — including payloads that were skipped, so `done` reaches `total`.
+    completes — including payloads that were skipped, so `done` reaches `total`. A
+    payload that nests too deep to parse or encode gets a `too_deep_line` instead.
     """
     results: dict[str, list[dict]] = {}
     progress = guarded(progress)
@@ -247,15 +262,20 @@ def run_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
         rows: list[dict] = []
         started = time.monotonic()
         for i, env in enumerate(envelopes, 1):
+            too_deep = False
             try:
-                obj = loads_within_depth(env["raw"])
-            except PARSE_ERRORS:
-                obj = None
+                obj = json.loads(env["raw"])
+            except PARSE_ERRORS as e:
+                obj, too_deep = None, isinstance(e, RecursionError)
             if obj is not None:
-                for row in run_payload(obj, env["raw"], fn, primer, trials, model=name):
+                payload_rows = run_payload(obj, env["raw"], fn, primer, trials, model=name)
+                too_deep = payload_rows is None
+                for row in payload_rows or []:
                     rows.append({"tool": env["tool"], "sha": env.get("sha", "?"), **row})
             if progress is not None:
-                progress(progress_line("fluency", name, i, len(envelopes), rows, started,
+                progress(too_deep_line("fluency", env["tool"], name, i, len(envelopes))
+                         if too_deep else
+                         progress_line("fluency", name, i, len(envelopes), rows, started,
                                        model_index=(k, len(answerers))))
         results[name] = rows
     return results
@@ -269,7 +289,7 @@ def run_fluency(envelopes: list[dict], answerers: dict[str, Answerer],
 # decision under production conditions.)
 # --------------------------------------------------------------------------- #
 def run_diff_payload(prev_obj: Any, curr_obj: Any, answerer: Answerer,
-                     tool: str = "", trials: int = 1, model: str = "") -> list[dict]:
+                     tool: str = "", trials: int = 1, model: str = "") -> list[dict] | None:
     """Does the model answer questions about the CURRENT result as well from
     (previous full result + diff) as from the full current result?
 
@@ -280,15 +300,20 @@ def run_diff_payload(prev_obj: Any, curr_obj: Any, answerer: Answerer,
 
     Returns rows carrying full-terse (`terse_ok`) and diff-form (`diff_ok`) success
     counts over the SAME questions. [] if curr is not record-shaped or no lossless diff
-    applies (nothing to compare)."""
-    questions = gen_questions(curr_obj)
-    if not questions:
-        return []
-    wire = diff_wire(prev_obj, curr_obj, tool)
-    if wire is None:
-        return []
-    curr_terse = compress(curr_obj)
-    diff_data = f"PREVIOUS RESULT:\n{compress(prev_obj)}\n\nUPDATE (diff against it):\n{wire}"
+    applies (nothing to compare). None, with nothing asked, if either payload nests too
+    deep to walk (RecursionError; see `run_payload`)."""
+    try:
+        questions = gen_questions(curr_obj)
+        if not questions:
+            return []
+        wire = diff_wire(prev_obj, curr_obj, tool)
+        if wire is None:
+            return []
+        curr_terse = compress(curr_obj)
+        prev_terse = compress(prev_obj)
+    except RecursionError:
+        return None
+    diff_data = f"PREVIOUS RESULT:\n{prev_terse}\n\nUPDATE (diff against it):\n{wire}"
     out: list[dict] = []
     for q in questions:
         full_u = _user_prompt(q.prompt, q.instruction, curr_terse)
@@ -329,17 +354,21 @@ def _aggregate_by_model(pairs: list[tuple], answerers: dict[str, Answerer], tria
                         payload_fn, label: str = "fluency --diff",
                         progress: Progress | None = None) -> dict:
     """Shared per-model aggregation loop for run_diff_fluency/run_text_diff_fluency:
-    run `payload_fn` over every pair for every answerer and collect the rows."""
+    run `payload_fn` over every pair for every answerer and collect the rows. A pair
+    `payload_fn` declines as too deep (None) gets a `too_deep_line`."""
     results: dict[str, list[dict]] = {}
     progress = guarded(progress)
     for k, (name, fn) in enumerate(answerers.items(), 1):
         rows: list[dict] = []
         started = time.monotonic()
         for i, (tool, csha, a, b) in enumerate(pairs, 1):
-            for row in payload_fn(a, b, fn, tool, trials=trials, model=name):
+            pair_rows = payload_fn(a, b, fn, tool, trials=trials, model=name)
+            for row in pair_rows or []:
                 rows.append({"tool": tool, "sha": csha, **row})
             if progress is not None:
-                progress(progress_line(label, name, i, len(pairs), rows, started,
+                progress(too_deep_line(label, tool, name, i, len(pairs))
+                         if pair_rows is None else
+                         progress_line(label, name, i, len(pairs), rows, started,
                                        model_index=(k, len(answerers))))
         results[name] = rows
     return results
@@ -352,8 +381,8 @@ def diff_pairs(envelopes: list[dict]) -> list[tuple]:
     pairs: list[tuple] = []
     for tool, csha, prev_raw, curr_raw in _iter_consecutive_pairs(envelopes):
         try:
-            prev_obj = loads_within_depth(prev_raw)
-            curr_obj = loads_within_depth(curr_raw)
+            prev_obj = json.loads(prev_raw)
+            curr_obj = json.loads(curr_raw)
         except PARSE_ERRORS:
             continue
         pairs.append((tool, csha, prev_obj, curr_obj))
@@ -388,7 +417,8 @@ def build_chain_windows(envelopes: list[dict], max_depth: int = 5,
     Sampling per depth is round-robin across tools (one window per tool per pass,
     starts spread along each tool's maximal diffable run) until `per_depth_cap` —
     tool diversity beats stacking one chatty tool's windows. Returns
-    [(tool, final_sha, depth, [obj_0 .. obj_k])]."""
+    [(tool, final_sha, depth, [obj_0 .. obj_k])]. A payload that nests too deep to
+    parse, diff or question (RecursionError) ends a run like a non-diffable hop."""
     runs: dict[str, list[list[tuple]]] = {}   # tool -> maximal runs of (sha, obj)
     by_tool: dict[str, list[dict]] = {}
     for env in envelopes:
@@ -397,13 +427,16 @@ def build_chain_windows(envelopes: list[dict], max_depth: int = 5,
         seq: list[tuple] = []
         for e in envs:
             try:
-                seq.append((e.get("sha", "?"), loads_within_depth(e["raw"])))
+                seq.append((e.get("sha", "?"), json.loads(e["raw"])))
             except PARSE_ERRORS:
                 seq.append((e.get("sha", "?"), None))
         cur: list[tuple] = []
         for (psha, p), (csha, c) in zip(seq, seq[1:], strict=False):  # sliding pairs
-            ok = (p is not None and c is not None
-                  and diff_wire(p, c, tool) is not None)
+            try:
+                ok = (p is not None and c is not None
+                      and diff_wire(p, c, tool) is not None)
+            except RecursionError:
+                ok = False
             if ok:
                 if not cur:
                     cur = [(psha, p)]
@@ -423,7 +456,13 @@ def build_chain_windows(envelopes: list[dict], max_depth: int = 5,
             for run in tool_runs:
                 for i in range(0, len(run) - depth, depth):   # non-overlapping
                     window = run[i:i + depth + 1]
-                    if gen_questions(window[-1][1]):
+                    # Inline, not a helper: a helper's extra frame moved the RecursionError
+                    # threshold, dropping a window a direct call handles (#591 B4).
+                    try:
+                        askable = bool(gen_questions(window[-1][1]))
+                    except RecursionError:
+                        askable = False
+                    if askable:
                         starts.append(window)
             if starts:
                 candidates[tool] = starts
@@ -446,23 +485,28 @@ def build_chain_windows(envelopes: list[dict], max_depth: int = 5,
 
 
 def run_chain_payload(objs: list, answerer: Answerer, tool: str = "",
-                      trials: int = 1, model: str = "") -> list[dict]:
+                      trials: int = 1, model: str = "") -> list[dict] | None:
     """run_diff_payload generalized to a depth-N chain: the same questions about the
     FINAL state, control = full-terse of the final result, form = the base full-terse
     plus every intermediate diff wire in order — exactly the context a model has
     accumulated after N consecutive diffs, with no system primer (production
-    condition). [] if any hop stops admitting a lossless diff or no questions."""
-    questions = gen_questions(objs[-1])
-    if not questions:
-        return []
-    wires: list[str] = []
-    for prev, curr in zip(objs, objs[1:], strict=False):  # sliding pairs
-        wire = diff_wire(prev, curr, tool)
-        if wire is None:
+    condition). [] if any hop stops admitting a lossless diff or no questions. None,
+    with nothing asked, if a payload nests too deep to walk (see `run_payload`)."""
+    try:
+        questions = gen_questions(objs[-1])
+        if not questions:
             return []
-        wires.append(wire)
-    curr_terse = compress(objs[-1])
-    chain_data = f"PREVIOUS RESULT:\n{compress(objs[0])}" + "".join(
+        wires: list[str] = []
+        for prev, curr in zip(objs, objs[1:], strict=False):  # sliding pairs
+            wire = diff_wire(prev, curr, tool)
+            if wire is None:
+                return []
+            wires.append(wire)
+        curr_terse = compress(objs[-1])
+        base_terse = compress(objs[0])
+    except RecursionError:
+        return None
+    chain_data = f"PREVIOUS RESULT:\n{base_terse}" + "".join(
         f"\n\nUPDATE (diff against the result above, applied in order):\n{w}"
         for w in wires)
     out: list[dict] = []
@@ -502,10 +546,13 @@ def run_diff_soak(envelopes: list[dict], answerers: dict[str, Answerer],
         rows: list[dict] = []
         started = time.monotonic()
         for i, (tool, sha, _depth, objs) in enumerate(windows, 1):
-            for row in run_chain_payload(objs, fn, tool, trials=trials, model=name):
+            window_rows = run_chain_payload(objs, fn, tool, trials=trials, model=name)
+            for row in window_rows or []:
                 rows.append({"tool": tool, "sha": sha, **row})
             if progress is not None:
-                progress(progress_line("fluency --diff-soak", name, i, len(windows), rows,
+                progress(too_deep_line("fluency --diff-soak", tool, name, i, len(windows))
+                         if window_rows is None else
+                         progress_line("fluency --diff-soak", name, i, len(windows), rows,
                                        started, model_index=(k, len(answerers))))
         results[name] = rows
     return results

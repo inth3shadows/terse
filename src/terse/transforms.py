@@ -184,15 +184,13 @@ def loads_faithful(raw: str) -> Any:
 # JSONDecodeError let one such payload abort a whole command, a paid eval run included.
 PARSE_ERRORS: tuple[type[Exception], ...] = (ValueError, TypeError, RecursionError)
 
-
-def loads_within_depth(raw: Any) -> Any:
-    """`json.loads(raw)`, raising ValueError for a value nested past `MAX_DEPTH`, which
-    every later recursive walk (the codec, question generators) would RecursionError on.
-    Callers catch `PARSE_ERRORS`."""
-    obj = json.loads(raw)
-    if exceeds_depth(obj):
-        raise ValueError(f"nested deeper than {MAX_DEPTH}")
-    return obj
+# The reason an eval or report gives for a payload it skipped because it nests too deep to
+# parse, or too deep for the recursive walks (the codec, the question generators). There
+# is deliberately no fixed depth screen in front of those walks: they handle payloads well
+# past `MAX_DEPTH`, so a payload is skipped exactly when parsing or walking it raised
+# RecursionError (#591 review B4), and the skip says so rather than reading as 0% savings
+# or as some other skip reason.
+TOO_DEEP = "nests too deep to parse or encode (RecursionError)"
 
 
 def exceeds_depth(obj: Any, cap: int = MAX_DEPTH) -> bool:

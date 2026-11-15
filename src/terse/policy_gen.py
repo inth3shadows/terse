@@ -61,6 +61,7 @@ from .capture import (
 from .lossy import DEFAULT_TEXT_DROP_MIN, TEXT_SELECTOR_CODE_BLOCKS, fenced_spans
 from .measure import measure_joined, measure_payload
 from .tokenize import count_cl100k
+from .transforms import PARSE_ERRORS
 
 # Tiers are cumulative in the codec (minify ⊂ tabularize ⊂ dictionary). minify is implied
 # by re-serialization, so it never ships alone — tabularize always carries it.
@@ -490,7 +491,7 @@ def _drop_candidates(
     for raw in raws:
         try:
             obj = json.loads(raw)
-        except (ValueError, TypeError):   # ValueError: the int-digit limit, #563
+        except PARSE_ERRORS:   # the int-digit limit (#563), deep nesting, non-str
             continue
         records, p = find_record_list_with_path(obj)
         if records is None or p is None:

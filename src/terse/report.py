@@ -3539,7 +3539,8 @@ def build_tokenizer_report(rows: list[dict[str, Any]]) -> str:
         a = r[CL100K]["pct"]
         b = r[O200K]["pct"]
         if a is None or b is None:
-            out.append(f"| `{r['tool']}` | n/a | n/a | n/a |")
+            why = f" ({r['skipped']})" if r.get("skipped") else ""
+            out.append(f"| `{r['tool']}`{why} | n/a | n/a | n/a |")
             continue
         d = abs(a - b)
         deltas.append(d)
