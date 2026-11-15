@@ -12,9 +12,31 @@ from terse import transforms
 HUGE_INT = '{"n": ' + "9" * 5000 + "}"
 DEEP = "[" * 800 + "]" * 800
 VERY_DEEP = "[" * 100_000 + "]" * 100_000
+DEEP_OBJECT = '{"a":' * 100_000
 
 
-@pytest.mark.parametrize("raw", [HUGE_INT, VERY_DEEP, "nope", None])
+@pytest.fixture
+def deep_parse_overflows(monkeypatch):
+    """Make `json.loads` raise RecursionError on the 100k-deep fixtures, on every machine.
+
+    Whether CPython's C parser overflows at 100k levels depends on the build's C-stack
+    limit: this box's 3.14 does, the CI runner's 3.14 parses it fine (#591 CI). The code
+    under test must handle a RecursionError wherever it happens, so the overflow is
+    injected at the parse rather than hoped for; everything else parses for real. Patched
+    on the `json` module, which every reader calls as `json.loads` at call time."""
+    real = json.loads
+
+    def loads(s, *args, **kwargs):
+        if isinstance(s, str) and (s.startswith("[" * 1000) or s.startswith('{"a":' * 1000)):
+            raise RecursionError("maximum recursion depth exceeded while decoding (injected)")
+        return real(s, *args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", loads)
+
+
+@pytest.mark.usefixtures("deep_parse_overflows")
+@pytest.mark.parametrize("raw", [HUGE_INT, VERY_DEEP, "nope", None],
+                         ids=["huge_int", "deep_list", "not_json", "none"])
 def test_parsing_a_hostile_payload_raises_only_parse_errors(raw):
     with pytest.raises(transforms.PARSE_ERRORS):
         json.loads(raw)
@@ -24,6 +46,7 @@ def _env(raw, sha="s1", tool="t.get"):
     return {"raw": raw, "sha": sha, "tool": tool, "shape": "records"}
 
 
+@pytest.mark.usefixtures("deep_parse_overflows")
 def test_load_corpus_skips_bad_utf8_and_deep_files(tmp_path):
     from terse.capture import load_corpus
     (tmp_path / "bad.json").write_bytes(b'{"raw": "\xff"}')
@@ -87,8 +110,7 @@ def _records(salt: int = 0, depth: int = 0, n: int = 8) -> list[dict]:
 # generator's recursive walks handle; 600 is past what they handle (RecursionError).
 LEAF_250 = [json.dumps(_records(s, 250)) for s in range(3)]
 LEAF_600 = [json.dumps(_records(s, 600)) for s in range(3)]
-HOSTILE_REPLIES = ["[" + "9" * 5000 + "]", VERY_DEEP, "[" * 3000 + "]" * 3000,
-                   '{"a":' * 100_000]
+HOSTILE_REPLIES = ["[" + "9" * 5000 + "]", VERY_DEEP, "[" * 3000 + "]" * 3000, DEEP_OBJECT]
 REPLY_IDS = ["huge_int", "deep_100k", "deep_3000", "deep_object"]
 
 
@@ -98,6 +120,7 @@ def _envs(raws, tool="srv.t"):
 
 
 # B1: a model's reply is untrusted input to the scorer.
+@pytest.mark.usefixtures("deep_parse_overflows")
 @pytest.mark.parametrize("reply", HOSTILE_REPLIES, ids=REPLY_IDS)
 @pytest.mark.parametrize("qtype,expected", [("enumerate", ["a"]), ("deref", {"a": 1})])
 def test_score_reads_an_unparseable_reply_as_a_miss(qtype, expected, reply):
@@ -105,6 +128,7 @@ def test_score_reads_an_unparseable_reply_as_a_miss(qtype, expected, reply):
     assert score(qtype, expected, reply) is False
 
 
+@pytest.mark.usefixtures("deep_parse_overflows")
 @pytest.mark.parametrize("reply", HOSTILE_REPLIES, ids=REPLY_IDS)
 def test_run_fluency_scores_a_hostile_reply_and_keeps_the_rows(reply):
     from terse.fluency.harnesses import run_fluency
@@ -114,6 +138,7 @@ def test_run_fluency_scores_a_hostile_reply_and_keeps_the_rows(reply):
     assert len(out["m"]) == len(gen_questions(recs)) > 0
 
 
+@pytest.mark.usefixtures("deep_parse_overflows")
 @pytest.mark.parametrize("reply", HOSTILE_REPLIES, ids=REPLY_IDS)
 def test_drop_eval_question_survives_a_hostile_final_reply(reply):
     from terse.dropeval import DropQuestion, ToolCall, Turn, _run_question
@@ -125,6 +150,7 @@ def test_drop_eval_question_survives_a_hostile_final_reply(reply):
 
 
 # B2: `policy generate`, `tune` and `probe` read the same corpus payloads.
+@pytest.mark.usefixtures("deep_parse_overflows")
 def test_policy_drop_candidates_skip_a_payload_too_deep_to_parse():
     from terse.policy_gen import _drop_candidates
     _drop_candidates([VERY_DEEP, HUGE_INT, json.dumps(_records())])
@@ -140,6 +166,7 @@ def _write_corpus(d, raws):
     return d
 
 
+@pytest.mark.usefixtures("deep_parse_overflows")
 @pytest.mark.parametrize("argv", [["probe"], ["probe", "--cross-server"],
                                   ["policy", "generate"], ["tune"]])
 def test_corpus_commands_complete_on_a_payload_too_deep_to_parse(tmp_path, argv):
@@ -153,6 +180,7 @@ def test_corpus_commands_complete_on_a_payload_too_deep_to_parse(tmp_path, argv)
 
 
 # B3: an unparseable PRIOR envelope is treated like a missing one and overwritten.
+@pytest.mark.usefixtures("deep_parse_overflows")
 @pytest.mark.parametrize("prior", [b'{"captured_at": 1, "raw": "\xff"}', HUGE_INT.encode(),
                                    VERY_DEEP.encode()], ids=["bad_utf8", "huge_int", "deep"])
 def test_capture_overwrites_an_unparseable_prior_envelope(tmp_path, prior):
@@ -222,6 +250,7 @@ def test_a_payload_too_deep_for_the_codec_is_skipped_and_said_so():
     assert row["cl100k_base"]["pct"] is None and "too deep" in row["skipped"]
 
 
+@pytest.mark.usefixtures("deep_parse_overflows")
 def test_a_payload_too_deep_to_parse_is_reported_as_too_deep():
     from terse import dropeval, measure
     from terse import policy as policy_mod
@@ -286,6 +315,7 @@ def test_tool_call_arguments_of_another_type_stay_a_harness_error(monkeypatch):
 
 
 # B6: an unreadable corpus file is skipped with an accurate reason.
+@pytest.mark.usefixtures("deep_parse_overflows")
 def test_load_corpus_skips_unreadable_files_and_names_each_reason(tmp_path, capsys):
     import os
 
