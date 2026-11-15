@@ -530,7 +530,8 @@ class Interceptor:
                  log_prefix: str = "[terse-proxy]",
                  lazy_primer: bool = True,
                  shared_primer: PrimerLatch | None = None,
-                 primer_mode: str = PRIMER_ALWAYS):
+                 primer_mode: str = PRIMER_ALWAYS,
+                 track_in_flight: bool = False):
         self.policy = pol
         # The downstream server's name, when the caller knows it (`proxy --server-name`,
         # or a multiproxy peer's config name). Passed to every `policy.select`/`apply` so
@@ -544,6 +545,13 @@ class Interceptor:
         # overrides it to a peer-qualified name (see note_request's tool_name) so two
         # peers' same-named tools don't collide into one capture-corpus bucket.
         self.pending: dict[Any, tuple[str, str, str]] = {}
+        # id -> monotonic time it was forwarded, for every client REQUEST of any method
+        # still unanswered: cleared by a reply with that id or by the client's
+        # `notifications/cancelled`, capped like `pending`. Read by `run_proxy`'s post-EOF
+        # wait through `in_flight_since` (#588 review), which is the only caller that
+        # asks for it; None = not tracked (multiproxy answers broadcasts itself, so those
+        # replies never reach `transform_response` to clear an entry).
+        self._in_flight: dict[Any, float] | None = {} if track_in_flight else None
         # Bumped on every `initialize`, and folded into the result id handed to `capture`
         # so a reconnecting client's restarted JSON-RPC ids stay distinguishable (#148).
         self._result_gen = 0
@@ -761,6 +769,17 @@ class Interceptor:
         raw_params = msg.get("params")
         params = raw_params if isinstance(raw_params, dict) else {}
         with self._local_lock:
+            flight = self._in_flight
+            if flight is not None:
+                if method == "notifications/cancelled":
+                    rid = params.get("requestId")
+                    if isinstance(rid, (str, int, float)):
+                        flight.pop(rid, None)
+                elif isinstance(method, str) and isinstance(mid, (str, int, float)):
+                    flight.pop(mid, None)   # a reused id moves to the newest end
+                    flight[mid] = time.monotonic()
+                    while len(flight) > self.PENDING_MAX:
+                        flight.pop(next(iter(flight)))
             if method == "initialize":
                 # A re-handshake means the client rebuilt its MCP connection — and almost
                 # certainly its context window — so the model no longer holds any prior
@@ -840,6 +859,12 @@ class Interceptor:
                 while len(self.pending) > self.PENDING_MAX:
                     self.pending.pop(next(iter(self.pending)))
 
+    def in_flight_since(self, cutoff: float) -> bool:
+        """True while a request forwarded at or after `cutoff` (a `time.monotonic()`
+        value) is still unanswered. Always False unless built with `track_in_flight`."""
+        with self._local_lock:
+            return any(sent >= cutoff for sent in (self._in_flight or {}).values())
+
     def clear_init_id(self) -> None:
         """Reset the one-time initialize-reply marker `note_request` just set, without
         waiting for `transform_response` to see it. Used by multiproxy for a broadcast-
@@ -888,6 +913,8 @@ class Interceptor:
         # transform_response, even under multiproxy's shared drop store (see
         # _drop_put/_store_lock for the piece that DOES need cross-peer exclusion).
         with self._local_lock:
+            if self._in_flight is not None and isinstance(msg["id"], (str, int, float)):
+                self._in_flight.pop(msg["id"], None)   # answered, success or error
             if msg["id"] == self.init_id:
                 self.init_id = None  # one-time
                 if self._lazy_primer or self._primer_mode == PRIMER_NEVER:
@@ -2457,6 +2484,16 @@ def nonobject_params_reply(line: str) -> str | None:
     return "" if mid is None else error_line(mid, -32602, NONOBJECT_PARAMS_MESSAGE)
 
 
+def _encodable(text: str) -> bool:
+    """False for a str holding a lone surrogate (or a surrogateescape'd byte), which a
+    strict UTF-8 stream cannot write."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def pump(src: Iterable[str], dst: Any, transform: Callable[[str], Any],
          lock: Lock | None = None, on_read: Callable[[str], None] | None = None,
          on_write: Callable[[str], Callable[[], None]] | None = None) -> None:
@@ -2526,25 +2563,34 @@ def stdio_transport_error(cmd: list[str]) -> str | None:
 # How long a stdio child may sit IDLE after the client closed our stdin (we close the
 # child's in turn) before it is terminated. A server that ignores stdin EOF otherwise kept
 # `run_proxy` blocked in `wait()` forever, orphaning both processes, whenever the client
-# left without signalling us. Idle means no tool call still in flight and no output for
-# this long: a child still answering a request the client sent just before EOF (a slow
-# tool, a cold `npx` start) is never cut off for being slow.
+# left without signalling us. Idle means no request in flight and no output for this
+# long: a child still answering a request the client sent just before EOF (a slow tool, a
+# cold `npx` start answering `initialize`) is never cut off for being slow.
+#
+# "In flight" (#588 review) is any request, of any method, that is still unanswered (no
+# reply with its id, no `notifications/cancelled` for it) AND was forwarded no more than
+# `_EOF_GRACE_S` before client EOF. An older unanswered id is one the client already gave
+# up on (timed out, or got an `id: null` error for), so it never holds the wait open:
+# a child that ignores EOF is then reaped after the grace, not the ceiling.
 _EOF_GRACE_S = 30.0
-# The hard ceiling after client EOF, busy or not. `busy` reads the in-flight tool calls,
-# and an entry there is only cleared by its reply: a call the client cancelled (or a hung
-# tool it gave up on, the likeliest reason it left) stays "in flight" forever, as does a
-# child that keeps emitting notifications. Without a ceiling either brings the orphan
-# back. Generous, because a reply after EOF can still be legitimately slow.
+# The hard ceiling after client EOF, busy or not: a request sent just before EOF that the
+# child never answers, or a child that keeps emitting notifications (each one resets the
+# idle timer), would otherwise bring the orphan back. Generous, because a reply after EOF
+# can still be legitimately slow.
 _EOF_MAX_S = 600.0
 
 
-def _wait_child(transport: Any, t_up: Any, *, busy: Callable[[], bool] = lambda: False,
+def _wait_child(transport: Any, t_up: Any, *,
+                busy: Callable[[float], bool] = lambda _cutoff: False,
                 last_output: Callable[[], float] = lambda: 0.0,
                 poll_s: float = 0.2) -> int:
     """The stdio child's exit code. Waits as long as the session lasts; once the
-    client->server thread has ended (client EOF), a child that stays idle (`busy()` false
-    and no output, per `last_output()`, a monotonic timestamp) for `_EOF_GRACE_S` is
-    terminated (SIGTERM, then SIGKILL)."""
+    client->server thread has ended (client EOF), a child that stays idle (no request in
+    flight per `busy(cutoff)`, which is True while a request forwarded at or after the
+    monotonic `cutoff` is unanswered, and no output per `last_output()`, a monotonic
+    timestamp) for `_EOF_GRACE_S` is terminated (SIGTERM, then SIGKILL). A child that even
+    SIGKILL does not reap (D state, stopped or traced) is given up on with exit code 1
+    rather than waited for forever."""
     proc = getattr(transport, "proc", None)
     if proc is None:   # a non-subprocess transport: nothing to poll or escalate
         return int(transport.wait())
@@ -2560,13 +2606,19 @@ def _wait_child(transport: Any, t_up: Any, *, busy: Callable[[], bool] = lambda:
         if eof_at is None:
             eof_at = now
         capped = now - eof_at >= _EOF_MAX_S
-        if not capped and (busy() or now - max(eof_at, last_output()) < _EOF_GRACE_S):
+        if not capped and (busy(eof_at - _EOF_GRACE_S)
+                           or now - max(eof_at, last_output()) < _EOF_GRACE_S):
             continue
         why = (f"was still running {_EOF_MAX_S:g}s after client EOF" if capped else
                f"stayed idle {_EOF_GRACE_S:g}s after client EOF")
         sys.stderr.write(f"[terse] downstream {why} without exiting; terminating it\n")
-        _terminate_child(proc)
-        return int(proc.wait())
+        _terminate_child(proc)   # bounded: SIGTERM, then SIGKILL, each with a timeout
+        rc = proc.poll()
+        if rc is None:
+            sys.stderr.write(f"[terse] downstream (pid {proc.pid}) did not exit even "
+                             "after SIGKILL; giving up on reaping it\n")
+            return 1
+        return int(rc)
 
 
 def _terminate_child(proc: subprocess.Popen[Any], timeout: float = 2.0) -> None:
@@ -2871,7 +2923,7 @@ def run_proxy(
                         stats_retrieve=stats_retrieve, stats_primer=stats_primer,
                         ledger_label=ledger_label,
                         server_name=server_name, lazy_primer=lazy_primer,
-                        primer_mode=primer_mode)
+                        primer_mode=primer_mode, track_in_flight=True)
 
     try:
         transport = build_transport(cmd, headers=headers)
@@ -2910,6 +2962,15 @@ def run_proxy(
     try:
         def client_to_server() -> None:
             def fwd(line: str) -> Any:
+                # Undecodable bytes arrive as surrogateescape'd surrogates (below), which
+                # pump's `escape_surrogates` would forward as a DIFFERENT valid JSON value
+                # (`"caf\xe9"` -> `"caf\udce9"`). Drop the line with no reply, exactly as
+                # multiproxy's client loop does (#588 review).
+                if not _encodable(line):
+                    if debug:
+                        sys.stderr.write("[terse-proxy] client line dropped: not valid "
+                                         "UTF-8\n")
+                    return SWALLOW
                 # A terse.retrieve call is ours to answer from the drop store — the downstream
                 # server has no such tool. Write the reply straight back to the client and
                 # SWALLOW the request so it never reaches downstream (and never enters
@@ -2954,6 +3015,7 @@ def run_proxy(
             # A strict decoder raises on invalid UTF-8 INSIDE pump's iterator, outside its
             # per-line containment: one stray byte killed this thread, half-closed the
             # child and ended the session with exit 0. multiproxy has had this since #517.
+            # `fwd` above then drops each such line rather than forwarding it.
             try:
                 if hasattr(cin, "reconfigure"):
                     cin.reconfigure(errors="surrogateescape")
@@ -3005,7 +3067,7 @@ def run_proxy(
             if wire is not None:
                 wire.event("peer_exit", peer=peer_label, pid=None, exit_code=None)
         else:
-            rc = _wait_child(transport, t_up, busy=lambda: bool(inter.pending),
+            rc = _wait_child(transport, t_up, busy=inter.in_flight_since,
                              last_output=lambda: last_output[0])
             if wire is not None:
                 wire.event("peer_exit", peer=peer_label, pid=_transport_pid(transport),

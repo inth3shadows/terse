@@ -16,15 +16,18 @@ fails that pull request until the section has moved.
 ### Fixed
 - `terse proxy` (single server) ended the whole session with exit 0 on one byte of invalid
   UTF-8 from the client. The strict decoder raised inside the stdin loop and killed the
-  client-to-server thread. Client stdin is now read with `surrogateescape`, as the
-  multiproxy router has done since #517.
+  client-to-server thread. Client stdin is now read with `surrogateescape`, and a line
+  that is not valid UTF-8 is dropped, never forwarded (a `--debug` stderr note), exactly
+  as the multiproxy router has done since #517. Later lines are still answered.
 - A stdio downstream that ignores stdin EOF kept `terse proxy` blocked forever once the
   client disconnected without signalling it, orphaning both processes. After client EOF,
-  a child that stays idle for 30 seconds (no tool call in flight and no output) is now
-  terminated (SIGTERM, then SIGKILL), with a stderr note. A child still answering a
-  request the client sent before EOF is not cut off for being slow, up to a 10-minute
-  ceiling after EOF that also ends a child kept "busy" by a cancelled call or a stream of
-  notifications.
+  a child that stays idle for 30 seconds (no request in flight and no output) is now
+  terminated (SIGTERM, then SIGKILL), with a stderr note. A request of any method sent
+  within those 30 seconds before EOF and not yet answered or cancelled keeps the child
+  alive, so a slow reply (a cold-started server's `initialize`, a long tool call) is not
+  cut off. An older unanswered request is treated as abandoned. A 10-minute ceiling after
+  EOF ends a child that never answers or keeps sending notifications, and a child that
+  even SIGKILL cannot reap is given up on (exit 1) instead of waited for forever.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,
