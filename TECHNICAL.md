@@ -417,7 +417,10 @@ off by default because it failed rung 4 at the measured hit rate.
   (`bool("false") is True`) and a lax coercion would silently re-enable the guard — the
   one direction a typo must never fail in.
 - **`critical`:** a denylist against lossy ops — a `critical` field is never truncated
-  or dropped, even if also marked `lossy`.
+  or dropped, even if also marked `lossy`. That covers overlap too: a lossy rule on an
+  ancestor (`items` truncated while `items[].id` is critical) or inside a critical subtree
+  is skipped with a warning, and paths are compared by their parsed tokens (`a.[].b` is
+  `a[].b`).
 - **`lossy`:** `truncate` and `drop-to-retrieve` are implemented (opt-in, off by default);
   `summarize` is accepted by the schema but **permanently closed (#261)** — it emits a
   warning and leaves the field lossless. The schema still accepts it so an existing policy

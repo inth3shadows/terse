@@ -99,3 +99,64 @@ def test_apply_skips_lossy_when_shape_mismatches_and_stays_lossless():
     res = apply(raw, "gh.api.x", p)
     assert transforms.decompress(res.text) == json.loads(raw)   # lossless fallback
     assert any("skipped" in w for w in res.warnings)
+
+
+# --- critical overlaps (audit 2026-11-12, H1) ---
+def _three_items():
+    return {"items": [{"id": "A1", "body": "x" * 300}, {"id": "B2", "body": "y" * 300},
+                      {"id": "C3", "body": "z" * 300}]}
+
+
+def test_truncate_on_an_ancestor_of_a_critical_field_is_skipped():
+    # `items` truncated to 1 used to cut away items 2 and 3 AND their critical ids.
+    rule = _rule({"items": {"lossy": "truncate", "max": 1}, "items[].id": {"critical": True}})
+    obj = _three_items()
+    assert lossy.apply_lossy(obj, rule) == obj
+    out = json.loads(apply(json.dumps(obj), "t", Policy(rules=[rule])).text)
+    assert [r["id"] for r in out["items"]] == ["A1", "B2", "C3"]
+
+
+def test_drop_of_an_ancestor_of_a_critical_field_is_skipped():
+    rule = _rule({"a": {"lossy": "drop-to-retrieve", "min": 10}, "a.secret": {"critical": True}})
+    assert lossy._drop_specs(rule) == []
+
+
+def test_lossy_inside_a_critical_subtree_is_skipped():
+    rule = _rule({"a": {"critical": True}, "a.b": {"lossy": "truncate", "max": 1}})
+    assert lossy._truncate_specs(rule) == []
+
+
+def test_critical_paths_compare_by_tokens_not_spelling():
+    # `a.[].b` and `a[].b` parse to the same path; the denylist used to miss the match.
+    rule = _rule({"a.[].b": {"lossy": "truncate", "max": 2}, "a[].b": {"critical": True}})
+    assert lossy._truncate_specs(rule) == []
+
+
+def test_sibling_of_a_critical_field_is_still_lossy():
+    rule = _rule({"items[].body": {"lossy": "truncate", "max": 5},
+                  "items[].id": {"critical": True}})
+    out = lossy.apply_lossy(_three_items(), rule)
+    assert [r["id"] for r in out["items"]] == ["A1", "B2", "C3"]
+    assert out["items"][0]["body"] == "xxxxx…⟨+295 chars⟩"
+
+
+def test_overlap_is_warned():
+    from terse.policy import _lossy_warnings
+    rule = _rule({"items": {"lossy": "truncate", "max": 1}, "items[].id": {"critical": True}})
+    assert any("overlaps critical field 'items[].id'" in w for w in _lossy_warnings(rule))
+
+
+def test_shared_string_prefix_is_not_an_ancestor():
+    rule = _rule({"items": {"lossy": "truncate", "max": 1}, "items2[].id": {"critical": True}})
+    assert [p for p, _ in lossy._truncate_specs(rule)] == ["items"]
+
+
+def test_root_list_path_shields_its_children():
+    rule = _rule({"[]": {"lossy": "truncate", "max": 1}, "[].id": {"critical": True}})
+    assert lossy._truncate_specs(rule) == []
+
+
+def test_same_path_lossy_and_critical_is_warned():
+    from terse.policy import _lossy_warnings
+    rule = _rule({"a": {"lossy": "truncate", "max": 1, "critical": True}})
+    assert "field 'a': marked 'truncate' AND critical — kept lossless" in _lossy_warnings(rule)
