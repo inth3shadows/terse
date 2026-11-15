@@ -14,6 +14,36 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Fixed
+- `terse mcp-status` (table and `--json`) printed each wrapped server's downstream command
+  unredacted, so `--api-key sk-…` appeared in the clear. It now goes through the same
+  redaction as `install-mcp`/`uninstall-mcp` output. That redaction also covers more
+  shapes: the `Authorization: Bearer …` header form (`--header`/`-H`, as `mcp-remote`
+  takes it, including curl's attached `-HName: value` and a value passed as its own arg,
+  after `Name:` or `Name=` with nothing after it), `PAT`/`KEY`/`BEARER`/`SESSION` as a
+  delimited part of a flag or name (`--key`, `--github-pat`, `--openai-key`,
+  `--session-id`, `GH_PAT=`, `STRIPE_KEY=`, `SESSION_ID=`, `X-GitHub-PAT`), single-dash
+  secret flags (`-token`, `-api-key`), env assignments attached to an env flag
+  (`--env=BAR_TOKEN=…`, `-e=KEY=…`, `-eKEY=…`), a secret value that starts with `-`
+  (`--token -x…`), and URL userinfo `urlsplit` can't parse (`https://u:pw@[::1/x`).
+  A flag right after `-H` is read as a flag, a `-H` URL is redacted as a URL, and
+  docker's `-H host:port` is left as it is when the name is host-like (`token-svc:8080`,
+  not `Authorization:12345`). `--no-auth`, `--no-session`, lookup keys (`--cache-key`,
+  `--sort-key`) and `--session-dir`/`--session-timeout` take no secret, so the arg after
+  them prints; any other flag containing `auth` (`--oauth`, `--basicauth`) still masks
+  the arg after it, as do `--no-token` and `--no-password`, and `--no-auth=…` is masked.
+  A secret-shaped `NAME=` inside a header value (`X-Custom: token=…`) and curl's attached
+  `-Htoken …` are masked too. `mcp-status` redacts the argument list before joining it,
+  so a header value containing spaces is masked whole.
+- The savings ledger labelled an HTTP downstream by its full URL netloc, so a
+  `https://user:pass@host/mcp` target wrote `user:pass@host` into every ledger row and into
+  `terse stats` output. The label is now the `host[:port]` alone, and rows already in the
+  ledger with a `user:pass@` or `token@` label are read back under the host. A URL with
+  userinfo and no host (`https://u:pw@/x`) is labelled `unknown`, and one `urlparse`
+  rejects (`https://u:pw@[::1/x`) no longer crashes `mcp-status`, `stats` or proxy startup.
+
+## [0.50.1] - 2026-11-15
+
+### Fixed
 - An HTTP downstream's response reached the client unframed. A pretty-printed JSON body,
   or an SSE event whose `data:` spanned several lines, was written to the client's stdio
   stream as several lines of non-JSON, and the request hung. An HTML 200 (a captive portal

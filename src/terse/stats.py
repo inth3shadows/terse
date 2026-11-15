@@ -65,7 +65,18 @@ def server_label(cmd: list[str]) -> str:
         return "unknown"
     target = cmd[0]
     if "://" in target:
-        return urlparse(target).netloc or target
+        # `netloc` includes any `user:pass@`, which then sat in every ledger row and in
+        # `terse stats` output; the host[:port] after the last `@` is the identity.
+        try:
+            netloc = urlparse(target).netloc
+        except ValueError:
+            # `https://u:pw@[::1/x`: urlparse raises, and this runs in mcp-status, stats
+            # and proxy startup, none of which may crash on one malformed entry.
+            netloc = re.split(r"[/?#]", target.split("://", 1)[1], maxsplit=1)[0]
+        if not netloc:
+            return target   # `file:///srv/mcp.sock`: no authority, so no userinfo either
+        # `https://u:pw@/x` has userinfo and no host: nothing names it, and `/x` would.
+        return netloc.rpartition("@")[2] or "unknown"
     return Path(target).name or target
 
 
@@ -515,6 +526,15 @@ def load_stats(log_path: str | Path, since_ts: int | None = None) -> list[dict[s
                 continue
             if not isinstance(rec, dict):
                 continue
+            server = rec.get("server")
+            if isinstance(server, str) and "@" in server:
+                # Rows written before `server_label` dropped URL userinfo carry
+                # `user:pass@host` or `token@host`; show (and group) them under the host
+                # alone. Only when the tail looks like a host or the head like `user:pass`,
+                # so a config key that merely contains `@` (`kb@work`) is left alone.
+                head, _, tail = server.rpartition("@")
+                if ":" in head or "." in tail:
+                    rec["server"] = tail
             if since_ts is not None and not (isinstance(rec.get("ts"), int)
                                              and rec["ts"] >= since_ts):
                 continue
