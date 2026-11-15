@@ -18,22 +18,30 @@ from typing import Any
 
 from .report import (
     _FIXED_IDEAL_MIN_QUESTIONS,
+    _GAP_TOLERANCE,
     ATTRITION_NOTE,
     DIFF_ARMS,
     DROPEVAL_METRICS,
     FLUENCY_CONTROL,
     FLUENCY_GATING,
     _ci,
+    _format_worst_case_line,
     _sum,
     attrition,
     attrition_block,
     diff_gap_rows,
+    diff_soak_verdict,
+    diff_soak_verdict_lines,
+    diff_verdict_lines,
     dropeval_attrition_note,
     dropeval_directive_line,
     dropeval_verdict,
     exclusion_note,
+    fleet_gate,
+    fluency_conclusion_line,
     fluency_gap_rows,
     is_diff_run,
+    is_soak_run,
     row_verdict,
     savings_totals,
     strip_markup,
@@ -244,6 +252,20 @@ def build_terminal_diff_report(results: dict, form_label: str = "diff-form",
                            "control_acc": cacc, "control_ci": _ci(cse),
                            "passed": word == "PASS", "verdict": word})
     text = forest_bar_lines(plot_rows, form_label, control_label, color=color)
+    # The FLEET verdict, not just per-model badges (#589). This is the one output without
+    # `--html`, and with badges alone a withheld model never blocked PASS here while the
+    # markdown and the HTML banner said INCONCLUSIVE. The markdown's own bullets, from the
+    # same decision, markup stripped; a soak's also read its deepest slice. Printed only
+    # when something was scored: the no-verdict bullets point at prose this chart lacks,
+    # and `(no data)` plus the exclusion note below already say nothing was scored.
+    if is_soak_run(results):
+        soak = diff_soak_verdict(results)
+        fleet_word, lines = soak.word, diff_soak_verdict_lines(soak)
+    else:
+        gate = fleet_gate(gap_rows, bool(excluded))
+        fleet_word, lines = gate.word, diff_verdict_lines(gate, form_label, control_label)
+    if fleet_word is not None:
+        text += "\n\n" + "\n".join(_plain(line) for line in lines)
     # THIS chart is the one an operator sees without `--html`: `cli` prints the markdown
     # and this plot on every diff path and writes the HTML page only under `--html`, so
     # leaving it silent meant the disclosure existed exactly where it was least read
@@ -271,6 +293,14 @@ def build_terminal_fluency_report(results: dict, color: bool | None = None) -> s
                            "control_acc": cacc, "control_ci": _ci(cse),
                            "passed": word == "PASS", "verdict": word})
     text = forest_bar_lines(plot_rows, "best terse-form", "raw", color=color)
+    # The fleet verdict, from the markdown's own rule and lines (#589): any excluded model
+    # blocks PASS, as `build_fluency_report` decides it.
+    gate = fleet_gate(gap_rows, bool(broken))
+    if gate.worst is not None:
+        text += "\n\n" + "\n".join(_plain(line) for line in (
+            _format_worst_case_line(gate.worst, _GAP_TOLERANCE, "best terse-form", "raw",
+                                    withheld=gate.withheld),
+            fluency_conclusion_line(gate)))
     if broken:
         text += f"\n  ({exclusion_note(broken)})"
     # The bars are drawn over the PAIRED subset, and a chart that does not say what was

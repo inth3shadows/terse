@@ -30,14 +30,17 @@ from .report import (
     _ci,
     _pct,
     _sum,
-    _worst_case_gap,
-    arm_gap,
     attrition,
     attrition_block,
-    gate_word,
+    diff_gap_rows,
+    diff_soak_verdict,
+    diff_soak_verdict_lines,
+    fleet_gate,
     is_diff_run,
+    is_soak_run,
     row_verdict,
     savings_totals,
+    strip_markup,
     unmeasured_cause,
 )
 
@@ -278,7 +281,11 @@ def forest_plot(rows: list[dict[str, Any]], form_label: str, control_label: str)
     also carries a pass/fail status badge from the shared worst-case-gap verdict math."""
     if not rows:
         return '<p class="sub">No data.</p>'
-    label_w, right_pad = 110, 70
+    # Wide enough for the longest badge (review of #589): a fixed 70 px left 60 px after
+    # the badge's 10 px offset, which clipped `INCONCLUSIVE`, the warning word, to about
+    # "INCONCL". 8 px a glyph is a generous ceiling for 11px caps in the page's sans stack.
+    longest = max(len(r.get("verdict") or "FAIL") for r in rows)
+    label_w, right_pad = 110, 20 + 8 * longest
     plot_w = 480
     width = label_w + plot_w + right_pad
     legend_h = 26
@@ -503,7 +510,8 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
                             control_label: str = "full-terse") -> str:
     """HTML counterpart to report.build_diff_report / build_fluency_report's gap
     section: a forest plot of per-model accuracy with 95% CI, gated on the worst model."""
-    plot_rows, gap_rows = [], {}
+    plot_rows = []
+    measured: dict[str, list[dict[str, Any]]] = {}
     excluded: dict[str, ExclusionReason | None] = {}
     for model, rows in results.items():
         n = len(rows)
@@ -532,30 +540,42 @@ def build_html_diff_report(results: dict, form_label: str = "diff-form",
         if not is_diff_run(rows):
             excluded[model] = "not a diff run"
             continue
-        g = arm_gap(rows, *DIFF_ARMS)
-        if g.excluded:
-            excluded[model] = g.excluded
-            continue
-        gap_rows[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se, g.gap_se)
+        measured[model] = rows
+    # The verdict is the markdown's own decision (#589), over the same rows: `diff_gap_rows`
+    # is `arm_gap` per model, and a soak's word also reads its deepest slice. Deciding it
+    # here from the pooled gap alone put a green `✓ PASS` banner over a soak whose
+    # markdown said "Not concluded". "not a diff run" is not a withheld model: those rows
+    # were never a diff measurement, and the markdown cannot render them at all.
+    gap_rows, gate_excluded = diff_gap_rows(measured)
+    excluded.update(gate_excluded)
+    soak = diff_soak_verdict(measured) if is_soak_run(measured) else None
+    gate = soak.pooled if soak else fleet_gate(gap_rows, bool(gate_excluded))
+    word = soak.word if soak else gate.word
+    worst = gate.worst
 
-    worst = _worst_case_gap(gap_rows)
     for model, row in gap_rows.items():
         facc, fse, cacc, cse, *_ = row
         # The verdict's own rule, not a second point-estimate copy (#582).
-        word = row_verdict(row)
+        badge = row_verdict(row)
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
                            "control_acc": cacc, "control_ci": _ci(cse),
-                           "passed": word == "PASS", "verdict": word})
+                           "passed": badge == "PASS", "verdict": badge})
 
     verdict_html = ""
-    if worst:
-        word = gate_word(worst, withheld=any(r != "not a diff run" for r in excluded.values()))
+    if word is not None:
         cls = {"PASS": "good", "INCONCLUSIVE": "warn"}.get(word, "critical")
         mark = {"PASS": "✓", "INCONCLUSIVE": "?"}.get(word, "✕")
-        verdict_html = (f'<div class="banner {cls}">{mark} {word} — '
-                        f'worst-case model <code>{_esc(worst.model)}</code>: {form_label} '
-                        f'{worst.form_acc:.0%} vs {control_label} {worst.control_acc:.0%} '
-                        f'(gap {worst.gap:+.0%} ±{worst.gap_ci * 100:.0f}pt)</div>')
+        head = (f'worst-case model <code>{_esc(worst.model)}</code>: {form_label} '
+                f'{worst.form_acc:.0%} vs {control_label} {worst.control_acc:.0%} '
+                f'(gap {worst.gap:+.0%} ±{worst.gap_ci * 100:.0f}pt)' if worst else
+                "no pooled verdict")
+        verdict_html = f'<div class="banner {cls}">{mark} {word} — {head}</div>'
+        if soak:
+            # The soak's word reads more than the pooled gap in the banner, so the page
+            # carries the markdown's verdict bullets that say why.
+            verdict_html += "".join(
+                f"<p>{_esc_md(strip_markup(line.removeprefix('- '), code=False))}</p>"
+                for line in diff_soak_verdict_lines(soak))
     else:
         # Nothing survived the gate. Never render this neutral or absent: an empty verdict
         # card on a page titled "comprehension gap" reads as "no gap found". The second

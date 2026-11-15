@@ -15,17 +15,29 @@ fails that pull request until the section has moved.
 
 ### Changed
 - Comprehension verdicts (`terse fluency`, `fluency --diff`, the diff soak, the HTML
-  report, and `dropeval`'s accuracy gate) now PASS only when the gap's 95% interval clears
-  the 5% tolerance, not just its point estimate. 19/20 vs 20/20 used to print **PASS**,
-  "safe to enable `proxy --diff`", at "-5% ±10 pts". A point estimate inside the line
-  whose interval reaches past it is now **INCONCLUSIVE** (dropeval: INSUFFICIENT), naming
-  the model whose interval reaches furthest. The interval is now the paired,
+  report, and all three `dropeval` gates: retrieve-recall, no-overfetch and final-accuracy)
+  now PASS only when the gap's 95% interval clears the 5% tolerance, not just its point
+  estimate. 19/20 vs 20/20 used to print **PASS**, "safe to enable `proxy --diff`", at
+  "-5% ±10 pts". A point estimate inside the line whose interval reaches past it is now
+  **INCONCLUSIVE** (dropeval: INSUFFICIENT, with prose that says the metric was measured
+  and needs more questions), naming the model whose interval reaches furthest. A 39/40
+  recall run used to print SHIP and is now INSUFFICIENT. The interval is now the paired,
   question-clustered SE of the per-question difference rather than the two arms' SEs
   combined as if independent, which overstated the noise for paired arms. Two identical
   arms at 50% over 24 questions printed ±28 pts and now print ±0. A model withheld from
   the gate (unmeasured, underpowered, or with a broken control) now turns a would-be PASS
-  into INCONCLUSIVE in the diff, soak and fluency reports, as dropeval already did (#344).
-  It still never turns into a FAIL.
+  into INCONCLUSIVE in the diff, soak and fluency reports, and in each dropeval metric's
+  line, as dropeval's directive already did (#344). It still never turns into a FAIL.
+- The fleet verdict is now decided once and rendered by every output, so the markdown,
+  the HTML page and the `--bars` terminal chart cannot disagree. The `--bars` diff and
+  fluency charts now print the verdict lines, not only per-model badges. The soak's HTML
+  banner and chart now read the deepest slice too: a soak whose deepest slice was withheld
+  or too wide showed a green PASS banner over a markdown that said "Not concluded". A
+  model whose soak never reached the deepest depth now blocks that depth's PASS and is
+  named, instead of being left out.
+- The #334 question floor now counts questions both arms actually scored. A legacy result
+  file whose control was scored on one of 20 rows printed `+0% ±0 pts **PASS**`; it is now
+  withheld as underpowered. The HTML forest plot no longer clips the `INCONCLUSIVE` badge.
 
 ### Fixed
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of

@@ -529,7 +529,10 @@ def _payload_rows(*, degraded: bool):
                  trials=2, fails=2, attempts=8) for _ in range(20)]
 
 
-_WITHHELD_NOTE = " Measured models only: a model was withheld from the gate (named above)."
+# "(named above)" was false where the withheld models are named BELOW the line: the
+# dropeval bullets and the terminal chart's exclusion note (review of #589).
+_WITHHELD_NOTE = (" Measured models only: a model was withheld from the gate (named with its "
+                  "reason in this report).")
 # The conclusion lines a PASS prints, and the ones a withheld-blocked PASS prints instead.
 _CONCLUSION_LINE = re.compile(
     r"^- (Reading the diff costs no comprehension|terse's compressed form preserves"
