@@ -39,6 +39,8 @@ fails that pull request until the section has moved.
   file whose control was scored on one of 20 rows printed `+0% ±0 pts **PASS**`; it is now
   withheld as underpowered. The HTML forest plot no longer clips the `INCONCLUSIVE` badge.
 
+## [0.49.5] - 2026-11-15
+
 ### Fixed
 - `install-mcp` re-wrapped the OLD command after a wrapped entry had been replaced by hand.
   The stashed original always won over the live entry, so swapping `kb` for a new command
