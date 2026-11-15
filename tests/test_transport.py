@@ -39,11 +39,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             msg = json.loads(body.decode("utf-8"))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):   # a 100k-deep request line
             msg = {}
         self.server.requests.append(msg)  # type: ignore[attr-defined]
         mode = self.server.mode  # type: ignore[attr-defined]
-        mid = msg.get("id")
+        mid = msg.get("id") if isinstance(msg, dict) else None   # a batch: no one id
 
         if mode == "fail500":
             payload = b"internal error: disk full"
@@ -199,6 +199,21 @@ _FRAMING_MODES = {
     "fail_null_id_precise": lambda h, mid: _raw(h, 404, "application/json", (
         b'{"jsonrpc": "2.0", "id": null, "error": {"code": -32001, "message": "x", '
         b'"data": {"v": 0.12345678901234567890123, "a": 1, "a": 2}}}')),
+    # Review round 2 of #586.
+    "server_request_only": lambda h, mid: _raw(h, 200, "application/json",
+                                               b'{"jsonrpc":"2.0","id":9,"method":"ping"}'),
+    "unrelated_response": lambda h, mid: _raw(h, 200, "application/json",
+                                              b'{"jsonrpc":"2.0","id":77,"result":{}}'),
+    "rest_401": lambda h, mid: _raw(h, 401, "application/json",
+                                    b'{"error":"login required","id":null}'),
+    "rest_200": lambda h, mid: _raw(h, 200, "application/json",
+                                    b'{"error":"unauthorized","id":"req_abc"}'),
+    "deep_raw_newline": lambda h, mid: _raw(h, 200, "application/json", (
+        '{"jsonrpc":"2.0","id":3,"result":{"v":' + "[" * 60_000 + "]" * 60_000
+        + ',"s":"a\nb"}}').encode()),   # the raw LF after the depth the C scanner reaches
+    "huge_unterminated": lambda h, mid: _raw(h, 200, "application/json",
+                                             b'{"jsonrpc":"2.0","id":3,"result":'
+                                             + b"[" * 16_000_000),
 }
 
 
@@ -815,11 +830,12 @@ def test_compaction_is_linear_on_a_truncated_string_full_of_escaped_quotes():
 
 
 # --- review round 1 of #586: one rule decides what answers the request (B1-B7) ---
-def _transport_reply(mode: str) -> list[str]:
-    """What the transport itself enqueues for one request (id 3), before the interceptor."""
+def _transport_reply(mode: str, line: str | None = None) -> list[str]:
+    """What the transport itself enqueues for one outgoing line (by default a request with
+    id 3), before the interceptor."""
     with _fake_server(mode=mode) as srv:
         t = HttpTransport(_url(srv), timeout=5)
-        t._post(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}))
+        t._post(line or json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}))
     out = []
     while not t._q.empty():
         out.append(t._q.get_nowait())
@@ -888,3 +904,60 @@ def test_empty_success_body_to_a_request_answers_with_an_error(mode):   # B6
 def test_notification_still_gets_no_synthesized_reply(mode):   # B6 B4 guard
     lines = _one_list_call(mode, {"jsonrpc": "2.0", "method": "notifications/initialized"})
     assert lines == []
+
+
+# --- review round 2 of #586: what expects a reply, what is a response, never raise ---
+_CLIENT_RESPONSE = {"jsonrpc": "2.0", "id": 5, "result": {"roots": []}}
+
+
+@pytest.mark.parametrize("mode", ["blank202", "empty200"])
+def test_client_response_to_a_server_request_gets_nothing_back(mode):   # R2-1
+    # The client answering a server-initiated request (roots/list) is not a request: the
+    # spec's empty 202 means "accepted", and id 5 is in the SERVER's id space.
+    assert _transport_reply(mode, json.dumps(_CLIENT_RESPONSE)) == []
+
+
+@pytest.mark.parametrize("mode, expected", [
+    ("server_request_only", '{"jsonrpc":"2.0","id":9,"method":"ping"}'),
+    ("unrelated_response", '{"jsonrpc":"2.0","id":77,"result":{}}')])
+def test_client_response_is_never_rekeyed_or_answered_with_an_error(mode, expected):   # R2-1
+    assert _transport_reply(mode, json.dumps(_CLIENT_RESPONSE)) == [expected]
+
+
+@pytest.mark.parametrize("mode", ["rest_401", "rest_200"])
+def test_rest_error_body_is_not_taken_for_a_jsonrpc_response(mode):   # R2-2
+    msgs = [json.loads(ln) for ln in _transport_reply(mode)]
+    assert len(msgs) == 1 and msgs[0]["id"] == 3 and msgs[0]["error"]["code"] == -32000
+    if mode == "rest_200":
+        assert "unauthorized" not in msgs[0]["error"]["message"]   # a 2xx is never echoed
+
+
+def test_deeply_nested_request_line_never_raises():   # R2-3
+    line = ('{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"a":'
+            + "[" * 100_000 + "]" * 100_000 + "}}")
+    msgs = [json.loads(ln) for ln in _transport_reply("html", line)]
+    assert len(msgs) == 1 and msgs[0]["id"] == 3 and msgs[0]["error"]["code"] == -32000
+
+
+@pytest.mark.parametrize("mode", ["html", "empty200"])
+def test_batch_request_gets_one_error_per_request_id(mode):   # R2-4
+    batch = json.dumps([{"jsonrpc": "2.0", "id": 1, "method": "a"},
+                        {"jsonrpc": "2.0", "method": "notifications/n"},
+                        {"jsonrpc": "2.0", "id": 2, "method": "b"}])
+    msgs = [json.loads(ln) for ln in _transport_reply(mode, batch)]
+    assert sorted(m["id"] for m in msgs) == [1, 2]
+    assert all(m["error"]["code"] == -32000 for m in msgs)
+
+
+def test_lexed_deep_body_with_a_raw_newline_is_not_forwarded():   # R2-5
+    lines = _transport_reply("deep_raw_newline")
+    assert all("\n" not in ln and "\r" not in ln for ln in lines)
+    assert len(lines) == 1 and json.loads(lines[0])["error"]["code"] == -32000
+
+
+def test_lexical_fallback_is_bounded_on_a_huge_hostile_body():   # R2-6
+    import time as _time
+    start = _time.monotonic()
+    msgs = [json.loads(ln) for ln in _transport_reply("huge_unterminated")]
+    assert _time.monotonic() - start < 3.0
+    assert len(msgs) == 1 and msgs[0]["id"] == 3 and msgs[0]["error"]["code"] == -32000

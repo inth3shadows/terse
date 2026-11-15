@@ -23,14 +23,20 @@ fails that pull request until the section has moved.
   events, or newline-delimited JSON values) is split into them. Blank SSE priming events,
   non-JSON keepalives and other non-JSON-RPC content are dropped, and a 2xx body's content
   is never echoed into an error. One rule now decides, for every status, what answers a
-  request: a response carrying its id. If none does, the first response is re-keyed to
-  the request's id by splicing in the id and keeping the rest of its text, which covers
-  `"id": null` (a server's reply to an expired session), a wrong id, and `"3"` for `3`.
-  A request that got no response at all, including an empty 200/202 body, gets an error
-  instead of hanging. A notification still never gets a synthesized reply. A response
-  without a `"jsonrpc"` member is forwarded, and so is a valid body that Python's parser
-  refuses (an integer over 4300 digits, nesting past the recursion limit). This applies
-  to `terse proxy` and to multiproxy HTTP peers.
+  request: a response carrying its id. A response has a `result`, or an `error` that is a
+  JSON object, so a REST body such as `{"error": "login required"}` is not one. If no
+  response carries the id, the first response is re-keyed to the request's id by
+  splicing in the id and keeping the rest of its text, which covers `"id": null` (a
+  server's reply to an expired session), a wrong id, and `"3"` for `3`. A response over
+  4 MiB is not re-keyed: it is forwarded as sent, and the request gets an error. A
+  request that got no response at all, including an empty 200/202 body, gets an error
+  instead of hanging; in a batch, each unanswered request id gets its own error. Only a
+  request (a `method` and an `id`) expects a reply: a notification, or the client's own
+  response to a server-initiated request, never gets a synthesized one. A response without a
+  `"jsonrpc"` member is forwarded, and so is a valid body that Python's parser refuses
+  (an integer over 4300 digits, or nesting past the recursion limit, up to 4 MiB, where
+  the slower lexical reading is capped). This applies to `terse proxy` and to multiproxy
+  HTTP peers.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,

@@ -619,13 +619,19 @@ _DECODER = json.JSONDecoder()
 # parse time of an int-heavy body, so the common case keeps the C scanner's own `int`.
 _LENIENT_DECODER = json.JSONDecoder(parse_int=_lenient_int)
 _UNMATCHABLE_ID: Any = object()
+# The lexical walk below runs in Python at roughly 0.4 us a character, so it is only tried
+# on text up to this size; past it, a body the parser refuses is not JSON to us and the
+# request gets an error. Without the cap a 128 MiB hostile body blocked for about a minute.
+_MAX_LEXICAL_CHARS = 4 << 20
 
 
 def _decode_value(text: str, pos: int) -> tuple[Any, int] | None:
     """(value, end) of the JSON value at `text[pos]`, or None if it is not JSON. An object
     nested past the parser's recursion limit (valid JSON that `json` refuses) is walked
     lexically instead and stands in as a dict of its top-level keys with only `"id"`
-    parsed, which is all that classifying it reads; such an array stands in as None."""
+    parsed, which is all that classifying it reads; such an array stands in as None. The
+    walk is refused past `_MAX_LEXICAL_CHARS`, and on a literal with a raw line break,
+    which only a string can hold here, making it invalid JSON that would split a line."""
     try:
         return _DECODER.raw_decode(text, pos)
     except RecursionError:
@@ -639,14 +645,20 @@ def _decode_value(text: str, pos: int) -> tuple[Any, int] | None:
             pass
         except ValueError:
             return None
+    if len(text) - pos > _MAX_LEXICAL_CHARS:
+        return None
     literal = text[pos:]
     lexed = _lex_container(literal)
     if lexed is None:
         return None
     end, spans = lexed
+    if "\n" in literal[:end] or "\r" in literal[:end]:
+        return None
     if literal[0] == "[":
         return None, pos + end
     shape: dict[str, Any] = dict.fromkeys(spans)
+    if "error" in spans and literal[spans["error"][0]] == "{":
+        shape["error"] = {}   # an object, as `_is_response` requires
     if "id" in spans:
         start, stop = spans["id"]
         try:
@@ -683,55 +695,51 @@ def _iter_messages(text: str) -> Iterator[tuple[str, Any]]:
 
 
 def _is_response(msg: dict[str, Any]) -> bool:
-    """A JSON-RPC response: a result or error, and an id or a `jsonrpc` member (a lax
-    server may omit `jsonrpc`; `{"error": "login required"}` is neither)."""
-    return ("method" not in msg and ("result" in msg or "error" in msg)
-            and ("id" in msg or "jsonrpc" in msg))
+    """A JSON-RPC response: a `result`, or an `error` that is an object, plus an id or a
+    `jsonrpc` member (a lax server may omit `jsonrpc`). A REST error body such as
+    `{"error": "login required", "id": null}` is not one."""
+    return ("method" not in msg and ("id" in msg or "jsonrpc" in msg)
+            and ("result" in msg or isinstance(msg.get("error"), dict)))
 
 
-def _rekey(literal: str, msg: dict[str, Any], mid: Any) -> str:
+def _id_key(mid: Any) -> tuple[type, str]:
+    """A hashable stand-in for a JSON-RPC id that keeps its type: `3` and `"3"` differ."""
+    return type(mid), repr(mid)
+
+
+def _rekey(literal: str, msg: dict[str, Any], mid: Any) -> str | None:
     """`literal` (a compact JSON-RPC response, `msg` its parse) answering request `mid`:
     the id's text is spliced in and the rest kept literally, so no number or duplicate
-    key is rewritten the way a json round-trip would."""
+    key is rewritten the way a json round-trip would. None past `_MAX_LEXICAL_CHARS`,
+    which the walk to find the id is not run on."""
     new_id = json.dumps(mid, ensure_ascii=False)
     if "id" not in msg:
         return '{"id":' + new_id + "," + literal[1:]
+    if len(literal) > _MAX_LEXICAL_CHARS:
+        return None
     lexed = _lex_container(literal)
     if lexed is None or "id" not in lexed[1]:   # unreachable for text that parsed
-        return literal
+        return None
     start, stop = lexed[1]["id"]
     return literal[:start] + new_id + literal[stop:]
 
 
-def _request_shape(line: str) -> tuple[bool, bool, Any]:
-    """For the outgoing `line`: (expects a reply, carries the single id a reply must
-    match, that id). A batch expects a reply if any element has an id, but has no single
-    id; an unparseable line fails toward expecting one, as `_parse_request_id` does."""
-    try:
-        parsed = json.loads(line)
-    except (ValueError, RecursionError):
-        return True, False, None
-    if isinstance(parsed, dict):
-        return "id" in parsed, "id" in parsed, parsed.get("id")
-    if isinstance(parsed, list):
-        return any(isinstance(m, dict) and "id" in m for m in parsed), False, None
-    return True, False, None
-
-
-def _parse_request_id(line: str) -> tuple[bool, Any]:
-    """Parse `line` (an outgoing JSON-RPC request) once: whether it carries an `"id"`
-    key at all (a notification has none and per JSON-RPC must never get a reply) and
-    that id's value. Shared by every HttpTransport error/reply path so each parses the
-    outgoing line only once. If `line` isn't valid JSON (shouldn't happen — it came
-    from the client through `note_request`/`pump` unchanged), fails toward "has an id"
-    so the caller reports the error rather than silently dropping it."""
-    try:
-        parsed = json.loads(line)
-    except (json.JSONDecodeError, ValueError):
-        return True, None
-    if not isinstance(parsed, dict):
-        return True, None
-    return "id" in parsed, parsed.get("id")
+def _reply_ids(line: str) -> tuple[list[Any], bool]:
+    """Parse the outgoing `line` once: the ids it expects replies under, and whether it is
+    a single request whose reply may be re-keyed. Only a request, with a `method` AND an
+    `id`, expects one (per element in a batch). A notification does not, and neither does
+    the client's own response to a server-initiated request, whose id is in the SERVER's
+    id space, so a synthesized reply to it could fail an unrelated client request with
+    the same id. A line nested too deep for `json` is read by the same fallback as a
+    body. A line that cannot be read at all (it came from the client through
+    `note_request`/`pump` unchanged, so it shouldn't happen) fails toward one reply under
+    `id: null`, so the error is reported rather than silently dropped."""
+    values = [value for _, value in _iter_messages(line)]
+    if not values:
+        return [None], False
+    ids = [None if v["id"] is _UNMATCHABLE_ID else v["id"] for v in values
+           if isinstance(v, dict) and "method" in v and "id" in v]
+    return ids, len(ids) == 1 and len(values) == 1 and not line.lstrip().startswith("[")
 
 
 class HttpTransport:
@@ -920,23 +928,26 @@ class HttpTransport:
         rejecting an expired session, a wrong id, `"3"` for `3`) is re-keyed to the
         request's id; if there is no response at all, a synthesized error answers it, so
         the request never hangs. A notification never gets a synthesized reply, nor
-        anything at all for a failed POST."""
-        expects_reply, keyed, mid = _request_shape(line)
-        if failure is not None and not expects_reply:
+        anything at all for a failed POST, and neither does the client's own response to
+        a server request (see `_reply_ids`). A batch gets one error per unanswered id."""
+        ids, keyed = _reply_ids(line)
+        if failure is not None and not ids:
             return
         sse = "text/event-stream" in ctype
         messages = [(literal, msg)
                     for event in (_iter_sse(body) if sse else (body,))
                     for literal, msg in _iter_messages(event)
                     if isinstance(msg, dict) and (_is_response(msg) or "method" in msg)]
-        answered = any(_is_response(msg) and (
-            not keyed or ("id" in msg and type(msg["id"]) is type(mid) and msg["id"] == mid))
-            for _, msg in messages)
+        answered = {_id_key(msg["id"]) for _, msg in messages
+                    if _is_response(msg) and "id" in msg}
+        unanswered = [mid for mid in ids if _id_key(mid) not in answered]
         for literal, msg in messages:
-            if keyed and not answered and _is_response(msg):
-                literal, answered = _rekey(literal, msg, mid), True
+            if keyed and unanswered and _is_response(msg):
+                spliced = _rekey(literal, msg, unanswered[0])
+                if spliced is not None:
+                    literal, unanswered = spliced, []
             self._q.put(literal)
-        if not expects_reply or answered:
+        if not unanswered:
             return
         if failure is None:
             if sse:
@@ -947,23 +958,23 @@ class HttpTransport:
             else:
                 failure = ("terse: downstream HTTP response is not a JSON-RPC message "
                            f"answering the request ({len(body)} chars, not shown)")
-        self._maybe_enqueue_error(line, failure)
-    def _maybe_enqueue_error(self, line: str, message: str) -> None:
-        """Enqueue a synthesized JSON-RPC error for `line`'s in-flight request —
-        unless `line` is a notification (has no `"id"` key at all), which per
-        JSON-RPC never gets a reply. Enqueuing one anyway would hand the client an
-        unsolicited `id: null` message matching no request it sent, which a strict
-        client could reject or misinterpret as an unmatched response."""
-        has_id, mid = _parse_request_id(line)
-        if not has_id:
-            return
-        self._q.put(_SynthesizedReply(self._error_reply(mid, message)))
+        self._maybe_enqueue_error(line, failure, unanswered)
+
+    def _maybe_enqueue_error(self, line: str, message: str,
+                             ids: list[Any] | None = None) -> None:
+        """Enqueue a synthesized JSON-RPC error for each of `line`'s in-flight request
+        ids (`ids`, when the caller already parsed `line` with `_reply_ids`) — none for a
+        notification or the client's own response, which per JSON-RPC never get a reply.
+        Enqueuing one anyway would hand the client an unsolicited message matching no
+        request it sent, which a strict client could reject or misinterpret."""
+        for mid in _reply_ids(line)[0] if ids is None else ids:
+            self._q.put(_SynthesizedReply(self._error_reply(mid, message)))
 
     @staticmethod
     def _error_reply(mid: Any, message: str) -> str:
         """A JSON-RPC 2.0 error object for `mid` (the outgoing line's own request id),
         so the client's matching in-flight call gets a legible failure instead of
-        silence. Callers already resolved `mid` via `_parse_request_id`."""
+        silence. Callers already resolved `mid` via `_reply_ids`."""
         return json.dumps(
             {"jsonrpc": "2.0", "id": mid, "error": {"code": -32000, "message": message}},
             separators=(",", ":"), ensure_ascii=False,
