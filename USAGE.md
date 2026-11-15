@@ -1205,16 +1205,21 @@ TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \
 
 The report shows accuracy per model for raw vs compressed vs compressed-with-a-one-time
 format note ("primer"), flags which transform (if any) costs comprehension, and gives a
-PASS/FAIL gated on the *worst* model. A model that scores 0% on raw JSON is a setup
-error (wrong model id, no key) and is excluded from the verdict, not counted as a
-comprehension failure. `--trials N` repeats each question N times and reports each
+PASS / INCONCLUSIVE / FAIL gated on the *worst* model. PASS needs the gap's 95%
+interval (the paired, question-clustered SE of the per-question difference) to clear the
+5% tolerance, not just its point estimate; a point inside the line whose interval reaches
+past it is INCONCLUSIVE. A model that scores 0% on raw JSON is a setup error (wrong
+model id, no key) and is excluded from the verdict, not counted as a comprehension
+failure, but any excluded model turns a would-be PASS into INCONCLUSIVE: the tested set
+was only partly measured. `--trials N` repeats each question N times and reports each
 accuracy with a question-clustered `±` 95% bound — more questions tighten it without
 limit, more trials only down to a between-question floor they can't cross, so treat a
 wide `±` as "not yet tightly measured," not as "run more trials."
 
 Add `--bars` for the same verdict as a terminal forest plot — a point + 95% CI track
 per model (best terse-form vs raw, or diff-form vs full-terse under `--diff`) with a
-pass/fail badge, printed straight to the terminal. For a charted HTML version of that
+PASS / INCONCLUSIVE / FAIL badge, followed by the same verdict lines the markdown prints,
+straight to the terminal. For a charted HTML version of that
 forest plot, add `--html` to any of the paired diff-family evals (`--diff`,
 `--diff-soak`, `--text-diff-eval`) — it writes next to `--out` with a `.html` suffix,
 same inline-SVG/no-JS/no-CDN form as `measure --html`.
@@ -1233,7 +1238,9 @@ TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \
 
 The report scores retrieve-recall (did it call retrieve when the answer needed the dropped
 field), no-overfetch (did it leave the tool alone when the answer didn't need it), and
-final-answer accuracy — gated on the worst model. Run this before enabling
+final-answer accuracy — gated on the worst model. Each of the three needs its 95% interval,
+not just its point estimate, to clear the 5% tolerance: 39/40 on recall is INSUFFICIENT
+(measured, too few questions), not SHIP. Run this before enabling
 `drop-to-retrieve` in a policy you'll actually deploy.
 
 ### Cross-call diffing and its fluency check
@@ -1302,8 +1309,10 @@ TERSE_FLUENCY_BASE_URL=... TERSE_FLUENCY_API_KEY=... TERSE_FLUENCY_MODELS=... \
 ```
 
 The report shows accuracy by depth (chain form vs full-terse control on the same
-final-state questions) and PASS/FAILs both overall and at the deepest tested depth,
-worst model. The mechanical half of the same soak — hundreds of chained hops
+final-state questions) and gives PASS / INCONCLUSIVE / FAIL both overall and at the
+deepest tested depth, worst model, by the same interval rule as above. A model whose
+deepest slice was not scored (withheld, or the soak never reached it) blocks the deepest
+PASS and is named. The mechanical half of the same soak — hundreds of chained hops
 reconstructed exactly, keyframe cadence, reconnect resets — is pinned in
 `tests/test_diff_soak.py` and runs in CI.
 
