@@ -19,14 +19,18 @@ fails that pull request until the section has moved.
   redaction as `install-mcp`/`uninstall-mcp` output. That redaction also covers more
   shapes: the `Authorization: Bearer …` header form (`--header`/`-H`, as `mcp-remote`
   takes it, including curl's attached `-HName: value` and a value passed as its own arg,
-  after `Name:` or `Name=`), `PAT`/`KEY`/`BEARER`/`SESSION` as a delimited part of a flag
-  or name (`--key`, `--github-pat`, `--openai-key`, `--session-id`, `GH_PAT=`,
-  `STRIPE_KEY=`, `SESSION_ID=`, `X-GitHub-PAT`), env assignments attached to their flag
+  after `Name:` or `Name=` with nothing after it), `PAT`/`KEY`/`BEARER`/`SESSION` as a
+  delimited part of a flag or name (`--key`, `--github-pat`, `--openai-key`,
+  `--session-id`, `GH_PAT=`, `STRIPE_KEY=`, `SESSION_ID=`, `X-GitHub-PAT`), single-dash
+  secret flags (`-token`, `-api-key`), env assignments attached to an env flag
   (`--env=BAR_TOKEN=…`, `-e=KEY=…`, `-eKEY=…`), a secret value that starts with `-`
   (`--token -x…`), and URL userinfo `urlsplit` can't parse (`https://u:pw@[::1/x`).
   A flag right after `-H` is read as a flag, a `-H` URL is redacted as a URL, and
-  docker's `-H host:port` is left as it is. `mcp-status` redacts the argument list
-  before joining it, so a header value containing spaces is masked whole.
+  docker's `-H host:port` is left as it is when the name is host-like (`token-svc:8080`,
+  not `Authorization:12345`). Boolean negations (`--no-auth`, `--no-session`), `--oauth`,
+  lookup keys (`--cache-key`, `--sort-key`) and `--session-dir`/`--session-timeout` take
+  no secret, so the arg after them prints. `mcp-status` redacts the argument list before
+  joining it, so a header value containing spaces is masked whole.
 - The savings ledger labelled an HTTP downstream by its full URL netloc, so a
   `https://user:pass@host/mcp` target wrote `user:pass@host` into every ledger row and into
   `terse stats` output. The label is now the `host[:port]` alone, and rows already in the

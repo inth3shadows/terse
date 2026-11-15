@@ -1716,46 +1716,81 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
 
 
 # MCP servers commonly carry credentials directly in `args` (not just `env`); before/
-# after command lines get printed unconditionally by install/uninstall-mcp, including
-# to shared/logged terminals, so a secret-shaped flag's value is masked either way it
-# appears: `--api-key VALUE` (two args) or `--api-key=VALUE` (one arg).
-# Substring, not anchored: the anchored form printed `--access-token`, `--auth-token` and
-# `--client-secret` values in the clear. Over-matching (`--author`) only masks one display
-# token, the safe direction on a shared terminal.
-_SECRET_FLAG = re.compile(r"^--?[\w-]*(api[-_]?key|access[-_]?key|private[-_]?key|token|secret"
-                          r"|password|passwd|auth|credential)[\w-]*$", re.IGNORECASE)
+# after command lines get printed unconditionally by install/uninstall-mcp and
+# mcp-status, including to shared/logged terminals, so a secret's value is masked in
+# every shape it appears in: `--api-key VALUE`, `--api-key=VALUE`, `NAME=VALUE`, a header.
+#
+# One word list serves flag names and header/env names alike. Long words match as a
+# substring (the anchored form printed `--access-token`, `--client-secret`); short words
+# only as a whole `-`/`_`-delimited part, since as substrings `pat` would hit `--path` and
+# `key` `--keyframe`. Over-matching masks one display token, the safe direction.
+_SECRET_LONG_WORDS = (r"api[-_]?key|access[-_]?key|private[-_]?key|token|secret|password"
+                      r"|passwd|credential")
+_SECRET_SHORT_WORDS = ("pat", "key", "bearer", "session")
+
+# A header or env NAME (`X-Api-Key`, `Proxy-Authorization`, `GH_PAT`). A header name space
+# is open-ended and caller-defined, so `auth` and `cookie` match as substrings here.
+_SECRET_HEADER = re.compile(rf"({_SECRET_LONG_WORDS}|auth|cookie"
+                            rf"|(?:^|[_-])(?:{'|'.join(_SECRET_SHORT_WORDS)})(?:$|[_-]))",
+                            re.IGNORECASE)
+_SECRET_LONG = re.compile(_SECRET_LONG_WORDS, re.IGNORECASE)
+_NAME_PARTS = re.compile(r"[-_]")
+
+# A flag's `key` part qualified by one of these is a lookup key, not a secret
+# (`--cache-key`, `--sort-key`, `--primary-key`).
+_LOOKUP_KEY_QUALIFIERS = frozenset((
+    "cache", "sort", "primary", "partition", "foreign", "group", "index", "lookup", "hash",
+    "map", "row", "shard", "routing", "idempotency", "dedup", "dedupe", "unique", "order",
+    "object", "join", "composite"))
+
+
+def _is_secret_flag(flag: str) -> bool:
+    """Whether `flag` (`-x` or `--x`, without any `=VALUE`) takes a secret value. A
+    boolean negation (`--no-auth`, `--no-session`) takes none. `auth` must start a part
+    (`--auth`, `--basic-auth`, `--authorization`), so `--oauth` is the boolean it usually
+    is. `session` is a secret alone or as `session-id`/`session-key`, not as
+    `--session-dir`/`--session-timeout`."""
+    name = flag.lstrip("-").lower()
+    if not flag.startswith("-") or not name or name.startswith(("no-", "no_")):
+        return False
+    if _SECRET_LONG.search(name):
+        return True
+    parts = _NAME_PARTS.split(name)
+    for i, part in enumerate(parts):
+        if part.startswith("auth") or part in ("pat", "bearer", "sessionid"):
+            return True
+        if part == "key" and (i == 0 or parts[i - 1] not in _LOOKUP_KEY_QUALIFIERS):
+            return True
+        if part == "session" and parts[i + 1:] in ([], ["id"], ["key"]):
+            return True
+    return False
+
 
 # A bare `NAME=VALUE` arg (`docker run -e GH_TOKEN=...`, `npx ... API_KEY=...`) carries its
 # secret with no flag in front of it at all.
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*=")
 
-# `--header NAME=VALUE` (#5, HTTP downstream auth) carries its secret in the VALUE half
-# of a single arg, not in a flag NAME `_SECRET_FLAG` matches — so a bare `--header`
-# match would print `Authorization=Bearer xyz` unredacted. Match against the header
-# NAME instead, substring (not anchored like `_SECRET_FLAG`): a header name space is
-# open-ended and caller-defined (`X-Api-Key`, `Proxy-Authorization`, `Cookie`, ...), so
-# over-redacting a borderline name is the safe failure direction for a value that could
-# be printed to a shared terminal.
-_SECRET_HEADER = re.compile(r"(api[-_]?key|token|secret|password|passwd|auth|credential|cookie"
-                            r"|(?:^|[_-])(?:pat|key|bearer|session)(?:$|[_-]))", re.IGNORECASE)
-
-# Short secret-bearing words `_SECRET_FLAG`'s substring set cannot carry without masking
-# ordinary flags (`pat` would hit `--path`, `key` would hit `--keyframe`), so matched as a
-# whole `-`/`_`-delimited part of the flag name, the rule env names use: `--key`,
-# `--github-pat`, `--openai-key`, `--session-id`.
-_SECRET_FLAG_PART = re.compile(r"^--?(?:[\w-]*[_-])?(key|pat|bearer|session)(?:[_-][\w-]*)?$",
-                               re.IGNORECASE)
-
 # Flags whose next arg is a header: terse's own `--header NAME=VALUE`, and the
 # `NAME: VALUE` form `mcp-remote`/curl take as `--header`/`-H`.
 _HEADER_FLAGS = ("--header", "-H")
 
-# `-H` is also docker's host flag: `-H token-svc:8080` is a host and port, not a header
-# named `token-svc`. Only for `-H`, and only with no space and a port-sized number.
+# `-H` is also docker's host flag: `-H token-svc:8080` is a host and port, not a header.
+# Exempt only with no space, a port-sized number, and a host-like NAME (see `_redact_header_payload`).
 _HOST_PORT = re.compile(r"^[A-Za-z0-9.-]+:\d{1,5}$")
 
 # A URL-shaped payload (`-H https://u:pw@h`, `-H tcp://...`) is a URL, not a header.
 _URL_START = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://")
+
+# `_redact_url_text`. Both are linear: the userinfo run stops at the next `/` (every `://`
+# has one), and the tail always matches, so no `://` is rescanned to the end of the text.
+_URL_USERINFO = re.compile(r"(://)[^/?#\s]*@")
+_URL_TAIL = re.compile(r"(://[^?#\s]*)(?:([?#])\S*)?")
+
+
+def _header_sep(entry: str) -> int:
+    """Index of the first `=` or `:` in a header entry, -1 when it has neither."""
+    eq, colon = entry.find("="), entry.find(":")
+    return min(eq, colon) if eq != -1 and colon != -1 else max(eq, colon)
 
 
 def _redact_header_value(entry: str) -> str:
@@ -1779,10 +1814,10 @@ def _redact_header_value(entry: str) -> str:
 
 
 def _redact_url_text(text: str) -> str:
-    """Regex fallback for a URL `urlsplit` can't take apart: mask `scheme://userinfo@`
-    and everything from a `?` or `#` on, wherever they appear in `text`."""
-    text = re.sub(r"(://)[^/?#\s]*@", r"\1***@", text)
-    return re.sub(r"(://[^?#\s]*)([?#])\S*", r"\1\2***", text)
+    """Fallback for a URL `urlsplit` can't take apart: mask `scheme://userinfo@` and
+    everything from a `?` or `#` on, wherever they appear in `text`."""
+    text = _URL_USERINFO.sub(r"\1***@", text)
+    return _URL_TAIL.sub(lambda m: m[1] + (f"{m[2]}***" if m[2] else ""), text)
 
 
 def _redact_url(url: str) -> str:
@@ -1806,95 +1841,104 @@ def _redact_url(url: str) -> str:
 
 
 def _value_in_next_arg(header: str) -> bool:
-    """`Authorization:` or `X-Api-Key=` alone: a secret-shaped header whose value is the
-    NEXT arg."""
-    head = header.rstrip()
-    return head[-1:] in (":", "=") and bool(_SECRET_HEADER.search(head[:-1]))
+    """`Authorization:` or `X-Api-Key=` alone: nothing after the FIRST separator, and a
+    secret-shaped name, so the header's value is the NEXT arg."""
+    sep = _header_sep(header)
+    return (sep != -1 and not header[sep + 1:].strip()
+            and bool(_SECRET_HEADER.search(header[:sep])))
 
 
 def _redact_header_payload(flag: str, payload: str) -> str:
-    """The arg a header flag takes. A URL is redacted as one; `-H host:port` is left
-    alone; otherwise it's a header, and a header whose name isn't secret-shaped still has
-    any URL in its value redacted."""
+    """The arg a header flag takes. A URL is redacted as one. `-H host:port` is left alone
+    when the name is host-like: dotted (`auth.example.com:443`), or not ending in a secret
+    word (`token-svc:8080`; but `Authorization:12345`, `X-Auth-Token:1`, `Cookie:1` are
+    headers). Otherwise it's a header, and a header whose name isn't secret-shaped still
+    has any URL in its value redacted."""
     if _URL_START.match(payload):
         return _redact_url(payload)
     if flag == "-H" and _HOST_PORT.match(payload):
-        return payload
+        name = payload.partition(":")[0]
+        if "." in name or not _SECRET_HEADER.search(name.rpartition("-")[2]):
+            return payload
     out = _redact_header_value(payload)
     return _redact_url_text(out) if out == payload and "://" in payload else out
 
 
-def _is_flag_not_value(a: str) -> bool:
-    """After a secret flag, whether `a` is the next flag rather than the secret value.
-    `--x` and a bare header flag are flags (`--no-auth --policy /p`, `--oauth -H ...`);
-    any other `-x` is a value (`--token -FAKE`): masking a short flag by mistake is the
-    safe direction, printing a token that starts with `-` is not."""
-    return a.startswith("--") or a in _HEADER_FLAGS
+def _is_flag(a: str) -> bool:
+    """Whether `a`, met while a secret value is pending, is the next flag rather than the
+    value: a `--x`, a header flag, or a secret-shaped `-x` (`--no-auth -token sk-1`).
+    Any other `-x` is the value (`--token -FAKE`, `--password -Hx7Q`): masking a short
+    flag by mistake is the safe direction, printing a value that starts with `-` is not."""
+    return (a.startswith("--") or a in _HEADER_FLAGS
+            or (a.startswith("-") and _is_secret_flag(a.split("=", 1)[0])))
+
+
+def _redact_assignment(a: str, flag: str) -> str:
+    """An arg holding `=` that is a flag (`--url=...`, `--env=K=v`) or a bare `NAME=VALUE`.
+    A bare NAME, or the NAME of an env assignment attached to an env flag
+    (`--env=BAR_TOKEN=x`, `-e=KEY=x`, docker's `-eKEY=x`), masks the value when
+    secret-shaped. Any other `--x=a=b` (`--set=auth.enabled=true`) is not an env
+    assignment. A URL in the value has its userinfo and query masked."""
+    name, _, value = a.partition("=")
+    secret = False
+    if not a.startswith("-"):
+        secret = bool(_SECRET_HEADER.search(name))
+    else:
+        prefix, assign = "", ""
+        if (flag == "-e" or "env" in flag.lower()) and _ENV_ASSIGN.match(value):
+            prefix, assign = f"{name}=", value
+        elif a.startswith("-e") and _ENV_ASSIGN.match(a[2:]):
+            prefix, assign = "-e", a[2:]
+        if assign:
+            inner, _, value = assign.partition("=")
+            name, secret = prefix + inner, bool(_SECRET_HEADER.search(inner))
+    if secret:
+        return f"{name}=***"
+    return f"{name}={_redact_url(value)}" if "://" in value else a
 
 
 def _redact_args(args: list) -> list:
+    """`args` with every secret masked, for display. Per arg: (1) a pending secret value
+    is masked unless the arg is itself a flag (`_is_flag`); (2) otherwise the arg is
+    classified by its own shape."""
     out = []
-    pending: str | None = None  # None | "value" | "header" | "header-value"
+    pending: str | None = None  # None | "value" | "header"
     header_flag = ""            # the flag a "header" pending came from
     for a in args:
-        if pending in ("value", "header-value"):
-            # Checked before any other shape: `--password -Hx7Q` is a password, not `-H`.
-            # "header-value" is `--header "Authorization:" "Bearer x"`, the value as its
-            # own arg.
+        if pending == "value" and not _is_flag(a):
+            out.append("***")
             pending = None
-            if not _is_flag_not_value(a):
-                out.append("***")
-                continue
-            # The secret-looking flag was a boolean (`--no-auth`, `--oauth`), or the
-            # header had no value: the next token is another flag. Handle it as one.
-        if pending == "header":
-            pending = None
-            if not a.startswith("-"):
-                out.append(_redact_header_payload(header_flag, a))
-                pending = "header-value" if _value_in_next_arg(a) else None
-                continue
-            # `-H --api-key sk-1`: `-H` took no payload; the next token is a flag.
-        if a.startswith("-H") and len(a) > 2 and a[2] != "=":
-            # curl's attached form, `-HAuthorization: Bearer x`.
-            out.append("-H" + _redact_header_payload("-H", a[2:]))
-            pending = "header-value" if _value_in_next_arg(a[2:]) else None
             continue
+        if pending == "header" and not a.startswith("-"):
+            out.append(_redact_header_payload(header_flag, a))
+            pending = "value" if _value_in_next_arg(a) else None
+            continue
+        # Nothing pending, a boolean secret-ish flag (`--oauth`) or a value-less header
+        # (`Authorization:` then `--foo`), or a header flag with no payload (`-H --x`).
+        pending = None
         flag = a.split("=", 1)[0]
         if flag in _HEADER_FLAGS:
             if "=" in a:
                 # Inline form `--header=NAME=VALUE` (argparse also accepts this): the
                 # first `=` separates the flag from the NAME=VALUE payload.
-                _, rest = a.split("=", 1)
+                rest = a.split("=", 1)[1]
                 out.append(f"{flag}={_redact_header_payload(flag, rest)}")
-                pending = "header-value" if _value_in_next_arg(rest) else None
+                pending = "value" if _value_in_next_arg(rest) else None
             else:
                 out.append(a)
                 pending, header_flag = "header", flag  # the NEXT arg is the payload
-            continue
-        if _SECRET_FLAG.match(flag) or _SECRET_FLAG_PART.match(flag):
+        elif a.startswith("-H") and len(a) > 2:
+            # curl's attached form, `-HAuthorization: Bearer x`.
+            out.append("-H" + _redact_header_payload("-H", a[2:]))
+            pending = "value" if _value_in_next_arg(a[2:]) else None
+        elif _is_secret_flag(flag):
             out.append(f"{flag}=***" if "=" in a else a)
-            pending = "value" if "=" not in a else None
-            continue
-        if "=" in a and (a.startswith("-") or _ENV_ASSIGN.match(a)):
-            # `--url=https://u:pw@h`, `DATABASE_URL=postgres://u:pw@db`: the value half is
-            # what can hold a credential, and a secret-looking NAME masks it outright.
-            name, _, value = a.partition("=")
-            secret = not a.startswith("-") and bool(_SECRET_HEADER.search(name))
-            if a.startswith("-"):
-                # An env assignment attached to its flag: `--env=BAR_TOKEN=x`, `-e=KEY=x`,
-                # and docker's `-eKEY=x`. Its NAME decides, as for a bare `KEY=x`.
-                prefix, assign = f"{name}=", value
-                if not _ENV_ASSIGN.match(assign) and a.startswith("-e"):
-                    prefix, assign = "-e", a[2:]
-                if _ENV_ASSIGN.match(assign):
-                    inner, _, value = assign.partition("=")
-                    name, secret = prefix + inner, bool(_SECRET_HEADER.search(inner))
-            if secret:
-                out.append(f"{name}=***")
-            else:
-                out.append(f"{name}={_redact_url(value)}" if "://" in value else a)
-            continue
-        out.append(_redact_url(a) if "://" in a else a)
+            pending = None if "=" in a else "value"
+        elif "=" in a and (a.startswith("-") or _ENV_ASSIGN.match(a)):
+            # `--url=https://u:pw@h`, `DATABASE_URL=postgres://u:pw@db`, `--env=K=v`.
+            out.append(_redact_assignment(a, flag))
+        else:
+            out.append(_redact_url(a) if "://" in a else a)
     return out
 
 

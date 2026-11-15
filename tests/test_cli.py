@@ -2084,3 +2084,49 @@ def test_redact_args_masks_userinfo_of_an_unparseable_url(url):
     # B5: `_redact_url` returned these whole (urlsplit ValueError / no host).
     out = " ".join(_redact_args([url, f"--url={url}"]))
     assert "FAKE" not in out and out.count("***@") == 2
+
+
+# --- PR #584 review round 3 (ledger R2-1..R2-5) ---
+@pytest.mark.parametrize(("args", "want"), [
+    # R2-1: a single-dash secret flag is a flag, even while a value is pending.
+    (["--no-auth", "-token", "sk-1"], ["--no-auth", "-token", "***"]),
+    (["-insecure-auth", "-token", "sk-1"], ["-insecure-auth", "-token", "***"]),
+    (["--header", "Authorization:", "-api-key", "sk-1"],
+     ["--header", "Authorization:", "-api-key", "***"]),
+    # R2-2: a secret-shaped header NAME is never a `-H host:port`.
+    (["-H", "Authorization:12345"], ["-H", "Authorization: ***"]),
+    (["-H", "X-Auth-Token:12345"], ["-H", "X-Auth-Token: ***"]),
+    (["-HX-Api-Key:4242"], ["-HX-Api-Key: ***"]),
+    (["-H", "Cookie:123"], ["-H", "Cookie: ***"]),
+    # R2-3: a value after the first separator means nothing is pending.
+    (["--header", "Authorization: Basic dXNlcjpwdw==", "server.py"],
+     ["--header", "Authorization: ***", "server.py"]),
+])
+def test_redact_args_review_round_3_shapes(args, want):
+    assert _redact_args(args) == want
+
+
+@pytest.mark.parametrize("args", [
+    # R2-3
+    ["--header=X-Request-Id: token=", "server.py"],
+    # R2-4: compound non-secret flags, boolean negations, non-env `--x=a=b`.
+    ["--session-dir", "/tmp/x"], ["--session-timeout", "30"], ["--session-name", "n"],
+    ["--cache-key", "k"], ["--sort-key", "k"], ["--primary-key", "id"],
+    ["--no-session", "srv.py"], ["--oauth", "-p", "8080"],
+    ["--set=auth.enabled=true"], ["--label=session=foo"],
+])
+def test_redact_args_review_round_3_leaves_alone(args):
+    assert _redact_args(args) == args
+
+
+def test_redact_url_text_is_linear_on_repeated_schemes():
+    # R2-5: `(://[^?#\s]*)([?#])` rescanned to the end from every `://`: ~15 s at 64 KB.
+    import time
+
+    from terse.cli import _redact_url_text
+
+    blob = "://a" * 16000   # 64 KB
+    t0 = time.perf_counter()
+    _redact_url_text(blob)
+    _redact_args([f"--url={blob}", "--header", f"X-Upstream: {blob}"])
+    assert time.perf_counter() - t0 < 1.0
