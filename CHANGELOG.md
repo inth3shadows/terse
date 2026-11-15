@@ -14,6 +14,24 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Fixed
+- `terse proxy` (single server) ended the whole session with exit 0 on one byte of invalid
+  UTF-8 from the client. The strict decoder raised inside the stdin loop and killed the
+  client-to-server thread. Client stdin is now read with `surrogateescape`, and a line
+  that is not valid UTF-8 is dropped, never forwarded (a `--debug` stderr note), exactly
+  as the multiproxy router has done since #517. Later lines are still answered.
+- A stdio downstream that ignores stdin EOF kept `terse proxy` blocked forever once the
+  client disconnected without signalling it, orphaning both processes. After client EOF,
+  a child that stays idle for 30 seconds (no request in flight and no output) is now
+  terminated (SIGTERM, then SIGKILL), with a stderr note. A request of any method sent
+  within those 30 seconds before EOF and not yet answered or cancelled keeps the child
+  alive, so a slow reply (a cold-started server's `initialize`, a long tool call) is not
+  cut off. An older unanswered request is treated as abandoned. A 10-minute ceiling after
+  EOF ends a child that never answers or keeps sending notifications, and a child that
+  even SIGKILL cannot reap is given up on (exit 1) instead of waited for forever.
+
+## [0.49.3] - 2026-11-14
+
+### Fixed
 - In the multiproxy router, a downstream server that exited kept every later `ping`,
   `tools/list`, `resources/list` and `initialize` waiting the full 30-second broadcast
   timeout, because the dead peer stayed in each broadcast's set of peers still owed an

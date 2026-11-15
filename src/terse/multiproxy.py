@@ -88,6 +88,7 @@ from .proxy import (
     Interceptor,
     PrimerLatch,
     _build_capture_and_audit,
+    _encodable,
     _ignore_sigterm,
     _install_sigterm_to_exit,
     _new_session_id,
@@ -247,16 +248,6 @@ def _clip(text: str) -> str:
 def _short(value: object) -> str:
     """`repr(value)`, clipped (see `_clip`)."""
     return _clip(repr(value))
-
-
-def _encodable(text: str) -> bool:
-    """False for a str holding a lone surrogate (or a surrogateescape'd byte), which a
-    strict UTF-8 stream cannot write."""
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
 
 
 def _bad_id(mid: object) -> bool:
