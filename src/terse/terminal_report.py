@@ -18,23 +18,31 @@ from typing import Any
 
 from .report import (
     _FIXED_IDEAL_MIN_QUESTIONS,
+    _GAP_TOLERANCE,
     ATTRITION_NOTE,
     DIFF_ARMS,
     DROPEVAL_METRICS,
     FLUENCY_CONTROL,
     FLUENCY_GATING,
     _ci,
+    _format_worst_case_line,
     _sum,
     attrition,
     attrition_block,
     diff_gap_rows,
+    diff_soak_verdict,
+    diff_soak_verdict_lines,
+    diff_verdict_lines,
     dropeval_attrition_note,
     dropeval_directive_line,
     dropeval_verdict,
     exclusion_note,
+    fleet_gate,
+    fluency_conclusion_line,
     fluency_gap_rows,
     is_diff_run,
-    passes_tolerance,
+    is_soak_run,
+    row_verdict,
     savings_totals,
     strip_markup,
 )
@@ -217,8 +225,8 @@ def forest_bar_lines(rows: list[dict[str, Any]], form_label: str, control_label:
     scale = "0%" + "·" * (_TRACK_WIDTH + 1 - len("0%") - len("100%")) + "100%"
     lines = [f"  {'':<{label_w}}  ○ {control_label}   ● {form_label}   {scale}"]
     for r in rows:
-        badge = "PASS" if r["passed"] else "FAIL"
-        badge_sgr = "32" if r["passed"] else "31"
+        badge = r.get("verdict") or ("PASS" if r["passed"] else "FAIL")
+        badge_sgr = {"PASS": "32", "INCONCLUSIVE": "33"}.get(badge, "31")
         c_track = _c("36", _track(r["control_acc"], r["control_ci"], "○"), enabled)
         f_track = _c("35", _track(r["form_acc"], r["form_ci"], "●"), enabled)
         lines.append(f"  {r['model'][:label_w]:<{label_w}}  {c_track}")
@@ -237,12 +245,27 @@ def build_terminal_diff_report(results: dict, form_label: str = "diff-form",
     also covers a backend that answered with no content at all."""
     gap_rows, excluded = diff_gap_rows(results)
     plot_rows = []
-    for model, (facc, fse, cacc, cse) in gap_rows.items():
-        gap = facc - cacc
-        passed = passes_tolerance(gap)
+    for model, row in gap_rows.items():
+        facc, fse, cacc, cse, *_ = row
+        word = row_verdict(row)   # same rule as the markdown headline (#582)
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
-                           "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
+                           "control_acc": cacc, "control_ci": _ci(cse),
+                           "passed": word == "PASS", "verdict": word})
     text = forest_bar_lines(plot_rows, form_label, control_label, color=color)
+    # The FLEET verdict, not just per-model badges (#589). This is the one output without
+    # `--html`, and with badges alone a withheld model never blocked PASS here while the
+    # markdown and the HTML banner said INCONCLUSIVE. The markdown's own bullets, from the
+    # same decision, markup stripped; a soak's also read its deepest slice. Printed only
+    # when something was scored: the no-verdict bullets point at prose this chart lacks,
+    # and `(no data)` plus the exclusion note below already say nothing was scored.
+    if is_soak_run(results):
+        soak = diff_soak_verdict(results)
+        fleet_word, lines = soak.word, diff_soak_verdict_lines(soak)
+    else:
+        gate = fleet_gate(gap_rows, bool(excluded))
+        fleet_word, lines = gate.word, diff_verdict_lines(gate, form_label, control_label)
+    if fleet_word is not None:
+        text += "\n\n" + "\n".join(_plain(line) for line in lines)
     # THIS chart is the one an operator sees without `--html`: `cli` prints the markdown
     # and this plot on every diff path and writes the HTML page only under `--html`, so
     # leaving it silent meant the disclosure existed exactly where it was least read
@@ -263,12 +286,21 @@ def build_terminal_fluency_report(results: dict, color: bool | None = None) -> s
     whose raw control failed (backend/config error) are excluded, same as the markdown."""
     gap_rows, broken = fluency_gap_rows(results)
     plot_rows = []
-    for model, (facc, fse, cacc, cse) in gap_rows.items():
-        gap = facc - cacc
-        passed = passes_tolerance(gap)
+    for model, row in gap_rows.items():
+        facc, fse, cacc, cse, *_ = row
+        word = row_verdict(row)   # same rule as the markdown headline (#582)
         plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
-                           "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
+                           "control_acc": cacc, "control_ci": _ci(cse),
+                           "passed": word == "PASS", "verdict": word})
     text = forest_bar_lines(plot_rows, "best terse-form", "raw", color=color)
+    # The fleet verdict, from the markdown's own rule and lines (#589): any excluded model
+    # blocks PASS, as `build_fluency_report` decides it.
+    gate = fleet_gate(gap_rows, bool(broken))
+    if gate.worst is not None:
+        text += "\n\n" + "\n".join(_plain(line) for line in (
+            _format_worst_case_line(gate.worst, _GAP_TOLERANCE, "best terse-form", "raw",
+                                    withheld=gate.withheld),
+            fluency_conclusion_line(gate)))
     if broken:
         text += f"\n  ({exclusion_note(broken)})"
     # The bars are drawn over the PAIRED subset, and a chart that does not say what was
@@ -344,11 +376,11 @@ def build_terminal_dropeval_report(results: dict, color: bool | None = None,
             metric = metrics.get(key)
             if metric is None:
                 continue
-            facc, fse, cacc, cse = metric
-            gap = facc - cacc
-            passed = passes_tolerance(gap)
+            facc, fse, cacc, cse, *_ = metric
+            word = row_verdict(metric)   # same rule as the dropeval verdict (#582)
             plot_rows.append({"model": model, "form_acc": facc, "form_ci": _ci(fse),
-                               "control_acc": cacc, "control_ci": _ci(cse), "passed": passed})
+                               "control_acc": cacc, "control_ci": _ci(cse),
+                               "passed": word == "PASS", "verdict": word})
         # The note comes FIRST, and is emitted even when there is nothing to plot. The
         # `continue` used to sit above it, so a metric from which EVERY model was withheld
         # lost its disclosure along with its empty chart — and `dropeval_directive_line`,

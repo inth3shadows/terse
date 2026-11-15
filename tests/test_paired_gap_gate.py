@@ -194,14 +194,14 @@ def test_the_html_banner_gives_no_verdict_for_rows_that_are_not_a_diff_run():
 
 def test_a_correlated_loss_cannot_publish_PASS_in_the_diff_forest_plot():
     gap_rows, _ = diff_gap_rows({"m": _correlated_loss_rows()})
-    facc, _, cacc, _ = gap_rows["m"]
+    facc, _, cacc, *_ = gap_rows["m"]
     assert facc - cacc == pytest.approx(-0.20, abs=1e-9)
     assert "FAIL" in build_terminal_diff_report({"m": _correlated_loss_rows()}, color=False)
 
 
 def test_a_correlated_loss_cannot_publish_PASS_in_the_fluency_forest_plot():
     gap_rows, _ = fluency_gap_rows({"m": _payload_correlated_loss_rows()})
-    facc, _, cacc, _ = gap_rows["m"]
+    facc, _, cacc, *_ = gap_rows["m"]
     assert facc - cacc == pytest.approx(-0.20, abs=1e-9)
     plot = build_terminal_fluency_report({"m": _payload_correlated_loss_rows()}, color=False)
     assert "FAIL" in plot

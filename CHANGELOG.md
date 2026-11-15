@@ -23,6 +23,158 @@ fails that pull request until the section has moved.
   `arguments` is not an object (`"[1]"`, `"null"`) or whose retrieve `handle` is
   unhashable no longer aborts a `dropeval`/`codeceval` sweep, and a history line that is
   not an object is ignored.
+
+## [0.50.2] - 2026-11-15
+
+### Fixed
+- `terse mcp-status` (table and `--json`) printed each wrapped server's downstream command
+  unredacted, so `--api-key sk-…` appeared in the clear. It now goes through the same
+  redaction as `install-mcp`/`uninstall-mcp` output. That redaction also covers more
+  shapes: the `Authorization: Bearer …` header form (`--header`/`-H`, as `mcp-remote`
+  takes it, including curl's attached `-HName: value` and a value passed as its own arg,
+  after `Name:` or `Name=` with nothing after it), `PAT`/`KEY`/`BEARER`/`SESSION` as a
+  delimited part of a flag or name (`--key`, `--github-pat`, `--openai-key`,
+  `--session-id`, `GH_PAT=`, `STRIPE_KEY=`, `SESSION_ID=`, `X-GitHub-PAT`), single-dash
+  secret flags (`-token`, `-api-key`), env assignments attached to an env flag
+  (`--env=BAR_TOKEN=…`, `-e=KEY=…`, `-eKEY=…`), a secret value that starts with `-`
+  (`--token -x…`), and URL userinfo `urlsplit` can't parse (`https://u:pw@[::1/x`).
+  A flag right after `-H` is read as a flag, a `-H` URL is redacted as a URL, and
+  docker's `-H host:port` is left as it is when the name is host-like (`token-svc:8080`,
+  not `Authorization:12345`). `--no-auth`, `--no-session`, lookup keys (`--cache-key`,
+  `--sort-key`) and `--session-dir`/`--session-timeout` take no secret, so the arg after
+  them prints; any other flag containing `auth` (`--oauth`, `--basicauth`) still masks
+  the arg after it, as do `--no-token` and `--no-password`, and `--no-auth=…` is masked.
+  A secret-shaped `NAME=` inside a header value (`X-Custom: token=…`) and curl's attached
+  `-Htoken …` are masked too. `mcp-status` redacts the argument list before joining it,
+  so a header value containing spaces is masked whole.
+- The savings ledger labelled an HTTP downstream by its full URL netloc, so a
+  `https://user:pass@host/mcp` target wrote `user:pass@host` into every ledger row and into
+  `terse stats` output. The label is now the `host[:port]` alone, and rows already in the
+  ledger with a `user:pass@` or `token@` label are read back under the host. A URL with
+  userinfo and no host (`https://u:pw@/x`) is labelled `unknown`, and one `urlparse`
+  rejects (`https://u:pw@[::1/x`) no longer crashes `mcp-status`, `stats` or proxy startup.
+
+## [0.50.1] - 2026-11-15
+
+### Fixed
+- An HTTP downstream's response reached the client unframed. A pretty-printed JSON body,
+  or an SSE event whose `data:` spanned several lines, was written to the client's stdio
+  stream as several lines of non-JSON, and the request hung. An HTML 200 (a captive portal
+  or login page) was forwarded as junk, and a batch array went out unsplit. Each body is
+  now compacted by removing whitespace outside strings, lexically, so no number or
+  duplicate key is rewritten. A body carrying several messages (a batch array, SSE
+  events, or newline-delimited JSON values) is split into them. Blank SSE priming events,
+  non-JSON keepalives and other non-JSON-RPC content are dropped, and a 2xx body's content
+  is never echoed into an error. One rule now decides, for every status, what answers a
+  request: a response carrying its id. A response has a `result`, or an `error` that is a
+  JSON object, so a REST body such as `{"error": "login required"}` is not one. If no
+  response carries the id, the first response is re-keyed to the request's id by
+  splicing in the id and keeping the rest of its text, which covers `"id": null` (a
+  server's reply to an expired session), a wrong id, and `"3"` for `3`. A response over
+  4 MiB is not re-keyed: it is forwarded as sent, and the request gets an error. A
+  request that got no response at all, including an empty 200/202 body, gets an error
+  instead of hanging; in a batch, each unanswered request id gets its own error. Only a
+  request (a `method` and an `id`) expects a reply: a notification, or the client's own
+  response to a server-initiated request, never gets a synthesized one. A response without a
+  `"jsonrpc"` member is forwarded, and so is a valid body that Python's parser refuses
+  (an integer over 4300 digits, or nesting past the recursion limit, up to 4 MiB, where
+  the slower lexical reading is capped). This applies to `terse proxy` and to multiproxy
+  HTTP peers.
+
+## [0.50.0] - 2026-11-15
+
+### Changed
+- Comprehension verdicts (`terse fluency`, `fluency --diff`, the diff soak, the HTML
+  report, and all three `dropeval` gates: retrieve-recall, no-overfetch and final-accuracy)
+  now PASS only when the gap's 95% interval clears the 5% tolerance, not just its point
+  estimate. 19/20 vs 20/20 used to print **PASS**, "safe to enable `proxy --diff`", at
+  "-5% ±10 pts". A point estimate inside the line whose interval reaches past it is now
+  **INCONCLUSIVE** (dropeval: INSUFFICIENT, with prose that says the metric was measured
+  and needs more questions), naming the model whose interval reaches furthest. A 39/40
+  recall run used to print SHIP and is now INSUFFICIENT. The interval is now the paired,
+  question-clustered SE of the per-question difference rather than the two arms' SEs
+  combined as if independent, which overstated the noise for paired arms. Two identical
+  arms at 50% over 24 questions printed ±28 pts and now print ±0. A model withheld from
+  the gate (unmeasured, underpowered, or with a broken control) now turns a would-be PASS
+  into INCONCLUSIVE in the diff, soak and fluency reports, and in each dropeval metric's
+  line, as dropeval's directive already did (#344). It still never turns into a FAIL.
+- The fleet verdict is now decided once and rendered by every output, so the markdown,
+  the HTML page and the `--bars` terminal chart cannot disagree. The `--bars` diff and
+  fluency charts now print the verdict lines, not only per-model badges. The soak's HTML
+  banner and chart now read the deepest slice too: a soak whose deepest slice was withheld
+  or too wide showed a green PASS banner over a markdown that said "Not concluded". A
+  model whose soak never reached the deepest depth now blocks that depth's PASS and is
+  named, instead of being left out.
+- The #334 question floor now counts questions both arms actually scored. A legacy result
+  file whose control was scored on one of 20 rows printed `+0% ±0 pts **PASS**`; it is now
+  withheld as underpowered. The HTML forest plot no longer clips the `INCONCLUSIVE` badge.
+
+## [0.49.5] - 2026-11-15
+
+### Fixed
+- `install-mcp` re-wrapped the OLD command after a wrapped entry had been replaced by hand.
+  The stashed original always won over the live entry, so swapping `kb` for a new command
+  and re-running install brought the old one back and discarded yours, and
+  `uninstall-mcp` restored the old one over it. An entry that is no longer a terse
+  wrapper (and not a router) and differs from the stash is now treated as the new
+  original. Re-install wraps it, including `--multiproxy` folds, and uninstall keeps it
+  (printing `kept`) and drops the stale stash copy. The same holds when only the
+  downstream after the wrapper's `--` was edited (`-- kb --v1` to `-- kb --v2`):
+  re-install wraps the edited downstream and uninstall restores it, unwrapped (with a
+  `type` that matches if the edit changed stdio to a URL or back). terse's wrapper is
+  recognised by its launcher (including a custom `$TERSE_MCP_CMD`), not by its flags, so
+  a hand-edited flag or a deleted downstream keeps the stash, and a third-party
+  `mcp-gw proxy --policy x -- srv` entry stays the user's own. A terse wrapper is never
+  adopted as the original itself. A replacement with no string `command` or `url` is
+  refused with an error before anything is written.
+
+## [0.49.4] - 2026-11-15
+
+### Fixed
+- `terse proxy` (single server) ended the whole session with exit 0 on one byte of invalid
+  UTF-8 from the client. The strict decoder raised inside the stdin loop and killed the
+  client-to-server thread. Client stdin is now read with `surrogateescape`, and a line
+  that is not valid UTF-8 is dropped, never forwarded (a `--debug` stderr note), exactly
+  as the multiproxy router has done since #517. Later lines are still answered.
+- A stdio downstream that ignores stdin EOF kept `terse proxy` blocked forever once the
+  client disconnected without signalling it, orphaning both processes. After client EOF,
+  a child that stays idle for 30 seconds (no request in flight and no output) is now
+  terminated (SIGTERM, then SIGKILL), with a stderr note. A request of any method sent
+  within those 30 seconds before EOF and not yet answered or cancelled keeps the child
+  alive, so a slow reply (a cold-started server's `initialize`, a long tool call) is not
+  cut off. An older unanswered request is treated as abandoned. A 10-minute ceiling after
+  EOF ends a child that never answers or keeps sending notifications, and a child that
+  even SIGKILL cannot reap is given up on (exit 1) instead of waited for forever.
+
+## [0.49.3] - 2026-11-14
+
+### Fixed
+- In the multiproxy router, a downstream server that exited kept every later `ping`,
+  `tools/list`, `resources/list` and `initialize` waiting the full 30-second broadcast
+  timeout, because the dead peer stayed in each broadcast's set of peers still owed an
+  answer. A broadcast now completes as soon as every outstanding peer has exited,
+  including one already in flight when the peer dies, and no broadcast request is sent
+  to a dead peer. A listing that lacks the dead peer is still never saved to the warm-start
+  snapshot.
+
+## [0.49.2] - 2026-11-14
+
+### Fixed
+- A `{"critical": true}` field could still be lost through an overlapping lossy rule. The
+  denylist matched only the exact path string, so a truncate on `items` (`max: 1`) cut away
+  `items[].id` from every record past the first, a drop on `a` replaced a critical
+  `a.secret`, and `a.[].b` did not match a critical `a[].b`. Any lossy path that is an
+  ancestor of, descendant of, or equal to a critical path (compared by parsed tokens) is
+  now skipped with a warning naming the critical field.
+- A policy's `never_lossy_servers` written as a bare string (`"mybank"`) loaded as the set
+  of its characters, so no server matched and the credential-server floor was silently
+  off. `load_policy` now requires a list of strings, and `install-mcp --never-lossy` keeps a
+  hand-written bare string whole when adding to it.
+- A field's `max`/`min` that is not an integer (`"abc"`, `null`, `2.5`, `true`) or is out of
+  range (`max` < 1, `min` < 0) is now rejected at load. A non-integer used to raise on
+  every payload past the lossy stage's handler, so the tool was silently never
+  compressed, and a negative `max` sliced from the end of the value. Values that already
+  worked (`"50"`, `120.0`) still load.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,

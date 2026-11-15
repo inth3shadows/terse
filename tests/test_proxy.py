@@ -2927,3 +2927,201 @@ def test_one_unfaithful_block_does_not_sink_the_partial_join_of_the_rest():
     texts = [b["text"] for b in json.loads(out)["result"]["content"]]
     assert bad in texts                                  # passed through byte-for-byte
     assert reasons[-1] == "multiblock_partial"
+
+
+# --- single-proxy lifecycle edges (audit 2026-11-12, #582) ---
+def test_invalid_utf8_on_client_stdin_does_not_end_the_session():
+    # One stray byte used to kill the client->server thread (exit 0, empty output).
+    raw = (json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}) + "\n\xff\n"
+           ).encode("latin-1") + (json.dumps({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+                                  + "\n").encode()
+    cin = io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8")
+    cout = io.StringIO()
+    echo = [sys.executable, "-c", "import sys\nfor l in sys.stdin: sys.stdout.write(l); "
+            "sys.stdout.flush()"]
+    assert run_proxy(echo, FULL, stdin=cin, stdout=cout) == 0
+    ids = [json.loads(ln).get("id") for ln in cout.getvalue().splitlines()
+           if ln.startswith("{")]
+    assert ids == [1, 2]
+
+
+def test_child_that_ignores_stdin_eof_is_terminated_after_the_grace(monkeypatch):
+    import time as _time
+
+    from terse import proxy as proxy_mod
+    monkeypatch.setattr(proxy_mod, "_EOF_GRACE_S", 0.3)
+    stubborn = [sys.executable, "-c", "import time; time.sleep(60)"]
+    start = _time.monotonic()
+    rc = run_proxy(stubborn, FULL, stdin=io.StringIO(""), stdout=io.StringIO())
+    assert _time.monotonic() - start < 10
+    assert rc != 0          # killed by SIGTERM, not a clean exit
+
+
+def test_a_slow_reply_after_client_eof_is_still_delivered(monkeypatch):
+    # The child answers 1.5 s after EOF, past a 0.5 s grace: an in-flight tools/call
+    # keeps it alive, so the reply the client asked for is not cut off (#582 review).
+    from terse import proxy as proxy_mod
+    monkeypatch.setattr(proxy_mod, "_EOF_GRACE_S", 0.5)
+    slow = [sys.executable, "-c",
+            "import sys, time, json\n"
+            "req = json.loads(sys.stdin.readline())\n"
+            "time.sleep(1.5)\n"
+            "print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': "
+            "{'content': [{'type': 'text', 'text': 'done'}]}}), flush=True)\n"]
+    call = json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                       "params": {"name": "items.get", "arguments": {}}}) + "\n"
+    cout = io.StringIO()
+    assert run_proxy(slow, FULL, stdin=io.StringIO(call), stdout=cout) == 0
+    assert '"id":4' in cout.getvalue().replace(" ", "")
+
+
+def test_an_unanswered_call_does_not_keep_a_stubborn_child_forever(monkeypatch):
+    # A cancelled/hung call stays "in flight"; the hard ceiling still ends it (#582 review).
+    import time as _time
+
+    from terse import proxy as proxy_mod
+    monkeypatch.setattr(proxy_mod, "_EOF_GRACE_S", 0.3)
+    monkeypatch.setattr(proxy_mod, "_EOF_MAX_S", 1.0)
+    hung = [sys.executable, "-c", "import sys, time\nsys.stdin.readline()\ntime.sleep(60)"]
+    lines = (json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": "items.get", "arguments": {}}}) + "\n"
+             + json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                           "params": {"requestId": 1}}) + "\n")
+    start = _time.monotonic()
+    rc = run_proxy(hung, FULL, stdin=io.StringIO(lines), stdout=io.StringIO())
+    assert _time.monotonic() - start < 10 and rc != 0
+
+
+# --- #588 review blockers (B1-B4) ---
+def _recording_echo(path: pathlib.Path) -> list[str]:
+    """A child that appends every raw byte line it receives to `path` and echoes it."""
+    return [sys.executable, "-c",
+            "import sys\n"
+            f"f = open({str(path)!r}, 'wb')\n"
+            "for l in sys.stdin.buffer:\n"
+            "    f.write(l); f.flush(); sys.stdout.buffer.write(l); sys.stdout.flush()\n"]
+
+
+def test_invalid_utf8_client_lines_never_reach_the_child(tmp_path, capsys):
+    # B1: surrogateescape + escape_surrogates turned `caf\xe9` into the different JSON
+    # string "caf\udce9" and a bare `\xff` into the text `\udcff`, and forwarded both.
+    # Like multiproxy, such a line is dropped (a --debug note), and later lines still work.
+    ping1 = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+    ping2 = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+    raw = (ping1.encode() + b"\n"
+           + b'{"jsonrpc":"2.0","id":7,"method":"ping","params":{"s":"caf\xe9"}}\n'
+           + ping1.replace('"id": 1', '"id": 8').encode() + b"\xff\n"
+           + b"\xff\n"
+           + ping2.encode() + b"\n")
+    got = tmp_path / "child_in.bin"
+    cin = io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8")
+    cout = io.StringIO()
+    assert run_proxy(_recording_echo(got), FULL, debug=True, stdin=cin, stdout=cout) == 0
+    assert got.read_bytes().splitlines() == [ping1.encode(), ping2.encode()]
+    assert [json.loads(ln)["id"] for ln in cout.getvalue().splitlines()] == [1, 2]
+    assert capsys.readouterr().err.count("client line dropped: not valid UTF-8") == 3
+
+
+def _slow_reply_child(delay: float) -> list[str]:
+    return [sys.executable, "-c",
+            "import sys, time, json\n"
+            "req = json.loads(sys.stdin.readline())\n"
+            f"time.sleep({delay})\n"
+            "print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': {}}), "
+            "flush=True)\n"]
+
+
+@pytest.mark.parametrize("method", ["initialize", "tools/list", "resources/read",
+                                    "prompts/get"])
+def test_a_slow_reply_to_any_request_after_client_eof_is_still_delivered(monkeypatch,
+                                                                          method):
+    # B2: only tools/call ids kept the child alive after EOF, so a slow reply to any other
+    # request was killed at the grace and lost (before #588 it was delivered).
+    from terse import proxy as proxy_mod
+    monkeypatch.setattr(proxy_mod, "_EOF_GRACE_S", 0.4)
+    req = json.dumps({"jsonrpc": "2.0", "id": 5, "method": method, "params": {}}) + "\n"
+    cout = io.StringIO()
+    assert run_proxy(_slow_reply_child(1.2), FULL, stdin=io.StringIO(req),
+                     stdout=cout) == 0
+    assert [json.loads(ln)["id"] for ln in cout.getvalue().splitlines()] == [5]
+
+
+class _SlowStdin:
+    """Client stdin that yields `lines`, then waits `hold_s` before EOF; records when
+    EOF happened in `eof_at`."""
+
+    def __init__(self, lines: list[str], hold_s: float) -> None:
+        self.lines, self.hold_s, self.eof_at = lines, hold_s, None
+
+    def __iter__(self):
+        import time as _time
+        yield from self.lines
+        _time.sleep(self.hold_s)
+        self.eof_at = _time.monotonic()
+
+
+_HUNG = [sys.executable, "-c", "import sys, time\nsys.stdin.readline()\ntime.sleep(60)"]
+
+
+def _tools_call_line(mid: int) -> str:
+    return json.dumps({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+                       "params": {"name": "items.get", "arguments": {}}}) + "\n"
+
+
+def test_a_cancelled_call_does_not_hold_the_post_eof_wait_open(monkeypatch):
+    # B3: `notifications/cancelled` never cleared the call, so an idle child that ignores
+    # EOF was kept for the whole ceiling instead of the grace.
+    import time as _time
+
+    from terse import proxy as proxy_mod
+    monkeypatch.setattr(proxy_mod, "_EOF_GRACE_S", 0.3)
+    monkeypatch.setattr(proxy_mod, "_EOF_MAX_S", 6.0)
+    cancel = json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                         "params": {"requestId": 1}}) + "\n"
+    start = _time.monotonic()
+    rc = run_proxy(_HUNG, FULL, stdin=io.StringIO(_tools_call_line(1) + cancel),
+                   stdout=io.StringIO())
+    assert rc != 0
+    assert _time.monotonic() - start < 3.0
+
+
+def test_an_old_unanswered_call_does_not_hold_the_post_eof_wait_open(monkeypatch):
+    # B3: a call the client gave up on long before EOF (timed out, or answered with
+    # `id: null`) kept "busy" true, so the session waited the full ceiling. Only a request
+    # forwarded within `_EOF_GRACE_S` before EOF counts as still in flight.
+    import time as _time
+
+    from terse import proxy as proxy_mod
+    monkeypatch.setattr(proxy_mod, "_EOF_GRACE_S", 0.3)
+    monkeypatch.setattr(proxy_mod, "_EOF_MAX_S", 4.0)
+    cin = _SlowStdin([_tools_call_line(1)], hold_s=1.0)
+    rc = run_proxy(_HUNG, FULL, stdin=cin, stdout=io.StringIO())  # type: ignore[arg-type]
+    assert rc != 0 and cin.eof_at is not None
+    assert _time.monotonic() - cin.eof_at < 2.0
+
+
+def test_a_child_that_survives_sigkill_does_not_block_the_proxy(monkeypatch):
+    # B4: after `_terminate_child` the reap was an unbounded `proc.wait()`, so a child
+    # SIGKILL could not reap within its timeout (D state, stopped/traced) hung the proxy
+    # forever. Simulated by a `_terminate_child` that signals nothing.
+    import threading
+
+    from terse import proxy as proxy_mod
+    monkeypatch.setattr(proxy_mod, "_EOF_GRACE_S", 0.3)
+    monkeypatch.setattr(proxy_mod, "_STDIO_DRAIN_TIMEOUT", 0.5)
+    seen: list = []
+    monkeypatch.setattr(proxy_mod, "_terminate_child",
+                        lambda proc, timeout=2.0: seen.append(proc))
+    result: list = []
+    t = threading.Thread(target=lambda: result.append(run_proxy(
+        [sys.executable, "-c", "import time; time.sleep(30)"], FULL,
+        stdin=io.StringIO(""), stdout=io.StringIO())), daemon=True)
+    t.start()
+    t.join(timeout=6.0)
+    hung = t.is_alive()
+    for proc in seen:        # never leave the real child behind, pass or fail
+        proc.kill()
+        proc.wait()
+    t.join(timeout=5.0)
+    assert not hung
+    assert result and result[0] != 0
