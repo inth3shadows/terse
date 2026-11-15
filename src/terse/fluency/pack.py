@@ -11,7 +11,7 @@ import json
 
 from ..capture import extract_records
 from ..tokenize import count_cl100k
-from ..transforms import compress
+from ..transforms import PARSE_ERRORS, compress
 from .questions import gen_questions
 from .scoring import MISSING, _score_form
 
@@ -47,25 +47,39 @@ def build_pack(envelopes: list[dict], primer: str = PRIMER, trials: int = 1) -> 
     """Emit a self-contained eval pack (prompts + raw/terse forms + ground truth) so a
     run can be driven by any model client (e.g. via the secret-broker) and scored later
     with `score_pack`. Keyless: no model is called here. `trials` is a hint to the
-    external driver: collect that many replies per form (as a list) for a bounded verdict."""
+    external driver: collect that many replies per form (as a list) for a bounded verdict.
+
+    A payload that nests too deep to parse, or for `gen_questions`/`compress` to walk
+    (RecursionError), is left out and counted in `skipped_too_deep` (the key is present
+    only when it is non-zero, so an ordinary corpus's pack is unchanged)."""
     payloads = []
+    too_deep = 0
     for env in envelopes:
         try:
             obj = json.loads(env["raw"])
-        except (json.JSONDecodeError, TypeError):
+        except PARSE_ERRORS as e:
+            too_deep += isinstance(e, RecursionError)
             continue
-        qs = gen_questions(obj)
+        try:
+            qs = gen_questions(obj)
+            terse = compress(obj) if qs else ""
+        except RecursionError:
+            too_deep += 1
+            continue
         if not qs:
             continue
         payloads.append({
             "tool": env["tool"], "sha": env.get("sha", "?"),
-            "raw": env["raw"], "terse": compress(obj),
+            "raw": env["raw"], "terse": terse,
             "questions": [{
                 "qid": q.qid, "qtype": q.qtype, "transform": q.transform,
                 "prompt": q.prompt, "instruction": q.instruction, "expected": q.expected,
             } for q in qs],
         })
-    return {"primer": primer, "trials": trials, "payloads": payloads}
+    pack: dict = {"primer": primer, "trials": trials, "payloads": payloads}
+    if too_deep:
+        pack["skipped_too_deep"] = too_deep
+    return pack
 
 
 def score_pack(pack: dict, responses: dict) -> dict:
@@ -145,12 +159,16 @@ def token_summary(envelopes: list[dict]) -> list[dict]:
     for env in envelopes:
         try:
             obj = json.loads(env["raw"])
-        except (json.JSONDecodeError, TypeError):
+        except PARSE_ERRORS:
             continue
         if not extract_records(obj):
             continue
+        try:
+            terse = compress(obj)
+        except RecursionError:   # too deep to encode: no terse form to count (#591 B4)
+            continue
         rows.append({
             "tool": env["tool"], "sha": env.get("sha", "?"),
-            "raw_tok": count_cl100k(env["raw"]), "terse_tok": count_cl100k(compress(obj)),
+            "raw_tok": count_cl100k(env["raw"]), "terse_tok": count_cl100k(terse),
         })
     return rows

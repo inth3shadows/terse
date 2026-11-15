@@ -14,6 +14,40 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Fixed
+- One malformed payload, file or model reply no longer aborts a whole command. Several
+  readers caught only `JSONDecodeError`, so a >4300-digit integer (a plain `ValueError`),
+  deep nesting (`RecursionError`) or a torn multibyte write (`UnicodeDecodeError`) escaped
+  and ended the run. This affected `measure`, `validate`, `verify`, `probe` (and
+  `--cross-server`), `policy generate`/`autotune`, `tune`, `capture`, `fluency` (a
+  multi-model paid run lost every scored row), `dropeval`, `codeceval`, `terse stats` and
+  `measure --history`. Each now skips the bad item:
+  - The corpus loader also skips a file it cannot read at all (permission denied, a
+    directory named `x.json`), and its skip message counts each file by its real reason
+    (corrupt JSON, not UTF-8, nested too deep, integer past the digit limit, unreadable
+    file) instead of calling every one "corrupt JSON".
+  - A model reply the fluency scorer cannot parse (a huge integer, deep nesting) scores as
+    a miss instead of aborting the `fluency`/`dropeval` sweep.
+  - `capture` treats an unreadable prior envelope for the same payload like a missing one
+    and overwrites it, so that payload can be captured again.
+  - `terse stats` and `measure --history` drop a line holding an invalid byte instead of
+    decoding it into a different record.
+- A payload that nests too deep is skipped only when parsing or encoding it actually
+  fails with `RecursionError`. No fixed depth limit is applied first, so a payload past the
+  codec's 200-level limit that the codec and question generators still handle (several
+  hundred levels) is measured and evaluated exactly as before. A skipped payload is named
+  as too deep: `validate` shows `n/a (nests too deep to parse or encode)` rather than 0%
+  savings, `dropeval` reports `not_compressible` with that cause, the fluency pack records
+  `skipped_too_deep`, and the `fluency`, `--diff` and `--codec-verdict` progress lines say
+  why the payload was skipped. `--diff-soak` leaves such a payload out of its chain
+  windows, as it does a payload with no lossless diff.
+- A model's tool call whose `arguments` is not an object (`"[1]"`, `"null"`) no longer
+  aborts a `dropeval`/`codeceval` sweep. `arguments` sent already parsed as an object is
+  used as-is. A retrieve `handle` that is not a string misses with the proxy's own wording
+  (`handle ''`). A history line that is not an object is ignored.
+
+## [0.50.2] - 2026-11-15
+
+### Fixed
 - `terse mcp-status` (table and `--json`) printed each wrapped server's downstream command
   unredacted, so `--api-key sk-…` appeared in the clear. It now goes through the same
   redaction as `install-mcp`/`uninstall-mcp` output. That redaction also covers more

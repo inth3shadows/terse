@@ -117,7 +117,7 @@ from typing import Any, NamedTuple
 from . import capture, fluency
 from .dropeval import ToolAnswerer, Turn, _safe_call
 from .tokenize import count_cl100k
-from .transforms import minify
+from .transforms import PARSE_ERRORS, TOO_DEEP, minify
 
 # OpenAI function-calling schemas can't cleanly express "any JSON type" — see the module
 # docstring's spike note. `{"description": ...}` with no `"type"` is the untyped form that
@@ -830,6 +830,14 @@ def cell_tool(env: dict) -> str:
     return capture.qualify(bare, server)
 
 
+def _has_codec_questions(obj: Any) -> bool:
+    """`gen_codec_questions(obj)` is non-empty. A function of its own on purpose: called
+    from `run_codec_fluency`, it runs the question walk at the same stack depth that
+    `oversized_arms` and `run_codec_payload` repeat it at, so a payload too deep for that
+    walk fails HERE, where it is skipped and counted, never there (#591 B4)."""
+    return bool(gen_codec_questions(obj))
+
+
 def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
                       trials: int = 1,
                       progress: Callable[[str], None] | None = None,
@@ -912,10 +920,12 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
     asked_payloads: set[tuple[str, str]] = set()
     merged_duplicates: dict[str, int] = {}
     for i, env in enumerate(envelopes, 1):
+        too_deep = False
         try:
             obj = json.loads(env["raw"])
-        except (ValueError, TypeError):   # ValueError: the int-digit limit, #563
+        except PARSE_ERRORS as e:   # int-digit limit (#563), deep nesting, non-str
             obj = None  # these questions need parsed JSON; a non-JSON/text payload has none
+            too_deep = isinstance(e, RecursionError)
         terse = None
         if obj is not None and policy is not None:
             # Compressed under the SAME policy the primer was built from, lossless tiers only
@@ -930,13 +940,25 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
         # byte-for-byte on a `tiers: []` rule and on its depth/marker guards; compared with
         # `minify(obj)` alone that read as changed, so identical JSON was asked on both arms
         # and every trial was a free match toward SAFE (review round 4, #403 Blocker 2).
-        changed = (codec_changes(obj) if terse is None
-                   else obj is not None and terse not in (env["raw"], minify(obj)))
-        if obj is None or not gen_codec_questions(obj) or not changed:
+        # No fixed depth screen: a payload past `MAX_DEPTH` that the codec and question walks
+        # handle is asked as before; one they cannot (RecursionError) is skipped as too deep
+        # (#591 B4). `codec_changes` runs `compress` at the depth the later calls do.
+        askable = False
+        if obj is not None:
+            try:
+                changed = (codec_changes(obj) if terse is None
+                           else terse not in (env["raw"], minify(obj)))
+                askable = changed and _has_codec_questions(obj)
+            except RecursionError:
+                too_deep = True
+        if not askable:
             # One line per skip, like `run_drop_fluency` (#267): `done` reaches `total`
-            # without M near-identical lines per skipped envelope.
+            # without M near-identical lines per skipped envelope. A payload too deep to
+            # parse or encode is one the codec leaves unencoded (the proxy passes it
+            # through), so it is counted with the rest and named as such (#591 B4).
             if progress is not None:
-                progress(f"[fluency --codec-verdict] (skipped) "
+                why = f"skipped: {TOO_DEEP}" if too_deep else "skipped"
+                progress(f"[fluency --codec-verdict] ({why}) "
                          f"{cell_tool(env):<24} "
                          f"{i}/{len(envelopes)} payload(s)")
             skipped_unaskable += 1
@@ -962,10 +984,10 @@ def run_codec_fluency(envelopes: list[dict], answerers: dict[str, ToolAnswerer],
         toks = _payload_tokens(env["raw"], obj, terse)
         # `sha` is OMITTED, never defaulted, when the envelope has no usable one. `tool`
         # defaults because it is a LABEL — a group headed `?` is legible. `shape` carries a
-        # label default too, but nothing can reach it: `json.loads(env["raw"])` above already
-        # `continue`d on a non-str `raw`, and `envelope_shape` only falls back to the stored
-        # value when there is no `raw` string to classify. It is kept as the signature's own
-        # documented behaviour rather than as a live branch. `sha` is
+        # label default too, but nothing can reach it: a non-str `raw` fails the parse above
+        # (`PARSE_ERRORS`) and is skipped as unaskable, and `envelope_shape` only falls back
+        # to the stored value when there is no `raw` string to classify. It is kept as the
+        # signature's own documented behaviour rather than as a live branch. `sha` is
         # an IDENTITY: `report._codec_savings_section` de-duplicates payloads by it, so a
         # shared `"?"` placeholder silently collapses every sha-less payload in a group into
         # whichever was seen first, and reports the survivor's tokens as the group's total.

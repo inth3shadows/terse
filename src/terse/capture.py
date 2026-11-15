@@ -26,6 +26,7 @@ from . import policy as policy_mod
 from ._secure_io import append_restricted, mkdir_restricted, write_restricted
 from .transforms import (
     MAX_DEPTH,
+    PARSE_ERRORS,
     is_tabularizable,  # the canonical "what tabularize folds" rule
 )
 
@@ -235,6 +236,11 @@ def _prune_tool_samples(corpus: Path, safe_tool: str, keep: int) -> None:
             pass  # a concurrent proxy already pruned it, or it is not ours to remove
 
 
+# What reading and parsing one envelope file can raise: the parse's own errors plus the
+# file's (EACCES, a directory named `x.json`). Spelled once so both readers agree.
+_READ_ERRORS: tuple[type[Exception], ...] = (OSError, *PARSE_ERRORS)
+
+
 def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
                     server: str | None = None, result_id: str | None = None,
                     manual: bool | None = None,
@@ -307,7 +313,10 @@ def capture_payload(tool: str, raw: str, corpus_dir: str | Path, *,
                 result_id = prior.get("result_id")
                 if not isinstance(result_id, str):
                     result_id = None
-        except (json.JSONDecodeError, OSError):
+        except _READ_ERRORS:
+            # An unreadable prior (torn UTF-8, a >4300-digit int, deep nesting) is treated
+            # like a missing one and overwritten below; raising here would leave that sha
+            # un-capturable for good, since every later sighting reads the same file.
             pass
     envelope: dict[str, Any] = {
         "tool": tool,
@@ -360,6 +369,21 @@ def is_sidecar_filename(name: str) -> bool:
     return name.startswith("_")
 
 
+def _unreadable_reason(e: BaseException) -> str:
+    """Why `load_corpus` could not read one envelope file, for its skip message."""
+    if isinstance(e, OSError):
+        return "unreadable file"              # EACCES, a directory named `x.json`, ...
+    if isinstance(e, UnicodeDecodeError):
+        return "not UTF-8"
+    if isinstance(e, RecursionError):
+        return "nested too deep"
+    if isinstance(e, json.JSONDecodeError):
+        return "corrupt JSON"
+    if "integer string conversion" in str(e):
+        return "integer past the digit limit"   # the plain ValueError of #563
+    return f"unparseable ({type(e).__name__})"
+
+
 def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
     """Load every captured envelope from corpus/, in CAPTURE order.
 
@@ -372,15 +396,17 @@ def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
     """
     corpus = Path(corpus_dir)
     loaded: list[tuple[int, str, dict[str, Any]]] = []
-    skipped = 0
+    skipped: dict[str, int] = {}
     for path in corpus.glob("*.json"):
         try:
             env = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except _READ_ERRORS as e:
             # A corrupt/torn envelope was previously dropped silently, so it just
             # disappeared from coverage with no signal. Skipping is still correct (one
-            # bad file mustn't fail the whole measure), but count and surface it.
-            skipped += 1
+            # bad file mustn't fail the whole measure), but count and surface it, by the
+            # reason it actually failed.
+            why = _unreadable_reason(e)
+            skipped[why] = skipped.get(why, 0) + 1
             continue
         if isinstance(env, dict) and "raw" in env and "tool" in env:
             # The stored `shape` is deliberately left ALONE, stale or not. Re-classification
@@ -391,9 +417,10 @@ def load_corpus(corpus_dir: str | Path) -> list[dict[str, Any]]:
             seq = env["captured_at"] if isinstance(env.get("captured_at"), int) else 0
             loaded.append((seq, path.name, env))
     if skipped:
+        reasons = ", ".join(f"{n} {why}" for why, n in sorted(skipped.items()))
         sys.stderr.write(
-            f"[terse] load_corpus: skipped {skipped} unreadable envelope(s) in "
-            f"{corpus} (corrupt JSON)\n")
+            f"[terse] load_corpus: skipped {sum(skipped.values())} unreadable envelope(s) "
+            f"in {corpus} ({reasons})\n")
     loaded.sort(key=lambda t: (t[0], t[1]))
     return [env for _, _, env in loaded]
 

@@ -38,6 +38,7 @@ from . import capture, fluency
 from . import lossy as lossy_mod
 from . import policy as policy_mod
 from .proxy import TERSE_PRIMER
+from .transforms import PARSE_ERRORS, TOO_DEEP
 from .transport import guard_cleartext_credential, guarded_opener
 
 
@@ -590,6 +591,11 @@ def _run_question(question: DropQuestion, applied_text: str, staging: dict[str, 
         hit_expected_handle = False
         for c in retrieve_calls:
             call_handle = c.arguments.get("handle")
+            if not isinstance(call_handle, str):
+                # An unhashable handle (`["x"]`) raised at `in staging`. `""`, not None: the
+                # proxy (`answer_retrieve`) maps a non-str handle to "" and its miss text
+                # reads `handle ''`, and this eval must show the model the same words.
+                call_handle = ""
             if call_handle in staging:
                 content = lossy_mod._serialize(staging[call_handle])
                 if call_handle == question.expected_handle:
@@ -755,7 +761,11 @@ def _probe_envelope(env: dict, rule_for: Callable[..., Any]) -> tuple[DropProbe,
     rule = rule_for(tool, env.get("server"))
     try:
         obj = json.loads(env["raw"])
-    except (ValueError, TypeError):   # ValueError: the int-digit limit, #563
+    except RecursionError:
+        # Valid JSON nested too deep even to parse: the proxy passes it through untouched,
+        # so no drop step runs. Its own reason, not the text path's (#591 B4).
+        return _no_probe("not_compressible", f"payload {TOO_DEEP}"), rule, env["raw"], False
+    except PARSE_ERRORS:   # int-digit limit (#563), non-JSON, non-str
         # Not JSON: the span-addressed text path is the only one that can drop here. Same
         # probe shape, so a text payload's results merge into the report exactly like a
         # JSON one's — and its skip reasons into the coverage table the same way.
@@ -918,10 +928,21 @@ def openai_tool_answerer(base_url: str, api_key: str, model: str, tools: list[di
         calls: list[ToolCall] = []
         for tc in msg.get("tool_calls") or []:
             fn = tc.get("function", {})
-            try:
-                arguments = json.loads(fn.get("arguments") or "{}")
-            except json.JSONDecodeError:
-                arguments = {}  # a malformed tool-call payload scores as "called with no args"
+            raw_args = fn.get("arguments") or "{}"
+            if isinstance(raw_args, dict):
+                arguments = raw_args   # some backends send the object already parsed
+            else:
+                # Only a str is parsed. Any other type still raises TypeError, which
+                # `_safe_call` records as a harness error (#263) rather than as a call
+                # made with no arguments.
+                try:
+                    arguments = json.loads(raw_args)
+                except (ValueError, RecursionError):
+                    arguments = {}  # a malformed tool-call payload scores as "called with no args"
+            if not isinstance(arguments, dict):
+                # `"arguments": "[1]"` / `"null"`: every reader calls `.get` on it, which
+                # raised outside `_safe_call` and aborted the whole sweep (#582).
+                arguments = {}
             name = fn.get("name", "")
             calls.append(ToolCall(call_id=tc.get("id", ""), name=mcp_name.get(name, name),
                                   arguments=arguments))

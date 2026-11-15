@@ -11,6 +11,12 @@ import json
 import re
 from typing import Any
 
+from ..transforms import PARSE_ERRORS
+
+# A model's reply is untrusted input: a >4300-digit integer (ValueError) or deep nesting
+# (RecursionError) in it must score as a miss, never abort the run that asked (#591 B1).
+# `score` runs outside `_safe_ask`/`_safe_call`, so nothing above it would contain them.
+
 # A standalone number: not glued to a letter/digit/underscore on either side, so the
 # expected value can't be spuriously "found" inside an identifier or version string
 # (e.g. expected 6 must not match the "6" in "record_6" or "v6.2"). Trailing sentence
@@ -35,7 +41,7 @@ def _parse_list(reply: str) -> list | None:
             v = json.loads(reply[start:end + 1])
             if isinstance(v, list):
                 return v
-        except json.JSONDecodeError:
+        except PARSE_ERRORS:
             pass
     parts = [p.strip().strip("\"'") for p in re.split(r"[,\n]", reply) if p.strip()]
     return parts or None
@@ -69,7 +75,7 @@ def _extract_json(reply: str) -> Any:
         if i != -1 and j > i:
             try:
                 return json.loads(reply[i:j + 1])
-            except json.JSONDecodeError:
+            except PARSE_ERRORS:
                 pass
     return json.loads(reply)  # last resort; raises if not JSON
 
@@ -92,7 +98,7 @@ def score(qtype: str, expected: Any, reply: str) -> bool:
     if qtype == "deref":
         try:
             return _extract_json(reply) == expected  # JSON value-equality (dict order-insensitive)
-        except (json.JSONDecodeError, ValueError):
+        except PARSE_ERRORS:   # RecursionError: `==` on a deep parse recurses too
             return False
     # lookup / generic scalar
     if _is_number(expected):

@@ -37,6 +37,7 @@ from urllib.parse import urlparse
 
 from ._secure_io import append_restricted, mkdir_restricted
 from .tokenize import count_cl100k
+from .transforms import PARSE_ERRORS
 
 MAX_LEDGER_BYTES = 10 * 1024 * 1024  # rotate the live file past this size
 
@@ -516,13 +517,17 @@ def load_stats(log_path: str | Path, since_ts: int | None = None) -> list[dict[s
     records: list[dict[str, Any]] = []
     for path in (p.with_name(p.name + ".1"), p):
         try:
-            text = path.read_text(encoding="utf-8")
+            data = path.read_bytes()
         except OSError:
             continue
-        for line in text.splitlines():
+        for line in data.splitlines():
+            # Decoded per line, strictly: a torn multibyte write raised UnicodeDecodeError
+            # (not an OSError) for the whole file and took `terse stats` down, while
+            # `errors="replace"` would turn a bad byte inside a string into a DIFFERENT
+            # valid record (`srv.caf\ufffd`). The damaged line alone is skipped.
             try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
+                rec = json.loads(line.decode("utf-8"))
+            except PARSE_ERRORS:   # bad UTF-8, the int-digit limit, deep nesting
                 continue
             if not isinstance(rec, dict):
                 continue

@@ -958,7 +958,7 @@ def _cmd_probe(args: argparse.Namespace) -> int:
     for env in envelopes:
         try:
             records = extract_records(_json.loads(env["raw"]))
-        except (ValueError, TypeError):
+        except transforms.PARSE_ERRORS:   # int-digit limit, deep nesting, non-str
             records = None
         if records:
             vr_rows.append({"tool": env["tool"], "sha": env.get("sha", "?"), **value_redundancy(records)})
@@ -994,7 +994,7 @@ def _cmd_probe_cross_server(args: argparse.Namespace, envelopes: list[dict]) -> 
         raws_by_server.setdefault(srv, []).append((env.get("sha", ""), env["raw"]))
         try:
             records = extract_records(_json.loads(env["raw"]))
-        except (ValueError, TypeError):
+        except transforms.PARSE_ERRORS:   # int-digit limit, deep nesting, non-str
             records = None
         if records:
             records_by_server.setdefault(srv, []).extend(records)
@@ -1700,6 +1700,9 @@ def _cmd_fluency(args: argparse.Namespace) -> int:
         nq = sum(len(p["questions"]) for p in pack["payloads"])
         print(f"no model configured — wrote {nq} questions over {len(pack['payloads'])} "
               f"record-shaped payloads to {out}.")
+        if pack.get("skipped_too_deep"):
+            print(f"skipped {pack['skipped_too_deep']} payload(s): each "
+                  f"{transforms.TOO_DEEP}.")
         print("To run a model: set TERSE_FLUENCY_BASE_URL/_API_KEY/_MODELS (broker pool), "
               "then re-run.")
         print(f"Or drive the pack by hand and score it: `terse fluency --responses <file> "

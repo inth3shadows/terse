@@ -893,7 +893,7 @@ def apply(raw: str, tool: str, policy: Policy,
         return Applied(text=raw, tool=tool, tiers=(), skipped=True,
                        warnings=warnings + [f"{e}; passed through uncompressed to stay "
                                             "lossless"], unfaithful=True)
-    except (ValueError, TypeError, RecursionError):
+    except transforms.PARSE_ERRORS:
         # ValueError, not just JSONDecodeError (its subclass): an integer past Python's
         # 4300-digit limit raises a plain ValueError (#563), and it is non-JSON here too.
         # RecursionError: nesting so deep even the C parser blows the stack — the
@@ -1012,7 +1012,7 @@ def apply_joined(raws: list[str], tool: str, policy: Policy,
             objs.append(transforms.loads_faithful(raw))
         except transforms.UnfaithfulJSON:
             return None, None, JOIN_REFUSED_UNFAITHFUL
-        except (ValueError, TypeError, RecursionError):   # see `apply` (#563)
+        except transforms.PARSE_ERRORS:   # see `apply` (#563)
             return None, None, JOIN_REFUSED_NON_JSON
     if not all(isinstance(o, dict) for o in objs):
         # A mixed bag of dicts / scalars / arrays is not a record sequence; joining would
