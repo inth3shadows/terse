@@ -359,10 +359,8 @@ def test_measure_joined_skips_a_parseable_dict_nested_past_the_marker_walk():
     `policy generate` / `tune` (review of #591, round 2)."""
     from terse import measure
 
-    deep: dict = {}
-    node = deep
-    for _ in range(3000):
-        node["k"] = {}
-        node = node["k"]
-    raw = json.dumps({"items": [{"id": 1}, {"id": 2}], "deep": deep})
+    # Built as text: json.dumps itself overflows on this depth on Python 3.11. Where the
+    # parser also overflows (3.11), the payload is refused at the parse instead.
+    deep = '{"k":' * 3000 + "{}" + "}" * 3000
+    raw = '{"items":[{"id":1},{"id":2}],"deep":' + deep + "}"
     assert measure.measure_joined([raw, raw]) is None
