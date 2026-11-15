@@ -14,6 +14,25 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Fixed
+- `install-mcp` re-wrapped the OLD command after a wrapped entry had been replaced by hand.
+  The stashed original always won over the live entry, so swapping `kb` for a new command
+  and re-running install brought the old one back and discarded yours, and
+  `uninstall-mcp` restored the old one over it. An entry that is no longer a terse
+  wrapper (and not a router) and differs from the stash is now treated as the new
+  original. Re-install wraps it, including `--multiproxy` folds, and uninstall keeps it
+  (printing `kept`) and drops the stale stash copy. The same holds when only the
+  downstream after the wrapper's `--` was edited (`-- kb --v1` to `-- kb --v2`):
+  re-install wraps the edited downstream and uninstall restores it, unwrapped (with a
+  `type` that matches if the edit changed stdio to a URL or back). terse's wrapper is
+  recognised by its launcher (including a custom `$TERSE_MCP_CMD`), not by its flags, so
+  a hand-edited flag or a deleted downstream keeps the stash, and a third-party
+  `mcp-gw proxy --policy x -- srv` entry stays the user's own. A terse wrapper is never
+  adopted as the original itself. A replacement with no string `command` or `url` is
+  refused with an error before anything is written.
+
+## [0.49.4] - 2026-11-15
+
+### Fixed
 - `terse proxy` (single server) ended the whole session with exit 0 on one byte of invalid
   UTF-8 from the client. The strict decoder raised inside the stdin loop and killed the
   client-to-server thread. Client stdin is now read with `surrogateescape`, and a line
