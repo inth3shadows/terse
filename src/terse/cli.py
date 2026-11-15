@@ -1745,16 +1745,19 @@ _LOOKUP_KEY_QUALIFIERS = frozenset((
 
 
 def _is_secret_flag(flag: str) -> bool:
-    """Whether `flag` (`-x` or `--x`, without any `=VALUE`) takes a secret value. A
-    boolean negation (`--no-auth`, `--no-session`) takes none. `auth` matches anywhere in
-    the name, as it always has (`--oauth2`, `--basicauth`, `--proxyauth`), so a boolean
-    `--oauth` masks the arg after it: the safe direction. `session` is a secret alone or
-    as `session-id`/`session-key`, not as `--session-dir`/`--session-timeout`."""
+    """Whether `flag` (`-x` or `--x`, without any `=VALUE`) is secret-shaped. The long
+    words and `auth` match anywhere in the name, as they always have (`--oauth2`,
+    `--basicauth`, `--no-token`), so a boolean `--oauth` masks the arg after it: the safe
+    direction. The short words don't make a negation secret (`--no-session`). `session`
+    is a secret alone or as `session-id`/`session-key`, not as `--session-dir`/
+    `--session-timeout`. `_is_auth_negation` says which of these take no value."""
     name = flag.lstrip("-").lower()
-    if not flag.startswith("-") or not name or name.startswith(("no-", "no_")):
+    if not flag.startswith("-") or not name:
         return False
     if _SECRET_LONG.search(name) or "auth" in name:
         return True
+    if name.startswith(("no-", "no_")):
+        return False
     parts = _NAME_PARTS.split(name)
     for i, part in enumerate(parts):
         if part in ("pat", "bearer", "sessionid"):
@@ -1764,6 +1767,13 @@ def _is_secret_flag(flag: str) -> bool:
         if part == "session" and parts[i + 1:] in ([], ["id"], ["key"]):
             return True
     return False
+
+
+def _is_auth_negation(flag: str) -> bool:
+    """`--no-auth` (or `--no_auth`, `-no-auth`) exactly: the one boolean whose next arg is
+    not its value (`--no-auth server.py`). `--no-auth=x` is still masked, and every other
+    negation masks its next arg as main does (`--no-token x`, `--no-oauth2 x`)."""
+    return flag.lstrip("-").lower() in ("no-auth", "no_auth")
 
 
 # A bare `NAME=VALUE` arg (`docker run -e GH_TOKEN=...`, `npx ... API_KEY=...`) carries its
@@ -1809,7 +1819,12 @@ def _redact_header_value(entry: str) -> str:
         name, _, value = entry.partition(":")
         if not value.strip():
             return entry   # `Authorization:` with the value in the NEXT arg (see caller)
-        return f"{name}: ***" if _SECRET_HEADER.search(name) else entry
+        if _SECRET_HEADER.search(name):
+            return f"{name}: ***"
+        # `X-Custom: token=x`: the name is not secret-shaped but the value holds a
+        # secret-shaped `NAME=`, which main's whole-entry `=` split masked.
+        if eq != -1 and _SECRET_HEADER.search(entry[colon + 1:eq]):
+            return f"{entry[:eq]}=***"
     return entry
 
 
@@ -1927,13 +1942,15 @@ def _redact_args(args: list) -> list:
             else:
                 out.append(a)
                 pending, header_flag = "header", flag  # the NEXT arg is the payload
-        elif a.startswith("-H") and len(a) > 2:
-            # curl's attached form, `-HAuthorization: Bearer x`.
+        elif (a.startswith("-H") and len(a) > 2
+              and not (_header_sep(a) == -1 and _is_secret_flag(a))):
+            # curl's attached form, `-HAuthorization: Bearer x`. A bare secret-shaped
+            # word with no separator (`-Htoken x`, `-Hauth x`) is a secret flag below.
             out.append("-H" + _redact_header_payload("-H", a[2:]))
             pending = "value" if _value_in_next_arg(a[2:]) else None
         elif _is_secret_flag(flag):
             out.append(f"{flag}=***" if "=" in a else a)
-            pending = None if "=" in a else "value"
+            pending = None if "=" in a or _is_auth_negation(flag) else "value"
         elif "=" in a and (a.startswith("-") or _ENV_ASSIGN.match(a)):
             # `--url=https://u:pw@h`, `DATABASE_URL=postgres://u:pw@db`, `--env=K=v`.
             out.append(_redact_assignment(a, flag))

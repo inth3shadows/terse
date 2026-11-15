@@ -2110,8 +2110,6 @@ def test_redact_args_review_round_3_shapes(args, want):
 
 
 @pytest.mark.parametrize("args", [
-    # R2-3
-    ["--header=X-Request-Id: token=", "server.py"],
     # R2-4: compound non-secret flags, boolean negations, non-env `--x=a=b`.
     ["--session-dir", "/tmp/x"], ["--session-timeout", "30"], ["--session-name", "n"],
     ["--cache-key", "k"], ["--sort-key", "k"], ["--primary-key", "id"],
@@ -2160,6 +2158,11 @@ def test_redact_args_masks_any_flag_part_containing_auth(flag):
     ["https://u:FAKE@h/x"], ["https://h/x?access_token=FAKE"], ["https://h/x#access_token=FAKE"],
     ["--url=https://u:FAKE@h"], ["--no-auth", "--token", "FAKE"],
     *([f, "FAKE"] for f in _AUTH_FLAGS), *([f"{f}=FAKE"] for f in _AUTH_FLAGS),
+    # Round-4 parity check: L1 negations, L2 `NAME=` inside a header value, L3 `-Hword`.
+    ["--no-token", "FAKE"], ["--no-password=FAKE"], ["-no-token", "FAKE"], ["--no-auth=FAKE"],
+    ["-no-oauth2", "FAKE"], ["--no-basicauth", "FAKE"],
+    ["--header", "X-Custom: token=FAKE"], ["--header=X-Custom: token=FAKE"],
+    ["-Hauth", "FAKE"], ["-Htoken", "FAKE"], ["-HToken", "FAKE"], ["-Htoken", "Bearer FAKE"],
 ])
 def test_redact_args_masks_everything_main_masks(args):
     from terse.cli import _full_cmd
@@ -2237,3 +2240,20 @@ def test_mcp_status_contests_on_raw_argv_not_the_redacted_display(monkeypatch, c
     out = capsys.readouterr().out
     assert "FAKE1" not in out and "wraps=srv --token ***" in out
     assert seen and all(w == "srv --token FAKE1" for w in seen)
+
+
+@pytest.mark.parametrize(("args", "want"), [
+    (["--no-token", "FAKE"], ["--no-token", "***"]),
+    (["--no-auth=FAKE"], ["--no-auth=***"]),
+    (["--header", "X-Custom: token=FAKE"], ["--header", "X-Custom: token=***"]),
+    (["--header=X-Custom: token=FAKE"], ["--header=X-Custom: token=***"]),
+    (["-Htoken", "Bearer FAKE"], ["-Htoken", "***"]),
+    # The one accepted exception: a negation of `auth` takes no value.
+    (["--no-auth", "server.py"], ["--no-auth", "server.py"]),
+    # Moved from the round-3 leave-alone test (R2-3): the next arg is still not taken as
+    # the value, but `token=` inside the value is masked, as main masks it.
+    (["--header=X-Request-Id: token=", "server.py"],
+     ["--header=X-Request-Id: token=***", "server.py"]),
+])
+def test_redact_args_round_4_parity_shapes(args, want):
+    assert _redact_args(args) == want

@@ -27,11 +27,13 @@ fails that pull request until the section has moved.
   (`--token -x…`), and URL userinfo `urlsplit` can't parse (`https://u:pw@[::1/x`).
   A flag right after `-H` is read as a flag, a `-H` URL is redacted as a URL, and
   docker's `-H host:port` is left as it is when the name is host-like (`token-svc:8080`,
-  not `Authorization:12345`). Boolean negations (`--no-auth`, `--no-session`), lookup
-  keys (`--cache-key`, `--sort-key`) and `--session-dir`/`--session-timeout` take no
-  secret, so the arg after them prints; any other flag containing `auth` (`--oauth`,
-  `--basicauth`) still masks the arg after it. `mcp-status` redacts the argument list
-  before joining it, so a header value containing spaces is masked whole.
+  not `Authorization:12345`). `--no-auth`, `--no-session`, lookup keys (`--cache-key`,
+  `--sort-key`) and `--session-dir`/`--session-timeout` take no secret, so the arg after
+  them prints; any other flag containing `auth` (`--oauth`, `--basicauth`) still masks
+  the arg after it, as do `--no-token` and `--no-password`, and `--no-auth=…` is masked.
+  A secret-shaped `NAME=` inside a header value (`X-Custom: token=…`) and curl's attached
+  `-Htoken …` are masked too. `mcp-status` redacts the argument list before joining it,
+  so a header value containing spaces is masked whole.
 - The savings ledger labelled an HTTP downstream by its full URL netloc, so a
   `https://user:pass@host/mcp` target wrote `user:pass@host` into every ledger row and into
   `terse stats` output. The label is now the `host[:port]` alone, and rows already in the
