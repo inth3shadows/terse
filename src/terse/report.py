@@ -91,6 +91,42 @@ def _ci(se: float) -> float:
     return 1.96 * se
 
 
+def _paired_gap_se(rows: list[dict[str, Any]], form: str, control: str) -> float | None:
+    """Cluster-robust SE of `acc(form) - acc(control)` over questions BOTH arms scored,
+    clustering on the question (#582).
+
+    The two arms answer the same questions, so their errors are correlated: a hard
+    question is hard for both. Combining the arms' own SEs as if independent,
+    `sqrt(se_f² + se_c²)`, overstates the gap's noise in exactly that normal case: two
+    identical arms at 50% over 24 questions printed ±28 pts. This is the sandwich SE of
+    the difference of the two ratio estimators, `sqrt(n/(n-1) · Σ dᵢ²)`, with
+    `dᵢ = (kfᵢ − acc_f·tfᵢ)/Σtf − (kcᵢ − acc_c·tcᵢ)/Σtc`, which is 0 for identical arms.
+    None below two shared questions, where a between-question spread cannot be estimated
+    (the caller then falls back to the independent bound)."""
+    # Every row EITHER arm scored, exactly the rows `_form_stats` counts for each, so the
+    # SE covers the same questions as the two accuracies it is the SE of. A row only one
+    # arm scored contributes a zero term for the other (review of #582).
+    pairs = []
+    for r in rows:
+        tf, tc = _arm_trials(r, form), _arm_trials(r, control)
+        if tf > 0 or tc > 0:
+            pairs.append((int(r[form]) if tf > 0 else 0, tf,
+                          int(r[control]) if tc > 0 else 0, tc))
+    n = len(pairs)
+    sum_tf = sum(p[1] for p in pairs)
+    sum_tc = sum(p[3] for p in pairs)
+    # Each ARM needs two scored rows, `_form_stats`' own n<2 rule: an arm scored on one
+    # row has a residual of exactly 0 there, so it would add no noise at all and a
+    # one-question control could publish `±0 pts PASS` (review of #582).
+    if n < 2 or sum(1 for p in pairs if p[1]) < 2 or sum(1 for p in pairs if p[3]) < 2:
+        return None
+    acc_f = sum(p[0] for p in pairs) / sum_tf
+    acc_c = sum(p[2] for p in pairs) / sum_tc
+    d_sq = sum(((kf - acc_f * tf) / sum_tf - (kc - acc_c * tc) / sum_tc) ** 2
+               for kf, tf, kc, tc in pairs)
+    return math.sqrt(n / (n - 1) * d_sq)
+
+
 
 
 def _arm_attempts(r: dict[str, Any], trials_key: str, default: int) -> int:
@@ -944,6 +980,10 @@ class ArmGap(NamedTuple):
     # absent here: they are complete on every row by construction, so `len(rows)` is their
     # count and a second copy could only disagree. Same read-only proxy, same reason.
     display_n: Mapping[str, int] = MappingProxyType({})
+    # Paired SE of `form_acc - control_acc` (`_paired_gap_se`), for the winning form arm.
+    # None when it could not be estimated; `_worst_case_gap` then falls back to combining
+    # the arms' SEs as if independent.
+    gap_se: float | None = None
 
 
 # How many PAIRED questions a PASS needs before "no regression observed" means anything
@@ -984,6 +1024,13 @@ def passes_tolerance(gap: float, tol: float = _GAP_TOLERANCE) -> bool:
 
     Callers must pass a GAP (form minus control), never compare accuracies directly."""
     return gap >= -tol - 1e-9
+
+
+def _scored_both(pr: list[dict[str, Any]], form: str, control: str) -> int:
+    """How many of the paired rows `pr` BOTH arms actually scored: the question count
+    #334's floor is about. Not `len(pr)`, which keeps a legacy row an arm never answered
+    (see the floor in `_gap`, review of #589)."""
+    return sum(1 for r in pr if _arm_trials(r, form) > 0 and _arm_trials(r, control) > 0)
 
 
 def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
@@ -1071,9 +1118,19 @@ def _gap(rows: list[dict[str, Any]], gating: list[str], control: str,
     # would-be PASS from `_worst_case_gap` cannot turn a FAIL into a PASS, because the
     # failing model is still in the set. A form arm genuinely BEHIND its control by more
     # than tolerance publishes at any question count.
-    if len(pr) < floor and passes_tolerance(best[0] - cacc):
+    #
+    # Counted over the questions the winning arm AND the control both SCORED, not
+    # `len(pr)` (review of #589). `paired_rows` keeps a legacy row with no `attempts` key
+    # even when an arm completed zero trials on it, so 20 "paired" rows could carry a
+    # control scored on ONE of them: that arm's SE is the binomial SE of a single
+    # all-right question, exactly 0, and the run published `+0% ±0 pts **PASS** ... safe
+    # to enable proxy --diff`. A question one arm never answered is no evidence about the
+    # gap, so it cannot count toward the floor that licenses a PASS.
+    best_name = max(gating, key=lambda f: arms[f][0])
+    if _scored_both(pr, best_name, control) < floor and passes_tolerance(best[0] - cacc):
         return ArmGap(0.0, 0.0, 0.0, 0.0, [], "underpowered")
-    return ArmGap(best[0], best[1], cacc, cse, pr, None, arms, dn)
+    return ArmGap(best[0], best[1], cacc, cse, pr, None, arms, dn,
+                  _paired_gap_se(pr, best_name, control))
 
 
 def arm_gap(rows: list[dict[str, Any]], form: str, control: str, *,
@@ -2300,6 +2357,10 @@ def build_codec_verdict_report(results: dict[str, list[dict]],
     return "\n".join(out)
 
 
+# (form_acc, form_se, control_acc, control_se[, paired gap SE or None]).
+GapRow = tuple[float, ...] | tuple[float, float, float, float, float | None]
+
+
 class GapVerdict(NamedTuple):
     model: str
     gap: float
@@ -2307,60 +2368,165 @@ class GapVerdict(NamedTuple):
     control_acc: float
     gap_ci: float
     passed: bool
+    # The point estimate clears the tolerance but the interval's lower bound does not:
+    # the run cannot tell "no harm" from "harm beyond tolerance" (#582). Never also
+    # `passed`. Defaulted so every existing construction stays valid.
+    inconclusive: bool = False
+
+
+def row_verdict(row: GapRow, tol: float | None = None) -> str:
+    """PASS / INCONCLUSIVE / FAIL for ONE model's gap row, by the same rule as the
+    verdict, so a chart's per-model badge can never contradict the headline above it."""
+    v = _worst_case_gap({"": row}) if tol is None else _worst_case_gap({"": row}, tol)
+    return "FAIL" if v is None else gate_word(v)
+
+
+def gate_word(verdict: GapVerdict, withheld: bool = False) -> str:
+    """PASS / FAIL / INCONCLUSIVE for a gap verdict. A withheld model blocks PASS: the
+    tested set did not all pass, it was only partly measured (as dropeval does, #344)."""
+    if not verdict.passed and not verdict.inconclusive:
+        return "FAIL"
+    return "INCONCLUSIVE" if verdict.inconclusive or withheld else "PASS"
 
 
 def _worst_case_gap(
-    rows: dict[str, tuple[float, float, float, float]], tol: float = _GAP_TOLERANCE
+    rows: Mapping[str, GapRow], tol: float = _GAP_TOLERANCE
 ) -> GapVerdict | None:
-    """Shared verdict-gating math for both fluency-style reports — principle #24, gate on
-    the worst model, never the mean. `rows` maps model to a 4-tuple of form_acc, form_se,
-    control_acc, control_se. Returns the model with the lowest gap as a GapVerdict, or
-    None if `rows` is empty. gap = form_acc minus control_acc; gap_ci is the 95%
-    half-width of the independence-combined question-clustered (sandwich) SE of the two
-    arms; passed iff gap is at least -tol, inclusive of the boundary. Callers access
-    fields by name, e.g. verdict.form_acc, never by position, so a future field reorder
-    can't silently swap values."""
+    """Shared verdict-gating math for every gap report — principle #24, gate on the worst
+    model, never the mean. `rows` maps model to a `GapRow`: form_acc, form_se,
+    control_acc, control_se, and optionally the paired gap SE (`_paired_gap_se`, #582).
+    Returns a GapVerdict, or None if `rows` is empty. gap = form_acc minus control_acc;
+    gap_ci is the 95% half-width of the paired SE when the row carries one, else of the
+    two arms' SEs combined as if independent. passed iff every model's gap AND the lower
+    end of its interval (gap - gap_ci) are at least -tol, inclusive of the boundary;
+    `inconclusive` when every gap clears but some interval does not (that model is then
+    the one returned). Callers access fields by name, e.g. verdict.form_acc, never by
+    position, so a future field reorder can't silently swap values."""
+    lowest = None  # same shape: the model whose interval's LOWER bound is lowest
     worst = None  # (model, gap, facc, cacc, gap_ci) — cheapest to track positionally here;
-    for model, (facc, fse, cacc, cse) in rows.items():  # this is a private local, not the
-        gap = facc - cacc                               # public interface callers rely on.
-        # sqrt(fse^2+cse^2) assumes the two arms' SEs are independent, which overstates
-        # the true paired-on-question variance FOR ANY PAIR OF ARMS THAT ARE POSITIVELY
-        # CORRELATED — the normal case, since question difficulty is shared across arms.
-        # (It is not a universal upper bound: two arms that are anti-correlated on which
-        # questions they get right would make this an UNDER-estimate instead — just not a
-        # shape real comprehension arms take.) `passed` below does NOT read gap_ci (it
-        # gates on the point estimate `gap` alone), so this looseness cannot flip the
-        # merge gate itself; every consumer of `gap_ci` (`build_fluency_report`'s worst-
-        # case prose here, `_format_worst_case_line`'s "±N pts" headline shared by the
-        # diff/diff-soak/dropeval/fluency reports, the diff-soak deepest-slice line, and
-        # `build_html_diff_report`'s verdict banner) renders it as a width, never as a
-        # significance test — note this is NOT the HTML forest plot's whiskers, which read
-        # per-arm `form_ci`/`control_ci`, not `gap_ci`, at all —
-        # which is why `build_fluency_report` is written to never let a wide gap_ci argue
-        # AWAY a verdict: a bound that is only reliably an over-estimate can rule a gap
-        # "not yet tightly measured", never "not real". #297 made both SEs cluster-robust
-        # instead of ~0, so this bound is now wide enough to matter in practice, not just
-        # a formality. A tighter, correct fix is a paired cluster-robust SE on the
-        # per-question DIFFERENCE rather than combining two independent arm SEs; tracked
-        # as a follow-up rather than folded into #297's scope.
-        gap_ci = _ci(math.sqrt(fse ** 2 + cse ** 2))
+    for model, row in rows.items():   # `worst` is a private local, not the public interface
+        facc, fse, cacc, cse = row[:4]
+        paired_se = row[4] if len(row) > 4 else None
+        gap = facc - cacc
+        # `passed` reads gap_ci since #582, so the width of this interval decides PASS vs
+        # INCONCLUSIVE, and which SE feeds it matters. The paired SE of the per-question
+        # difference is the right one for two arms over the same questions. The fallback,
+        # sqrt(fse^2+cse^2), treats the arms as independent; that overstates the noise for
+        # positively correlated arms (the normal case: question difficulty is shared) and
+        # would understate it for anti-correlated ones. It is reached when the row carries
+        # no paired SE: the fixed-ideal dropeval metrics (recall, no-overfetch), whose
+        # control is a constant with `cse` 0 so the two coincide, and a gap whose paired
+        # SE could not be estimated (an arm scored on fewer than two questions, which
+        # `_gap`'s scored-question floor keeps from ever reaching a PASS).
+        gap_ci = _ci(paired_se if paired_se is not None else math.sqrt(fse ** 2 + cse ** 2))
         if worst is None or gap < worst[1]:
             worst = (model, gap, facc, cacc, gap_ci)
-    if worst is None:
+        if lowest is None or gap - gap_ci < lowest[1] - lowest[4]:
+            lowest = (model, gap, facc, cacc, gap_ci)
+    if worst is None or lowest is None:
         return None
     model, gap, facc, cacc, gap_ci = worst
-    passed = passes_tolerance(gap, tol)
-    return GapVerdict(model, gap, facc, cacc, gap_ci, passed)
+    if not passes_tolerance(gap, tol):
+        return GapVerdict(model, gap, facc, cacc, gap_ci, False)
+    # Every point estimate clears the tolerance. PASS also needs every model's interval
+    # to clear it (#582): 19/20 vs 20/20 used to print PASS at "-5% ±10 pts", a verdict
+    # the run's own interval could not support. The model reported is the one whose lower
+    # bound reaches furthest, which need not be the lowest point estimate.
+    model, gap, facc, cacc, gap_ci = lowest
+    if passes_tolerance(gap - gap_ci, tol):
+        return GapVerdict(*worst, True)
+    return GapVerdict(model, gap, facc, cacc, gap_ci, False, inconclusive=True)
 
 
-def _format_worst_case_line(verdict: GapVerdict, tol: float, form_label: str, control_label: str) -> str:
-    return (f"- Worst-case model `{verdict.model}`: {form_label} {verdict.form_acc:.0%} vs "
+def _format_worst_case_line(verdict: GapVerdict, tol: float, form_label: str,
+                            control_label: str, withheld: bool = False) -> str:
+    word = gate_word(verdict, withheld)
+    line = (f"- Worst-case model `{verdict.model}`: {form_label} {verdict.form_acc:.0%} vs "
             f"{control_label} {verdict.control_acc:.0%} (gap {verdict.gap:+.0%} "
-            f"±{verdict.gap_ci * 100:.0f} pts). **{'PASS' if verdict.passed else 'FAIL'}** "
-            f"at {tol:.0%} tolerance.")
+            f"±{verdict.gap_ci * 100:.0f} pts). **{word}** at {tol:.0%} tolerance.")
+    if verdict.inconclusive:
+        line += (f" The interval reaches {verdict.gap - verdict.gap_ci:+.0%}, past "
+                 f"-{tol:.0%}: too few questions to rule out a regression.")
+    elif verdict.passed and withheld:
+        # Location-neutral on purpose: the markdown names the withheld models above this
+        # line, the dropeval bullets and the terminal's exclusion note name them below it.
+        line += (" Measured models only: a model was withheld from the gate (named with "
+                 "its reason in this report).")
+    return line
 
 
-def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, float]],
+class FleetGate(NamedTuple):
+    """The fleet verdict of one gap report, decided ONCE and rendered by every renderer.
+
+    Review of #589: the markdown, the HTML banner and the terminal chart each decided the
+    verdict from their own inputs, and disagreed. A withheld model blocked PASS in the
+    markdown and the HTML while the terminal chart (the one output without `--html`)
+    printed a per-model PASS badge and no fleet verdict at all."""
+    word: str | None          # PASS / INCONCLUSIVE / FAIL; None when nothing was scored
+    worst: GapVerdict | None  # the headline row `_worst_case_gap` picked
+    withheld: bool            # a model was withheld from the gate: blocks PASS, never FAIL
+
+
+def fleet_gate(rows: Mapping[str, GapRow], withheld: bool) -> FleetGate:
+    worst = _worst_case_gap(rows)
+    return FleetGate(None if worst is None else gate_word(worst, withheld), worst, withheld)
+
+
+def diff_verdict_lines(gate: FleetGate, form_label: str, control_label: str) -> list[str]:
+    """The `## Verdict` bullets of a `--diff` / `--text-diff-eval` run. The markdown prints
+    them and the terminal chart prints them with the markup stripped, so the two cannot
+    reach different conclusions about the same run."""
+    if gate.worst is None:
+        # Nothing survived the gate. Say so instead of falling silent — this verdict is
+        # read as a go/no-go on `proxy --diff`, and an empty one reads as "no objection".
+        # Reason-specific advice: "fix the backend" is wrong guidance for a run whose
+        # backend answered every call and whose arms merely could not be paired.
+        # Not "no model left a question both arms completed": `_unmeasured` gates on
+        # transport BEFORE pairing, so a model withheld by it can still have questions
+        # that pair cleanly. Says what is true of every withheld model instead.
+        # It POINTS at the paragraph rather than re-listing the reasons. The old wording
+        # enumerated three ("an unreachable backend, calls lost until nothing paired, or
+        # too few questions"), which made this a FOURTH copy of the reason vocabulary —
+        # already drifted, since it had no entry for the producer that loses no calls at
+        # all (an arm with zero completed trials). The paragraph above states the reason
+        # and its remedy together, chosen from the counts; restating it here can only
+        # disagree with it (#338).
+        return ["- **NO VERDICT — nothing was scored.** Every model was withheld, so "
+                "this run says nothing about the diff form either way. The paragraph "
+                "above names each model, its reason, and the remedy that reason "
+                "licenses; they are not the same remedy, so read it before re-running."]
+    out = [_format_worst_case_line(gate.worst, _GAP_TOLERANCE, form_label, control_label,
+                                   withheld=gate.withheld)]
+    if gate.word == "PASS":
+        out.append("- Reading the diff costs no comprehension beyond tolerance — safe to "
+                   "enable `proxy --diff` for the tested models.")
+    elif gate.word == "INCONCLUSIVE":
+        out.append("- Not concluded — do not enable `proxy --diff` on this run: "
+                   + ("re-run with more questions to tighten the interval."
+                      if gate.worst.inconclusive else
+                      "measure the withheld model(s) first."))
+    else:
+        out.append("- The diff form regresses comprehension beyond tolerance — keep "
+                   "`proxy --diff` off, or restrict it to tools whose diffs stay legible.")
+    return out
+
+
+def fluency_conclusion_line(gate: FleetGate) -> str:
+    """The fluency verdict's closing bullet, shared by the markdown and the terminal."""
+    if gate.word == "PASS":
+        return ("- terse's compressed form preserves comprehension within tolerance — "
+                "the proxy's in-place rewrite holds for the tested models.")
+    if gate.word == "INCONCLUSIVE":
+        return "- Not concluded — " + (
+            "the interval reaches past tolerance; re-run with more questions before "
+            "shipping." if gate.worst is not None and gate.worst.inconclusive else
+            "measure the excluded model(s) before shipping.")
+    return ("- Comprehension regresses beyond tolerance — the proxy's in-place rewrite "
+            "is not safe to ship as-is for the worst model; prefer the primer or restrict "
+            "the policy to the transforms that held.")
+
+
+def diff_gap_rows(results: dict) -> tuple[dict[str, GapRow],
                                           dict[str, ExclusionReason | None]]:
     """(form=diff_ok, control=terse_ok) gap-row tuples per model — the same shape
     `_worst_case_gap` and the bar-chart renderers (html/terminal) consume, computed
@@ -2373,7 +2539,7 @@ def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, f
     the markdown while the forest plot printed directly beneath it still drew a FAIL bar
     off the same rows. `cli` prints both together for all three diff paths (`--diff`,
     `--diff-soak`, `--text-diff-eval`), and the chart is what a reader sees first."""
-    out: dict[str, tuple[float, float, float, float]] = {}
+    out: dict[str, GapRow] = {}
     excluded: dict[str, ExclusionReason | None] = {}
     for model, rows in results.items():
         if not rows:
@@ -2384,11 +2550,11 @@ def diff_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, f
             # exclusion as "calls went unanswered", which is false for an `unpaired` model.
             excluded[model] = g.excluded
             continue
-        out[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
+        out[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se, g.gap_se)
     return out, excluded
 
 
-def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float, float]],
+def fluency_gap_rows(results: dict) -> tuple[dict[str, GapRow],
                                              dict[str, ExclusionReason | None]]:
     """(form=best of terse/primer, control=raw) gap-row tuples per model, for the bar-
     chart renderers. Excludes any model whose raw control failed (0% — a backend/config
@@ -2401,7 +2567,7 @@ def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float
     the chart immediately below plotted its depressed gap as a red FAIL bar — the exact
     false verdict #263 exists to kill, surviving in the renderer the reader looks at
     first."""
-    out: dict[str, tuple[float, float, float, float]] = {}
+    out: dict[str, GapRow] = {}
     broken: dict[str, ExclusionReason | None] = {}
     for model, rows in results.items():
         if not rows:
@@ -2410,7 +2576,7 @@ def fluency_gap_rows(results: dict) -> tuple[dict[str, tuple[float, float, float
         if g.excluded:
             broken[model] = g.excluded
             continue
-        out[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
+        out[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se, g.gap_se)
     return out, broken
 
 
@@ -2534,7 +2700,7 @@ def _accuracy_gate(rows: list[dict[str, Any]]) -> ArmGap:
     return g
 
 
-def dropeval_gap_rows(results: dict) -> tuple[dict[str, dict[Metric, tuple[float, float, float, float]]],
+def dropeval_gap_rows(results: dict) -> tuple[dict[str, dict[Metric, GapRow]],
                                               dict[str, ExclusionReason]]:
     """(gap_rows, accuracy_excluded) — the `diff_gap_rows`/`fluency_gap_rows` shape, now a
     projection of `dropeval_verdict` rather than a second copy of its math.
@@ -2753,10 +2919,11 @@ class DropevalVerdict(NamedTuple):
     value, so a disagreement is not caught by a test, it is unconstructible."""
     directive: Directive
     metrics: dict[Metric, MetricVerdict]
-    # model -> metric -> (form_acc, form_se, control_acc, control_se), for the table and
-    # the forest plots. "accuracy" is ABSENT rather than zeroed for a withheld model, so a
-    # renderer that iterates what it finds cannot draw a bar for a gap nobody measured.
-    gates: dict[str, dict[Metric, tuple[float, float, float, float]]]
+    # model -> metric -> `GapRow` (form_acc, form_se, control_acc, control_se[, paired
+    # SE]), for the table and the forest plots. "accuracy" is ABSENT rather than zeroed
+    # for a withheld model, so a renderer that iterates what it finds cannot draw a bar
+    # for a gap nobody measured.
+    gates: dict[str, dict[Metric, GapRow]]
     # Transport failure past the INCONCLUSIVE threshold. Non-empty means the run measures
     # the harness, not the model, and no behavioral claim survives.
     inconclusive: dict[str, tuple[int, int]]
@@ -2774,7 +2941,7 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
     over a small input space can be swept EXHAUSTIVELY in seconds — which is how
     `tests/test_dropeval_monotonicity.py` covers a cross product that 29 hand-written
     examples left a hole in, and how the same sweep can be a gate rather than a review."""
-    gates: dict[str, dict[Metric, tuple[float, float, float, float]]] = {}
+    gates: dict[str, dict[Metric, GapRow]] = {}
     excluded_by_metric: dict[Metric, dict[str, ExclusionReason]] = {
         m: {} for m, _, _ in DROPEVAL_METRICS}
     thin_by_metric: dict[Metric, dict[str, int]] = {m: {} for m, _, _ in DROPEVAL_METRICS}
@@ -2886,7 +3053,7 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
         if g.excluded:
             excluded_by_metric["accuracy"][model] = g.excluded
         else:
-            gates[model]["accuracy"] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
+            gates[model]["accuracy"] = (g.form_acc, g.form_se, g.control_acc, g.control_se, g.gap_se)
 
     inconclusive = inconclusive_models(results)
     degraded_accepted: dict[str, tuple[int, int]] = {}
@@ -2909,7 +3076,8 @@ def dropeval_verdict(results: dict, accept_degraded: bool = False) -> DropevalVe
         # FAILS, `worst` contributes BLOCK and outranks every one of these.
         outcomes += [Directive.INSUFFICIENT] * len(thin)
         if worst is not None:
-            outcomes.append(Directive.SHIP if worst.passed else Directive.BLOCK)
+            outcomes.append(Directive.SHIP if worst.passed else
+                            Directive.INSUFFICIENT if worst.inconclusive else Directive.BLOCK)
         # `default` fires for an empty fleet — no model scored, none withheld, nothing
         # known. It must not be SHIP, and it is the one place in this function where that
         # is a choice rather than a consequence, so
@@ -3035,29 +3203,55 @@ def dropeval_directive_line(v: DropevalVerdict) -> str:
         # of a kind was withheld from that kind's gate instead of scored at a fabricated
         # 0%, and the sentence would then have asserted a pass for a metric that was never
         # measured — the same over-claim, in the metric it was written to avoid.
+        #
+        # TWO causes reach here, and they need different prose (review of #589). A metric
+        # can be withheld (a model excluded from it, or measured too thin), or it can be
+        # fully measured with an interval that reaches past tolerance (#582). The first
+        # version of this branch assumed every non-SHIP metric was withheld, so 39/40 on
+        # recall printed "the drop-to-retrieve MECHANISM itself was not gated" about a
+        # metric that WAS gated, and one accuracy miss in 40 printed "unmeasured".
         withheld = {label: sorted(set(v.metrics[m].excluded) | set(v.metrics[m].thin))
                     for m, label, _ in DROPEVAL_METRICS
-                    if v.metrics[m].directive is not Directive.SHIP}
-        if not withheld:
+                    if v.metrics[m].directive is not Directive.SHIP
+                    and (v.metrics[m].excluded or v.metrics[m].thin)}
+        wide = [(label, w) for m, label, _ in DROPEVAL_METRICS
+                if v.metrics[m].directive is not Directive.SHIP
+                and (w := v.metrics[m].worst) is not None and w.inconclusive]
+        if not withheld and not wide:
             # No metric reached its gate at all — only `dropeval_verdict({})`, since both
             # renderers stop before this on an empty fleet. Spelled out rather than folded
             # into the sentence below with an `or "this fleet"`, which would have claimed
             # models were withheld when none existed.
             return ("**INCONCLUSIVE for enabling** — no model reached a gate, so there is "
                     "nothing to conclude about enabling the drop.")
-        # INSUFFICIENT is the max only when EVERY withheld model is underpowered — the
-        # arms paired and showed no loss, over too few questions to mean anything. A
-        # different headline because it is a different next action: generate questions,
+        # INSUFFICIENT is the max only when EVERY non-concluding cause is a measurement
+        # that does not reach: an underpowered or thin model, or an interval too wide.
+        # A different headline because it is a different next action: generate questions,
         # versus go find out why the comparison never happened. Before this the two
         # rendered identically, which made `INSUFFICIENT` a lattice member with no
         # observable behaviour — a distinction the code drew and the reader never saw.
         head = ("**INSUFFICIENT for enabling**" if v.directive is Directive.INSUFFICIENT
                 else "**INCONCLUSIVE for enabling**")
+        # Measured, but too few questions: the interval of a metric that WAS gated reaches
+        # past the line. Said as that, never as "not gated" or "unmeasured".
+        wide_text = ""
+        if wide:
+            wide_text = ("measured, but the 95% interval reaches past tolerance for "
+                         + "; ".join(f"{label} (worst-case `{w.model}` at {w.gap:+.0%} "
+                                     f"±{w.gap_ci * 100:.0f} pts reaches "
+                                     f"{w.gap - w.gap_ci:+.0%}, past -{_GAP_TOLERANCE:.0%})"
+                                     for label, w in wide)
+                         + ": too few questions to rule out a regression — generate more "
+                         "questions and re-run")
+        if not withheld:
+            return f"{head} — {wide_text}."
         detail = "; ".join(
             f"{label} for " + (", ".join(f"`{m}`" for m in models) if models else "this fleet")
             for label, models in withheld.items())
         mech_ok = all(v.metrics[m].directive is Directive.SHIP
                       for m in ("recall", "precision"))
+        mech_withheld = [m for m in ("recall", "precision")
+                         if v.metrics[m].excluded or v.metrics[m].thin]
         if mech_ok:
             lead = ("recall and no-overfetch clear tolerance for the worst model, so the "
                     "mechanism works, but the OUTCOME impact of dropping is unmeasured")
@@ -3068,9 +3262,13 @@ def dropeval_directive_line(v: DropevalVerdict) -> str:
             # sentence has to be about their weight, not their absence.
             lead = ("the drop-to-retrieve mechanism was measured on too few questions to "
                     "conclude anything from a clean result — not concluded")
-        else:
+        elif mech_withheld:
             lead = ("the drop-to-retrieve MECHANISM itself was not gated, so nothing "
                     "downstream of it means anything — not gated")
+        else:
+            # The mechanism metrics were gated (one is only too wide, said below); what is
+            # withheld is downstream of them.
+            lead = "a metric was not gated for every model — not gated"
         # SCOPED to the withheld models. The unscoped form of this sentence ("the OUTCOME
         # impact of dropping is unmeasured") was true on the old code, where it could only
         # fire when NO model was scored on accuracy. The lattice reaches here whenever ANY
@@ -3084,8 +3282,9 @@ def dropeval_directive_line(v: DropevalVerdict) -> str:
                       f"`{acc.worst.model}` at {acc.worst.gap:+.0%} — but a policy that is "
                       "unsafe for one model in the fleet is unsafe (#24), so the verdict "
                       "cannot rest on the models that happened to be measurable.")
-        return (f"{head} — {lead}: {detail}.{scoped} Each model above is named with the "
-                "reason its metric did not conclude.")
+        also = f" Also {wide_text}." if wide_text else ""
+        return (f"{head} — {lead}: {detail}.{scoped}{also} Each model above is named with "
+                "the reason its metric did not conclude.")
     assert_never(v.directive)
 
 def _pct(saved: int, base: int) -> str:
@@ -3669,7 +3868,7 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         f"| Model | q | {control_label} | diff | regressions |",
         "|---|---|---|---|---|",
     ]
-    gap_rows: dict[str, tuple[float, float, float, float]] = {}
+    gap_rows: dict[str, GapRow] = {}
     unmeasured: dict[str, tuple[ExclusionReason | None, int, int, int]] = {}  # (why, fails, attempts, paired)
     for model, rows in results.items():
         n = len(rows)
@@ -3688,7 +3887,8 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
             unmeasured[model] = (g.excluded,
                                  sum(int(r.get("fails", 0)) for r in rows),
                                  sum(int(r.get("attempts", 0)) for r in rows),
-                                 len(paired_rows(rows, *DIFF_ARMS)))
+                                 # The count the #334 floor reads (#589).
+                                 _scored_both(paired_rows(rows, *DIFF_ARMS), *DIFF_ARMS))
             out.append(f"| `{model}` | {n} | n/a | n/a | n/a |")
             continue
         facc, fse = g.control_acc, g.control_se
@@ -3701,7 +3901,7 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         # issue named only the fluency one.
         regr = sum(1 for r in g.rows
                    if _arm_full(r, "terse_ok") and not _arm_full(r, "diff_ok"))
-        gap_rows[model] = (dacc, dse, facc, fse)  # form=diff, control=control_label
+        gap_rows[model] = (dacc, dse, facc, fse, g.gap_se)  # form=diff, control=control_label
         # `len(g.rows)`, not `len(rows)`: every accuracy on this line is computed over the
         # PAIRED subset, so printing the full question count beside them states a
         # denominator the numbers do not use. `q` is the exam that was actually sat.
@@ -3719,34 +3919,9 @@ def _build_diff_style_report(results: dict, title: str, intro: list[str],
         out += [attr_text, ""]
 
     out += ["## Verdict", ""]
-    worst = _worst_case_gap(gap_rows)
-    if worst:
-        out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "diff-form", control_label))
-        if worst.passed:
-            out.append("- Reading the diff costs no comprehension beyond tolerance — safe to "
-                       "enable `proxy --diff` for the tested models.")
-        else:
-            out.append("- The diff form regresses comprehension beyond tolerance — keep "
-                       "`proxy --diff` off, or restrict it to tools whose diffs stay legible.")
-    else:
-        # Nothing survived the gate. Say so instead of falling silent — this verdict is
-        # read as a go/no-go on `proxy --diff`, and an empty one reads as "no objection".
-        # Reason-specific advice: "fix the backend" is wrong guidance for a run whose
-        # backend answered every call and whose arms merely could not be paired.
-        # Not "no model left a question both arms completed": `_unmeasured` gates on
-        # transport BEFORE pairing, so a model withheld by it can still have questions
-        # that pair cleanly. Says what is true of every withheld model instead.
-        # It POINTS at the paragraph rather than re-listing the reasons. The old wording
-        # enumerated three ("an unreachable backend, calls lost until nothing paired, or
-        # too few questions"), which made this a FOURTH copy of the reason vocabulary —
-        # already drifted, since it had no entry for the producer that loses no calls at
-        # all (an arm with zero completed trials). The paragraph above states the reason
-        # and its remedy together, chosen from the counts; restating it here can only
-        # disagree with it (#338).
-        out.append("- **NO VERDICT — nothing was scored.** Every model was withheld, so "
-                   "this run says nothing about the diff form either way. The paragraph "
-                   "above names each model, its reason, and the remedy that reason "
-                   "licenses; they are not the same remedy, so read it before re-running.")
+    # ONE decision (`fleet_gate`), the same bullets the terminal chart prints (#589).
+    out += diff_verdict_lines(fleet_gate(gap_rows, bool(unmeasured)), "diff-form",
+                              control_label)
     out.append("")
     return "\n".join(out)
 
@@ -3806,6 +3981,152 @@ def build_text_diff_report(results: dict, pairs: int | None = None) -> str:
         control_label="raw text",
         pairs=pairs,
     )
+
+
+class SoakVerdict(NamedTuple):
+    """The diff-chain soak's verdict, decided ONCE (review of #589).
+
+    The markdown decided it from the pooled gap AND the deepest slice, while the HTML
+    banner and the terminal chart read the pooled gap alone: a soak whose deepest slice
+    was withheld, or too wide to conclude, printed "Not concluded" in the markdown and a
+    green `✓ PASS` banner on the page. Every renderer now reads `word` from here."""
+    pooled: FleetGate
+    # Pooled-gate exclusions, transport-dead models included (`diff_gap_rows`).
+    pooled_excluded: Mapping[str, ExclusionReason | None]
+    depths: tuple[int, ...]
+    deep: int
+    deepest: GapVerdict | None
+    deep_withheld: bool             # some model has deepest rows, none of them scored
+    # Models in the tested set with no SCORED slice at the deepest depth: withheld there,
+    # or never reached it. Either way the deepest verdict covers only part of the set.
+    deep_missing: tuple[str, ...]
+    word: str | None                # PASS / INCONCLUSIVE / FAIL; None = nothing scored
+
+
+def is_soak_run(results: dict) -> bool:
+    """Do these results come from `run_diff_soak`? Its rows, and only its rows, carry
+    `depth`; read off the data so a renderer cannot be handed a soak and miss it."""
+    rows = [r for rs in results.values() for r in rs]
+    return bool(rows) and all("depth" in r for r in rows)
+
+
+def diff_soak_verdict(results: dict) -> SoakVerdict:
+    gap_rows, excluded = diff_gap_rows(results)
+    pooled = fleet_gate(gap_rows, bool(excluded))
+    depths = tuple(sorted({r["depth"] for rows in results.values() for r in rows}))
+    # The soak-specific signal on top of the overall gate: the worst model's gap at the
+    # DEEPEST depth, since a clean average can hide a depth-correlated slide.
+    deep = depths[-1] if depths else 0
+    # `_unmeasured` applies here too. Gating only the overall gap left this depth-specific
+    # signal computing off withheld models, so a down backend still decided the drift
+    # conclusion — the same defect, one paragraph further down. Found by the invariance
+    # test, not by review.
+    # `_unmeasured` only, NOT every pooled exclusion: a model excluded from the pooled
+    # gate because its shallow depths were one-sided can still have a complete, scorable
+    # deepest slice — which the per-depth `arm_gap` below is the right judge of, and which
+    # is real evidence about drift. Filtering on the pooled list dropped a fully-paired
+    # -80% depth-5 failure out of the depth verdict and printed "No depth-correlated
+    # comprehension drift" beside a table showing it.
+    tested = [m for m, rs in results.items() if rs and not _unmeasured(rs)]
+    deep_rows = {m: rs for m, rs in
+                 ((m, [x for x in results[m] if x["depth"] == deep]) for m in tested) if rs}
+    deep_gaps: dict[str, GapRow] = {}
+    for m, rs in deep_rows.items():
+        dg = arm_gap(rs, *DIFF_ARMS)
+        if not dg.excluded:
+            deep_gaps[m] = (dg.form_acc, dg.form_se, dg.control_acc, dg.control_se, dg.gap_se)
+    deepest = _worst_case_gap(deep_gaps)
+    # The deepest slice can be WITHHELD while the overall gap still publishes: the
+    # per-depth gate is per-slice, so a depth-5 arm that lost its hard questions is
+    # excluded there while the pooled model sails through. Absence of a measurement is not
+    # a passing measurement.
+    deep_withheld = bool(deep_rows) and not deep_gaps
+    # EVERY tested model, not just those with rows at the deepest depth (review of #589):
+    # a model whose soak never reached that depth was silently left out, and "No
+    # depth-correlated comprehension drift" printed about a set it did not cover.
+    deep_missing = tuple(sorted(set(tested) - set(deep_gaps)))
+    scored = [v for v in (pooled.worst, deepest) if v is not None]
+    if any(not v.passed and not v.inconclusive for v in scored):
+        word: str | None = "FAIL"   # a demonstrated failure; nothing withheld can move it
+    elif not scored:
+        word = None
+    elif (any(v.inconclusive for v in scored) or pooled.withheld or deep_withheld
+          or deep_missing):
+        word = "INCONCLUSIVE"
+    else:
+        word = "PASS"
+    return SoakVerdict(pooled, MappingProxyType(dict(excluded)), depths, deep, deepest,
+                       deep_withheld, deep_missing, word)
+
+
+def diff_soak_verdict_lines(v: SoakVerdict) -> list[str]:
+    """The soak's `## Verdict` bullets, from `diff_soak_verdict`. The markdown prints them
+    and the terminal chart prints them with the markup stripped."""
+    out: list[str] = []
+    worst, deepest, deep = v.pooled.worst, v.deepest, v.deep
+    if worst is None:
+        # Nothing survived the pooled gate. An empty verdict on a drift soak reads as "no
+        # drift found", which is the opposite of "nothing was looked at".
+        out.append("- **No pooled verdict** — every model's POOLED gap was withheld, so "
+                   "the pooled line says nothing about drift either way. Scoped to the "
+                   "pooled comparison on purpose: a depth slice can still be scored below, "
+                   "and since #334 often is, so claiming the run measured nothing would "
+                   "contradict a verdict printed two lines further down. The paragraphs "
+                   "above name each model, its reason, and the remedy that reason "
+                   "licenses — see the note on the sibling line in `build_diff_report` for "
+                   "why they are not re-listed here.")
+    else:
+        out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "chain-form",
+                                           "full-terse", withheld=v.pooled.withheld))
+    # The deepest-depth analysis is DELIBERATELY independent of the pooled exclusion: a
+    # withheld pooled gap must not skip it. #334 made that state reachable for a model
+    # that lost zero calls (a pooled subset under the question floor), and nesting this
+    # under the pooled line was measured dropping a fully-paired -100% collapse at the
+    # deepest depth out of the verdict. An exclusion must never remove a demonstrated
+    # regression from a verdict.
+    if deepest:
+        line = (f"- At the deepest tested depth ({deep}): worst model "
+                f"`{deepest.model}` chain {deepest.form_acc:.0%} vs full "
+                f"{deepest.control_acc:.0%} (gap {deepest.gap:+.0%} "
+                f"±{deepest.gap_ci * 100:.0f} pts). "
+                f"**{gate_word(deepest, v.pooled.withheld or bool(v.deep_missing))}** at "
+                f"{_GAP_TOLERANCE:.0%} tolerance.")
+        if v.deep_missing:
+            line += (" Not scored at this depth: "
+                     + ", ".join(f"`{m}`" for m in v.deep_missing)
+                     + " (slice withheld, or the soak never reached it), so this line "
+                     "covers only part of the tested set.")
+        out.append(line)
+    elif v.deep_withheld:
+        out.append(f"- **NO VERDICT at the deepest tested depth ({deep})** — every "
+                   f"model's deepest slice was withheld, so the depth this soak exists "
+                   f"to probe was not scored."
+                   + (f" The overall line above is pooled across shallower depths and "
+                      f"says nothing about drift at {deep}." if worst else
+                      " The pooled gap was withheld too, so this run has no verdict at "
+                      "any depth."))
+    # One conclusion, from `v.word`, so no two lines can disagree (#582). Nothing when the
+    # deepest depth went unscored: the NO VERDICT line above already said what happened,
+    # and a conclusion here would contradict it.
+    if v.deep_withheld:
+        pass
+    elif v.word == "PASS":
+        out.append("- No depth-correlated comprehension drift within tolerance — "
+                   "chained diffs up to the tested depth read as well as fulls.")
+    elif v.word == "INCONCLUSIVE":
+        wide = any(x is not None and x.inconclusive for x in (worst, deepest))
+        out.append("- Not concluded — this run does not identify a safe keyframe "
+                   "interval: " + ("an interval reaches past tolerance; re-run with "
+                                   "more questions." if wide else
+                                   "measure the withheld model(s) first."))
+    elif v.word == "FAIL":
+        passing = len(v.depths) > 1 and worst is not None and worst.passed
+        out.append("- Comprehension drifts beyond tolerance somewhere in the chain — "
+                   + ("keep the keyframe interval at or below the deepest PASSING "
+                      "depth." if passing else
+                      "no tested depth published a passing gap, so this run does not "
+                      "identify a safe keyframe interval."))
+    return out
 
 
 def build_diff_soak_report(results: dict) -> str:
@@ -3953,20 +4274,12 @@ def build_diff_soak_report(results: dict) -> str:
                 tail += unmeasured_cause(slice_fails)
             out += [lead + at + tail, ""]
 
-    gap_rows: dict[str, tuple[float, float, float, float]] = {}
-    pooled_out: dict[str, ExclusionReason | None] = {}
-    for model, rows in results.items():
-        if not rows or model in unmeasured:
-            continue
-        g = arm_gap(rows, *DIFF_ARMS)
-        if g.excluded:
-            # Recorded and named below. Dropping a model from the ship gate with no trace
-            # anywhere let a soak print "Worst-case model `N` ... PASS" while `M`'s pooled
-            # gap had been withheld entirely — the other two report families name their
-            # exclusions and this one did not.
-            pooled_out[model] = g.excluded
-            continue
-        gap_rows[model] = (g.form_acc, g.form_se, g.control_acc, g.control_se)
+    sv = diff_soak_verdict(results)
+    # Recorded and named below. Dropping a model from the ship gate with no trace anywhere
+    # let a soak print "Worst-case model `N` ... PASS" while `M`'s pooled gap had been
+    # withheld entirely — the other two report families name their exclusions and this
+    # one did not. The transport-dead models were named in their own paragraph above.
+    pooled_out = {m: r for m, r in sv.pooled_excluded.items() if m not in unmeasured}
     if pooled_out:
         # "the pooled verdict", precisely: a model withheld here may still appear in the
         # by-depth table and in the deepest-depth line, because those are scored per depth
@@ -3990,97 +4303,9 @@ def build_diff_soak_report(results: dict) -> str:
         out += [attr_text, ""]
 
     out += ["## Verdict", ""]
-    worst = _worst_case_gap(gap_rows)
-    if not worst:
-        # Nothing survived the gate. An empty verdict on a drift soak reads as "no drift
-        # found", which is the opposite of "nothing was looked at".
-        # The advice has to match the cause. "Fix the backend(s) and re-run" sends a reader
-        # to re-run something that will fail identically when the backend answered fine and
-        # the arms simply could not be paired.
-        out.append("- **No pooled verdict** — every model's POOLED gap was withheld, so "
-                   "the pooled line says nothing about drift either way. Scoped to the "
-                   "pooled comparison on purpose: a depth slice can still be scored below, "
-                   "and since #334 often is, so claiming the run measured nothing would "
-                   "contradict a verdict printed two lines further down. The paragraphs "
-                   "above name each model, its reason, and the remedy that reason "
-                   "licenses — see the note on the sibling line in `build_diff_report` for "
-                   "why they are not re-listed here.")
-    if worst:
-        out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "chain-form",
-                                           "full-terse"))
-    # DELIBERATELY NOT nested under `if worst:`. This block's own comments below insist it
-    # is independent of the POOLED exclusion — and it was not: being inside that branch
-    # meant a withheld pooled gap skipped the deepest-depth analysis entirely. #334 made
-    # that state reachable for a model that lost zero calls (a pooled subset under the
-    # question floor), and it was measured dropping a fully-paired -100% collapse at the
-    # deepest depth out of the verdict, under a line promising "depth slices that pair
-    # cleanly are still scored below". An exclusion must never remove a demonstrated
-    # regression from a verdict; nesting made the pooled gate decide the depth question.
-    if True:
-        # The soak-specific signal on top of the overall gate: the worst model's gap
-        # at the DEEPEST depth, since a clean average can hide a depth-correlated slide.
-        deep = depths[-1] if depths else 0
-        # `unmeasured` applies here too. Gating only the overall gap above left this
-        # depth-specific signal computing off withheld models, so a down backend still
-        # decided the drift conclusion — the same defect, one paragraph further down the
-        # same function. Found by the invariance test, not by review.
-        # `unmeasured` only. NOT `pooled_out`: that is the POOLED exclusion, and a model
-        # excluded there because its shallow depths were one-sided can still have a
-        # complete, scorable deepest slice — which the per-depth `arm_gap` below is the
-        # right judge of, and which is real evidence about drift. Filtering on the pooled
-        # list dropped a fully-paired -80% depth-5 failure out of the depth verdict and
-        # printed "No depth-correlated comprehension drift" beside a table showing it; when
-        # that model was the only one at the deepest depth it emptied `deep_rows`, so even
-        # the NO-VERDICT branch was skipped. That is the "absence reads as a pass" bug this
-        # function already fixed once, re-entered through a different door.
-        deep_rows = {m: r for m, r in
-                     ((m, [x for x in rs if x["depth"] == deep])
-                      for m, rs in results.items() if m not in unmeasured) if r}
-        deep_gaps = {}
-        for m, rs in deep_rows.items():
-            dg = arm_gap(rs, *DIFF_ARMS)
-            if dg.excluded:
-                continue
-            deep_gaps[m] = (dg.form_acc, dg.form_se, dg.control_acc, dg.control_se)
-        deepest = _worst_case_gap(deep_gaps)
-        # The deepest slice can now be WITHHELD while the overall gap still publishes —
-        # the per-depth gate above is per-slice, so a depth-5 arm that lost its hard
-        # questions is excluded there while the pooled model sails through. Before that
-        # gate existed, `deep_rows` empty implied `worst` was None too, so `deepest is
-        # None` was unreachable here and reading it as "passed" was harmless. It is not
-        # harmless now: it printed "No depth-correlated comprehension drift" about the one
-        # depth nobody scored. Absence of a measurement is not a passing measurement.
-        deep_withheld = bool(deep_rows) and not deep_gaps
-        if deepest:
-            out.append(f"- At the deepest tested depth ({deep}): worst model "
-                       f"`{deepest.model}` chain {deepest.form_acc:.0%} vs full "
-                       f"{deepest.control_acc:.0%} (gap {deepest.gap:+.0%} "
-                       f"±{deepest.gap_ci * 100:.0f} pts). "
-                       f"**{'PASS' if deepest.passed else 'FAIL'}** at "
-                       f"{_GAP_TOLERANCE:.0%} tolerance.")
-        elif deep_withheld:
-            out.append(f"- **NO VERDICT at the deepest tested depth ({deep})** — every "
-                       f"model's deepest slice was withheld, so the depth this soak exists "
-                       f"to probe was not scored."
-                       + (f" The overall line above is pooled across shallower depths and "
-                          f"says nothing about drift at {deep}." if worst else
-                          " The pooled gap was withheld too, so this run has no verdict at "
-                          "any depth."))
-        if worst and worst.passed and not deep_withheld and (
-                deepest is None or deepest.passed):
-            out.append("- No depth-correlated comprehension drift within tolerance — "
-                       "chained diffs up to the tested depth read as well as fulls.")
-        elif not deep_withheld and (worst or deepest):
-            # `worst or deepest` is the guard un-nesting this block made necessary: with
-            # neither, NOTHING was scored, and "comprehension drifts beyond tolerance" is a
-            # finding rather than the absence of one. The NO VERDICT line above already
-            # said what happened; a conclusion here would contradict it.
-            passing = [d for d in depths if d != deep] if worst and worst.passed else []
-            out.append("- Comprehension drifts beyond tolerance somewhere in the chain — "
-                       + ("keep the keyframe interval at or below the deepest PASSING "
-                          "depth." if passing else
-                          "no tested depth published a passing gap, so this run does not "
-                          "identify a safe keyframe interval."))
+    # ONE decision (`diff_soak_verdict`), the same bullets the terminal chart prints and
+    # the same word the HTML banner shows (#589).
+    out += diff_soak_verdict_lines(sv)
     out.append("")
     return "\n".join(out)
 
@@ -4296,7 +4521,7 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
             acc_cell = "not gated"
             ctl_cell = "not run" if reason == "no control arm" else REASON_LABEL[reason]
         else:
-            aacc, ase, cacc, _ = scored
+            aacc, ase, cacc, *_ = scored
             acc_cell = f"{aacc:.0%} ±{_ci(ase) * 100:.0f}"
             ctl_cell = f"{cacc:.0%}"
         out.append(f"| `{model}` | {len(recall_rows)} | {cells['recall']} "
@@ -4391,9 +4616,13 @@ def build_dropeval_report(results: dict, accept_degraded: bool = False) -> str:
         out += ["- " + dropeval_directive_line(v), ""]
         return "\n".join(out)
     for metric, label, control_label in DROPEVAL_METRICS:
-        worst = v.metrics[metric].worst
-        if worst is not None:
-            out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, label, control_label))
+        mv = v.metrics[metric]
+        if mv.worst is not None:
+            # A model withheld from this metric, or measured too thin to conclude, blocks
+            # its PASS exactly as it blocks the metric's directive (#589): without it a
+            # metric printed `**PASS**` one line above an INSUFFICIENT directive.
+            out.append(_format_worst_case_line(mv.worst, _GAP_TOLERANCE, label, control_label,
+                                               withheld=bool(mv.excluded or mv.thin)))
     # One bullet per (metric, reason), each naming its own models. A withheld model is
     # named here AND has already raised `v.directive` off SHIP, so the two halves of
     # "excluded" — the prose and the gate — cannot drift apart.
@@ -4624,7 +4853,8 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
                           # prints this, so that read was a dead constant 0 — which reads
                           # as "nothing paired at all", the OTHER reason.
                           "paired": len(paired_rows(rows, "terse_ok", "primer_ok", "raw_ok")),
-                          "gap_form": g.form_acc, "gap_form_se": g.form_se}
+                          "gap_form": g.form_acc, "gap_form_se": g.form_se,
+                          "gap_se": g.gap_se if g.gap_se is not None else math.nan}
         if has_inline:
             summary[model].update({"inline": iacc, "inline_se": ise})
         # The inline arm's own q, stated in the cell WHENEVER it is smaller than the row's
@@ -4732,50 +4962,36 @@ def build_fluency_report(results: dict, token_rows: list[dict[str, Any]]) -> str
         # happened until this review — the model vanishes from the verdict unnamed.
         out.append(f"- Excluded ({REASON_LABEL['underpowered']} — not concluded): "
                    f"{', '.join(f'`{m}`' for m in underpowered_models)}.")
-    # best terse-side form per model, carrying its own SE for the gap's confidence interval.
-    # gap CI: raw and the best form are over the same questions (not independent), so
-    # √(se_raw²+se_best²) is a conservative over-estimate of the gap's SE — the honest
-    # direction for a bound that gates a ship decision.
+    # best terse-side form per model, carrying the paired SE of its gap against raw
+    # (`_paired_gap_se`, #582): raw and the best form answer the same questions.
     # Straight from `best_arm_gap`, which already picked the best arm over the paired
     # subset. This used to re-derive the best-of math here, a second copy of
     # `fluency_gap_rows`' body that could (and did) drift from it.
-    gap_rows = {m: (s["gap_form"], s["gap_form_se"], s["raw"], s["raw_se"])
+    gap_rows = {m: (s["gap_form"], s["gap_form_se"], s["raw"], s["raw_se"],
+                    None if math.isnan(s["gap_se"]) else s["gap_se"])
                 for m, s in gated.items()}
-    worst = _worst_case_gap(gap_rows)
+    # ANY excluded model blocks PASS, whatever its reason: the same rule, over the same
+    # set, as `build_terminal_fluency_report` (#589).
+    gate = fleet_gate(gap_rows, any(r is not None for r in reasons.values()))
+    worst = gate.worst
     if worst:
         helps = sum(1 for s in gated.values() if s["primer"] > s["terse"] + 1e-9)
-        out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "best terse-form", "raw"))
-        # `gap_ci` combines the two arms' SEs as if independent (√(fse²+cse²)), which
-        # overstates the true variance of a PAIRED gap whenever the arms are positively
-        # correlated (the normal case — question difficulty is shared) — before #297 that
-        # didn't matter because both SEs were ~0 by default, but the cluster-robust SE is
-        # routinely several points wide, and this bound is wide enough in practice to call
-        # a genuine regression "noise" (the correct paired CI on the same data can be
-        # several times tighter and not cross the gap at all). A bound that is only ever
-        # an OVER-estimate cannot support a "not distinguishable" conclusion on EITHER
-        # side of the tolerance line, so neither branch below claims one — only that the
-        # gap is smaller than a loose ceiling on its own noise. (A proper paired
-        # cluster-robust SE on the per-question difference would let this section make a
-        # real significance claim — tracked as a follow-up, not folded into #297's scope.)
-        if worst.gap_ci > 1e-9 and abs(worst.gap) < worst.gap_ci:
+        out.append(_format_worst_case_line(worst, _GAP_TOLERANCE, "best terse-form", "raw",
+                                           withheld=gate.withheld))
+        # `gap_ci` is the paired, question-clustered interval of the gap (#582), so the
+        # verdict line above already says whether the run can tell "within tolerance"
+        # from "beyond it". The note below adds one thing only, for a PASS: the margin
+        # is real but not yet tight. On INCONCLUSIVE or FAIL the verdict line says it all.
+        if gate.word == "PASS" and worst.gap_ci > 1e-9 and abs(worst.gap) < worst.gap_ci:
             # More questions tighten this bound without limit; more trials also tighten
             # it, but only down to a between-question floor they can't cross (they
-            # resample k, not the question set) — so this is neither "raise `--trials`"
-            # (#297's own estimator makes that false as the SOLE lever) nor "trials never
-            # help" (also false).
-            verdict_word = "This passing gap" if worst.passed else "Note: this gap"
-            out.append(f"- {verdict_word} is smaller than a (loose, conservative) "
-                       "upper-bound estimate of its own noise floor — treat the verdict "
-                       "above as real, not yet as a tightly measured margin; more "
-                       "questions would tighten this bound further than more trials would.")
+            # resample k, not the question set).
+            out.append("- This passing gap is smaller than its own 95% interval — treat "
+                       "the verdict above as real, not yet as a tightly measured margin; "
+                       "more questions would tighten this bound further than more trials "
+                       "would.")
         out.append(f"- The primer improves terse-form accuracy for {helps}/{len(gated)} model(s).")
-        if worst.passed:
-            out.append("- terse's compressed form preserves comprehension within tolerance — "
-                       "the proxy's in-place rewrite holds for the tested models.")
-        else:
-            out.append("- Comprehension regresses beyond tolerance — the proxy's in-place rewrite "
-                       "is not safe to ship as-is for the worst model; prefer the primer or restrict "
-                       "the policy to the transforms that held.")
+        out.append(fluency_conclusion_line(gate))
     elif not gated:
         # Nothing to gate on. Say so loudly: silence here is how a run that measured
         # NOTHING gets read as a run that found nothing wrong (#263). Absence of a
