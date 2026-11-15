@@ -2852,3 +2852,177 @@ def test_an_unlaunchable_hand_replacement_is_refused_before_any_change(tmp_path,
         im.wrap_multi(json.loads(json.dumps(config)), stash, ["kb"], str(policy), TERSE_CMD,
                       peers_file=str(tmp_path / "peers.json"))
     assert stash == {"kb": {"command": "old-kb", "args": ["--v1"]}}
+
+
+# --- review of #587, round 2: what counts as terse's wrapper ---
+def _installed(tmp_path, monkeypatch, launcher, original=None):
+    cfg = tmp_path / ".claude.json"
+    original = original or {"command": "old-kb", "args": ["--v1"]}
+    cfg.write_text(json.dumps(_cfg(kb=original)))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}")
+    monkeypatch.setattr(im, "terse_invocation", lambda: launcher)
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    return cfg, policy
+
+
+def _set_kb(cfg, entry):
+    config = json.loads(cfg.read_text())
+    config["mcpServers"]["kb"] = entry
+    cfg.write_text(json.dumps(config))
+
+
+def _flag_edits():
+    def no_stats(a):
+        a.insert(a.index("proxy") + 1, "--no-stats")
+
+    def equals(a):
+        i = a.index("--policy")
+        a[i:i + 2] = [f"--policy={a[i + 1]}"]
+
+    def deleted(a):
+        i = a.index("--policy")
+        del a[i:i + 2]
+
+    def reordered(a):
+        i, j = a.index("--policy"), a.index("--server-name")
+        pol, name = a[i:i + 2], a[j:j + 2]
+        rest = [t for k, t in enumerate(a[i:j + 2]) if k not in (0, 1, j - i, j - i + 1)]
+        a[i:j + 2] = [*name, *pol, *rest]
+    return [no_stats, equals, deleted, reordered]
+
+
+@pytest.mark.parametrize("edit", _flag_edits(), ids=lambda f: f.__name__)
+def test_custom_launcher_wrapper_with_hand_edited_terse_flags_is_still_terses(
+        tmp_path, monkeypatch, edit):
+    # R2-1: the wrapper is recognised by the launcher that wrote it, not by its flags.
+    launcher = [str(tmp_path / "tmcp")]
+    for step in ("reinstall", "uninstall"):
+        cfg, policy = _installed(tmp_path, monkeypatch, launcher)
+        entry = _live_kb(cfg)
+        edit(entry["args"])
+        _set_kb(cfg, entry)
+        if step == "reinstall":
+            im.do_install(["kb"], str(policy), cfg=cfg)
+            args = _live_kb(cfg)["args"]
+            assert args.count("--") == 1 and args.count("proxy") == 1
+            assert _stash_kb(cfg) == {"command": "old-kb", "args": ["--v1"]}
+        res = im.do_uninstall(["kb"], cfg=cfg)
+        assert res["changes"][0]["restored"] is True
+        assert _live_kb(cfg) == {"command": "old-kb", "args": ["--v1"]}
+
+
+GATEWAY = {"command": "mcp-gw", "args": ["proxy", "--policy", "strict", "--", "real-srv"]}
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_a_third_party_proxy_policy_gateway_is_a_hand_replacement(tmp_path, monkeypatch, custom):
+    # R2-2: someone else's `proxy --policy x -- srv` is the user's entry, never unnested.
+    launcher = [str(tmp_path / "tmcp")] if custom else TERSE_CMD
+    cfg, policy = _installed(tmp_path, monkeypatch, launcher)
+    _set_kb(cfg, GATEWAY)
+    res = im.do_uninstall(["kb"], cfg=cfg)
+    assert res["changes"][0].get("stash_dropped") and _live_kb(cfg) == GATEWAY
+    cfg, policy = _installed(tmp_path, monkeypatch, launcher)
+    _set_kb(cfg, GATEWAY)
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    args = _live_kb(cfg)["args"]
+    assert args[args.index("--") + 1:] == ["mcp-gw", *GATEWAY["args"]]
+    assert _stash_kb(cfg) == GATEWAY
+
+
+def test_a_gateway_inside_terses_wrapper_is_not_unnested(tmp_path, monkeypatch):
+    # R2-2, nested: the downstream `mcp-gw proxy --policy ... -- real-srv` is one launch.
+    cfg, policy = _installed(tmp_path, monkeypatch, TERSE_CMD)
+    entry = _live_kb(cfg)
+    args = entry["args"]
+    entry["args"] = [*args[:args.index("--") + 1], "mcp-gw", *GATEWAY["args"]]
+    _set_kb(cfg, entry)
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    assert _stash_kb(cfg) == GATEWAY
+    im.do_uninstall(["kb"], cfg=cfg)
+    assert _live_kb(cfg) == GATEWAY
+
+
+@pytest.mark.parametrize("custom", [False, True])
+@pytest.mark.parametrize("keep_sep", [False, True])
+def test_a_wrapper_with_its_downstream_deleted_keeps_the_stash(
+        tmp_path, monkeypatch, custom, keep_sep):
+    # R2-3: terse's wrapper minus its `-- downstream` is still terse's, not an original.
+    launcher = [str(tmp_path / "tmcp")] if custom else TERSE_CMD
+    for step in ("reinstall", "uninstall"):
+        cfg, policy = _installed(tmp_path, monkeypatch, launcher)
+        entry = _live_kb(cfg)
+        args = entry["args"]
+        entry["args"] = args[:args.index("--") + (1 if keep_sep else 0)]
+        _set_kb(cfg, entry)
+        if step == "reinstall":
+            im.do_install(["kb"], str(policy), cfg=cfg)
+            args = _live_kb(cfg)["args"]
+            assert args.count("--") == 1 and args[args.index("--") + 1:] == ["old-kb", "--v1"]
+            assert _stash_kb(cfg) == {"command": "old-kb", "args": ["--v1"]}
+        im.do_uninstall(["kb"], cfg=cfg)
+        assert _live_kb(cfg) == {"command": "old-kb", "args": ["--v1"]}
+
+
+@pytest.mark.parametrize("bad", [{"command": 5}, {"url": 5}, {"command": ["kb-mcp"]},
+                                 {"command": "", "url": ""}])
+def test_a_replacement_without_a_str_command_or_url_is_refused(tmp_path, monkeypatch, bad):
+    # R2-4: B4's validation must match what can actually be launched.
+    cfg, policy = _installed(tmp_path, monkeypatch, TERSE_CMD)
+    _set_kb(cfg, bad)
+    before = (cfg.read_bytes(), im.stash_path(cfg).read_bytes())
+    with pytest.raises(ValueError, match="replaced by hand"):
+        im.do_install(["kb"], str(policy), cfg=cfg)
+    assert (cfg.read_bytes(), im.stash_path(cfg).read_bytes()) == before
+
+
+@pytest.mark.parametrize("original,tail,want", [
+    ({"type": "stdio", "command": "old-kb", "args": ["--v1"]}, ["https://new.example/mcp"],
+     {"type": "http", "url": "https://new.example/mcp"}),
+    ({"type": "http", "url": "https://old.example/mcp"}, ["new-kb"],
+     {"type": "stdio", "command": "new-kb", "args": []}),
+    ({"type": "sse", "url": "https://old.example/mcp"}, ["https://new.example/mcp"],
+     {"type": "sse", "url": "https://new.example/mcp"}),
+])
+def test_an_edited_downstream_that_changes_transport_gets_a_matching_type(
+        tmp_path, monkeypatch, original, tail, want):
+    # R2-5: `type` follows the adopted launch, not the wrapper's copy of the old one.
+    cfg, _ = _installed(tmp_path, monkeypatch, TERSE_CMD, original)
+    entry = _live_kb(cfg)
+    args = entry["args"]
+    entry["args"] = [*args[:args.index("--") + 1], *tail]
+    _set_kb(cfg, entry)
+    im.do_uninstall(["kb"], cfg=cfg)
+    assert _live_kb(cfg) == want
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_a_url_downstream_edited_inside_the_wrapper_keeps_its_headers(
+        tmp_path, monkeypatch, custom):
+    # R2-9: URL edit inside the wrapper; the `--header` flags are part of the downstream.
+    launcher = [str(tmp_path / "tmcp")] if custom else TERSE_CMD
+    original = {"url": "https://old.example/mcp", "headers": {"Authorization": "Bearer t"}}
+    cfg, policy = _installed(tmp_path, monkeypatch, launcher, original)
+    entry = _live_kb(cfg)
+    entry["args"][-1] = "https://new.example/mcp"
+    _set_kb(cfg, entry)
+    im.do_install(["kb"], str(policy), cfg=cfg)
+    want = {"url": "https://new.example/mcp", "headers": {"Authorization": "Bearer t"}}
+    assert _stash_kb(cfg) == want
+    im.do_uninstall(["kb"], cfg=cfg)
+    assert _live_kb(cfg) == want
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_multiproxy_folds_a_downstream_edited_inside_the_wrapper(tmp_path, monkeypatch, custom):
+    # R2-9: the fold path adopts the edited downstream too.
+    launcher = [str(tmp_path / "tmcp")] if custom else TERSE_CMD
+    cfg, policy = _installed(tmp_path, monkeypatch, launcher)
+    entry = _live_kb(cfg)
+    entry["args"][-1] = "--v2"
+    _set_kb(cfg, entry)
+    res = im.do_install(["kb"], str(policy), cfg=cfg, multiproxy=True)
+    (kb,) = json.loads(Path(res["peers_file"]).read_text())["downstreams"]
+    assert kb["command"] == ["old-kb", "--v2"]
+    assert _stash_kb(cfg) == {"command": "old-kb", "args": ["--v2"]}

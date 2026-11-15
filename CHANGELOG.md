@@ -22,10 +22,13 @@ fails that pull request until the section has moved.
   original. Re-install wraps it, including `--multiproxy` folds, and uninstall keeps it
   (printing `kept`) and drops the stale stash copy. The same holds when only the
   downstream after the wrapper's `--` was edited (`-- kb --v1` to `-- kb --v2`):
-  re-install wraps the edited downstream and uninstall restores it, unwrapped. A wrapper
-  written through a custom `$TERSE_MCP_CMD` launcher is still recognised as terse's own
-  and is never adopted as the original itself. A replacement with neither `command` nor
-  `url` is refused with an error before anything is written.
+  re-install wraps the edited downstream and uninstall restores it, unwrapped (with a
+  `type` that matches if the edit changed stdio to a URL or back). terse's wrapper is
+  recognised by its launcher (including a custom `$TERSE_MCP_CMD`), not by its flags, so
+  a hand-edited flag or a deleted downstream keeps the stash, and a third-party
+  `mcp-gw proxy --policy x -- srv` entry stays the user's own. A terse wrapper is never
+  adopted as the original itself. A replacement with no string `command` or `url` is
+  refused with an error before anything is written.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,
