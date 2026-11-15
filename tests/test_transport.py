@@ -161,6 +161,44 @@ _FRAMING_MODES = {
     "precise": lambda h, mid: _raw(h, 200, "application/json", (
         '{\n "jsonrpc": "2.0",\n "id": ' + json.dumps(mid) + ',\n "result": '
         '{"v": 0.12345678901234567890123, "a": 1, "a": 2}\n}').encode()),
+    # Review round 1 of #586: response shapes the first cut of the framing fix mishandled.
+    "no_jsonrpc_member": lambda h, mid: _raw(h, 200, "application/json", json.dumps(
+        {"id": mid, "result": _TOOLS}, indent=2).encode()),
+    "huge_int": lambda h, mid: _raw(h, 200, "application/json", (
+        '{"jsonrpc": "2.0", "id": ' + json.dumps(mid) + ', "result": {"n": '
+        + "7" * 5000 + '}}\n').encode()),
+    "deep_result": lambda h, mid: _raw(h, 200, "application/json", (
+        '{"jsonrpc": "2.0", "id": ' + json.dumps(mid) + ', "result": {"v": '
+        + "[" * 60_000 + "]" * 60_000 + '}}\n').encode()),
+    "deep_only": lambda h, mid: _raw(h, 200, "application/json",
+                                     b"[" * 100_000 + b"]" * 100_000),
+    "ndjson": lambda h, mid: _raw(h, 200, "application/json", (json.dumps(
+        {"jsonrpc": "2.0", "method": "notifications/progress", "params": {"p": 1}}) + "\n"
+        + json.dumps({"jsonrpc": "2.0", "id": mid, "result": _TOOLS}) + "\n").encode()),
+    "ok_null_id": lambda h, mid: _raw(h, 200, "application/json", json.dumps(
+        {"jsonrpc": "2.0", "id": None,
+         "error": {"code": -32600, "message": "bad request"}}).encode()),
+    "fail_other_id": lambda h, mid: _raw(h, 400, "application/json", json.dumps(
+        {"jsonrpc": "2.0", "id": 99, "error": {"code": -32600, "message": "bad"}}).encode()),
+    "fail_string_id": lambda h, mid: _raw(h, 400, "application/json", json.dumps(
+        {"jsonrpc": "2.0", "id": str(mid), "error": {"code": -32600, "message": "bad"}}
+    ).encode()),
+    "sse_notification_then_junk": lambda h, mid: _raw(h, 200, "text/event-stream", (
+        "data: " + json.dumps({"jsonrpc": "2.0", "method": "notifications/progress",
+                               "params": {"p": 1}})
+        + '\n\ndata: {"jsonrpc": "2.0", "id": ' + json.dumps(mid) + ', "res\n\n').encode()),
+    "empty200": lambda h, mid: _raw(h, 200, "application/json", b""),
+    "blank202": lambda h, mid: _raw(h, 202, "application/json", b"  \r\n"),
+    "fail_sse_null_id": lambda h, mid: _raw(h, 404, "text/event-stream", (
+        "event: message\ndata: " + json.dumps(
+            {"jsonrpc": "2.0", "id": None,
+             "error": {"code": -32001, "message": "session expired"}}) + "\n\n").encode()),
+    "fail_bom": lambda h, mid: _raw(h, 401, "application/json", ("﻿" + json.dumps(
+        {"jsonrpc": "2.0", "id": mid,
+         "error": {"code": -32001, "message": "missing Authorization header"}})).encode()),
+    "fail_null_id_precise": lambda h, mid: _raw(h, 404, "application/json", (
+        b'{"jsonrpc": "2.0", "id": null, "error": {"code": -32001, "message": "x", '
+        b'"data": {"v": 0.12345678901234567890123, "a": 1, "a": 2}}}')),
 }
 
 
@@ -694,8 +732,9 @@ def test_redirect_target_cannot_fixate_the_mcp_session():
 
 
 # --- framing: every downstream body becomes newline-free JSON-RPC lines (#582) ---
-def _one_list_call(mode: str) -> list[str]:
-    cin = io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}) + "\n")
+def _one_list_call(mode: str, request: dict | None = None) -> list[str]:
+    request = request or {"jsonrpc": "2.0", "id": 3, "method": "tools/list"}
+    cin = io.StringIO(json.dumps(request) + "\n")
     cout = io.StringIO()
     with _fake_server(mode=mode) as srv:
         assert run_proxy([_url(srv)], FULL, stdin=cin, stdout=cout) == 0
@@ -773,3 +812,79 @@ def test_compaction_is_linear_on_a_truncated_string_full_of_escaped_quotes():
     start = _time.monotonic()
     assert _compact_json_text(text) == text.lstrip("\n")
     assert _time.monotonic() - start < 2.0
+
+
+# --- review round 1 of #586: one rule decides what answers the request (B1-B7) ---
+def _transport_reply(mode: str) -> list[str]:
+    """What the transport itself enqueues for one request (id 3), before the interceptor."""
+    with _fake_server(mode=mode) as srv:
+        t = HttpTransport(_url(srv), timeout=5)
+        t._post(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}))
+    out = []
+    while not t._q.empty():
+        out.append(t._q.get_nowait())
+    return out
+
+
+def test_response_without_a_jsonrpc_member_is_forwarded():   # B1
+    msgs = [json.loads(ln) for ln in _one_list_call("no_jsonrpc_member")]
+    assert msgs == [{"id": 3, "result": _TOOLS}]
+
+
+@pytest.mark.parametrize("mode", ["huge_int", "deep_result"])
+def test_body_past_python_parser_limits_is_forwarded_not_replaced(mode):   # B1
+    # A 5000-digit int (int max str digits) or 60k-deep nesting (recursion limit) is
+    # valid JSON that json.loads refuses; the real result must still reach the client.
+    lines = _transport_reply(mode)
+    assert len(lines) == 1 and "\n" not in lines[0]
+    assert "error" not in lines[0] and lines[0].startswith('{"jsonrpc":"2.0","id":3,')
+
+
+def test_deeply_nested_non_message_answers_with_an_error_not_a_crash():
+    msgs = [json.loads(ln) for ln in _transport_reply("deep_only")]
+    assert len(msgs) == 1 and msgs[0]["id"] == 3 and msgs[0]["error"]["code"] == -32000
+
+
+def test_newline_delimited_json_body_is_split_into_its_messages():   # B2
+    msgs = [json.loads(ln) for ln in _one_list_call("ndjson")]
+    assert [m.get("method") for m in msgs] == ["notifications/progress", None]
+    assert msgs[1] == {"jsonrpc": "2.0", "id": 3, "result": _TOOLS}
+
+
+@pytest.mark.parametrize("mode", ["ok_null_id", "fail_other_id", "fail_string_id",
+                                  "fail_sse_null_id"])
+def test_response_not_keyed_to_the_request_is_answered_under_its_id(mode):   # B3 B4 B7
+    msgs = [json.loads(ln) for ln in _one_list_call(mode)]
+    assert len(msgs) == 1 and msgs[0]["id"] == 3
+    assert msgs[0]["error"]["code"] in (-32600, -32001)   # the server's own error
+
+
+def test_error_status_body_gets_the_same_framing_as_a_success_body():   # B7
+    msgs = [json.loads(ln) for ln in _one_list_call("fail_bom")]
+    assert msgs == [{"jsonrpc": "2.0", "id": 3, "error": {
+        "code": -32001, "message": "missing Authorization header"}}]
+
+
+def test_rekeyed_response_keeps_its_literal_text():   # deferred re-key item, free here
+    # Only the id is spliced; the one-line body is otherwise exactly what the server sent.
+    lines = _one_list_call("fail_null_id_precise")
+    assert lines == ['{"jsonrpc": "2.0", "id": 3, "error": {"code": -32001, "message": "x", '
+                     '"data": {"v": 0.12345678901234567890123, "a": 1, "a": 2}}}']
+
+
+def test_sse_stream_with_only_a_notification_and_junk_answers_the_request():   # B5
+    msgs = [json.loads(ln) for ln in _one_list_call("sse_notification_then_junk")]
+    assert [m.get("method") for m in msgs] == ["notifications/progress", None]
+    assert msgs[1]["id"] == 3 and "no JSON-RPC message" in msgs[1]["error"]["message"]
+
+
+@pytest.mark.parametrize("mode", ["empty200", "blank202"])
+def test_empty_success_body_to_a_request_answers_with_an_error(mode):   # B6
+    msgs = [json.loads(ln) for ln in _one_list_call(mode)]
+    assert len(msgs) == 1 and msgs[0]["id"] == 3 and msgs[0]["error"]["code"] == -32000
+
+
+@pytest.mark.parametrize("mode", ["empty200", "blank202", "fail_other_id"])
+def test_notification_still_gets_no_synthesized_reply(mode):   # B6 B4 guard
+    lines = _one_list_call(mode, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+    assert lines == []

@@ -19,13 +19,18 @@ fails that pull request until the section has moved.
   stream as several lines of non-JSON, and the request hung. An HTML 200 (a captive portal
   or login page) was forwarded as junk, and a batch array went out unsplit. Each body is
   now compacted by removing whitespace outside strings, lexically, so no number or
-  duplicate key is rewritten. A batch is split into its messages, and a body that is not
-  JSON-RPC answers the request with an error that does not echo the body. In an SSE
-  stream, blank priming events and non-JSON keepalives are skipped, and the request gets
-  an error only if the stream carried no message. A 4xx/5xx JSON-RPC error carrying
-  `"id": null` (a server's reply to an expired session) is now answered under the
-  request's own id instead of matching nothing. This applies to
-  `terse proxy` and to multiproxy HTTP peers.
+  duplicate key is rewritten. A body carrying several messages (a batch array, SSE
+  events, or newline-delimited JSON values) is split into them. Blank SSE priming events,
+  non-JSON keepalives and other non-JSON-RPC content are dropped, and a 2xx body's content
+  is never echoed into an error. One rule now decides, for every status, what answers a
+  request: a response carrying its id. If none does, the first response is re-keyed to
+  the request's id by splicing in the id and keeping the rest of its text, which covers
+  `"id": null` (a server's reply to an expired session), a wrong id, and `"3"` for `3`.
+  A request that got no response at all, including an empty 200/202 body, gets an error
+  instead of hanging. A notification still never gets a synthesized reply. A response
+  without a `"jsonrpc"` member is forwarded, and so is a valid body that Python's parser
+  refuses (an integer over 4300 digits, nesting past the recursion limit). This applies
+  to `terse proxy` and to multiproxy HTTP peers.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,
