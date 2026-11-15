@@ -40,6 +40,69 @@ fails that pull request until the section has moved.
   withheld as underpowered. The HTML forest plot no longer clips the `INCONCLUSIVE` badge.
 
 ### Fixed
+- `install-mcp` re-wrapped the OLD command after a wrapped entry had been replaced by hand.
+  The stashed original always won over the live entry, so swapping `kb` for a new command
+  and re-running install brought the old one back and discarded yours, and
+  `uninstall-mcp` restored the old one over it. An entry that is no longer a terse
+  wrapper (and not a router) and differs from the stash is now treated as the new
+  original. Re-install wraps it, including `--multiproxy` folds, and uninstall keeps it
+  (printing `kept`) and drops the stale stash copy. The same holds when only the
+  downstream after the wrapper's `--` was edited (`-- kb --v1` to `-- kb --v2`):
+  re-install wraps the edited downstream and uninstall restores it, unwrapped (with a
+  `type` that matches if the edit changed stdio to a URL or back). terse's wrapper is
+  recognised by its launcher (including a custom `$TERSE_MCP_CMD`), not by its flags, so
+  a hand-edited flag or a deleted downstream keeps the stash, and a third-party
+  `mcp-gw proxy --policy x -- srv` entry stays the user's own. A terse wrapper is never
+  adopted as the original itself. A replacement with no string `command` or `url` is
+  refused with an error before anything is written.
+
+## [0.49.4] - 2026-11-15
+
+### Fixed
+- `terse proxy` (single server) ended the whole session with exit 0 on one byte of invalid
+  UTF-8 from the client. The strict decoder raised inside the stdin loop and killed the
+  client-to-server thread. Client stdin is now read with `surrogateescape`, and a line
+  that is not valid UTF-8 is dropped, never forwarded (a `--debug` stderr note), exactly
+  as the multiproxy router has done since #517. Later lines are still answered.
+- A stdio downstream that ignores stdin EOF kept `terse proxy` blocked forever once the
+  client disconnected without signalling it, orphaning both processes. After client EOF,
+  a child that stays idle for 30 seconds (no request in flight and no output) is now
+  terminated (SIGTERM, then SIGKILL), with a stderr note. A request of any method sent
+  within those 30 seconds before EOF and not yet answered or cancelled keeps the child
+  alive, so a slow reply (a cold-started server's `initialize`, a long tool call) is not
+  cut off. An older unanswered request is treated as abandoned. A 10-minute ceiling after
+  EOF ends a child that never answers or keeps sending notifications, and a child that
+  even SIGKILL cannot reap is given up on (exit 1) instead of waited for forever.
+
+## [0.49.3] - 2026-11-14
+
+### Fixed
+- In the multiproxy router, a downstream server that exited kept every later `ping`,
+  `tools/list`, `resources/list` and `initialize` waiting the full 30-second broadcast
+  timeout, because the dead peer stayed in each broadcast's set of peers still owed an
+  answer. A broadcast now completes as soon as every outstanding peer has exited,
+  including one already in flight when the peer dies, and no broadcast request is sent
+  to a dead peer. A listing that lacks the dead peer is still never saved to the warm-start
+  snapshot.
+
+## [0.49.2] - 2026-11-14
+
+### Fixed
+- A `{"critical": true}` field could still be lost through an overlapping lossy rule. The
+  denylist matched only the exact path string, so a truncate on `items` (`max: 1`) cut away
+  `items[].id` from every record past the first, a drop on `a` replaced a critical
+  `a.secret`, and `a.[].b` did not match a critical `a[].b`. Any lossy path that is an
+  ancestor of, descendant of, or equal to a critical path (compared by parsed tokens) is
+  now skipped with a warning naming the critical field.
+- A policy's `never_lossy_servers` written as a bare string (`"mybank"`) loaded as the set
+  of its characters, so no server matched and the credential-server floor was silently
+  off. `load_policy` now requires a list of strings, and `install-mcp --never-lossy` keeps a
+  hand-written bare string whole when adding to it.
+- A field's `max`/`min` that is not an integer (`"abc"`, `null`, `2.5`, `true`) or is out of
+  range (`max` < 1, `min` < 0) is now rejected at load. A non-integer used to raise on
+  every payload past the lossy stage's handler, so the tool was silently never
+  compressed, and a negative `max` sliced from the end of the value. Values that already
+  worked (`"50"`, `120.0`) still load.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,
