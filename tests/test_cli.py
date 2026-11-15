@@ -2037,3 +2037,50 @@ def test_mcp_status_redacts_a_header_value_containing_spaces(tmp_path, monkeypat
     assert main(["mcp-status", "--json"]) == 0
     raw = capsys.readouterr().out
     assert "SECRET1" not in raw and "wraps_argv" not in raw
+
+
+# --- PR #584 review round 2 (ledger B1-B7) ---
+@pytest.mark.parametrize(("args", "want"), [
+    # B1: a flag after `-H` is a flag, and a URL payload still has its userinfo masked.
+    (["some-server", "-H", "--api-key", "sk-1"], ["some-server", "-H", "--api-key", "***"]),
+    (["-H", "https://u:pw@db.example/x"], ["-H", "https://***@db.example/x"]),
+    # B2: an env assignment attached to its flag with `=`.
+    (["--env=BAR_TOKEN=FAKE"], ["--env=BAR_TOKEN=***"]),
+    (["-e=BAR_TOKEN=FAKE"], ["-e=BAR_TOKEN=***"]),
+    (["--set-env=KEY=FAKE"], ["--set-env=KEY=***"]),
+    (["-eSESSION_ID=FAKE", "-eKEY=FAKE"], ["-eSESSION_ID=***", "-eKEY=***"]),
+    (["--env=DATABASE_URL=postgres://u:FAKE@db/x"], ["--env=DATABASE_URL=postgres://***@db/x"]),
+    # B3: `NAME=` with the value in the next arg.
+    (["--header", "X-Api-Key=", "sk-1"], ["--header", "X-Api-Key=***", "***"]),
+    # B4: compound flags, by the delimited-part rule env names use.
+    (["--github-pat", "ghp_1"], ["--github-pat", "***"]),
+    (["--openai-key", "sk-1"], ["--openai-key", "***"]),
+    (["--stripe-key", "x"], ["--stripe-key", "***"]),
+    (["--session-id", "s1"], ["--session-id", "***"]),
+    # B6: a secret value starting with `-`; a `--flag` after `Authorization:` is a flag.
+    (["--token", "-FAKE"], ["--token", "***"]),
+    (["--no-auth", "-H", "Authorization: Bearer S"], ["--no-auth", "-H", "Authorization: ***"]),
+    # B7: the attached `-H` check must not run on a pending secret value.
+    (["--password", "-Hx7Q", "--port", "8080"], ["--password", "***", "--port", "8080"]),
+])
+def test_redact_args_review_round_2_shapes(args, want):
+    assert _redact_args(args) == want
+
+
+@pytest.mark.parametrize("args", [
+    # B1 flip side: `-H host:port` (docker's -H) is not a header.
+    ["-H", "auth.example.com:443"], ["-H", "token-svc:8080"], ["-Htoken-svc:8080"],
+    # B6: `Authorization:` with no value before a `--flag` masks nothing.
+    ["--header", "Authorization:", "--foo", "-x"],
+    # B4: the delimited-part rule leaves these alone.
+    ["--monkey", "x"], ["--keep-alive", "5"], ["--hotkey", "k"],
+])
+def test_redact_args_review_round_2_leaves_alone(args):
+    assert _redact_args(args) == args
+
+
+@pytest.mark.parametrize("url", ["https://u:FAKE@[::1/x", "https://u:FAKE@/x"])
+def test_redact_args_masks_userinfo_of_an_unparseable_url(url):
+    # B5: `_redact_url` returned these whole (urlsplit ValueError / no host).
+    out = " ".join(_redact_args([url, f"--url={url}"]))
+    assert "FAKE" not in out and out.count("***@") == 2
