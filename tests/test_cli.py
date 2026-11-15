@@ -2101,6 +2101,9 @@ def test_redact_args_masks_userinfo_of_an_unparseable_url(url):
     # R2-3: a value after the first separator means nothing is pending.
     (["--header", "Authorization: Basic dXNlcjpwdw==", "server.py"],
      ["--header", "Authorization: ***", "server.py"]),
+    # Round 4 (R3-1): `--oauth` is secret-shaped, as on main, so the arg after it is
+    # masked even when it is a short flag. Over-masking is the accepted direction.
+    (["--oauth", "-p", "8080"], ["--oauth", "***", "8080"]),
 ])
 def test_redact_args_review_round_3_shapes(args, want):
     assert _redact_args(args) == want
@@ -2112,7 +2115,7 @@ def test_redact_args_review_round_3_shapes(args, want):
     # R2-4: compound non-secret flags, boolean negations, non-env `--x=a=b`.
     ["--session-dir", "/tmp/x"], ["--session-timeout", "30"], ["--session-name", "n"],
     ["--cache-key", "k"], ["--sort-key", "k"], ["--primary-key", "id"],
-    ["--no-session", "srv.py"], ["--oauth", "-p", "8080"],
+    ["--no-session", "srv.py"],
     ["--set=auth.enabled=true"], ["--label=session=foo"],
 ])
 def test_redact_args_review_round_3_leaves_alone(args):
@@ -2130,3 +2133,107 @@ def test_redact_url_text_is_linear_on_repeated_schemes():
     _redact_url_text(blob)
     _redact_args([f"--url={blob}", "--header", f"X-Upstream: {blob}"])
     assert time.perf_counter() - t0 < 1.0
+
+
+# --- PR #584 review round 4 (ledger R3-1): parity with the `auth` masking main ships ---
+_AUTH_FLAGS = ["--oauth", "--oauth2", "--oauth-client", "--basicauth", "--httpauth",
+               "--proxyauth"]
+
+
+@pytest.mark.parametrize("flag", _AUTH_FLAGS)
+def test_redact_args_masks_any_flag_part_containing_auth(flag):
+    # Round 3 required `auth` to START a name part, which printed these; main masks them.
+    assert _redact_args([flag, "FAKE", "pkg"]) == [flag, "***", "pkg"]
+    assert _redact_args([f"{flag}=FAKE", "pkg"]) == [f"{flag}=***", "pkg"]
+
+
+# Shapes origin/main (c18dd00) masks, from the round-1/round-2 batteries and R3-1. Each
+# must stay masked: a security PR may not print what the shipped code hides.
+@pytest.mark.parametrize("args", [
+    ["--api-key", "FAKE"], ["--api-key=FAKE"], ["--token", "FAKE"], ["--token=FAKE"],
+    ["--auth", "FAKE"], ["--bearer-token", "FAKE"], ["--access-token", "FAKE"],
+    ["--client-secret", "FAKE"], ["--password", "FAKE"], ["--credential=FAKE"],
+    ["-token", "FAKE"], ["-api-key=FAKE"], ["--private-key", "FAKE"],
+    ["--header", "Authorization=Bearer FAKE"], ["--header=X-Api-Key=FAKE"],
+    ["FOO_TOKEN=FAKE"], ["X_SECRET=FAKE"], ["PASSWORD=FAKE"], ["-e", "FOO_TOKEN=FAKE"],
+    ["-eFOO_TOKEN=FAKE"], ["-ePASSWORD=FAKE"], ["-e", "DATABASE_URL=postgres://u:FAKE@db/x"],
+    ["https://u:FAKE@h/x"], ["https://h/x?access_token=FAKE"], ["https://h/x#access_token=FAKE"],
+    ["--url=https://u:FAKE@h"], ["--no-auth", "--token", "FAKE"],
+    *([f, "FAKE"] for f in _AUTH_FLAGS), *([f"{f}=FAKE"] for f in _AUTH_FLAGS),
+])
+def test_redact_args_masks_everything_main_masks(args):
+    from terse.cli import _full_cmd
+
+    assert "FAKE" not in " ".join(_redact_args(args))
+    assert "FAKE" not in _full_cmd({"command": "x", "args": args})
+
+
+# --- PR #584 review round 4, skill items R3-2..R3-4: mcp-status router rows ---
+def _router_fleet(tmp_path, monkeypatch):
+    """A user-scope router fronting `gh` and `kb`, launched through a `--` launcher, and a
+    project-scope `kb` proxy: the cross-scope duplicate #447 reports."""
+    from terse import install_mcp as im
+
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    cfg = tmp_path / "home" / "claude.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(json.dumps({"mcpServers": {"kb": {"command": "kb-mcp"},
+                                              "gh": {"command": "gh-mcp"}}}), encoding="utf-8")
+    pol = _write(tmp_path, "p.json", json.dumps({"version": 1, "defaults": {"tiers": ["minify"]}}))
+    im.do_install(["kb", "gh"], str(pol), cfg=cfg, multiproxy=True)
+    doc = json.loads(cfg.read_text(encoding="utf-8"))
+    peers = doc["mcpServers"]["terse"]["args"][-1]
+    doc["mcpServers"]["terse"] = {"command": "uv", "args": [
+        "run", "--with", "terse", "--", "terse", "proxy", "--config", peers]}
+    cfg.write_text(json.dumps(doc), encoding="utf-8")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".mcp.json").write_text(json.dumps({"mcpServers": {"kb": {
+        "command": "/abs/python",
+        "args": ["-m", "terse", "proxy", "--server-name", "kb", "--", "kb-server"]}}}),
+        encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG", str(cfg))
+    monkeypatch.chdir(proj)
+    return ["--file", str(proj / ".mcp.json"), "--repo-path", str(proj)]
+
+
+def test_mcp_status_router_row_shows_its_peers_and_the_duplicate(tmp_path, monkeypatch, capsys):
+    # R3-2: the router row printed its own launch argv (`terse proxy --config ...`), and
+    # the cross-scope `kb` duplicate was no longer reported.
+    flags = _router_fleet(tmp_path, monkeypatch)
+    capsys.readouterr()
+    assert main(["mcp-status", *flags]) == 0
+    out = capsys.readouterr().out
+    assert "wraps=gh, kb" in out and "--config" not in out
+    assert "`kb` is ALSO run by" in out
+    assert main(["mcp-status", "--json", *flags]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert next(r for r in rows if r["server"] == "terse")["wraps"] == "gh, kb"
+
+
+def test_mcp_status_contests_on_raw_argv_not_the_redacted_display(monkeypatch, capsys):
+    # R3-4: the duplicate/precedence maps read a guessed label off `wraps`, so they must
+    # see the RAW argv; only the printed copy is redacted.
+    import terse.install_mcp as install_mcp
+    import terse.stats as stats
+
+    rows = [{"scope": "user", "server": "a", "state": "wrapped", "policy": None,
+             "config": "/user.json", "router": None, "wraps": "srv --token FAKE1",
+             "wraps_argv": ["srv", "--token", "FAKE1"]}]
+    seen: list[str] = []
+    real_contested, real_winner = stats._contested_labels, stats._precedence_winner
+
+    def contested(scan_rows, *a, **k):
+        seen.extend(str(r.get("wraps")) for r in scan_rows)
+        return real_contested(scan_rows, *a, **k)
+
+    def winner(scan_rows, *a, **k):
+        seen.extend(str(r.get("wraps")) for r in scan_rows)
+        return real_winner(scan_rows, *a, **k)
+    monkeypatch.setattr(install_mcp, "scan_scopes", lambda *a, **k: rows)
+    monkeypatch.setattr(stats, "_contested_labels", contested)
+    monkeypatch.setattr(stats, "_precedence_winner", winner)
+    assert main(["mcp-status"]) == 0
+    out = capsys.readouterr().out
+    assert "FAKE1" not in out and "wraps=srv --token ***" in out
+    assert seen and all(w == "srv --token FAKE1" for w in seen)

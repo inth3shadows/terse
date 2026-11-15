@@ -1746,18 +1746,18 @@ _LOOKUP_KEY_QUALIFIERS = frozenset((
 
 def _is_secret_flag(flag: str) -> bool:
     """Whether `flag` (`-x` or `--x`, without any `=VALUE`) takes a secret value. A
-    boolean negation (`--no-auth`, `--no-session`) takes none. `auth` must start a part
-    (`--auth`, `--basic-auth`, `--authorization`), so `--oauth` is the boolean it usually
-    is. `session` is a secret alone or as `session-id`/`session-key`, not as
-    `--session-dir`/`--session-timeout`."""
+    boolean negation (`--no-auth`, `--no-session`) takes none. `auth` matches anywhere in
+    the name, as it always has (`--oauth2`, `--basicauth`, `--proxyauth`), so a boolean
+    `--oauth` masks the arg after it: the safe direction. `session` is a secret alone or
+    as `session-id`/`session-key`, not as `--session-dir`/`--session-timeout`."""
     name = flag.lstrip("-").lower()
     if not flag.startswith("-") or not name or name.startswith(("no-", "no_")):
         return False
-    if _SECRET_LONG.search(name):
+    if _SECRET_LONG.search(name) or "auth" in name:
         return True
     parts = _NAME_PARTS.split(name)
     for i, part in enumerate(parts):
-        if part.startswith("auth") or part in ("pat", "bearer", "sessionid"):
+        if part in ("pat", "bearer", "sessionid"):
             return True
         if part == "key" and (i == 0 or parts[i - 1] not in _LOOKUP_KEY_QUALIFIERS):
             return True
@@ -2196,15 +2196,17 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
     from .install_mcp import scan_scopes
     from .stats import _WRITES_LEDGER_ROWS, _contested_labels, _precedence_winner
 
-    rows = scan_scopes(file=args.file, repo_path=args.repo_path)
+    raw_rows = scan_scopes(file=args.file, repo_path=args.repo_path)
     # `wraps` is the downstream argv joined with spaces, straight from the config: it held
     # `--api-key sk-...` in the clear on both the table and `--json`. Redact the argv LIST
     # (`wraps_argv`, so a header value containing spaces stays one arg) with the same rules
     # install/uninstall print with, then join. A router's `wraps` is its peer-name list
     # and has no argv. `wraps_argv` itself is raw and never leaves this function.
+    # `raw_rows` feed only the duplicate/precedence maps below, which guess a label from
+    # `wraps` and must see what the proxy will actually run; `rows` are what is printed.
     rows = [{**{k: v for k, v in r.items() if k != "wraps_argv"},
              **({"wraps": " ".join(_redact_args(r["wraps_argv"]))}
-                if r.get("wraps_argv") else {})} for r in rows]
+                if r.get("wraps_argv") else {})} for r in raw_rows]
     if args.json:
         # Scriptable/CI-checkable parity with `terse stats --json`; [] on no servers.
         print(json.dumps(rows, indent=2))
@@ -2220,10 +2222,11 @@ def _cmd_mcp_status(args: argparse.Namespace) -> int:
     # catches the same-scope shape; a duplicate in ANOTHER scope (a project router folding
     # `kb` beside a user-scope `kb` proxy, #424) printed nothing here while `terse stats`
     # reported the label contested. Keyed on the row that actually runs for each name.
-    winners = _precedence_winner(rows)
+    # Indices into `raw_rows` index `rows` too: same rows, same order.
+    winners = _precedence_winner(raw_rows)
     row_index = {id(r): i for i, r in enumerate(rows)}
     dup_of: dict[int, list[tuple[str, list[str]]]] = {}
-    for lbl, contest in sorted(_contested_labels(rows).items()):
+    for lbl, contest in sorted(_contested_labels(raw_rows).items()):
         for name in sorted(contest.writers):
             idx = winners.get(name)
             if idx is not None:

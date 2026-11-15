@@ -67,8 +67,16 @@ def server_label(cmd: list[str]) -> str:
     if "://" in target:
         # `netloc` includes any `user:pass@`, which then sat in every ledger row and in
         # `terse stats` output; the host[:port] after the last `@` is the identity.
-        netloc = urlparse(target).netloc.rpartition("@")[2]
-        return netloc or target.rpartition("@")[2]
+        try:
+            netloc = urlparse(target).netloc
+        except ValueError:
+            # `https://u:pw@[::1/x`: urlparse raises, and this runs in mcp-status, stats
+            # and proxy startup, none of which may crash on one malformed entry.
+            netloc = re.split(r"[/?#]", target.split("://", 1)[1], maxsplit=1)[0]
+        if not netloc:
+            return target   # `file:///srv/mcp.sock`: no authority, so no userinfo either
+        # `https://u:pw@/x` has userinfo and no host: nothing names it, and `/x` would.
+        return netloc.rpartition("@")[2] or "unknown"
     return Path(target).name or target
 
 

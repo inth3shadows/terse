@@ -27,14 +27,17 @@ fails that pull request until the section has moved.
   (`--token -x…`), and URL userinfo `urlsplit` can't parse (`https://u:pw@[::1/x`).
   A flag right after `-H` is read as a flag, a `-H` URL is redacted as a URL, and
   docker's `-H host:port` is left as it is when the name is host-like (`token-svc:8080`,
-  not `Authorization:12345`). Boolean negations (`--no-auth`, `--no-session`), `--oauth`,
-  lookup keys (`--cache-key`, `--sort-key`) and `--session-dir`/`--session-timeout` take
-  no secret, so the arg after them prints. `mcp-status` redacts the argument list before
-  joining it, so a header value containing spaces is masked whole.
+  not `Authorization:12345`). Boolean negations (`--no-auth`, `--no-session`), lookup
+  keys (`--cache-key`, `--sort-key`) and `--session-dir`/`--session-timeout` take no
+  secret, so the arg after them prints; any other flag containing `auth` (`--oauth`,
+  `--basicauth`) still masks the arg after it. `mcp-status` redacts the argument list
+  before joining it, so a header value containing spaces is masked whole.
 - The savings ledger labelled an HTTP downstream by its full URL netloc, so a
   `https://user:pass@host/mcp` target wrote `user:pass@host` into every ledger row and into
   `terse stats` output. The label is now the `host[:port]` alone, and rows already in the
-  ledger with a `user:pass@` or `token@` label are read back under the host.
+  ledger with a `user:pass@` or `token@` label are read back under the host. A URL with
+  userinfo and no host (`https://u:pw@/x`) is labelled `unknown`, and one `urlparse`
+  rejects (`https://u:pw@[::1/x`) no longer crashes `mcp-status`, `stats` or proxy startup.
 - A JSON payload whose parse would lose a value is now forwarded untouched instead of
   compressed. `json.loads` collapses duplicate keys (`{"a":1,"a":2}` -> `{"a":2}`) and
   rounds float literals past double precision (`0.10000000000000000001` -> `0.1`,

@@ -1879,6 +1879,10 @@ def _scan_target(target: Target, scope: str, approval=None) -> list[dict]:
             # A router has no `--` downstream and no single `--policy`: what it fronts is
             # the peers file's list, and each peer carries its own policy there.
             wraps = ", ".join(sorted(folded)) or NO_PEERS
+            # A router launched through a `--` launcher (`uv run --with terse -- terse proxy
+            # --config ...`) split its OWN argv into `wraps_argv` above; mcp-status prints
+            # that in place of `wraps`, and the peer list is what it has to show.
+            wraps_argv = None
             policy_missing = bool(policy and os.path.isabs(policy)
                                   and not os.path.exists(policy))
         # A project entry the user REJECTED is in the file but never launched, in any

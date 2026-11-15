@@ -496,3 +496,15 @@ def test_load_stats_strips_userinfo_from_old_ledger_rows(tmp_path):
                               "kb@work")) + "\n", encoding="utf-8")
     assert [r["server"] for r in load_stats(log)] == [
         "mcp.example.com", "mcp.example.com", "kb@work"]
+
+
+@pytest.mark.parametrize("url", ["https://u:FAKE@[::1/x", "https://u:FAKE@/x"])
+def test_server_label_survives_a_malformed_url_without_userinfo(url):
+    # R3-3 (PR #584 round 4): urlparse raised on the bracket, crashing mcp-status, stats
+    # and proxy startup; the hostless form was labelled `/x`.
+    label = server_label([url])
+    assert "FAKE" not in label and label != "/x" and label
+
+
+def test_server_label_keeps_an_empty_netloc_url_as_before():
+    assert server_label(["file:///srv/mcp.sock"]) == "file:///srv/mcp.sock"
