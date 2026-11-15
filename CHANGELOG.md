@@ -13,6 +13,33 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+### Fixed
+- An HTTP downstream's response reached the client unframed. A pretty-printed JSON body,
+  or an SSE event whose `data:` spanned several lines, was written to the client's stdio
+  stream as several lines of non-JSON, and the request hung. An HTML 200 (a captive portal
+  or login page) was forwarded as junk, and a batch array went out unsplit. Each body is
+  now compacted by removing whitespace outside strings, lexically, so no number or
+  duplicate key is rewritten. A body carrying several messages (a batch array, SSE
+  events, or newline-delimited JSON values) is split into them. Blank SSE priming events,
+  non-JSON keepalives and other non-JSON-RPC content are dropped, and a 2xx body's content
+  is never echoed into an error. One rule now decides, for every status, what answers a
+  request: a response carrying its id. A response has a `result`, or an `error` that is a
+  JSON object, so a REST body such as `{"error": "login required"}` is not one. If no
+  response carries the id, the first response is re-keyed to the request's id by
+  splicing in the id and keeping the rest of its text, which covers `"id": null` (a
+  server's reply to an expired session), a wrong id, and `"3"` for `3`. A response over
+  4 MiB is not re-keyed: it is forwarded as sent, and the request gets an error. A
+  request that got no response at all, including an empty 200/202 body, gets an error
+  instead of hanging; in a batch, each unanswered request id gets its own error. Only a
+  request (a `method` and an `id`) expects a reply: a notification, or the client's own
+  response to a server-initiated request, never gets a synthesized one. A response without a
+  `"jsonrpc"` member is forwarded, and so is a valid body that Python's parser refuses
+  (an integer over 4300 digits, or nesting past the recursion limit, up to 4 MiB, where
+  the slower lexical reading is capped). This applies to `terse proxy` and to multiproxy
+  HTTP peers.
+
+## [0.50.0] - 2026-11-15
+
 ### Changed
 - Comprehension verdicts (`terse fluency`, `fluency --diff`, the diff soak, the HTML
   report, and all three `dropeval` gates: retrieve-recall, no-overfetch and final-accuracy)

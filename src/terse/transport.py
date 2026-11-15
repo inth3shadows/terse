@@ -507,20 +507,239 @@ def _iter_sse(body: str) -> Iterator[str]:
         yield "\n".join(data_lines)
 
 
-def _parse_request_id(line: str) -> tuple[bool, Any]:
-    """Parse `line` (an outgoing JSON-RPC request) once: whether it carries an `"id"`
-    key at all (a notification has none and per JSON-RPC must never get a reply) and
-    that id's value. Shared by every HttpTransport error/reply path so each parses the
-    outgoing line only once. If `line` isn't valid JSON (shouldn't happen — it came
-    from the client through `note_request`/`pump` unchanged), fails toward "has an id"
-    so the caller reports the error rather than silently dropping it."""
+# A JSON string literal (escapes included) or a run of JSON whitespace. Matching strings
+# first is what keeps whitespace INSIDE them; the regex engine does the scanning, so a
+# multi-megabyte pretty-printed body is not walked one character at a time in Python.
+# The string pattern is the unrolled `"[^"\\]*(?:\\.[^"\\]*)*"?`: its closing quote is
+# OPTIONAL, so an unterminated string (a truncated body) is consumed to the end in one
+# linear pass instead of failing and being retried from every later `"`, which was
+# quadratic on a cut-off string full of `\"` (review of #582 item 4).
+_STRING = r'"[^"\\]*(?:\\.[^"\\]*)*"?'
+_JSON_STRING_OR_WS = re.compile(r'(' + _STRING + r')|[ \t\r\n]+', re.DOTALL)
+# A string literal, or one structural character that can change nesting or split a batch.
+_JSON_STRING_OR_STRUCT = re.compile(_STRING + r'|[\[\]{},]', re.DOTALL)
+
+
+def _compact_json_text(text: str) -> str:
+    """`text` with every whitespace character OUTSIDE a JSON string removed, everything
+    else kept byte-for-byte. Lexical, never a parse/re-serialize, so it cannot round a
+    number or collapse a duplicate key (#580). A raw newline can only survive inside a
+    string, where it makes the text invalid JSON anyway, which the caller then rejects."""
+    text = text.removeprefix("\ufeff")   # a UTF-8 BOM is not JSON; json.loads rejects it
+    if "\n" not in text and "\r" not in text and not text[:1].isspace() \
+            and not text[-1:].isspace():
+        return text   # the common case: already one line, nothing to strip
+    return _JSON_STRING_OR_WS.sub(lambda m: m.group(1) or "", text)
+
+
+def _split_top_level_array(compact: str) -> list[str]:
+    """The literal text of each element of a compact JSON array (already validated by the
+    caller), split at depth-1 commas outside strings."""
+    parts: list[str] = []
+    depth = 0
+    start = 1
+    for m in _JSON_STRING_OR_STRUCT.finditer(compact):
+        ch = m.group()
+        if ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+            if depth == 0:
+                parts.append(compact[start:m.start()].strip())
+        elif ch == "," and depth == 1:
+            parts.append(compact[start:m.start()].strip())
+            start = m.end()
+    return parts
+
+
+# A string literal, or one character that opens/closes a container or separates members.
+_JSON_TOKEN = re.compile(_STRING + r'|[\[\]{},:]', re.DOTALL)
+
+
+def _lex_container(text: str) -> tuple[int, dict[str, tuple[int, int]]] | None:
+    """Where the JSON object or array that `text` starts with ends, and for an object the
+    span of each top-level member's value (a duplicate key: the last, as a parser keeps).
+    Lexical, for what a parse cannot do: a body nested past the parser's recursion limit,
+    and splicing a new id into a response's literal text. None if `text` does not start
+    with a closed object or array."""
+    if text[:1] not in ("{", "["):
+        return None
+    in_object = text[0] == "{"
+    spans: dict[str, tuple[int, int]] = {}
+    depth = 0
+    key: str | None = None
+    value_start = 0
+    for m in _JSON_TOKEN.finditer(text):
+        tok = m.group()
+        if tok in ("{", "["):
+            depth += 1
+            continue
+        if tok in ("}", "]"):
+            depth -= 1
+            if depth == 0:
+                if in_object and key is not None:
+                    spans[key] = _trimmed_span(text, value_start, m.start())
+                return m.end(), spans
+            continue
+        if not in_object or depth != 1:
+            continue
+        if tok == ",":
+            if key is not None:
+                spans[key] = _trimmed_span(text, value_start, m.start())
+            key = None
+        elif tok == ":":
+            value_start = m.end()
+        elif key is None:   # a string where a member name goes
+            try:
+                key = json.loads(tok)
+            except ValueError:   # an unterminated string: not a closed object
+                return None
+    return None
+
+
+def _trimmed_span(text: str, start: int, stop: int) -> tuple[int, int]:
+    """`(start, stop)` narrowed past the JSON whitespace at either end of `text[start:stop]`."""
+    value = text[start:stop]
+    return start + len(value) - len(value.lstrip(" \t\r\n")), \
+        stop - (len(value) - len(value.rstrip(" \t\r\n")))
+
+
+def _lenient_int(digits: str) -> Any:
+    """`int(digits)`, or the digits as text past Python's int-string limit (4300 digits by
+    default), where `int()` raises and a valid reply would be thrown away. Only a message's
+    shape and id are read from the parse; its literal text is what is forwarded."""
     try:
-        parsed = json.loads(line)
-    except (json.JSONDecodeError, ValueError):
-        return True, None
-    if not isinstance(parsed, dict):
-        return True, None
-    return "id" in parsed, parsed.get("id")
+        return int(digits)
+    except ValueError:
+        return digits
+
+
+_DECODER = json.JSONDecoder()
+# Only for the retry after the int-string limit: a Python callback per integer doubles the
+# parse time of an int-heavy body, so the common case keeps the C scanner's own `int`.
+_LENIENT_DECODER = json.JSONDecoder(parse_int=_lenient_int)
+_UNMATCHABLE_ID: Any = object()
+# The lexical walk below runs in Python at roughly 0.4 us a character, so it is only tried
+# on text up to this size; past it, a body the parser refuses is not JSON to us and the
+# request gets an error. Without the cap a 128 MiB hostile body blocked for about a minute.
+_MAX_LEXICAL_CHARS = 4 << 20
+
+
+def _decode_value(text: str, pos: int) -> tuple[Any, int] | None:
+    """(value, end) of the JSON value at `text[pos]`, or None if it is not JSON. An object
+    nested past the parser's recursion limit (valid JSON that `json` refuses) is walked
+    lexically instead and stands in as a dict of its top-level keys with only `"id"`
+    parsed, which is all that classifying it reads; such an array stands in as None. The
+    walk is refused past `_MAX_LEXICAL_CHARS`, and on a literal with a raw line break,
+    which only a string can hold here, making it invalid JSON that would split a line."""
+    try:
+        return _DECODER.raw_decode(text, pos)
+    except RecursionError:
+        pass
+    except json.JSONDecodeError:
+        return None
+    except ValueError:   # an integer past the int-string limit; not a syntax error
+        try:
+            return _LENIENT_DECODER.raw_decode(text, pos)
+        except RecursionError:
+            pass
+        except ValueError:
+            return None
+    if len(text) - pos > _MAX_LEXICAL_CHARS:
+        return None
+    literal = text[pos:]
+    lexed = _lex_container(literal)
+    if lexed is None:
+        return None
+    end, spans = lexed
+    if "\n" in literal[:end] or "\r" in literal[:end]:
+        return None
+    if literal[0] == "[":
+        return None, pos + end
+    shape: dict[str, Any] = dict.fromkeys(spans)
+    if "error" in spans and literal[spans["error"][0]] == "{":
+        shape["error"] = {}   # an object, as `_is_response` requires
+    if "id" in spans:
+        start, stop = spans["id"]
+        try:
+            shape["id"] = _LENIENT_DECODER.decode(literal[start:stop])
+        except (ValueError, RecursionError):
+            shape["id"] = _UNMATCHABLE_ID
+    return shape, pos + end
+
+
+def _iter_messages(text: str) -> Iterator[tuple[str, Any]]:
+    """(literal text, parsed value) of each top-level JSON value in one HTTP body or SSE
+    event, a batch array flattened into its elements. A body may carry several values
+    (newline-delimited). Whitespace outside strings is removed lexically first, so each
+    literal is one line and otherwise byte-for-byte what the server sent. Stops at the
+    first text that is not JSON."""
+    compact = _compact_json_text(text)
+    pos = 0
+    while pos < len(compact):
+        decoded = _decode_value(compact, pos)
+        if decoded is None:
+            return
+        value, end = decoded
+        literal = compact[pos:end]
+        pos = end
+        if not literal.startswith("["):
+            yield literal, value
+        elif isinstance(value, list):
+            yield from zip(_split_top_level_array(literal), value, strict=False)
+        else:   # an array past the recursion limit: each element is decoded on its own
+            for element in _split_top_level_array(literal):
+                one = _decode_value(element, 0)
+                if one is not None and one[1] == len(element):
+                    yield element, one[0]
+
+
+def _is_response(msg: dict[str, Any]) -> bool:
+    """A JSON-RPC response: a `result`, or an `error` that is an object, plus an id or a
+    `jsonrpc` member (a lax server may omit `jsonrpc`). A REST error body such as
+    `{"error": "login required", "id": null}` is not one."""
+    return ("method" not in msg and ("id" in msg or "jsonrpc" in msg)
+            and ("result" in msg or isinstance(msg.get("error"), dict)))
+
+
+def _id_key(mid: Any) -> tuple[type, str]:
+    """A hashable stand-in for a JSON-RPC id that keeps its type: `3` and `"3"` differ."""
+    return type(mid), repr(mid)
+
+
+def _rekey(literal: str, msg: dict[str, Any], mid: Any) -> str | None:
+    """`literal` (a compact JSON-RPC response, `msg` its parse) answering request `mid`:
+    the id's text is spliced in and the rest kept literally, so no number or duplicate
+    key is rewritten the way a json round-trip would. None past `_MAX_LEXICAL_CHARS`,
+    which the walk to find the id is not run on."""
+    new_id = json.dumps(mid, ensure_ascii=False)
+    if "id" not in msg:
+        return '{"id":' + new_id + "," + literal[1:]
+    if len(literal) > _MAX_LEXICAL_CHARS:
+        return None
+    lexed = _lex_container(literal)
+    if lexed is None or "id" not in lexed[1]:   # unreachable for text that parsed
+        return None
+    start, stop = lexed[1]["id"]
+    return literal[:start] + new_id + literal[stop:]
+
+
+def _reply_ids(line: str) -> tuple[list[Any], bool]:
+    """Parse the outgoing `line` once: the ids it expects replies under, and whether it is
+    a single request whose reply may be re-keyed. Only a request, with a `method` AND an
+    `id`, expects one (per element in a batch). A notification does not, and neither does
+    the client's own response to a server-initiated request, whose id is in the SERVER's
+    id space, so a synthesized reply to it could fail an unrelated client request with
+    the same id. A line nested too deep for `json` is read by the same fallback as a
+    body. A line that cannot be read at all (it came from the client through
+    `note_request`/`pump` unchanged, so it shouldn't happen) fails toward one reply under
+    `id: null`, so the error is reported rather than silently dropped."""
+    values = [value for _, value in _iter_messages(line)]
+    if not values:
+        return [None], False
+    ids = [None if v["id"] is _UNMATCHABLE_ID else v["id"] for v in values
+           if isinstance(v, dict) and "method" in v and "id" in v]
+    return ids, len(ids) == 1 and len(values) == 1 and not line.lstrip().startswith("[")
 
 
 class HttpTransport:
@@ -651,9 +870,11 @@ class HttpTransport:
         except urllib.error.HTTPError as exc:
             # A 4xx/5xx status. Per MCP Streamable-HTTP the server MAY still have sent
             # a legitimate JSON-RPC error object in the body (e.g. "missing
-            # Authorization header") — read it and forward it verbatim when it looks
-            # like one, instead of discarding the real detail behind a generic
-            # wrapper message the client can't act on.
+            # Authorization header"). It goes through the same `_deliver` as a 2xx body
+            # (framing, batch/SSE splitting, re-keying a `"id": null` reply to an
+            # expired session), so the real detail reaches the client instead of a
+            # generic wrapper. Only if nothing in it answers the request is the generic
+            # error, quoting the body, synthesized.
             try:
                 # Bounded like the success path: an uncapped 4xx/5xx body was the one
                 # read a hostile server could still use to exhaust memory.
@@ -661,23 +882,10 @@ class HttpTransport:
                     "utf-8", errors="replace")
             except Exception:  # noqa: BLE001 — reading the error body is best-effort
                 raw_body = ""
-            if raw_body.strip():
-                try:
-                    parsed = json.loads(raw_body)
-                except (ValueError, RecursionError):  # JSONDecodeError is a ValueError
-                    parsed = None
-                if isinstance(parsed, dict) and "jsonrpc" in parsed:
-                    # Forward it verbatim ONLY if the outgoing line actually expected a
-                    # reply — a notification (no "id") must never get one, the same
-                    # invariant _maybe_enqueue_error enforces for a non-JSON-RPC-shaped
-                    # error body just below.
-                    has_id, _ = _parse_request_id(line)
-                    if has_id:
-                        self._q.put(raw_body)
-                    return
             detail = raw_body.strip()[:_MAX_ERROR_DETAIL_CHARS] or str(exc)
-            self._maybe_enqueue_error(
-                line, f"terse: downstream HTTP {exc.code} {exc.reason}: {detail}")
+            err_ctype = exc.headers.get("Content-Type", "") if exc.headers else ""
+            self._deliver(line, err_ctype, raw_body,
+                          failure=f"terse: downstream HTTP {exc.code} {exc.reason}: {detail}")
             return
         except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
             # OSError covers a bare connection-refused/timeout that never got far enough
@@ -702,32 +910,71 @@ class HttpTransport:
                       if type(exc) is ValueError else str(exc))
             self._maybe_enqueue_error(line, f"terse: downstream HTTP request failed: {reason}")
             return
-        if "text/event-stream" in ctype:
-            for msg in _iter_sse(body.decode("utf-8", errors="replace")):
-                self._q.put(msg)
-        else:
-            text = body.decode("utf-8", errors="replace")
-            if text.strip():
-                self._q.put(text)
-            # else: a 202 Accepted / empty body is valid Streamable-HTTP and
-            # means nothing to enqueue (e.g. the reply to a notification).
+        self._deliver(line, ctype, body.decode("utf-8", errors="replace"), failure=None)
 
-    def _maybe_enqueue_error(self, line: str, message: str) -> None:
-        """Enqueue a synthesized JSON-RPC error for `line`'s in-flight request —
-        unless `line` is a notification (has no `"id"` key at all), which per
-        JSON-RPC never gets a reply. Enqueuing one anyway would hand the client an
-        unsolicited `id: null` message matching no request it sent, which a strict
-        client could reject or misinterpret as an unmatched response."""
-        has_id, mid = _parse_request_id(line)
-        if not has_id:
+    def _deliver(self, line: str, ctype: str, body: str, failure: str | None) -> None:
+        """Enqueue one downstream body (`failure`: the error-status message, None for a
+        2xx) as newline-free JSON-RPC messages, and make sure `line`'s request is answered.
+
+        The queue feeds a newline-delimited stdio stream, so each message is compacted
+        LEXICALLY (whitespace outside strings removed, literal text kept, so no number or
+        duplicate key is rewritten), and a body carrying several (SSE events, a batch
+        array, newline-delimited values) is split into them. Requests and notifications
+        from the server and responses are forwarded; anything else (an HTML login page, a
+        priming event, a `ping` keepalive) is dropped and never echoed.
+
+        One rule decides what answers the request, whatever the status: a response
+        carrying its id. If none does, the first response (`"id": null` from a server
+        rejecting an expired session, a wrong id, `"3"` for `3`) is re-keyed to the
+        request's id; if there is no response at all, a synthesized error answers it, so
+        the request never hangs. A notification never gets a synthesized reply, nor
+        anything at all for a failed POST, and neither does the client's own response to
+        a server request (see `_reply_ids`). A batch gets one error per unanswered id."""
+        ids, keyed = _reply_ids(line)
+        if failure is not None and not ids:
             return
-        self._q.put(_SynthesizedReply(self._error_reply(mid, message)))
+        sse = "text/event-stream" in ctype
+        messages = [(literal, msg)
+                    for event in (_iter_sse(body) if sse else (body,))
+                    for literal, msg in _iter_messages(event)
+                    if isinstance(msg, dict) and (_is_response(msg) or "method" in msg)]
+        answered = {_id_key(msg["id"]) for _, msg in messages
+                    if _is_response(msg) and "id" in msg}
+        unanswered = [mid for mid in ids if _id_key(mid) not in answered]
+        for literal, msg in messages:
+            if keyed and unanswered and _is_response(msg):
+                spliced = _rekey(literal, msg, unanswered[0])
+                if spliced is not None:
+                    literal, unanswered = spliced, []
+            self._q.put(literal)
+        if not unanswered:
+            return
+        if failure is None:
+            if sse:
+                failure = ("terse: downstream SSE stream carried no JSON-RPC message "
+                           "answering the request")
+            elif not body.strip():
+                failure = "terse: downstream HTTP response was empty (no JSON-RPC message)"
+            else:
+                failure = ("terse: downstream HTTP response is not a JSON-RPC message "
+                           f"answering the request ({len(body)} chars, not shown)")
+        self._maybe_enqueue_error(line, failure, unanswered)
+
+    def _maybe_enqueue_error(self, line: str, message: str,
+                             ids: list[Any] | None = None) -> None:
+        """Enqueue a synthesized JSON-RPC error for each of `line`'s in-flight request
+        ids (`ids`, when the caller already parsed `line` with `_reply_ids`) — none for a
+        notification or the client's own response, which per JSON-RPC never get a reply.
+        Enqueuing one anyway would hand the client an unsolicited message matching no
+        request it sent, which a strict client could reject or misinterpret."""
+        for mid in _reply_ids(line)[0] if ids is None else ids:
+            self._q.put(_SynthesizedReply(self._error_reply(mid, message)))
 
     @staticmethod
     def _error_reply(mid: Any, message: str) -> str:
         """A JSON-RPC 2.0 error object for `mid` (the outgoing line's own request id),
         so the client's matching in-flight call gets a legible failure instead of
-        silence. Callers already resolved `mid` via `_parse_request_id`."""
+        silence. Callers already resolved `mid` via `_reply_ids`."""
         return json.dumps(
             {"jsonrpc": "2.0", "id": mid, "error": {"code": -32000, "message": message}},
             separators=(",", ":"), ensure_ascii=False,
