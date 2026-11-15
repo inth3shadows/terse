@@ -988,6 +988,7 @@ class Router:
         # Peers whose reader hit EOF: a call routed to one is answered at once, since
         # nothing will ever reply to it.
         self._exited_peers: set[int] = set()
+        self._warned_exit: set[int] = set()   # peers whose exit has been logged once
 
         # The fast initialize (#270). A broadcast `initialize` waits on the slowest peer
         # (4.2s on the live fleet, 2026-09-26), and a headless client sends its first
@@ -1455,6 +1456,12 @@ class Router:
         try:
             timer.start()
             self._fan_out(msg, kind, seq, on_done)
+            with self._pending_lock:
+                # Every peer still owed an answer has already exited (or there was no
+                # live one to begin with): merge now instead of waiting out the timer.
+                only_dead = not pb.done and pb.remaining <= self._exited_peers
+            if only_dead:
+                self._finish_broadcast(seq)
         except BaseException:
             # Undo the registration (#511): the caller's catch-all answers -32603, and a
             # broadcast left pending would answer the same id again when its timer fired
@@ -1479,6 +1486,8 @@ class Router:
                  on_done: Callable[[_PendingBroadcast], None] | None) -> None:
         """Send broadcast `seq` to every peer under its broadcast-local ids."""
         for i, peer in enumerate(self.peers):
+            if i in self._exited_peers:
+                continue   # its stdin is gone; `_broadcast` does not wait on it either
             rewritten = dict(msg)
             rewritten["id"] = f"terse-b{seq}-{i}"
             line = json.dumps(rewritten, separators=(",", ":"), ensure_ascii=False)
@@ -1705,7 +1714,10 @@ class Router:
                 return True  # already merged/timed out — a late arrival; swallow, drop
             pb.parts[peer_idx] = msg
             pb.remaining.discard(peer_idx)
-            remaining_empty = not pb.remaining
+            # A peer that has exited will never answer: waiting on it only stalls the
+            # merge to the full timeout. `remaining` itself keeps it, so `_record` still
+            # refuses to snapshot a listing that lacks it.
+            remaining_empty = pb.remaining <= self._exited_peers
         if remaining_empty:
             self._finish_broadcast(seq)
         return True
@@ -1765,10 +1777,29 @@ class Router:
             left = [(key, self._routed_timers.pop(key)) for key in gone]
             if left:
                 self._routed_cv.notify_all()
+            # A broadcast still waiting on this peer would otherwise sit until its full
+            # timeout (30s) — and so would every later ping/listing (#582). Finish any
+            # whose only outstanding peers are now all dead.
+            stalled = [seq for seq, pb in self._pending.items()
+                       if not pb.done and idx in pb.remaining
+                       and pb.remaining <= self._exited_peers]
         for (_, mid), timer in left:
             if timer is not None:
                 timer.cancel()
             self._answer_routed(idx, mid, "exited before answering", origin="peer_exit")
+        if idx not in self._warned_exit:
+            self._warned_exit.add(idx)
+            sys.stderr.write(f"[terse-multiproxy] peer {self.peers[idx].name!r} exited; "
+                             "broadcasts no longer wait on it (its tools, prompts and "
+                             "resources are missing from later listings)\n")
+        for seq in stalled:
+            # One merge failing must not skip the rest (they would fall back to their
+            # full timeout), nor escape into the reader thread's `finally`.
+            try:
+                self._finish_broadcast(seq)
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(f"[terse-multiproxy] finishing a broadcast after peer "
+                                 f"{self.peers[idx].name!r} exited failed: {exc}\n")
 
     def _timeout_broadcast(self, seq: int) -> None:
         with self._pending_lock:
@@ -2346,8 +2377,9 @@ class Router:
                 self._tool_state = (pb.seq, table, silent)
                 self._tool_entries = list(tools)   # COPY — see __init__
                 # Warn only for the reasons nothing else warns about. A `no reply` peer was
-                # already named by `_timeout_broadcast` (a broadcast completes on arrival or
-                # on timeout, so that is the only way to be absent), and `empty` is a peer
+                # already named by `_timeout_broadcast`, or by `peer_exited` when it died
+                # (a broadcast completes on arrival, on timeout, or once every outstanding
+                # peer has exited, so those are the only ways to be absent), and `empty` is a peer
                 # exercising its right to export nothing. Warning inside the seq guard, not
                 # before it, so a listing refused as stale does not report peers that are
                 # missing from a table which was never installed.

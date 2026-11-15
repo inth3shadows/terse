@@ -14,6 +14,17 @@ fails that pull request until the section has moved.
 ## [Unreleased]
 
 ### Fixed
+- In the multiproxy router, a downstream server that exited kept every later `ping`,
+  `tools/list`, `resources/list` and `initialize` waiting the full 30-second broadcast
+  timeout, because the dead peer stayed in each broadcast's set of peers still owed an
+  answer. A broadcast now completes as soon as every outstanding peer has exited,
+  including one already in flight when the peer dies, and no broadcast request is sent
+  to a dead peer. A listing that lacks the dead peer is still never saved to the warm-start
+  snapshot.
+
+## [0.49.2] - 2026-11-14
+
+### Fixed
 - A `{"critical": true}` field could still be lost through an overlapping lossy rule. The
   denylist matched only the exact path string, so a truncate on `items` (`max: 1`) cut away
   `items[].id` from every record past the first, a drop on `a` replaced a critical
