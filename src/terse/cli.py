@@ -1882,7 +1882,7 @@ def _redact_header_payload(flag: str, payload: str) -> str:
 def _is_flag(a: str) -> bool:
     """Whether `a`, met while a secret value is pending, is the next flag rather than the
     value: a `--x`, a header flag, or a secret-shaped `-x` (`--no-auth -token sk-1`).
-    Any other `-x` is the value (`--token -FAKE`, `--password -Hx7Q`): masking a short
+    Any other `-x` is the value (`--token -FAKE`, `--password -HFAKE`): masking a short
     flag by mistake is the safe direction, printing a value that starts with `-` is not."""
     return (a.startswith("--") or a in _HEADER_FLAGS
             or (a.startswith("-") and _is_secret_flag(a.split("=", 1)[0])))

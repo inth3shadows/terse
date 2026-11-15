@@ -2061,7 +2061,7 @@ def test_mcp_status_redacts_a_header_value_containing_spaces(tmp_path, monkeypat
     (["--token", "-FAKE"], ["--token", "***"]),
     (["--no-auth", "-H", "Authorization: Bearer S"], ["--no-auth", "-H", "Authorization: ***"]),
     # B7: the attached `-H` check must not run on a pending secret value.
-    (["--password", "-Hx7Q", "--port", "8080"], ["--password", "***", "--port", "8080"]),
+    (["--password", "-HFAKE", "--port", "8080"], ["--password", "***", "--port", "8080"]),
 ])
 def test_redact_args_review_round_2_shapes(args, want):
     assert _redact_args(args) == want
