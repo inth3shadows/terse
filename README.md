@@ -29,8 +29,8 @@ minified. What the model gets instead costs 181:
   **59.1%** fewer tokens, against −6.5% for TOON and 4.5% for compressmcp on the same
   corpus ([Benchmarks](#benchmarks-terse-vs-alternatives)).
 - **Measured on real sessions, priced at the billed rate.** A replay of the maintainer's
-  own Claude Code sessions: terse saves **23.5% of what the MCP results it handled would
-  have cost**, and 0.77% of the whole bill of the sessions that used it
+  own Claude Code sessions: terse saves **22.6% of what the MCP results it handled would
+  have cost**, and 0.71% of the whole bill of the sessions that used it
   ([What it is worth in real sessions](#what-it-is-worth-in-real-sessions)).
 - **Selective.** It works per tool and passes through anything it can't shrink, so a
   result's body never grows. The one-time format primer (and its typed wrapper, #463) and
@@ -48,23 +48,38 @@ first, cache read after, write again on a cache rebuild, nothing after compactio
 charges every `terse.retrieve` fetch-back to terse. No model calls; it reads the ledger and
 the transcripts already on disk.
 
-Run on 2026-11-04 over transcripts from 2026-07-14 to 2026-11-04: 6,309 not under `/tmp`,
-720 of them with a terse result. Test servers were removed from a copy of the ledger first,
-and transcripts under `/tmp` (the test harness: 16 with a terse result) are left out of the
-summary; see #577. Some scripted `claude -p` probes run elsewhere are still in it (35
-sessions with a terse result); without them the 1-5-call band is +13.1%. The join rate,
-96.4% of the results terse changed, is measured over all transcripts.
+Run on 2026-11-17 over transcripts from 2026-07-12 to 2026-11-17: 7,807 not under `/tmp`, 818
+of them with a terse result. Test servers (the fake `a`/`b`/`c` echo servers, `demo`, `probe`,
+`python*`, and router handshake and test configs) were removed from a copy of the ledger first,
+and transcripts under `/tmp` (the test harness: 14 with a terse result) are left out of the
+summary; see #577. Some scripted `claude -p` probes run elsewhere are still in it (35 sessions
+with a terse result: the transcripts whose `entrypoint` is `sdk-cli`); without them the
+1-5-call band is +10.6%. The join rate, 96.5% of the results terse changed, is measured over
+all transcripts.
 
 | measure | value |
 |---|--:|
-| saved, share of what the joined MCP results would have cost | **23.5%** of 119.0M input-equivalent tokens, after fetch-backs (26.7% before) |
-| share of the whole bill, sessions that used terse | 0.77% (Opus 5.5 0.80%, Sonnet 5 0.98%, Opus 5 0.73%) |
-| share of the whole bill, every real-work session scanned | 0.43% |
-| saving from `secret.list_credentials` + `codegraph_explore`, before fetch-backs | 92% |
-| sessions over 100 calls | +24.1% of their MCP cost |
-| sessions of 1-5 calls | +6.4% (an earlier −15.5% came from the 16 test-harness sessions; [#577](https://github.com/inth3shadows/terse/issues/577)) |
-| fetch-backs of dropped code blocks | 3.8M, about a third of what that rule saved; since `keep_first` and `retract_after` went live (2026-09-26, #252), sessions over 100 calls fetched back once, 2% of the rule's saving there |
-| the model repeated the same call within 3 calls (a possible sign it could not use the result): changed vs unchanged results | 0.1% vs 2.77% |
+| saved, share of what the joined MCP results would have cost | **22.6%** of 128.9M input-equivalent tokens, after fetch-backs (25.6% before) |
+| share of the whole bill, sessions that used terse | 0.71% (Opus 5.5 0.61%, Sonnet 5 0.98%, Opus 5 0.73%) |
+| share of the whole bill, every real-work session scanned | 0.39% |
+| share of the saving before fetch-backs that came from `secret.list_credentials` + `codegraph_explore` | 94% |
+| sessions over 100 calls | +23.2% of their MCP cost |
+| sessions of 1-5 calls | +5.8% (an earlier −15.5% came from the 16 test-harness sessions; [#577](https://github.com/inth3shadows/terse/issues/577)) |
+| fetch-backs of dropped code blocks | 3.9M, about a third of what that rule saved; since `keep_first` and `retract_after` went live (2026-09-26, #252), sessions over 100 calls fetched back 3 times (3 sessions), 2% of the rule's saving there |
+| the model repeated the same call within 3 calls (a possible sign it could not use the result): changed vs unchanged results | 0.09% vs 2.69% |
+
+What changed since the 2026-11-04 run: sessions that started before it reproduce it (23.3% of
+their MCP cost, 0.77% of the bill), so the lower totals come from the sessions since, about
+1,500, roughly 100 of them with a terse result, which save 12-13% of their MCP cost (the range
+is where the 4 November cutoff falls). Three tools account for it. `secret.list_credentials`
+got smaller upstream: its server has returned a brief list by default since 2026-10-07, and
+terse's mean saving per priced result fell from 5,612 tokens (cl100k) before that date to 111
+since 4 November (129 and 24 results). `codegraph_explore` results are the same size as before,
+but terse saved 67% of their cost before 7 October and 34-38% after; that cause is not
+isolated. `kb.read.search` results cost more with terse than without since 7 October (about 200
+tokens per result: -33% of their cost to 4 November, -25% since, against +1.5% before 7
+October; cause not isolated). MCP results through terse were 0.9% of what the newer sessions
+cost, against 1.8% before.
 
 Why it is smaller than 59.1%:
 
@@ -72,7 +87,7 @@ Why it is smaller than 59.1%:
   billed at a tenth of input price (measured 2026-09-22, 1,093 sessions). A removed token is
   mostly one that would have been re-read cheaply.
 - **MCP results are a small share of a session.** The MCP results that went through terse
-  were about 1.8% of what all scanned sessions cost. In the 2026-10-07 shell replay (6,776
+  were about 1.7% of what all scanned sessions cost. In the 2026-10-07 shell replay (6,776
   transcripts), shell output was 16.1% and file reads 7.1% of the whole bill, and no MCP
   proxy sees either.
 - **The client already moves big results out.** Claude Code saves an MCP result over
