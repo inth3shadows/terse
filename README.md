@@ -71,15 +71,18 @@ all transcripts.
 What changed since the 2026-11-04 run: sessions that started before it reproduce it (23.3% of
 their MCP cost, 0.77% of the bill), so the lower totals come from the sessions since, about
 1,500, roughly 100 of them with a terse result, which save 12-13% of their MCP cost (the range
-is where the 4 November cutoff falls). Three tools account for it. `secret.list_credentials`
+is where the 4 November cutoff falls). Two tools changed; how much of the drop each explains,
+against the newer sessions' different mix of tools, is not separated. `secret.list_credentials`
 got smaller upstream: its server has returned a brief list by default since 2026-10-07, and
 terse's mean saving per priced result fell from 5,612 tokens (cl100k) before that date to 111
-since 4 November (129 and 24 results). `codegraph_explore` results are the same size as before,
-but terse saved 67% of their cost before 7 October and 34-38% after; that cause is not
-isolated. `kb.read.search` results cost more with terse than without since 7 October (about 200
-tokens per result: -33% of their cost to 4 November, -25% since, against +1.5% before 7
-October; cause not isolated). MCP results through terse were 0.9% of what the newer sessions
-cost, against 1.8% before.
+since 4 November (129 and 24 results). `kb.read.search` results cost more with terse than
+without since 7 October (about 200 tokens per result: -33% of their cost to 4 November, -25%
+since, against +1.5% before 7 October; cause not isolated). `codegraph_explore` is not a cause:
+since `keep_first` and `retract_after` went live (2026-09-26, #252) terse drops fewer of its
+code blocks, so it saves 34-45% of their cost before fetch-backs where it saved 78%, but
+fetch-backs fell from 54% of that saving to under 4%, and the net saving is about the same (36%
+before, 34-44% since). MCP results through terse were 0.9% of what the newer sessions cost,
+against 1.8% before.
 
 Why it is smaller than 59.1%:
 
