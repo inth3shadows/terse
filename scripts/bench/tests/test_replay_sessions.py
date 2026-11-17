@@ -562,3 +562,79 @@ def test_a_transcript_elsewhere_is_real_work(tmp_path):
     assert not rs.is_harness(root / "-home-ericm-personal-projects-terse" / "a.jsonl", root)
     assert not rs.is_harness(root / "-home-ericm-tmp-notes" / "a.jsonl", root)
     assert not rs.is_harness(tmp_path / "elsewhere" / "a.jsonl", root)
+
+
+# ---------------------------------------------------------------- session primer
+
+PRIMER = rs.PRIMER_HEAD + "- Table {...}: rows.\n" + rs.PRIMER_TAIL
+PAYLOAD = '{"__terse_table__":1,"n":2,"cols":["a"],"rows":[[1],[2]]}'
+
+
+def test_strip_primer_removes_a_leading_text_block():
+    rest, copies = rs.strip_primer(PRIMER + "\n" + PAYLOAD)
+    assert (rest, copies) == (PAYLOAD, 1)
+
+
+def test_strip_primer_unwraps_the_typed_wrapper():
+    wrapped = '{"__terse_primer__":' + json.dumps(PRIMER) + ',"__terse_payload__":' + PAYLOAD + "}"
+    assert rs.strip_primer(wrapped) == (PAYLOAD, 1)
+
+
+def test_strip_primer_counts_a_primer_shown_in_both_places():
+    wrapped = '{"__terse_primer__":' + json.dumps(PRIMER) + ',"__terse_payload__":' + PAYLOAD + "}"
+    assert rs.strip_primer(PRIMER + wrapped) == (PAYLOAD, 2)
+
+
+def test_strip_primer_leaves_a_result_that_only_quotes_the_primer():
+    quoted = "search hit:\n" + PRIMER + "\n" + PAYLOAD
+    assert rs.strip_primer(quoted) == (quoted, 0)
+    assert rs.primer_tokens(quoted) == (0, 0)
+
+
+def test_strip_primer_leaves_a_wrapper_it_cannot_parse():
+    broken = '{"__terse_primer__":"unterminated'
+    assert rs.strip_primer(broken) == (broken, 0)
+
+
+def test_primer_tokens_is_the_shown_size_difference():
+    text = PRIMER + "\n" + PAYLOAD
+    tokens, copies = rs.primer_tokens(text)
+    assert copies == 1
+    assert tokens == rs.shown_tokens(text) - rs.shown_tokens(PAYLOAD) > 0
+
+
+def test_replay_prices_the_primer_inside_the_net_and_reports_its_share(tmp_path):
+    led = rs.load_ledger(ledger_file(tmp_path, [row(100, raw=1000, out=600)]))
+    res = rs.Result("a", "mcp__terse__kb_read_search", 100.5, 2600, 750, False, "{}",
+                    None, 150, 1)
+    events = [("call", call(w1=100)), ("result", res), ("call", call(read=100, w1=900))]
+    item = rs.replay(events, {"a": led[0]})["items"][0]
+    # 1,000 raw - 750 shown = 250 saved, of which the primer cost 150.
+    assert item["weighted"] == pytest.approx(250 * 2.0)
+    assert item["primer_weighted"] == pytest.approx(-150 * 2.0)
+    assert item["primer_tokens"] == 150 and item["primer_shapes"] == 1
+
+
+def test_summarize_reports_the_primer_apart_and_keeps_the_total():
+    base = {"tool": "kb_read_search", "status": "priced", "delta_tokens": 250,
+            "kept_inline_tokens": 0, "carried_calls": 1, "weighted": 500.0, "usd": None,
+            "model": OPUS, "changed": True, "recall_3": False, "shown_tokens": 750,
+            "kept_inline_weighted": 0, "copy": False, "raw_weighted": 2000.0,
+            "primer_tokens": 150, "primer_shapes": 2, "primer_weighted": -300.0}
+    plain = dict(base, primer_tokens=0, primer_shapes=0, primer_weighted=0.0)
+    session = {"calls": 3, "model": OPUS, "session_weighted": 10000.0, "net_weighted": 1000.0,
+               "items": [base, plain]}
+    counts = {"ledger_results": 2, "joined": 2, "size_mismatch": 0, "no_transcript": 0,
+              "groups_split": 0, "changed_results": 2, "changed_joined": 2,
+              "saved_tokens_joined_pct": 100.0, "mismatch_offsets": {}}
+    got = rs.summarize([session], counts, {})
+    assert got["net_weighted"] == 1000.0               # unchanged by the split
+    assert got["primer"] == {"results": 1, "shown_twice": 1, "tokens": 150, "weighted": -300.0,
+                             "share_of_mcp_results_pct": -7.5,
+                             "by_tool": {"kb_read_search": 1}}
+    tool = got["by_tool"]["kb_read_search"]
+    assert tool["weighted"] == 1000.0 and tool["primer_weighted"] == -300.0
+    assert tool["weighted_excl_primer"] == 1300.0
+    text = rs.render(got)
+    assert "session primer: 1 results carried it (1 showed it twice)" in text
+    assert "excl." in text and "32.5%" in text
