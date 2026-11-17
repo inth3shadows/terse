@@ -313,6 +313,9 @@ class Result:
     primer_shapes: int = 0
     # Characters of the shown text that were the primer: `classify` compares sizes without it.
     primer_chars: int = 0
+    # The shown text is terse's typed wrapper, which exists only in `structuredContent`:
+    # the client showed the typed field, whatever the sizes say.
+    shown_wrapper: bool = False
 
 
 def _usage_call(usage: dict, model: str | None) -> Call:
@@ -345,10 +348,12 @@ WRAP_CLOSE = re.compile(r'\s*\}')
 _JSON = json.JSONDecoder()
 
 
-def _unwrap(lead: str) -> tuple[str, str] | None:
-    """(primer, rest) when `lead` opens with the typed wrapper {"__terse_primer__":TEXT,
-    "__terse_payload__":P}, in any JSON spacing; None when it does not, or does not parse.
-    `rest` is P exactly as it was written, followed by anything after the wrapper."""
+def _empty_wrapper_primer(lead: str) -> tuple[str, str] | None:
+    """(primer, lead with the primer emptied) when `lead` opens with the typed wrapper
+    {"__terse_primer__":TEXT,"__terse_payload__":P} in any JSON spacing; None when it does
+    not, or does not parse. Only TEXT is removed: terse records a carrier's typed output
+    with the wrapper and an empty primer (proxy.py, #463), so the skeleton stays with the
+    result and only the primer is the session's."""
     head = PRIMER_WRAP.match(lead)
     if not head:
         return None
@@ -360,40 +365,42 @@ def _unwrap(lead: str) -> tuple[str, str] | None:
         _, stop = _JSON.raw_decode(lead, key.end())
     except json.JSONDecodeError:
         return None
-    close = WRAP_CLOSE.match(lead, stop)
-    if not close:
+    if not WRAP_CLOSE.match(lead, stop):
         return None
-    return primer, lead[key.end():stop] + lead[close.end():]
+    return primer, lead[:head.end()] + '""' + lead[at:]
 
 
 def strip_primer(text: str) -> tuple[str, int]:
     """(text without the session primer, copies removed). The primer rides at the front of
     the result that claims it: as a leading text block (PRIMER_HEAD .. PRIMER_TAIL), as the
-    typed wrapper {"__terse_primer__":TEXT,"__terse_payload__":P} (#463), or both. Only a
-    leading primer is removed, so a result that merely quotes the primer text (a search over
-    terse's own source) keeps it. A wrapper whose shape does not parse is left alone, and so
-    is one whose primer is empty: it explains nothing, so it is not counted as a primer."""
+    primer string inside the typed wrapper {"__terse_primer__":TEXT,"__terse_payload__":P}
+    (#463), or both. Only a leading primer is removed, so a result that merely quotes the
+    primer text (a search over terse's own source) keeps it. From a wrapper only TEXT is
+    removed, the way terse's own ledger records it; a wrapper that does not parse, or whose
+    primer is already empty, is left alone. Leading whitespace is kept."""
+    body = text.lstrip()
+    lead_ws = text[:len(text) - len(body)]
     copies = 0
-    lead = text.lstrip()
-    if lead.startswith(PRIMER_HEAD):
-        end = lead.find(PRIMER_TAIL)
+    if body.startswith(PRIMER_HEAD):
+        end = body.find(PRIMER_TAIL)
         if end >= 0:
-            lead = lead[end + len(PRIMER_TAIL):].lstrip()
+            body = body[end + len(PRIMER_TAIL):].lstrip()
             copies += 1
-    unwrapped = _unwrap(lead)
-    if unwrapped and unwrapped[0]:
-        lead = unwrapped[1]
+    emptied = _empty_wrapper_primer(body)
+    if emptied and emptied[0]:
+        body = emptied[1]
         copies += 1
-    return (lead, copies) if copies else (text, 0)
+    return (lead_ws + body, copies) if copies else (text, 0)
 
 
-def primer_tokens(text: str) -> tuple[int, int]:
-    """(cl100k tokens the session primer added to this shown result, copies). The whole
-    difference is charged: the primer text and the wrapper around the payload."""
+def primer_tokens(text: str, tokens: int | None = None) -> tuple[int, int, int]:
+    """(cl100k tokens, copies, characters) the session primer added to this shown result.
+    `tokens` is the whole text's count when the caller already has it."""
     rest, copies = strip_primer(text)
     if not copies:
-        return 0, 0
-    return max(0, (shown_tokens(text) or 0) - (shown_tokens(rest) or 0)), copies
+        return 0, 0, 0
+    whole = tokens if tokens is not None else shown_tokens(text)
+    return max(0, (whole or 0) - (shown_tokens(rest) or 0)), copies, len(text) - len(rest)
 
 
 def is_offload_notice(text: str) -> bool:
@@ -474,14 +481,13 @@ def scan_transcript(path: Path, billed_elsewhere: set[tuple] | None = None,
                         continue
                     text = _result_text(block.get("content"))
                     tokens = shown_tokens(text)
-                    rest, p_copies = strip_primer(text)
-                    p_tok = (max(0, (tokens or 0) - (shown_tokens(rest) or 0))
-                             if p_copies else 0)
+                    p_tok, p_copies, p_chars = primer_tokens(text, tokens)
                     events.append(("result", Result(
                         block["tool_use_id"], use[0], parse_ts(rec["timestamp"]),
                         len(text), tokens,
                         is_offload_notice(text), use[1], text if keep_text else None,
-                        p_tok, p_copies, len(text) - len(rest) if p_copies else 0)))
+                        p_tok, p_copies, p_chars,
+                        bool(PRIMER_WRAP.match(strip_primer(text)[0].lstrip())))))
     return events
 
 
@@ -671,8 +677,9 @@ def classify(res: Result, led: LedgerResult) -> tuple[str, int, int]:
     # side, so a tie read as text overstated the saving.
     # Compare without the primer: terse's recorded sizes never include it (#594 review).
     shown = res.chars - res.primer_chars
-    typed = (led.typed_out_chars > 0
-             and abs(shown - led.typed_out_chars) <= abs(shown - led.text_out_chars))
+    typed = led.typed_out_chars > 0 and (
+        res.shown_wrapper
+        or abs(shown - led.typed_out_chars) <= abs(shown - led.text_out_chars))
     raw_tokens, raw_chars = led.raw_side(typed)
     raw_offloads = raw_tokens > OFFLOAD_TOKENS or raw_chars > OFFLOAD_CHARS
     if res.offloaded:
@@ -752,7 +759,9 @@ def replay(events: list[tuple], joined: dict[str, LedgerResult],
         weighted = delta * scale * per_w
         usd = None if per_usd is None else delta * scale * per_usd
         # The primer's share of `weighted`, as a cost (<= 0). Already inside `weighted`.
-        primer_weighted = -res.primer_tokens * scale * per_w if status == "priced" else 0.0
+        # A retrieve's weight is its whole shown size, so a primer on it is priced too.
+        primer_weighted = (-res.primer_tokens * scale * per_w
+                           if status in ("priced", "retrieve") else 0.0)
         # What this result would have cost in context with terse off: the denominator
         # for "share of what an MCP result costs". Nothing for a result the raw path
         # would have saved to a file, and nothing for a retrieve, which it never makes.
@@ -953,7 +962,7 @@ def primer_summary(items: list[dict], mcp_raw: float) -> dict:
     # table's `weighted` does (a copied result is counted where it was first billed).
     return {
         "results": len(carried),
-        "unpriced_results": sum(1 for it in carried if it["status"] != "priced"),
+        "unpriced_results": sum(1 for it in carried if it["status"] not in ("priced", "retrieve")),
         "shown_twice": sum(1 for it in carried if it.get("primer_shapes", 0) >= 2),
         "tokens": sum(it["primer_tokens"] for it in carried),
         "weighted": round(weighted, 1),
@@ -994,7 +1003,7 @@ def render(summary: dict) -> str:
     lines.append(f"pessimistic bound for results kept inline: "
                  f"-{summary['kept_inline_pessimistic_weighted']:,.0f}")
     pr = summary.get("primer")
-    if pr and pr["results"]:
+    if pr and (pr["results"] or pr["weighted"]):
         share = ("-" if pr["share_of_mcp_results_pct"] is None
                  else f"{pr['share_of_mcp_results_pct']}%")
         lines.append(f"session primer: {pr['results']} results carried it ({pr['unpriced_results']} "

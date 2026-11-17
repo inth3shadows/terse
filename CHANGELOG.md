@@ -19,6 +19,9 @@ fails that pull request until the section has moved.
   without the primer it happened to carry. The primer is paid once per session by whichever
   result carries it, so charging it to that result's tool made `kb.read.search` look like a
   net cost (#593). Totals are unchanged.
+- `scripts/bench/replay_sessions.py` reads a result shown as terse's typed wrapper as the typed
+  field, and finds the wrapper in any JSON spacing. On the 2026-11-17 data no result's price
+  changes; the sizes alone had been within a few characters of a tie for some carriers.
 
 ## [0.50.3] - 2026-11-15
 

@@ -2,6 +2,7 @@
 the offload rules, and the per-call carry pricing."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -575,20 +576,24 @@ def test_strip_primer_removes_a_leading_text_block():
     assert (rest, copies) == (PAYLOAD, 1)
 
 
-def test_strip_primer_unwraps_the_typed_wrapper():
+EMPTIED = '{"__terse_primer__":"","__terse_payload__":' + PAYLOAD + "}"
+
+
+def test_strip_primer_empties_the_typed_wrappers_primer_and_keeps_the_wrapper():
+    # The skeleton stays: terse records a carrier's typed output with it (round 3, F1).
     wrapped = '{"__terse_primer__":' + json.dumps(PRIMER) + ',"__terse_payload__":' + PAYLOAD + "}"
-    assert rs.strip_primer(wrapped) == (PAYLOAD, 1)
+    assert rs.strip_primer(wrapped) == (EMPTIED, 1)
 
 
 def test_strip_primer_counts_a_primer_shown_in_both_places():
     wrapped = '{"__terse_primer__":' + json.dumps(PRIMER) + ',"__terse_payload__":' + PAYLOAD + "}"
-    assert rs.strip_primer(PRIMER + wrapped) == (PAYLOAD, 2)
+    assert rs.strip_primer(PRIMER + wrapped) == (EMPTIED, 2)
 
 
 def test_strip_primer_leaves_a_result_that_only_quotes_the_primer():
     quoted = "search hit:\n" + PRIMER + "\n" + PAYLOAD
     assert rs.strip_primer(quoted) == (quoted, 0)
-    assert rs.primer_tokens(quoted) == (0, 0)
+    assert rs.primer_tokens(quoted) == (0, 0, 0)
 
 
 def test_strip_primer_leaves_a_wrapper_it_cannot_parse():
@@ -598,8 +603,8 @@ def test_strip_primer_leaves_a_wrapper_it_cannot_parse():
 
 def test_primer_tokens_is_the_shown_size_difference():
     text = PRIMER + "\n" + PAYLOAD
-    tokens, copies = rs.primer_tokens(text)
-    assert copies == 1
+    tokens, copies, chars = rs.primer_tokens(text)
+    assert copies == 1 and chars == len(text) - len(PAYLOAD)
     assert tokens == rs.shown_tokens(text) - rs.shown_tokens(PAYLOAD) > 0
 
 
@@ -661,7 +666,8 @@ def test_strip_primer_reads_a_wrapper_written_with_spaces():
     obj = {"__terse_primer__": PRIMER, "__terse_payload__": {"a": [1, 2]}}
     for text in (json.dumps(obj), json.dumps(obj, indent=2)):
         rest, copies = rs.strip_primer(text)
-        assert copies == 1 and json.loads(rest) == {"a": [1, 2]}
+        assert copies == 1
+        assert json.loads(rest) == {"__terse_primer__": "", "__terse_payload__": {"a": [1, 2]}}
 
 
 def test_replay_reports_a_primer_on_a_result_it_does_not_price(tmp_path):
@@ -695,3 +701,54 @@ def test_render_omits_the_primer_line_with_no_carrier_and_never_prints_none():
     got["primer"] = dict(got["primer"], results=1, tokens=600, share_of_mcp_results_pct=None)
     line = [ln for ln in rs.render(got).splitlines() if ln.startswith("session primer")][0]
     assert "None" not in line and "= - of MCP cost" in line
+
+
+def test_a_wrapper_carrier_read_from_a_transcript_is_priced_on_the_typed_side(tmp_path):
+    # Round 3 (F1): terse records a wrapper carrier's typed output WITH the wrapper skeleton
+    # and an empty primer (proxy.py, #463), so only the primer string may be set aside.
+    payload = {"result": {"__terse_table__": 1, "n": 2, "cols": ["a"], "rows": [[1], [2]]}}
+    shown = json.dumps({"__terse_primer__": PRIMER, "__terse_payload__": payload},
+                       separators=(",", ":"), ensure_ascii=False)
+    recorded = json.dumps({"__terse_primer__": "", "__terse_payload__": payload},
+                          separators=(",", ":"), ensure_ascii=False)
+    use = {"type": "tool_use", "id": "tu1", "name": "mcp__terse__kb_read_search", "input": {}}
+    path = _records(tmp_path / "s.jsonl", [
+        {"type": "assistant", "requestId": "r1", "timestamp": "2026-10-01T00:00:00Z",
+         "message": {"id": "m", "model": OPUS, "content": [use],
+                     "usage": {"input_tokens": 1, "output_tokens": 1}}},
+        {"type": "user", "timestamp": "2026-10-01T00:00:01Z", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "tu1", "content": shown}]}},
+    ])
+    res = rs.scan_transcript(path)[1][1]
+    assert res.primer_chars == len(json.dumps(PRIMER, ensure_ascii=False)) - 2
+    assert res.chars - res.primer_chars == len(recorded)
+    # Text blocks recorded far nearer the shown size than the typed field, as on live data.
+    led = rs.load_ledger(ledger_file(tmp_path, [row(
+        100, raw=3000, out=900, raw_chars=12000, out_chars=len(recorded) + 1500,
+        structured_chars=8000, structured_out_chars=len(recorded),
+        structured_tokens=2000, structured_out_tokens=300)]))[0]
+    status, delta, _ = rs.classify(res, led)
+    assert status == "priced" and delta == 2000 - res.tokens   # typed raw: 2,000 tokens
+
+
+def test_strip_primer_keeps_leading_whitespace_out_of_the_primer():
+    rest, copies = rs.strip_primer("\n  " + PRIMER + "\n" + PAYLOAD)
+    assert copies == 1 and rest == "\n  " + PAYLOAD
+
+
+def test_an_already_empty_wrapper_primer_is_not_a_primer():
+    assert rs.strip_primer(EMPTIED) == (EMPTIED, 0)
+    assert rs.strip_primer(PRIMER + EMPTIED) == (EMPTIED, 1)
+
+
+def test_a_shown_wrapper_is_read_as_the_typed_field_even_when_text_is_nearer(tmp_path):
+    # Round 3: a wrapper exists only in structuredContent, so the typed side is certain;
+    # on live data the two recorded sizes can sit 11 chars apart in 40,000.
+    led = rs.load_ledger(ledger_file(tmp_path, [row(
+        100, raw=3000, out=1200, raw_chars=12000, out_chars=4000,
+        structured_chars=8000, structured_out_chars=2100,
+        structured_tokens=2000, structured_out_tokens=500)]))[0]
+    res = rs.Result("t1", "mcp__terse__kb_read_search", 100.5, 1905, 480, False, "{}",
+                    shown_wrapper=True)
+    assert rs.classify(res, led) == ("priced", 2000 - 480, 0)
+    assert rs.classify(dataclasses.replace(res, shown_wrapper=False), led)[1] == 1000 - 480
