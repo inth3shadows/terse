@@ -629,12 +629,69 @@ def test_summarize_reports_the_primer_apart_and_keeps_the_total():
               "saved_tokens_joined_pct": 100.0, "mismatch_offsets": {}}
     got = rs.summarize([session], counts, {})
     assert got["net_weighted"] == 1000.0               # unchanged by the split
-    assert got["primer"] == {"results": 1, "shown_twice": 1, "tokens": 150, "weighted": -300.0,
+    assert got["primer"] == {"results": 1, "unpriced_results": 0, "shown_twice": 1,
+                             "tokens": 150, "weighted": -300.0,
                              "share_of_mcp_results_pct": -7.5,
                              "by_tool": {"kb_read_search": 1}}
     tool = got["by_tool"]["kb_read_search"]
     assert tool["weighted"] == 1000.0 and tool["primer_weighted"] == -300.0
     assert tool["weighted_excl_primer"] == 1300.0
     text = rs.render(got)
-    assert "session primer: 1 results carried it (1 showed it twice)" in text
+    assert "session primer: 1 results carried it (0 of them not priced, 1 showed it twice)" in text
     assert "excl." in text and "32.5%" in text
+
+
+# ---------------------------------------------------------------- review round 1 (#594)
+
+def test_classify_ignores_the_primer_when_choosing_typed_or_text(tmp_path):
+    # F1: a typed-wrapper carrier. Typed out 1,000 chars, text out 2,000; the shown size is
+    # the typed field plus a 2,240-char primer. Read raw, 3,240 sits nearer the text side.
+    led = rs.load_ledger(ledger_file(tmp_path, [row(
+        100, raw=3000, out=1250, raw_chars=12000, out_chars=3000,
+        structured_chars=8000, structured_out_chars=1000,
+        structured_tokens=2000, structured_out_tokens=250)]))[0]
+    res = rs.Result("t1", "mcp__terse__kb_read_search", 100.5, 3240, 810, False, "{}",
+                    None, 560, 1, 2240)
+    # Typed raw is 2,000 tokens: 2,000 - 810 shown.
+    assert rs.classify(res, led) == ("priced", 1190, 0)
+
+
+def test_strip_primer_reads_a_wrapper_written_with_spaces():
+    # F2: the wrapper with json.dumps' default separators, and pretty-printed.
+    obj = {"__terse_primer__": PRIMER, "__terse_payload__": {"a": [1, 2]}}
+    for text in (json.dumps(obj), json.dumps(obj, indent=2)):
+        rest, copies = rs.strip_primer(text)
+        assert copies == 1 and json.loads(rest) == {"a": [1, 2]}
+
+
+def test_replay_reports_a_primer_on_a_result_it_does_not_price(tmp_path):
+    # F3: the primer rode a result terse kept inline (raw would have gone to a file). It is
+    # not priced, but the session still paid for a primer and the line must say so.
+    led = rs.load_ledger(ledger_file(tmp_path, [row(100, raw=40000, out=9000)]))
+    res = rs.Result("a", "mcp__terse__kb_read_search", 100.5, 38000, 9600, False, "{}",
+                    None, 600, 1, 2300)
+    events = [("call", call(w1=100)), ("result", res), ("call", call(read=100, w1=9700))]
+    item = rs.replay(events, {"a": led[0]})["items"][0]
+    assert item["status"] == "kept_inline"
+    assert item["primer_tokens"] == 600 and item["primer_weighted"] == 0
+    session = {"calls": 2, "model": OPUS, "session_weighted": 1000.0, "net_weighted": 0.0,
+               "items": [item]}
+    counts = {"ledger_results": 1, "joined": 1, "size_mismatch": 0, "no_transcript": 0,
+              "groups_split": 0, "changed_results": 1, "changed_joined": 1,
+              "saved_tokens_joined_pct": 100.0, "mismatch_offsets": {}}
+    pr = rs.summarize([session], counts, {})["primer"]
+    assert pr["results"] == 1 and pr["unpriced_results"] == 1 and pr["tokens"] == 600
+
+
+def test_render_omits_the_primer_line_with_no_carrier_and_never_prints_none():
+    # F4.
+    counts = {"ledger_results": 0, "joined": 0, "size_mismatch": 0, "no_transcript": 0,
+              "groups_split": 0, "changed_results": 0, "changed_joined": 0,
+              "saved_tokens_joined_pct": None, "mismatch_offsets": {}}
+    text = rs.render(rs.summarize([], counts, {}))
+    assert "session primer" not in text
+    # A carrier but no priced MCP cost to share against: the share prints as "-".
+    got = rs.summarize([], counts, {})
+    got["primer"] = dict(got["primer"], results=1, tokens=600, share_of_mcp_results_pct=None)
+    line = [ln for ln in rs.render(got).splitlines() if ln.startswith("session primer")][0]
+    assert "None" not in line and "= - of MCP cost" in line

@@ -29,8 +29,8 @@ minified. What the model gets instead costs 181:
   **59.1%** fewer tokens, against −6.5% for TOON and 4.5% for compressmcp on the same
   corpus ([Benchmarks](#benchmarks-terse-vs-alternatives)).
 - **Measured on real sessions, priced at the billed rate.** A replay of the maintainer's
-  own Claude Code sessions: terse saves **22.6% of what the MCP results it handled would
-  have cost**, and 0.71% of the whole bill of the sessions that used it
+  own Claude Code sessions: terse saves **22.7% of what the MCP results it handled would
+  have cost**, and 0.72% of the whole bill of the sessions that used it
   ([What it is worth in real sessions](#what-it-is-worth-in-real-sessions)).
 - **Selective.** It works per tool and passes through anything it can't shrink, so a
   result's body never grows. The one-time format primer (and its typed wrapper, #463) and
@@ -48,30 +48,30 @@ first, cache read after, write again on a cache rebuild, nothing after compactio
 charges every `terse.retrieve` fetch-back to terse. No model calls; it reads the ledger and
 the transcripts already on disk.
 
-Run on 2026-11-17 over transcripts from 2026-07-12 to 2026-11-17: 7,807 not under `/tmp`, 818
+Run on 2026-11-17 over transcripts from 2026-07-12 to 2026-11-17: 7,817 not under `/tmp`, 818
 of them with a terse result. Test servers (the fake `a`/`b`/`c` echo servers, `demo`, `probe`,
 `python*`, and router handshake and test configs) were removed from a copy of the ledger first,
 and transcripts under `/tmp` (the test harness: 14 with a terse result) are left out of the
 summary; see #577. Some scripted `claude -p` probes run elsewhere are still in it (35 sessions
 with a terse result: the transcripts whose `entrypoint` is `sdk-cli`); without them the
-1-5-call band is +10.6%. The join rate, 96.5% of the results terse changed, is measured over
+1-5-call band is +11.1%. The join rate, 96.5% of the results terse changed, is measured over
 all transcripts.
 
 | measure | value |
 |---|--:|
-| saved, share of what the joined MCP results would have cost | **22.6%** of 128.9M input-equivalent tokens, after fetch-backs (25.6% before) |
-| share of the whole bill, sessions that used terse | 0.71% (Opus 5.5 0.61%, Sonnet 5 0.98%, Opus 5 0.73%) |
+| saved, share of what the joined MCP results would have cost | **22.7%** of 129.3M input-equivalent tokens, after fetch-backs (25.7% before) |
+| share of the whole bill, sessions that used terse | 0.72% (Opus 5.5 0.62%, Sonnet 5 0.98%, Opus 5 0.73%) |
 | share of the whole bill, every real-work session scanned | 0.39% |
-| share of the saving before fetch-backs that came from `secret.list_credentials` + `codegraph_explore` | 94% |
-| sessions over 100 calls | +23.2% of their MCP cost |
-| sessions of 1-5 calls | +5.8% (an earlier −15.5% came from the 16 test-harness sessions; [#577](https://github.com/inth3shadows/terse/issues/577)) |
+| share of the saving before fetch-backs that came from `secret.list_credentials` + `codegraph_explore` | 93% |
+| sessions over 100 calls | +23.3% of their MCP cost |
+| sessions of 1-5 calls | +6.1% (an earlier −15.5% came from the 16 test-harness sessions; [#577](https://github.com/inth3shadows/terse/issues/577)) |
 | fetch-backs of dropped code blocks | 3.9M, about a third of what that rule saved; since `keep_first` and `retract_after` went live (2026-09-26, #252), sessions over 100 calls fetched back 3 times (3 sessions), 2% of the rule's saving there |
 | the model repeated the same call within 3 calls (a possible sign it could not use the result): changed vs unchanged results | 0.09% vs 2.69% |
-| the session format primer, reported apart from the tool that carried it | -1.65% of MCP cost: 218 results, 124,835 tokens (inside the 22.6%) |
+| the session format primer, reported apart from the tool that carried it | -1.65% of MCP cost: 219 results, 125,378 tokens (inside the 22.7%) |
 
-What changed since the 2026-11-04 run: sessions that started before it reproduce it (23.3% of
+What changed since the 2026-11-04 run: sessions that started before it reproduce it (23.4% of
 their MCP cost, 0.77% of the bill), so the lower totals come from the sessions since, about
-1,500, roughly 100 of them with a terse result, which save 12-13% of their MCP cost (the range
+1,500, roughly 100 of them with a terse result, which save 13-14% of their MCP cost (the range
 is where the 4 November cutoff falls). One tool's results got smaller, and the session primer
 moved onto another; how much of the drop each explains, against the newer sessions' different
 mix of tools, is not separated. `secret.list_credentials` got smaller upstream: its server has
@@ -79,9 +79,9 @@ returned a brief list by default since 2026-10-07, and terse's mean saving per p
 fell from 5,612 tokens (cl100k) before that date to 111 since 4 November (129 and 24 results).
 `kb.read.search` did not get worse: it now carries the session primer more often than any other
 tool, since terse stopped attaching the primer to results Claude Code saves to a file (#495,
-#497, 2026-10-06), and 116 of the 218 primers in the replay rode on it. With the primer counted
-against it, `kb.read.search` comes out at -5.4% of its cost; on its own results, terse saves
-4.9% (#593). `codegraph_explore` is not a cause: since `keep_first` and `retract_after` went
+#497, 2026-10-06), and 116 of the 219 primers in the replay rode on it. With the primer counted
+against it, `kb.read.search` comes out at -3.4% of its cost; on its own results, terse saves
+6.8% (#593). `codegraph_explore` is not a cause: since `keep_first` and `retract_after` went
 live (2026-09-26, #252) terse drops fewer of its code blocks, so it saves 34-45% of their cost
 before fetch-backs where it saved 78%, but fetch-backs fell from 54% of that saving to under
 4%, and the net saving is about the same (36% before, 34-44% since). MCP results through terse

@@ -311,6 +311,8 @@ class Result:
     # block and the typed wrapper (#463).
     primer_tokens: int = 0
     primer_shapes: int = 0
+    # Characters of the shown text that were the primer: `classify` compares sizes without it.
+    primer_chars: int = 0
 
 
 def _usage_call(usage: dict, model: str | None) -> Call:
@@ -337,9 +339,31 @@ def shown_tokens(text: str) -> int | None:
         return len(tokenize._enc(tokenize.CL100K).encode(text, disallowed_special=()))
 
 
-PRIMER_WRAP = '{"__terse_primer__":'
-PRIMER_PAYLOAD_KEY = ',"__terse_payload__":'
+PRIMER_WRAP = re.compile(r'\{\s*"__terse_primer__"\s*:\s*')
+PRIMER_PAYLOAD_KEY = re.compile(r'\s*,\s*"__terse_payload__"\s*:\s*')
+WRAP_CLOSE = re.compile(r'\s*\}')
 _JSON = json.JSONDecoder()
+
+
+def _unwrap(lead: str) -> tuple[str, str] | None:
+    """(primer, rest) when `lead` opens with the typed wrapper {"__terse_primer__":TEXT,
+    "__terse_payload__":P}, in any JSON spacing; None when it does not, or does not parse.
+    `rest` is P exactly as it was written, followed by anything after the wrapper."""
+    head = PRIMER_WRAP.match(lead)
+    if not head:
+        return None
+    try:
+        primer, at = _JSON.raw_decode(lead, head.end())
+        key = PRIMER_PAYLOAD_KEY.match(lead, at)
+        if not isinstance(primer, str) or not key:
+            return None
+        _, stop = _JSON.raw_decode(lead, key.end())
+    except json.JSONDecodeError:
+        return None
+    close = WRAP_CLOSE.match(lead, stop)
+    if not close:
+        return None
+    return primer, lead[key.end():stop] + lead[close.end():]
 
 
 def strip_primer(text: str) -> tuple[str, int]:
@@ -347,7 +371,8 @@ def strip_primer(text: str) -> tuple[str, int]:
     the result that claims it: as a leading text block (PRIMER_HEAD .. PRIMER_TAIL), as the
     typed wrapper {"__terse_primer__":TEXT,"__terse_payload__":P} (#463), or both. Only a
     leading primer is removed, so a result that merely quotes the primer text (a search over
-    terse's own source) keeps it. A wrapper whose shape does not parse is left alone."""
+    terse's own source) keeps it. A wrapper whose shape does not parse is left alone, and so
+    is one whose primer is empty: it explains nothing, so it is not counted as a primer."""
     copies = 0
     lead = text.lstrip()
     if lead.startswith(PRIMER_HEAD):
@@ -355,17 +380,10 @@ def strip_primer(text: str) -> tuple[str, int]:
         if end >= 0:
             lead = lead[end + len(PRIMER_TAIL):].lstrip()
             copies += 1
-    if lead.startswith(PRIMER_WRAP):
-        try:
-            primer, at = _JSON.raw_decode(lead, len(PRIMER_WRAP))
-            if isinstance(primer, str) and lead.startswith(PRIMER_PAYLOAD_KEY, at):
-                start = at + len(PRIMER_PAYLOAD_KEY)
-                _, stop = _JSON.raw_decode(lead, start)
-                if lead.startswith("}", stop):
-                    lead = lead[start:stop] + lead[stop + 1:]
-                    copies += 1 if primer else 0
-        except json.JSONDecodeError:
-            pass
+    unwrapped = _unwrap(lead)
+    if unwrapped and unwrapped[0]:
+        lead = unwrapped[1]
+        copies += 1
     return (lead, copies) if copies else (text, 0)
 
 
@@ -455,12 +473,15 @@ def scan_transcript(path: Path, billed_elsewhere: set[tuple] | None = None,
                     if use is None or not rec.get("timestamp"):
                         continue
                     text = _result_text(block.get("content"))
-                    p_tok, p_copies = primer_tokens(text)
+                    tokens = shown_tokens(text)
+                    rest, p_copies = strip_primer(text)
+                    p_tok = (max(0, (tokens or 0) - (shown_tokens(rest) or 0))
+                             if p_copies else 0)
                     events.append(("result", Result(
                         block["tool_use_id"], use[0], parse_ts(rec["timestamp"]),
-                        len(text), shown_tokens(text),
+                        len(text), tokens,
                         is_offload_notice(text), use[1], text if keep_text else None,
-                        p_tok, p_copies)))
+                        p_tok, p_copies, len(text) - len(rest) if p_copies else 0)))
     return events
 
 
@@ -648,8 +669,10 @@ def classify(res: Result, led: LedgerResult) -> tuple[str, int, int]:
     # result has one (untouched `secret.list_credentials` results in the transcripts are
     # `structured_chars` long to the character), and the raw text blocks are the larger
     # side, so a tie read as text overstated the saving.
+    # Compare without the primer: terse's recorded sizes never include it (#594 review).
+    shown = res.chars - res.primer_chars
     typed = (led.typed_out_chars > 0
-             and abs(res.chars - led.typed_out_chars) <= abs(res.chars - led.text_out_chars))
+             and abs(shown - led.typed_out_chars) <= abs(shown - led.text_out_chars))
     raw_tokens, raw_chars = led.raw_side(typed)
     raw_offloads = raw_tokens > OFFLOAD_TOKENS or raw_chars > OFFLOAD_CHARS
     if res.offloaded:
@@ -757,8 +780,10 @@ def replay(events: list[tuple], joined: dict[str, LedgerResult],
             "copy": start < len(calls) and not calls[start].billed,
             "kept_inline_weighted": round(inline * scale * per_w, 2),
             "raw_weighted": round(raw_weighted, 2),
-            "primer_tokens": res.primer_tokens if status == "priced" else 0,
-            "primer_shapes": res.primer_shapes if status == "priced" else 0,
+            # Recorded on every status: the session paid for the primer wherever it rode.
+            # Only a priced result has a weight to share it with (`primer_weighted`).
+            "primer_tokens": res.primer_tokens,
+            "primer_shapes": res.primer_shapes,
             "primer_weighted": round(primer_weighted, 2),
         })
         net_weighted += weighted
@@ -924,8 +949,11 @@ def summarize(sessions: list[dict], join_counts: dict,
 def primer_summary(items: list[dict], mcp_raw: float) -> dict:
     carried = [it for it in items if it.get("primer_tokens") and not it["copy"]]
     weighted = sum(it.get("primer_weighted", 0.0) for it in items)
+    # Counts are of results, without copies; `weighted` includes copies' carry, as every
+    # table's `weighted` does (a copied result is counted where it was first billed).
     return {
         "results": len(carried),
+        "unpriced_results": sum(1 for it in carried if it["status"] != "priced"),
         "shown_twice": sum(1 for it in carried if it.get("primer_shapes", 0) >= 2),
         "tokens": sum(it["primer_tokens"] for it in carried),
         "weighted": round(weighted, 1),
@@ -966,11 +994,14 @@ def render(summary: dict) -> str:
     lines.append(f"pessimistic bound for results kept inline: "
                  f"-{summary['kept_inline_pessimistic_weighted']:,.0f}")
     pr = summary.get("primer")
-    if pr:
-        lines.append(f"session primer: {pr['results']} results carried it ({pr['shown_twice']} "
-                     f"showed it twice), {pr['tokens']:,} tokens, {pr['weighted']:,.0f} weighted "
-                     f"= {pr['share_of_mcp_results_pct']}% of MCP cost; inside the net above, "
-                     f"left out of the 'excl.' column below. Carried by: {pr['by_tool']}")
+    if pr and pr["results"]:
+        share = ("-" if pr["share_of_mcp_results_pct"] is None
+                 else f"{pr['share_of_mcp_results_pct']}%")
+        lines.append(f"session primer: {pr['results']} results carried it ({pr['unpriced_results']} "
+                     f"of them not priced, {pr['shown_twice']} showed it twice), "
+                     f"{pr['tokens']:,} tokens, {pr['weighted']:,.0f} weighted = {share} of MCP "
+                     f"cost; inside the net above, left out of the 'excl.' column below. "
+                     f"Carried by: {pr['by_tool']}")
 
     def table(title, rows, order=None):
         lines.append("")
