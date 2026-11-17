@@ -790,7 +790,8 @@ def replay(events: list[tuple], joined: dict[str, LedgerResult],
             "kept_inline_weighted": round(inline * scale * per_w, 2),
             "raw_weighted": round(raw_weighted, 2),
             # Recorded on every status: the session paid for the primer wherever it rode.
-            # Only a priced result has a weight to share it with (`primer_weighted`).
+            # Only a priced result or a retrieve has a weight to share it with
+            # (`primer_weighted`); the other statuses carry no delta.
             "primer_tokens": res.primer_tokens,
             "primer_shapes": res.primer_shapes,
             "primer_weighted": round(primer_weighted, 2),

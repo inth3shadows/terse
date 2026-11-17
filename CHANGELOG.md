@@ -22,6 +22,8 @@ fails that pull request until the section has moved.
 - `scripts/bench/replay_sessions.py` reads a result shown as terse's typed wrapper as the typed
   field, and finds the wrapper in any JSON spacing. On the 2026-11-17 data no result's price
   changes; the sizes alone had been within a few characters of a tie for some carriers.
+  The primer's own size counts only the primer string, not the wrapper around the payload,
+  which terse records as part of the result.
 
 ## [0.50.3] - 2026-11-15
 

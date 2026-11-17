@@ -752,3 +752,26 @@ def test_a_shown_wrapper_is_read_as_the_typed_field_even_when_text_is_nearer(tmp
                     shown_wrapper=True)
     assert rs.classify(res, led) == ("priced", 2000 - 480, 0)
     assert rs.classify(dataclasses.replace(res, shown_wrapper=False), led)[1] == 1000 - 480
+
+
+def test_a_primer_on_a_retrieve_is_priced_apart_and_not_counted_as_unpriced():
+    # V1: a retrieve's weight is its whole shown size, primer included.
+    res = rs.Result("r", "mcp__terse__terse_retrieve", 100.5, 4000, 1000, False, "{}",
+                    None, 300, 1, 1100)
+    events = [("call", call(read=20000, w1=500)), ("result", res),
+              ("call", call(read=20500, w1=1100))]
+    item = rs.replay(events, {})["items"][0]
+    assert item["status"] == "retrieve"
+    assert item["primer_weighted"] == pytest.approx(-300 * 2.0)
+    assert rs.primer_summary([item], 1000.0)["unpriced_results"] == 0
+
+
+def test_the_primer_line_shows_when_only_copied_history_carried_it():
+    # V2: no first-billed carrier, but copies' carry still holds primer weight, and the
+    # 'excl.' column differs from 'saved'; the line that explains it must print.
+    counts = {"ledger_results": 0, "joined": 0, "size_mismatch": 0, "no_transcript": 0,
+              "groups_split": 0, "changed_results": 0, "changed_joined": 0,
+              "saved_tokens_joined_pct": None, "mismatch_offsets": {}}
+    got = rs.summarize([], counts, {})
+    got["primer"] = dict(got["primer"], results=0, weighted=-600.0)
+    assert any(ln.startswith("session primer") for ln in rs.render(got).splitlines())
