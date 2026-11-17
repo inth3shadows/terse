@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.50.3] - 2026-11-15
+
 ### Fixed
 - One malformed payload, file or model reply no longer aborts a whole command. Several
   readers caught only `JSONDecodeError`, so a >4300-digit integer (a plain `ValueError`),
