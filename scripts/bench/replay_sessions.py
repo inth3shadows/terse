@@ -20,7 +20,10 @@ Method
    still disagrees is left out and counted.
 2. delta = (what the raw result would have cost in context) - (what the model was shown),
    in cl100k tokens. The shown side is tokenized from the transcript, so the primer and any
-   wrapper are charged to terse automatically.
+   wrapper are charged to terse automatically. The primer is a once-per-session cost that
+   lands on whichever result carries it, so its share is also measured apart
+   (`primer_tokens`, `primer_weighted`) and reported on its own line; the per-group tables
+   show the saving with and without it. Totals are the same either way.
 3. Price delta on every API call that carried it: the write rate on the call that first
    included it, the read rate on later calls, the write rate again on a call that rebuilt
    the cache, and nothing after a compaction. Rates come from each call's own usage block
@@ -87,6 +90,7 @@ ab_session = _load("ab_session", HERE / "ab_session.py")
 cost_model = _load("cost_model", HERE / "cost_per_task" / "cost_model.py")
 
 from terse import tokenize  # noqa: E402 -- after the sys.path setup
+from terse.proxy import PRIMER_HEAD, PRIMER_TAIL  # noqa: E402
 from terse.tokenize import count_cl100k  # noqa: E402
 
 # Claude Code saves an MCP result to a file past either limit (code.claude.com/docs/en/mcp;
@@ -302,6 +306,16 @@ class Result:
     args: str
     # The shown text itself, only when the scan was asked to keep it.
     text: str | None = None
+    # cl100k tokens of the session primer this result carried (0 for none); see
+    # `primer_tokens`. `primer_shapes` counts the copies: 2 when it rode both the text
+    # block and the typed wrapper (#463).
+    primer_tokens: int = 0
+    primer_shapes: int = 0
+    # Characters of the shown text that were the primer: `classify` compares sizes without it.
+    primer_chars: int = 0
+    # The shown text is terse's typed wrapper, which exists only in `structuredContent`:
+    # the client showed the typed field, whatever the sizes say.
+    shown_wrapper: bool = False
 
 
 def _usage_call(usage: dict, model: str | None) -> Call:
@@ -326,6 +340,67 @@ def shown_tokens(text: str) -> int | None:
         return count_cl100k(text)
     except ValueError:
         return len(tokenize._enc(tokenize.CL100K).encode(text, disallowed_special=()))
+
+
+PRIMER_WRAP = re.compile(r'\{\s*"__terse_primer__"\s*:\s*')
+PRIMER_PAYLOAD_KEY = re.compile(r'\s*,\s*"__terse_payload__"\s*:\s*')
+WRAP_CLOSE = re.compile(r'\s*\}')
+_JSON = json.JSONDecoder()
+
+
+def _empty_wrapper_primer(lead: str) -> tuple[str, str] | None:
+    """(primer, lead with the primer emptied) when `lead` opens with the typed wrapper
+    {"__terse_primer__":TEXT,"__terse_payload__":P} in any JSON spacing; None when it does
+    not, or does not parse. Only TEXT is removed: terse records a carrier's typed output
+    with the wrapper and an empty primer (proxy.py, #463), so the skeleton stays with the
+    result and only the primer is the session's."""
+    head = PRIMER_WRAP.match(lead)
+    if not head:
+        return None
+    try:
+        primer, at = _JSON.raw_decode(lead, head.end())
+        key = PRIMER_PAYLOAD_KEY.match(lead, at)
+        if not isinstance(primer, str) or not key:
+            return None
+        _, stop = _JSON.raw_decode(lead, key.end())
+    except json.JSONDecodeError:
+        return None
+    if not WRAP_CLOSE.match(lead, stop):
+        return None
+    return primer, lead[:head.end()] + '""' + lead[at:]
+
+
+def strip_primer(text: str) -> tuple[str, int]:
+    """(text without the session primer, copies removed). The primer rides at the front of
+    the result that claims it: as a leading text block (PRIMER_HEAD .. PRIMER_TAIL), as the
+    primer string inside the typed wrapper {"__terse_primer__":TEXT,"__terse_payload__":P}
+    (#463), or both. Only a leading primer is removed, so a result that merely quotes the
+    primer text (a search over terse's own source) keeps it. From a wrapper only TEXT is
+    removed, the way terse's own ledger records it; a wrapper that does not parse, or whose
+    primer is already empty, is left alone. Leading whitespace is kept."""
+    body = text.lstrip()
+    lead_ws = text[:len(text) - len(body)]
+    copies = 0
+    if body.startswith(PRIMER_HEAD):
+        end = body.find(PRIMER_TAIL)
+        if end >= 0:
+            body = body[end + len(PRIMER_TAIL):].lstrip()
+            copies += 1
+    emptied = _empty_wrapper_primer(body)
+    if emptied and emptied[0]:
+        body = emptied[1]
+        copies += 1
+    return (lead_ws + body, copies) if copies else (text, 0)
+
+
+def primer_tokens(text: str, tokens: int | None = None) -> tuple[int, int, int]:
+    """(cl100k tokens, copies, characters) the session primer added to this shown result.
+    `tokens` is the whole text's count when the caller already has it."""
+    rest, copies = strip_primer(text)
+    if not copies:
+        return 0, 0, 0
+    whole = tokens if tokens is not None else shown_tokens(text)
+    return max(0, (whole or 0) - (shown_tokens(rest) or 0)), copies, len(text) - len(rest)
 
 
 def is_offload_notice(text: str) -> bool:
@@ -405,10 +480,14 @@ def scan_transcript(path: Path, billed_elsewhere: set[tuple] | None = None,
                     if use is None or not rec.get("timestamp"):
                         continue
                     text = _result_text(block.get("content"))
+                    tokens = shown_tokens(text)
+                    p_tok, p_copies, p_chars = primer_tokens(text, tokens)
                     events.append(("result", Result(
                         block["tool_use_id"], use[0], parse_ts(rec["timestamp"]),
-                        len(text), shown_tokens(text),
-                        is_offload_notice(text), use[1], text if keep_text else None)))
+                        len(text), tokens,
+                        is_offload_notice(text), use[1], text if keep_text else None,
+                        p_tok, p_copies, p_chars,
+                        bool(PRIMER_WRAP.match(strip_primer(text)[0].lstrip())))))
     return events
 
 
@@ -596,8 +675,11 @@ def classify(res: Result, led: LedgerResult) -> tuple[str, int, int]:
     # result has one (untouched `secret.list_credentials` results in the transcripts are
     # `structured_chars` long to the character), and the raw text blocks are the larger
     # side, so a tie read as text overstated the saving.
-    typed = (led.typed_out_chars > 0
-             and abs(res.chars - led.typed_out_chars) <= abs(res.chars - led.text_out_chars))
+    # Compare without the primer: terse's recorded sizes never include it (#594 review).
+    shown = res.chars - res.primer_chars
+    typed = led.typed_out_chars > 0 and (
+        res.shown_wrapper
+        or abs(shown - led.typed_out_chars) <= abs(shown - led.text_out_chars))
     raw_tokens, raw_chars = led.raw_side(typed)
     raw_offloads = raw_tokens > OFFLOAD_TOKENS or raw_chars > OFFLOAD_CHARS
     if res.offloaded:
@@ -676,6 +758,10 @@ def replay(events: list[tuple], joined: dict[str, LedgerResult],
         scale = ratio.get(model, ratio.get(None, 1.0))
         weighted = delta * scale * per_w
         usd = None if per_usd is None else delta * scale * per_usd
+        # The primer's share of `weighted`, as a cost (<= 0). Already inside `weighted`.
+        # A retrieve's weight is its whole shown size, so a primer on it is priced too.
+        primer_weighted = (-res.primer_tokens * scale * per_w
+                           if status in ("priced", "retrieve") else 0.0)
         # What this result would have cost in context with terse off: the denominator
         # for "share of what an MCP result costs". Nothing for a result the raw path
         # would have saved to a file, and nothing for a retrieve, which it never makes.
@@ -703,6 +789,12 @@ def replay(events: list[tuple], joined: dict[str, LedgerResult],
             "copy": start < len(calls) and not calls[start].billed,
             "kept_inline_weighted": round(inline * scale * per_w, 2),
             "raw_weighted": round(raw_weighted, 2),
+            # Recorded on every status: the session paid for the primer wherever it rode.
+            # Only a priced result or a retrieve has a weight to share it with
+            # (`primer_weighted`); the other statuses carry no delta.
+            "primer_tokens": res.primer_tokens,
+            "primer_shapes": res.primer_shapes,
+            "primer_weighted": round(primer_weighted, 2),
         })
         net_weighted += weighted
         net_usd = None if (net_usd is None or usd is None) else net_usd + usd
@@ -772,19 +864,23 @@ def summarize(sessions: list[dict], join_counts: dict,
         for row in rows:
             slot = acc.setdefault(key(row), {
                 "results": 0, "delta_tokens": 0, "weighted": 0.0, "usd": 0.0,
-                "usd_missing": 0, "raw_weighted": 0.0})
+                "usd_missing": 0, "raw_weighted": 0.0, "primer_weighted": 0.0})
             if not row["copy"]:
                 slot["results"] += 1
                 slot["delta_tokens"] += row["delta_tokens"]
             slot["weighted"] += row["weighted"]
             slot["raw_weighted"] += row["raw_weighted"]
+            slot["primer_weighted"] += row.get("primer_weighted", 0.0)
             if row["usd"] is None:
                 slot["usd_missing"] += 1
             else:
                 slot["usd"] += row["usd"]
         for slot in acc.values():
+            # The group's saving without the primer it happened to carry.
+            slot["weighted_excl_primer"] = round(slot["weighted"] - slot["primer_weighted"], 1)
             slot["weighted"] = round(slot["weighted"], 1)
             slot["raw_weighted"] = round(slot["raw_weighted"], 1)
+            slot["primer_weighted"] = round(slot["primer_weighted"], 1)
             slot["usd"] = round(slot["usd"], 4)
         return acc
 
@@ -845,6 +941,9 @@ def summarize(sessions: list[dict], join_counts: dict,
         "net_share_of_mcp_results_pct": round(100 * net / mcp_raw, 2) if mcp_raw else None,
         "touched_sessions_weighted": round(sum(s["session_weighted"] for s in touched), 1),
         "kept_inline_pessimistic_weighted": round(sum(it["kept_inline_weighted"] for it in items), 1),
+        # The once-per-session primer, measured apart from the tool that carried it. It is
+        # inside `net_weighted` already; this is its share, as a cost (<= 0).
+        "primer": primer_summary(items, mcp_raw),
         "by_status": fold(items, lambda r: r["status"]),
         "by_model": fold(items, lambda r: r["model"] or "unknown"),
         "by_tool": fold(items, lambda r: r["tool"]),
@@ -854,6 +953,22 @@ def summarize(sessions: list[dict], join_counts: dict,
                    "unchanged": recall_rate(r for r in plain if not r["changed"])},
         "tokenizer_ratio": {m: {"n": len(v), "median": round(st.median(v), 3)}
                             for m, v in calib.items() if v},
+    }
+
+
+def primer_summary(items: list[dict], mcp_raw: float) -> dict:
+    carried = [it for it in items if it.get("primer_tokens") and not it["copy"]]
+    weighted = sum(it.get("primer_weighted", 0.0) for it in items)
+    # Counts are of results, without copies; `weighted` includes copies' carry, as every
+    # table's `weighted` does (a copied result is counted where it was first billed).
+    return {
+        "results": len(carried),
+        "unpriced_results": sum(1 for it in carried if it["status"] not in ("priced", "retrieve")),
+        "shown_twice": sum(1 for it in carried if it.get("primer_shapes", 0) >= 2),
+        "tokens": sum(it["primer_tokens"] for it in carried),
+        "weighted": round(weighted, 1),
+        "share_of_mcp_results_pct": round(100 * weighted / mcp_raw, 2) if mcp_raw else None,
+        "by_tool": dict(Counter(it["tool"] for it in carried).most_common()),
     }
 
 
@@ -888,11 +1003,20 @@ def render(summary: dict) -> str:
                  f"{summary['net_share_of_all_sessions_pct']}%")
     lines.append(f"pessimistic bound for results kept inline: "
                  f"-{summary['kept_inline_pessimistic_weighted']:,.0f}")
+    pr = summary.get("primer")
+    if pr and (pr["results"] or pr["weighted"]):
+        share = ("-" if pr["share_of_mcp_results_pct"] is None
+                 else f"{pr['share_of_mcp_results_pct']}%")
+        lines.append(f"session primer: {pr['results']} results carried it ({pr['unpriced_results']} "
+                     f"of them not priced, {pr['shown_twice']} showed it twice), "
+                     f"{pr['tokens']:,} tokens, {pr['weighted']:,.0f} weighted = {share} of MCP "
+                     f"cost; inside the net above, left out of the 'excl.' column below. "
+                     f"Carried by: {pr['by_tool']}")
 
     def table(title, rows, order=None):
         lines.append("")
         lines.append(f"{title:<34}{'results':>9}{'delta tok':>13}{'weighted':>15}{'usd':>11}"
-                     f"{'raw path':>15}{'saved':>8}")
+                     f"{'raw path':>15}{'saved':>8}{'excl.':>8}")
         keys = order or sorted(rows, key=lambda k: -rows[k]["weighted"])
         for key in keys:
             if key not in rows:
@@ -901,9 +1025,11 @@ def render(summary: dict) -> str:
             usd = f"{r['usd']:,.2f}" + ("*" if r["usd_missing"] else "")
             share = (f"{100 * r['weighted'] / r['raw_weighted']:.1f}%"
                      if r["raw_weighted"] else "-")
+            excl = (f"{100 * r['weighted_excl_primer'] / r['raw_weighted']:.1f}%"
+                    if r["raw_weighted"] else "-")
             lines.append(f"{str(key)[:33]:<34}{r['results']:>9}{r['delta_tokens']:>13,}"
                          f"{r['weighted']:>15,.0f}{usd:>11}{r['raw_weighted']:>15,.0f}"
-                         f"{share:>8}")
+                         f"{share:>8}{excl:>8}")
 
     table("by status", summary["by_status"])
     table("by model", summary["by_model"])

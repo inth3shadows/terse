@@ -2,6 +2,7 @@
 the offload rules, and the per-call carry pricing."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -562,3 +563,215 @@ def test_a_transcript_elsewhere_is_real_work(tmp_path):
     assert not rs.is_harness(root / "-home-ericm-personal-projects-terse" / "a.jsonl", root)
     assert not rs.is_harness(root / "-home-ericm-tmp-notes" / "a.jsonl", root)
     assert not rs.is_harness(tmp_path / "elsewhere" / "a.jsonl", root)
+
+
+# ---------------------------------------------------------------- session primer
+
+PRIMER = rs.PRIMER_HEAD + "- Table {...}: rows.\n" + rs.PRIMER_TAIL
+PAYLOAD = '{"__terse_table__":1,"n":2,"cols":["a"],"rows":[[1],[2]]}'
+
+
+def test_strip_primer_removes_a_leading_text_block():
+    rest, copies = rs.strip_primer(PRIMER + "\n" + PAYLOAD)
+    assert (rest, copies) == (PAYLOAD, 1)
+
+
+EMPTIED = '{"__terse_primer__":"","__terse_payload__":' + PAYLOAD + "}"
+
+
+def test_strip_primer_empties_the_typed_wrappers_primer_and_keeps_the_wrapper():
+    # The skeleton stays: terse records a carrier's typed output with it (round 3, F1).
+    wrapped = '{"__terse_primer__":' + json.dumps(PRIMER) + ',"__terse_payload__":' + PAYLOAD + "}"
+    assert rs.strip_primer(wrapped) == (EMPTIED, 1)
+
+
+def test_strip_primer_counts_a_primer_shown_in_both_places():
+    wrapped = '{"__terse_primer__":' + json.dumps(PRIMER) + ',"__terse_payload__":' + PAYLOAD + "}"
+    assert rs.strip_primer(PRIMER + wrapped) == (EMPTIED, 2)
+
+
+def test_strip_primer_leaves_a_result_that_only_quotes_the_primer():
+    quoted = "search hit:\n" + PRIMER + "\n" + PAYLOAD
+    assert rs.strip_primer(quoted) == (quoted, 0)
+    assert rs.primer_tokens(quoted) == (0, 0, 0)
+
+
+def test_strip_primer_leaves_a_wrapper_it_cannot_parse():
+    broken = '{"__terse_primer__":"unterminated'
+    assert rs.strip_primer(broken) == (broken, 0)
+
+
+def test_primer_tokens_is_the_shown_size_difference():
+    text = PRIMER + "\n" + PAYLOAD
+    tokens, copies, chars = rs.primer_tokens(text)
+    assert copies == 1 and chars == len(text) - len(PAYLOAD)
+    assert tokens == rs.shown_tokens(text) - rs.shown_tokens(PAYLOAD) > 0
+
+
+def test_replay_prices_the_primer_inside_the_net_and_reports_its_share(tmp_path):
+    led = rs.load_ledger(ledger_file(tmp_path, [row(100, raw=1000, out=600)]))
+    res = rs.Result("a", "mcp__terse__kb_read_search", 100.5, 2600, 750, False, "{}",
+                    None, 150, 1)
+    events = [("call", call(w1=100)), ("result", res), ("call", call(read=100, w1=900))]
+    item = rs.replay(events, {"a": led[0]})["items"][0]
+    # 1,000 raw - 750 shown = 250 saved, of which the primer cost 150.
+    assert item["weighted"] == pytest.approx(250 * 2.0)
+    assert item["primer_weighted"] == pytest.approx(-150 * 2.0)
+    assert item["primer_tokens"] == 150 and item["primer_shapes"] == 1
+
+
+def test_summarize_reports_the_primer_apart_and_keeps_the_total():
+    base = {"tool": "kb_read_search", "status": "priced", "delta_tokens": 250,
+            "kept_inline_tokens": 0, "carried_calls": 1, "weighted": 500.0, "usd": None,
+            "model": OPUS, "changed": True, "recall_3": False, "shown_tokens": 750,
+            "kept_inline_weighted": 0, "copy": False, "raw_weighted": 2000.0,
+            "primer_tokens": 150, "primer_shapes": 2, "primer_weighted": -300.0}
+    plain = dict(base, primer_tokens=0, primer_shapes=0, primer_weighted=0.0)
+    session = {"calls": 3, "model": OPUS, "session_weighted": 10000.0, "net_weighted": 1000.0,
+               "items": [base, plain]}
+    counts = {"ledger_results": 2, "joined": 2, "size_mismatch": 0, "no_transcript": 0,
+              "groups_split": 0, "changed_results": 2, "changed_joined": 2,
+              "saved_tokens_joined_pct": 100.0, "mismatch_offsets": {}}
+    got = rs.summarize([session], counts, {})
+    assert got["net_weighted"] == 1000.0               # unchanged by the split
+    assert got["primer"] == {"results": 1, "unpriced_results": 0, "shown_twice": 1,
+                             "tokens": 150, "weighted": -300.0,
+                             "share_of_mcp_results_pct": -7.5,
+                             "by_tool": {"kb_read_search": 1}}
+    tool = got["by_tool"]["kb_read_search"]
+    assert tool["weighted"] == 1000.0 and tool["primer_weighted"] == -300.0
+    assert tool["weighted_excl_primer"] == 1300.0
+    text = rs.render(got)
+    assert "session primer: 1 results carried it (0 of them not priced, 1 showed it twice)" in text
+    assert "excl." in text and "32.5%" in text
+
+
+# ---------------------------------------------------------------- review round 1 (#594)
+
+def test_classify_ignores_the_primer_when_choosing_typed_or_text(tmp_path):
+    # F1: a typed-wrapper carrier. Typed out 1,000 chars, text out 2,000; the shown size is
+    # the typed field plus a 2,240-char primer. Read raw, 3,240 sits nearer the text side.
+    led = rs.load_ledger(ledger_file(tmp_path, [row(
+        100, raw=3000, out=1250, raw_chars=12000, out_chars=3000,
+        structured_chars=8000, structured_out_chars=1000,
+        structured_tokens=2000, structured_out_tokens=250)]))[0]
+    res = rs.Result("t1", "mcp__terse__kb_read_search", 100.5, 3240, 810, False, "{}",
+                    None, 560, 1, 2240)
+    # Typed raw is 2,000 tokens: 2,000 - 810 shown.
+    assert rs.classify(res, led) == ("priced", 1190, 0)
+
+
+def test_strip_primer_reads_a_wrapper_written_with_spaces():
+    # F2: the wrapper with json.dumps' default separators, and pretty-printed.
+    obj = {"__terse_primer__": PRIMER, "__terse_payload__": {"a": [1, 2]}}
+    for text in (json.dumps(obj), json.dumps(obj, indent=2)):
+        rest, copies = rs.strip_primer(text)
+        assert copies == 1
+        assert json.loads(rest) == {"__terse_primer__": "", "__terse_payload__": {"a": [1, 2]}}
+
+
+def test_replay_reports_a_primer_on_a_result_it_does_not_price(tmp_path):
+    # F3: the primer rode a result terse kept inline (raw would have gone to a file). It is
+    # not priced, but the session still paid for a primer and the line must say so.
+    led = rs.load_ledger(ledger_file(tmp_path, [row(100, raw=40000, out=9000)]))
+    res = rs.Result("a", "mcp__terse__kb_read_search", 100.5, 38000, 9600, False, "{}",
+                    None, 600, 1, 2300)
+    events = [("call", call(w1=100)), ("result", res), ("call", call(read=100, w1=9700))]
+    item = rs.replay(events, {"a": led[0]})["items"][0]
+    assert item["status"] == "kept_inline"
+    assert item["primer_tokens"] == 600 and item["primer_weighted"] == 0
+    session = {"calls": 2, "model": OPUS, "session_weighted": 1000.0, "net_weighted": 0.0,
+               "items": [item]}
+    counts = {"ledger_results": 1, "joined": 1, "size_mismatch": 0, "no_transcript": 0,
+              "groups_split": 0, "changed_results": 1, "changed_joined": 1,
+              "saved_tokens_joined_pct": 100.0, "mismatch_offsets": {}}
+    pr = rs.summarize([session], counts, {})["primer"]
+    assert pr["results"] == 1 and pr["unpriced_results"] == 1 and pr["tokens"] == 600
+
+
+def test_render_omits_the_primer_line_with_no_carrier_and_never_prints_none():
+    # F4.
+    counts = {"ledger_results": 0, "joined": 0, "size_mismatch": 0, "no_transcript": 0,
+              "groups_split": 0, "changed_results": 0, "changed_joined": 0,
+              "saved_tokens_joined_pct": None, "mismatch_offsets": {}}
+    text = rs.render(rs.summarize([], counts, {}))
+    assert "session primer" not in text
+    # A carrier but no priced MCP cost to share against: the share prints as "-".
+    got = rs.summarize([], counts, {})
+    got["primer"] = dict(got["primer"], results=1, tokens=600, share_of_mcp_results_pct=None)
+    line = [ln for ln in rs.render(got).splitlines() if ln.startswith("session primer")][0]
+    assert "None" not in line and "= - of MCP cost" in line
+
+
+def test_a_wrapper_carrier_read_from_a_transcript_is_priced_on_the_typed_side(tmp_path):
+    # Round 3 (F1): terse records a wrapper carrier's typed output WITH the wrapper skeleton
+    # and an empty primer (proxy.py, #463), so only the primer string may be set aside.
+    payload = {"result": {"__terse_table__": 1, "n": 2, "cols": ["a"], "rows": [[1], [2]]}}
+    shown = json.dumps({"__terse_primer__": PRIMER, "__terse_payload__": payload},
+                       separators=(",", ":"), ensure_ascii=False)
+    recorded = json.dumps({"__terse_primer__": "", "__terse_payload__": payload},
+                          separators=(",", ":"), ensure_ascii=False)
+    use = {"type": "tool_use", "id": "tu1", "name": "mcp__terse__kb_read_search", "input": {}}
+    path = _records(tmp_path / "s.jsonl", [
+        {"type": "assistant", "requestId": "r1", "timestamp": "2026-10-01T00:00:00Z",
+         "message": {"id": "m", "model": OPUS, "content": [use],
+                     "usage": {"input_tokens": 1, "output_tokens": 1}}},
+        {"type": "user", "timestamp": "2026-10-01T00:00:01Z", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "tu1", "content": shown}]}},
+    ])
+    res = rs.scan_transcript(path)[1][1]
+    assert res.primer_chars == len(json.dumps(PRIMER, ensure_ascii=False)) - 2
+    assert res.chars - res.primer_chars == len(recorded)
+    # Text blocks recorded far nearer the shown size than the typed field, as on live data.
+    led = rs.load_ledger(ledger_file(tmp_path, [row(
+        100, raw=3000, out=900, raw_chars=12000, out_chars=len(recorded) + 1500,
+        structured_chars=8000, structured_out_chars=len(recorded),
+        structured_tokens=2000, structured_out_tokens=300)]))[0]
+    status, delta, _ = rs.classify(res, led)
+    assert status == "priced" and delta == 2000 - res.tokens   # typed raw: 2,000 tokens
+
+
+def test_strip_primer_keeps_leading_whitespace_out_of_the_primer():
+    rest, copies = rs.strip_primer("\n  " + PRIMER + "\n" + PAYLOAD)
+    assert copies == 1 and rest == "\n  " + PAYLOAD
+
+
+def test_an_already_empty_wrapper_primer_is_not_a_primer():
+    assert rs.strip_primer(EMPTIED) == (EMPTIED, 0)
+    assert rs.strip_primer(PRIMER + EMPTIED) == (EMPTIED, 1)
+
+
+def test_a_shown_wrapper_is_read_as_the_typed_field_even_when_text_is_nearer(tmp_path):
+    # Round 3: a wrapper exists only in structuredContent, so the typed side is certain;
+    # on live data the two recorded sizes can sit 11 chars apart in 40,000.
+    led = rs.load_ledger(ledger_file(tmp_path, [row(
+        100, raw=3000, out=1200, raw_chars=12000, out_chars=4000,
+        structured_chars=8000, structured_out_chars=2100,
+        structured_tokens=2000, structured_out_tokens=500)]))[0]
+    res = rs.Result("t1", "mcp__terse__kb_read_search", 100.5, 1905, 480, False, "{}",
+                    shown_wrapper=True)
+    assert rs.classify(res, led) == ("priced", 2000 - 480, 0)
+    assert rs.classify(dataclasses.replace(res, shown_wrapper=False), led)[1] == 1000 - 480
+
+
+def test_a_primer_on_a_retrieve_is_priced_apart_and_not_counted_as_unpriced():
+    # V1: a retrieve's weight is its whole shown size, primer included.
+    res = rs.Result("r", "mcp__terse__terse_retrieve", 100.5, 4000, 1000, False, "{}",
+                    None, 300, 1, 1100)
+    events = [("call", call(read=20000, w1=500)), ("result", res),
+              ("call", call(read=20500, w1=1100))]
+    item = rs.replay(events, {})["items"][0]
+    assert item["status"] == "retrieve"
+    assert item["primer_weighted"] == pytest.approx(-300 * 2.0)
+    assert rs.primer_summary([item], 1000.0)["unpriced_results"] == 0
+
+
+def test_the_primer_line_shows_when_only_copied_history_carried_it():
+    # V2: no first-billed carrier, but copies' carry still holds primer weight, and the
+    # 'excl.' column differs from 'saved'; the line that explains it must print.
+    counts = {"ledger_results": 0, "joined": 0, "size_mismatch": 0, "no_transcript": 0,
+              "groups_split": 0, "changed_results": 0, "changed_joined": 0,
+              "saved_tokens_joined_pct": None, "mismatch_offsets": {}}
+    got = rs.summarize([], counts, {})
+    got["primer"] = dict(got["primer"], results=0, weighted=-600.0)
+    assert any(ln.startswith("session primer") for ln in rs.render(got).splitlines())

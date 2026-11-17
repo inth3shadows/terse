@@ -13,7 +13,17 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+- `scripts/bench/replay_sessions.py` reports the session format primer on its own line, and
+  each by-model, by-tool and by-length table gains an `excl.` column: that group's saving
+  without the primer it happened to carry. The primer is paid once per session by whichever
+  result carries it, so charging it to that result's tool made `kb.read.search` look like a
+  net cost (#593). Totals are unchanged.
+- `scripts/bench/replay_sessions.py` reads a result shown as terse's typed wrapper as the typed
+  field, and finds the wrapper in any JSON spacing. On the 2026-11-17 data no result's price
+  changes; the sizes alone had been within a few characters of a tie for some carriers.
+  The primer's own size counts only the primer string, not the wrapper around the payload,
+  which terse records as part of the result.
 
 ## [0.50.3] - 2026-11-15
 
