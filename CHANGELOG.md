@@ -13,6 +13,10 @@ fails that pull request until the section has moved.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.51.0] - 2026-11-17
+
 ### Changed
 - `scripts/bench/replay_sessions.py` reports the session format primer on its own line, and
   each by-model, by-tool and by-length table gains an `excl.` column: that group's saving
