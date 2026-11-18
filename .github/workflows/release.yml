@@ -70,7 +70,7 @@ jobs:
     steps:
       # fetch-depth: 0 — need every tag and commit to find the last release and the
       # commits since it. Shallow would misread both.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1  # zizmor: ignore[artipacked] -- this job pushes a tag with the checkout's token
         with:
           fetch-depth: 0
       # DECIDE the version but do NOT push the tag yet — the test gate below must pass
@@ -165,9 +165,9 @@ jobs:
       # `changelog_bookkeeping` tests — see the block below.
       # A red suite fails the job here, so no tag is ever pushed for a broken build.
       - if: steps.decide.outputs.release == 'true'
-        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
-          enable-cache: true
+          enable-cache: false
       # Minus the `changelog_bookkeeping` tests: they audit whether PREVIOUS releases were
       # filed in CHANGELOG.md, which says nothing about whether THIS commit is fit to tag —
       # and their answer can flip between a PR's green CI and its squash on main. It did:
@@ -206,13 +206,14 @@ jobs:
     steps:
       # Check out AT THE TAG (not the branch) so hatch-vcs resolves the version to it,
       # byte-for-byte. fetch-depth: 0 is REQUIRED — hatch-vcs uses `git describe`.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ needs.version.outputs.tag }}
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081 # v5
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
-          enable-cache: true
+          enable-cache: false
       # No test step here: the `version` job already ran the suite against this exact
       # commit BEFORE pushing the tag, so a red build never gets a tag to reach this job.
       - name: Build sdist + wheel
@@ -267,4 +268,4 @@ jobs:
       # never reached PyPI). v1.14.2 bumped its internal twine to v7, whose release notes
       # name 2.5 upload support as the headline fix. Do not roll this back below v1.14.2.
       - name: Publish to PyPI (Trusted Publishing + attestations)
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
